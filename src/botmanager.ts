@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
@@ -44,6 +44,7 @@ import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
 import { buyInsurance } from "./routines/common.js";
+import { logSkills, refreshSkillNames } from "./skillTracker.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -745,27 +746,27 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
         ? r.skills as Record<string, unknown>
         : r;
     
-    if (skillsObj) {
-      const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
-      for (const [skillId, s] of Object.entries(skillsObj)) {
-        // Skip non-skill keys
-        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
-        
-        if (s && typeof s === "object") {
-          const skillObj = s as Record<string, unknown>;
-          const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
-          const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
-          const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
-          skillData[skillId] = {
-            level: level || 0,
-            xp: xp || 0,
-            nextLevelXp: xpToNext || 0
-          };
-        }
-      }
-      server.broadcastSkillsUpdate(botName, skillData);
-    }
-  }
+if (skillsObj) {
+       const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
+       for (const [skillId, s] of Object.entries(skillsObj)) {
+         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+         
+         if (s && typeof s === "object") {
+           const skillObj = s as Record<string, unknown>;
+           const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
+           const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
+           const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
+           skillData[skillId] = {
+             level: level || 0,
+             xp: xp || 0,
+             nextLevelXp: xpToNext || 0
+           };
+         }
+       }
+       server.broadcastSkillsUpdate(botName, skillData);
+     }
+     logSkills(bot);
+   }
 
 // Refresh cached state after mutating commands
   const refreshCommands = new Set([
@@ -1072,6 +1073,7 @@ async function main(): Promise<void> {
                 try {
                   await catalogStore.fetchAll(bot.api);
                   server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  refreshSkillNames();
                 } catch (err) {
                   server.logSystem(`Catalog fetch failed: ${err}`);
                 }
@@ -1113,6 +1115,7 @@ async function main(): Promise<void> {
                   try {
                     await catalogStore.fetchAll(bot.api);
                     server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                    refreshSkillNames();
                   } catch (err) {
                     server.logSystem(`Catalog fetch failed: ${err}`);
                   }
@@ -1220,6 +1223,15 @@ async function main(): Promise<void> {
     }
   }, 120 * 1000));
 
+  // Periodic skill logging for all bots with active sessions - every 60 seconds
+  intervals.push(setInterval(() => {
+    for (const bot of bots.values()) {
+      if (bot.api.getSession()) {
+        logSkills(bot);
+      }
+    }
+  }, 60 * 1000));
+
   // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
   // This keeps sessions alive and fetches notifications without heavy API calls
   intervals.push(setInterval(async () => {
@@ -1275,6 +1287,7 @@ async function main(): Promise<void> {
         try {
           await catalogStore.fetchAll(bot.api);
           server.logSystem(`Catalog refreshed (${catalogStore.getSummary()})`);
+          refreshSkillNames();
         } catch (err) {
           server.logSystem(`Catalog refresh failed: ${err}`);
         }

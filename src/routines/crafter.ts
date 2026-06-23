@@ -259,6 +259,28 @@ async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Pr
   return recipe?.effective_time_per_run || 0;
 }
 
+function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[]): void {
+  const { log } = ctx;
+  const recipeNames = new Map<string, string>();
+  for (const r of recipes) {
+    recipeNames.set(r.recipe_id, r.name);
+  }
+  const progressSummaries: string[] = [];
+  for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
+    const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
+    const completed = progress.completed * outputQty;
+    const queued = progress.queued * outputQty;
+    const remaining = progress.remaining;
+    const name = recipeNames.get(recipeId) || recipeId;
+    progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+  }
+  if (progressSummaries.length > 0) {
+    log("craft", `[Queue Status] ${progressSummaries.join(", ")}`);
+  } else {
+    log("craft", "[Queue Status] No active jobs in queue");
+  }
+}
+
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[]): Promise<void> {
   const { bot } = ctx;
   const serverJobs = await checkCraftingQueue(bot, recipes);
@@ -337,6 +359,7 @@ async function waitForCompletion(
   const { log } = ctx;
   const timeoutMs = (estimatedTicks ? estimatedTicks * 2 + 10 : 30) * 10000;
   const startTime = Date.now();
+  let lastStatusReport = Date.now();
 
   const serverJobIds = await checkCraftingQueue(bot, recipes);
   tracker.syncWithServer(serverJobIds);
@@ -365,6 +388,11 @@ async function waitForCompletion(
     if (Date.now() - startTime > timeoutMs) {
       log("craft", `Crafting timeout for ${recipeId} - marking as complete (server may have finished)`);
       return true;
+    }
+
+    if (Date.now() - lastStatusReport >= 60000) {
+      reportQueueStatus(ctx, tracker, recipes);
+      lastStatusReport = Date.now();
     }
   }
 
@@ -472,11 +500,17 @@ async function craftFromCategories(
 
   const MAX_CRAFTS = 10;
   let totalCrafted = 0;
+  let lastStatusReport = Date.now();
 
   while (totalCrafted < MAX_CRAFTS && bot.state === "running") {
     const serverJobIds = await checkCraftingQueue(bot, recipes);
     tracker.syncWithServer(serverJobIds);
     tracker.save();
+
+    if (Date.now() - lastStatusReport >= 60000) {
+      reportQueueStatus(ctx, tracker, recipes);
+      lastStatusReport = Date.now();
+    }
 
     let target: Recipe | null = null;
     for (const candidate of candidates) {
@@ -646,7 +680,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {
-      ctx.log("craft", "No goal items configured - crafting from enabled categories");
+      if (settings.enabledCategories.length > 0) {
+        ctx.log("craft", "No goal items configured - crafting from enabled categories");
+      }
       const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, settings.craftingPreset);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
@@ -658,7 +694,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (goalItems.length === 0 && isSpecializedBot) {
-      ctx.log("craft", "No goals match assigned categories - crafting from categories");
+      if (assignedCategories.length > 0) {
+        ctx.log("craft", "No goals match assigned categories - crafting from categories");
+      }
       const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, settings.craftingPreset);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);

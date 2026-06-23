@@ -1326,9 +1326,10 @@ if (miningType === "ice") {
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
     // Ore mining - trust map data, only filter by hidden status
+    // Gas clouds (nebula) can also contain regular ores like energy_crystal
     if (targetResource) {
       for (const poi of pois) {
-        const isOreBelt = isOreBeltPoi(poi.type) ||
+        const isOreBelt = isOreBeltPoi(poi.type) || isGasCloudPoi(poi.type) ||
                           (poi.name && (poi.name.toLowerCase().includes('belt') ||
                                         poi.name.toLowerCase().includes('mineral field') ||
                                         poi.name.toLowerCase().includes('asteroid')));
@@ -1345,9 +1346,9 @@ if (miningType === "ice") {
       }
       return null; // No POI with target ore available
     }
-    // Fallback: any ore belt or hidden POI
+    // Fallback: any ore belt or gas cloud (nebula can contain regular ores) or hidden POI
     const oreBelt = pois.find(p => {
-      const isOreBelt = isOreBeltPoi(p.type) ||
+      const isOreBelt = isOreBeltPoi(p.type) || isGasCloudPoi(p.type) ||
                         (p.name && (p.name.toLowerCase().includes('belt') ||
                                     p.name.toLowerCase().includes('mineral field') ||
                                     p.name.toLowerCase().includes('asteroid')));
@@ -3568,7 +3569,8 @@ if (configuredSystem) {
         const canMineHere = (() => {
           if (miningType === "ore") {
             if (isDeepCoreOre(effectiveTarget)) return deepCoreCap.canMineVisibleDeepCore;
-            return isOreBeltPoi(currentPoi.type);
+            // Gas clouds (nebula) can also contain regular ores like energy_crystal
+            return isOreBeltPoi(currentPoi.type) || isGasCloudPoi(currentPoi.type);
           }
           if (miningType === "gas") return isGasCloudPoi(currentPoi.type);
           if (miningType === "ice") return isIceFieldPoi(currentPoi.type) || (isHidden && canMineHiddenIce);
@@ -3624,7 +3626,8 @@ if (configuredSystem) {
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
-        const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
+        // For ore mining, accept both ore belts AND gas clouds (nebula can contain regular ores)
+        const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || isGasCloudPoi(p.type) || p.hidden === true)) ||
           (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
           (miningType === "ice" && isIceFieldPoi(p.type));
@@ -3662,7 +3665,9 @@ if (configuredSystem) {
         const broaderLocations = broaderLocationsRaw.filter(loc => {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
-          if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+          if (!poi) return true;
+          // For ore mining, accept both ore belts AND gas clouds (nebula can contain regular ores)
+          if (miningType === "ore") return isOreBeltPoi(poi?.type || "") || isGasCloudPoi(poi?.type || "");
                 if (miningType === "radioactive") {
                   const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                     (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 

@@ -7,10 +7,24 @@ const DATA_DIR = join(process.cwd(), "data");
 const SKILLS_LOG_DIR = join(DATA_DIR, "skillsLog");
 
 let lastLoggedAt: Record<string, number> = {};
+let cachedSkillNames: string[] | null = null;
 
 function getSkillNames(): string[] {
+  if (cachedSkillNames) return cachedSkillNames;
+  
   const skills = catalogStore.getAll().skills;
-  return Object.keys(skills).sort();
+  const names = Object.keys(skills).sort();
+  
+  if (names.length === 0) {
+    return [];
+  }
+  
+  cachedSkillNames = names;
+  return names;
+}
+
+export function refreshSkillNames(): void {
+  cachedSkillNames = null;
 }
 
 function ensureLogDir(): void {
@@ -23,8 +37,7 @@ function getLogPath(botName: string): string {
   return join(SKILLS_LOG_DIR, `${botName}-skillLog.csv`);
 }
 
-function writeHeader(botName: string): void {
-  const skillNames = getSkillNames();
+function writeHeader(botName: string, skillNames: string[]): void {
   const header = ["botName", ...skillNames.flatMap(name => [`${name}Level`, `${name}XP`])].join(",");
   const logPath = getLogPath(botName);
   ensureLogDir();
@@ -42,8 +55,14 @@ export function logSkills(bot: Bot): void {
   
   lastLoggedAt[bot.username] = now;
   
-  const skillNames = getSkillNames();
+  let skillNames = getSkillNames();
+  
   const skills = bot.status().skills || {};
+  
+  if (skillNames.length === 0) {
+    skillNames = Object.keys(skills).sort();
+    cachedSkillNames = skillNames;
+  }
   
   const values = skillNames.map(name => {
     const skill = skills[name];
@@ -58,7 +77,7 @@ export function logSkills(bot: Bot): void {
   
   ensureLogDir();
   if (!existsSync(logPath)) {
-    writeHeader(bot.username);
+    writeHeader(bot.username, skillNames);
   }
   
   appendFileSync(logPath, line + "\n", "utf8");

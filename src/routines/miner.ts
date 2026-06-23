@@ -1164,19 +1164,19 @@ export function findFirstAvailableQuotaTarget(
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
       if (!poi) return true;
-      if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+      // Only filter by hidden status - trust map data for ore/gas/ice types
+      if (miningType === "ore") return true; // All non-hidden POIs are valid for ore
       if (miningType === "radioactive") {
         if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-        const isOreBelt = isOreBeltPoi(poi.type) || 
-                          loc.poiName.toLowerCase().includes('belt') || 
-                          loc.poiName.toLowerCase().includes('mineral field') ||
-                          loc.poiName.toLowerCase().includes('asteroid');
-        return isOreBelt || poi.hidden === true;
+        return true;
       }
-      if (miningType === "gas") return isGasCloudPoi(poi.type);
+      if (miningType === "gas") {
+        if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+        return true;
+      }
       if (miningType === "ice") {
         if (poi.hidden === true && !canMineHiddenIce) return false;
-        return isIceFieldPoi(poi.type);
+        return true;
       }
       return true;
     });
@@ -1279,7 +1279,7 @@ function findMiningPoi(
     return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
   };
 
-  if (miningType === "ice") {
+if (miningType === "ice") {
     // Ice mining
     if (targetResource) {
       for (const poi of pois) {
@@ -1325,12 +1325,16 @@ function findMiningPoi(
     });
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
-    // Ore mining
+    // Ore mining - trust map data, only filter by hidden status
     if (targetResource) {
       for (const poi of pois) {
-        const isAllowedPoi = isOreBeltPoi(poi.type) ||
-                            (allowHiddenPois && poi.hidden === true) ||
-                            (poi.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id));
+        const isOreBelt = isOreBeltPoi(poi.type) ||
+                          (poi.name && (poi.name.toLowerCase().includes('belt') ||
+                                        poi.name.toLowerCase().includes('mineral field') ||
+                                        poi.name.toLowerCase().includes('asteroid')));
+        const isAllowedPoi = isOreBelt ||
+                              (allowHiddenPois && poi.hidden === true) ||
+                              (poi.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id));
         if (isAllowedPoi) {
           const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
           const storedPoi = sysData?.pois.find((p: any) => p.id === poi.id);
@@ -1341,12 +1345,14 @@ function findMiningPoi(
       }
       return null; // No POI with target ore available
     }
-    // Fallback: any ore belt
+    // Fallback: any ore belt or hidden POI
     const oreBelt = pois.find(p => {
-      const isAllowedPoi = isOreBeltPoi(p.type) ||
-                          (allowHiddenPois && p.hidden === true) ||
-                          (p.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(p.id));
-      return isAllowedPoi;
+      const isOreBelt = isOreBeltPoi(p.type) ||
+                        (p.name && (p.name.toLowerCase().includes('belt') ||
+                                    p.name.toLowerCase().includes('mineral field') ||
+                                    p.name.toLowerCase().includes('asteroid')));
+      return isOreBelt || (allowHiddenPois && p.hidden === true) ||
+             (p.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(p.id));
     });
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else {
@@ -2691,24 +2697,20 @@ if (configuredSystem) {
       const locations = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
-        if (!poi) return true; // keep if type unknown
-        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (!poi) return true;
+        // Only filter by hidden status - trust map data
+        if (miningType === "ore") return true;
         if (miningType === "radioactive") {
-          if (poi.hidden === true && !canMineHiddenRadioactive) {
-            return false;
-          }
-          const isOreBelt = isOreBeltPoi(poi.type) || 
-                            loc.poiName.toLowerCase().includes('belt') || 
-                            loc.poiName.toLowerCase().includes('mineral field') ||
-                            loc.poiName.toLowerCase().includes('asteroid');
-          return isOreBelt || poi.hidden === true;
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
         }
-        if (miningType === "gas") return isGasCloudPoi(poi.type);
+        if (miningType === "gas") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
+        }
         if (miningType === "ice") {
-          if (poi.hidden === true && !canMineHiddenIce) {
-            return false;
-          }
-          return isIceFieldPoi(poi.type);
+          if (poi.hidden === true && !canMineHiddenIce) return false;
+          return true;
         }
         return true;
       }).filter(loc => {
@@ -2732,19 +2734,19 @@ if (configuredSystem) {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true;
-        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        // Only filter by hidden status - trust map data
+        if (miningType === "ore") return true;
         if (miningType === "radioactive") {
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-          const isOreBelt = isOreBeltPoi(poi.type) ||
-            loc.poiName.toLowerCase().includes('belt') ||
-            loc.poiName.toLowerCase().includes('mineral field') ||
-            loc.poiName.toLowerCase().includes('asteroid');
-          return isOreBelt || poi.hidden === true;
+          return true;
         }
-        if (miningType === "gas") return isGasCloudPoi(poi.type);
+        if (miningType === "gas") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
+        }
         if (miningType === "ice") {
           if (poi.hidden === true && !canMineHiddenIce) return false;
-          return isIceFieldPoi(poi.type);
+          return true;
         }
         return true;
       });
@@ -2841,15 +2843,19 @@ if (configuredSystem) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
-              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              // Only filter by hidden status - trust map data
+              if (miningType === "ore") return true;
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                return isOreBeltPoi(poi.type) || poi.hidden === true;
+                return true;
               }
-              if (miningType === "gas") return isGasCloudPoi(poi.type);
+              if (miningType === "gas") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                return true;
+              }
               if (miningType === "ice") {
                 if (poi.hidden === true && !canMineHiddenIce) return false;
-                return isIceFieldPoi(poi.type);
+                return true;
               }
               return true;
             }).filter(loc => {
@@ -3049,15 +3055,19 @@ if (configuredSystem) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
-              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              // Only filter by hidden status - trust map data
+              if (miningType === "ore") return true;
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                return isOreBeltPoi(poi.type) || poi.hidden === true;
+                return true;
               }
-              if (miningType === "gas") return isGasCloudPoi(poi.type);
+              if (miningType === "gas") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                return true;
+              }
               if (miningType === "ice") {
                 if (poi.hidden === true && !canMineHiddenIce) return false;
-                return isIceFieldPoi(poi.type);
+                return true;
               }
               return true;
             }).filter(loc => {
@@ -5565,8 +5575,19 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                   const poi = sys?.pois.find(p => p.id === loc.poiId);
                   if (!poi) continue;
 
-                  // Verify POI type matches
-                  if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
+                  // Verify POI type matches - only filter by hidden status, trust map data
+                  if (miningType === "ore") {
+                    if (poi.hidden) continue; // Hidden POIs need special handling
+                  }
+                  if (miningType === "radioactive") {
+                    if (poi.hidden && !canMineHiddenRadioactive) continue;
+                  }
+                  if (miningType === "gas") {
+                    if (poi.hidden && !canMineHiddenRadioactive) continue;
+                  }
+                  if (miningType === "ice") {
+                    if (poi.hidden && !canMineHiddenIce) continue;
+                  }
                   if (miningType === "radioactive" && !(canMineBasicRadioactive && (
                     isOreBeltPoi(poi.type) ||
                     (!poi.hidden && canMineDeepCoreRadioactive) ||

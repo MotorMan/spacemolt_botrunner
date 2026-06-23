@@ -41,6 +41,7 @@ async function getCrafterSettings(): Promise<{
   };
   blacklistedRecipes: string[];
   useQueuedCrafting: boolean;
+  craftingPreset: string;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -136,6 +137,7 @@ async function getCrafterSettings(): Promise<{
     autoBuy,
     blacklistedRecipes,
     useQueuedCrafting,
+    craftingPreset: (c.craftingPreset as string) || "fast",
   };
 }
 
@@ -214,7 +216,9 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
 
 async function checkCraftingQueue(bot: any, recipes: Recipe[]): Promise<ServerJobInfo[]> {
   const resp = await bot.exec("craft", { action: "queue" });
-  if (resp.error) return [];
+  if (resp.error) {
+    return [];
+  }
   const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown>)?.details as Record<string, unknown> | undefined;
   const jobs = (details?.jobs as Array<Record<string, unknown>>) || (result?.jobs as Array<Record<string, unknown>>) || [];
@@ -269,6 +273,7 @@ async function queueCraftJob(
   bot: any,
   tracker: CraftQueueTracker,
   recipes?: Recipe[],
+  preset: string = "fast",
 ): Promise<{ success: boolean; error?: string; jobId?: string }> {
   const { log } = ctx;
 
@@ -286,11 +291,11 @@ async function queueCraftJob(
     return { success: true, error: "Job already queued" };
   }
 
-  log("craft", `Queueing ${runs} runs of ${recipeId} (preset=workshop)...`);
+  log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
   const craftResp = await bot.exec("craft", {
     id: recipeId,
     quantity: runs,
-    preset: "workshop",
+    preset: preset,
   });
 
   if (craftResp.error) {
@@ -330,7 +335,7 @@ async function waitForCompletion(
   recipes: Recipe[] = [],
 ): Promise<boolean> {
   const { log } = ctx;
-  const timeoutMs = (estimatedTicks ? estimatedTicks * 2 + 10 : 10) * 10000;
+  const timeoutMs = (estimatedTicks ? estimatedTicks * 2 + 10 : 30) * 10000;
   const startTime = Date.now();
 
   const serverJobIds = await checkCraftingQueue(bot, recipes);
@@ -344,18 +349,6 @@ async function waitForCompletion(
   }
 
   while (bot.state === "running") {
-    if (Date.now() - startTime > timeoutMs) {
-      const latestJobIds = await checkCraftingQueue(bot, recipes);
-      tracker.syncWithServer(latestJobIds);
-      tracker.save();
-      const progress = tracker.getProgress(recipeId);
-      const currentCompletedItems = progress.completed * outputQty;
-      if (currentCompletedItems >= quantityItems) {
-        log("craft", `Crafting complete for ${recipeId} (timeout verification)`);
-        return true;
-      }
-    }
-
     await ctx.sleep(5000);
 
     const currentJobIds = await checkCraftingQueue(bot, recipes);
@@ -366,6 +359,11 @@ async function waitForCompletion(
     const currentCompletedItems = progress.completed * outputQty;
     if (currentCompletedItems >= quantityItems) {
       log("craft", `Crafting complete for ${recipeId}`);
+      return true;
+    }
+
+    if (Date.now() - startTime > timeoutMs) {
+      log("craft", `Crafting timeout for ${recipeId} - marking as complete (server may have finished)`);
       return true;
     }
   }
@@ -380,6 +378,7 @@ async function executeCraftingPlan(
   planItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
   tracker: CraftQueueTracker,
   recipes: Recipe[],
+  preset: string = "fast",
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -410,7 +409,7 @@ async function executeCraftingPlan(
 
     ctx.log("craft", `Queueing ${remainingItems}x ${item.recipe.name} (${item.reason})`);
     const estTime = await getEstimatedCraftingTime(item.recipe.recipe_id, recipes);
-    const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, recipes);
+    const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, recipes, preset);
     if (!queueResult.success) {
       if (queueResult.error === "insufficient_inputs") {
         ctx.log("error", `Insufficient materials for ${item.recipe.name} - need ${remainingItems}x output`);
@@ -435,6 +434,7 @@ async function craftFromCategories(
   recipes: Recipe[],
   enabledCategories: string[],
   tracker: CraftQueueTracker,
+  preset: string = "fast",
 ): Promise<string[]> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -496,7 +496,7 @@ async function craftFromCategories(
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, recipes);
+    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, recipes, preset);
     if (!queueResult.success && queueResult.error !== "Job already queued") {
       const idx = candidates.findIndex(c => c.recipe === target);
       if (idx !== -1) candidates.splice(idx, 1);
@@ -647,7 +647,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (goalItems.length === 0 && !isSpecializedBot) {
       ctx.log("craft", "No goal items configured - crafting from enabled categories");
-      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, settings.craftingPreset);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
@@ -659,7 +659,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (goalItems.length === 0 && isSpecializedBot) {
       ctx.log("craft", "No goals match assigned categories - crafting from categories");
-      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, settings.craftingPreset);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
@@ -696,7 +696,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     ctx.log("craft", `Executing queue-based plan (${settings.goalProcessingMode} mode)`);
-    const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes);
+    const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset);
     const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];

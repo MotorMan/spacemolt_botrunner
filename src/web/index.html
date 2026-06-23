@@ -12546,6 +12546,18 @@
 
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div>
+        <div class="setting-label">Crafting Preset</div>
+        <div class="setting-hint">Which crafting facility to use. <b>Fast</b> auto-routes to your facility, faction facility, or public rental. <b>Workshop</b> forces hand-crafting at station. <b>Cheap</b> uses lowest fee.</div>
+      </div>
+      <select id="set-crafter-craftingPreset" style="min-width:150px">
+        <option value="fast" ${(crafter.craftingPreset || "fast") === "fast" ? "selected" : ""}>fast - Auto-routing (default)</option>
+        <option value="cheap" ${(crafter.craftingPreset || "fast") === "cheap" ? "selected" : ""}>cheap - Lowest fee</option>
+        <option value="workshop" ${(crafter.craftingPreset || "fast") === "workshop" ? "selected" : ""}>workshop - Hand-crafting</option>
+      </select>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
         <div class="setting-label">Goal Processing Mode</div>
         <div class="setting-hint">How to process multiple goal items: <b>Batch</b> completes each goal fully before moving to the next, <b>Round-Robin</b> crafts one batch of each goal in rotation.</div>
       </div>
@@ -12873,6 +12885,11 @@
           document.getElementById("set-crafter-goalProcessingMode")?.value ||
           "batch";
 
+        // Collect crafting preset
+        const craftingPreset =
+          document.getElementById("set-crafter-craftingPreset")?.value ||
+          "fast";
+
         // Collect auto-buy settings
         const autoBuyEnabled =
           document.getElementById("set-crafter-autoBuy-enabled")?.checked ||
@@ -12947,6 +12964,7 @@
             maxCreditsPerCycle: autoBuyMaxCredits,
             excludeCategories: autoBuyExcludeCategories,
           },
+          craftingPreset,
           requestItems,
           blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
         };

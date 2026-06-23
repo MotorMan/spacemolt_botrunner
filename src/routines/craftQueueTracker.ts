@@ -108,7 +108,10 @@ export class CraftQueueTracker {
     return remainingRuns >= quantity;
   }
 
-  syncWithServer(serverJobs: ServerJobInfo[]): void {
+syncWithServer(serverJobs: ServerJobInfo[]): void {
+    if (serverJobs.length === 1 && serverJobs[0].jobId === "error") {
+      return;
+    }
     const currentIds = new Set(serverJobs.map(j => j.jobId));
     for (const [jobId, job] of Array.from(this.jobs.entries())) {
       if (!currentIds.has(jobId)) {

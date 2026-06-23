@@ -10,6 +10,7 @@ import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
+import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
@@ -1259,7 +1260,6 @@ async refreshSkills(): Promise<ApiResponse> {
      const resp = await this.api.execute("get_skills");
      if (!resp.error && resp.result) {
        const r = resp.result as Record<string, unknown>;
-       // Handle various response formats: skills.skills, skills.data, or top-level
        let skillsData: Record<string, unknown> | null = null;
        if (r.skills && typeof r.skills === "object") {
          skillsData = r.skills as Record<string, unknown>;
@@ -1289,6 +1289,7 @@ async refreshSkills(): Promise<ApiResponse> {
          }
        }
      }
+     logSkills(this);
      return resp;
    }
 

@@ -3759,17 +3759,29 @@ if (configuredSystem) {
               pois = newPois;
               bot.system = chosen.systemId;
             const chosenPoi = pois.find(p => p.id === chosen.poiId);
-            if (chosenPoi && ((miningType === "ore" && (isOreBeltPoi(chosenPoi.type) || chosenPoi.hidden === true)) ||
-              (miningType === "radioactive" && canMineBasicRadioactive && (
-                isOreBeltPoi(chosenPoi.type) ||
-                (chosenPoi.name && (chosenPoi.name.toLowerCase().includes('belt') || 
-                                    chosenPoi.name.toLowerCase().includes('mineral field') ||
-                                    chosenPoi.name.toLowerCase().includes('asteroid'))) ||
-                (!chosenPoi.hidden && canMineDeepCoreRadioactive) ||
-                (chosenPoi.hidden && canMineHiddenRadioactive)
-              )) ||
-              (miningType === "gas" && isGasCloudPoi(chosenPoi.type)) ||
-              (miningType === "ice" && isIceFieldPoi(chosenPoi.type)))) {
+            if (!chosenPoi) {
+              ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) not found in current system — clearing target and returning home`);
+              effectiveTarget = "";
+              targetResource = "";
+              await ensureUndocked(ctx);
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              await ensureDocked(ctx);
+              await dumpCargo(ctx, settings);
+              continue;
+            }
+            let isValid = false;
+            if (miningType === "ore") {
+              isValid = !chosenPoi.hidden || canMineHiddenPois;
+            } else if (miningType === "radioactive") {
+              isValid = canMineBasicRadioactive && (!chosenPoi.hidden || canMineHiddenRadioactive);
+            } else if (miningType === "gas") {
+              isValid = true;
+            } else if (miningType === "ice") {
+              isValid = true;
+            }
+            
+            if (isValid) {
               miningPoi = { id: chosenPoi.id, name: chosenPoi.name };
               ctx.log("mining", `Will travel to ${chosenPoi.name} @ ${chosen.systemName}`);
             } else {

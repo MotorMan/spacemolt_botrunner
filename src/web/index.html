@@ -20158,6 +20158,7 @@ When responding:
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
               <span class="fc-name">${esc(name)}${levelStr}</span>
+              <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="margin-left:8px;font-size:10px">${activeStr}</span>
               ${category ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(category)}</span>` : ""}
             </div>

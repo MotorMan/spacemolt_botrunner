@@ -1241,11 +1241,17 @@ function findMiningPoi(
 ): { id: string; name: string } | null {
   const checkOreAvailable = (storedPoi: any, target: string) => {
     if (!target) return true;
-    const oreEntry = storedPoi?.ores_found.find((o: any) => o.item_id === target);
+    const oreEntry = storedPoi?.ores_found?.find((o: any) => o.item_id === target);
     const resourceEntry = storedPoi?.resources?.find((r: any) => r.resource_id === target);
     
-    // Check resources first (from get_poi scans - includes undiscovered ores)
-    if (resourceEntry) {
+    // CRITICAL FIX: If resources data exists (from get_poi scans), check resources first.
+    // Only fall back to ores_found if there's no resources data for this POI.
+    // This prevents death loops when the ore is no longer at a POI but mining history exists.
+    const hasResourcesData = storedPoi?.resources !== undefined && storedPoi?.resources.length > 0;
+    if (hasResourcesData) {
+      // We have scan data - ore must be in resources to be available
+      if (!resourceEntry) return false;
+      // Check resources depletion
       if (!resourceEntry.depleted) return true;
       if (!depletionTimeoutMs) return true;
       return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
@@ -3617,9 +3623,20 @@ if (configuredSystem) {
         const sysData = mapStore.getSystem(bot.system);
         const storedPoi = sysData?.pois.find(sp => sp.id === p.id);
         if (!storedPoi) return false;
+// CRITICAL FIX: Check both resources (scan data) and ores_found (mining history)
+        // Prefer resources data since it's the current state
+        const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
         const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
-        if (!oreEntry) return false;
-        if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
+        // If we have resources data (even if empty array), require the ore to be in resources
+        // An empty resources array [] means the ore was scanned and is NOT present
+        const hasResourcesData = storedPoi.resources !== undefined;
+        if (hasResourcesData) {
+          if (!resourceEntry) return false;
+        } else {
+          // No resources data - fall back to mining history
+          if (!oreEntry) return false;
+        }
+        if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
         return true;
       });
       if (altPoi) {

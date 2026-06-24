@@ -19102,6 +19102,8 @@ When responding:
       let personalFacilityPage = 0;
       let personalFacilityPageSize = 20;
       let personalFacilityLoadComplete = false;
+      let personalFacilityDismantling = {};
+      let personalFacilityDismantleTimers = {};
 
       function fetchFactionBuildableTypes(username) {
         const container = document.getElementById("factionBuildableTypes");
@@ -20153,18 +20155,24 @@ When responding:
 
                 const upgradeInfo = personalFacilityUpgrades[facId];
                 const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
+                const dismantling = personalFacilityDismantling[facId];
+                const dismantleTimerHtml = dismantling
+                  ? `<span style="margin-left:8px;font-size:10px;color:var(--yellow)">Dismantling: <span id="dismantle-timer-${esc(facId)}">--</span></span>`
+                  : "";
 
-                return `<div class="faction-card">
+                return `<div class="faction-card" id="fac-card-${esc(facId)}">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
               <span class="fc-name">${esc(name)}${levelStr}</span>
               <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="margin-left:8px;font-size:10px">${activeStr}</span>
               ${category ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(category)}</span>` : ""}
+              ${dismantleTimerHtml}
             </div>
             <div style="display:flex;gap:4px">
               ${isTransferable ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_faction')">Transfer to Faction</button>` : ""}
               ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showPersonalFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
+              ${dismantling ? `<button class="danger sm" style="font-size:10px;padding:2px 6px" onclick="cancelDismantle('${esc(username)}','${esc(facId)}')">Cancel Dismantle</button>` : `<button class="sm danger" style="font-size:10px;padding:2px 6px" onclick="dismantlePersonalFacility('${esc(username)}','${esc(facId)}')">Dismantle</button>`}
               <button class="sm" style="font-size:10px;padding:2px 6px" onclick="togglePersonalFacility('${esc(username)}','${esc(facId)}','${active}')">${active ? "Disable" : "Enable"}</button>
             </div>
           </div>
@@ -20196,6 +20204,100 @@ When responding:
             }
           },
         );
+      }
+
+      function dismantlePersonalFacility(username, facilityId) {
+        const container = document.getElementById("personalFacilitiesList");
+        if (!container) return;
+
+        personalFacilityDismantling[facilityId] = {
+          startTime: Date.now(),
+          totalTicks: 60,
+          username,
+        };
+
+        fetchPersonalFacilities(username);
+
+        sendExec(
+          username,
+          "facility",
+          { action: "dismantle", facility_id: facilityId },
+          (result) => {
+            if (result.ok) {
+              const data = result.data || {};
+              const facilityName = data.facility_name || "facility";
+              const crateCount = data.crate_count || 0;
+              const ticks = data.ticks_to_complete || 60;
+
+              personalFacilityDismantling[facilityId] = {
+                startTime: Date.now(),
+                totalTicks: ticks,
+                facilityName,
+                crateCount,
+                username,
+              };
+
+              appendLine(
+                "system",
+                `${username}: Dismantling ${facilityName} (${crateCount} crates, ${ticks} ticks)`,
+              );
+              startDismantleTimer(facilityId);
+            } else {
+              delete personalFacilityDismantling[facilityId];
+              fetchPersonalFacilities(username);
+              appendLine(
+                "system",
+                `Dismantle failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      function cancelDismantle(username, facilityId) {
+        delete personalFacilityDismantling[facilityId];
+        if (personalFacilityDismantleTimers[facilityId]) {
+          clearInterval(personalFacilityDismantleTimers[facilityId]);
+          delete personalFacilityDismantleTimers[facilityId];
+        }
+        appendLine("system", `Cancelled dismantle for facility ${facilityId}`);
+        fetchPersonalFacilities(username);
+      }
+
+      function startDismantleTimer(facilityId) {
+        if (personalFacilityDismantleTimers[facilityId]) {
+          clearInterval(personalFacilityDismantleTimers[facilityId]);
+        }
+
+        const updateTimer = () => {
+          const dismantling = personalFacilityDismantling[facilityId];
+          if (!dismantling) {
+            clearInterval(personalFacilityDismantleTimers[facilityId]);
+            delete personalFacilityDismantleTimers[facilityId];
+            return;
+          }
+
+          const elapsed = Math.floor((Date.now() - dismantling.startTime) / 1000);
+          const ticksElapsed = Math.floor(elapsed / 10);
+          const remainingTicks = Math.max(0, dismantling.totalTicks - ticksElapsed);
+
+          const timerEl = document.getElementById(`dismantle-timer-${esc(facilityId)}`);
+          if (timerEl) {
+            const mins = Math.floor(remainingTicks / 6);
+            const secs = (remainingTicks % 6) * 10;
+            timerEl.textContent = `${mins}:${secs.toString().padStart(2, "0")}`;
+          }
+
+          if (remainingTicks <= 0) {
+            clearInterval(personalFacilityDismantleTimers[facilityId]);
+            delete personalFacilityDismantleTimers[facilityId];
+            delete personalFacilityDismantling[facilityId];
+            appendLine("system", `Dismantle complete for ${dismantling.facilityName || facilityId}`);
+          }
+        };
+
+        updateTimer();
+        personalFacilityDismantleTimers[facilityId] = setInterval(updateTimer, 1000);
       }
 
       function upgradePersonalFacility(username, facilityId) {

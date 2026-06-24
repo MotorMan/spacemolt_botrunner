@@ -603,6 +603,17 @@ function findTradeOpportunities(
       continue;
     }
 
+    // CRITICAL: Verify destination has actual buy demand (not just cached data)
+    // This prevents buying items when no one wants to buy them
+    const destSys = mapStore.getSystem(sp.destSystem);
+    const destPoi = destSys?.pois.find(p => p.id === sp.destPoi);
+    const destMarket = destPoi?.market.find(m => m.item_id === sp.itemId);
+    if (!destMarket || !destMarket.best_buy || destMarket.buy_quantity <= 0) {
+      skippedItems++;
+      debugLog?.(`  Skipping ${sp.itemName}: no destination buyer (buyQty=${destMarket?.buy_quantity || 0})`);
+      continue;
+    }
+
     routes.push({
       itemId: sp.itemId,
       itemName: sp.itemName,
@@ -2322,6 +2333,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!currentMarket || !currentMarket.best_sell || currentMarket.best_sell > candidate.buyPrice * 1.1 || currentMarket.sell_quantity < qty) {
         ctx.log("trade", `Market data stale or price changed — skipping buy of ${candidate.itemName}`);
         releaseTradeLock(bot.username, candidate.itemId, "aborted:stale_data");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
+        continue;
+      }
+
+      // CRITICAL: Verify destination buyer still exists before buying
+      const destSys = mapStore.getSystem(candidate.destSystem);
+      const destPoi = destSys?.pois.find(p => p.id === candidate.destPoi);
+      const destMarket = destPoi?.market.find(m => m.item_id === candidate.itemId);
+      if (!destMarket || !destMarket.best_buy || destMarket.buy_quantity <= 0) {
+        ctx.log("trade", `Destination buyer vanished for ${candidate.itemName} at ${candidate.destPoiName} — skipping buy`);
+        mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+        releaseTradeLock(bot.username, candidate.itemId, "aborted:no_destination_buyer");
         pendingLockItemId = null;
         pendingLockReleased = true;
         continue;

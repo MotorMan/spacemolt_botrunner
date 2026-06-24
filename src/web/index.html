@@ -22125,6 +22125,7 @@ async function fetchPersonalFacilityTypes(username) {
         const jettisonOres = m.jettisonOres || [];
         const deepCoreJettisonOres = m.deepCoreJettisonOres || [];
         const radioactiveJettisonOres = m.radioactiveJettisonOres || [];
+        const jettisonGas = m.jettisonGas || [];
         const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
         const ignoreDepletion = m.ignoreDepletion ?? false;
         const maxJumps = m.maxJumps ?? 10;
@@ -22614,6 +22615,22 @@ async function fetchPersonalFacilityTypes(username) {
       </div>
     </div>
 
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⛽ Gas Jettison List</div>
+      <div class="setting-hint" style="margin-bottom:12px">Gas items listed here will be jettisoned when gas harvesting. Useful for clearing low-value gases when faction storage is full (e.g., jettison hydrogen when you only want argon).</div>
+      <table id="gas-jettison-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Gas to Jettison</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${buildJettisonRows(jettisonGas, gasOres)}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="gas-jettison-add-ore" style="flex:1">${buildJettisonOreOpts(gasOres)}</select>
+        <button class="secondary" onclick="addGasJettisonOre()">Add</button>
+      </div>
+    </div>
+
 	<div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
@@ -22952,6 +22969,28 @@ async function fetchPersonalFacilityTypes(username) {
         oreSelect.value = "";
       }
 
+      function addGasJettisonOre() {
+        const oreSelect = document.getElementById("gas-jettison-add-ore");
+        if (!oreSelect) return;
+        const oreId = oreSelect.value;
+        if (!oreId) return;
+
+        const existing = document.querySelector(
+          `#gas-jettison-table tr[data-ore-id="${oreId}"]`,
+        );
+        if (existing) return;
+
+        const oreName = gasOres.find((o) => o.item_id === oreId)?.name || oreId;
+        const tbody = document.querySelector("#gas-jettison-table tbody");
+        const tr = document.createElement("tr");
+        tr.dataset.oreId = oreId;
+        tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+        tbody.appendChild(tr);
+        oreSelect.value = "";
+      }
+
       function saveMinerSettings() {
         const collectJettisonOres = () => {
           const ores = [];
@@ -22979,6 +23018,17 @@ async function fetchPersonalFacilityTypes(username) {
           const ores = [];
           for (const row of document.querySelectorAll(
             "#radioactive-jettison-ore-table tbody tr",
+          )) {
+            const oreId = row.dataset.oreId;
+            if (oreId) ores.push(oreId);
+          }
+          return ores;
+        };
+
+        const collectGasJettisonOres = () => {
+          const ores = [];
+          for (const row of document.querySelectorAll(
+            "#gas-jettison-table tbody tr",
           )) {
             const oreId = row.dataset.oreId;
             if (oreId) ores.push(oreId);
@@ -23062,6 +23112,7 @@ async function fetchPersonalFacilityTypes(username) {
           jettisonOres: collectJettisonOres(),
           deepCoreJettisonOres: collectDeepCoreJettisonOres(),
           radioactiveJettisonOres: collectRadioactiveJettisonOres(),
+          jettisonGas: collectGasJettisonOres(),
         };
 
         // Preserve existing quotas when saving from main miner settings

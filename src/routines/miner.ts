@@ -416,6 +416,7 @@ async function getMinerSettings(username?: string): Promise<{
   jettisonOres: string[]; // Ore IDs to jettison when found in cargo during mining
   deepCoreJettisonOres: string[]; // Ore IDs to jettison when mining deep core (hidden POIs)
   radioactiveJettisonOres: string[]; // Ore IDs to jettison when mining radioactive ores
+  jettisonGas: string[]; // Gas IDs to jettison when gas harvesting
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
@@ -509,6 +510,7 @@ async function getMinerSettings(username?: string): Promise<{
     jettisonOres: (m.jettisonOres as string[]) || [],
     deepCoreJettisonOres: (m.deepCoreJettisonOres as string[]) || [],
     radioactiveJettisonOres: (m.radioactiveJettisonOres as string[]) || [],
+    jettisonGas: (m.jettisonGas as string[]) || [],
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
@@ -3478,11 +3480,14 @@ if (configuredSystem) {
 
     if (bot.state !== "running") break;
 
-    // ── Determine active jettison list (deep core vs regular) ──
+    // ── Determine active jettison list (gas, deep core, or regular) ──
     const isDeepCoreMining = effectiveTarget && isDeepCoreOre(effectiveTarget);
-    const activeJettisonList = isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
-      ? settings.deepCoreJettisonOres
-      : settings.jettisonOres;
+    const isGasMining = miningType === "gas";
+    const activeJettisonList = isGasMining && settings.jettisonGas.length > 0
+      ? settings.jettisonGas
+      : isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
+        ? settings.deepCoreJettisonOres
+        : settings.jettisonOres;
 
     // ── Find mining POI and station in current system ──
     // Survey for hidden POIs if radioactive mining with capability
@@ -5893,21 +5898,21 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
         if (activeJettisonList.includes(oreId)) {
           const jettisonResp = await bot.exec("jettison", { item_id: oreId, quantity: 9999 });
           if (!jettisonResp.error) {
-            const dcTag = isDeepCoreMining ? " [deep core]" : "";
-            ctx.log("mining", `Jettisoned ${oreName} (low-value ore configured for jettison${dcTag})`);
+            const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
+            ctx.log("mining", `Jettisoned ${oreName} (low-value item configured for jettison${dcTag})`);
             await bot.refreshCargo();
           }
         }
 
-        // JETTISON: Also clear any other jettison-listed ores that may have accumulated in cargo
-        for (const jettisonOreId of activeJettisonList) {
-          if (jettisonOreId === oreId) continue; // Already jettisoned above
-          const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
+        // JETTISON: Also clear any other jettison-listed items that may have accumulated in cargo
+        for (const jettisonItemId of activeJettisonList) {
+          if (jettisonItemId === oreId) continue; // Already jettisoned above
+          const cargoItem = bot.inventory.find(i => i.itemId === jettisonItemId);
           if (cargoItem && cargoItem.quantity > 0) {
-            const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+            const jettisonResp = await bot.exec("jettison", { item_id: jettisonItemId, quantity: cargoItem.quantity });
             if (!jettisonResp.error) {
-              const jettisonName = cargoItem.name || jettisonOreId;
-              const dcTag = isDeepCoreMining ? " [deep core]" : "";
+              const jettisonName = cargoItem.name || jettisonItemId;
+              const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
               ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${jettisonName} (configured for jettison${dcTag})`);
               await bot.refreshCargo();
             }

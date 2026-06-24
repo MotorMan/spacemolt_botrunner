@@ -1702,6 +1702,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Startup: Refuel if docked (cloaking indicates docked status) ──
+    // If cloaking was just enabled or bot is already cloaked, we're docked - refuel
+    const isDocked = bot.docked || bot.isCloaked;
+    if (isDocked) {
+      ctx.log("mining", "Bot is docked - checking fuel at startup");
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+    }
+
     while (bot.state === "running") {
       // ── Death recovery ──
       const alive = await detectAndRecoverFromDeath(ctx);

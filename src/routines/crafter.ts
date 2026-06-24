@@ -1,4 +1,4 @@
-import type { Routine, RoutineContext } from "../bot.js";
+import type { Routine, RoutineContext, CargoItem } from "../bot.js";
 import {
   ensureDocked,
   repairShip,
@@ -9,8 +9,10 @@ import {
   calculateMultiGoalPlan,
   formatCraftingPlan,
   isRecipeCraftable as isRecipeCraftableNew,
+  findRecipeForItem,
 } from "./craft-goals.js";
 import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
+import { catalogStore } from "../catalogstore.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -216,6 +218,95 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
   return all;
 }
 
+interface FactionFacility {
+  facility_id: string;
+  type: string;
+  name: string;
+  level: number;
+  faction_service: string;
+  rent_per_cycle: number;
+  status: string;
+}
+
+interface FacilityRecipeMap {
+  facilityType: string;
+  recipeId: string;
+}
+
+async function fetchFactionFacilities(bot: any): Promise<FactionFacility[]> {
+  const resp = await bot.exec("facility", { action: "faction_list" });
+  if (resp.error) {
+    bot.log("error", `facility faction_list error: ${resp.error.message}`);
+    return [];
+  }
+  const result = resp.result as Record<string, unknown> | undefined;
+  if (!result) {
+    bot.log("error", `facility faction_list: no result`);
+    return [];
+  }
+  
+  let facilities: Array<Record<string, unknown>> = [];
+  if (Array.isArray(result.faction_facilities)) {
+    facilities = result.faction_facilities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(result.facilities)) {
+    facilities = result.facilities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(result)) {
+    facilities = result as Array<Record<string, unknown>>;
+  } else {
+    const facilitiesKey = Object.keys(result).find(k => k.includes("facility"));
+    if (facilitiesKey) {
+      facilities = (result[facilitiesKey] as Array<Record<string, unknown>>) || [];
+    }
+  }
+  
+  bot.log("debug", `facility faction_list: found ${facilities.length} facilities`);
+  if (facilities.length > 0) {
+    bot.log("debug", `facility sample: ${JSON.stringify(facilities[0])}`);
+  }
+  
+  return facilities.map(f => ({
+    facility_id: (f.facility_id as string) || (f.id as string) || "",
+    type: (f.type as string) || (f.facility_type as string) || "",
+    name: (f.name as string) || "",
+    level: (f.level as number) || 0,
+    faction_service: (f.faction_service as string) || "",
+    rent_per_cycle: (f.rent_per_cycle as number) || 0,
+    status: (f.status as string) || "",
+  }));
+}
+
+function getFacilityRecipeMap(): FacilityRecipeMap[] {
+  const facilities = catalogStore.getAll().facilities;
+  const map: FacilityRecipeMap[] = [];
+  for (const [facilityId, facility] of Object.entries(facilities)) {
+    const catFac = facility as Record<string, unknown>;
+    const recipeId = (catFac.recipe_id as string) || "";
+    const facId = (catFac.id as string) || facilityId;
+    if (recipeId && facId) {
+      map.push({ facilityType: facId, recipeId });
+    }
+  }
+  return map;
+}
+
+function getRecipesAvailableAtFacilities(
+  factionFacilities: FactionFacility[],
+  facilityRecipeMap: FacilityRecipeMap[]
+): Set<string> {
+  const facilityTypes = new Set(
+    factionFacilities
+      .filter(f => f.faction_service === "")
+      .map(f => f.type)
+  );
+  const availableRecipes = new Set<string>();
+  for (const entry of facilityRecipeMap) {
+    if (facilityTypes.has(entry.facilityType)) {
+      availableRecipes.add(entry.recipeId);
+    }
+  }
+  return availableRecipes;
+}
+
 // ── Queue-focused crafting logic ──────────────────────────────
 
 async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
@@ -300,6 +391,29 @@ async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker
   tracker.save();
 }
 
+function calculateMaxCraftable(
+  recipe: Recipe | undefined,
+  factionStorage: CargoItem[],
+): number {
+  if (!recipe) return 0;
+  
+  const storageMap = new Map<string, number>();
+  for (const i of factionStorage) {
+    storageMap.set(i.itemId.toLowerCase(), i.quantity);
+  }
+  let maxRuns = Infinity;
+  
+  for (const comp of recipe.components) {
+    const available = storageMap.get(comp.item_id.toLowerCase()) || 0;
+    const neededPerRun = comp.quantity;
+    const runsPossible = Math.floor(available / neededPerRun);
+    maxRuns = Math.min(maxRuns, runsPossible);
+  }
+  
+  if (maxRuns === Infinity) return 0;
+  return maxRuns;
+}
+
 async function queueCraftJob(
   ctx: RoutineContext,
   recipeId: string,
@@ -313,34 +427,62 @@ async function queueCraftJob(
 
   const recipe = recipes?.find(r => r.recipe_id === recipeId);
   const outputQty = recipe?.output_quantity || 1;
-  const runs = Math.ceil(quantity / outputQty);
+  const originalRuns = Math.ceil(quantity / outputQty);
 
-  if (tracker.hasPendingJob(recipeId, runs)) {
+  if (tracker.hasPendingJob(recipeId, originalRuns)) {
     return { success: true, error: "Job already queued" };
   }
 
   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
   tracker.syncWithServer(serverJobs);
-  if (tracker.hasPendingJob(recipeId, runs)) {
+  if (tracker.hasPendingJob(recipeId, originalRuns)) {
     return { success: true, error: "Job already queued" };
   }
 
-  log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
-  const craftResp = await bot.exec("craft", {
-    id: recipeId,
-    quantity: runs,
-    preset: preset,
-  });
-
-  if (craftResp.error) {
-    const msg = craftResp.error.message;
-    if (msg.toLowerCase().includes("insufficient")) {
-      return { success: false, error: "insufficient_inputs" };
-    }
-    return { success: false, error: msg };
+  const maxCraftable = calculateMaxCraftable(recipe, bot.factionStorage);
+  const maxRunsPossible = maxCraftable;
+  let runs = Math.min(originalRuns, maxRunsPossible);
+  
+  if (runs <= 0) {
+    log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
+    return { success: false, error: "insufficient_inputs" };
   }
 
-  const result = craftResp.result as Record<string, unknown> | undefined;
+  while (runs > 0) {
+    log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
+    const craftResp = await bot.exec("craft", {
+      id: recipeId,
+      quantity: runs,
+      preset: preset,
+    });
+
+    if (!craftResp.error) {
+      return handleSuccess(craftResp, recipeId, runs, log, tracker, bot);
+    }
+
+    const msg = craftResp.error.message;
+    if (!msg.toLowerCase().includes("insufficient") && !msg.toLowerCase().includes("cannot_craft")) {
+      return { success: false, error: msg };
+    }
+
+    runs = Math.ceil(runs / 2);
+    if (runs === 0) break;
+    
+    log("craft", `Retrying ${recipeId} with ${runs} runs...`);
+  }
+
+  return { success: false, error: "Could not queue any runs after multiple attempts" };
+}
+
+function handleSuccess(
+  resp: any,
+  recipeId: string,
+  runs: number,
+  log: any,
+  tracker: CraftQueueTracker,
+  bot: any,
+): { success: boolean; error?: string; jobId?: string } {
+  const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown> | undefined)?.details as Record<string, unknown> | undefined;
   const jobId = (details?.job_id as string) || (result?.job_id as string) || "";
 
@@ -649,6 +791,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       return total;
     }
 
+    const factionFacilities = await fetchFactionFacilities(bot);
+    const facilityRecipeMap = getFacilityRecipeMap();
+    const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap);
+    ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
+
     ctx.log("craft", "Processing crafting goals...");
     const goalItems: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
 
@@ -728,6 +875,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       goalItems.map(g => ({ itemId: g.itemId, quantity: g.quantity, recipe: g.recipe })),
       recipes,
       countItem,
+      facilityAvailableRecipes,
     );
 
     const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];

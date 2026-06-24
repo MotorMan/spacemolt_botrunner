@@ -22980,7 +22980,24 @@ async function fetchPersonalFacilityTypes(username) {
         );
         if (existing) return;
 
-        const oreName = gasOres.find((o) => o.item_id === oreId)?.name || oreId;
+        const gasOresList = [
+          { item_id: "argon_gas", name: "Argon Gas" },
+          { item_id: "hydrogen_gas", name: "Hydrogen Gas" },
+          { item_id: "helium_gas", name: "Helium Gas" },
+          { item_id: "neon_gas", name: "Neon Gas" },
+          { item_id: "hydrogen_sulfide", name: "Hydrogen Sulfide" },
+          { item_id: "carbon_monoxide", name: "Carbon Monoxide" },
+          { item_id: "nitrogen_gas", name: "Nitrogen Gas" },
+          { item_id: "nitrogen_oxygen_mix", name: "Nitrogen-Oxygen Mix" },
+          { item_id: "krypton_gas", name: "Krypton Gas" },
+          { item_id: "xenon_gas", name: "Xenon Gas" },
+          { item_id: "ion_gas", name: "Ion Gas" },
+          { item_id: "plasma_gas", name: "Plasma Gas" },
+          { item_id: "chlorine_gas", name: "Chlorine Gas" },
+          { item_id: "fluorine_gas", name: "Fluorine Gas" },
+          { item_id: "nebula_gas", name: "Nebula Gas" },
+        ];
+        const oreName = gasOresList.find((o) => o.item_id === oreId)?.name || oreId;
         const tbody = document.querySelector("#gas-jettison-table tbody");
         const tr = document.createElement("tr");
         tr.dataset.oreId = oreId;

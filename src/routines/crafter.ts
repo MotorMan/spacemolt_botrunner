@@ -14,6 +14,10 @@ import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
+const QUEUE_REFRESH_COOLDOWN = 60000;
+let lastQueueCheck = 0;
+let cachedQueueJobs: ServerJobInfo[] = [];
+
 interface CraftLimit {
   recipeId: string;
   limit: number;
@@ -214,11 +218,18 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
 
 // ── Queue-focused crafting logic ──────────────────────────────
 
-async function checkCraftingQueue(bot: any, recipes: Recipe[]): Promise<ServerJobInfo[]> {
+async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
+  const now = Date.now();
+  if (!forceRefresh && now - lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
+    return cachedQueueJobs;
+  }
+  
   const resp = await bot.exec("craft", { action: "queue" });
   if (resp.error) {
     return [];
   }
+  lastQueueCheck = now;
+  
   const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown>)?.details as Record<string, unknown> | undefined;
   const jobs = (details?.jobs as Array<Record<string, unknown>>) || (result?.jobs as Array<Record<string, unknown>>) || [];
@@ -236,7 +247,7 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[]): Promise<ServerJo
     }
     recipeIdToId.set(r.recipe_id, r.recipe_id);
   }
-  return jobs.map((job: Record<string, unknown>) => {
+  cachedQueueJobs = jobs.map((job: Record<string, unknown>) => {
     const recipeName = ((job.recipe as string) || "").toLowerCase();
     const recipeFromId = (job.recipe as string) || "";
     const recipeId = recipeNameToId.get(recipeName) 
@@ -252,6 +263,7 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[]): Promise<ServerJo
       runsRemaining: (job.runs_remaining as number) || 0,
     };
   }).filter(j => j.jobId && j.recipeId);
+  return cachedQueueJobs;
 }
 
 async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Promise<number> {
@@ -283,7 +295,7 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
 
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[]): Promise<void> {
   const { bot } = ctx;
-  const serverJobs = await checkCraftingQueue(bot, recipes);
+  const serverJobs = await checkCraftingQueue(bot, recipes, true);
   tracker.syncWithServer(serverJobs);
   tracker.save();
 }
@@ -307,7 +319,7 @@ async function queueCraftJob(
     return { success: true, error: "Job already queued" };
   }
 
-  const serverJobs = await checkCraftingQueue(bot, recipes || []);
+  const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
   tracker.syncWithServer(serverJobs);
   if (tracker.hasPendingJob(recipeId, runs)) {
     return { success: true, error: "Job already queued" };
@@ -360,8 +372,9 @@ async function waitForCompletion(
   const timeoutMs = (estimatedTicks ? estimatedTicks * 2 + 10 : 30) * 10000;
   const startTime = Date.now();
   let lastStatusReport = Date.now();
+  let lastQueueRefresh = 0;
 
-  const serverJobIds = await checkCraftingQueue(bot, recipes);
+  const serverJobIds = await checkCraftingQueue(bot, recipes, true);
   tracker.syncWithServer(serverJobIds);
   tracker.save();
 
@@ -374,9 +387,13 @@ async function waitForCompletion(
   while (bot.state === "running") {
     await ctx.sleep(5000);
 
-    const currentJobIds = await checkCraftingQueue(bot, recipes);
-    tracker.syncWithServer(currentJobIds);
-    tracker.save();
+    const now = Date.now();
+    if (now - lastQueueRefresh >= QUEUE_REFRESH_COOLDOWN) {
+      const currentJobIds = await checkCraftingQueue(bot, recipes, true);
+      tracker.syncWithServer(currentJobIds);
+      tracker.save();
+      lastQueueRefresh = now;
+    }
 
     const progress = tracker.getProgress(recipeId);
     const currentCompletedItems = progress.completed * outputQty;

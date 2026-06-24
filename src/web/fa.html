@@ -44,6 +44,13 @@
     .fa-row .cat.salvage { color: #ff7b72; }
     .fa-row .cat.storage { color: #79c0ff; }
     .fa-row .cat.skill { color: #a78bfa; }
+    .fa-row .cat.mining { color: #f97316; }
+    .fa-row .cat.navigation { color: #58a6ff; }
+    .fa-row .cat.exploration { color: #39d2c0; }
+    .fa-row .cat.reputation { color: #bc8cff; }
+    .fa-row .cat.drone { color: #ff7b72; }
+    .fa-row .cat.session { color: #8b949e; }
+    .fa-row .cat.achievement { color: #a78bfa; }
     .fa-row .cat.other { color: #8b949e; }
     .fa-row .amt { min-width: 90px; text-align: right; font-weight: 600; }
     .fa-row .amt.in { color: #4ade80; }
@@ -75,8 +82,18 @@
       <button class="fa-cat-btn" data-cat="salvage" style="background:#1a1a2e;color:#555;border-color:#333;">salvage</button>
       <button class="fa-cat-btn" data-cat="storage" style="background:#1a1a2e;color:#555;border-color:#333;">storage</button>
       <button class="fa-cat-btn" data-cat="skill" style="background:#1a1a2e;color:#555;border-color:#333;">skill</button>
+      <button class="fa-cat-btn" data-cat="mining" style="background:#1a1a2e;color:#555;border-color:#333;">mining</button>
+      <button class="fa-cat-btn" data-cat="navigation" style="background:#1a1a2e;color:#555;border-color:#333;">navigation</button>
+      <button class="fa-cat-btn" data-cat="exploration" style="background:#1a1a2e;color:#555;border-color:#333;">exploration</button>
+      <button class="fa-cat-btn" data-cat="reputation" style="background:#1a1a2e;color:#555;border-color:#333;">reputation</button>
+      <button class="fa-cat-btn" data-cat="drone" style="background:#1a1a2e;color:#555;border-color:#333;">drone</button>
+      <button class="fa-cat-btn" data-cat="session" style="background:#1a1a2e;color:#555;border-color:#333;">session</button>
+      <button class="fa-cat-btn" data-cat="achievement" style="background:#1a1a2e;color:#555;border-color:#333;">achievement</button>
       <button class="fa-cat-btn" data-cat="other" style="background:#1a1a2e;color:#555;border-color:#333;">other</button>
     </div>
+    <select id="faEventTypeSelect" style="display:none;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;min-width:140px;" title="Filter by event type">
+      <option value="">event type</option>
+    </select>
     <input type="number" id="faPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Page number">
     <button id="faLoadBtn" onclick="loadActionLog()">Load Log</button>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
@@ -128,7 +145,20 @@
   let creditsOut = 0;
   let pendingLoad = false;
   let activeCat = '';
+  let activeEventType = '';
   let seenIds = new Set();
+
+  const EVENT_TYPES = {
+    mining: ['yield'],
+    navigation: ['jumped'],
+    exploration: ['discovered'],
+    reputation: ['changed'],
+    drone: ['deploy', 'recall', 'loss'],
+    session: ['login'],
+    trading: ['buy', 'sell'],
+    combat: ['damage', 'kill', 'outcome'],
+    mission: ['abandon', 'expire', 'complete']
+  };
 
   // ── Helpers ─────────────────────────────────────────────
   function esc(s) {
@@ -253,7 +283,10 @@
     if (ws && ws.readyState !== WebSocket.OPEN) { alert('Not connected to server'); return; }
 
     const page = Math.max(1, parseInt(document.getElementById('faPageInput').value) || 1);
-    const params = activeCat ? { category: activeCat, page } : { page };
+    const params = {};
+    if (activeCat) params.category = activeCat;
+    if (activeEventType) params.event_type = activeEventType;
+    params.page = page;
     const label = activeCat || 'all';
     setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
 
@@ -301,7 +334,11 @@
   }
 
   function applyFilter() {
-    filteredEntries = activeCat ? rawEntries.filter(e => e.category === activeCat) : rawEntries;
+    filteredEntries = rawEntries.filter(e => {
+      if (activeCat && e.category !== activeCat) return false;
+      if (activeEventType && e.eventType !== activeEventType) return false;
+      return true;
+    });
     creditsIn = 0;
     creditsOut = 0;
     for (const e of filteredEntries) {
@@ -313,6 +350,18 @@
     document.getElementById('faNet').textContent = fmt(creditsIn - creditsOut);
     document.getElementById('faEntryCount').textContent = rawEntries.length;
     document.getElementById('faFilteredCount').textContent = filteredEntries.length;
+  }
+
+  function updateEventTypeOptions() {
+    const select = document.getElementById('faEventTypeSelect');
+    const events = EVENT_TYPES[activeCat] || [];
+    select.innerHTML = '<option value="">event type</option>' + events.map(e => `<option value="${e}">${e}</option>`).join('');
+    select.style.display = activeCat ? 'inline-block' : 'none';
+    if (!events.length || select.value === '') {
+      select.value = '';
+      applyFilter();
+      renderResults();
+    }
   }
 
   // ── Render ──────────────────────────────────────────────
@@ -339,6 +388,7 @@
     seenIds = new Set();
     creditsIn = 0;
     creditsOut = 0;
+    activeEventType = '';
     document.getElementById('faCreditsIn').textContent = '0';
     document.getElementById('faCreditsOut').textContent = '0';
     document.getElementById('faNet').textContent = '0';
@@ -375,12 +425,20 @@
     if (!btn) return;
     const cat = btn.dataset.cat;
     activeCat = cat;
+    activeEventType = '';
     document.querySelectorAll('#faCatGroup .fa-cat-btn').forEach(b => styleCatBtn(b, false));
     if (activeCat === '') {
       styleCatBtn(document.querySelector('#faCatGroup .fa-cat-btn[data-cat=""]'), true);
     } else {
       styleCatBtn(btn, true);
     }
+    updateEventTypeOptions();
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faEventTypeSelect').addEventListener('change', () => {
+    activeEventType = document.getElementById('faEventTypeSelect').value;
     applyFilter();
     renderResults();
   });

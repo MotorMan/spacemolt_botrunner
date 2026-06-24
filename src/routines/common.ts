@@ -3004,6 +3004,48 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
   return false;
 }
 
+// ── Transit Detection ───────────────────────────────────────────
+
+/**
+ * Wait for the bot to finish any ongoing transit (jump/travel).
+ * Returns true if bot was in transit and completed it, false if not in transit.
+ * Waits up to maxWaitSeconds (default 120s) before giving up.
+ */
+export async function waitForTransitCompletion(
+  ctx: RoutineContext,
+  maxWaitSeconds: number = 120,
+): Promise<boolean> {
+  const { bot } = ctx;
+  
+  await bot.refreshPOI();
+  
+  if (!bot.inTransit) {
+    return false;
+  }
+  
+  const transitType = bot.transitType || "unknown";
+  const ticksRemaining = bot.ticksRemaining;
+  ctx.log("travel", `Bot is in transit (${transitType}) with ${ticksRemaining} ticks remaining - waiting...`);
+  
+  const startTime = Date.now();
+  const maxWaitMs = maxWaitSeconds * 1000;
+  
+  while (bot.state === "running" && Date.now() - startTime < maxWaitMs) {
+    await bot.refreshPOI();
+    
+    if (!bot.inTransit) {
+      ctx.log("travel", `Transit complete - ${transitType} finished`);
+      return true;
+    }
+    
+    ctx.log("travel", `Still in transit (${bot.transitType}) - ${bot.ticksRemaining} ticks remaining`);
+    await ctx.sleep(10000);
+  }
+  
+  ctx.log("warn", `Transit wait timeout after ${maxWaitSeconds}s - bot still in transit`);
+  return false;
+}
+
 // ── Insurance ────────────────────────────────────────────────
 
 /** Minimum credits to keep when buying insurance. */

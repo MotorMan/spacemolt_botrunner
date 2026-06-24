@@ -168,6 +168,15 @@ docked = false;
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
+  /** Whether the bot is currently in transit (jumping/traveling). */
+  inTransit = false;
+
+  /** Type of current transit: "jump" or "travel" (if in_transit is true). */
+  transitType: "jump" | "travel" | null = null;
+
+  /** Ticks remaining until transit completes (if in_transit is true). */
+  ticksRemaining: number | null = null;
+
   /** The ID of the wreck being towed (if any). */
   towingWreckId: string | null = null;
 
@@ -1240,6 +1249,10 @@ docked = false;
       this.system = (poi.system_id as string) || (poi.system as string) || this.system;
       this.poi = (poi.id as string) || (poi.poi_id as string) || this.poi;
       this.docked = poi.docked != null ? !!(poi.docked as boolean) : this.docked;
+      this.inTransit = (r.in_transit as boolean) ?? false;
+      this.transitType = (r.transit_type as string) === "jump" ? "jump" : 
+                         (r.transit_type as string) === "travel" ? "travel" : null;
+      this.ticksRemaining = (r.ticks_remaining as number) ?? null;
     }
     return resp;
   }

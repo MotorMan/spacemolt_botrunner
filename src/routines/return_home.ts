@@ -2,9 +2,7 @@ import type { Routine, RoutineContext } from "../bot.js";
 import {
   getSystemInfo,
   ensureDocked,
-  ensureUndocked,
   navigateToSystem,
-  refuelAtStation,
   findStation,
   isStationPoi,
   isApprovedFuelStation,
@@ -12,9 +10,7 @@ import {
   readSettings,
   checkAndFleeFromBattle,
   repairShip,
-  type BattleState,
-  getBattleStatus,
-  fleeFromBattle,
+  waitForTransitCompletion,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -78,6 +74,20 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         break;
       }
     }
+  }
+
+  // Check for ongoing transit (jump/travel) before starting
+  yield "check_transit";
+  await bot.refreshPOI();
+  if (bot.inTransit) {
+    ctx.log("travel", `Bot is already in transit (${bot.transitType}) - waiting for completion before return home`);
+    const transitCompleted = await waitForTransitCompletion(ctx, 180);
+    if (!transitCompleted) {
+      ctx.log("error", "Transit did not complete within timeout - cannot start return home");
+      return; // Cancel routine
+    }
+    // Refresh location after transit completes
+    await bot.refreshLocation();
   }
 
   // Read settings

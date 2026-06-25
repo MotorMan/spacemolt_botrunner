@@ -1353,6 +1353,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("trade", `Fleet coordination: cleaned up ${cleanedLocks} stale lock(s)`);
     }
 
+    // ── Cloak status check (every cycle when autoCloak enabled) ──
+    // Re-verify cloaking status and re-enable if needed (but only if we have fuel)
+    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
+      ctx.log("trade", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+      await enableCloakingIfPossible(ctx);
+    }
+
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;

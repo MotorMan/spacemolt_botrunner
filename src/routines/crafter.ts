@@ -384,9 +384,9 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
   }
 }
 
-async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[]): Promise<void> {
+async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[], forceRefresh = false): Promise<void> {
   const { bot } = ctx;
-  const serverJobs = await checkCraftingQueue(bot, recipes, true);
+  const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
   tracker.syncWithServer(serverJobs);
   tracker.save();
 }
@@ -568,7 +568,7 @@ async function queueAllRecipes(
   const { bot } = ctx;
   const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
 
-  await syncCraftingQueue(ctx, tracker, recipes);
+  await syncCraftingQueue(ctx, tracker, recipes, true);
 
   for (const item of planItems) {
     if (bot.state !== "running") break;

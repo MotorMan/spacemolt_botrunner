@@ -50,12 +50,12 @@
     <div class="calc-highlight">
       <div class="calc-highlight-title">Calculations</div>
       <div class="shipcomp-stats">
-        <span style="margin-right:16px">Cargo/sec = Cargo ÷ Jump Time (based on speed: 6=20s, 5=30s, 4=40s, 3=50s, 2=60s, 1=70s)</span>
-        <span style="margin-right:16px">Fuel/jump = (Tier × Speed) × Module Count</span>
-        <span>Module Count = weapon_slots + defense_slots + utility_slots</span>
+        <span style="margin-right:16px">Cargo/sec = Cargo ÷ Jump Time (speed: 6=20s, 5=30s, 4=40s, 3=50s, 2=60s, 1=70s)</span>
+        <span style="margin-right:16px">Fuel/jump = (Tier × Speed × Modules) ÷ 10 × (1 - Fuel Efficiency %)</span>
+        <span>Module Count = weapon_slots + defense_slots + utility_slots (min 1)</span>
       </div>
       <div class="calc-note">
-        Fuel cost assumes all module slots are filled. Use the module count filter to adjust.
+        Fuel Efficiency bonus from inherent_capabilities reduces fuel cost. Module count minimum is 1.
       </div>
     </div>
 
@@ -185,8 +185,11 @@
       const tier = ship.tier !== undefined ? ship.tier : -1;
       const jumpTime = SPEED_TO_JUMP_TIME[speed] || 70;
       const cargoPerSec = jumpTime > 0 ? cargo / jumpTime : 0;
-      const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
-      const fuelPerJump = tier >= 0 ? tier * speed * moduleCount : 0;
+      const moduleCount = Math.max(1, (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0));
+      const fuelEfficiencyBonus = (ship.inherent_capabilities || [])
+        .filter(c => c.type === 'fuel_efficiency_bonus')
+        .reduce((sum, c) => sum + (c.value || 0), 0);
+      const fuelPerJump = tier >= 0 ? Math.round(tier * speed * moduleCount / 10 * (1 - fuelEfficiencyBonus / 100)) : 0;
 
       switch (key) {
         case 'name': return ship.name || ship.id || '';
@@ -239,8 +242,11 @@
         const tier = ship.tier !== undefined ? ship.tier : -1;
         const jumpTime = SPEED_TO_JUMP_TIME[speed] || 70;
         const cargoPerSec = jumpTime > 0 ? (cargo / jumpTime).toFixed(2) : '-';
-        const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
-        const fuelPerJump = tier >= 0 ? (tier * speed * moduleCount) : 0;
+        const moduleCount = Math.max(1, (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0));
+        const fuelEfficiencyBonus = (ship.inherent_capabilities || [])
+          .filter(c => c.type === 'fuel_efficiency_bonus')
+          .reduce((sum, c) => sum + (c.value || 0), 0);
+        const fuelPerJump = tier >= 0 ? Math.round(tier * speed * moduleCount / 10 * (1 - fuelEfficiencyBonus / 100)) : 0;
         const empireName = getEmpireName(ship.faction);
         const tierText = tier < 0 ? 'Legacy' : (tier === 0 ? 'T0' : `T${tier}`);
         
@@ -331,8 +337,11 @@
         const tier = ship.tier !== undefined ? ship.tier : -1;
         const jumpTime = getJumpTime(speed);
         const cargoPerSec = jumpTime > 0 ? (cargo / jumpTime).toFixed(2) : '-';
-        const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
-        const fuelPerJump = tier >= 0 ? (tier * speed * moduleCount) : 0;
+        const moduleCount = Math.max(1, (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0));
+        const fuelEfficiencyBonus = (ship.inherent_capabilities || [])
+          .filter(c => c.type === 'fuel_efficiency_bonus')
+          .reduce((sum, c) => sum + (c.value || 0), 0);
+        const fuelPerJump = tier >= 0 ? Math.round(tier * speed * moduleCount / 10 * (1 - fuelEfficiencyBonus / 100)) : 0;
 
         const empireClass = getEmpireClass(ship.faction);
         const empireName = getEmpireName(ship.faction);

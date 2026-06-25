@@ -2951,14 +2951,18 @@ if (configuredSystem) {
             .sort((a, b) => {
               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
               if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+              const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+              if (isCommon) {
+                if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                const aRem = a.remaining ?? 0;
+                const bRem = b.remaining ?? 0;
+                if (aRem !== bRem) return bRem - aRem;
+                return (b.richness ?? 0) - (a.richness ?? 0);
+              }
               const aRem = a.remaining ?? 0;
               const bRem = b.remaining ?? 0;
               if (aRem !== bRem) return bRem - aRem;
               if (a.jumps !== b.jumps) return a.jumps - b.jumps;
-              const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
-              if (isCommon) {
-                return (b.richness ?? 0) - (a.richness ?? 0);
-              }
               return 0;
             });
           const droppedByJump = allOreLocations
@@ -3085,15 +3089,19 @@ if (configuredSystem) {
               .sort((a, b) => {
                 if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
                 if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                const isCommonA = STRIP_MINER_ORES.has(a.resourceId.toLowerCase());
+                const isCommonB = STRIP_MINER_ORES.has(b.resourceId.toLowerCase());
+                if (isCommonA || isCommonB) {
+                  if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                  const aRem = a.remaining ?? 0;
+                  const bRem = b.remaining ?? 0;
+                  if (aRem !== bRem) return bRem - aRem;
+                  return (b.richness ?? 0) - (a.richness ?? 0);
+                }
                 const aRem = a.remaining ?? 0;
                 const bRem = b.remaining ?? 0;
                 if (aRem !== bRem) return bRem - aRem;
                 if (a.jumps !== b.jumps) return a.jumps - b.jumps;
-                const isCommonA = STRIP_MINER_ORES.has(a.resourceId.toLowerCase());
-                const isCommonB = STRIP_MINER_ORES.has(b.resourceId.toLowerCase());
-                if (isCommonA || isCommonB) {
-                  return (b.richness ?? 0) - (a.richness ?? 0);
-                }
                 return 0;
               });
             

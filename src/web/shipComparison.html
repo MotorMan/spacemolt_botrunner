@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ship Comparison - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .shipcomp-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .shipcomp-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .shipcomp-header h3 { margin:0; color:var(--text-bright); }
+    .shipcomp-stats { color:var(--text-dim); font-size:12px; }
+    .shipcomp-filters { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+    .shipcomp-filters label { font-size:12px; color:var(--text-dim); margin-right:4px; }
+    .shipcomp-filters select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipcomp-content { flex:1; min-height:0; overflow:auto; }
+    .shipcomp-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .shipcomp-table th { text-align:left; padding:8px 12px; background:var(--bg-row-hover); border-bottom:1px solid var(--border); color:var(--text-bright); font-weight:600; position:sticky; top:0; z-index:10; }
+    .shipcomp-table td { padding:6px 12px; border-bottom:1px solid var(--border); }
+    .shipcomp-table tr:hover { background:var(--bg-row-hover); }
+    .tier-badge { display:inline-block; padding:2px 6px; background:var(--bg-input); border:1px solid var(--border); border-radius:3px; font-size:11px; }
+    .tier-0 { color: #00ffff; }
+    .tier-1 { color: #808000; }
+    .tier-2 { color: #0000ff; }
+    .tier-3 { color: #800080; }
+    .tier-4 { color: #ff0000; }
+    .tier-5 { color: #ffff00; }
+    .tier-legacy { color: #666; }
+    .empire-crimson { color: #ff6b6b; }
+    .empire-nebula { color: #74c0fc; }
+    .empire-outerrim { color: #868e96; }
+    .empire-solarian { color: #fab032; }
+    .empire-voidborn { color: #cc55fd; }
+    .faction-badge { display:inline-block; padding:2px 8px; border-radius:3px; font-size:11px; font-weight:600; }
+    .calc-highlight { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; margin-bottom:12px; }
+    .calc-highlight-title { color:var(--text-bright); font-weight:600; margin-bottom:8px; }
+    .calc-note { color:var(--text-dim); font-size:11px; margin-top:4px; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="shipcomp-layout">
+    <div class="shipcomp-header">
+      <h3>Ship Comparison</h3>
+      <span class="shipcomp-stats" id="shipcompStats"></span>
+    </div>
+
+    <div class="calc-highlight">
+      <div class="calc-highlight-title">Calculations</div>
+      <div class="shipcomp-stats">
+        <span style="margin-right:16px">Cargo/sec = Cargo ÷ Jump Time (based on speed: 6=20s, 5=30s, 4=40s, 3=50s, 2=60s, 1=70s)</span>
+        <span style="margin-right:16px">Fuel/jump = (Tier × Speed) × Module Count</span>
+        <span>Module Count = weapon_slots + defense_slots + utility_slots</span>
+      </div>
+      <div class="calc-note">
+        Fuel cost assumes all module slots are filled. Use the module count filter to adjust.
+      </div>
+    </div>
+
+    <div class="shipcomp-filters">
+      <label>Empire:</label>
+      <select id="empireFilter" onchange="renderTable()">
+        <option value="">All Empires</option>
+        <option value="crimson">Crimson Fleet</option>
+        <option value="nebula">Nebula Collective</option>
+        <option value="outerrim">Outer Rim</option>
+        <option value="solarian">Solarian Empire</option>
+        <option value="voidborn">Voidborn</option>
+      </select>
+      <label>Tier:</label>
+      <select id="tierFilter" onchange="renderTable()">
+        <option value="">All Tiers</option>
+        <option value="0">T0</option>
+        <option value="1">T1</option>
+        <option value="2">T2</option>
+        <option value="3">T3</option>
+        <option value="4">T4</option>
+        <option value="5">T5</option>
+        <option value="legacy">Legacy</option>
+      </select>
+      <label>Category:</label>
+      <select id="categoryFilter" onchange="renderTable()">
+        <option value="">All Categories</option>
+        <option value="Combat">Combat</option>
+        <option value="Industrial">Industrial</option>
+        <option value="Civilian">Civilian</option>
+        <option value="Support">Support</option>
+      </select>
+      <label>Min Speed:</label>
+      <select id="speedFilter" onchange="renderTable()">
+        <option value="">Any Speed</option>
+        <option value="5">≥5</option>
+        <option value="4">≥4</option>
+        <option value="3">≥3</option>
+        <option value="2">≥2</option>
+        <option value="1">≥1</option>
+      </select>
+      <input type="text" id="searchFilter" placeholder="🔍 Search ships..." oninput="renderTable()" style="margin-left:auto; width:180px;">
+      <button onclick="exportCSV()" style="padding:6px 12px; font-size:12px; margin-left:8px;">Export CSV</button>
+    </div>
+
+    <div class="shipcomp-content" id="shipcompContent">
+      <div class="empty-state">Loading ship data...</div>
+    </div>
+  </div>
+
+  <script>
+    let ships = [];
+    let catalog = { ships: {} };
+    let sortState = { key: null, direction: 'asc' };
+
+    const SPEED_TO_JUMP_TIME = { 6: 20, 5: 30, 4: 40, 3: 50, 2: 60, 1: 70 };
+
+    async function loadData() {
+      try {
+        const catalogRes = await fetch('/api/catalog');
+        catalog = await catalogRes.json();
+        ships = Object.values(catalog.ships || {});
+        updateStats();
+        renderTable();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+        document.getElementById('shipcompStats').textContent = 'Failed to load ship data';
+      }
+    }
+
+    function updateStats() {
+      const total = ships.length;
+      const empires = new Set(ships.map(s => s.faction).filter(f => f));
+      document.getElementById('shipcompStats').textContent = `${total} ships | ${empires.size} empires`;
+    }
+
+    function getEmpireClass(faction) {
+      if (!faction) return '';
+      const map = { crimson: 'crimson', nebula: 'nebula', outerrim: 'outerrim', solarian: 'solarian', voidborn: 'voidborn' };
+      return map[faction.toLowerCase()] || '';
+    }
+
+    function getEmpireName(faction) {
+      if (!faction) return 'Unknown';
+      const map = { crimson: 'Crimson Fleet', nebula: 'Nebula Collective', outerrim: 'Outer Rim', solarian: 'Solarian Empire', voidborn: 'Voidborn' };
+      return map[faction.toLowerCase()] || faction;
+    }
+
+    function getTierClass(tier) {
+      if (tier === undefined || tier === null) return 'tier-legacy';
+      if (tier < 0) return 'tier-legacy';
+      return `tier-${tier}`;
+    }
+
+    function getTierText(tier) {
+      if (tier === undefined || tier === null || tier < 0) return 'Legacy';
+      return tier === 0 ? 'T0' : `T${tier}`;
+    }
+
+    function getJumpTime(speed) {
+      return SPEED_TO_JUMP_TIME[speed] || 70;
+    }
+
+    function formatNumber(n) {
+      if (n === undefined || n === null) return '-';
+      return n.toLocaleString();
+    }
+
+    function getSortIndicator(key) {
+      if (sortState.key !== key) return '';
+      return sortState.direction === 'asc' ? ' ↑' : ' ↓';
+    }
+
+    function sortShips(key) {
+      if (sortState.key === key) {
+        sortState.direction = sortState.direction === 'asc' ? 'desc' : 'asc';
+      } else {
+        sortState.key = key;
+        sortState.direction = 'asc';
+      }
+      renderTable();
+    }
+
+    function getShipValue(ship, key) {
+      const speed = ship.base_speed || 0;
+      const cargo = ship.cargo_capacity || 0;
+      const tier = ship.tier !== undefined ? ship.tier : -1;
+      const jumpTime = SPEED_TO_JUMP_TIME[speed] || 70;
+      const cargoPerSec = jumpTime > 0 ? cargo / jumpTime : 0;
+      const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
+      const fuelPerJump = tier >= 0 ? tier * speed * moduleCount : 0;
+
+      switch (key) {
+        case 'name': return ship.name || ship.id || '';
+        case 'empire': return getEmpireName(ship.faction);
+        case 'class': return ship.class || '';
+        case 'tier': return tier < 0 ? -1 : tier;
+        case 'hull': return ship.base_hull || 0;
+        case 'shield': return ship.base_shield || 0;
+        case 'shield_recharge': return ship.base_shield_recharge || 0;
+        case 'armor': return ship.base_armor || 0;
+        case 'speed': return speed;
+        case 'fuel': return ship.base_fuel || 0;
+        case 'cargo': return cargo;
+        case 'cpu': return ship.cpu_capacity || 0;
+        case 'power': return ship.power_capacity || 0;
+        case 'weapon_slots': return ship.weapon_slots || 0;
+        case 'defense_slots': return ship.defense_slots || 0;
+        case 'utility_slots': return ship.utility_slots || 0;
+        case 'cargo_per_sec': return cargoPerSec;
+        case 'fuel_per_jump': return fuelPerJump;
+        default: return '';
+      }
+    }
+
+    function exportCSV() {
+      const headers = ['Ship', 'Empire', 'Class', 'Tier', 'Hull', 'Shield', 'Shield Regen', 'Armor', 'Speed', 'Fuel', 'Cargo', 'CPU', 'Power', 'W Slots', 'D Slots', 'U Slots', 'Cargo/sec', 'Fuel/jump'];
+      const rows = [headers.join(',')];
+      
+      let exportData = [...ships];
+      
+      if (sortState.key) {
+        exportData.sort((a, b) => {
+          const aVal = getShipValue(a, sortState.key);
+          const bVal = getShipValue(b, sortState.key);
+          if (typeof aVal === 'string' && typeof bVal === 'string') {
+            return sortState.direction === 'asc' 
+              ? aVal.localeCompare(bVal) 
+              : bVal.localeCompare(aVal);
+          }
+          if (sortState.direction === 'asc') {
+            return (aVal || 0) - (bVal || 0);
+          }
+          return (bVal || 0) - (aVal || 0);
+        });
+      }
+      
+      exportData.forEach(ship => {
+        const speed = ship.base_speed || 0;
+        const cargo = ship.cargo_capacity || 0;
+        const tier = ship.tier !== undefined ? ship.tier : -1;
+        const jumpTime = SPEED_TO_JUMP_TIME[speed] || 70;
+        const cargoPerSec = jumpTime > 0 ? (cargo / jumpTime).toFixed(2) : '-';
+        const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
+        const fuelPerJump = tier >= 0 ? (tier * speed * moduleCount) : 0;
+        const empireName = getEmpireName(ship.faction);
+        const tierText = tier < 0 ? 'Legacy' : (tier === 0 ? 'T0' : `T${tier}`);
+        
+        const row = [
+          `"${ship.name || ship.id || ''}"`,
+          `"${empireName}"`,
+          `"${ship.class || ''}"`,
+          tierText,
+          ship.base_hull || 0,
+          ship.base_shield || 0,
+          ship.base_shield_recharge || 0,
+          ship.base_armor || 0,
+          speed,
+          ship.base_fuel || 0,
+          cargo,
+          ship.cpu_capacity || 0,
+          ship.power_capacity || 0,
+          ship.weapon_slots || 0,
+          ship.defense_slots || 0,
+          ship.utility_slots || 0,
+          cargoPerSec,
+          fuelPerJump > 0 ? fuelPerJump : '-'
+        ];
+        rows.push(row.join(','));
+      });
+
+      const csvContent = rows.join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', 'ships.csv');
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    }
+
+    function renderTable() {
+      const content = document.getElementById('shipcompContent');
+      const empire = document.getElementById('empireFilter').value;
+      const tier = document.getElementById('tierFilter').value;
+      const category = document.getElementById('categoryFilter').value;
+      const minSpeed = parseInt(document.getElementById('speedFilter').value) || 0;
+      const search = document.getElementById('searchFilter').value.toLowerCase();
+
+      let filtered = ships.filter(ship => {
+        if (empire && (ship.faction || '').toLowerCase() !== empire) return false;
+        if (tier) {
+          if (tier === 'legacy') {
+            if (ship.tier !== undefined && ship.tier !== null && ship.tier >= 0) return false;
+          } else if (String(ship.tier) !== tier) return false;
+        }
+        if (category && (ship.category || '') !== category) return false;
+        if (minSpeed && (ship.base_speed || 0) < minSpeed) return false;
+        if (search) {
+          const name = (ship.name || ship.id || '').toLowerCase();
+          const cls = (ship.class || '').toLowerCase();
+          if (!name.includes(search) && !cls.includes(search)) return false;
+        }
+        return true;
+      });
+
+      if (sortState.key) {
+        filtered.sort((a, b) => {
+          const aVal = getShipValue(a, sortState.key);
+          const bVal = getShipValue(b, sortState.key);
+          if (typeof aVal === 'string' && typeof bVal === 'string') {
+            return sortState.direction === 'asc' 
+              ? aVal.localeCompare(bVal) 
+              : bVal.localeCompare(aVal);
+          }
+          if (sortState.direction === 'asc') {
+            return (aVal || 0) - (bVal || 0);
+          }
+          return (bVal || 0) - (aVal || 0);
+        });
+      }
+
+      if (filtered.length === 0) {
+        content.innerHTML = '<div class="empty-state">No ships match your filters</div>';
+        return;
+      }
+
+      const rows = filtered.map(ship => {
+        const speed = ship.base_speed || 0;
+        const cargo = ship.cargo_capacity || 0;
+        const tier = ship.tier !== undefined ? ship.tier : -1;
+        const jumpTime = getJumpTime(speed);
+        const cargoPerSec = jumpTime > 0 ? (cargo / jumpTime).toFixed(2) : '-';
+        const moduleCount = (ship.weapon_slots || 0) + (ship.defense_slots || 0) + (ship.utility_slots || 0);
+        const fuelPerJump = tier >= 0 ? (tier * speed * moduleCount) : 0;
+
+        const empireClass = getEmpireClass(ship.faction);
+        const empireName = getEmpireName(ship.faction);
+        const tierClass = getTierClass(ship.tier);
+        const tierText = getTierText(ship.tier);
+
+        return `<tr>
+          <td><strong>${esc(ship.name || ship.id)}</strong></td>
+          <td><span class="faction-badge ${empireClass}">${esc(empireName)}</span></td>
+          <td>${esc(ship.class || '-')}</td>
+          <td><span class="tier-badge ${tierClass}">${tierText}</span></td>
+          <td>${formatNumber(ship.base_hull)}</td>
+          <td>${formatNumber(ship.base_shield)}</td>
+          <td>${formatNumber(ship.base_shield_recharge || 0)}</td>
+          <td>${formatNumber(ship.base_armor || 0)}</td>
+          <td>${formatNumber(speed)}</td>
+          <td>${formatNumber(ship.base_fuel)}</td>
+          <td>${formatNumber(cargo)}</td>
+          <td>${formatNumber(ship.cpu_capacity)}</td>
+          <td>${formatNumber(ship.power_capacity)}</td>
+          <td>${formatNumber(ship.weapon_slots)}</td>
+          <td>${formatNumber(ship.defense_slots)}</td>
+          <td>${formatNumber(ship.utility_slots)}</td>
+          <td><strong>${cargoPerSec}</strong></td>
+          <td><strong>${fuelPerJump > 0 ? fuelPerJump.toLocaleString() : '-'}</strong></td>
+        </tr>`;
+      }).join('');
+
+      content.innerHTML = `<table class="shipcomp-table">
+        <thead>
+          <tr>
+            <th onclick="sortShips('name')" style="cursor:pointer">Ship${getSortIndicator('name')}</th>
+            <th onclick="sortShips('empire')" style="cursor:pointer">Empire${getSortIndicator('empire')}</th>
+            <th onclick="sortShips('class')" style="cursor:pointer">Class${getSortIndicator('class')}</th>
+            <th onclick="sortShips('tier')" style="cursor:pointer">Tier${getSortIndicator('tier')}</th>
+            <th onclick="sortShips('hull')" style="cursor:pointer">Hull${getSortIndicator('hull')}</th>
+            <th onclick="sortShips('shield')" style="cursor:pointer">Shield${getSortIndicator('shield')}</th>
+            <th onclick="sortShips('shield_recharge')" style="cursor:pointer">Shield Regen${getSortIndicator('shield_recharge')}</th>
+            <th onclick="sortShips('armor')" style="cursor:pointer">Armor${getSortIndicator('armor')}</th>
+            <th onclick="sortShips('speed')" style="cursor:pointer">Speed${getSortIndicator('speed')}</th>
+            <th onclick="sortShips('fuel')" style="cursor:pointer">Fuel${getSortIndicator('fuel')}</th>
+            <th onclick="sortShips('cargo')" style="cursor:pointer">Cargo${getSortIndicator('cargo')}</th>
+            <th onclick="sortShips('cpu')" style="cursor:pointer">CPU${getSortIndicator('cpu')}</th>
+            <th onclick="sortShips('power')" style="cursor:pointer">Power${getSortIndicator('power')}</th>
+            <th onclick="sortShips('weapon_slots')" style="cursor:pointer">W Slots${getSortIndicator('weapon_slots')}</th>
+            <th onclick="sortShips('defense_slots')" style="cursor:pointer">D Slots${getSortIndicator('defense_slots')}</th>
+            <th onclick="sortShips('utility_slots')" style="cursor:pointer">U Slots${getSortIndicator('utility_slots')}</th>
+            <th onclick="sortShips('cargo_per_sec')" style="cursor:pointer"><span style="color:var(--accent)">Cargo/sec${getSortIndicator('cargo_per_sec')}</span></th>
+            <th onclick="sortShips('fuel_per_jump')" style="cursor:pointer"><span style="color:var(--yellow)">Fuel/jump${getSortIndicator('fuel_per_jump')}</span></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    loadData();
+  </script>
+</body>
+</html>

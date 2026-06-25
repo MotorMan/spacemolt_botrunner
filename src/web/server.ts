@@ -1884,6 +1884,17 @@ constructor(port: number = 3000) {
           });
         }
 
+        // Serve shipComparison.html for ship comparison route
+        if (url.pathname === "/shipComparison.html") {
+          const shipComparisonPath = join(import.meta.dir, "shipComparison.html");
+          return new Response(readFileSync(shipComparisonPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

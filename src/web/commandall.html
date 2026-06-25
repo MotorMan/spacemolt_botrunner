@@ -188,7 +188,7 @@
             bots = msg.bots || [];
             routines = msg.routines || [];
             settings = msg.settings || {};
-            window.currentSettings = settings; // Sync for use in render functions
+            window.currentSettings = settings;
             knownSystems = msg.knownSystems || [];
             knownOres = msg.knownOres || [];
             mobileCapitol = msg.mobileCapitol || null;
@@ -205,7 +205,7 @@
             break;
           case 'status':
             bots = msg.bots || [];
-            renderCommandAllControls();
+            updateCommandAllBotList();
             break;
           case 'execResult':
             handleExecResult(msg);
@@ -231,6 +231,18 @@
     function renderCommandAllControls() {
       const controls = document.getElementById('commandAllControls');
       if (!controls) return;
+
+      // Preserve user input values before rebuild
+      const preservedInputs = {};
+      const inputEls = controls.querySelectorAll('input[type="text"], input[type="number"]');
+      inputEls.forEach(el => {
+        if (el.id) preservedInputs[el.id] = el.value;
+      });
+      const preservedSelects = {};
+      const selectEls = controls.querySelectorAll('select');
+      selectEls.forEach(el => {
+        if (el.id) preservedSelects[el.id] = el.value;
+      });
 
       // Use first bot's system for POI list (assume all bots are in same system)
       const firstBotSystem = bots[0]?.system || '';
@@ -474,6 +486,36 @@
           <button class="primary sm" onclick="caExecCustom()">Run</button>
         </div>
       `;
+
+      // Restore preserved input values
+      Object.entries(preservedInputs).forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el && el.value !== value) el.value = value;
+      });
+      Object.entries(preservedSelects).forEach(([id, value]) => {
+        const el = document.getElementById(id);
+        if (el && el.value !== value) el.value = value;
+      });
+    }
+
+    /** Update only the bot list dropdowns (lightweight update for status messages) */
+    function updateCommandAllBotList() {
+      const allBotOpts = bots.length > 0
+        ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')
+        : '<option value="">No bots available</option>';
+
+      const targets = ['ca-gift-target', 'ca-giftall-target', 'ca-credits-target'];
+      for (const id of targets) {
+        const el = document.getElementById(id);
+        if (el) {
+          const currentVal = el.value;
+          el.innerHTML = allBotOpts;
+          // Restore selection if still valid
+          if (currentVal && allBotOpts.includes(currentVal)) {
+            el.value = currentVal;
+          }
+        }
+      }
     }
 
     /** Execute a command on all bots with delay between each */

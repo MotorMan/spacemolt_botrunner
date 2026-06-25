@@ -514,9 +514,8 @@ async function waitForCompletion(
   const timeoutMs = (estimatedTicks ? estimatedTicks * 2 + 10 : 30) * 10000;
   const startTime = Date.now();
   let lastStatusReport = Date.now();
-  let lastQueueRefresh = 0;
 
-  const serverJobIds = await checkCraftingQueue(bot, recipes, true);
+  const serverJobIds = await checkCraftingQueue(bot, recipes);
   tracker.syncWithServer(serverJobIds);
   tracker.save();
 
@@ -530,11 +529,10 @@ async function waitForCompletion(
     await ctx.sleep(5000);
 
     const now = Date.now();
-    if (now - lastQueueRefresh >= QUEUE_REFRESH_COOLDOWN) {
-      const currentJobIds = await checkCraftingQueue(bot, recipes, true);
+    if (now - lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
+      const currentJobIds = await checkCraftingQueue(bot, recipes);
       tracker.syncWithServer(currentJobIds);
       tracker.save();
-      lastQueueRefresh = now;
     }
 
     const progress = tracker.getProgress(recipeId);
@@ -622,14 +620,13 @@ async function waitForAllCompletions(
   }
 
   let lastSync = 0;
-  const SYNC_INTERVAL = 10000;
 
   while (bot.state === "running" && queuedItems.length > 0) {
     await ctx.sleep(5000);
 
     const now = Date.now();
-    if (now - lastSync >= SYNC_INTERVAL) {
-      const serverJobs = await checkCraftingQueue(bot, recipes, true);
+    if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
+      const serverJobs = await checkCraftingQueue(bot, recipes);
       tracker.syncWithServer(serverJobs);
       tracker.save();
       lastSync = now;

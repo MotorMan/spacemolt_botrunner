@@ -246,6 +246,8 @@ const BACKUP_FILES = [
   'settings.json',
   'shipsForSale.json',
   'traderActivity.json',
+  'traderProfitDebug.csv',
+  'transportProfitDebug.csv',
 ];
 
 class MapStore {

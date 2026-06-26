@@ -1857,8 +1857,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
 // ── Startup: Enable cloaking if configured and module available ──
-    // Note: Enabling cloak causes automatic undock, so we need to refresh state and re-dock if needed
+    // Best practice: manually undock before cloaking to have full control over state
+    // This avoids race conditions with auto-undock and ensures we can re-dock for resupply
     let wasCloakingAttempted = false;
+    if (settings0.enableCloak && bot.docked && !bot.isCloaked) {
+      ctx.log("mining", "Manually undocking before cloaking to control state...");
+      const undockResp = await bot.exec("undock");
+      await ctx.sleep(500);
+      await bot.refreshShip();
+    }
+    
     if (settings0.enableCloak) {
       const cloaked = await enableCloakingIfPossible(ctx, cachedModules);
       if (cloaked) {
@@ -1878,10 +1886,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Startup: Ensure ammo loaded for miners with weapons (if docked) ──
     // Miner ships often have weapons that need ammo loaded before combat
     // When docked at home system, also withdraw ammo from faction storage
-    // After cloaking, bot may have auto-undocked - refresh state and re-dock if needed
-    const effectivelyDocked = bot.docked || (wasCloakingAttempted && bot.isCloaked);
     if (wasCloakingAttempted && homeSystem && bot.system === homeSystem && !bot.docked) {
-      ctx.log("mining", "Cloaking auto-undocked bot - re-docking at home station for resupply");
+      ctx.log("mining", "Re-docking at home station for resupply after cloaking");
       const dockResp = await bot.exec("dock");
       if (!dockResp.error) {
         bot.docked = true;

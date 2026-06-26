@@ -2787,15 +2787,21 @@ if (configuredSystem) {
       }
 
       if (locations.length === 0) {
-        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map`);
-        
-        // Debug: Log why the target wasn't found
         const debugLocations = mapStore.findOreLocations(effectiveTarget);
-        ctx.log("debug", `DEBUG: Found ${debugLocations.length} total locations for "${effectiveTarget}" in map`);
-        
-        // Check if the ore exists at all in the map
         const allOres = mapStore.getAllKnownOres();
         const oreExists = allOres.some(o => o.item_id === effectiveTarget);
+        
+        if (!oreExists) {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map`);
+        } else if (debugLocations.length === 0) {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map - no locations match mining type "${miningType}"`);
+        } else if (afterPoiFilter.length > 0 && afterDepletionFilter.length === 0) {
+          ctx.log("error", `All ${resourceLabel} "${effectiveTarget}" POIs are fully depleted and under lockout - no accessible locations`);
+        } else {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in accessible locations`);
+        }
+        
+        ctx.log("debug", `DEBUG: Found ${debugLocations.length} total locations for "${effectiveTarget}" in map`);
         ctx.log("debug", `DEBUG: Ore "${effectiveTarget}" ${oreExists ? "EXISTS" : "DOES NOT EXIST"} in known ores`);
         
         // Check map data

@@ -422,7 +422,7 @@ async function queueCraftJob(
   tracker: CraftQueueTracker,
   recipes?: Recipe[],
   preset: string = "fast",
-): Promise<{ success: boolean; error?: string; jobId?: string }> {
+): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
   const recipe = recipes?.find(r => r.recipe_id === recipeId);
@@ -430,48 +430,45 @@ async function queueCraftJob(
   const originalRuns = Math.ceil(quantity / outputQty);
 
   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued" };
+    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
   }
 
   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
   tracker.syncWithServer(serverJobs);
   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued" };
+    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
   }
 
   const maxCraftable = calculateMaxCraftable(recipe, bot.factionStorage);
-  const maxRunsPossible = maxCraftable;
-  let runs = Math.min(originalRuns, maxRunsPossible);
+  const runs = Math.min(originalRuns, maxCraftable);
   
   if (runs <= 0) {
     log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
     return { success: false, error: "insufficient_inputs" };
   }
 
-  while (runs > 0) {
-    log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
-    const craftResp = await bot.exec("craft", {
-      id: recipeId,
-      quantity: runs,
-      preset: preset,
-    });
-
-    if (!craftResp.error) {
-      return handleSuccess(craftResp, recipeId, runs, log, tracker, bot);
-    }
-
-    const msg = craftResp.error.message;
-    if (!msg.toLowerCase().includes("insufficient") && !msg.toLowerCase().includes("cannot_craft")) {
-      return { success: false, error: msg };
-    }
-
-    runs = Math.ceil(runs / 2);
-    if (runs === 0) break;
-    
-    log("craft", `Retrying ${recipeId} with ${runs} runs...`);
+  if (runs < originalRuns) {
+    log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
   }
 
-  return { success: false, error: "Could not queue any runs after multiple attempts" };
+  log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
+  const craftResp = await bot.exec("craft", {
+    id: recipeId,
+    quantity: runs,
+    preset: preset,
+  });
+
+  if (!craftResp.error) {
+    return handleSuccess(craftResp, recipeId, runs, log, tracker, bot);
+  }
+
+  const msg = craftResp.error.message;
+  if (msg.toLowerCase().includes("insufficient") || msg.toLowerCase().includes("cannot_craft")) {
+    log("craft", `Insufficient materials for ${recipeId} - will retry next cycle`);
+    return { success: false, error: "insufficient_inputs" };
+  }
+
+  return { success: false, error: msg };
 }
 
 function handleSuccess(
@@ -481,7 +478,7 @@ function handleSuccess(
   log: any,
   tracker: CraftQueueTracker,
   bot: any,
-): { success: boolean; error?: string; jobId?: string } {
+): { success: boolean; error?: string; jobId?: string; queuedRuns?: number } {
   const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown> | undefined)?.details as Record<string, unknown> | undefined;
   const jobId = (details?.job_id as string) || (result?.job_id as string) || "";
@@ -495,7 +492,7 @@ function handleSuccess(
   tracker.save();
 
   log("craft", `Queued ${runs} runs of ${recipeId} (job_id=${jobId})`);
-  return { success: true, jobId };
+  return { success: true, jobId, queuedRuns: runs };
 }
 
 // ── Wait for completion ───────────────────────────────────────
@@ -598,7 +595,11 @@ async function queueAllRecipes(
       continue;
     }
 
-    queued.push({ recipeId: item.recipe.recipe_id, quantity: remainingItems, outputQty });
+    const actualQueued = queueResult.queuedRuns || 0;
+    queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+    if (actualQueued * outputQty < remainingItems) {
+      ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x`);
+    }
   }
 
   return queued;

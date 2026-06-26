@@ -51,6 +51,13 @@ import {
   canChallengeLock,
   cleanupStaleLocks,
 } from "./traderCoordination.js";
+import {
+  addUnsoldItem,
+  removeUnsoldItem,
+  getUnsoldItemsByItem,
+  getAllUnsoldItems,
+  type UnsoldItem,
+} from "./unsoldItems.js";
 
 // ── CSV Logging ─────────────────────────────────────────────────
 
@@ -335,6 +342,7 @@ function getTraderSettings(username?: string): {
   maxFactionCreditsToUse: number;
   enableMissions: boolean;
   debugLogging: boolean;
+  unsoldItemHomeBaseOnly: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -350,9 +358,10 @@ function getTraderSettings(username?: string): {
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
-    maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0, // 0 = unlimited
+    maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0,
     enableMissions: (t.enableMissions as boolean) !== false,
     debugLogging: (t.debugLogging as boolean) ?? false,
+    unsoldItemHomeBaseOnly: (t.unsoldItemHomeBaseOnly as boolean) ?? true,
   };
 }
 
@@ -1165,6 +1174,96 @@ function findCargoSellRoutes(
   return routes;
 }
 
+/**
+ * Generate trade routes from unsold items in faction storage.
+ * Checks if previously purchased items can now be sold profitably.
+ */
+function findUnsoldItemRoutes(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTraderSettings>,
+  currentSystem: string,
+  cargoCapacity: number = 999,
+): TradeRoute[] {
+  const { bot } = ctx;
+  const routes: TradeRoute[] = [];
+  
+  const unsoldItems = getAllUnsoldItems();
+  if (unsoldItems.length === 0) {
+    return routes;
+  }
+
+  const homeSystem = settings.homeSystem || "";
+  const homeBaseOnly = settings.unsoldItemHomeBaseOnly;
+  const blacklist = getSystemBlacklist();
+  
+  for (const unsold of unsoldItems) {
+    if (homeBaseOnly && unsold.storageSystem !== homeSystem) {
+      ctx.log("trade", `Skipping ${unsold.itemName} in unsold items - stored at ${unsold.storageSystem}, not home system ${homeSystem}`);
+      continue;
+    }
+
+    const allBuys = mapStore.getAllBuyDemand();
+    const buyers = allBuys
+      .filter(b => b.itemId === unsold.itemId && b.price > 0 && b.quantity > 0)
+      .filter(b => {
+        const sys = mapStore.getSystem(b.systemId);
+        const poi = sys?.pois.find(p => p.id === b.poiId);
+        return poi?.has_base ?? false;
+      })
+      .sort((a, b) => b.price - a.price);
+
+    if (buyers.length === 0) {
+      ctx.log("trade", `No buyers for unsold ${unsold.itemName} (${unsold.quantity}x @ ${unsold.boughtPrice}cr/ea)`);
+      continue;
+    }
+
+    const bestBuyer = buyers[0];
+    const toSource = estimateFuelCost(currentSystem, unsold.storageSystem, settings.fuelCostPerJump);
+    const sourceToDest = estimateFuelCost(unsold.storageSystem, bestBuyer.systemId, settings.fuelCostPerJump);
+    
+    if (toSource.jumps >= 999 || sourceToDest.jumps >= 999) {
+      ctx.log("trade", `No route to withdraw ${unsold.itemName} from storage or deliver to buyer`);
+      continue;
+    }
+
+    const totalJumps = toSource.jumps + sourceToDest.jumps;
+    const totalFuelCost = toSource.cost + sourceToDest.cost;
+    const maxQty = Math.min(unsold.quantity, maxItemsForCargo(cargoCapacity, unsold.itemId));
+    
+    const revenue = bestBuyer.price * maxQty;
+    const profitPerUnit = bestBuyer.price - unsold.boughtPrice - (totalJumps > 0 ? totalFuelCost / maxQty : 0);
+    const totalProfit = profitPerUnit * maxQty;
+
+    if (profitPerUnit < settings.minProfitPerUnit) {
+      ctx.log("trade", `${unsold.itemName}: ${Math.round(profitPerUnit)}cr/unit profit < min ${settings.minProfitPerUnit} — skipping`);
+      continue;
+    }
+
+    routes.push({
+      itemId: unsold.itemId,
+      itemName: unsold.itemName,
+      sourceSystem: unsold.storageSystem,
+      sourcePoi: unsold.storagePoi,
+      sourcePoiName: `Storage at ${unsold.storagePoi}`,
+      buyPrice: unsold.boughtPrice,
+      buyQty: maxQty,
+      destSystem: bestBuyer.systemId,
+      destPoi: bestBuyer.poiId,
+      destPoiName: bestBuyer.poiName,
+      sellPrice: bestBuyer.price,
+      sellQty: maxQty,
+      jumps: totalJumps,
+      jumpsToBuy: toSource.jumps,
+      jumpsToSell: sourceToDest.jumps,
+      profitPerUnit,
+      totalProfit,
+    });
+  }
+
+  routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  return routes;
+}
+
 // ── Missions ───────────────────────────────────────────────── //disable this!
 
 /**
@@ -1561,7 +1660,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (cargoItems.length > 0 && bot.docked) {
       const allBuys = mapStore.getAllBuyDemand();
       const homeSystem = settings.homeSystem || startSystem;
-      const itemsToDeposit: Array<{ itemId: string; name: string; quantity: number }> = [];
+      const itemsToDeposit: Array<{ itemId: string; name: string; quantity: number; buyPrice?: number }> = [];
       const itemsToSell: Array<{ itemId: string; name: string; quantity: number; price: number }> = [];
       
       for (const item of cargoItems) {
@@ -1678,11 +1777,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (bot.faction && bot.docked) {
           const deposited: string[] = [];
           for (const item of itemsToDeposit) {
-            //const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-            const dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
+            const dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: item.quantity });
             if (!dResp.error) {
               deposited.push(`${item.quantity}x ${item.name}`);
               logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} from cargo (no good sell price found)`);
+              addUnsoldItem({
+                itemId: item.itemId,
+                itemName: item.name,
+                boughtPrice: item.buyPrice || 0,
+                quantity: item.quantity,
+                storageSystem: bot.system,
+                storagePoi: bot.poi,
+                depositedAt: new Date().toISOString(),
+                botUsername: bot.username,
+              });
             }
           }
           if (deposited.length > 0) {
@@ -1815,11 +1923,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     let affordableRoutesCount = 0;
     let cargoRoutes: TradeRoute[] = [];
     let marketRoutes: TradeRoute[] = [];
+    let unsoldRoutes: TradeRoute[] = [];
 
     if (!recoveredSessionHandled) {
       await bot.refreshLocation();
       await bot.refreshCargo();
-      // Subtract fuel cell weight from cargo capacity so route planning doesn't over-buy
       let fuelCellWeight = 0;
       for (const item of bot.inventory) {
         const lower = item.itemId.toLowerCase();
@@ -1832,11 +1940,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
       marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
         settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined);
+      unsoldRoutes = findUnsoldItemRoutes(ctx, settings, bot.system, cargoCapacity);
       ctx.log("trade", `findCargoSellRoutes found ${cargoRoutes.length} routes`);
       ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${spreadCount} spreads`);
-      // Filter out routes that sell items we just sold at the current station (demand already filled)
+      ctx.log("trade", `findUnsoldItemRoutes found ${unsoldRoutes.length} routes from unsold items`);
       const currentPoi = bot.poi;
-      let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
+      let allRoutes = [...cargoRoutes, ...marketRoutes, ...unsoldRoutes].filter(r => {
         if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
         return true;
       });
@@ -1994,8 +2103,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         route = candidate;
         buyQty = Math.min(inCargo, candidate.buyQty);
-        investedCredits = 0; // already have the items
+        investedCredits = 0;
         ctx.log("trade", `Selling ${buyQty}x ${candidate.itemName} from cargo`);
+        break;
+      }
+
+      const isUnsoldRoute = candidate.sourcePoi.startsWith("Storage at ");
+      if (isUnsoldRoute) {
+        ctx.log("trade", `Route #${ri + 1}: ${candidate.itemName} — withdraw ${candidate.buyQty}x from storage → sell at ${candidate.destPoiName} (${candidate.sellPrice}cr/ea) — est. profit ${Math.round(candidate.totalProfit)}cr (${candidate.jumps} jumps)`);
+        
+        const storageMatch = candidate.sourcePoi.match(/Storage at (.+)/);
+        const storagePoi = storageMatch ? storageMatch[1] : candidate.sourcePoi;
+        
+        const lockAcquired = acquireTradeLock({
+          botUsername: bot.username,
+          itemId: candidate.itemId,
+          itemName: candidate.itemName,
+          sourceSystem: candidate.sourceSystem,
+          sourcePoi: storagePoi,
+          destSystem: candidate.destSystem,
+          destPoi: candidate.destPoi,
+          quantityCommitted: candidate.buyQty,
+          sessionId: `${bot.username}_unsold_${Date.now()}`,
+        });
+        
+        if (!lockAcquired) {
+          ctx.log("trade", `Route locked by another bot — skipping ${candidate.itemName}`);
+          failedSources.add(sourceKey);
+          continue;
+        }
+        
+        pendingLockItemId = candidate.itemId;
+        pendingLockReleased = false;
+        ctx.log("trade", `Fleet lock acquired for unsold item: ${candidate.itemName}`);
+        
+        route = candidate;
+        buyQty = candidate.buyQty;
+        investedCredits = 0;
         break;
       }
 
@@ -2099,6 +2243,83 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       yield "travel_to_source";
+
+      if (isUnsoldRoute) {
+        const storagePoi = candidate.sourcePoi.replace("Storage at ", "");
+        
+        if (bot.system !== candidate.sourceSystem) {
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { homeSystem });
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for trade run — waiting 30s");
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_refuel");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
+            await ctx.sleep(30000);
+            break;
+          }
+          
+          ctx.log("travel", `Heading to ${candidate.sourcePoiName} in ${candidate.sourceSystem}...`);
+          const arrived = await navigateToSystem(ctx, candidate.sourceSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", "Failed to reach storage system — trying next route");
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
+            continue;
+          }
+        }
+
+        if (bot.poi !== storagePoi) {
+          await ensureUndocked(ctx);
+          ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
+          const tResp = await bot.exec("travel", { target_poi: storagePoi });
+          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during travel — fleeing!");
+            await ctx.sleep(2000);
+            continue;
+          }
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to storage failed: ${tResp.error.message}`);
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
+            continue;
+          }
+          bot.poi = storagePoi;
+        }
+
+        yield "dock_source";
+        await ensureDocked(ctx);
+        bot.docked = true;
+
+        await bot.refreshStorage();
+        const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: candidate.itemId, quantity: buyQty });
+        if (wResp.error) {
+          ctx.log("error", `Failed to withdraw ${buyQty}x ${candidate.itemName} from faction storage: ${wResp.error.message}`);
+          releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
+          continue;
+        }
+
+        await bot.refreshCargo();
+        const inCargo = bot.inventory.find(i => i.itemId === candidate.itemId)?.quantity ?? 0;
+        if (inCargo <= 0) {
+          ctx.log("error", `${candidate.itemName} not in cargo after withdrawal — trying next route`);
+          releaseTradeLock(bot.username, candidate.itemId, "aborted:no_item");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
+          continue;
+        }
+
+        removeUnsoldItem(candidate.itemId, candidate.sourceSystem, storagePoi);
+        ctx.log("trade", `Withdrew ${inCargo}x ${candidate.itemName} from faction storage`);
+        route = candidate;
+        buyQty = inCargo;
+        investedCredits = 0;
+        break;
+      }
 
       if (bot.system !== candidate.sourceSystem) {
         await ensureUndocked(ctx);
@@ -3114,10 +3335,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await bot.refreshCargo();
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining > 0) {
-            //await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
-            await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining }); //fixed by human!
+            await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
             ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
             logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
+            addUnsoldItem({
+              itemId: route!.itemId,
+              itemName: route!.itemName,
+              boughtPrice: route!.buyPrice,
+              quantity: remaining,
+              storageSystem: homeSystem,
+              storagePoi: homeStation.id,
+              depositedAt: new Date().toISOString(),
+              botUsername: bot.username,
+            });
           }
         }
       } else {
@@ -3159,9 +3389,18 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await bot.refreshCargo();
         remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
         if (remaining > 0) {
-          //await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
-          await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining }); //fixed by human! since it's SOL, may as well do faction deposit.
+          await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
           ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to Sol Central storage`);
+          addUnsoldItem({
+            itemId: route!.itemId,
+            itemName: route!.itemName,
+            boughtPrice: route!.buyPrice,
+            quantity: remaining,
+            storageSystem: solSystem,
+            storagePoi: SOL_CENTRAL,
+            depositedAt: new Date().toISOString(),
+            botUsername: bot.username,
+          });
         }
       }
     }

@@ -2573,6 +2573,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "get_status";
     await bot.refreshShip();
 
+    // ── Cloak status check ──
+    // Verify bot is still cloaked (cloak can expire or be lost).
+    // If not cloaked and cloaking is enabled with fuel available, re-enable cloak.
+    // Skip check if bot has 0 fuel to avoid getting stuck.
+    if (settings0.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+      ctx.log("mining", "Cloak check: not cloaked, attempting to re-enable...");
+      const cloaked = await enableCloakingIfPossible(ctx, cachedModules || undefined);
+      if (cloaked) {
+        ctx.log("mining", "Cloaking re-enabled successfully");
+      } else {
+        ctx.log("warn", "Cloaking re-enable failed or not possible");
+      }
+    }
+
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {

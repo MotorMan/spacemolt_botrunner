@@ -63,7 +63,6 @@ export class ClientSyncSlave {
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
     const url = `${this.settings.masterUrl}${path}`;
-    this.log(`Requesting: ${url}`);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     
@@ -71,15 +70,14 @@ export class ClientSyncSlave {
       const res = await fetch(url, { ...init, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: controller.signal });
       clearTimeout(timeoutId);
       const text = await res.text();
-      this.log(`Response from ${url}: ${res.status} ${text.substring(0, 200)}`);
       try { return JSON.parse(text) as T; } catch { return text as T; }
     } catch (err) {
       clearTimeout(timeoutId);
       if (err instanceof Error && err.name === 'AbortError') {
-        this.logError(`Timeout connecting to ${url}`);
+        this.logError(`Timeout connecting to master`);
         throw new Error(`Connection timeout to ${this.settings.masterUrl}`);
       }
-      this.logError(`Fetch error to ${url}: ${err instanceof Error ? err.message : String(err)}`);
+      this.logError(`Fetch error: ${err instanceof Error ? err.message : String(err)}`);
       throw err;
     }
   }
@@ -105,6 +103,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
         this.clientId = payload.clientId;
         this.connectionState = 'connected';
         this.lastError = null;
+        this.log(`Connected to master as ${this.settings.label || "slave"} (${payload.clientId})`);
       } else {
         this.connectionState = 'disconnected';
         this.lastError = payload.error || `HTTP ${res.status}`;
@@ -125,6 +124,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       for (const [id, sys] of Object.entries(systems)) {
         mapStore.registerPoiFromScan(id, (sys as Record<string, unknown>).poi as any);
       }
+      this.log(`Updated map: ${Object.keys(systems).length} systems`);
     }
   }
 
@@ -166,10 +166,9 @@ private async pushStatuses(): Promise<void> {
 
   private async pollCycle(): Promise<void> {
     if (!this.running) return;
-    this.log(`Poll cycle starting, clientId: ${this.clientId || 'none'}`);
     try {
       if (!this.clientId) {
-        this.log('Attempting registration...');
+        this.log('Registering with master...');
         const reg = await this.register();
         if (!reg.ok) throw new Error(reg.error || "register failed");
       }
@@ -184,12 +183,11 @@ private async pushStatuses(): Promise<void> {
       }
       this.lastSync = Date.now();
       this.lastError = null;
-      this.log(`Poll cycle completed successfully`);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       this.clientId = null;
       this.connectionState = 'disconnected';
-      this.logError(`Poll cycle failed: ${this.lastError}`);
+      this.logError(`Sync failed: ${this.lastError}`);
     }
   }
 }

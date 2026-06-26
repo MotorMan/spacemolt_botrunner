@@ -1457,7 +1457,10 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
 async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
 
-  if (!bot.docked) return;
+  if (!bot.docked) {
+    ctx.log("trade", "Not docked - cannot resupply");
+    return;
+  }
 
   await bot.refreshLocation();
   await bot.refreshCargo();
@@ -1854,10 +1857,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
 // ── Startup: Enable cloaking if configured and module available ──
+    // Note: Enabling cloak causes automatic undock, so we need to refresh state and re-dock if needed
+    let wasCloakingAttempted = false;
     if (settings0.enableCloak) {
       const cloaked = await enableCloakingIfPossible(ctx, cachedModules);
       if (cloaked) {
         ctx.log("mining", "Cloaking enabled - bot is now invulnerable to attacks");
+        wasCloakingAttempted = true;
       }
     }
 
@@ -1872,6 +1878,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Startup: Ensure ammo loaded for miners with weapons (if docked) ──
     // Miner ships often have weapons that need ammo loaded before combat
     // When docked at home system, also withdraw ammo from faction storage
+    // After cloaking, bot may have auto-undocked - refresh state and re-dock if needed
+    const effectivelyDocked = bot.docked || (wasCloakingAttempted && bot.isCloaked);
+    if (wasCloakingAttempted && homeSystem && bot.system === homeSystem && !bot.docked) {
+      ctx.log("mining", "Cloaking auto-undocked bot - re-docking at home station for resupply");
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error) {
+        bot.docked = true;
+        ctx.log("mining", "Re-docked at home station");
+      }
+    }
+
     if (bot.docked) {
       const weapons = await getWeaponModules(ctx);
       if (weapons.length > 0) {
@@ -6356,8 +6373,8 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
     if (weapons.length > 0) {
       ctx.log("mining", `Docked: checking ammo for ${weapons.length} weapon(s)`);
       
-      // If at home system, resupply from faction storage first
-      if (bot.system === homeSystem) {
+      // If at home system and docked, resupply from faction storage first
+      if (bot.system === homeSystem && bot.docked) {
         await ensureMinerResupply(ctx);
       }
       

@@ -34,6 +34,10 @@ import {
   RADIOACTIVE_ORES,
 } from "./miner_radioactive.js";
 import {
+  ensureAmmoLoaded,
+  getWeaponModules,
+} from "./battle.js";
+import {
   getActiveMiningSession,
   startMiningSession,
   updateMiningSession,
@@ -1714,6 +1718,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (isDocked) {
       ctx.log("mining", "Bot is docked - checking fuel at startup");
       await tryRefuel(ctx, { skipApprovedCheck: true });
+    }
+
+    // ── Startup: Ensure ammo loaded for miners with weapons (if docked) ──
+    // Miner ships often have weapons that need ammo loaded before combat
+    if (bot.docked) {
+      const weapons = await getWeaponModules(ctx);
+      if (weapons.length > 0) {
+        ctx.log("mining", `Startup: checking ammo for ${weapons.length} weapon(s) at dock`);
+        const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+        if (!hasAmmo) {
+          ctx.log("warn", "Startup: low on weapon ammo — will resupply at station");
+        }
+      }
     }
 
     while (bot.state === "running") {
@@ -6168,6 +6185,17 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
       }
     } else {
       bot.docked = true;
+    }
+
+    // ── Ensure weapons are loaded with ammo after docking ──
+    // Miner ships may have weapons that need ammo loaded before combat
+    const weapons = await getWeaponModules(ctx);
+    if (weapons.length > 0) {
+      ctx.log("mining", `Docked: checking ammo for ${weapons.length} weapon(s)`);
+      const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+      if (!hasAmmo) {
+        ctx.log("warn", "Docked: low on weapon ammo — will resupply if at home station");
+      }
     }
 
     // ── Collect storage + unload cargo ──

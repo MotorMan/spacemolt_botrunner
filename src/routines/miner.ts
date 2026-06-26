@@ -37,6 +37,8 @@ import {
   ensureAmmoLoaded,
   getWeaponModules,
 } from "./battle.js";
+import { catalogStore } from "../catalogstore.js";
+import { getItemSize } from "./common.js";
 import {
   getActiveMiningSession,
   startMiningSession,
@@ -1448,6 +1450,153 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
   return modules;
 }
 
+/**
+ * Miner resupply: ammo from faction storage, fuel cells, and repair kits.
+ * Called when docked at home base to ensure weapons are loaded and supplies are stocked.
+ */
+async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+
+  if (!bot.docked) return;
+
+  await bot.refreshLocation();
+  await bot.refreshCargo();
+
+  const weapons = await getWeaponModules(ctx);
+  ctx.log("debug", `Miner resupply: detected ${weapons.length} weapons`);
+
+  for (const w of weapons) {
+    ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
+  }
+
+  const weaponAmmoTypes = new Set<string>();
+  for (const w of weapons) {
+    if (w.ammoType && w.ammoType !== "none") {
+      weaponAmmoTypes.add(w.ammoType);
+    }
+  }
+
+  let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
+  if (freeSpace < 5) {
+    ctx.log("trade", "Cargo almost full — skipping resupply");
+    return;
+  }
+
+  const currentRepair = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentFuel = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("fuel_cell"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentShield = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  for (const ammoType of weaponAmmoTypes) {
+    const ammoIndex = catalogStore.getAmmoTypeIndex();
+    const possibleAmmo = ammoIndex[ammoType] || [];
+    ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
+
+    if (possibleAmmo.length === 0) {
+      ctx.log("trade", `No catalog options for ${ammoType} — skipping`);
+      continue;
+    }
+
+    const currentAmmoForType = bot.inventory
+      .filter(i => possibleAmmo.includes(i.itemId))
+      .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+    const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
+    const maxAmmoForType = weaponsUsingThisAmmo.length > 0
+      ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0))
+      : 0;
+    let ammoToGet: number;
+    if (maxAmmoForType > 50) {
+      ammoToGet = Math.max(0, 20 - currentAmmoForType);
+    } else if (maxAmmoForType > 0) {
+      ammoToGet = Math.max(0, 40 - currentAmmoForType);
+    } else {
+      ammoToGet = Math.max(0, 30 - currentAmmoForType);
+    }
+
+    let chosenAmmoId: string | null = null;
+    const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
+    if (loadedAmmo && loadedAmmo.loadedAmmoId) {
+      chosenAmmoId = loadedAmmo.loadedAmmoId;
+      ctx.log("debug", `Preferring currently loaded ammo: ${chosenAmmoId}`);
+    } else {
+      chosenAmmoId = possibleAmmo[0];
+    }
+
+    if (!chosenAmmoId) {
+      ctx.log("trade", `No suitable ammo found for ${ammoType} — skipping`);
+      continue;
+    }
+
+    const ammoOrder = chosenAmmoId && possibleAmmo.includes(chosenAmmoId)
+      ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
+      : possibleAmmo;
+    for (const ammoId of ammoOrder) {
+      const ammoSize = getItemSize(ammoId);
+      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (actualQty <= 0) {
+        continue;
+      }
+
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: ammoId,
+        quantity: actualQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
+        freeSpace -= actualQty * ammoSize;
+        break;
+      } else {
+        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${wResp.error.message}`);
+      }
+    }
+  }
+
+  const desiredRepair = 12;
+  const repairToGet = Math.max(0, desiredRepair - currentRepair);
+  if (repairToGet > 0) {
+    const kitQty = Math.min(repairToGet, Math.floor(freeSpace / getItemSize("repair_kit")));
+    if (kitQty > 0) {
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: "advanced_repair_kit",
+        quantity: kitQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${kitQty} advanced_repair_kit from faction storage`);
+        freeSpace -= kitQty * getItemSize("advanced_repair_kit");
+      }
+    }
+  }
+
+  const desiredShield = 20;
+  const shieldToGet = Math.max(0, desiredShield - currentShield);
+  if (shieldToGet > 0 && freeSpace >= getItemSize("shield_charge")) {
+    const shQty = Math.min(shieldToGet, Math.floor(freeSpace / getItemSize("shield_charge")));
+    if (shQty > 0) {
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: "shield_charge",
+        quantity: shQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
+      }
+    }
+  }
+}
+
 // ── Deep core mining efficiency helpers ───────────────────────────────────
 
 /**
@@ -1722,10 +1871,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Startup: Ensure ammo loaded for miners with weapons (if docked) ──
     // Miner ships often have weapons that need ammo loaded before combat
+    // When docked at home system, also withdraw ammo from faction storage
     if (bot.docked) {
       const weapons = await getWeaponModules(ctx);
       if (weapons.length > 0) {
         ctx.log("mining", `Startup: checking ammo for ${weapons.length} weapon(s) at dock`);
+        
+        // If at home system, resupply from faction storage first
+        if (bot.system === homeSystem) {
+          await ensureMinerResupply(ctx);
+        }
+        
         const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
         if (!hasAmmo) {
           ctx.log("warn", "Startup: low on weapon ammo — will resupply at station");
@@ -6195,9 +6351,16 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
 
     // ── Ensure weapons are loaded with ammo after docking ──
     // Miner ships may have weapons that need ammo loaded before combat
+    // When docked at home system, also withdraw ammo from faction storage
     const weapons = await getWeaponModules(ctx);
     if (weapons.length > 0) {
       ctx.log("mining", `Docked: checking ammo for ${weapons.length} weapon(s)`);
+      
+      // If at home system, resupply from faction storage first
+      if (bot.system === homeSystem) {
+        await ensureMinerResupply(ctx);
+      }
+      
       const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
       if (!hasAmmo) {
         ctx.log("warn", "Docked: low on weapon ammo — will resupply if at home station");

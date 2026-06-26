@@ -866,7 +866,7 @@ async function main(): Promise<void> {
   const settings = loadSettings();
   const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
   server = new WebServer(port);
-  server.routines = Object.keys(ROUTINES);
+  server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
   server.onShutdown = async () => {
     (globalThis as any).shutdownServer("web-ui");

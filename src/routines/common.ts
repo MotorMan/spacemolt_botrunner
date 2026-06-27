@@ -3247,27 +3247,25 @@ export function logStatus(ctx: RoutineContext): void {
   ctx.log("info", `Credits: ${bot.credits} | Fuel: ${fuelPct}% | Hull: ${hullPct}% | Cargo: ${bot.cargo}/${bot.cargoMax} | System: ${bot.system} | Docked: ${bot.docked}`);
 }
 
-/** Minimum credits a bot must keep before donating to faction. */
-const FACTION_DONATE_FLOOR = 1000;
-
 /**
  * Donate a configurable % of profit to the faction treasury.
  * Reads `general.factionDonatePct` from settings (default 10).
- * Bot retains at least 1000 credits after donation.
+ * Bot retains at least `creditsToHold` credits after donation (default 10000).
  */
-export async function factionDonateProfit(ctx: RoutineContext, profit: number): Promise<void> {
+export async function factionDonateProfit(ctx: RoutineContext, profit: number, creditsToHold?: number): Promise<void> {
   if (profit <= 0) return;
   const all = readSettings();
   const pct = (all.general?.factionDonatePct as number) ?? 10;
   if (pct <= 0) return;
   const { bot } = ctx;
+  const hold = creditsToHold ?? (all.general?.factionDonateFloor as number) ?? 10000;
   const donation = Math.floor(profit * (pct / 100));
   if (donation <= 0) return;
-  if (bot.credits - donation < FACTION_DONATE_FLOOR) return;
+  if (bot.credits - donation < hold) return;
   const resp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: donation }); // NEVER CHANGE THIS - deposit credits to faction storage
   if (!resp.error) {
     ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
-    logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
+    logFactionActivity(ctx, "deposit", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
 }
 

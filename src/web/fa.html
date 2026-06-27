@@ -94,8 +94,10 @@
     <select id="faEventTypeSelect" style="display:none;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;min-width:140px;" title="Filter by event type">
       <option value="">event type</option>
     </select>
-    <input type="number" id="faPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Page number">
+    <input type="number" id="faStartPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Start page">
+    <input type="number" id="faPageCountInput" value="1" min="1" max="10" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Number of pages">
     <button id="faLoadBtn" onclick="loadActionLog()">Load Log</button>
+    <button id="faLoadPagesBtn" onclick="loadMultiplePages()">Load Pages</button>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
     <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
     <span id="faCooldown" style="font-size:11px;color:var(--text-dim);display:none;">Wait 1s...</span>
@@ -121,7 +123,7 @@
   </div>
 </div>
 
-<div id="faPasteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;display:none;align-items:center;justify-content:center;">
+<div id="faPasteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center;">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px;width:90%;max-width:700px;max-height:85vh;display:flex;flex-direction:column;gap:10px;">
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <strong style="font-size:14px;">Paste get_action_log JSON Result</strong>
@@ -147,6 +149,7 @@
   let activeCat = '';
   let activeEventType = '';
   let seenIds = new Set();
+  let lastLoadedPage = 1;
 
   const EVENT_TYPES = {
     mining: ['yield'],
@@ -278,11 +281,38 @@
       setFaStatus('Cooldown: wait 1 second before loading again.', false, true);
       return;
     }
+    pendingLoad = true;
+    document.getElementById('faLoadBtn').disabled = true;
+    document.getElementById('faCooldown').style.display = 'inline';
+    const cooldownEl = document.getElementById('faCooldown');
+    let countdown = 1;
+    cooldownEl.textContent = 'Wait ' + countdown + 's...';
+    const timer = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        clearInterval(timer);
+        pendingLoad = false;
+        document.getElementById('faLoadBtn').disabled = false;
+        cooldownEl.style.display = 'none';
+      } else {
+        cooldownEl.textContent = 'Wait ' + countdown + 's...';
+      }
+    }, 1000);
     const bot = document.getElementById('faBotSelect').value;
-    if (!bot) { alert('Select a bot first'); return; }
-    if (ws && ws.readyState !== WebSocket.OPEN) { alert('Not connected to server'); return; }
+    if (!bot) {
+      pendingLoad = false;
+      document.getElementById('faLoadBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+    if (ws && ws.readyState !== WebSocket.OPEN) {
+      pendingLoad = false;
+      document.getElementById('faLoadBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
 
-    const page = Math.max(1, parseInt(document.getElementById('faPageInput').value) || 1);
+    const page = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
     const params = {};
     if (activeCat) params.category = activeCat;
     if (activeEventType) params.event_type = activeEventType;
@@ -291,17 +321,91 @@
     setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
 
     sendExec(bot, 'get_action_log', params, (result) => {
-      document.getElementById('faLoadBtn').disabled = false;
       if (result.error) {
         setFaStatus('Error: ' + esc(result.error), true);
         return;
       }
       const data = result.data || {};
       const entries = parseEntries(data);
+      lastLoadedPage = page;
+      document.getElementById('faStartPageInput').value = page + 1;
       setFaStatus('Loaded ' + entries.length + ' entries for ' + esc(bot) + ' (page ' + page + ')', false, false);
       ingestEntries(entries);
       renderResults();
     });
+  }
+
+  function loadMultiplePages() {
+    if (pendingLoad) {
+      setFaStatus('Cooldown: wait 1 second before loading again.', false, true);
+      return;
+    }
+    pendingLoad = true;
+    document.getElementById('faLoadPagesBtn').disabled = true;
+    document.getElementById('faCooldown').style.display = 'inline';
+    const cooldownEl = document.getElementById('faCooldown');
+    let countdown = 1;
+    cooldownEl.textContent = 'Wait ' + countdown + 's...';
+    const timer = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        clearInterval(timer);
+        pendingLoad = false;
+        document.getElementById('faLoadPagesBtn').disabled = false;
+        cooldownEl.style.display = 'none';
+      } else {
+        cooldownEl.textContent = 'Wait ' + countdown + 's...';
+      }
+    }, 1000);
+    const bot = document.getElementById('faBotSelect').value;
+    if (!bot) {
+      pendingLoad = false;
+      document.getElementById('faLoadPagesBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+    if (ws && ws.readyState !== WebSocket.OPEN) {
+      pendingLoad = false;
+      document.getElementById('faLoadPagesBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+
+    const startPage = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
+    const pageCount = Math.max(1, Math.min(10, parseInt(document.getElementById('faPageCountInput').value) || 1));
+    const params = {};
+    if (activeCat) params.category = activeCat;
+    if (activeEventType) params.event_type = activeEventType;
+    const label = activeCat || 'all';
+    setFaStatus('Loading ' + pageCount + ' page(s) for ' + esc(bot) + ' (category: ' + label + ', from page ' + startPage + ')...', false, true);
+
+    let loadedPages = 0;
+    let totalEntries = 0;
+
+    const loadPage = (page) => {
+      params.page = page;
+      sendExec(bot, 'get_action_log', params, (result) => {
+        loadedPages++;
+        if (result.error) {
+          setFaStatus('Error on page ' + page + ': ' + esc(result.error), true);
+        } else {
+          const data = result.data || {};
+          const entries = parseEntries(data);
+          totalEntries += entries.length;
+          ingestEntries(entries);
+        }
+        if (loadedPages < pageCount) {
+          loadPage(startPage + loadedPages);
+        } else {
+          lastLoadedPage = startPage + pageCount - 1;
+          document.getElementById('faStartPageInput').value = startPage + pageCount;
+          renderResults();
+          setFaStatus('Loaded ' + totalEntries + ' entries from ' + pageCount + ' page(s)', false, false);
+        }
+      });
+    };
+
+    loadPage(startPage);
   }
 
   // ── Parse ───────────────────────────────────────────────
@@ -389,6 +493,8 @@
     creditsIn = 0;
     creditsOut = 0;
     activeEventType = '';
+    lastLoadedPage = 1;
+    document.getElementById('faStartPageInput').value = 1;
     document.getElementById('faCreditsIn').textContent = '0';
     document.getElementById('faCreditsOut').textContent = '0';
     document.getElementById('faNet').textContent = '0';
@@ -441,6 +547,15 @@
     activeEventType = document.getElementById('faEventTypeSelect').value;
     applyFilter();
     renderResults();
+  });
+
+  document.getElementById('faStartPageInput').addEventListener('input', () => {
+    lastLoadedPage = 0;
+  });
+
+  document.getElementById('faPageCountInput').addEventListener('input', () => {
+    const val = parseInt(document.getElementById('faPageCountInput').value) || 1;
+    document.getElementById('faPageCountInput').value = Math.max(1, Math.min(10, val));
   });
 
   // Apply initial styles on load
@@ -512,6 +627,7 @@
   initCatStyles();
   fetchInitialData();
   connect();
+  document.getElementById('faStartPageInput').value = lastLoadedPage + 1;
 </script>
 </body>
 </html>

@@ -82,6 +82,7 @@ function getFactionTraderSettings(username?: string): {
   stationPriority: boolean;
   categoryTrade: CategoryTradeConfig[];
   sellAllItems: boolean;
+  creditsToHold: number;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -133,6 +134,7 @@ function getFactionTraderSettings(username?: string): {
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     categoryTrade,
     sellAllItems: (t.sellAllItems as boolean) || false,
+    creditsToHold: (t.creditsToHold as number) || 10000,
   };
 }
 
@@ -1768,7 +1770,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         bot.stats.totalTrades++;
         bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
         ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue, ${route!.totalProfit}cr profit`);
-        await factionDonateProfit(ctx, route!.totalProfit);
+        await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
         await completeTradeSession(bot.username, totalRevenue, route!.totalProfit);
       } else if (route) {
         // No items sold - fail any existing session
@@ -2107,14 +2109,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               bot.stats.totalTrades++;
               bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
               ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
-              await factionDonateProfit(ctx, route!.totalProfit);
+              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
               await completeTradeSession(bot.username, revenue, route!.totalProfit);
             } else {
               const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
               bot.stats.totalTrades++;
               bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
               ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
-              await factionDonateProfit(ctx, route!.totalProfit);
+              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
               await completeTradeSession(bot.username, revenue, route!.totalProfit);
 
               // Release buy order lock
@@ -2210,9 +2212,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await tryRefuel(ctx);
     await repairShip(ctx);
 
-    // ── Deposit excess credits: keep only 10k, deposit rest to faction ──
+    // ── Deposit excess credits: keep only creditsToHold, deposit rest to faction ──
     yield "deposit_credits";
-    const BOT_WORKING_BALANCE = 10_000;
+    const BOT_WORKING_BALANCE = settings.creditsToHold || 10_000;
     if (bot.credits > BOT_WORKING_BALANCE) {
       const excessCredits = bot.credits - BOT_WORKING_BALANCE;
       //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });

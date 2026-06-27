@@ -115,13 +115,6 @@ main {
 .tab-page.active {
   display: flex;
 }
-#page-players {
-  padding: 0;
-  gap: 0;
-}
-#page-players.active {
-  display: flex;
-}
 #page-commandall {
   padding: 0;
   gap: 0;
@@ -129,16 +122,16 @@ main {
 #page-commandall.active {
   display: flex;
 }
-#page-fa {
-  padding: 0;
-  gap: 0;
-}
-#page-fa.active {
-  display: flex;
-}
 #page-achievements {
   padding: 0;
   gap: 0;
+}
+#playersFrame, #shipsforsaleFrame, #commandallFrame, #achievementsFrame {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border: none;
+  min-height: 0;
 }
 #page-marketbrowser {
   padding: 0;

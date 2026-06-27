@@ -35,11 +35,8 @@
           <div class="top-tab" data-tab="map" onclick="switchTab('map')">
             Map
           </div>
-          <div class="top-tab" data-tab="market" onclick="switchTab('market')">
+          <div class="top-tab active" data-tab="market" onclick="switchTab('market'); switchMarketView('overview')">
             Market
-          </div>
-          <div class="top-tab" data-tab="marketbrowser" onclick="switchTab('marketbrowser')">
-            Market Browser
           </div>
           <div
             class="top-tab"
@@ -55,29 +52,15 @@
           >
             Faction
           </div>
-          <div
+<div
             class="top-tab"
             data-tab="shipyard"
-            onclick="switchTab('shipyard')"
+            onclick="switchTab('shipyard'); switchShipyardView('manage')"
           >
             Shipyard
           </div>
-          <div class="top-tab" data-tab="stats" onclick="switchTab('stats')">
+          <div class="top-tab" data-tab="stats" onclick="switchTab('stats'); switchStatsView('main')">
             Stats
-          </div>
-          <div
-            class="top-tab"
-            data-tab="players"
-            onclick="switchTab('players')"
-          >
-            Players
-          </div>
-          <div
-            class="top-tab"
-            data-tab="shipsforsale"
-            onclick="switchTab('shipsforsale')"
-          >
-            Ships For Sale
           </div>
           <div
             class="top-tab"
@@ -86,22 +69,17 @@
           >
             Settings
           </div>
-          <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
-<div
-             class="top-tab"
-             data-tab="catalog"
-             onclick="switchTab('catalog')"
-           >
-             Catalog
-           </div>
-           <div
-             class="top-tab"
-             data-tab="achievements"
-             onclick="switchTab('achievements')"
-           >
-             Achievements
-           </div>
-         </div>
+          <div class="top-tab" data-tab="catalog" onclick="switchTab('catalog')">
+            Catalog
+          </div>
+          <div
+            class="top-tab"
+            data-tab="achievements"
+            onclick="switchTab('achievements')"
+          >
+            Achievements
+          </div>
+          </div>
       </div>
       <div class="header-right">
         <div class="conn-status">
@@ -852,43 +830,47 @@
 
       <!-- ══ Market Tab ══ -->
       <div class="tab-page" id="page-market">
-        <div style="padding: 16px; overflow-y: auto; height: 100%">
-          <div
-            style="
-              display: flex;
-              align-items: center;
-              gap: 12px;
-              margin-bottom: 12px;
-              flex-wrap: wrap;
-            "
-          >
-            <h3 style="margin: 0; color: var(--text-bright)">
-              Market Overview
-            </h3>
-            <span
-              id="marketStats"
-              style="color: var(--text-dim); font-size: 12px"
-            ></span>
-            <input
-              type="text"
-              id="marketSearch"
-              placeholder="Search items..."
-              oninput="renderMarketTable()"
-              style="
-                margin-left: auto;
-                width: 200px;
-                font-size: 12px;
-                padding: 4px 8px;
-              "
-            />
-          </div>
-          <div id="marketTableWrap"></div>
+        <div class="market-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;">
+          <button class="active" onclick="switchMarketView('overview')" id="marketViewOverview">Market Overview</button>
+          <button onclick="switchMarketView('browser')" id="marketViewBrowser">Market Browser</button>
         </div>
-      </div>
-
-      <!-- ══ Market Browser Tab ══ -->
-      <div class="tab-page" id="page-marketbrowser">
-        <iframe id="marketbrowserFrame" src="/market.html"></iframe>
+        <div id="marketOverviewView">
+          <div style="padding: 16px; overflow-y: auto; height: calc(100% - 50px)">
+            <div
+              style="
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+                flex-wrap: wrap;
+              "
+            >
+              <h3 style="margin: 0; color: var(--text-bright)">
+                Market Overview
+              </h3>
+              <span
+                id="marketStats"
+                style="color: var(--text-dim); font-size: 12px"
+              ></span>
+              <input
+                type="text"
+                id="marketSearch"
+                placeholder="Search items..."
+                oninput="renderMarketTable()"
+                style="
+                  margin-left: auto;
+                  width: 200px;
+                  font-size: 12px;
+                  padding: 4px 8px;
+                "
+              />
+            </div>
+            <div id="marketTableWrap"></div>
+          </div>
+        </div>
+        <div id="marketBrowserView" style="display: none; height: calc(100% - 50px)">
+          <iframe id="marketbrowserFrame" src="/market.html" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
       </div>
 
       <!-- ══ Missions Tab ══ -->
@@ -939,32 +921,26 @@
 
       <!-- ══ Shipyard Tab ══ -->
       <div class="tab-page" id="page-shipyard">
-        <div class="faction-layout">
-          <div class="faction-sidebar">
-            <div class="faction-sidebar-header">Shipyard</div>
-            <div class="faction-sidebar-body" id="shipyardSidebarBody">
-              <!-- filled by JS -->
+        <div class="shipyard-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;">
+          <button class="active" onclick="switchShipyardView('manage')" id="shipyardViewManage">Manage Ships</button>
+          <button onclick="switchShipyardView('forsale')" id="shipyardViewForsale">Ships For Sale</button>
+        </div>
+        <div id="shipyardManageView">
+          <div class="faction-layout">
+            <div class="faction-sidebar">
+              <div class="faction-sidebar-header">Shipyard</div>
+              <div class="faction-sidebar-body" id="shipyardSidebarBody">
+                <!-- filled by JS -->
+              </div>
+            </div>
+            <div class="faction-content" id="shipyardContent">
+              <div class="faction-no-data">Select a bot to manage ships.</div>
             </div>
           </div>
-          <div class="faction-content" id="shipyardContent">
-            <div class="faction-no-data">Select a bot to manage ships.</div>
-          </div>
         </div>
-      </div>
-
-      <!-- ══ Players Tab ══ -->
-      <div class="tab-page" id="page-players">
-        <iframe id="playersFrame" src="/players.html"></iframe>
-      </div>
-
-      <!-- ══ Ships For Sale Tab ══ -->
-      <div class="tab-page" id="page-shipsforsale">
-        <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
-      </div>
-
-      <!-- ══ Forensic Analysis Tab ══ -->
-      <div class="tab-page" id="page-fa">
-        <iframe id="faFrame" src="/fa.html"></iframe>
+        <div id="shipyardForsaleView" style="display: none; height: 100%">
+          <iframe id="shipsforsaleFrame" src="/shipsforsale.html" style="width: 100%; height: calc(100% - 50px); border: none;"></iframe>
+        </div>
       </div>
 
       <!-- ══ Stats Tab ══ -->
@@ -1031,6 +1007,15 @@
           </button>
           <button id="statsTabSkills" onclick="switchStatsView('skills')">
             Skills
+          </button>
+          <button id="statsTabPlayers" onclick="switchStatsView('players')">
+            Players
+          </button>
+          <button id="statsTabFa" onclick="switchStatsView('fa')">
+            Forensic Analysis
+          </button>
+          <button id="statsTabAchievements" onclick="switchStatsView('achievements')">
+            Achievements
           </button>
         </div>
 
@@ -1278,6 +1263,21 @@
             <div class="skills-empty">Loading skills data...</div>
           </div>
         </div>
+
+        <!-- Players View -->
+        <div id="statsPlayersView" style="display: none; height: 100%">
+          <iframe id="playersFrame" src="/players.html" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+
+        <!-- Forensic Analysis View -->
+        <div id="statsFaView" style="display: none; height: 100%">
+          <iframe id="faFrame" src="/fa.html" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+
+        <!-- Achievements View -->
+        <div id="statsAchievementsView" style="display: none; height: 100%">
+          <iframe id="achievementsFrame" src="/achievements.html" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
       </div>
 
       <!-- ══ Catalog Tab ══ -->
@@ -1303,11 +1303,6 @@
             <div class="catalog-empty">Select a category to browse items.</div>
           </div>
         </div>
-      </div>
-
-      <!-- ══ Achievements Tab ══ -->
-      <div class="tab-page" id="page-achievements">
-        <iframe id="achievementsFrame" src="/achievements.html"></iframe>
       </div>
 
       <!-- ══ Bot Profile Page (hidden by default) ══ -->
@@ -1597,39 +1592,39 @@
           renderStatsTab();
           refreshFactionFunds();
           loadTaxesDataAndRender();
+          switchStatsView("main");
         }
         if (name === "commandall") {
           const frame = document.getElementById("commandallFrame");
           if (frame) frame.src = frame.src;
         }
         if (name === "fleetcombat") {
-          renderFleetCombatControls(true); // Force render when tab is opened
-          // Update battle UI visibility
+          renderFleetCombatControls(true);
           updateBattleUI();
-        }
-        if (name === "players") {
-          // Refresh the iframe to get latest data
-          const frame = document.getElementById("playersFrame");
-          if (frame) frame.src = frame.src;
-        }
-        if (name === "shipsforsale") {
-          // Refresh the iframe to get latest data
-          const frame = document.getElementById("shipsforsaleFrame");
-          if (frame) frame.src = frame.src;
-        }
-        if (name === "fa") {
-          const frame = document.getElementById("faFrame");
-          if (frame) frame.src = frame.src;
         }
         if (name === "catalog") {
           renderCatalog();
         }
-        if (name === "achievements") {
-          const frame = document.getElementById("achievementsFrame");
+      }
+
+      function switchMarketView(view) {
+        document.getElementById("marketViewOverview").classList.toggle("active", view === "overview");
+        document.getElementById("marketViewBrowser").classList.toggle("active", view === "browser");
+        document.getElementById("marketOverviewView").style.display = view === "overview" ? "" : "none";
+        document.getElementById("marketBrowserView").style.display = view === "browser" ? "" : "none";
+        if (view === "browser") {
+          const frame = document.getElementById("marketbrowserFrame");
           if (frame) frame.src = frame.src;
         }
-        if (name === "marketbrowser") {
-          const frame = document.getElementById("marketbrowserFrame");
+      }
+
+      function switchShipyardView(view) {
+        document.getElementById("shipyardViewManage").classList.toggle("active", view === "manage");
+        document.getElementById("shipyardViewForsale").classList.toggle("active", view === "forsale");
+        document.getElementById("shipyardManageView").style.display = view === "manage" ? "" : "none";
+        document.getElementById("shipyardForsaleView").style.display = view === "forsale" ? "" : "none";
+        if (view === "forsale") {
+          const frame = document.getElementById("shipsforsaleFrame");
           if (frame) frame.src = frame.src;
         }
       }
@@ -3673,12 +3668,27 @@
         document
           .getElementById("statsTabSkills")
           .classList.toggle("active", view === "skills");
+        document
+          .getElementById("statsTabPlayers")
+          .classList.toggle("active", view === "players");
+        document
+          .getElementById("statsTabFa")
+          .classList.toggle("active", view === "fa");
+        document
+          .getElementById("statsTabAchievements")
+          .classList.toggle("active", view === "achievements");
         document.getElementById("statsMainView").style.display =
           view === "main" ? "" : "none";
         document.getElementById("statsTaxesView").style.display =
           view === "taxes" ? "" : "none";
         document.getElementById("statsSkillsView").style.display =
           view === "skills" ? "" : "none";
+        document.getElementById("statsPlayersView").style.display =
+          view === "players" ? "" : "none";
+        document.getElementById("statsFaView").style.display =
+          view === "fa" ? "" : "none";
+        document.getElementById("statsAchievementsView").style.display =
+          view === "achievements" ? "" : "none";
         if (view === "taxes") {
           if (!taxesLoaded) {
             await loadTaxesData();
@@ -3693,6 +3703,18 @@
           startSkillsUpdates();
         } else {
           stopSkillsUpdates();
+        }
+        if (view === "players") {
+          const frame = document.getElementById("playersFrame");
+          if (frame) frame.src = frame.src;
+        }
+        if (view === "fa") {
+          const frame = document.getElementById("faFrame");
+          if (frame) frame.src = frame.src;
+        }
+        if (view === "achievements") {
+          const frame = document.getElementById("achievementsFrame");
+          if (frame) frame.src = frame.src;
         }
       }
 

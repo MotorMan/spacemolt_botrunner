@@ -49,6 +49,7 @@
         <span class="filter-btn" onclick="switchItemType('fuel')">Fuel</span>
         <span class="filter-btn" onclick="switchItemType('consumable')">Consumable</span>
         <span class="filter-btn" onclick="switchItemType('refined')">Refined</span>
+        <span class="filter-btn" onclick="switchItemType('other')">Other</span>
       </div>
       <input type="text" class="search-input" id="itemSearch" placeholder="Search items..." onkeyup="filterItems()">
     </div>
@@ -60,28 +61,117 @@
 
   <script>
     let mapData = {};
+    let catalogData = {};
     let currentItemType = 'all';
-    let itemCategoryMap = {};
+    let currentSortCol = null;
+    let currentSortDir = 'asc';
     let mobileCapitol = null;
 
-    const ITEM_CATEGORIES = {
-      ore: ['ore', 'ice'],
-      material: ['gas', 'plate', 'alloy', 'sheet', 'wiring', 'cell', 'residue', 'crystal', 'fragment', 'essence', 'matter'],
-      component: ['armor', 'hull', 'shield', 'recharger', 'booster', 'hardener', 'repairer', 'module', 'unit', 'array', 'core', 'cluster', 'lens', 'processor', 'separator', 'vent', 'stabilizer', 'matrix', 'capacitor', 'reactor', 'thruster', 'assemblies'],
-      ammo: ['rounds', 'missiles', 'torpedoes', 'cannon', 'beam', 'laser', 'projectile', 'smartbomb', 'mine', 'charge', 'shell'],
-      drone: ['drone'],
-      fuel: ['fuel', 'cell', 'rod', 'ice'],
-      module: ['bay', 'rig', 'array', 'device', 'chamber', 'stabilizer', 'injector', 'optimizer'],
-      consumable: ['rations', 'stim', 'culture', 'serum', 'spirit', 'wine', 'food', 'medicine', 'biotic', 'pharmaceutical'],
-      refined: ['refined', 'processed', 'purified', 'contained', 'concentrate', 'enriched']
-    };
+    async function loadCatalog() {
+      try {
+        const res = await fetch('/data/catalog.json');
+        catalogData = await res.json();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+      }
+    }
 
-    function getItemCategory(itemId, itemName) {
-      const key = (itemId + ' ' + (itemName || '')).toLowerCase();
-      for (const [cat, keywords] of Object.entries(ITEM_CATEGORIES)) {
-        if (keywords.some(kw => key.includes(kw))) {
-          return cat;
-        }
+function getItemCategory(itemId, itemName) {
+      const name = (itemName || itemId).toLowerCase();
+      
+      if (name.includes('_ore') || name.endsWith('_ore')) return 'ore';
+      if (name.includes('_ice')) return 'ore';
+      if (name.includes('gas_') || name.includes('residue')) return 'material';
+      if (name.includes('crystal')) return 'material';
+      if (name.includes('armor_') || name.includes('hull_') || name.includes('shield_') || 
+          name.includes('recharger_') || name.includes('booster_') || name.includes('hardener_') ||
+          name.includes('repairer_') || name.includes('unit_') || name.includes('array_') ||
+          name.includes('core_') || name.includes('cluster_') || name.includes('lens_') ||
+          name.includes('processor_') || name.includes('separator_') || name.includes('vent_') ||
+          name.includes('stabilizer_') || name.includes('matrix_') || name.includes('capacitor_') ||
+          name.includes('reactor_') || name.includes('thruster_') || name.includes('assemblies_')) return 'component';
+      if (name.includes('_rounds') || name.includes('missiles_') || name.includes('torpedoes_') ||
+          name.includes('cannon_') || name.includes('beam_') || name.includes('laser_') ||
+          name.includes('projectile_') || name.includes('smartbomb_') || name.includes('mine_') ||
+          name.includes('charge_') || name.includes('shell_')) return 'ammo';
+      if (name.includes('drone_')) return 'drone';
+      if (name.includes('fuel_') || name.includes('rod_')) return 'fuel';
+      if (name.includes('bay_') || name.includes('rig_') || name.includes('device_') ||
+          name.includes('chamber_') || name.includes('injector_') || name.includes('optimizer_')) return 'module';
+      if (name.includes('rations_') || name.includes('stim_') || name.includes('culture_') ||
+          name.includes('serum_') || name.includes('spirit_') || name.includes('wine_') ||
+          name.includes('food_') || name.includes('medicine_') || name.includes('biotic_') ||
+          name.includes('pharmaceutical_')) return 'consumable';
+      
+      const item = catalogData.items?.[itemId];
+      if (item?.category) {
+        const cat = item.category.toLowerCase();
+        const categoryMap = {
+          'ore': 'ore',
+          'mineral': 'ore',
+          'ice': 'ore',
+          'gas': 'material',
+          'plate': 'material',
+          'alloy': 'material',
+          'sheet': 'material',
+          'wiring': 'material',
+          'residue': 'material',
+          'fragment': 'material',
+          'essence': 'material',
+          'matter': 'material',
+          'armor': 'component',
+          'hull': 'component',
+          'shield': 'component',
+          'recharger': 'component',
+          'booster': 'component',
+          'hardener': 'component',
+          'repairer': 'component',
+          'unit': 'component',
+          'core': 'component',
+          'cluster': 'component',
+          'lens': 'component',
+          'processor': 'component',
+          'separator': 'component',
+          'vent': 'component',
+          'stabilizer': 'component',
+          'matrix': 'component',
+          'capacitor': 'component',
+          'reactor': 'component',
+          'thruster': 'component',
+          'assemblies': 'component',
+          'rounds': 'ammo',
+          'missiles': 'ammo',
+          'torpedoes': 'ammo',
+          'cannon': 'ammo',
+          'beam': 'ammo',
+          'laser': 'ammo',
+          'projectile': 'ammo',
+          'smartbomb': 'ammo',
+          'mine': 'ammo',
+          'charge': 'ammo',
+          'shell': 'ammo',
+          'drone': 'drone',
+          'fuel': 'fuel',
+          'rod': 'fuel',
+          'bay': 'module',
+          'rig': 'module',
+          'device': 'module',
+          'chamber': 'module',
+          'injector': 'module',
+          'optimizer': 'module',
+          'rations': 'consumable',
+          'stim': 'consumable',
+          'culture': 'consumable',
+          'serum': 'consumable',
+          'spirit': 'consumable',
+          'wine': 'consumable',
+          'food': 'consumable',
+          'medicine': 'consumable',
+          'biotic': 'consumable',
+          'pharmaceutical': 'consumable',
+        };
+        const normalized = categoryMap[cat];
+        if (normalized) return normalized;
       }
       return 'other';
     }
@@ -112,6 +202,7 @@
         const mapRes = await fetch('/data/map.json');
         mapData = await mapRes.json();
         mobileCapitol = mapData.mobile_capitol || null;
+        await loadCatalog();
         renderMarket();
       } catch (e) {
         console.error('Failed to load data:', e);
@@ -189,8 +280,7 @@
               const itemId = m.item_id;
               if (!itemId) continue;
               
-              const category = itemCategoryMap[itemId] || getItemCategory(itemId, m.item_name);
-              itemCategoryMap[itemId] = category;
+              const category = getItemCategory(itemId, m.item_name);
               
               if (currentItemType !== 'all' && category !== currentItemType) continue;
               if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && 
@@ -268,21 +358,44 @@
           <thead>
             <tr>
               <th style="width:32px"></th>
-              <th>Item</th>
-              <th>Category</th>
-              <th>Avg Buy Price</th>
-              <th>Avg Sell Price</th>
-              <th>Demand</th>
-              <th>Supply</th>
-              <th>Profit</th>
+              <th onclick="sortItems('item')">Item${getSortIndicator('item')}</th>
+              <th onclick="sortItems('category')">Category${getSortIndicator('category')}</th>
+              <th onclick="sortItems('avgBuy')">Avg Buy Price${getSortIndicator('avgBuy')}</th>
+              <th onclick="sortItems('avgSell')">Avg Sell Price${getSortIndicator('avgSell')}</th>
+              <th onclick="sortItems('demand')" style="text-align:center">Demand${getSortIndicator('demand')}</th>
+              <th onclick="sortItems('supply')" style="text-align:center">Supply${getSortIndicator('supply')}</th>
+              <th onclick="sortItems('profit')">Profit${getSortIndicator('profit')}</th>
             </tr>
           </thead>
           <tbody>
       `;
 
       for (const faction of factionNames) {
-        const items = Object.entries(factionAverages[faction]);
-        items.sort((a, b) => b[1].avgSell - a[1].avgSell);
+        let items = Object.entries(factionAverages[faction]);
+        
+        if (currentSortCol) {
+          items.sort((a, b) => {
+            let valA, valB;
+            if (currentSortCol === 'item') {
+              valA = a[0]; valB = b[0];
+            } else if (currentSortCol === 'category') {
+              valA = itemMap.get(a[0])?.category || ''; valB = itemMap.get(b[0])?.category || '';
+            } else if (currentSortCol === 'profit') {
+              valA = itemMap.get(a[0]) ? (a[1].avgSell - a[1].avgBuy) : 0;
+              valB = itemMap.get(b[0]) ? (b[1].avgSell - b[1].avgBuy) : 0;
+            } else {
+              valA = a[1][currentSortCol] || 0;
+              valB = b[1][currentSortCol] || 0;
+            }
+            if (typeof valA === 'string') {
+              valA = valA.toLowerCase();
+              valB = valB.toLowerCase();
+            }
+            if (valA < valB) return currentSortDir === 'asc' ? -1 : 1;
+            if (valA > valB) return currentSortDir === 'asc' ? 1 : -1;
+            return 0;
+          });
+        }
         
         html += `<tr class="faction-header" style="background:${getFactionColor(faction)}20">
           <td><span class="expand-btn" onclick="toggleFaction(this)">▼</span></td>
@@ -296,8 +409,6 @@
           const data = itemMap.get(itemId);
           const profit = prices.avgSell - prices.avgBuy;
           const profitColor = profit > 0 ? 'var(--green)' : profit < 0 ? 'var(--red)' : 'var(--text-dim)';
-          const stationList = data.stations.map(s => `${s.stationName}(${s.buyPrice})`).join(', ');
-          
           html += `
             <tr class="item-row" data-item="${itemId}" onclick="showStationDetails(this, ${JSON.stringify(data.stations).replace(/"/g, '&quot;')})">
               <td></td>
@@ -311,8 +422,7 @@
             </tr>
             <tr class="station-detail" style="display:none">
               <td></td>
-              <td colspan="6" style="font-size:11px;color:var(--text-dim);padding:4px 12px">
-                ${stationList}
+              <td colspan="6" style="font-size:11px;color:var(--text-dim);padding:8px 12px">
               </td>
             </tr>
           `;
@@ -343,7 +453,6 @@
 
     function toggleFaction(btn) {
       const row = btn.closest('tr');
-      const factionName = row.textContent.trim();
       const isCollapsed = btn.textContent === '▶';
       
       if (isCollapsed) {
@@ -354,7 +463,7 @@
         row.classList.add('collapsed');
       }
       
-      let nextRow = row.nextSibling;
+      let nextRow = row.nextElementSibling;
       while (nextRow) {
         if (nextRow.classList.contains('faction-header')) break;
         if (nextRow.classList.contains('item-row')) {
@@ -362,7 +471,7 @@
         } else if (nextRow.classList.contains('station-detail')) {
           nextRow.style.display = 'none';
         }
-        nextRow = nextRow.nextSibling;
+        nextRow = nextRow.nextElementSibling;
       }
     }
 
@@ -376,6 +485,21 @@
         'Unknown': '#607d8b'
       };
       return colors[faction] || '#607d8b';
+    }
+
+    function getSortIndicator(col) {
+      if (col !== currentSortCol) return '';
+      return currentSortDir === 'asc' ? ' ▲' : ' ▼';
+    }
+
+    function sortItems(col) {
+      if (col === currentSortCol) {
+        currentSortDir = currentSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        currentSortCol = col;
+        currentSortDir = 'asc';
+      }
+      renderMarket();
     }
 
     function esc(s) {

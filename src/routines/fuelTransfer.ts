@@ -38,6 +38,64 @@ import {
 
 const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell", "military_fuel_cell"];
 
+// ── Cloaking module detection and enablement ────────────────────────────────
+
+/**
+ * Check if the ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * This is a one-time command - once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("fuel", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx);
+  if (!hasCloak) {
+    ctx.log("fuel", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("fuel", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("fuel", "Cloaking enabled successfully");
+  return true;
+}
+
 function isFuelCellItem(itemId: string): boolean {
   const lower = itemId.toLowerCase();
   return FUEL_CELL_ITEM_ID_PREFIXES.some(p => lower.includes(p));
@@ -70,6 +128,7 @@ interface FuelTransportSettings {
   items: FuelTransportItem[];
   refuelThreshold: number;
   repairThreshold: number;
+  autoCloak: boolean;
 }
 
 function getActiveLoadouts(): FacilityTransferLoadout[] {
@@ -98,6 +157,7 @@ function getFuelTransportSettings(username?: string): FuelTransportSettings {
     items,
     refuelThreshold: (t.refuelThreshold as number) || 35,
     repairThreshold: (t.repairThreshold as number) || 40,
+    autoCloak: (t.autoCloak as boolean) ?? false,
   };
 }
 
@@ -271,6 +331,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   const safetyOpts = {
     fuelThresholdPct: settings.refuelThreshold,
     hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
   };
 
   const general = readSettings().general || {};
@@ -292,6 +353,10 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   }
 
   ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
+
+  if (settings.autoCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
 
   const activeLoadouts = getActiveLoadouts();
   const useLoadoutMode = activeLoadouts.length > 0;
@@ -335,6 +400,11 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       yield "death_recovery";
       await ctx.sleep(30000);
       continue;
+    }
+
+    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
+      ctx.log("fuel", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+      await enableCloakingIfPossible(ctx);
     }
 
     if (!bot.docked || bot.poi !== homeStation || bot.system !== homeSystem) {

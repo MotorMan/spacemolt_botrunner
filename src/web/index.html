@@ -38,7 +38,7 @@
           <div class="top-tab" data-tab="market" onclick="switchTab('market')">
             Market
           </div>
-          <div class="top-tab" data-tab="marketbrowser" onclick="window.open('/market.html', '_blank'); return false;">
+          <div class="top-tab" data-tab="marketbrowser" onclick="switchTab('marketbrowser')">
             Market Browser
           </div>
           <div
@@ -886,6 +886,11 @@
         </div>
       </div>
 
+      <!-- ══ Market Browser Tab ══ -->
+      <div class="tab-page" id="page-marketbrowser">
+        <iframe id="marketbrowserFrame" src="/market.html"></iframe>
+      </div>
+
       <!-- ══ Missions Tab ══ -->
       <div class="tab-page" id="page-missions">
         <div class="missions-layout">
@@ -1621,6 +1626,10 @@
         }
         if (name === "achievements") {
           const frame = document.getElementById("achievementsFrame");
+          if (frame) frame.src = frame.src;
+        }
+        if (name === "marketbrowser") {
+          const frame = document.getElementById("marketbrowserFrame");
           if (frame) frame.src = frame.src;
         }
       }
@@ -26142,6 +26151,7 @@ async function fetchPersonalFacilityTypes(username) {
         const repairThreshold = ft.repairThreshold ?? 40;
         const useLoadouts = ft.useLoadouts ?? false;
         const selectedLoadout = ft.selectedLoadout ?? "";
+        const autoCloak = ft.autoCloak ?? false;
 
         const general = settings.general || {};
         const generalSystem = general.factionStorageSystem || "";
@@ -26313,25 +26323,33 @@ async function fetchPersonalFacilityTypes(username) {
     </div>
 
     <div class="setting-row" style="margin-top:16px">
-      <div>
-        <div class="setting-label">Refuel Threshold (%)</div>
-        <div class="setting-hint">Refuel when fuel drops below this %.</div>
+        <div>
+          <div class="setting-label">Refuel Threshold (%)</div>
+          <div class="setting-hint">Refuel when fuel drops below this %.</div>
+        </div>
+        <input type="number" id="set-ft-refuelThreshold" min="10" max="80" value="${refuelThreshold}">
       </div>
-      <input type="number" id="set-ft-refuelThreshold" min="10" max="80" value="${refuelThreshold}">
-    </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Repair Threshold (%)</div>
-        <div class="setting-hint">Repair hull when HP drops below this %.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Repair Threshold (%)</div>
+          <div class="setting-hint">Repair hull when HP drops below this %.</div>
+        </div>
+        <input type="number" id="set-ft-repairThreshold" min="10" max="80" value="${repairThreshold}">
       </div>
-      <input type="number" id="set-ft-repairThreshold" min="10" max="80" value="${repairThreshold}">
-    </div>
 
-    <div class="settings-save-bar">
-      <button class="sm" onclick="loadFuelTransferLoadouts(); renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
-      <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
-    </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto Cloak</div>
+          <div class="setting-hint">Enable cloaking when traveling through dangerous systems.</div>
+        </div>
+        <input type="checkbox" id="set-ft-autoCloak" ${autoCloak ? "checked" : ""}>
+      </div>
+
+      <div class="settings-save-bar">
+        <button class="sm" onclick="loadFuelTransferLoadouts(); renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
+        <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
+      </div>
   `;
       }
 
@@ -26459,6 +26477,7 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-ft-repairThreshold")?.value,
             ) || 40,
+          autoCloak: document.getElementById("set-ft-autoCloak")?.checked || false,
         };
         send({ type: "saveSettings", routine: "fuel_transport", settings: s });
         settings.fuel_transport = s;

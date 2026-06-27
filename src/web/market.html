@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market Browser - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--text); }
+    body { padding:16px; display:flex; flex-direction:column; overflow:hidden; }
+    .market-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .market-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .market-header h3 { margin:0; color:var(--text-bright); }
+    .market-controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .filter-btn { padding:6px 12px; cursor:pointer; border:1px solid var(--border); border-radius:4px; background:var(--card-bg); color:var(--text); font-size:12px; }
+    .filter-btn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .search-input { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; flex:1; max-width:300px; }
+    .view-content { flex:1; min-height:0; overflow:auto; }
+    .market-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .market-table th { text-align:left; padding:8px 12px; background:var(--card-bg); border-bottom:1px solid var(--border); color:var(--text-dim); font-weight:600; cursor:pointer; white-space:nowrap; }
+    .market-table th:hover { color:var(--text); }
+    .market-table td { padding:6px 12px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    .market-table tr:hover { background:var(--hover); }
+    .faction-header { background:var(--card-bg); padding:12px; border-bottom:1px solid var(--border); margin-top:16px; margin-bottom:8px; font-weight:600; color:var(--text-bright); display:flex; justify-content:space-between; align-items:center; }
+    .faction-header.collapsed { opacity:0.6; }
+    .expand-btn { padding:2px 8px; font-size:11px; cursor:pointer; color:var(--text-dim); }
+    .expand-btn:hover { color:var(--accent); }
+    .station-info { font-size:11px; color:var(--text-dim); margin-top:4px; }
+    .age-old { color:#f44336; }
+    .age-warm { color:#ff9800; }
+    .age-new { color:#4caf50; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+    .stats-bar { font-size:12px; color:var(--text-dim); margin-bottom:12px; }
+    .item-type-tag { display:inline-block; padding:2px 6px; background:var(--card-bg); border:1px solid var(--border); border-radius:3px; font-size:10px; margin-left:4px; }
+  </style>
+</head>
+<body>
+  <div class="market-layout">
+    <div class="market-header">
+      <h3>Market Browser</h3>
+      <div class="market-controls">
+        <span class="filter-btn active" onclick="switchItemType('all')">All Items</span>
+        <span class="filter-btn" onclick="switchItemType('ore')">Ore</span>
+        <span class="filter-btn" onclick="switchItemType('material')">Material</span>
+        <span class="filter-btn" onclick="switchItemType('component')">Component</span>
+        <span class="filter-btn" onclick="switchItemType('ammo')">Ammo</span>
+        <span class="filter-btn" onclick="switchItemType('module')">Module</span>
+        <span class="filter-btn" onclick="switchItemType('drone')">Drone</span>
+        <span class="filter-btn" onclick="switchItemType('fuel')">Fuel</span>
+        <span class="filter-btn" onclick="switchItemType('consumable')">Consumable</span>
+        <span class="filter-btn" onclick="switchItemType('refined')">Refined</span>
+      </div>
+      <input type="text" class="search-input" id="itemSearch" placeholder="Search items..." onkeyup="filterItems()">
+    </div>
+    <div class="stats-bar" id="marketStats"></div>
+    <div class="view-content" id="viewContent">
+      <div class="empty-state">Loading market data...</div>
+    </div>
+  </div>
+
+  <script>
+    let mapData = {};
+    let currentItemType = 'all';
+    let itemCategoryMap = {};
+    let mobileCapitol = null;
+
+    const ITEM_CATEGORIES = {
+      ore: ['ore', 'ice'],
+      material: ['gas', 'plate', 'alloy', 'sheet', 'wiring', 'cell', 'residue', 'crystal', 'fragment', 'essence', 'matter'],
+      component: ['armor', 'hull', 'shield', 'recharger', 'booster', 'hardener', 'repairer', 'module', 'unit', 'array', 'core', 'cluster', 'lens', 'processor', 'separator', 'vent', 'stabilizer', 'matrix', 'capacitor', 'reactor', 'thruster', 'assemblies'],
+      ammo: ['rounds', 'missiles', 'torpedoes', 'cannon', 'beam', 'laser', 'projectile', 'smartbomb', 'mine', 'charge', 'shell'],
+      drone: ['drone'],
+      fuel: ['fuel', 'cell', 'rod', 'ice'],
+      module: ['bay', 'rig', 'array', 'device', 'chamber', 'stabilizer', 'injector', 'optimizer'],
+      consumable: ['rations', 'stim', 'culture', 'serum', 'spirit', 'wine', 'food', 'medicine', 'biotic', 'pharmaceutical'],
+      refined: ['refined', 'processed', 'purified', 'contained', 'concentrate', 'enriched']
+    };
+
+    function getItemCategory(itemId, itemName) {
+      const key = (itemId + ' ' + (itemName || '')).toLowerCase();
+      for (const [cat, keywords] of Object.entries(ITEM_CATEGORIES)) {
+        if (keywords.some(kw => key.includes(kw))) {
+          return cat;
+        }
+      }
+      return 'other';
+    }
+
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/ws`);
+      
+      ws.onopen = () => {
+        loadData();
+      };
+      
+      ws.onclose = () => {
+        setTimeout(connect, 2000);
+      };
+      
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'init') {
+          loadData();
+        }
+      };
+    }
+
+    async function loadData() {
+      try {
+        const mapRes = await fetch('/data/map.json');
+        mapData = await mapRes.json();
+        mobileCapitol = mapData.mobile_capitol || null;
+        renderMarket();
+      } catch (e) {
+        console.error('Failed to load data:', e);
+      }
+    }
+
+    function getFactionForStation(stationId) {
+      const factionFiles = {
+        'sol_central': 'Solarian',
+        'sirius_observatory_station': 'Solarian',
+        'procyon_colonial_station': 'Solarian',
+        'alpha_centauri_colonial_station': 'Solarian',
+        'nova_terra_central': 'Solarian',
+        'the_core': 'Voidborn',
+        'synchrony_hub': 'Voidborn',
+        'node_gamma_relay_station': 'Voidborn',
+        'node_alpha_processing_station': 'Voidborn',
+        'node_beta_industrial_station': 'Voidborn',
+        'the_experiment_research_station': 'Voidborn',
+        'market_prime_exchange': 'Nebula',
+        'grand_exchange': 'Nebula',
+        'treasure_cache_trading_post': 'Nebula',
+        'gold_run_extraction_hub': 'Nebula',
+        'cargo_lanes_freight_depot': 'Nebula',
+        'factory_belt_manufacturing_hub': 'Nebula',
+        'the_levy_customs_station': 'Nebula',
+        'traders_rest_resort_station': 'Nebula',
+        'war_citadel': 'Crimson',
+        'the_anvil_arsenal': 'Crimson',
+        'ironhearth_station': 'Crimson',
+        'blood_forge_smelting_works': 'Crimson',
+        'ramens_rest': 'Outer Rim',
+        'deep_range_outpost': 'Outer Rim',
+        'first_step_memorial_station': 'Outer Rim',
+        'void_gate_outpost': 'Outer Rim',
+        'starfall_salvage_station': 'Outer Rim',
+        'unknown_edge_waystation': 'Outer Rim',
+        'mobile_capital': 'Outer Rim'
+      };
+      return factionFiles[stationId] || 'Unknown';
+    }
+
+    function switchItemType(type) {
+      currentItemType = type;
+      document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.filter-btn').forEach(b => {
+        if (b.textContent.toLowerCase().includes(type) || (type === 'all' && b.textContent === 'All Items')) {
+          b.classList.add('active');
+        }
+      });
+      renderMarket();
+    }
+
+    function filterItems() {
+      renderMarket();
+    }
+
+    function isMobileCapitol(poiId) {
+      return poiId && poiId.includes('mobile_capitol');
+    }
+
+    function renderMarket() {
+      const container = document.getElementById('viewContent');
+      const searchTerm = document.getElementById('itemSearch')?.value?.toLowerCase() || '';
+      
+      const itemMap = new Map();
+      const systems = mapData.systems || {};
+      
+      for (const [sysId, sys] of Object.entries(systems)) {
+        const sysName = sys.name || sysId;
+        for (const poi of sys.pois || []) {
+          if (isMobileCapitol(poi.id)) continue;
+          if (poi.market && Array.isArray(poi.market)) {
+            for (const m of poi.market) {
+              const itemId = m.item_id;
+              if (!itemId) continue;
+              
+              const category = itemCategoryMap[itemId] || getItemCategory(itemId, m.item_name);
+              itemCategoryMap[itemId] = category;
+              
+              if (currentItemType !== 'all' && category !== currentItemType) continue;
+              if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && 
+                  !(m.item_name && m.item_name.toLowerCase().includes(searchTerm))) continue;
+              
+              if (!itemMap.has(itemId)) {
+                itemMap.set(itemId, {
+                  name: m.item_name || itemId,
+                  category: category,
+                  stations: [],
+                  totalBuy: 0,
+                  totalSell: 0,
+                  bestBuyPrice: 0,
+                  bestSellPrice: 0
+                });
+              }
+              
+              const entry = itemMap.get(itemId);
+              const stationName = poi.name || poi.id;
+              const faction = getFactionForStation(poi.id);
+              
+              entry.stations.push({
+                sysName,
+                stationName,
+                faction,
+                buyPrice: m.best_sell || 0,
+                sellPrice: m.best_buy || 0,
+                demand: m.buy_quantity || 0,
+                supply: m.sell_quantity || 0,
+                updated: m.last_updated
+              });
+              
+              entry.totalBuy += m.buy_quantity || 0;
+              entry.totalSell += m.sell_quantity || 0;
+              if (m.best_sell > entry.bestBuyPrice) entry.bestBuyPrice = m.best_sell;
+              if (m.best_buy > entry.bestSellPrice) entry.bestSellPrice = m.best_buy;
+            }
+          }
+        }
+      }
+
+      const factionAverages = {};
+      for (const [itemId, data] of itemMap) {
+        const factionData = {};
+        for (const station of data.stations) {
+          const f = station.faction;
+          if (!factionData[f]) factionData[f] = { totalBuy: 0, totalSell: 0, count: 0, stations: [] };
+          factionData[f].totalBuy += station.buyPrice;
+          factionData[f].totalSell += station.sellPrice;
+          factionData[f].count++;
+          factionData[f].stations.push(station);
+        }
+        for (const [f, fd] of Object.entries(factionData)) {
+          if (!factionAverages[f]) factionAverages[f] = {};
+          factionAverages[f][itemId] = {
+            avgBuy: Math.round(fd.totalBuy / fd.count),
+            avgSell: Math.round(fd.totalSell / fd.count),
+            stationCount: fd.count
+          };
+        }
+      }
+
+      const factionOrder = ['Solarian', 'Voidborn', 'Nebula', 'Crimson', 'Outer Rim', 'Unknown'];
+      const factionNames = Object.keys(factionAverages).sort((a, b) => {
+        const aIdx = factionOrder.indexOf(a);
+        const bIdx = factionOrder.indexOf(b);
+        return (aIdx === -1 ? 999 : aIdx) - (bIdx === -1 ? 999 : bIdx);
+      });
+
+      let html = `
+        <div class="stats-bar">
+          ${itemMap.size} items across ${Object.keys(systems).length} systems | Mobile Capitol: ${mobileCapitol ? (mobileCapitol.systemName || mobileCapitol.systemId) : 'not discovered'}
+        </div>
+        <table class="market-table">
+          <thead>
+            <tr>
+              <th style="width:32px"></th>
+              <th>Item</th>
+              <th>Category</th>
+              <th>Avg Buy Price</th>
+              <th>Avg Sell Price</th>
+              <th>Demand</th>
+              <th>Supply</th>
+              <th>Profit</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+
+      for (const faction of factionNames) {
+        const items = Object.entries(factionAverages[faction]);
+        items.sort((a, b) => b[1].avgSell - a[1].avgSell);
+        
+        html += `<tr class="faction-header" style="background:${getFactionColor(faction)}20">
+          <td><span class="expand-btn" onclick="toggleFaction(this)">▼</span></td>
+          <td colspan="6">
+            <span style="font-weight:600">${faction}</span>
+            <span style="font-size:11px;color:var(--text-dim);margin-left:8px">(${items.length} items)</span>
+          </td>
+        </tr>`;
+
+        for (const [itemId, prices] of items) {
+          const data = itemMap.get(itemId);
+          const profit = prices.avgSell - prices.avgBuy;
+          const profitColor = profit > 0 ? 'var(--green)' : profit < 0 ? 'var(--red)' : 'var(--text-dim)';
+          const stationList = data.stations.map(s => `${s.stationName}(${s.buyPrice})`).join(', ');
+          
+          html += `
+            <tr class="item-row" data-item="${itemId}" onclick="showStationDetails(this, ${JSON.stringify(data.stations).replace(/"/g, '&quot;')})">
+              <td></td>
+              <td style="font-weight:500">${itemId}</td>
+              <td><span class="item-type-tag">${data.category}</span></td>
+              <td>${prices.avgBuy.toLocaleString()} cr</td>
+              <td>${prices.avgSell.toLocaleString()} cr</td>
+              <td style="text-align:center">${data.totalBuy.toLocaleString()}</td>
+              <td style="text-align:center">${data.totalSell.toLocaleString()}</td>
+              <td style="color:${profitColor};font-weight:500">${profit > 0 ? '+' : ''}${profit.toLocaleString()} cr</td>
+            </tr>
+            <tr class="station-detail" style="display:none">
+              <td></td>
+              <td colspan="6" style="font-size:11px;color:var(--text-dim);padding:4px 12px">
+                ${stationList}
+              </td>
+            </tr>
+          `;
+        }
+      }
+
+      html += `</tbody></table>`;
+      container.innerHTML = html;
+    }
+
+    function showStationDetails(row, stations) {
+      const detailRow = row.nextElementSibling;
+      if (!detailRow || !detailRow.classList.contains('station-detail')) return;
+      
+      const isHidden = detailRow.style.display === 'none';
+      detailRow.style.display = isHidden ? '' : 'none';
+      
+      if (isHidden) {
+        const stationHtml = stations.map(s => 
+          `<span style="margin-right:16px">
+            <strong>${s.stationName}</strong> (${s.sysName}): 
+            Buy ${s.buyPrice} | Sell ${s.sellPrice} | Dem ${s.demand} | Sup ${s.supply}
+          </span>`
+        ).join('<br>');
+        detailRow.innerHTML = `<td colspan="6" style="font-size:11px;color:var(--text-dim);padding:8px 12px">${stationHtml}</td>`;
+      }
+    }
+
+    function toggleFaction(btn) {
+      const row = btn.closest('tr');
+      const factionName = row.textContent.trim();
+      const isCollapsed = btn.textContent === '▶';
+      
+      if (isCollapsed) {
+        btn.textContent = '▼';
+        row.classList.remove('collapsed');
+      } else {
+        btn.textContent = '▶';
+        row.classList.add('collapsed');
+      }
+      
+      let nextRow = row.nextSibling;
+      while (nextRow) {
+        if (nextRow.classList.contains('faction-header')) break;
+        if (nextRow.classList.contains('item-row')) {
+          nextRow.style.display = isCollapsed ? '' : 'none';
+        } else if (nextRow.classList.contains('station-detail')) {
+          nextRow.style.display = 'none';
+        }
+        nextRow = nextRow.nextSibling;
+      }
+    }
+
+    function getFactionColor(faction) {
+      const colors = {
+        'Solarian': '#4fc3f7',
+        'Voidborn': '#9c27b0',
+        'Nebula': '#e91e63',
+        'Crimson': '#f44336',
+        'Outer Rim': '#ff9800',
+        'Unknown': '#607d8b'
+      };
+      return colors[faction] || '#607d8b';
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    connect();
+  </script>
+</body>
+</html>

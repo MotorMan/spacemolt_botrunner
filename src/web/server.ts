@@ -593,6 +593,36 @@ constructor(port: number = 3000) {
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
         }
+        if (url.pathname === "/api/stationRef") {
+          const stationRefPath = join(DATA_DIR, "stationRef.json");
+          if (existsSync(stationRefPath)) {
+            try {
+              const raw = readFileSync(stationRefPath, "utf-8");
+              return Response.json(JSON.parse(raw));
+            } catch {
+              return Response.json({ stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} });
+            }
+          }
+          return Response.json({ stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} });
+        }
+        if (url.pathname === "/api/faction-station-map") {
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({});
+          }
+          const result: Record<string, string[]> = {};
+          const files = readdirSync(CACHE_DIR);
+          const factionFiles = files.filter(f => f.endsWith(".json") && !f.startsWith("Busy") && !f.startsWith("1582") && !f.startsWith("bad"));
+          for (const file of factionFiles) {
+            const match = file.match(/^(.+)--(.+)\.json$/);
+            if (match) {
+              const [, faction, station] = match;
+              if (!result[faction]) result[faction] = [];
+              if (!result[faction].includes(station)) result[faction].push(station);
+            }
+          }
+          return Response.json(result);
+        }
         if (url.pathname === "/api/map/register-poi" && req.method === "POST") {
           const body = await req.json() as {
             system_id: string;

@@ -228,6 +228,7 @@ const PARAM_RULES = `
 - game_exec("mine")  — NO parameters. Never pass target_poi or any params to mine.
 - game_exec("sell",  {item_id: "ore_iron", quantity: 10}) — use the item's snake_case id, NOT its display name
 - game_exec("buy",   {item_id: "item_id", quantity: 5})
+- game_exec("set_home_base", {base_id: "base_uuid"}) — set your home base for respawning (must be docked there)
 - Must be UNDOCKED to travel/jump/mine; must be DOCKED to sell/buy/craft/refuel/repair
 - MINE-ABLE poi types: asteroid_belt, gas_cloud, ice_field, nebula, resource_field
 - NOT mine-able: sun, star, planet, station, wormhole, jump_gate
@@ -411,6 +412,51 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     return compact(resp.result);
   },
 
+  /** Set your home base for respawning (wrapper for game_exec). */
+  set_home_base: async (args, ctx) => {
+    const resp = await ctx.bot.exec("set_home_base", { base_id: args.base_id });
+    if (resp.error) {
+      return compact({ error: resp.error.message, code: resp.error.code });
+    }
+    return compact(resp.result);
+  },
+
+  /** Purchase ship insurance (wrapper for game_exec). */
+  buy_insurance: async (args, ctx) => {
+    const resp = await ctx.bot.exec("buy_insurance", { ticks: args.ticks });
+    if (resp.error) {
+      return compact({ error: resp.error.message, code: resp.error.code });
+    }
+    return compact(resp.result);
+  },
+
+  /** Claim insurance (wrapper for game_exec). */
+  claim_insurance: async (args, ctx) => {
+    const resp = await ctx.bot.exec("claim_insurance");
+    if (resp.error) {
+      return compact({ error: resp.error.message, code: resp.error.code });
+    }
+    return compact(resp.result);
+  },
+
+  /** Get insurance quote (wrapper for game_exec). */
+  get_insurance_quote: async (_args, ctx) => {
+    const resp = await ctx.bot.exec("get_insurance_quote");
+    if (resp.error) {
+      return compact({ error: resp.error.message, code: resp.error.code });
+    }
+    return compact(resp.result);
+  },
+
+  /** View insurance policies (wrapper for game_exec). */
+  view_insurance: async (_args, ctx) => {
+    const resp = await ctx.bot.exec("view_insurance");
+    if (resp.error) {
+      return compact({ error: resp.error.message, code: resp.error.code });
+    }
+    return compact(resp.result);
+  },
+
   /** Get locally-stored data for a star system. */
   map_get_system: async (args) => {
     const sys = mapStore.getSystem(args.system_id as string);
@@ -531,6 +577,58 @@ const TOOLS: ToolDefinition[] = [
         },
         required: ["command"],
       },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "set_home_base",
+      description: "Set your home base for respawning. You must be docked at the base. Requires cloning service.",
+      parameters: {
+        type: "object",
+        properties: {
+          base_id: { type: "string", description: "UUID of base to set as home (must be docked there)" },
+        },
+        required: ["base_id"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "buy_insurance",
+      description: "Purchase ship insurance at your current risk-based rate. Coverage equals fitted ship value.",
+      parameters: {
+        type: "object",
+        properties: {
+          ticks: { type: "integer", description: "Number of ticks to cover (1 tick = 10 seconds)" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "claim_insurance",
+      description: "Claim your insurance after death. Returns insurance policies, coverage amounts, and expiration dates.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_insurance_quote",
+      description: "Get a risk-based insurance quote for your current ship. Must be docked at a base.",
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_insurance",
+      description: "View your active insurance policies, coverage amounts, and expiration dates.",
+      parameters: { type: "object", properties: {}, required: [] },
     },
   },
   {

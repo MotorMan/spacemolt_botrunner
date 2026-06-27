@@ -420,6 +420,7 @@ interface TransportState {
   lastUpdated: string;
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
+  visitedEmpireStations: string[];
 }
 
 interface FleetShip {
@@ -1169,71 +1170,58 @@ async function selectNextPickupStation(
   const currentSystem = bot.system || "";
   const currentPoi = bot.poi || "";
   
-  const availableStations = empireStations.filter(
-    s => s.poiId !== currentPoi || s.systemId !== currentSystem
+  const visitedStations = state.visitedEmpireStations || [];
+  const currentStationKey = `${currentSystem}:${currentPoi}`.toLowerCase();
+  
+  if (!visitedStations.includes(currentStationKey)) {
+    state.visitedEmpireStations = [...visitedStations, currentStationKey];
+    saveTransportState(state);
+  }
+  
+  const unvisitedStations = empireStations.filter(
+    s => !state.visitedEmpireStations.includes(`${s.systemId}:${s.poiId}`.toLowerCase())
   );
   
-  if (availableStations.length === 0) {
-    ctx.log("transport", `All empire stations already checked, finding nearest from ${empireStations.length} total`);
-    let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
-    for (const s of empireStations) {
-      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-      const dist = hopsBetweenSync(currentSystem, s.systemId);
-      if (dist < nearest.dist) {
-        nearest = { ...s, dist };
-      }
+  if (unvisitedStations.length > 0) {
+    const stationsWithHops = unvisitedStations.map(s => {
+      const hops = hopsToStation(currentSystem, s.systemId);
+      return { ...s, hops };
+    }).filter(s => s.hops <= settings.maxJumps);
+    
+    ctx.log("transport", `Found ${stationsWithHops.length} reachable unvisited stations out of ${unvisitedStations.length} total`);
+    
+    if (stationsWithHops.length > 0) {
+      stationsWithHops.sort((a, b) => a.hops - b.hops);
+      const next = stationsWithHops[0];
+      ctx.log("transport", `Moving to unvisited station: ${next.poiName} (${next.hops} hops)`);
+      return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
     }
-    if (nearest.dist === 9999) {
-      ctx.log("transport", `No other empire stations available`);
-      return null;
-    }
-    if (nearest.dist > settings.maxJumps) {
-      ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
-    }
-    return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
-  }
-
-  if (empireLower === "solarian") {
-    const randomStation = availableStations[Math.floor(Math.random() * availableStations.length)];
-    if (randomStation.poiId === currentPoi && randomStation.systemId === currentSystem) {
-      ctx.log("transport", `Randomly selected same station, using next available`);
-      const otherStations = availableStations.filter(s => !(s.poiId === currentPoi && s.systemId === currentSystem));
-      if (otherStations.length > 0) {
-        return { system: otherStations[0].systemId, poi: otherStations[0].poiId, poiName: otherStations[0].poiName };
-      }
-    }
-    ctx.log("transport", `Solarian Empire: randomly selecting ${randomStation.poiName}`);
-    return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
-  }
-
-  const stationsWithHops = availableStations.map(s => {
-    const hops = hopsToStation(currentSystem, s.systemId);
-    return { ...s, hops };
-  }).filter(s => s.hops <= settings.maxJumps);
-  
-  ctx.log("transport", `Found ${stationsWithHops.length} reachable stations out of ${availableStations.length}`);
-  
-  if (stationsWithHops.length === 0) {
-    let nearest: EmpireStation & { dist: number } = { ...availableStations[0], dist: 9999 };
-    for (const s of availableStations) {
-      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-      const dist = hopsToStation(currentSystem, s.systemId);
-      if (dist < nearest.dist) {
-        nearest = { ...s, dist };
-      }
-    }
-    if (nearest.dist === 9999) {
-      ctx.log("transport", `No other stations within ${settings.maxJumps} hops`);
-      return null;
-    }
-    ctx.log("transport", `No stations within ${settings.maxJumps} hops, falling back to nearest: ${nearest.poiName}`);
-    return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
+    
+    const fallback = unvisitedStations[0];
+    ctx.log("transport", `No unvisited stations within ${settings.maxJumps} hops, using: ${fallback.poiName}`);
+    return { system: fallback.systemId, poi: fallback.poiId, poiName: fallback.poiName };
   }
   
-  stationsWithHops.sort((a, b) => a.hops - b.hops);
-  const next = stationsWithHops[0];
-  ctx.log("transport", `Moving to next closest station: ${next.poiName} (${next.hops} hops)`);
-  return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
+  ctx.log("transport", `All ${empireStations.length} empire stations visited, resetting and finding nearest from ${empireStations.length} total`);
+  state.visitedEmpireStations = [];
+  saveTransportState(state);
+  
+  let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
+  for (const s of empireStations) {
+    if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
+    const dist = hopsBetweenSync(currentSystem, s.systemId);
+    if (dist < nearest.dist) {
+      nearest = { ...s, dist };
+    }
+  }
+  if (nearest.dist === 9999) {
+    ctx.log("transport", `No other empire stations available`);
+    return null;
+  }
+  if (nearest.dist > settings.maxJumps) {
+    ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
+  }
+  return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
 }
 
 // ── Route planning ───────────────────────────────────────────
@@ -1324,7 +1312,7 @@ function hopsBetweenSync(a: string, b: string): number {
 
 function hopsToStation(a: string, b: string): number {
   if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b);
+  const route = mapStore.findRoute(a, b, getSystemBlacklist());
   if (!route) return 9999;
   return route.length - 1;
 }
@@ -1350,6 +1338,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     lastUpdated: new Date().toISOString(),
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
+    visitedEmpireStations: [],
   };
 }
 
@@ -1745,6 +1734,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           await ctx.sleep(30000);
           continue;
         }
+        state.roundsWithoutPassengers = 0;
         await collectFuelCells(ctx, settings);
       } else {
         ctx.log("transport", `Ready at ${state.pickupStation}`);
@@ -1821,9 +1811,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (economy disabled): ${p.name}`);
           continue;
         }
-        const arr = byDest.get(p.destination) || [];
+        const arr = byDest.get(p.destination.toLowerCase()) || [];
         arr.push(p);
-        byDest.set(p.destination, arr);
+        byDest.set(p.destination.toLowerCase(), arr);
       }
 
       // For multi-destination tours, plan the route FIRST so loading order follows it.
@@ -1885,8 +1875,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       };
 
       for (const leg of plannedRoute) {
-        const passengers = byDest.get(leg.poi) || [];
-        const passengersByOrigDest = leg.origDest ? byDest.get(leg.origDest) || [] : passengers;
+        const legPoiLower = leg.poi.toLowerCase();
+        const passengers = byDest.get(leg.poi) || byDest.get(legPoiLower) || [];
+        const passengersByOrigDest = leg.origDest ? (byDest.get(leg.origDest) || byDest.get(leg.origDest.toLowerCase()) || []) : passengers;
         const passengersFinal = passengersByOrigDest.length > 0 ? passengersByOrigDest : passengers;
         if (passengersFinal.length === 0) continue;
 
@@ -1916,7 +1907,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         });
 
         let loadedThisLeg = 0;
-        let loadAttempted = false;
         for (const p of sortedPassengers) {
           if (loadedNames.has(p.citizen_id)) continue;
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
@@ -1950,9 +1940,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           loadedThisLeg++;
         }
         
-        if (loadedThisLeg > 0 && !loadAttempted) {
-          loadAttempted = true;
-          const loadResp = await bot.exec("load_passenger", { destination: leg.origDest || leg.poi });
+        if (loadedThisLeg > 0) {
+          const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
           if (loadResp.error) {
             ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
           }

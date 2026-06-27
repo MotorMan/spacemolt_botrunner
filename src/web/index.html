@@ -2107,11 +2107,12 @@
       /** Fetch initial data via REST API as fallback if WebSocket is slow */
       async function fetchInitialData() {
         try {
+          const settingsRes = await fetch("/api/settings").then((r) => r.json());
+          const station = (settingsRes.general && settingsRes.general.factionStorageStation) || "";
           const [
             botsRes,
             discoveredRes,
             routinesRes,
-            settingsRes,
             flockRes,
             mapRes,
             statsRes,
@@ -2123,7 +2124,6 @@
             fetch("/api/bots").then((r) => r.json()),
             fetch("/api/bots/discovered").then((r) => r.json()),
             fetch("/api/routines").then((r) => r.json()),
-            fetch("/api/settings").then((r) => r.json()),
             fetch("/api/flock/settings")
               .then((r) => r.json())
               .catch(() => ({ flockGroups: [], assignments: {} })),
@@ -2131,7 +2131,7 @@
             fetch("/api/stats").then((r) => r.json()),
             fetch("/api/catalog").then((r) => r.json()),
             fetch("/api/logs/main").then((r) => r.json()),
-            fetch("/api/faction-storage")
+            fetch(`/api/faction-storage?station=${encodeURIComponent(station)}`)
               .then((r) => r.json())
               .catch(() => ({ items: [] })),
             fetch("/api/last-used-routines")
@@ -31933,7 +31933,17 @@ async function fetchPersonalFacilityTypes(username) {
       // Load faction storage from disk (shared warehouse)
       async function loadGlobalFactionStorage() {
         try {
-          const res = await fetch("/api/faction-storage");
+          let station = "";
+          if (settings.general && settings.general.factionStorageStation) {
+            station = settings.general.factionStorageStation;
+          } else {
+            try {
+              const settingsRes = await fetch("/api/settings");
+              const settingsData = await settingsRes.json();
+              station = (settingsData.general && settingsData.general.factionStorageStation) || "";
+            } catch {}
+          }
+          const res = await fetch(`/api/faction-storage?station=${encodeURIComponent(station)}`);
           const data = await res.json();
           globalFactionStorage = (data.items || data.entries || []).map(
             (e) => ({

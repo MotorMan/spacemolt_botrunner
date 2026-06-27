@@ -846,6 +846,12 @@ constructor(port: number = 3000) {
           
           try {
             const files = readdirSync(CACHE_DIR);
+            const allItems: any[] = [];
+            let bestFuelReserve = 0;
+            let bestFuelCapacity = 0;
+            let bestFactionName = "";
+            let bestStation = "";
+            
             for (const file of files) {
               if (!file.endsWith(".json")) continue;
               const match1 = file.match(/^(.+)::(.+)\.json$/);
@@ -853,20 +859,31 @@ constructor(port: number = 3000) {
               const match = match1 || match2;
               if (!match) continue;
               const [, fn, st] = match;
-              if (st === station || (station === "" && st === "default")) {
+              if (st === station) {
                 const factionStoragePath = join(CACHE_DIR, file);
                 const raw = readFileSync(factionStoragePath, "utf-8");
                 const data = JSON.parse(raw);
                 const items = data.entries || data.items || [];
-                return Response.json({
-                  items,
-                  factionFuelReserve: data.factionFuelReserve || 0,
-                  factionFuelCapacity: data.factionFuelCapacity || 0,
-                  factionName: data.factionName,
-                  station: data.station,
-                });
+                allItems.push(...items);
+                if (data.factionFuelReserve > bestFuelReserve) {
+                  bestFuelReserve = data.factionFuelReserve;
+                  bestFuelCapacity = data.factionFuelCapacity || 0;
+                  bestFactionName = data.factionName || fn;
+                  bestStation = data.station || st;
+                }
               }
             }
+            
+            if (allItems.length > 0) {
+              return Response.json({
+                items: allItems,
+                factionFuelReserve: bestFuelReserve,
+                factionFuelCapacity: bestFuelCapacity,
+                factionName: bestFactionName,
+                station: bestStation,
+              });
+            }
+            
             for (const file of files) {
               if (!file.endsWith(".json")) continue;
               const match1 = file.match(/^(.+)::(.+)\.json$/);

@@ -1978,12 +1978,35 @@ export async function navigateToSystem(
         errorMsg.includes("pending") ||
         errorMsg.includes("busy") ||
         errorMsg.includes("systems are not connected") || // Sometimes a temporary state
-        errorMsg.includes("you are already in"); // Already at destination - treat as success
+        errorMsg.includes("you are already in") || // Already at destination - treat as success
+        errorMsg.includes("mid-jump") || // Already in a jump - wait for it to complete
+        errorMsg.includes("mid-travel") || // Already traveling - wait for it to complete
+        errorMsg.includes("already in transit"); // Generic in-transit error
 
       if (!isTransient) {
         // Permanent error - don't retry
         ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
         return false;
+      }
+
+      // Handle "mid-jump" or "mid-travel" errors - wait for transit to complete
+      if (errorMsg.includes("mid-jump") || errorMsg.includes("mid-travel") || errorMsg.includes("already in transit")) {
+        ctx.log("travel", "Bot is already in transit - waiting for jump/travel to complete...");
+        const transitCompleted = await waitForTransitCompletion(ctx, 180);
+        if (!transitCompleted) {
+          ctx.log("error", "Transit did not complete within timeout - cannot continue navigation");
+          return false;
+        }
+        // Refresh location after transit completes
+        await bot.refreshLocation();
+        // Check if we're now at the target system
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Arrived at ${targetSystemId} after transit completed`);
+          return true;
+        }
+        // Transit completed but we're not at target - recalculate route from current position
+        ctx.log("travel", `Transit completed at ${bot.system}, recalculating route to ${targetSystemId}...`);
+        continue; // Continue the jump loop with updated position
       }
 
       // Special case: "already in" means we're already at the target system

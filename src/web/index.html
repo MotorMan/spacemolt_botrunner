@@ -16977,8 +16977,8 @@ When responding:
       }
 
       function switchMissionsSubTab(tab) {
+        if (missionsSubTab === tab) return;
         missionsSubTab = tab;
-        missionsSelectedBot = null;
         renderMissionsSidebar();
         renderMissionsPage();
       }
@@ -17040,17 +17040,19 @@ When responding:
           <button class="mission-subtab-btn${missionsSubTab === "bot" ? " active" : ""}" onclick="switchMissionsSubTab(\'bot\')">Bot Missions</button>
           <button class="mission-subtab-btn${missionsSubTab === "all" ? " active" : ""}" onclick="switchMissionsSubTab(\'all\')">All Known</button>
         </div>`;
-        html += `<button class="mission-bot-btn${!missionsSelectedBot && missionsSubTab === "bot" ? " active" : ""}" onclick="selectMissionView(null)">All Available</button>`;
-        for (const bot of bots) {
-          const active = missionsSelectedBot === bot.username ? " active" : "";
-          html += `<button class="mission-bot-btn${active}" onclick="selectMissionView('${esc(bot.username)}')">${esc(bot.username)}</button>`;
+
+        if (missionsSubTab === "bot") {
+          html += `<button class="mission-bot-btn${!missionsSelectedBot ? " active" : ""}" onclick="selectMissionView(null)">All Available</button>`;
+          for (const bot of bots) {
+            const active = missionsSelectedBot === bot.username ? " active" : "";
+            html += `<button class="mission-bot-btn${active}" onclick="selectMissionView('${esc(bot.username)}')">${esc(bot.username)}</button>`;
+          }
         }
         body.innerHTML = html;
       }
 
       function selectMissionView(botName) {
         if (missionsSubTab === "all") {
-          switchMissionsSubTab("all");
           return;
         }
         missionsSelectedBot = botName;

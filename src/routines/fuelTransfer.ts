@@ -8,10 +8,8 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   readSettings,
-  writeSettings,
   logFactionActivity,
   checkAndFleeFromBattle,
-  checkBattleAfterCommand,
   getBattleStatus,
   fleeFromBattle,
   getItemSize,
@@ -19,14 +17,6 @@ import {
   type BattleState,
 } from "./common.js";
 import {
-  startTrip,
-  addTripEvent,
-  completeTrip,
-  failCurrentTrip,
-  getCurrentTrip,
-  loadFuelTransferData,
-  saveFuelTransferData,
-  type FuelTripRecord,
   getFactionStorageQuantity,
   getFactionStorageLastUpdated,
   updateFactionStorageFromDeposit,
@@ -35,8 +25,33 @@ import {
   saveStationCompletion,
   type FacilityTransferLoadout,
 } from "./fuelTransferTracking.js";
+import { getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 
 const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell", "military_fuel_cell"];
+
+const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
+const factionStorageApiLastCalled: Map<string, number> = new Map();
+
+async function getRemoteFactionAllItemsRateLimited(bot: Bot, remoteStationId: string): Promise<Record<string, number>> {
+  const cache = getFactionStorageCacheByStationOnly(remoteStationId);
+  if (cache && Date.now() - cache.lastUpdated < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const result: Record<string, number> = {};
+    for (const entry of cache.entries) {
+      result[entry.itemId] = entry.quantity;
+    }
+    return result;
+  }
+
+  const now = Date.now();
+  const lastCall = factionStorageApiLastCalled.get(remoteStationId) || 0;
+  const timeSinceLastCall = now - lastCall;
+  if (timeSinceLastCall < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const waitTime = FACTION_STORAGE_API_RATE_LIMIT_MS - timeSinceLastCall;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+  factionStorageApiLastCalled.set(remoteStationId, Date.now());
+  return getRemoteFactionAllItems(bot, remoteStationId);
+}
 
 // ── Cloaking module detection and enablement ────────────────────────────────
 
@@ -475,7 +490,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       const applicableLoadouts: string[] = [];
       const loadoutItemMap: Map<string, Set<string>> = new Map();
       
-      const stationQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+      const stationQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
       if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
       ctx.log("fuel", `Viewed faction storage at ${remoteStationId}: ${Object.keys(stationQtyCache).length} items found`);
 
@@ -522,7 +537,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
 
           if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
-            const freshQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+            const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
             if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
             for (const loadoutName of applicableLoadouts) {
               const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
@@ -755,6 +770,20 @@ async function getItemStatus(
   const cachedQty = getFactionStorageQuantity(remoteStationId, itemId);
   const cachedLastUpdated = getFactionStorageLastUpdated(remoteStationId);
   const hasCache = cachedLastUpdated > 0;
+
+  const cache = getFactionStorageCacheByStationOnly(remoteStationId);
+  if (cache && Date.now() - cache.lastUpdated < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    return { cachedQty, currentQty: cachedQty, hasCache };
+  }
+
+  const now = Date.now();
+  const lastCall = factionStorageApiLastCalled.get(remoteStationId) || 0;
+  const timeSinceLastCall = now - lastCall;
+  if (timeSinceLastCall < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const waitTime = FACTION_STORAGE_API_RATE_LIMIT_MS - timeSinceLastCall;
+    await ctx.sleep(waitTime);
+  }
+  factionStorageApiLastCalled.set(remoteStationId, Date.now());
 
   const currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
   if (bot.state !== "running") return { cachedQty, currentQty, hasCache };

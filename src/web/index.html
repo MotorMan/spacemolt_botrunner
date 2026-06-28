@@ -1435,6 +1435,8 @@
       let profileBot = null;
       let activeOreFilters = new Set();
       let battleState = {};
+      let missionsSubTab = "bot";
+      let allKnownMissions = null;
       let catalog = {
         items: {},
         ships: {},
@@ -16964,13 +16966,21 @@ When responding:
       function renderMissionsPage() {
         renderMissionsSidebar();
         if (showConsolidatedMissions) {
-          // Fetch active missions for all bots before rendering consolidated view
           fetchAllActiveMissions();
-        } else if (missionsSelectedBot) {
+        } else if (missionsSubTab === "bot" && missionsSelectedBot) {
           fetchActiveMissions(missionsSelectedBot);
-        } else {
+        } else if (missionsSubTab === "bot") {
           renderMissionsFromMap();
+        } else {
+          fetchAllKnownMissions();
         }
+      }
+
+      function switchMissionsSubTab(tab) {
+        missionsSubTab = tab;
+        missionsSelectedBot = null;
+        renderMissionsSidebar();
+        renderMissionsPage();
       }
 
       /** Fetch active missions for all bots (for consolidated view) */
@@ -17010,7 +17020,9 @@ When responding:
             : "📋 Consolidated";
           btn.classList.toggle("active", showConsolidatedMissions);
         }
-        renderMissionsSidebar();
+        if (!showConsolidatedMissions) {
+          renderMissionsSidebar();
+        }
         renderMissionsPage();
       }
 
@@ -17019,13 +17031,16 @@ When responding:
         if (!body) return;
 
         if (showConsolidatedMissions) {
-          // In consolidated view, show a simple message
           body.innerHTML =
             '<div style="padding:10px;font-size:11px;color:var(--text-dim);text-align:center">Consolidated View Active<br>Grouping missions by template across all bots</div>';
           return;
         }
 
-        let html = `<button class="mission-bot-btn${!missionsSelectedBot ? " active" : ""}" onclick="selectMissionView(null)">All Available</button>`;
+        let html = `<div class="missions-subtabs" style="display:flex;gap:4px;margin-bottom:8px">
+          <button class="mission-subtab-btn${missionsSubTab === "bot" ? " active" : ""}" onclick="switchMissionsSubTab(\'bot\')">Bot Missions</button>
+          <button class="mission-subtab-btn${missionsSubTab === "all" ? " active" : ""}" onclick="switchMissionsSubTab(\'all\')">All Known</button>
+        </div>`;
+        html += `<button class="mission-bot-btn${!missionsSelectedBot && missionsSubTab === "bot" ? " active" : ""}" onclick="selectMissionView(null)">All Available</button>`;
         for (const bot of bots) {
           const active = missionsSelectedBot === bot.username ? " active" : "";
           html += `<button class="mission-bot-btn${active}" onclick="selectMissionView('${esc(bot.username)}')">${esc(bot.username)}</button>`;
@@ -17034,6 +17049,10 @@ When responding:
       }
 
       function selectMissionView(botName) {
+        if (missionsSubTab === "all") {
+          switchMissionsSubTab("all");
+          return;
+        }
         missionsSelectedBot = botName;
         renderMissionsSidebar();
         if (botName) {
@@ -17166,6 +17185,105 @@ When responding:
         html += renderAvailableMissions(null);
         html += "</div>";
         content.innerHTML = html;
+      }
+
+      let allKnownMissionsSortState = {
+        sortBy: "title",
+        direction: "asc",
+      };
+
+      function fetchAllKnownMissions() {
+        const content = document.getElementById("missionsContent");
+        if (!content) return;
+        content.innerHTML = '<div class="map-empty">Loading all known missions...</div>';
+
+        fetch("/data/rawMissions.json")
+          .then((r) => r.json())
+          .then((data) => {
+            allKnownMissions = data;
+            renderAllKnownMissions();
+          })
+          .catch((err) => {
+            content.innerHTML = `<div class="map-empty">Failed to load missions: ${err.message}</div>`;
+          });
+      }
+
+      function renderAllKnownMissions() {
+        const content = document.getElementById("missionsContent");
+        if (!content) return;
+
+        if (!allKnownMissions || !allKnownMissions.missions) {
+          content.innerHTML = '<div class="map-empty">No known missions data available.</div>';
+          return;
+        }
+
+        const missions = Object.values(allKnownMissions.missions);
+        let sortedMissions = [...missions];
+
+        const { sortBy, direction } = allKnownMissionsSortState;
+        if (sortBy) {
+          sortedMissions.sort((a, b) => {
+            const aMission = a.data || a;
+            const bMission = b.data || b;
+            let aVal = aMission[sortBy] || aMission.mission_id || "";
+            let bVal = bMission[sortBy] || bMission.mission_id || "";
+            if (typeof aVal === "string") aVal = aVal.toLowerCase();
+            if (typeof bVal === "string") bVal = bVal.toLowerCase();
+            if (aVal < bVal) return direction === "asc" ? -1 : 1;
+            if (aVal > bVal) return direction === "asc" ? 1 : -1;
+            return 0;
+          });
+        }
+
+        const count = sortedMissions.length;
+        let html = '<div class="missions-section">';
+        html += '<div class="missions-section-title">All Known Missions</div>';
+        html += `<div style="color:var(--text-dim);font-size:12px;margin-bottom:12px">${count} missions in database</div>`;
+
+        html += `<div class="missions-sort-bar" style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+          <span style="color:var(--text-dim);font-size:11px,align-self:center">Sort by:</span>
+          <button class="subcat-btn ${sortBy === "title" ? "active" : ""}" onclick="sortAllKnownMissions("title")">Title${sortBy === "title" ? (direction === "asc" ? " ↑" : " ↓") : ""}</button>
+          <button class="subcat-btn ${sortBy === "type" ? "active" : ""}" onclick="sortAllKnownMissions("type")">Type${sortBy === "type" ? (direction === "asc" ? " ↑" : " ↓") : ""}</button>
+          <button class="subcat-btn ${sortBy === "difficulty" ? "active" : ""}" onclick="sortAllKnownMissions("difficulty")">Difficulty${sortBy === "difficulty" ? (direction === "asc" ? " ↑" : " ↓") : ""}</button>
+          <button class="subcat-btn ${sortBy === "reward_credits" ? "active" : ""}" onclick="sortAllKnownMissions("reward_credits")">Reward${sortBy === "reward_credits" ? (direction === "asc" ? " ↑" : " ↓") : ""}</button>
+        </div>`;
+
+        html += '<div class="all-known-missions-grid">';
+        for (const m of sortedMissions) {
+          const data = m.data || m;
+          const title = data.title || m.mission_id || "Unknown";
+          const type = data.type || "";
+          const difficulty = data.difficulty || 0;
+          const reward = data.rewards?.credits ? `${Number(data.rewards.credits).toLocaleString()} cr` : "-";
+          const description = data.description || "";
+          const stationCount = (m.stations || []).length;
+
+          html += `<div class="all-known-mission-card">
+            <div class="all-known-mission-head">
+              <span class="all-known-mission-title">${esc(title)}</span>
+              ${type ? `<span class="mission-type-badge">${esc(type)}</span>` : ""}
+            </div>
+            <div class="all-known-mission-meta">
+              <span class="mission-reward">${reward}</span>
+              <span class="mission-difficulty">Difficulty: ${difficulty}</span>
+              <span class="mission-stations">${stationCount} station${stationCount !== 1 ? "s" : ""}</span>
+            </div>
+            ${description ? `<div class="mission-desc" style="font-size:11px;color:var(--text-dim);margin-top:4px">${esc(description)}</div>` : ""}
+          </div>`;
+        }
+        html += '</div>';
+        html += "</div>";
+        content.innerHTML = html;
+      }
+
+      function sortAllKnownMissions(sortBy) {
+        if (allKnownMissionsSortState.sortBy === sortBy) {
+          allKnownMissionsSortState.direction = allKnownMissionsSortState.direction === "asc" ? "desc" : "asc";
+        } else {
+          allKnownMissionsSortState.sortBy = sortBy;
+          allKnownMissionsSortState.direction = "asc";
+        }
+        renderAllKnownMissions();
       }
 
       function claimMission(botName, missionId) {

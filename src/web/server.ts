@@ -824,14 +824,28 @@ constructor(port: number = 3000) {
             return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
-        if (url.pathname === "/data/shipsForSale.json") {
+if (url.pathname === "/data/shipsForSale.json") {
           const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
           if (existsSync(shipsForSalePath)) {
             return new Response(readFileSync(shipsForSalePath, "utf-8"), {
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+              },
             });
           } else {
             return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/rawMissions.json") {
+          const rawMissionsPath = join(process.cwd(), "data", "rawMissions.json");
+if (existsSync(rawMissionsPath)) {
+            return new Response(readFileSync(rawMissionsPath, "utf-8"), {
+              headers: {
+                "Content-Type": "application/json",
+              },
+            });
+          } else {
+            return Response.json({ error: "rawMissions.json not found" }, { status: 404 });
           }
         }
         if (url.pathname === "/api/logs/main") {

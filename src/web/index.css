@@ -137,7 +137,7 @@ main {
   padding: 0;
   gap: 0;
 }
-#playersFrame, #shipsforsaleFrame, #commandallFrame, #faFrame, #achievementsFrame, #marketbrowserFrame, #shipSimFrame, #engineeringCalcFrame, #shipComparisonFrame {
+#playersFrame, #shipsforsaleFrame, #commandallFrame, #faFrame, #achievementsFrame, #marketbrowserFrame {
   flex: 1;
   width: 100%;
   height: 100%;
@@ -1124,13 +1124,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   border-top: 1px solid var(--border);
 }
 
-/* Stats sub-tab views */
-#statsPlayersView, #statsFaView, #statsAchievementsView {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-
 /* ── Map page ───────────────────────────────────── */
 .map-layout {
   display: flex;
@@ -1602,19 +1595,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   display: inline-block;
 }
 .mkt-expand-btn:hover { text-decoration: underline; }
-
-/* Market browser view */
-#marketBrowserView {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-#marketBrowserView iframe {
-  flex: 1;
-  width: 100%;
-  height: 100%;
-  border: none;
-}
 
 /* Orders table */
 .ord-table {
@@ -2151,19 +2131,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   text-align: center;
   padding: 40px;
 }
-#shipyardManageView {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-#shipyardManageView .faction-layout {
-  flex: 1;
-  min-height: 0;
-}
-#page-shipyard {
-  display: flex;
-  flex-direction: column;
-}
 .faction-layout {
   display: flex;
   gap: 16px;
@@ -2214,8 +2181,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .faction-nav-btn.active { background: rgba(88,166,255,0.1); border-color: var(--accent); color: var(--accent); }
 .faction-content {
   flex: 1;
-  display: flex;
-  flex-direction: column;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -2347,17 +2312,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding: 5px 8px;
   font-size: 12px;
   flex: 1;
-}
-#shipyardForsaleView {
-  display: flex;
-  flex: 1;
-  min-height: 0;
-}
-#shipyardForsaleView iframe {
-  flex: 1;
-  width: 100%;
-  height: 100%;
-  border: none;
 }
 @media (max-width: 768px) {
   .faction-layout { flex-direction: column; }

@@ -37,6 +37,7 @@
  *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
  *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
  *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
+ *   cloakOnStart    — stay cloaked until attack command, then re-cloak after battle (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -193,6 +194,7 @@ function getHunterSettings(username?: string): {
   onlyNPCs: boolean;
   huntCreatures: boolean;
   autoCloak: boolean;
+  cloakOnStart: boolean;
   ammoThreshold: number;
   ammoReloadAbsoluteThreshold: number;
   ammoReloadPercentThreshold: number;
@@ -239,10 +241,11 @@ function getHunterSettings(username?: string): {
     repairThreshold: (h.repairThreshold as number) || 30,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-    onlyNPCs: (h.onlyNPCs as boolean) !== false,
-    huntCreatures: (h.huntCreatures as boolean) !== false,
-    autoCloak: (h.autoCloak as boolean) ?? false,
-    ammoThreshold: (h.ammoThreshold as number) || 5,
+onlyNPCs: (h.onlyNPCs as boolean) !== false,
+  huntCreatures: (h.huntCreatures as boolean) !== false,
+  autoCloak: (h.autoCloak as boolean) ?? false,
+  cloakOnStart: (h.cloakOnStart as boolean) ?? false,
+  ammoThreshold: (h.ammoThreshold as number) || 5,
     ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
@@ -734,6 +737,19 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
 
+  // Cloak on start if cloakOnStart is enabled
+  if (initialSettings.cloakOnStart && !bot.isCloaked) {
+    const cloakResp = await bot.exec("cloak", { enable: true });
+    if (!cloakResp.error) {
+      ctx.log("system", "Cloak enabled on routine start (cloakOnStart)");
+    } else {
+      const msg = cloakResp.error.message.toLowerCase();
+      if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+        ctx.log("warn", `Failed to cloak on start: ${cloakResp.error.message}`);
+      }
+    }
+  }
+
   // If we started the routine while docked at home base, refuel, repair, then restock
   if (bot.docked) {
     await repairShip(ctx);
@@ -1013,7 +1029,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
               // Engage the threats
               for (const threat of threats) {
-                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (!won) {
                   ctx.log("combat", "Retreated from threat — aborting patrol");
                   abortPatrol = true;
@@ -1064,7 +1080,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1134,7 +1150,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1160,7 +1176,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
                 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1517,7 +1533,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1566,7 +1582,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1591,7 +1607,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1879,7 +1895,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1924,7 +1940,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1948,7 +1964,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             for (const newThreat of newThreats) {
               if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                 totalKills++;
                 ctx.log("combat", `Kill #${totalKills} (additional threat)`);
@@ -2069,7 +2085,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);
@@ -2439,7 +2455,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);

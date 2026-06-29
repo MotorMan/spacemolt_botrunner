@@ -24379,6 +24379,17 @@ async function fetchPersonalFacilityTypes(username) {
       <input type="number" id="set-hunter-ammoReloadPercentThreshold" min="5" max="50" value="${ammoReloadPercentThreshold}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Cloak on Start</div>
+        <div class="setting-hint">Stay cloaked until just before attacking, then re-cloak after battle. Helps avoid detection by enemy players watching the external map.</div>
+      </div>
+      <select id="set-hunter-cloakOnStart">
+        <option value="false"${!(h.cloakOnStart ?? false) ? " selected" : ""}>Disabled (autoCloak only for travel)</option>
+        <option value="true"${(h.cloakOnStart ?? false) ? " selected" : ""}>Enabled (always cloaked in combat)</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -24449,6 +24460,8 @@ async function fetchPersonalFacilityTypes(username) {
               document.getElementById("set-hunter-ammoReloadPercentThreshold")
                 .value,
             ) || 25,
+          cloakOnStart:
+            document.getElementById("set-hunter-cloakOnStart").value === "true",
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols
             : [],
@@ -25198,6 +25211,17 @@ async function fetchPersonalFacilityTypes(username) {
       <input type="number" id="set-fleet-hunter-maxReloadAttempts" min="1" max="10" value="${maxReloadAttempts}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Cloak on Start</div>
+        <div class="setting-hint">Stay cloaked until just before attacking, then re-cloak after battle. Helps avoid detection by enemy players watching the external map.</div>
+      </div>
+      <select id="set-fleet-hunter-cloakOnStart">
+        <option value="false"${!(h.cloakOnStart ?? false) ? " selected" : ""}>Disabled (autoCloak only for travel)</option>
+        <option value="true"${(h.cloakOnStart ?? false) ? " selected" : ""}>Enabled (always cloaked in combat)</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveFleetHunterSettings()">Save Settings</button>
     </div>
@@ -25272,6 +25296,9 @@ async function fetchPersonalFacilityTypes(username) {
           enableFactionBroadcast:
             document.getElementById("set-fleet-hunter-enableFactionBroadcast")
               .value === "true",
+          cloakOnStart:
+            document.getElementById("set-fleet-hunter-cloakOnStart").value ===
+            "true",
         };
         send({ type: "saveSettings", routine: "fleet_hunter", settings: s });
         settings.fleet_hunter = s;

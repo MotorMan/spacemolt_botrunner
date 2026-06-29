@@ -22,6 +22,8 @@
  *   fleeFromTier      — pirate tier that triggers flee (default: "boss")
  *   minPiratesToFlee  — number of pirates that triggers flee (default: 3)
  *   regroupSystem     — system to regroup at if disconnected (default: last known)
+ *   autoCloak         — auto-cloak when traveling (default: false)
+ *   cloakOnStart      — stay cloaked until attack command, re-cloak after battle (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -75,6 +77,7 @@ interface FleetHunterSettings {
   fleeFromTier: PirateTier;
   minPiratesToFlee: number;
   autoCloak: boolean;
+  cloakOnStart: boolean;
   ammoThreshold: number;
   maxReloadAttempts: number;
   huntingEnabled: boolean;
@@ -96,6 +99,7 @@ function getFleetHunterSettings(): FleetHunterSettings {
     fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     autoCloak: (h.autoCloak as boolean) ?? false,
+    cloakOnStart: (h.cloakOnStart as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     huntingEnabled: (h.huntingEnabled as boolean) ?? true,
@@ -270,6 +274,10 @@ async function executeAttackCommand(ctx: RoutineContext, params: string): Promis
     settings.minPiratesToFlee,
     "large", // maxAttackTier
     targetData.sideId, // sideId if provided by commander
+    false, // skipScan
+    0, // repairThreshold
+    false, // onlyNPCs
+    settings.cloakOnStart, // cloakOnStart
   );
 
   if (!won) {

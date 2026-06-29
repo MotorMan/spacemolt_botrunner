@@ -608,6 +608,7 @@ export async function engageTarget(
   skipScan: boolean = false,
   repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
   onlyNPCs: boolean = false,     // if true, flee when encountering players
+  cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -620,7 +621,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -644,10 +645,20 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
+
+  // Disable cloak before attacking if cloakOnStart is enabled
+  if (cloakOnStart && bot.isCloaked) {
+    ctx.log("combat", `Disabling cloak before attacking ${target.name}...`);
+    const cloakResp = await bot.exec("cloak", { enable: false });
+    if (cloakResp.error) {
+      ctx.log("warn", `Failed to disable cloak: ${cloakResp.error.message}`);
+    }
+  }
+
   if (!skipScan) {
     let scanResp = await bot.exec("scan", { target_id: target.id });
     if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
@@ -690,17 +701,34 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
       }
     }
     return false;
   }
 
   ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
+
+/** Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module. */
+export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
+  const { bot } = ctx;
+  if (!cloakOnStart) return;
+  if (bot.isCloaked) return;
+  
+  const resp = await bot.exec("cloak", { enable: true });
+  if (!resp.error) {
+    ctx.log("combat", "Re-cloaked after battle victory");
+  } else {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to re-cloak after battle: ${resp.error.message}`);
+    }
+  }
+}
 
 export async function fightFreshBattle(
   ctx: RoutineContext,
@@ -709,6 +737,7 @@ export async function fightFreshBattle(
   fleeFromTier: PirateTier,
   maxAttackTier: PirateTier,
   repairThreshold: number = 0,
+  cloakOnStart: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -751,6 +780,7 @@ export async function fightFreshBattle(
   let status = await getBattleStatus(ctx);
   if (!status) {
     ctx.log("combat", `✅ Battle ended during setup — ${target.name} eliminated!`);
+    await recloakAfterBattle(ctx, cloakOnStart);
     return true;
   }
 
@@ -764,6 +794,7 @@ export async function fightFreshBattle(
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -771,6 +802,7 @@ export async function fightFreshBattle(
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -996,6 +1028,7 @@ export async function fightJoinedBattle(
   canFlee: boolean = true,
   shieldRechargePct: number = 80,
   onlyNPCs: boolean = false,
+  cloakOnStart: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -1056,6 +1089,7 @@ export async function fightJoinedBattle(
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -1063,6 +1097,7 @@ export async function fightJoinedBattle(
     if (!status) {
       ctx.log("combat", `✅ Battle complete — victory! (${tickCount} ticks)`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -1092,6 +1127,8 @@ export async function fightJoinedBattle(
         }
       } else if (!better) {
         ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks)!`);
+        await checkAndPraiseMorgThar(ctx, true);
+        await recloakAfterBattle(ctx, cloakOnStart);
         return true;
       }
     }

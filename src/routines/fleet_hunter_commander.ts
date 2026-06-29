@@ -26,6 +26,7 @@
  *   fleeFromTier         - flee from pirates above this tier (default: "boss")
  *   minPiratesToFlee     - min pirates to flee from (default: 3)
  *   autoCloak            - auto-cloak when traveling (default: false)
+ *   cloakOnStart         - stay cloaked until attack command, re-cloak after battle (default: false)
  *   ammoThreshold        - ammo % to trigger reload (default: 5)
  *   maxReloadAttempts    - max reload attempts (default: 3)
  *   huntingEnabled       - enable/disable hunting (default: true)
@@ -338,6 +339,7 @@ interface FleetHunterSettings {
   fleeFromTier: PirateTier;
   minPiratesToFlee: number;
   autoCloak: boolean;
+  cloakOnStart: boolean;
   ammoThreshold: number;
   ammoReloadAbsoluteThreshold: number;
   ammoReloadPercentThreshold: number;
@@ -362,6 +364,7 @@ export function getFleetHunterSettings(): FleetHunterSettings {
     fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     autoCloak: (h.autoCloak as boolean) ?? false,
+    cloakOnStart: (h.cloakOnStart as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
     ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
@@ -597,6 +600,7 @@ async function engageTargetFleet(
   fleeThreshold: number,
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
+  cloakOnStart: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -631,7 +635,7 @@ async function engageTargetFleet(
     await ctx.sleep(1000);
 
     // Use engageTarget from battle.ts with sideId for commander
-    return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", sideId);
+    return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", sideId, false, 0, false, cloakOnStart);
   }
 
   // No existing battle — start fresh fight
@@ -657,7 +661,7 @@ async function engageTargetFleet(
   ctx.log("combat", `⚔️ Fleet battle started with ${target.name} — advancing`);
 
   // Use engageTarget from battle.ts (no sideId since it's a fresh battle)
-  return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large");
+  return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", undefined, false, 0, false, cloakOnStart);
 }
 
 // ── Fleet Hunter Commander Routine ───────────────────────

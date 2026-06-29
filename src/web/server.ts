@@ -10,6 +10,7 @@ import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
+import { wildlifeStore } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 
@@ -355,6 +356,7 @@ constructor(port: number = 3000) {
         syncCoordination: true,
         syncCivilianTransport: true,
         syncRescue: true,
+        syncWildlife: true,
         allowRemoteBotsInDropdowns: true,
         remoteBotNameStyle: "prefix",
         pushLocalDiscoveries: true,
@@ -838,7 +840,7 @@ if (url.pathname === "/data/shipsForSale.json") {
         }
         if (url.pathname === "/data/rawMissions.json") {
           const rawMissionsPath = join(process.cwd(), "data", "rawMissions.json");
-if (existsSync(rawMissionsPath)) {
+          if (existsSync(rawMissionsPath)) {
             return new Response(readFileSync(rawMissionsPath, "utf-8"), {
               headers: {
                 "Content-Type": "application/json",
@@ -846,6 +848,19 @@ if (existsSync(rawMissionsPath)) {
             });
           } else {
             return Response.json({ error: "rawMissions.json not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/api/wildlife") {
+          return Response.json(wildlifeStore.getFullData());
+        }
+        if (url.pathname === "/data/wildlifeInfo.json") {
+          const wildlifePath = join(DATA_DIR, "wildlifeInfo.json");
+          if (existsSync(wildlifePath)) {
+            return new Response(readFileSync(wildlifePath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Wildlife info file not found" }, { status: 404 });
           }
         }
         if (url.pathname === "/api/logs/main") {
@@ -1181,6 +1196,9 @@ if (existsSync(rawMissionsPath)) {
           }
           if (url.pathname === "/api/client-sync/player-names" && req.method === "GET") {
             return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/wildlife" && req.method === "GET") {
+            return Response.json(wildlifeStore.getFullData(), { headers: cors });
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
             const body = await req.json() as { apiKey: string; label: string; password?: string };

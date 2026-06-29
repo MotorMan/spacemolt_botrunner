@@ -7,6 +7,7 @@ import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
+import { wildlifeStore } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
@@ -2962,6 +2963,37 @@ if (this.craftQueueTracker && jobId && recipeId) {
 
     if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
       this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);
+    }
+  }
+
+  trackWildlife(nearbyResult: unknown): void {
+    if (!nearbyResult || typeof nearbyResult !== "object") {
+      return;
+    }
+
+    const data = nearbyResult as Record<string, unknown>;
+    const creaturesArray = Array.isArray(data.creatures) ? data.creatures : [];
+
+    let wildlifeCount = 0;
+    for (const entity of creaturesArray as Array<Record<string, unknown>>) {
+      const name = (entity.name as string) || "";
+      if (name && name.trim()) {
+        const trimmedName = name.trim();
+        const creatureId = (entity.creature_id as string) || "";
+        const species = (entity.species as string) || "";
+        const role = (entity.role as string) || "";
+        const hull = (entity.hull as number) || 0;
+        const maxHull = (entity.max_hull as number) || hull;
+        const inCombat = (entity.in_combat as boolean) || false;
+        
+        if (wildlifeStore.add(trimmedName, this.system, this.poi, creatureId, species, role, hull, maxHull, inCombat)) {
+          wildlifeCount++;
+        }
+      }
+    }
+
+    if (wildlifeCount > 0) {
+      this.log("wildlife", `Discovered ${wildlifeCount} new wildlife creature(s) from nearby scan`);
     }
   }
 

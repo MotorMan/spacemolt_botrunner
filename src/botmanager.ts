@@ -266,6 +266,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
       syncCoordination: ((s.syncCoordination as boolean) ?? true),
       syncCivilianTransport: ((s.syncCivilianTransport as boolean) ?? true),
       syncRescue: ((s.syncRescue as boolean) ?? true),
+      syncWildlife: ((s.syncWildlife as boolean) ?? true),
       allowRemoteBotsInDropdowns: ((s.allowRemoteBotsInDropdowns as boolean) ?? true),
       remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
       pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
@@ -735,6 +736,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   // Track player names from get_nearby responses
   if (!resp.error && resp.result && command === "get_nearby") {
     bot.trackNearbyPlayers(resp.result);
+    bot.trackWildlife(resp.result);
   }
 
 // Broadcast skills update for get_skills command
@@ -901,6 +903,7 @@ async function main(): Promise<void> {
       syncCoordination: (csSettings.syncCoordination as boolean) ?? true,
       syncCivilianTransport: (csSettings.syncCivilianTransport as boolean) ?? true,
       syncRescue: (csSettings.syncRescue as boolean) ?? true,
+      syncWildlife: (csSettings.syncWildlife as boolean) ?? true,
       allowRemoteBotsInDropdowns: (csSettings.allowRemoteBotsInDropdowns as boolean) ?? true,
       remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
       pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,

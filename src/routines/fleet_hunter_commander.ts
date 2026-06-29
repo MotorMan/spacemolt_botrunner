@@ -1369,6 +1369,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
 
         // Track player names from nearby scan
         bot.trackNearbyPlayers(nearbyResp.result);
+        bot.trackWildlife(nearbyResp.result);
 
         const entities = parseNearby(nearbyResp.result);
         const pirates = entities.filter(e => e.isPirate && isPirateTarget(e, true, currentSettings.maxAttackTier));
@@ -1799,6 +1800,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
 
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
+    bot.trackWildlife(nearbyResp.result);
 
     const entities = parseNearby(nearbyResp.result);
     const pirates = entities.filter(e => e.isPirate && isPirateTarget(e, true, currentSettings.maxAttackTier));

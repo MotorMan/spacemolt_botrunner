@@ -2060,6 +2060,7 @@ async function* visitOtherPoi(
 
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
+    bot.trackWildlife(nearbyResp.result);
 
     // Check for pirates and flee if detected (skip if cloaked and ignorePirateFleeWhenCloaked is enabled)
     const { checkAndFleeFromPirates } = await import("./common.js");

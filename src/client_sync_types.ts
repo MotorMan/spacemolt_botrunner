@@ -15,6 +15,7 @@ export interface SyncSettings {
   syncCoordination: boolean;
   syncCivilianTransport: boolean;
   syncRescue: boolean;
+  syncWildlife: boolean;
   allowRemoteBotsInDropdowns: boolean;
   remoteBotNameStyle: "prefix" | "suffix";
   pushLocalDiscoveries: boolean;
@@ -77,7 +78,8 @@ export type SyncEventType =
   | "playerName"
   | "coordination"
   | "civilianTransport"
-  | "rescue";
+  | "rescue"
+  | "wildlife";
 
 export interface SyncHookContext {
   enabled: boolean;

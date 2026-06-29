@@ -870,6 +870,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       const nearbyResp = await bot.exec("get_nearby");
       if (!nearbyResp.error && nearbyResp.result) {
         bot.trackNearbyPlayers(nearbyResp.result);
+        bot.trackWildlife(nearbyResp.result);
         const entities = parseNearby(nearbyResp.result);
         const targets = entities.filter(e => isPirateTarget(e, false, "boss"));
 
@@ -1210,6 +1211,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     const nearbyResp = await bot.exec("get_nearby");
     if (!nearbyResp.error && nearbyResp.result) {
       bot.trackNearbyPlayers(nearbyResp.result);
+      bot.trackWildlife(nearbyResp.result);
       const entities = parseNearby(nearbyResp.result);
       const targets = entities.filter(e => isPirateTarget(e, false, "boss"));
 

@@ -3,7 +3,7 @@ import { join } from "path";
 import type { SpaceMoltAPI } from "./api.js";
 import { debugLog } from "./debug.js";
 
-const OPENAPI_BASE_URL = "https://game.spacemolt.com/api";
+const OPENAPI_BASE_URL = "https://game.spacemolt.com/api/v2";
 
 export interface CatalogItem {
   id: string;

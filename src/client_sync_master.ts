@@ -148,6 +148,10 @@ export class ClientSyncMaster {
     return true;
   }
 
+  public wildlifeUpdate(_payload: { data: unknown }): boolean {
+    return true;
+  }
+
   public getBots(): unknown[] {
     return [];
   }

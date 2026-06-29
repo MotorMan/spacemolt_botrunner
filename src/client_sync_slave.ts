@@ -3,6 +3,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 import { onCoordinationUpdate } from "./client_sync_hooks.js";
+import { wildlifeStore } from "./wildlivestore.js";
 
 export class ClientSyncSlave {
   private settings: SyncSettings;
@@ -159,6 +160,22 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     }
   }
 
+  private async pullWildlife(): Promise<void> {
+    const data = await this.request<Record<string, unknown>>("/api/client-sync/wildlife");
+    if (data && typeof data === "object" && "wildlife" in data) {
+      const wildlifeData = data.wildlife as Record<string, any>;
+      for (const [normalized, entry] of Object.entries(wildlifeData)) {
+        if (entry && typeof entry === "object") {
+          const e = entry as Record<string, unknown>;
+          wildlifeStore["data"].wildlife[normalized] = e as any;
+        }
+      }
+      wildlifeStore["data"].lastUpdated = data.lastUpdated as string;
+      wildlifeStore["data"].counts.wildlife = Object.keys(wildlifeData).length;
+      this.log(`Updated wildlife: ${Object.keys(wildlifeData).length} entities`);
+    }
+  }
+
 private async pushStatuses(): Promise<void> {
     const statuses: Record<string, unknown>[] = [];
     await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
@@ -176,6 +193,7 @@ private async pushStatuses(): Promise<void> {
       if (this.settings.syncCatalog) await this.pullCatalog();
       if (this.settings.syncBotChat) await this.pullChat();
       if (this.settings.syncCoordination) await this.pullCoordination();
+      if (this.settings.syncWildlife) await this.pullWildlife();
       await this.pushStatuses();
       if (this.settings.pushLocalDiscoveries) {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });

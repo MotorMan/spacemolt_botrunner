@@ -24037,6 +24037,7 @@ async function fetchPersonalFacilityTypes(username) {
         const desiredShieldCharges = h.desiredShieldCharges ?? 20;
         const desiredRepairKits = h.desiredRepairKits ?? 12;
         const onlyNPCs = h.onlyNPCs !== false;
+        const huntCreatures = h.huntCreatures !== false;
         const responseRange = h.responseRange ?? 3;
         const maxAttackTier = h.maxAttackTier || "large";
         const fleeFromTier = h.fleeFromTier || "boss";
@@ -24278,6 +24279,17 @@ async function fetchPersonalFacilityTypes(username) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Hunt Wildlife</div>
+        <div class="setting-hint">Also attack wildlife creatures for combat practice and loot. Grazers are passive prey, predators must be hunted first.</div>
+      </div>
+      <select id="set-hunter-huntCreatures">
+        <option value="true"${huntCreatures ? " selected" : ""}>Enabled</option>
+        <option value="false"${!huntCreatures ? " selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Max Attack Tier</div>
         <div class="setting-hint">Maximum pirate tier to engage. Pirates above this tier will be ignored.</div>
       </div>
@@ -24402,6 +24414,8 @@ async function fetchPersonalFacilityTypes(username) {
             ) || 12,
           onlyNPCs:
             document.getElementById("set-hunter-onlyNPCs").value === "true",
+          huntCreatures:
+            document.getElementById("set-hunter-huntCreatures").value === "true",
           maxAttackTier: document.getElementById("set-hunter-maxAttackTier")
             .value,
           fleeFromTier: document.getElementById("set-hunter-fleeFromTier")

@@ -108,7 +108,7 @@ const SESSION_CREATE_INTERVAL = 3000;
 let globalSessionQueue: Promise<void> = Promise.resolve();
 
 // Command-to-Tool Mapping for V2 API
-const DIRECT_PATH_COMMANDS = new Set(['set_home_base', 'buy_insurance', 'claim_insurance', 'get_insurance_quote', 'view_insurance']);
+// Note: Direct-path commands (like /command instead of /tool/command) are no longer used
 
 const COMMAND_TOOL_MAP: Record<string, string> = {
   // Auth commands
@@ -298,10 +298,8 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'claim_insurance': 'spacemolt_salvage',
   'get_insurance_quote': 'spacemolt_salvage',
   'view_insurance': 'spacemolt_salvage',
+  'set_home_base': 'spacemolt_salvage',
   
-  // Direct-path commands (no tool prefix)
-  // 'set_home_base' is handled by DIRECT_PATH_COMMANDS set
-
   // Fleet
   'fleet': 'spacemolt_fleet',
 };
@@ -376,8 +374,9 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'tow_wreck': 'tow',
    'sell_wreck': 'sell',
    'scrap_wreck': 'scrap',
-   'release_tow': 'release',
-   'buy_insurance': 'insure',
+'release_tow': 'release',
+  'buy_insurance': 'insure',
+  'set_home_base': 'set_home',
 };
 
 // Commands that use payload.action for the action (like facility and battle)
@@ -1011,10 +1010,14 @@ export class SpaceMoltAPI {
       delete body.target_poi;
     }
 
+    // Translate base_id -> id for set_home_base (API uses 'id' parameter)
+    if (command === 'set_home_base' && body.base_id !== undefined) {
+      body.id = body.base_id;
+      delete body.base_id;
+    }
+
     if (tool === 'spacemolt_catalog') {
       url = `${this.baseUrl}/${tool}`;
-    } else if (DIRECT_PATH_COMMANDS.has(command)) {
-      url = `${this.baseUrl}/${command}`;
     } else if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
       const action = payload.action as string;
       url = `${this.baseUrl}/${tool}/${action}`;

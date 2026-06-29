@@ -58,10 +58,13 @@ export interface NearbyEntity {
   faction: string;
   isNPC: boolean;
   isPirate: boolean;
+  isCreature?: boolean;
+  creatureId?: string;
   tier?: PirateTier;
   isBoss?: boolean;
   hull?: number;
   maxHull?: number;
+  inCombat?: boolean;
   shield?: number;
   maxShield?: number;
   status?: string;
@@ -155,6 +158,28 @@ export function parseNearby(result: unknown): NearbyEntity[] {
     }
   }
 
+  if (Array.isArray(r.creatures)) {
+    const rawCreatures = r.creatures as Array<Record<string, unknown>>;
+    for (const c of rawCreatures) {
+      const creatureId = (c.creature_id as string) || "";
+      if (!creatureId) continue;
+
+      entities.push({
+        id: creatureId,
+        name: (c.name as string) || "",
+        type: "creature",
+        faction: "",
+        isNPC: true,
+        isPirate: false,
+        isCreature: true,
+        creatureId: creatureId,
+        hull: c.hull as number,
+        maxHull: c.max_hull as number,
+        inCombat: c.in_combat as boolean,
+      });
+    }
+  }
+
   return entities.filter(e => e.id);
 }
 
@@ -162,8 +187,6 @@ export function parseNearby(result: unknown): NearbyEntity[] {
 
 export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttackTier: PirateTier = "large"): boolean {
   if (entity.isPirate) {
-    // Server already filtered this into the pirates list — attack it
-    // (tier system is still incomplete, so we ignore tier gating for now)
     return true;
   }
   if (onlyNPCs && !entity.isNPC) return false;
@@ -173,6 +196,11 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
   const nameMatch = entity.name ? PIRATE_KEYWORDS.some(kw => entity.name.toLowerCase().includes(kw)) : false;
 
   return factionMatch || typeMatch || (entity.isNPC && nameMatch);
+}
+
+export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
+  if (!huntCreatures) return false;
+  return !!(entity.isCreature || entity.type === "creature");
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────

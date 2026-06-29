@@ -227,7 +227,7 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
     if (!isWeapon) continue;
 
     // V2 API provides ammo_type directly, fall back to catalog lookup
-    let ammoType = (mod.ammo_type as string) || (mod.loaded_ammo_id as string);
+    let ammoType = (mod.ammo_type as string) || "";
     if (!ammoType && modId) {
       const catalogModule = catalogStore.getItem(modId);
       if (catalogModule) {
@@ -278,6 +278,7 @@ export async function ensureAmmoLoaded(
   percentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
+  await bot.refreshShip();
   const weapons = await getWeaponModules(ctx);
   if (weapons.length === 0) {
     ctx.log("warn", "No weapon modules found — skipping reload");
@@ -292,7 +293,20 @@ export async function ensureAmmoLoaded(
 
   let anyReloaded = false;
   for (const weapon of weapons) {
-    if (!weapon.ammoType) {
+    ctx.log("debug", `Weapon "${weapon.name}": currentAmmo=${weapon.currentAmmo}, maxAmmo=${weapon.maxAmmo}, ammoType="${weapon.ammoType || 'empty'}"`);
+    
+    let effectiveAmmoType = weapon.ammoType;
+    if (!effectiveAmmoType && weapon.loadedAmmoId) {
+      const ammoIndex = catalogStore.getAmmoTypeIndex();
+      for (const [ammoType, ammoIds] of Object.entries(ammoIndex)) {
+        if (ammoIds.includes(weapon.loadedAmmoId)) {
+          effectiveAmmoType = ammoType;
+          break;
+        }
+      }
+    }
+    
+    if (!effectiveAmmoType) {
       ctx.log("combat", `Weapon "${weapon.name}" does not use ammo — skipping reload check`);
       continue;
     }
@@ -308,25 +322,25 @@ export async function ensureAmmoLoaded(
         ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (abs:${absThreshold}, pct:${pctThreshold}%)`);
       }
     } else {
-      const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);
+      const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
       if (matchingAmmo.length > 0) {
-        ctx.log("combat", `Weapon "${weapon.name}" ammo state unknown - attempting reload with ${weapon.ammoType}`);
+        ctx.log("combat", `Weapon "${weapon.name}" ammo state unknown - attempting reload with ${effectiveAmmoType}`);
         needsReload = true;
       } else {
-        ctx.log("warn", `Weapon "${weapon.name}" needs ${weapon.ammoType} but none in cargo`);
+        ctx.log("warn", `Weapon "${weapon.name}" needs ${effectiveAmmoType} but none in cargo`);
       }
     }
 
     if (!needsReload) continue;
 
-    const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);
+    const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
     if (matchingAmmo.length === 0) {
-      ctx.log("combat", `⚠️ No ${weapon.ammoType} ammo in cargo for "${weapon.name}" — need to resupply`);
+      ctx.log("combat", `⚠️ No ${effectiveAmmoType} ammo in cargo for "${weapon.name}" — need to resupply`);
       continue;
     }
 
     const ammoItem = matchingAmmo[0];
-    ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${weapon.ammoType}) — reloading "${weapon.name}"...`);
+    ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${effectiveAmmoType}) — reloading "${weapon.name}"...`);
 
     for (let i = 0; i < maxAttempts; i++) {
       const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId });
@@ -338,7 +352,7 @@ export async function ensureAmmoLoaded(
           break;
         }
         if (msg.includes("no ammo") || msg.includes("no_ammo") || msg.includes("empty")) {
-          ctx.log("combat", `No ${weapon.ammoType} ammo available — need to resupply at station`);
+          ctx.log("combat", `No ${effectiveAmmoType} ammo available — need to resupply at station`);
           return false;
         }
         if (msg.includes("must specify") || msg.includes("missing")) {

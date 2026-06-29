@@ -755,6 +755,8 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     await repairShip(ctx);
     await tryRefuel(ctx, { skipApprovedCheck: true });
     await ensureHunterResupply(ctx);
+    await ensureUndocked(ctx);
+    await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
   }
 
   // Field repair using cargo kits on routine start (in case started with battle damage and not docked)

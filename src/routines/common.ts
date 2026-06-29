@@ -1846,6 +1846,21 @@ export async function navigateToSystem(
 
     await ensureUndocked(ctx);
 
+    // Pre-jump cloak check: cloak before jumping to dangerous systems if autoCloak enabled
+    if (opts.autoCloak && !bot.isCloaked) {
+      const nextSys = mapStore.getSystem(nextSystem);
+      if (nextSys && isDangerousSystem(nextSys.security_level)) {
+        ctx.log("system", `Cloaking before jump to dangerous system ${nextSystem}...`);
+        const cloakResp = await bot.exec("cloak", { enable: true });
+        if (cloakResp.error) {
+          const msg = cloakResp.error.message.toLowerCase();
+          if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+            ctx.log("warn", `Failed to cloak before jump: ${cloakResp.error.message}`);
+          }
+        }
+      }
+    }
+
     // Jump with retry logic for transient errors
     let jumpSuccess = false;
     let retries = 0;

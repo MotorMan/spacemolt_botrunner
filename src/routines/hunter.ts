@@ -1258,7 +1258,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         } else {
           await ensureDocked(ctx);
         }
-        await collectFromStorage(ctx);
+        await ensureHunterResupply(ctx);
 
         yield "complete_missions";
         await completeActiveMissions(ctx);
@@ -1288,7 +1288,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         await bot.checkSkills();
 
         ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-        await ensureHunterResupply(ctx);
       } else {
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
@@ -1690,7 +1689,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         } else {
           await ensureDocked(ctx);
         }
-        await collectFromStorage(ctx);
+        await ensureHunterResupply(ctx);
 
         yield "complete_missions";
         await completeActiveMissions(ctx);
@@ -1720,7 +1719,6 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await bot.checkSkills();
 
         ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-        await ensureHunterResupply(ctx);
       } else {
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);

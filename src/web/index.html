@@ -22399,6 +22399,7 @@ async function fetchPersonalFacilityTypes(username) {
         const stayOutUntilFull = m.stayOutUntilFull ?? false;
         const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
         const oreSecondary = depositFallback;
+        const desiredEmergencyWarpDevices = m.desiredEmergencyWarpDevices ?? 3;
 
         const systemOpts = ['<option value="">(current system)</option>'];
         for (const sys of [...knownSystems].sort((a, b) =>
@@ -22939,6 +22940,14 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Desired Emergency Warp Devices</div>
+          <div class="setting-hint">Target number of emergency_warp_device items to keep in cargo for emergency escapes.</div>
+        </div>
+        <input type="number" id="set-miner-desiredEmergencyWarpDevices" min="0" max="10" value="${desiredEmergencyWarpDevices}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Depletion Timeout (Hours)</div>
           <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
         </div>
@@ -23390,6 +23399,10 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-miner-minimumFuelCells").value,
             ) || 20,
+          desiredEmergencyWarpDevices:
+            parseInt(
+              document.getElementById("set-miner-desiredEmergencyWarpDevices").value,
+            ) || 3,
 
           // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
           // They are preserved from existing settings when saving from this page

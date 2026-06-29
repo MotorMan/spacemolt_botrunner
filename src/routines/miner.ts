@@ -431,6 +431,7 @@ async function getMinerSettings(username?: string): Promise<{
   noMidMiningRetarget: boolean;
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
+  desiredEmergencyWarpDevices: number;
 
   // Flock mining settings
   flockEnabled: boolean;
@@ -531,6 +532,7 @@ async function getMinerSettings(username?: string): Promise<{
     flockName: (botOverrides.flockName as string) || "",
     flockRole: parseFlockRole(botOverrides.flockRole) ?? "follower",
     flockGroups,
+    desiredEmergencyWarpDevices: (m.desiredEmergencyWarpDevices as number) ?? 3,
   };
 }
 
@@ -1596,6 +1598,24 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
       if (!wResp.error) {
         ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
       }
+    }
+  }
+
+  const settings = await getMinerSettings();
+  const desiredWarp = settings.desiredEmergencyWarpDevices ?? 3;
+  const currentWarp = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const warpToGet = Math.max(0, desiredWarp - currentWarp);
+  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "emergency_warp_device",
+      quantity: warpToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
     }
   }
 }

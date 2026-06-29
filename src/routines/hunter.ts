@@ -211,6 +211,7 @@ function getHunterSettings(username?: string): {
   homeStation: string;
   desiredShieldCharges: number;
   desiredRepairKits: number;
+  desiredEmergencyWarpDevices: number;
   pirateBaseSystem: string;
   patrolRadius: number;
 } {
@@ -261,6 +262,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
+    desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
   };
@@ -2327,6 +2329,25 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
   if (!gotShield) {
     ctx.log("trade", "Shield charges: relying on faction storage");
+  }
+
+  const desiredWarp = hs.desiredEmergencyWarpDevices ?? 3;
+  const currentWarp = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const warpToGet = Math.max(0, desiredWarp - currentWarp);
+  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "emergency_warp_device",
+      quantity: warpToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
+    } else {
+      ctx.log("trade", `Emergency warp devices: relying on faction storage (${warpToGet} needed)`);
+    }
   }
 
   // 3. Military fuel cells — fill the rest (prefer faction storage)

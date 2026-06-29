@@ -24036,6 +24036,7 @@ async function fetchPersonalFacilityTypes(username) {
         const shieldRechargePct = h.shieldRechargePct ?? 80;
         const desiredShieldCharges = h.desiredShieldCharges ?? 20;
         const desiredRepairKits = h.desiredRepairKits ?? 12;
+        const desiredEmergencyWarpDevices = h.desiredEmergencyWarpDevices ?? 3;
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
         const responseRange = h.responseRange ?? 3;
@@ -24268,6 +24269,14 @@ async function fetchPersonalFacilityTypes(username) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Desired Emergency Warp Devices</div>
+        <div class="setting-hint">Target number of emergency_warp_device items to keep in cargo for emergency escapes.</div>
+      </div>
+      <input type="number" id="set-hunter-desiredEmergencyWarpDevices" min="0" max="10" value="${desiredEmergencyWarpDevices}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Attack Mode</div>
         <div class="setting-hint">Restrict attacks to NPC pirates only, or also engage hostile players.</div>
       </div>
@@ -24423,6 +24432,10 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-hunter-desiredRepairKits").value,
             ) || 12,
+          desiredEmergencyWarpDevices:
+            parseInt(
+              document.getElementById("set-hunter-desiredEmergencyWarpDevices").value,
+            ) || 3,
           onlyNPCs:
             document.getElementById("set-hunter-onlyNPCs").value === "true",
           huntCreatures:

@@ -1,6 +1,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import {
   type SystemPOI,
   type Connection,
@@ -560,6 +561,23 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     return;
   }
 
+  // ── Setup exploration coordination ──
+  let sendBotChat: ((content: string, channel: BotChatChannel, recipients?: string[], metadata?: Record<string, unknown>) => void) | undefined;
+  let getAllBotNames: (() => string[]) | undefined;
+  
+  if (ctx.sendBotChat) {
+    sendBotChat = ctx.sendBotChat;
+  }
+  if (ctx.getAllBotNames) {
+    getAllBotNames = ctx.getAllBotNames;
+  }
+  
+  // Register for coordination messages
+  if (getAllBotNames || sendBotChat) {
+    botChatChannel.onMessage(bot.username, processExplorationTarget);
+    ctx.log("exploration", "Exploration coordination enabled");
+  }
+
   const visitedSystems = new Set<string>();
   const visitedSystemTimes = new Map<string, number>(); // Track when each system was last visited (timestamp)
   const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
@@ -709,6 +727,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();
+    cleanupExplorationTargets();
 
     // ── Battle check — check global battle state first ──
     if (await checkAndFleeFromBattle(ctx, "explorer")) {
@@ -1216,7 +1235,7 @@ yield "deposit_cargo";
     // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
       const blacklist = getSystemBlacklist();
-      const unknowns = findUnknownSystems(ctx, systemId, blacklist, fledFromSystems, currentSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
+      const unknowns = findUnknownSystemsWithCoordination(ctx, systemId, blacklist, fledFromSystems, currentSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
 
       if (unknowns.length > 0) {
         // Pick the nearest high-priority target (unknown first, then stale)
@@ -1226,6 +1245,15 @@ yield "deposit_cargo";
           ? ` (oldest data: ${timeAgoFromIso(target.oldestPoiUpdate)})`
           : "";
         ctx.log("exploration", `Direct-to-${priorityLabel}: Found ${unknowns.length} system(s) needing exploration, targeting nearest: ${target.name} (${target.distance} jumps)${staleInfo}`);
+        
+        // Announce our target to other explorers via bot chat
+        if (sendBotChat && getAllBotNames) {
+          const allBots = getAllBotNames();
+          const otherBots = allBots.filter(name => name !== bot.username);
+          if (otherBots.length > 0) {
+            announceExplorationTarget(ctx, target.id);
+          }
+        }
         
         // Load fuel cells if cargo space available
         if (bot.cargoMax > 0 && bot.cargo < bot.cargoMax) {
@@ -1340,6 +1368,16 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
     }
 
     const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
+    
+    // ── Coordination: Announce our target to other explorers ──
+    if (sendBotChat && getAllBotNames && nextSystem) {
+      const allBots = getAllBotNames();
+      const otherBots = allBots.filter(name => name !== bot.username);
+      if (otherBots.length > 0) {
+        announceExplorationTarget(ctx, nextSystem.id);
+      }
+    }
+    
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -4752,4 +4790,130 @@ function cleanupTemporaryBlacklist(): void {
       temporaryPirateBlacklist.delete(systemId);
     }
   }
+}
+
+// ── Explorer Coordination ────────────────────────────────────────
+
+/** Exploration target announced by other explorers via bot chat. */
+interface ExplorationTarget {
+  botName: string;
+  targetSystemId: string;
+  timestamp: number;
+  expiresAt: number;
+}
+
+/** In-memory store of other explorers' current targets (expires after 5 minutes). */
+const explorationTargets = new Map<string, ExplorationTarget>();
+const EXPLORATION_TARGET_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Announce our current target system to other explorers via bot chat.
+ */
+function announceExplorationTarget(ctx: RoutineContext, targetSystemId: string): void {
+  const { sendBotChat, getAllBotNames } = ctx;
+  if (!sendBotChat || !getAllBotNames) return;
+
+  const allBots = getAllBotNames();
+  const otherBots = allBots.filter(name => name !== ctx.bot.username);
+  
+  if (otherBots.length === 0) return;
+
+  sendBotChat(
+    JSON.stringify({
+      type: "exploration_target",
+      targetSystemId,
+      botName: ctx.bot.username,
+    }),
+    "coordination",
+    otherBots,
+    { timestamp: Date.now() }
+  );
+}
+
+/**
+ * Process an incoming exploration target announcement from another bot.
+ */
+function processExplorationTarget(message: BotChatMessage): void {
+  try {
+    const data = JSON.parse(message.content);
+    if (data.type !== "exploration_target") return;
+    
+    const target: ExplorationTarget = {
+      botName: data.botName,
+      targetSystemId: data.targetSystemId,
+      timestamp: message.timestamp,
+      expiresAt: message.timestamp + EXPLORATION_TARGET_TTL_MS,
+    };
+    
+    explorationTargets.set(data.botName, target);
+  } catch {
+    // Invalid JSON, ignore
+  }
+}
+
+/**
+ * Get all currently claimed exploration targets (not expired).
+ */
+function getClaimedTargets(): Set<string> {
+  const now = Date.now();
+  const claimed = new Set<string>();
+  
+  for (const [botName, target] of explorationTargets.entries()) {
+    if (now < target.expiresAt) {
+      claimed.add(target.targetSystemId.toLowerCase());
+    } else {
+      explorationTargets.delete(botName);
+    }
+  }
+  
+  return claimed;
+}
+
+/**
+ * Clean up expired exploration targets.
+ */
+function cleanupExplorationTargets(): void {
+  const now = Date.now();
+  for (const [botName, target] of explorationTargets.entries()) {
+    if (now >= target.expiresAt) {
+      explorationTargets.delete(botName);
+    }
+  }
+}
+
+/**
+ * Find unknown systems to explore, avoiding targets claimed by other explorers.
+ * Returns systems sorted by priority then distance (nearest first).
+ */
+function findUnknownSystemsWithCoordination(
+  ctx: RoutineContext,
+  currentSystem: string,
+  blacklist: string[],
+  fledFromSystems: Set<string>,
+  ignoreBlacklistWhenCloaked: boolean = false,
+  isCloaked: boolean = false,
+): Array<{
+  id: string;
+  name: string;
+  distance: number;
+  route: string[];
+  priority: "unknown" | "stale";
+  oldestPoiUpdate: string | null;
+}> {
+  const claimedTargets = getClaimedTargets();
+  cleanupExplorationTargets();
+  
+  const unknowns = findUnknownSystems(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
+  
+  // Filter out systems that other explorers are targeting
+  const unclaimed = unknowns.filter(u => !claimedTargets.has(u.id.toLowerCase()));
+  
+  if (unclaimed.length === 0 && unknowns.length > 0) {
+    ctx.log("exploration", `All unknown systems are being targeted by other explorers - selecting nearest available`);
+    // Return the original list - we'll pick the nearest even if targeted
+    return unknowns;
+  }
+  
+  ctx.log("exploration", `Filtered out ${unknowns.length - unclaimed.length} systems being targeted by other explorers`);
+  return unclaimed;
 }

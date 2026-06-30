@@ -17584,23 +17584,44 @@ When responding:
         content.innerHTML =
           '<div class="faction-no-data">Loading faction data...</div>';
 
-        sendExec(username, "faction_info", undefined, (result) => {
-          if (factionSelectedBot !== username) return;
+        function fetchFactionInfoPage(offset, accumulatedData) {
+          const params = offset ? { offset } : undefined;
+          sendExec(username, "faction_info", params, (result) => {
+            if (factionSelectedBot !== username) return;
 
-          if (!result.ok || !result.data) {
-            // Not in a faction — show join/create options
-            factionData = null;
-            renderNoFaction(username, result.error);
-            return;
-          }
-          factionData = result.data;
-          // faction_info doesn't include treasury — fetch it separately
+            if (!result.ok || !result.data) {
+              if (!accumulatedData) {
+                factionData = null;
+                renderNoFaction(username, result.error);
+                return;
+              }
+              finishFetch(accumulatedData);
+              return;
+            }
+
+            const data = result.data;
+            const members = Array.isArray(data.members) ? data.members : [];
+            if (accumulatedData) {
+              accumulatedData.members = [...accumulatedData.members, ...members];
+            } else {
+              accumulatedData = { ...data, members };
+            }
+
+            if (data.members_truncated === true) {
+              fetchFactionInfoPage(offset + 50, accumulatedData);
+            } else {
+              finishFetch(accumulatedData);
+            }
+          });
+        }
+
+        function finishFetch(finalData) {
+          factionData = finalData;
           sendExec(
             username,
             "view_storage",
             { source: "faction" },
             (storageResult) => {
-              //removed any because that is WRONG.
               if (
                 storageResult.ok &&
                 storageResult.data &&
@@ -17612,7 +17633,9 @@ When responding:
                 renderFactionContent(username);
             },
           );
-        });
+        }
+
+        fetchFactionInfoPage(0, null);
       }
 
       function renderNoFaction(username, error) {
@@ -17934,7 +17957,13 @@ When responding:
         if (members.length === 0)
           return '<div class="faction-no-data">No member data available</div>';
 
-        const rows = members
+        const sortedMembers = [...members].sort((a, b) => {
+          const nameA = (a.username || a.name || a.player_id || "").toLowerCase();
+          const nameB = (b.username || b.name || b.player_id || "").toLowerCase();
+          return nameA.localeCompare(nameB);
+        });
+
+        const rows = sortedMembers
           .map((m) => {
             const name = m.username || m.name || m.player_id || "?";
             const pid = m.player_id || m.id || name;

@@ -1212,14 +1212,27 @@ export async function ensureFueled(
 
   ctx.log("system", `Fuel low (${fuelPct}%) — need to refuel (threshold: ${thresholdPct}%)...`);
 
-  // ── STEP 1: Convert all cargo fuel cells to fuel ────────────────────────
-  // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
-  // via the refuel command even while docked at a station.
+  // ── STEP 1: Check if already docked at a station with fuel service ───────
   await bot.refreshShip();
   const wasDocked = bot.docked;
   const { pois } = await getSystemInfo(ctx);
   const dockingStation = wasDocked ? pois.find(p => isStationPoi(p) && p.id === bot.poi) : undefined;
 
+  // If docked at a station with fuel service, refuel there first (don't undock)
+  if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
+    ctx.log("system", `Already docked at ${dockingStation.name} with fuel service — refueling in place...`);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
+    await bot.refreshShip();
+    const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (newFuelPct >= thresholdPct) {
+      ctx.log("system", `Refueled at station — fuel now ${newFuelPct}%`);
+      return true;
+    }
+  }
+
+  // ── STEP 2: Convert all cargo fuel cells to fuel ────────────────────────
+  // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
+  // via the refuel command even while docked at a station.
   // Undock first so cargo fuel cells are used one at a time (refuel undocked = use cargo)
   if (wasDocked) {
     ctx.log("system", "Undocking to use cargo fuel cells before reaching for station fuel...");

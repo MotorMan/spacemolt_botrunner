@@ -6,6 +6,17 @@ const TRACKING_FILE = join(DATA_DIR, "fuelServiceState.json");
 
 export type FacilityStatus = "pending_facility" | "building_facility" | "pending_materials" | "crafting_fuel" | "monitoring";
 
+export interface MaterialTransportStatus {
+  itemId: string;
+  itemName: string;
+  neededQty: number;
+  inCargo: number;
+  withdrawnQty: number;
+  depositedQty: number;
+  status: "pending" | "withdrawing" | "in_transit" | "depositing" | "complete" | "failed";
+  error?: string;
+}
+
 export interface StationFacilityState {
   stationId: string;
   facilityType: string;
@@ -19,6 +30,7 @@ export interface StationFacilityState {
   lastCraftJobCheck: number;
   status: FacilityStatus;
   buildFailures: number;
+  materialTransport?: Record<string, MaterialTransportStatus>;
 }
 
 export interface FuelServiceState {
@@ -114,4 +126,41 @@ export function incrementBuildFailures(stationId: string, facilityType: string):
 
 export function resetBuildFailures(stationId: string, facilityType: string): void {
   updateFacilityState(stationId, facilityType, { buildFailures: 0 });
+}
+
+export function updateMaterialTransportStatus(
+  stationId: string,
+  facilityType: string,
+  itemId: string,
+  updates: Partial<MaterialTransportStatus>
+): void {
+  const data = loadState();
+  const key = `${stationId}::${facilityType}`;
+  const existing = data.facilities[key] || {
+    stationId,
+    facilityType,
+    facilityBuilt: false,
+    facilityUnderConstruction: false,
+    craftJobRecipeId: "",
+    craftJobRunsDone: 0,
+    craftJobRunsTotal: 0,
+    lastCraftJobCheck: 0,
+    status: "pending_facility" as FacilityStatus,
+    buildFailures: 0,
+  };
+  const currentTransport = existing.materialTransport || {};
+  const currentMaterial = currentTransport[itemId] || {
+    itemId,
+    itemName: itemId,
+    neededQty: 0,
+    inCargo: 0,
+    withdrawnQty: 0,
+    depositedQty: 0,
+    status: "pending" as const,
+  };
+  const updatedMaterial: MaterialTransportStatus = { ...currentMaterial, ...updates };
+  currentTransport[itemId] = updatedMaterial;
+  const updated: StationFacilityState = { ...existing, materialTransport: currentTransport };
+  data.facilities[key] = updated;
+  saveState(data);
 }

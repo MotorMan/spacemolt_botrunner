@@ -2965,8 +2965,69 @@ export function getModProfile(routineName: string): string[] {
 }
 
 /**
+ * Deposit non-essential items from cargo to free up space.
+ * Returns true if any items were deposited.
+ */
+async function depositCargoToMakeSpace(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshCargo();
+  
+  let deposited = false;
+  for (const cargoItem of bot.inventory) {
+    const lower = cargoItem.itemId.toLowerCase();
+    if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+      const depositResp = await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+      if (!depositResp.error) {
+        ctx.log("trade", `Deposited ${cargoItem.quantity}x ${cargoItem.name} to storage to make space for modules`);
+        deposited = true;
+      }
+    }
+  }
+  return deposited;
+}
+
+/**
+ * Withdraw a module from faction storage to cargo.
+ * Returns true if successful or already in cargo, false otherwise.
+ */
+async function withdrawModuleFromStorage(ctx: RoutineContext, modId: string): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshCargo();
+  
+  // Check if already in cargo
+  const inCargo = bot.inventory.some(item => item.itemId === modId);
+  if (inCargo) return true;
+  
+  // Check if in faction storage
+  await bot.refreshFactionStorage();
+  const inStorage = bot.factionStorage.some(item => item.itemId === modId);
+  if (!inStorage) {
+    ctx.log("warn", `Module ${modId} not found in faction storage`);
+    return false;
+  }
+  
+  // Withdraw from faction storage
+  ctx.log("trade", `Withdrawing ${modId} from faction storage...`);
+  const resp = await bot.exec("storage", { 
+    action: "withdraw", 
+    target: "faction", 
+    item_id: modId, 
+    quantity: 1 
+  });
+  
+  if (resp.error) {
+    ctx.log("error", `Failed to withdraw ${modId} from faction storage: ${resp.error.message}`);
+    return false;
+  }
+  
+  return true;
+}
+
+/**
  * Ensure the bot's ship has the desired mods installed.
  * Uninstalls unwanted mods and installs missing ones.
+ * Handles cargo space issues by depositing items when needed.
+ * Handles modules in faction storage by withdrawing them first.
  * Requires docked at a station with shipyard service.
  */
 export async function ensureModsFitted(
@@ -2998,14 +3059,55 @@ export async function ensureModsFitted(
   // Install missing desired mods
   for (const mod of desiredMods) {
     if (!installedSet.has(mod)) {
-      const resp = await bot.exec("install_mod", { mod_id: mod });
-      if (!resp.error) {
-        ctx.log("system", `Installed mod: ${mod}`);
-      } else {
-        const msg = resp.error.message.toLowerCase();
-        if (!msg.includes("already") && !msg.includes("not found") && !msg.includes("no slot")) {
-          ctx.log("error", `Failed to install mod ${mod}: ${resp.error.message}`);
+      let installedSuccessfully = false;
+      let attempts = 0;
+      const maxAttempts = 3; // Initial attempt + withdraw + 1 retry after depositing
+      
+      while (!installedSuccessfully && attempts < maxAttempts) {
+        const resp = await bot.exec("install_mod", { mod_id: mod });
+        if (!resp.error) {
+          ctx.log("system", `Installed mod: ${mod}`);
+          installedSuccessfully = true;
+        } else {
+          const msg = resp.error.message.toLowerCase();
+          
+          // Check for "not found in cargo" - need to withdraw from storage
+          if (msg.includes("not found") && !msg.includes("not found in storage")) {
+            if (attempts === 0) {
+              ctx.log("trade", `Module ${mod} not in cargo - attempting to withdraw from faction storage...`);
+              const withdrawn = await withdrawModuleFromStorage(ctx, mod);
+              if (withdrawn) {
+                attempts++;
+                continue; // Retry installation
+              } else {
+                ctx.log("warn", `Could not withdraw ${mod} from storage - skipping`);
+                break;
+              }
+            }
+          }
+          
+          // Check for cargo space issues
+          if (msg.includes("no_space") || msg.includes("not enough cargo") || msg.includes("cargo space")) {
+            if (attempts < maxAttempts - 1) {
+              ctx.log("trade", `Cargo full while installing ${mod} - depositing items to make space...`);
+              const deposited = await depositCargoToMakeSpace(ctx);
+              if (deposited) {
+                attempts++;
+                continue; // Retry installation
+              } else {
+                ctx.log("warn", `Could not make space for ${mod} - skipping`);
+                break;
+              }
+            } else {
+              ctx.log("warn", `Still no cargo space after deposit - skipping ${mod}`);
+            }
+          } else if (msg.includes("already") || msg.includes("no slot")) {
+            // Non-retryable errors - just log and continue
+          } else {
+            ctx.log("error", `Failed to install mod ${mod}: ${resp.error.message}`);
+          }
         }
+        attempts++;
       }
     }
   }

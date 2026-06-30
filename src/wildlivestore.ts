@@ -94,7 +94,8 @@ export class WildlifeStore {
     role: string,
     hull: number,
     maxHull: number,
-    inCombat: boolean
+    inCombat: boolean,
+    danger?: number
   ): boolean {
     if (!name || typeof name !== "string") {
       return false;
@@ -110,11 +111,11 @@ export class WildlifeStore {
 
     if (existing) {
       existing.lastSeen = now;
-      existing.system = system || existing.system;
-      existing.poi = poi || existing.poi;
-      existing.hull = hull || existing.hull;
-      existing.maxHull = maxHull || existing.maxHull;
-      existing.inCombat = inCombat || existing.inCombat;
+      if (system) existing.system = system;
+      if (poi) existing.poi = poi;
+      existing.hull = hull;
+      existing.maxHull = maxHull;
+      existing.inCombat = inCombat;
       if (creatureId) existing.creatureId = creatureId;
       this.save();
       return false;
@@ -124,6 +125,7 @@ export class WildlifeStore {
       name: name,
       species: species,
       role: role,
+      danger: danger,
       hull: hull,
       maxHull: maxHull,
       inCombat: inCombat,

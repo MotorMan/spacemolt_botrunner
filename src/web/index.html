@@ -718,6 +718,12 @@
             >
               Connect Clients
             </div>
+            <div
+              class="sidebar-item"
+              onclick="switchSettingsTab('fuel_service')"
+            >
+              Fuel Service
+            </div>
           </div>
           <div class="settings-panel" id="settingsContent">
             <!-- filled by JS -->
@@ -1265,17 +1271,17 @@
         </div>
 
         <!-- Players View -->
-        <div id="statsPlayersView" style="display: none; height: 100%">
+        <div id="statsPlayersView" style="display: none; height: 100%; min-height: 0">
           <iframe id="playersFrame" src="/players.html" style="width: 100%; height: 100%; border: none;"></iframe>
         </div>
 
         <!-- Forensic Analysis View -->
-        <div id="statsFaView" style="display: none; height: 100%">
+        <div id="statsFaView" style="display: none; height: 100%; min-height: 0">
           <iframe id="faFrame" src="/fa.html" style="width: 100%; height: 100%; border: none;"></iframe>
         </div>
 
         <!-- Achievements View -->
-        <div id="statsAchievementsView" style="display: none; height: 100%">
+        <div id="statsAchievementsView" style="display: none; height: 100%; min-height: 0">
           <iframe id="achievementsFrame" src="/achievements.html" style="width: 100%; height: 100%; border: none;"></iframe>
         </div>
       </div>
@@ -3686,11 +3692,11 @@
         document.getElementById("statsSkillsView").style.display =
           view === "skills" ? "" : "none";
         document.getElementById("statsPlayersView").style.display =
-          view === "players" ? "" : "none";
+          view === "players" ? "flex" : "none";
         document.getElementById("statsFaView").style.display =
-          view === "fa" ? "" : "none";
+          view === "fa" ? "flex" : "none";
         document.getElementById("statsAchievementsView").style.display =
-          view === "achievements" ? "" : "none";
+          view === "achievements" ? "flex" : "none";
         if (view === "taxes") {
           if (!taxesLoaded) {
             await loadTaxesData();
@@ -11510,6 +11516,8 @@
           renderModuleSellerSettings(panel);
         } else if (activeSettingsTab === "client_sync") {
           renderClientSyncSettings(panel);
+        } else if (activeSettingsTab === "fuel_service") {
+          renderFuelServiceSettings(panel);
         }
       }
 
@@ -30612,6 +30620,294 @@ async function fetchPersonalFacilityTypes(username) {
             body: JSON.stringify({ password }),
           });
         }
+      }
+
+      function renderFuelServiceSettings(panel) {
+        const fs = settings.fuel_service || {};
+        const stations = fs.stations || [];
+        const facilityConfigs = (fs.facilityConfigs || []);
+        const refuelThreshold = fs.refuelThreshold ?? 35;
+        const repairThreshold = fs.repairThreshold ?? 40;
+        const autoCloak = fs.autoCloak ?? false;
+        const serviceAllEmpires = fs.serviceAllEmpires ?? false;
+
+        const general = settings.general || {};
+        const generalSystem = general.factionStorageSystem || "";
+        const generalStation = general.factionStorageStation || "";
+        let generalLabel = "not set";
+        if (generalSystem && generalStation && mapData[generalSystem]) {
+          const gPoi = (mapData[generalSystem].pois || []).find((p) => p.id === generalStation);
+          if (gPoi)
+            generalLabel =
+              (gPoi.base_name || gPoi.name || generalStation) +
+              " (" +
+              (mapData[generalSystem].name || generalSystem) +
+              ")";
+        }
+
+        let stationOpts = '<option value="">(not set)</option>';
+        for (const [sysId, sys] of Object.entries(mapData || {})) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(
+              b.base_name || b.name || b.id || "",
+            ),
+          )) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const val = sysId + "|" + poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
+          }
+        }
+
+        // Render configured stations list
+         const stationsList =
+           stations.length > 0
+             ? stations
+                 .map((s, idx) => {
+                   const parts = s.includes("|") ? s.split("|") : [generalSystem, s];
+                   const sysId = parts[0];
+                   const poiId = parts[1];
+                   const sysData = mapData[sysId];
+                   const poiName = sysData
+                     ? (sysData.pois || []).find((p) => p.id === poiId)
+                         ?.base_name ||
+                       (sysData.pois || []).find((p) => p.id === poiId)?.name ||
+                       poiId
+                     : poiId;
+                   return `<div class="blacklist-item">
+           <span class="blacklist-name">${esc(sysData?.name || sysId)} / ${esc(poiName)} <span class="blacklist-id">(${esc(s)})</span></span>
+           <button class="sm danger" onclick="removeFuelServiceStation(${idx})">Remove</button>
+         </div>`;
+                 })
+                 .join("")
+             : '<div class="blacklist-empty">No stations added. Add stations below using the dropdown.</div>';
+
+         // Render configured facilities as list with priority editing
+        const facilityList = facilityConfigs.length > 0
+          ? facilityConfigs.map((fc, idx) => {
+              const facility = catalog.facilities?.[fc.id];
+              const name = facility?.name || fc.id;
+              const recipeId = facility?.recipe_id || "";
+              const recipe = catalog.recipes?.[recipeId];
+              const outputPerRun = recipe?.output_quantity || facility?.output_quantity || 200;
+              return `<div class="blacklist-item" style="display:flex;align-items:center;gap:8px">
+                <span style="flex:1">${esc(name)} <span class="blacklist-id">(${esc(fc.id)})</span></span>
+                <span style="font-size:10px;color:var(--text-dim);margin-right:8px">Recipe: ${esc(recipeId)} (${outputPerRun}/run)</span>
+                <input type="number" min="0" max="100" value="${fc.priority}" 
+                  onchange="updateFuelServiceFacilityPriority('${esc(fc.id)}', this.value)"
+                  style="width:60px;font-size:12px;padding:2px 4px" title="Priority (lower = earlier)">
+                <button class="sm danger" onclick="removeFuelServiceFacility(${idx})" style="margin-left:4px">Remove</button>
+              </div>`;
+            }).join("")
+          : '<div class="blacklist-empty">No facilities configured. Add facilities below.</div>';
+
+        panel.innerHTML = `
+      <h3>Fuel Service Settings</h3>
+      <div class="settings-desc">Automate fuel production at faction stations by building and operating fuel production facilities.</div>
+
+      <div style="padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);margin-bottom:12px">
+        <b>Home Base:</b> ${esc(generalLabel)}
+      </div>
+
+      <div style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+        <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏁 Remote Stations</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Stations to service with fuel production facilities.</div>
+        ${stationsList}
+        <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+          <select id="fs-add-station" style="flex:1;min-width:0">${stationOpts}</select>
+          <button class="primary sm" onclick="addFuelServiceStation()">+ Add Station</button>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+        <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏗 Facilities to Build</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+          Facilities will be built and used to produce fuel. Priority control: lower numbers processed first.
+        </div>
+        <div style="max-height:250px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);padding:8px;margin-bottom:12px">
+          ${facilityList}
+        </div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:4px">Add facility by ID (autocomplete):</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="text" id="fs-add-facility" placeholder="e.g. peroxide_reaction_cell" 
+            oninput="filterFacilitySuggestions(this.value)" 
+            style="flex:1;font-size:12px;padding:4px" autocomplete="off">
+          <span id="fs-facility-validation" style="font-size:16px;width:24px;text-align:center"></span>
+          <button class="primary sm" onclick="addFuelServiceFacility()">+ Add</button>
+        </div>
+        <div id="fs-facility-suggestions" style="margin-top:4px;font-size:11px;max-height:150px;overflow-y:auto"></div>
+      </div>
+
+      <div class="setting-row" style="margin-top:16px">
+        <div>
+          <div class="setting-label">Refuel Threshold (%)</div>
+          <div class="setting-hint">Refuel when fuel drops below this %.</div>
+        </div>
+        <input type="number" id="set-fs-refuelThreshold" min="10" max="80" value="${refuelThreshold}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Repair Threshold (%)</div>
+          <div class="setting-hint">Repair hull when HP drops below this %.</div>
+        </div>
+        <input type="number" id="set-fs-repairThreshold" min="10" max="80" value="${repairThreshold}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Auto Cloak</div>
+          <div class="setting-hint">Enable cloaking when traveling through dangerous systems.</div>
+        </div>
+        <input type="checkbox" id="set-fs-autoCloak" ${autoCloak ? "checked" : ""}>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Service All Empires</div>
+          <div class="setting-hint">Service stations regardless of empire (not just your own).</div>
+        </div>
+        <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
+      </div>
+
+      <div class="settings-save-bar">
+        <button class="primary" onclick="saveFuelServiceSettings()">Save Settings</button>
+      </div>
+    `;
+        // Update validation icon after rendering
+        setTimeout(() => updateFacilityValidation(), 0);
+      }
+
+      function updateFacilityValidation() {
+        const input = document.getElementById("fs-add-facility");
+        const validation = document.getElementById("fs-facility-validation");
+        if (!input || !validation) return;
+        const facilityId = input.value.trim();
+        if (!facilityId) {
+          validation.textContent = "";
+          return;
+        }
+        const facility = catalog.facilities?.[facilityId];
+        if (facility && facility.category === "production") {
+          validation.innerHTML = '<span style="color:var(--green)">✓</span>';
+        } else {
+          validation.innerHTML = '<span style="color:var(--red)">✗</span>';
+        }
+      }
+
+      function filterFacilitySuggestions(search) {
+        const suggestionsEl = document.getElementById("fs-facility-suggestions");
+        if (!suggestionsEl) return;
+        
+        if (!search || search.length < 2) {
+          suggestionsEl.innerHTML = "";
+          return;
+        }
+        
+        const lowerSearch = search.toLowerCase();
+        const matches = Object.entries(catalog.facilities || {})
+          .filter(([, f]) => f.category === "production" && f.id.toLowerCase().includes(lowerSearch))
+          .sort(([, a], [, b]) => (a.name || a.id).localeCompare(b.name || b.id))
+          .slice(0, 8);
+        
+        if (matches.length === 0) {
+          suggestionsEl.innerHTML = '<div style="color:var(--text-dim);padding:4px">No matching facilities</div>';
+        } else {
+          suggestionsEl.innerHTML = matches.map(([id, f]) => 
+            `<div style="padding:2px 4px;cursor:pointer" onclick="selectFacilitySuggestion('${esc(id)}')">
+              ${esc(f.name || id)} <span class="blacklist-id">(${esc(id)})</span>
+            </div>`
+          ).join("");
+        }
+      }
+
+      function selectFacilitySuggestion(facilityId) {
+        const input = document.getElementById("fs-add-facility");
+        if (input) input.value = facilityId;
+        document.getElementById("fs-facility-suggestions").innerHTML = "";
+        updateFacilityValidation();
+      }
+
+      function addFuelServiceFacility() {
+        const input = document.getElementById("fs-add-facility");
+        const facilityId = input?.value.trim();
+        if (!facilityId) return;
+        
+        const facility = catalog.facilities?.[facilityId];
+        if (!facility || facility.category !== "production") {
+          alert(`Invalid facility ID: ${facilityId}`);
+          return;
+        }
+        
+        if (!settings.fuel_service) settings.fuel_service = {};
+        if (!settings.fuel_service.facilityConfigs) settings.fuel_service.facilityConfigs = [];
+        if (!settings.fuel_service.facilityConfigs.find((c) => c.id === facilityId)) {
+          settings.fuel_service.facilityConfigs.push({ id: facilityId, priority: 0 });
+        }
+        input.value = "";
+        document.getElementById("fs-facility-suggestions").innerHTML = "";
+        renderFuelServiceSettings(document.getElementById("settingsContent"));
+      }
+
+      function updateFuelServiceFacilityPriority(facilityId, priority) {
+        const fs = settings.fuel_service || {};
+        if (!fs.facilityConfigs) return;
+        const fc = fs.facilityConfigs.find((c) => c.id === facilityId);
+        if (fc) {
+          fc.priority = parseInt(priority) || 0;
+        }
+      }
+
+      function removeFuelServiceFacility(idx) {
+        if (!settings.fuel_service?.facilityConfigs) return;
+        settings.fuel_service.facilityConfigs.splice(idx, 1);
+        renderFuelServiceSettings(document.getElementById("settingsContent"));
+      }
+
+      function updateFuelServiceFacility(facilityId, checked) {
+        const fs = settings.fuel_service || {};
+        if (!fs.facilityConfigs) fs.facilityConfigs = [];
+        if (checked) {
+          if (!fs.facilityConfigs.find((c) => c.id === facilityId)) {
+            fs.facilityConfigs.push({ id: facilityId, priority: 0 });
+          }
+        } else {
+          fs.facilityConfigs = fs.facilityConfigs.filter((c) => c.id !== facilityId);
+        }
+        settings.fuel_service = fs;
+        renderFuelServiceSettings(document.getElementById("settingsContent"));
+      }
+
+      function addFuelServiceStation() {
+        const sel = document.getElementById("fs-add-station");
+        const val = sel?.value;
+        if (!val) return;
+        if (!settings.fuel_service) settings.fuel_service = {};
+        if (!settings.fuel_service.stations) settings.fuel_service.stations = [];
+        if (!settings.fuel_service.stations.includes(val)) {
+          settings.fuel_service.stations.push(val);
+        }
+        renderFuelServiceSettings(document.getElementById("settingsContent"));
+      }
+
+      function removeFuelServiceStation(idx) {
+        if (!settings.fuel_service?.stations) return;
+        settings.fuel_service.stations.splice(idx, 1);
+        renderFuelServiceSettings(document.getElementById("settingsContent"));
+      }
+
+      function saveFuelServiceSettings() {
+        const s = {
+          stations: settings.fuel_service?.stations || [],
+          facilityConfigs: settings.fuel_service?.facilityConfigs || [],
+          refuelThreshold: parseInt(document.getElementById("set-fs-refuelThreshold")?.value) || 35,
+          repairThreshold: parseInt(document.getElementById("set-fs-repairThreshold")?.value) || 40,
+          autoCloak: document.getElementById("set-fs-autoCloak")?.checked || false,
+          serviceAllEmpires: document.getElementById("set-fs-serviceAllEmpires")?.checked || false,
+        };
+        send({ type: "saveSettings", routine: "fuel_service", settings: s });
+        settings.fuel_service = s;
       }
 
       function fcMove() {

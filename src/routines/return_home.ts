@@ -13,6 +13,61 @@ import {
   waitForTransitCompletion,
 } from "./common.js";
 
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("travel", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("travel", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("travel", "Enabling cloaking module for return journey...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to enable cloak: ${resp.error.message}`);
+    }
+    return false;
+  }
+
+  ctx.log("travel", "Cloaking enabled successfully");
+  return true;
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 /**
@@ -23,6 +78,7 @@ function getReturnHomeSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
   refuelThreshold: number;
+  enableCloak: boolean;
 } {
   const all = readSettings();
   const globalDefaults = all.return_home || {};
@@ -32,6 +88,7 @@ function getReturnHomeSettings(username?: string): {
     homeSystem: (botOverrides.homeSystem as string) || (globalDefaults.homeSystem as string) || "sol",
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
     refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
+    enableCloak: (botOverrides.enableCloak as boolean) ?? (globalDefaults.enableCloak as boolean) ?? true,
   };
 }
 
@@ -95,6 +152,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeSystem = settings.homeSystem;
   const homeStation = settings.homeStation;
   const refuelThreshold = settings.refuelThreshold;
+  const enableCloak = settings.enableCloak;
 
   if (!homeSystem) {
     ctx.log("error", "No home system configured — cannot return home");
@@ -102,6 +160,11 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
+
+  // Enable cloaking if configured and module is available
+  if (enableCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
 
   // Battle check before starting return home
   if (await checkAndFleeFromBattle(ctx, "return_home")) {

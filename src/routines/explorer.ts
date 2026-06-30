@@ -828,6 +828,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // Check for pirates in the area
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        // Track wildlife from nearby scan
+        bot.trackWildlife(nearbyResp.result);
+        
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         
@@ -1296,23 +1299,26 @@ yield "deposit_cargo";
           await ctx.sleep(30000);
           continue;
         }
-        if (nearbyResp.result && typeof nearbyResp.result === "object") {
-          // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
-          if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
-            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-            if (fled) {
-              ctx.log("error", "Pirates detected - fled, will retry");
-              fledFromSystems.add(systemId);
-              await ctx.sleep(30000);
-              continue;
-            }
-          }
-        }
-        lastSystem = systemId;
-        continue;
-      } else {
-        ctx.log("info", "Direct-to-Unknown: No unknown systems found — using normal exploration");
-      }
+if (nearbyResp.result && typeof nearbyResp.result === "object") {
+           // Track wildlife from nearby scan
+           bot.trackWildlife(nearbyResp.result);
+           
+           // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
+           if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
+             const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+             if (fled) {
+               ctx.log("error", "Pirates detected - fled, will retry");
+               fledFromSystems.add(systemId);
+               await ctx.sleep(30000);
+               continue;
+             }
+           }
+         }
+         lastSystem = systemId;
+         continue;
+       } else {
+         ctx.log("info", "Direct-to-Unknown: No unknown systems found — using normal exploration");
+       }
     }
 
     // ALWAYS ensure fueled before jumping — will navigate to nearest station if needed
@@ -1409,6 +1415,9 @@ yield "deposit_cargo";
         // Check for pirates
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          // Track wildlife from nearby scan
+          bot.trackWildlife(nearbyResp.result);
+          
           // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
           if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
             const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
@@ -1507,6 +1516,9 @@ yield "deposit_cargo";
     // Check for pirates
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      // Track wildlife from nearby scan
+      bot.trackWildlife(nearbyResp.result);
+      
       // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
       if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
@@ -2663,6 +2675,9 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Check for pirates before docking
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        // Track wildlife from nearby scan
+        bot.trackWildlife(nearbyResp.result);
+        
         const tradeSettings = getExplorerSettings(bot.username);
         if (!bot.isCloaked || !tradeSettings.ignorePirateFleeWhenCloaked) {
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);

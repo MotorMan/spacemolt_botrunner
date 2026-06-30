@@ -79,6 +79,26 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
   return true;
 }
 
+async function checkAndRecloak(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  const { bot } = ctx;
+  
+  if (!settings.enableCloak) {
+    return;
+  }
+  
+  if (bot.isCloaked) {
+    return;
+  }
+  
+  if (bot.fuel <= 0) {
+    ctx.log("transport", "Cannot recloak - no fuel available");
+    return;
+  }
+  
+  ctx.log("transport", "Bot is decloaked, attempting to recloak...");
+  await enableCloakingIfPossible(ctx);
+}
+
 let stationRefCache: StationRef | null = null;
 
 function loadStationRef(): StationRef {
@@ -2020,6 +2040,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           }
         }
         bot.refreshStatus().catch(() => {});
+        await checkAndRecloak(ctx, settings);
       }
 
       const listResp = await bot.exec("list_passengers");
@@ -2326,12 +2347,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       if (waypoint.system !== bot.system) {
         ctx.log("transport", `Navigating to system ${waypoint.system}`);
         const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
-        await bot.refreshStatus();
         if (!ok) {
           ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);
           await ctx.sleep(30000);
           continue;
         }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
         ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
@@ -2359,6 +2381,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           continue;
         }
         await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
       }
 
       const alreadyDocked = bot.docked && bot.poi === waypoint.poi;
@@ -2381,6 +2404,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       await collectFuelCells(ctx, settings);
 
       await bot.refreshStatus();
+      await checkAndRecloak(ctx, settings);
       const creditsAfter = bot.credits || 0;
       const fareEarned = creditsAfter - creditsBefore;
 

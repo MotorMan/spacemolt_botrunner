@@ -421,6 +421,7 @@ interface TransportState {
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
   visitedEmpireStations: string[];
+  needsTravel: boolean;
 }
 
 interface FleetShip {
@@ -1339,6 +1340,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
     visitedEmpireStations: [],
+    needsTravel: false,
   };
 }
 
@@ -1627,54 +1629,59 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
       if (bot.docked && bot.poi && bot.system) {
-        // Collect fuel cells at any station when idle
-        await collectFuelCells(ctx, settings);
-        const resp = await bot.exec("list_station_passengers");
-        if (!resp.error && resp.result) {
-          const data = parseStationPassengers(resp.result);
-          if (data && data.count > 0) {
-            state.pickupStation = bot.poi;
-            state.pickupSystem = bot.system;
-            ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
-          } else {
-            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-            ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
-            if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
-              ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-              const nextPickup = await selectNextPickupStation(ctx, state, settings);
-              if (!nextPickup) {
-                // No next pickup available - try to return home
-                if (settings.homeSystem) {
-                  ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-                  state.pickupStation = settings.homeStation || null;
-                  state.pickupSystem = settings.homeSystem || null;
-                  state.roundsWithoutPassengers = 0;
+        if (state.needsTravel) {
+          // We already have a new pickup station set, proceed to travel
+        } else {
+          // Collect fuel cells at any station when idle
+          await collectFuelCells(ctx, settings);
+          const resp = await bot.exec("list_station_passengers");
+          if (!resp.error && resp.result) {
+            const data = parseStationPassengers(resp.result);
+            if (data && data.count > 0) {
+              state.pickupStation = bot.poi;
+              state.pickupSystem = bot.system;
+              ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
+            } else {
+              state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+              ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+              if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
+                ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+                const nextPickup = await selectNextPickupStation(ctx, state, settings);
+                if (!nextPickup) {
+                  // No next pickup available - try to return home
+                  if (settings.homeSystem) {
+                    ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+                    state.pickupStation = settings.homeStation || null;
+                    state.pickupSystem = settings.homeSystem || null;
+                    state.roundsWithoutPassengers = 0;
+                  } else {
+                    await ctx.sleep(60000);
+                    continue;
+                  }
                 } else {
-                  await ctx.sleep(60000);
-                  continue;
-                }
-              } else {
-                const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-                if (isSameStation) {
-                  ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                  const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+                  if (isSameStation) {
+                    ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                    state.roundsWithoutPassengers = 0;
+                    state.pickupStation = nextPickup.poi;
+                    state.pickupSystem = nextPickup.system;
+                    await ctx.sleep(5000);
+                    continue;
+                  }
                   state.roundsWithoutPassengers = 0;
                   state.pickupStation = nextPickup.poi;
                   state.pickupSystem = nextPickup.system;
-                  await ctx.sleep(5000);
-                  continue;
+                  state.needsTravel = true;
                 }
-                state.roundsWithoutPassengers = 0;
-                state.pickupStation = nextPickup.poi;
-                state.pickupSystem = nextPickup.system;
+              } else {
+                await ctx.sleep(60000);
+                continue;
               }
-            } else {
-              await ctx.sleep(60000);
-              continue;
             }
+          } else {
+            await ctx.sleep(60000);
+            continue;
           }
-        } else {
-          await ctx.sleep(60000);
-          continue;
         }
       } else {
         const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
@@ -1691,6 +1698,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         } else {
           state.pickupStation = pickup.poi;
           state.pickupSystem = pickup.system;
+          state.needsTravel = true;
         }
       }
 
@@ -1699,7 +1707,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       const sysMatch = String(bot.system || "").toLowerCase() === String(state.pickupSystem || "").toLowerCase();
       const alreadyAtPickup = bot.docked && poiMatch && sysMatch;
       
-      if (!alreadyAtPickup) {
+      if (!alreadyAtPickup || state.needsTravel) {
+        state.needsTravel = false;
         // Travel to pickup station and dock
         if (!state.pickupStation || !state.pickupSystem) {
           state.status = "idle";
@@ -1840,22 +1849,33 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       if (waiting.length > 0 && byDest.size === 0 && destDrafts.length === 0) {
         ctx.log("transport", `All ${waiting.length} passengers filtered out (likely pirates). Moving to next station.`);
-        state.roundsWithoutPassengers = 0;
-        const nextPickup = await selectNextPickupStation(ctx, state, settings);
-        if (nextPickup) {
-          const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-          if (!isSameStation) {
+        state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        ctx.log("transport", `No valid passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+        if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
+          ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+          const nextPickup = await selectNextPickupStation(ctx, state, settings);
+          if (nextPickup) {
+            const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+            if (!isSameStation) {
+              state.pickupStation = nextPickup.poi;
+              state.pickupSystem = nextPickup.system;
+              state.roundsWithoutPassengers = 0;
+              state.needsTravel = true;
+              state.status = "idle";
+              saveTransportState(state);
+              await ctx.sleep(5000);
+              continue;
+            }
+            ctx.log("transport", `Next pickup is same station, resetting counter`);
+            state.roundsWithoutPassengers = 0;
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
-            state.status = "idle";
-            saveTransportState(state);
-            await ctx.sleep(5000);
-            continue;
+          } else if (settings.homeSystem) {
+            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            state.roundsWithoutPassengers = 0;
           }
-        }
-        if (settings.homeSystem) {
-          state.pickupStation = settings.homeStation || null;
-          state.pickupSystem = settings.homeSystem || null;
         }
         state.status = "idle";
         saveTransportState(state);
@@ -2109,6 +2129,18 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             }
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
+            state.roundsWithoutPassengers = 0;
+            state.onboardPassengers = [];
+            state.route = [];
+            state.status = "idle";
+            state.needsTravel = true;
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          } else if (settings.homeSystem) {
+            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
             state.onboardPassengers = [];
             state.route = [];

@@ -4272,6 +4272,11 @@
               e.target.id?.startsWith("profile-")
             ) {
               window._profileActionsOpen = true;
+              // Clear any existing timeout
+              if (window._profileActionsCloseTimeout) {
+                clearTimeout(window._profileActionsCloseTimeout);
+                window._profileActionsCloseTimeout = null;
+              }
             }
           });
           actionsEl.addEventListener("focusout", (e) => {
@@ -4282,7 +4287,21 @@
               relatedTarget.tagName !== "SELECT" ||
               !relatedTarget.id?.startsWith("profile-")
             ) {
-              window._profileActionsOpen = false;
+              // Set a timeout to close, allowing time for option clicks
+              window._profileActionsCloseTimeout = setTimeout(() => {
+                window._profileActionsOpen = false;
+                window._profileActionsCloseTimeout = null;
+              }, 200);
+            }
+          });
+          // Also track mousedown to prevent re-render during dropdown interaction
+          actionsEl.addEventListener("mousedown", (e) => {
+            if (e.target.tagName === "SELECT" && e.target.id?.startsWith("profile-")) {
+              window._profileActionsOpen = true;
+              if (window._profileActionsCloseTimeout) {
+                clearTimeout(window._profileActionsCloseTimeout);
+                window._profileActionsCloseTimeout = null;
+              }
             }
           });
         }
@@ -4962,43 +4981,51 @@
         ];
         for (const group of flockGroups) {
           const sel = group.name === botFlock?.flockName ? " selected" : "";
-flockOpts.push(
-             `<option value="${esc(group.name)}"${sel}>${esc(group.name)}</option>`,
-           );
-         }
+          flockOpts.push(
+            `<option value="${esc(group.name)}"${sel}>${esc(group.name)}</option>`,
+          );
+        }
 
-         // Per-bot target empires for fuel_service routine
-         const isFuelService =
-           (bot.state === "running" && bot.routine === "fuel_service") ||
-           (bot.state !== "running" &&
-             bot.state !== "stopping" &&
-             getProfileSelectedRoutine() === "fuel_service");
-         if (isFuelService) {
-           const botSettings = settings[bot.username] || {};
-           const globalTargetEmpires = (settings.fuel_service || {}).targetEmpires || [];
-           const botTargetEmpires = botSettings.targetEmpires || [];
-           const empireOptions = [
-             `<option value=""${!botTargetEmpires.length ? " selected" : ""}>(global: ${globalTargetEmpires.length ? globalTargetEmpires.join(", ") : "all (serviceAllEmpires=true)"})</option>`,
-           ];
-           const empireList = ["crimson", "nebula", "outerrim", "solarian", "voidborn"];
-           for (const emp of empireList) {
-             const sel = botTargetEmpires.includes(emp) ? " selected" : "";
-             empireOptions.push(
-               `<option value="${esc(emp)}"${sel}>${esc(emp)}</option>`,
-             );
-           }
-           actions += `
-       <span class="profile-ore-label" style="margin-left:8px">Target Empires:</span>
-       <select id="profile-fuelService-targetEmpires" multiple onchange="saveProfileFuelServiceTargetEmpires()" style="min-width:120px;max-width:180px;font-size:11px;padding:2px 4px;height:auto">${empireOptions.join("")}</select>`;
-         }
+        // Per-bot target empires for fuel_service routine
+        const isFuelService =
+          (bot.state === "running" && bot.routine === "fuel_service") ||
+          (bot.state !== "running" &&
+            bot.state !== "stopping" &&
+            getProfileSelectedRoutine() === "fuel_service");
+        if (isFuelService) {
+          const botSettings = settings[bot.username] || {};
+          const globalTargetEmpires = (settings.fuel_service || {}).targetEmpires || [];
+          const botTargetEmpires = botSettings.targetEmpires || [];
+          const empireOptions = [
+            `<option value=""${botTargetEmpires.length === 0 ? " selected" : ""}>(global: ${globalTargetEmpires.length ? globalTargetEmpires.join(", ") : "all (serviceAllEmpires=true)"})</option>`,
+          ];
+          const empireList = ["crimson", "nebula", "outerrim", "solarian", "voidborn"];
+          for (const emp of empireList) {
+            const sel = botTargetEmpires.includes(emp) ? " selected" : "";
+            empireOptions.push(
+              `<option value="${esc(emp)}"${sel}>${esc(emp)}</option>`,
+            );
+          }
+          actions += `
+        <span class="profile-ore-label" style="margin-left:8px">Target Empires:</span>
+        <select id="profile-fuelService-targetEmpires" multiple onchange="saveProfileFuelServiceTargetEmpires()" style="min-width:120px;max-width:180px;font-size:11px;padding:2px 4px;height:auto">${empireOptions.join("")}</select>`;
 
-         actions += `
-    <span class="profile-ore-label" style="margin-left:8px">Flock:</span>
-    <select id="profile-flockName" onclick="event.stopPropagation()" onchange="saveProfileFlock()">${flockOpts.join("")}</select>
-    <label style="margin-left:4px;font-size:11px">
-      <input type="checkbox" id="profile-flockLeader" onclick="event.stopPropagation()" onchange="saveProfileFlock()"${botFlock?.flockRole === "leader" ? " checked" : ""}>
-      Leader
-    </label>`;
+          const globalUseAllStations = (settings.fuel_service || {}).useAllStationsInEmpire ?? false;
+          const botUseAllStations = botSettings.useAllStationsInEmpire ?? false;
+          actions += `
+        <label style="display:inline-flex;align-items:center;gap:4px;margin-left:8px;font-size:11px;cursor:pointer">
+          <input type="checkbox" id="profile-fuelService-useAllStations" onchange="saveProfileFuelServiceUseAllStations()"${botUseAllStations ? " checked" : ""}>
+          All stations in empire
+        </label>`;
+        }
+
+        actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Flock:</span>
+      <select id="profile-flockName" onclick="event.stopPropagation()" onchange="saveProfileFlock()">${flockOpts.join("")}</select>
+      <label style="margin-left:4px;font-size:11px">
+        <input type="checkbox" id="profile-flockLeader" onclick="event.stopPropagation()" onchange="saveProfileFlock()"${botFlock?.flockRole === "leader" ? " checked" : ""}>
+        Leader
+      </label>`;
 
         document.getElementById("profileActions").innerHTML = actions;
       }
@@ -5396,6 +5423,22 @@ flockOpts.push(
         settings[bot.username] = updated;
       }
 
+      function saveProfileFuelServiceUseAllStations() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const checkbox = document.getElementById("profile-fuelService-useAllStations");
+        if (!checkbox) return;
+        const useAllStations = checkbox.checked;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { useAllStationsInEmpire: useAllStations });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
       function saveProfileCrafterProfile() {
         const bot = getProfileBot();
         if (!bot) return;
@@ -5547,7 +5590,6 @@ flockOpts.push(
 
         // Skip sidebar rebuild if a topbar dropdown is open
         if (window._profileActionsOpen) {
-          renderProfileTopbar();
           return;
         }
 
@@ -30424,10 +30466,28 @@ async function fetchPersonalFacilityTypes(username) {
       <div id="clientSyncOptionsPanel" style="${mode === "slave" ? "" : "display:none"}">
         <div style="margin-top:8px;margin-bottom:4px;font-size:13px;font-weight:500;color:var(--text-bright)">Sync Options</div>
         
-        <div class="setting-row">
-          <div><div class="setting-label">Sync Map</div></div>
-          <input type="checkbox" id="set-client_sync-syncMap" ${syncMap ? "checked" : ""}>
+<div class="setting-row">
+        <div>
+          <label>Cargo to Faction Storage</label>
+          <div class="setting-hint">Sell items at market then deposit fuel from cargo into faction storage. Used by cargo mover.</div>
         </div>
+        <input type="checkbox" id="set-fs-cargoToFactionStorage" ${cargoToFactionStorage ? "checked" : ""}>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-label">Service All Empires</div>
+        <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-label">Use All Stations in Empire</div>
+        <input type="checkbox" id="set-fs-useAllStationsInEmpire" ${useAllStationsInEmpire ? "checked" : ""}>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-label">Refresh Interval (seconds)</div>
+        <input type="number" id="set-fs-refreshIntervalSec" min="30" max="3600" value="${refreshIntervalSec ?? 300}">
+      </div>
         <div class="setting-row">
           <div><div class="setting-label">Sync Market</div></div>
           <input type="checkbox" id="set-client_sync-syncMarket" ${syncMarket ? "checked" : ""}>
@@ -30700,6 +30760,7 @@ async function fetchPersonalFacilityTypes(username) {
         const repairThreshold = fs.repairThreshold ?? 40;
         const autoCloak = fs.autoCloak ?? false;
         const serviceAllEmpires = fs.serviceAllEmpires ?? false;
+        const useAllStationsInEmpire = fs.useAllStationsInEmpire ?? false;
         const refreshIntervalSec = fs.refreshIntervalSec ?? 300;
 
         const general = settings.general || {};
@@ -30826,7 +30887,7 @@ async function fetchPersonalFacilityTypes(username) {
         <input type="number" id="set-fs-repairThreshold" min="10" max="80" value="${repairThreshold}">
       </div>
 
-      <div class="setting-row">
+<div class="setting-row">
         <div>
           <div class="setting-label">Auto Cloak</div>
           <div class="setting-hint">Enable cloaking when traveling through dangerous systems.</div>
@@ -30834,23 +30895,31 @@ async function fetchPersonalFacilityTypes(username) {
         <input type="checkbox" id="set-fs-autoCloak" ${autoCloak ? "checked" : ""}>
       </div>
 
-<div class="setting-row">
-         <div>
-           <div class="setting-label">Service All Empires</div>
-           <div class="setting-hint">Service stations regardless of empire (not just your own).</div>
-         </div>
-         <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
-       </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Service All Empires</div>
+          <div class="setting-hint">Service stations regardless of empire (not just your own).</div>
+        </div>
+        <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
+      </div>
 
       <div class="setting-row">
-         <div>
-           <div class="setting-label">Refresh Interval (seconds)</div>
-           <div class="setting-hint">How often to check fuel reserves and queue production.</div>
-         </div>
-         <input type="number" id="set-fs-refreshIntervalSec" min="30" max="3600" value="${refreshIntervalSec ?? 300}">
-       </div>
+        <div>
+          <div class="setting-label">Use All Stations in Empire</div>
+          <div class="setting-hint">Bypass station list and use all stations in the target empire(s). Only applies when station list is empty.</div>
+        </div>
+        <input type="checkbox" id="set-fs-useAllStationsInEmpire" ${useAllStationsInEmpire ? "checked" : ""}>
+      </div>
 
-       <div class="settings-save-bar">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Refresh Interval (seconds)</div>
+          <div class="setting-hint">How often to check fuel reserves and queue production.</div>
+        </div>
+        <input type="number" id="set-fs-refreshIntervalSec" min="30" max="3600" value="${refreshIntervalSec ?? 300}">
+      </div>
+
+      <div class="settings-save-bar">
         <button class="primary" onclick="saveFuelServiceSettings()">Save Settings</button>
       </div>
     `;
@@ -30984,6 +31053,7 @@ function saveFuelServiceSettings() {
            repairThreshold: parseInt(document.getElementById("set-fs-repairThreshold")?.value) || 40,
            autoCloak: document.getElementById("set-fs-autoCloak")?.checked || false,
            serviceAllEmpires: document.getElementById("set-fs-serviceAllEmpires")?.checked || false,
+           useAllStationsInEmpire: document.getElementById("set-fs-useAllStationsInEmpire")?.checked || false,
            refreshIntervalSec: parseInt(document.getElementById("set-fs-refreshIntervalSec")?.value) || 300,
          };
          send({ type: "saveSettings", routine: "fuel_service", settings: s });

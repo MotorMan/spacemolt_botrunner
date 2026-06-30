@@ -65,6 +65,27 @@ function getEmpireForStation(stationId: string): string | null {
   return null;
 }
 
+function getAllStationsForEmpire(empire: string): string[] {
+  const stations = EMPIRE_STATIONS[empire.toLowerCase()];
+  if (!stations) return [];
+  return stations.map(s => `${s.systemId}|${s.poiId}`);
+}
+
+function getAllStationsForEmpires(empireList: string[]): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const empire of empireList) {
+    const stations = getAllStationsForEmpire(empire);
+    for (const station of stations) {
+      if (!seen.has(station)) {
+        seen.add(station);
+        result.push(station);
+      }
+    }
+  }
+  return result;
+}
+
 /** Rate-limited call to view_faction_storage for a station. */
 async function getRemoteFactionFuelReserve(bot: Bot, stationId: string): Promise<{reserve: number; capacity: number}> {
    const now = Date.now();
@@ -117,6 +138,7 @@ interface FuelServiceSettings {
   repairThreshold: number;
   autoCloak: boolean;
   serviceAllEmpires: boolean;
+  useAllStationsInEmpire: boolean;
   targetEmpires?: string[];
   refreshIntervalSec?: number;
 }
@@ -148,21 +170,48 @@ interface CraftJobInfo {
   status: string;
 }
 
-function getFuelServiceSettings(botUsername?: string): FuelServiceSettings {
+function getFuelServiceSettings(botUsername?: string, botEmpire?: string): FuelServiceSettings {
   const all = readSettings();
   const general = all.general || {};
   const fs = all.fuel_service || {};
+  // Per-bot overrides can be at both settings[bot].fuel_service and settings[bot] (top-level)
   const botOverrides = botUsername
     ? (all[botUsername as string] as Record<string, unknown> | undefined)?.fuel_service
     : undefined;
+  const botTopLevel = botUsername
+    ? (all[botUsername as string] as Record<string, unknown> | undefined)
+    : undefined;
 
-  const stations = ((botOverrides as Record<string, unknown>)?.stations as string[]) ||
+  let stations: string[] = ((botOverrides as Record<string, unknown>)?.stations as string[]) ||
     (fs.stations as string[]) ||
     [];
   const facilityConfigs = (fs.facilityConfigs as Array<{ id: string; priority: number }>) || [];
-  
+
+  const serviceAllEmpires = (fs.serviceAllEmpires as boolean) ?? false;
+  // Check per-bot override first (at top-level), then global
+  const useAllStationsInEmpire = (botTopLevel?.useAllStationsInEmpire as boolean) ??
+    (fs.useAllStationsInEmpire as boolean) ?? false;
+
+  // Expand stations list if useAllStationsInEmpire is enabled
+  if (useAllStationsInEmpire && stations.length === 0) {
+    // Determine which empires to use
+    let empiresToUse: string[];
+    if (serviceAllEmpires) {
+      // Use all empires when serviceAllEmpires is true
+      empiresToUse = Object.keys(EMPIRE_STATIONS);
+    } else {
+      // Use target empires (per-bot at top-level or fuel_service, or global)
+      const perBotTargetEmpiresTop = (botTopLevel?.targetEmpires as string[]);
+      const perBotTargetEmpires = (botOverrides as Record<string, unknown>)?.targetEmpires as string[];
+      const globalTargetEmpires = (fs.targetEmpires as string[]);
+      empiresToUse = perBotTargetEmpiresTop || perBotTargetEmpires || globalTargetEmpires || [botEmpire || ""];
+    }
+    stations = getAllStationsForEmpires(empiresToUse);
+  }
+
   // Per-bot empire override - only used if serviceAllEmpires is false
-  const targetEmpires = (fs.serviceAllEmpires !== true && (botOverrides as Record<string, unknown>)?.targetEmpires as string[]) ||
+  const targetEmpires = (botTopLevel?.targetEmpires as string[]) ||
+    (fs.serviceAllEmpires !== true && (botOverrides as Record<string, unknown>)?.targetEmpires as string[]) ||
     undefined;
 
   return {
@@ -173,7 +222,8 @@ function getFuelServiceSettings(botUsername?: string): FuelServiceSettings {
     refuelThreshold: (fs.refuelThreshold as number) || 35,
     repairThreshold: (fs.repairThreshold as number) || 40,
     autoCloak: (fs.autoCloak as boolean) ?? false,
-    serviceAllEmpires: (fs.serviceAllEmpires as boolean) ?? false,
+    serviceAllEmpires,
+    useAllStationsInEmpire,
     targetEmpires,
     refreshIntervalSec: (fs.refreshIntervalSec as number) || 300,
   };
@@ -532,7 +582,7 @@ export const fuelServiceRoutine: Routine = async function* (ctx: RoutineContext)
      return;
    }
 
-   const settings = getFuelServiceSettings(bot.username);
+   const settings = getFuelServiceSettings(bot.username, bot.getEmpire());
    const safetyOpts = {
      fuelThresholdPct: settings.refuelThreshold,
      hullThresholdPct: settings.repairThreshold,

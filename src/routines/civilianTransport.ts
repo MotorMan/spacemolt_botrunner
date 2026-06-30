@@ -99,6 +99,29 @@ async function checkAndRecloak(ctx: RoutineContext, settings: CivilianTransportS
   await enableCloakingIfPossible(ctx);
 }
 
+async function depositExcessCredits(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  const { bot } = ctx;
+  
+  if (!bot.docked) {
+    return;
+  }
+  
+  if (bot.credits <= settings.factionDepositThreshold) {
+    return;
+  }
+  
+  const excessToDeposit = bot.credits - settings.factionDepositThreshold;
+  ctx.log("transport", `Depositing ${excessToDeposit.toLocaleString()} credits to faction storage (above threshold of ${settings.factionDepositThreshold.toLocaleString()})`);
+  
+  const resp = await bot.exec("faction_deposit_credits", { amount: excessToDeposit });
+  
+  if (resp.error) {
+    ctx.log("error", `Failed to deposit credits: ${resp.error.message}`);
+  } else {
+    ctx.log("transport", `Successfully deposited ${excessToDeposit.toLocaleString()} credits`);
+  }
+}
+
 let stationRefCache: StationRef | null = null;
 
 function loadStationRef(): StationRef {
@@ -519,6 +542,7 @@ interface CivilianTransportSettings {
   announceDestination: boolean;
   disableFactionMessage: boolean;
   enableCloak: boolean;
+  factionDepositThreshold: number;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -548,6 +572,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     announceDestination: (t.announceDestination as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
     enableCloak: (t.enableCloak as boolean) ?? false,
+    factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
   };
 }
 
@@ -2041,6 +2066,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
         bot.refreshStatus().catch(() => {});
         await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
       }
 
       const listResp = await bot.exec("list_passengers");
@@ -2354,6 +2380,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
         await bot.refreshStatus();
         await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
         ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
@@ -2382,6 +2409,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
         await bot.refreshStatus();
         await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
       }
 
       const alreadyDocked = bot.docked && bot.poi === waypoint.poi;
@@ -2405,6 +2433,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       await bot.refreshStatus();
       await checkAndRecloak(ctx, settings);
+      await depositExcessCredits(ctx, settings);
       const creditsAfter = bot.credits || 0;
       const fareEarned = creditsAfter - creditsBefore;
 

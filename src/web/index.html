@@ -27329,6 +27329,14 @@ async function fetchPersonalFacilityTypes(username) {
       <div class="setting-hint" style="margin-top:4px">Requires a cloaking module. Drains 1 fuel per tick.</div>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Faction deposit threshold</div>
+        <div class="setting-hint">Deposit excess credits to faction storage when docked (default: 1,000,000).</div>
+      </div>
+      <input type="number" id="set-civilian_transport-factionDepositThreshold" min="0" value="${esc(String(ct.factionDepositThreshold ?? 1000000))}">
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -27395,6 +27403,10 @@ async function fetchPersonalFacilityTypes(username) {
         const enableCloak =
           document.getElementById("set-civilian_transport-enableCloak")
             ?.checked ?? false;
+        const factionDepositThreshold = Number(
+          document.getElementById("set-civilian_transport-factionDepositThreshold")
+            ?.value || 1000000,
+        );
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -27419,6 +27431,7 @@ async function fetchPersonalFacilityTypes(username) {
         s.announceDestination = announceDestination;
         s.disableFactionMessage = disableFactionMessage;
         s.enableCloak = enableCloak;
+        s.factionDepositThreshold = factionDepositThreshold;
 
         send({
           type: "saveSettings",

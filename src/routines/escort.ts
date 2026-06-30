@@ -305,7 +305,8 @@ async function handleFleetCoordination(
     const arrived = await navigateToSystem(ctx, homeSystem, {
       fuelThresholdPct: 50,
       hullThresholdPct: 40,
-      skipBlacklist: true
+      skipBlacklist: true,
+      joinBattles: true
     });
     if (!arrived) {
       return { success: false, message: `Could not reach home system ${homeSystem}` };
@@ -319,7 +320,8 @@ async function handleFleetCoordination(
     const arrived = await navigateToSystem(ctx, minerSystem, {
       fuelThresholdPct: 50,
       hullThresholdPct: 40,
-      skipBlacklist: true
+      skipBlacklist: true,
+      joinBattles: true
     });
     if (!arrived) {
       return { success: false, message: `Could not reach miner at ${minerSystem}` };

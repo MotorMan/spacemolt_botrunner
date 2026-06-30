@@ -1668,7 +1668,7 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -1895,10 +1895,10 @@ export async function navigateToSystem(
         const battleNotifs = parseBattleNotifications(jumpResp.notifications);
         const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
         if (hasBattle) {
-          // For hunters (skipBlacklist=true), they intentionally enter pirate systems - don't flee
+          // For combat bots that want to join battles (joinBattles=true), continue navigation
           // For other bots, flee on battle detection
-          if (opts.skipBlacklist) {
-            ctx.log("combat", "Battle detected during jump - hunter intentionally enters - continuing navigation");
+          if (opts.joinBattles) {
+            ctx.log("combat", "Battle detected during jump - combat bot joins battle - continuing navigation");
             inBattleDuringJump = true;
             battleInterruptHandled = true;
           } else {
@@ -1927,13 +1927,13 @@ export async function navigateToSystem(
       // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
       if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
         ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message}`);
-        // For hunters (skipBlacklist=true), they intentionally enter pirate systems - join battle instead of flee
+        // For combat bots that want to join battles (joinBattles=true), join battle instead of flee
         // For other bots, flee on battle interrupt
-        if (opts.skipBlacklist) {
-          ctx.log("combat", "Hunter detected battle interrupt - joining battle instead of fleeing");
+        if (opts.joinBattles) {
+          ctx.log("combat", "Combat bot detected battle interrupt - joining battle instead of fleeing");
           inBattleDuringJump = true;
           battleInterruptHandled = true;
-          // Don't flee - let the escort routine handle battle engagement
+          // Don't flee - let the combat routine handle battle engagement
           // Return false to signal navigation was interrupted by battle
           return false;
         } else {

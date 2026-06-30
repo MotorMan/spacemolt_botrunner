@@ -219,6 +219,7 @@ async function executeMoveCommand(ctx: RoutineContext, params: string): Promise<
     hullThresholdPct: settings.repairThreshold,
     autoCloak: settings.autoCloak,
     skipBlacklist: true, // Fleet hunters BYPASS blacklist - they hunt in pirate systems!
+    joinBattles: true,
   };
 
   // Navigate to system
@@ -325,6 +326,7 @@ async function executeRegroupCommand(ctx: RoutineContext, params: string): Promi
     hullThresholdPct: settings.repairThreshold,
     autoCloak: settings.autoCloak,
     skipBlacklist: true,
+    joinBattles: true,
   };
 
   // Navigate to regroup point
@@ -425,9 +427,10 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
         hullThresholdPct: currentSettings.repairThreshold,
         autoCloak: currentSettings.autoCloak,
         skipBlacklist: true,
+        joinBattles: true,
       };
 
-      // ── Status ──
+      // ── Status ─-
       yield "get_status";
       await bot.refreshStatus();
       logStatus(ctx);

@@ -553,7 +553,7 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
     if (safeSystem) {
       const sys = mapStore.getSystem(safeSystem);
       ctx.log("travel", `Heading to safe system ${sys?.name || safeSystem} (${sys?.security_level}) for repairs...`);
-      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true });
+      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true, joinBattles: true });
       if (!arrived) {
         ctx.log("error", "Could not reach safe system — attempting local dock");
       }
@@ -809,6 +809,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
     const patrolSystem = settings.system || "";
 
@@ -2039,6 +2040,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     // Navigate to the target system in the list
@@ -2433,6 +2435,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     for (const targetSystem of profile.patrolSystems) {
@@ -2552,6 +2555,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
     const arrived = await navigateToSystem(ctx, pirateBase, safetyOpts);
     if (!arrived) {
@@ -2581,6 +2585,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: currentSettings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     const targetSystem = patrolList[systemIndex % patrolList.length];

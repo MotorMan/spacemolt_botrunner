@@ -745,6 +745,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
         hullThresholdPct: currentSettings.repairThreshold,
         autoCloak: currentSettings.autoCloak,
         skipBlacklist: true,
+        joinBattles: true,
       };
       const patrolSystem = currentSettings.patrolSystem || "";
 
@@ -1104,15 +1105,16 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
         continue;
       }
 
-      const currentSettings = getFleetHunterSettings();
+const currentSettings = getFleetHunterSettings();
       const safetyOpts = {
         fuelThresholdPct: currentSettings.refuelThreshold,
         hullThresholdPct: currentSettings.repairThreshold,
         autoCloak: currentSettings.autoCloak,
         skipBlacklist: true,
+        joinBattles: true,
       };
 
-      // ── Check for pending commands from fleet comm or web UI ──
+      // ── Check for pending commands from fleet comm or web UI ─-
       if (fleetState.currentCommand) {
         const cmd = fleetState.currentCommand;
         const params = fleetState.commandParams || "";
@@ -1589,15 +1591,16 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
     }
 
     const currentSettings = getFleetHunterSettings();
-    const safetyOpts = {
-      fuelThresholdPct: currentSettings.refuelThreshold,
-      hullThresholdPct: currentSettings.repairThreshold,
-      autoCloak: currentSettings.autoCloak,
-      skipBlacklist: true,
-    };
+const safetyOpts = {
+        fuelThresholdPct: currentSettings.refuelThreshold,
+        hullThresholdPct: currentSettings.repairThreshold,
+        autoCloak: currentSettings.autoCloak,
+        skipBlacklist: true,
+        joinBattles: true,
+      };
 
-      // ── Check for pending commands from fleet comm or web UI ──
-      if (fleetState.currentCommand) {
+        // ── Check for pending commands from fleet comm or web UI ─-
+        if (fleetState.currentCommand) {
         const cmd = fleetState.currentCommand;
         const params = fleetState.commandParams || "";
         const targetSystem = parseMoveParams(params)?.systemId || "";

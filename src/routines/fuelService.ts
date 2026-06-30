@@ -66,27 +66,46 @@ function getEmpireForStation(stationId: string): string | null {
 }
 
 /** Rate-limited call to view_faction_storage for a station. */
+async function getRemoteFactionFuelReserve(bot: Bot, stationId: string): Promise<{reserve: number; capacity: number}> {
+   const now = Date.now();
+   const lastCalled = factionStorageApiLastCalled.get(stationId) || 0;
+   const elapsed = now - lastCalled;
+   
+   if (elapsed < STATION_API_RATE_LIMIT_MS) {
+     await new Promise(resolve => setTimeout(resolve, STATION_API_RATE_LIMIT_MS - elapsed));
+   }
+   factionStorageApiLastCalled.set(stationId, Date.now());
+   
+   const resp = await bot.exec("view_faction_storage", { station_id: stationId });
+   if (resp.error || !resp.result) return { reserve: 0, capacity: 0 };
+   
+   const result = resp.result as Record<string, unknown>;
+   const reserve = (result.faction_fuel_reserve as number) || 0;
+   const capacity = (result.faction_fuel_capacity as number) || 0;
+   return { reserve, capacity };
+}
+
 async function getRemoteFactionStorage(bot: Bot, stationId: string): Promise<Record<string, number>> {
-  const now = Date.now();
-  const lastCalled = factionStorageApiLastCalled.get(stationId) || 0;
-  const elapsed = now - lastCalled;
-  
-  if (elapsed < STATION_API_RATE_LIMIT_MS) {
-    await new Promise(resolve => setTimeout(resolve, STATION_API_RATE_LIMIT_MS - elapsed));
-  }
-  factionStorageApiLastCalled.set(stationId, Date.now());
-  
-  const resp = await bot.exec("view_faction_storage", { station_id: stationId });
-  if (resp.error || !resp.result) return {};
-  
-  const result = resp.result as Record<string, unknown>;
-  const items = (result.items as Array<Record<string, unknown>>) || [];
-  const qtyMap: Record<string, number> = {};
-  for (const item of items) {
-    const id = (item.item_id as string) || (item.itemId as string);
-    qtyMap[id.toLowerCase()] = (item.quantity as number) || 0;
-  }
-  return qtyMap;
+   const now = Date.now();
+   const lastCalled = factionStorageApiLastCalled.get(stationId) || 0;
+   const elapsed = now - lastCalled;
+   
+   if (elapsed < STATION_API_RATE_LIMIT_MS) {
+     await new Promise(resolve => setTimeout(resolve, STATION_API_RATE_LIMIT_MS - elapsed));
+   }
+   factionStorageApiLastCalled.set(stationId, Date.now());
+   
+   const resp = await bot.exec("view_faction_storage", { station_id: stationId });
+   if (resp.error || !resp.result) return {};
+   
+   const result = resp.result as Record<string, unknown>;
+   const items = (result.items as Array<Record<string, unknown>>) || [];
+   const qtyMap: Record<string, number> = {};
+   for (const item of items) {
+     const id = (item.item_id as string) || (item.itemId as string);
+     qtyMap[id.toLowerCase()] = (item.quantity as number) || 0;
+   }
+   return qtyMap;
 }
 
 interface FuelServiceSettings {
@@ -99,6 +118,7 @@ interface FuelServiceSettings {
   autoCloak: boolean;
   serviceAllEmpires: boolean;
   targetEmpires?: string[];
+  refreshIntervalSec?: number;
 }
 
 interface FacilityDefinition {
@@ -155,6 +175,7 @@ function getFuelServiceSettings(botUsername?: string): FuelServiceSettings {
     autoCloak: (fs.autoCloak as boolean) ?? false,
     serviceAllEmpires: (fs.serviceAllEmpires as boolean) ?? false,
     targetEmpires,
+    refreshIntervalSec: (fs.refreshIntervalSec as number) || 300,
   };
 }
 
@@ -274,16 +295,10 @@ function findRecipeForItem(itemId: string): Recipe | null {
   return null;
 }
 
-function calculateMaxCraftableAtHome(bot: { factionStorage?: { itemId: string; quantity: number }[] }, recipe: Recipe): number {
-  const storage = bot.factionStorage || [];
-  const storageMap = new Map<string, number>();
-  for (const i of storage) {
-    storageMap.set(i.itemId?.toLowerCase(), i.quantity);
-  }
-
+function calculateMaxCraftableAtHome(storage: Record<string, number>, recipe: Recipe): number {
   let maxRuns = Infinity;
   for (const comp of recipe.components) {
-    const available = storageMap.get(comp.item_id?.toLowerCase()) || 0;
+    const available = storage[comp.item_id?.toLowerCase()] || 0;
     const neededPerRun = comp.quantity;
     const runsPossible = Math.floor(available / neededPerRun);
     maxRuns = Math.min(maxRuns, runsPossible);
@@ -296,6 +311,7 @@ async function craftItemAtHome(
   bot: Bot,
   itemId: string,
   quantity: number,
+  homeStation: string,
 ): Promise<boolean> {
   const recipe = findRecipeForItem(itemId);
   if (!recipe) {
@@ -303,7 +319,8 @@ async function craftItemAtHome(
     return false;
   }
 
-  const maxCraftable = calculateMaxCraftableAtHome(bot, recipe);
+  const homeStorage = await getRemoteFactionStorage(bot, homeStation);
+  const maxCraftable = calculateMaxCraftableAtHome(homeStorage, recipe);
   const runs = Math.ceil(quantity / (recipe.output_quantity || 1));
   const actualRuns = Math.min(runs, maxCraftable);
 
@@ -318,331 +335,454 @@ async function craftItemAtHome(
 }
 
 async function buildFacilityAtStation(
-  ctx: RoutineContext,
-  bot: Bot,
-  stationId: string,
-  facilityType: string,
-  homeStation: string,
-): Promise<boolean> {
-  const facility = getFacilityDefinition(facilityType);
-  if (!facility) {
-    ctx.log("error", `Facility definition not found for ${facilityType}`);
-    return false;
-  }
+   ctx: RoutineContext,
+   bot: Bot,
+   stationId: string,
+   facilityType: string,
+   homeStation: string,
+   homeSystem: string,
+   autoCloak: boolean,
+ ): Promise<boolean> {
+   const facility = getFacilityDefinition(facilityType);
+   if (!facility) {
+     ctx.log("error", `Facility definition not found for ${facilityType}`);
+     return false;
+   }
 
-  const buildMaterials = (facility.build_materials as Array<{ item_id: string; quantity: number }>) || [];
-  if (buildMaterials.length === 0) {
-    ctx.log("error", `No build materials defined for ${facilityType}`);
-    return false;
-  }
+   const buildMaterials = (facility.build_materials as Array<{ item_id: string; quantity: number }>) || [];
+   if (buildMaterials.length === 0) {
+     ctx.log("error", `No build materials defined for ${facilityType}`);
+     return false;
+   }
 
-  const failures = incrementBuildFailures(stationId, facilityType);
-  if (failures >= 3) {
-    ctx.log("error", `Facility ${facilityType} at ${stationId} has failed ${failures} times - giving up`);
-    return false;
-  }
+   const failures = incrementBuildFailures(stationId, facilityType);
+   if (failures >= 3) {
+     ctx.log("error", `Facility ${facilityType} at ${stationId} has failed ${failures} times - giving up`);
+     return false;
+   }
 
-  for (const material of buildMaterials) {
-    const itemId = material.item_id;
-    const neededQty = material.quantity;
+   // Check home station faction storage for materials and craft if needed
+   for (const material of buildMaterials) {
+     const itemId = material.item_id;
+     const neededQty = material.quantity;
 
-    // Check home station faction storage for materials
-    const homeStorage = await getRemoteFactionStorage(bot, homeStation);
-    const haveQty = homeStorage[itemId.toLowerCase()] || 0;
+     const homeStorage = await getRemoteFactionStorage(bot, homeStation);
+     const haveQty = homeStorage[itemId.toLowerCase()] || 0;
 
-    if (haveQty < neededQty) {
-      const needToCraft = neededQty - haveQty;
-      ctx.log("fuel", `Need to craft ${needToCraft}x ${itemId} for facility build`);
-      const craftOk = await craftItemAtHome(ctx, bot, itemId, needToCraft);
-      if (!craftOk) {
-        ctx.log("error", `Failed to craft ${needToCraft}x ${itemId}`);
-        return false;
-      }
-    }
-  }
+     if (haveQty < neededQty) {
+       const needToCraft = neededQty - haveQty;
+       ctx.log("fuel", `Need to craft ${needToCraft}x ${itemId} for facility build`);
+       const craftOk = await craftItemAtHome(ctx, bot, itemId, needToCraft, homeStation);
+       if (!craftOk) {
+         ctx.log("error", `Failed to craft ${needToCraft}x ${itemId}`);
+         return false;
+       }
+       // Re-fetch storage after crafting to verify
+       const refreshedStorage = await getRemoteFactionStorage(bot, homeStation);
+       const refreshedQty = refreshedStorage[itemId.toLowerCase()] || 0;
+       if (refreshedQty < neededQty) {
+         ctx.log("error", `Crafting didn't provide enough ${itemId}`);
+         return false;
+       }
+     }
+   }
 
-  ctx.log("fuel", `Issuing facility_build for ${facilityType} at ${stationId}`);
-  const buildResp = await bot.exec("facility", { action: "faction_build", facility_type: facilityType });
-  if (buildResp.error) {
-    ctx.log("error", `facility_build failed: ${buildResp.error.message}`);
-    return false;
-  }
+   // Transport materials to target station (if not home station)
+   if (stationId !== homeStation) {
+     // Enable cloak if requested and not already cloaked
+     if (autoCloak && !bot.isCloaked && bot.fuel > 0) {
+       const shipResp = await bot.exec("get_ship");
+       if (shipResp.result) {
+         const shipData = shipResp.result as Record<string, unknown>;
+         const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+         const hasCloak = modules.some((mod: unknown) => {
+           const m = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : {};
+           const id = (m?.id as string) || (m?.type_id as string) || "";
+           const name = (m?.name as string) || "";
+           const special = (m?.special as string) || "";
+           const checkStr = `${id.toLowerCase()} ${name.toLowerCase()} ${special.toLowerCase()}`;
+           return checkStr.includes("cloak");
+         });
+         if (hasCloak) {
+           ctx.log("fuel", "Enabling cloak for transport...");
+           await bot.exec("cloak", { enable: true });
+         }
+       }
+     }
 
-  resetBuildFailures(stationId, facilityType);
-  return true;
+     ctx.log("fuel", `Transporting build materials to ${stationId}...`);
+     if (bot.system !== homeSystem || bot.poi !== homeStation || !bot.docked) {
+       await navigateToStation(ctx, homeSystem, homeStation);
+       if (bot.state !== "running") return false;
+     }
+
+     // Withdraw each material from home faction storage
+     for (const material of buildMaterials) {
+       const itemId = material.item_id;
+       const qty = material.quantity;
+
+       // Check if already in cargo
+       const inCargo = bot.inventory.find(i => i.itemId === itemId)?.quantity || 0;
+       if (inCargo >= qty) continue;
+
+       // Withdraw from faction storage
+       const withdrawQty = qty;
+       ctx.log("fuel", `Withdrawing ${withdrawQty}x ${itemId} from home...`);
+       const withdrawResp = await bot.exec("storage", {
+         action: "withdraw",
+         target: "faction",
+         item_id: itemId,
+         quantity: withdrawQty,
+         station_id: homeStation,
+       });
+       if (withdrawResp.error) {
+         ctx.log("error", `Withdraw failed for ${itemId}: ${withdrawResp.error.message}`);
+         return false;
+       }
+
+       // Wait for cargo update
+       for (let attempt = 0; attempt < 5; attempt++) {
+         await ctx.sleep(1000);
+         await bot.refreshCargo();
+         const afterQty = bot.inventory.find(i => i.itemId === itemId)?.quantity || 0;
+         if (afterQty >= qty) break;
+       }
+     }
+
+     // Navigate back to target station
+     const stationParts = stationId.split("|").length > 1 ? stationId.split("|") : [null, stationId];
+     const targetSys = stationParts[0] || stationId;
+     await navigateToStation(ctx, targetSys, stationId);
+     if (bot.state !== "running") return false;
+
+     // Deposit to target faction storage
+     for (const material of buildMaterials) {
+       const itemId = material.item_id;
+
+       const inCargo = bot.inventory.find(i => i.itemId === itemId)?.quantity || 0;
+       if (inCargo === 0) continue;
+
+       ctx.log("fuel", `Depositing ${inCargo}x ${itemId} to ${stationId}...`);
+       const depositResp = await bot.exec("faction_deposit_items", {
+         item_id: itemId,
+         quantity: inCargo,
+         station_id: stationId,
+       });
+       if (depositResp.error) {
+         // Fall back to personal storage
+         const personalResp = await bot.exec("deposit_items", {
+           item_id: itemId,
+           quantity: inCargo,
+           station_id: stationId,
+         });
+         if (personalResp.error) {
+           ctx.log("error", `Deposit failed for ${itemId}: ${personalResp.error.message}`);
+           return false;
+         }
+       }
+       await ctx.sleep(500);
+       await bot.refreshCargo();
+     }
+   }
+
+   ctx.log("fuel", `Issuing facility_build for ${facilityType} at ${stationId}`);
+   const buildResp = await bot.exec("facility", { action: "faction_build", facility_type: facilityType });
+   if (buildResp.error) {
+     ctx.log("error", `facility_build failed: ${buildResp.error.message}`);
+     return false;
+   }
+
+   resetBuildFailures(stationId, facilityType);
+   return true;
 }
 
 async function queueFuelProduction(
-  ctx: RoutineContext,
-  bot: Bot,
-  facilityId: string,
-  recipeId: string,
-  quantity: number
-): Promise<boolean> {
-  ctx.log("fuel", `Queueing ${quantity}x ${recipeId} at facility ${facilityId}`);
-  const resp = await bot.exec("facility", {
-    action: "job_add",
-    facility_id: facilityId,
-    recipe_id: recipeId,
-    quantity,
-  });
+   ctx: RoutineContext,
+   bot: Bot,
+   facilityId: string,
+   recipeId: string,
+   quantity: number
+ ): Promise<boolean> {
+   ctx.log("fuel", `Queueing ${quantity}x ${recipeId} at facility ${facilityId}`);
+   const resp = await bot.exec("facility", {
+     action: "job_add",
+     facility_id: facilityId,
+     recipe_id: recipeId,
+     quantity,
+   });
 
-  if (resp.error) {
-    ctx.log("error", `job_add failed: ${resp.error.message}`);
-    return false;
-  }
-  return true;
-}
+   if (resp.error) {
+     ctx.log("error", `job_add failed: ${resp.error.message}`);
+     return false;
+   }
+   return true;
+ }
 
 export const fuelServiceRoutine: Routine = async function* (ctx: RoutineContext) {
-  const { bot } = ctx;
+   const { bot } = ctx;
 
-  while (bot.state !== "running") {
-    await ctx.sleep(2000);
-  }
+   while (bot.state !== "running") {
+     await ctx.sleep(2000);
+   }
 
-  const alive = await detectAndRecoverFromDeath(ctx);
-  if (!alive) {
-    await ctx.sleep(30000);
-    yield "death_recovery";
-    return;
-  }
+   const alive = await detectAndRecoverFromDeath(ctx);
+   if (!alive) {
+     await ctx.sleep(30000);
+     yield "death_recovery";
+     return;
+   }
 
-  const settings = getFuelServiceSettings(bot.username);
-  const safetyOpts = {
-    fuelThresholdPct: settings.refuelThreshold,
-    hullThresholdPct: settings.repairThreshold,
-    autoCloak: settings.autoCloak,
-  };
+   const settings = getFuelServiceSettings(bot.username);
+   const safetyOpts = {
+     fuelThresholdPct: settings.refuelThreshold,
+     hullThresholdPct: settings.repairThreshold,
+     autoCloak: settings.autoCloak,
+   };
 
-  if (!settings.homeSystem || !settings.homeStation) {
-    ctx.log("error", "Fuel Service: General > Faction Storage System and Station must be set");
-    yield "config_error";
-    await ctx.sleep(60000);
-    return;
-  }
+   if (!settings.homeSystem || !settings.homeStation) {
+     ctx.log("error", "Fuel Service: General > Faction Storage System and Station must be set");
+     yield "config_error";
+     await ctx.sleep(60000);
+     return;
+   }
 
-  if (settings.stations.length === 0) {
-    ctx.log("warn", "Fuel Service: No stations configured");
-    yield "no_stations";
-    await ctx.sleep(60000);
-    return;
-  }
+   if (settings.stations.length === 0) {
+     ctx.log("warn", "Fuel Service: No stations configured");
+     yield "no_stations";
+     await ctx.sleep(60000);
+     return;
+   }
 
-  if (settings.facilityConfigs.length === 0) {
-    ctx.log("warn", "Fuel Service: No facility types configured");
-    yield "no_facilities";
-    await ctx.sleep(60000);
-    return;
-  }
+   if (settings.facilityConfigs.length === 0) {
+     ctx.log("warn", "Fuel Service: No facility types configured");
+     yield "no_facilities";
+     await ctx.sleep(60000);
+     return;
+   }
 
-  ctx.log("fuel", `Fuel Service started: ${settings.stations.length} stations, ${settings.facilityConfigs.length} facility types`);
+   ctx.log("fuel", `Fuel Service started: ${settings.stations.length} stations, ${settings.facilityConfigs.length} facility types`);
 
-  while (bot.state === "running") {
-    yield "cycle_start";
+   while (bot.state === "running") {
+     yield "cycle_start";
 
-    if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+     if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
 
-    if (await checkAndFleeFromBattle(ctx, "fuel_service")) {
-      yield "battle_flee";
-      await ctx.sleep(5000);
-      continue;
-    }
+     if (await checkAndFleeFromBattle(ctx, "fuel_service")) {
+       yield "battle_flee";
+       await ctx.sleep(5000);
+       continue;
+     }
 
-    const facilities = settings.facilityConfigs.sort((a, b) => a.priority - b.priority);
+     const facilities = settings.facilityConfigs.sort((a, b) => a.priority - b.priority);
 
-    for (const facilityConfig of facilities) {
-      if (bot.state !== "running") break;
+     for (const facilityConfig of facilities) {
+       if (bot.state !== "running") break;
 
-      const facilityType = facilityConfig.id;
-      const recipeId = getRecipeForFacility(facilityType);
-      if (!recipeId) {
-        ctx.log("error", `Could not find recipe for facility ${facilityType}`);
-        continue;
-      }
+       const facilityType = facilityConfig.id;
+       const recipeId = getRecipeForFacility(facilityType);
+       if (!recipeId) {
+         ctx.log("error", `Could not find recipe for facility ${facilityType}`);
+         continue;
+       }
 
-      for (const stationRef of settings.stations) {
-        if (bot.state !== "running") break;
+       for (const stationRef of settings.stations) {
+         if (bot.state !== "running") break;
 
-        // Parse station reference (format: "system|poiId" or just "poiId")
-        const parts = stationRef.split("|");
-        const targetSystem = parts[0];
-        const targetStation = parts[1];
+         // Parse station reference (format: "system|poiId" or just "poiId")
+         const parts = stationRef.includes("|") ? stationRef.split("|") : [settings.homeSystem, stationRef];
+         const targetSystem = parts[0];
+         const targetStation = parts[1];
 
-        // Empire filtering: skip if station not in target empire
-        if (!settings.serviceAllEmpires) {
-          const stationEmpire = getEmpireForStation(targetStation);
-          const botEmpire = bot.getEmpire();
-          const allowedEmpires = settings.targetEmpires || [botEmpire];
-          
-          // Station empire must be in allowed list
-          if (stationEmpire && !allowedEmpires.includes(stationEmpire) && !allowedEmpires.includes(stationEmpire.toLowerCase())) {
-            ctx.log("fuel", `Skipping station ${targetStation} (empire: ${stationEmpire}) - not in target empires: ${allowedEmpires.join(", ")}`);
-            continue;
-          }
-          
-          // Bot's own empire is always allowed for home base operations
-          if (!stationEmpire && targetStation !== settings.homeStation) {
-            ctx.log("fuel", `Skipping unknown station ${targetStation} (could not determine empire)`);
-            continue;
-          }
-        }
+         // Empire filtering: skip if station not in target empire
+         if (!settings.serviceAllEmpires) {
+           const stationEmpire = getEmpireForStation(targetStation);
+           const botEmpire = bot.getEmpire();
+           const allowedEmpires = settings.targetEmpires || [botEmpire];
+           
+           // Station empire must be in allowed list
+           if (stationEmpire && !allowedEmpires.includes(stationEmpire) && !allowedEmpires.includes(stationEmpire.toLowerCase())) {
+             ctx.log("fuel", `Skipping station ${targetStation} (empire: ${stationEmpire}) - not in target empires: ${allowedEmpires.join(", ")}`);
+             continue;
+           }
+           
+           // Bot's own empire is always allowed for home base operations
+           if (!stationEmpire && targetStation !== settings.homeStation) {
+             ctx.log("fuel", `Skipping unknown station ${targetStation} (could not determine empire)`);
+             continue;
+           }
+         }
 
-        // Navigate to target station if not already there
-        if (bot.system !== targetSystem || bot.poi !== targetStation) {
-          await navigateToStation(ctx, targetSystem, targetStation);
-          if (bot.state !== "running") break;
-        }
+         // Navigate to target station if not already there
+         if (bot.system !== targetSystem || bot.poi !== targetStation) {
+           await navigateToStation(ctx, targetSystem, targetStation);
+           if (bot.state !== "running") break;
+         }
 
-        const state = getFacilityState(targetStation, facilityType) || {
-          stationId: targetStation,
-          facilityType,
-          facilityBuilt: false,
-          facilityUnderConstruction: false,
-          craftJobRecipeId: recipeId,
-          craftJobRunsDone: 0,
-          craftJobRunsTotal: 0,
-          lastCraftJobCheck: 0,
-          status: "pending_facility" as FacilityStatus,
-          buildFailures: 0,
-        };
+         const state = getFacilityState(targetStation, facilityType) || {
+           stationId: targetStation,
+           facilityType,
+           facilityBuilt: false,
+           facilityUnderConstruction: false,
+           craftJobRecipeId: recipeId,
+           craftJobRunsDone: 0,
+           craftJobRunsTotal: 0,
+           lastCraftJobCheck: 0,
+           status: "pending_facility" as FacilityStatus,
+           buildFailures: 0,
+         };
 
-        const facilitiesAtStation = await getFacilitiesAtStation(bot);
-        const existingFacility = facilitiesAtStation.find(f => f.type === facilityType);
+         const facilitiesAtStation = await getFacilitiesAtStation(bot);
+         const existingFacility = facilitiesAtStation.find(f => f.type === facilityType);
 
-        if (!existingFacility || !existingFacility.facility_id) {
-          state.facilityBuilt = false;
-          state.facilityUnderConstruction = false;
-          state.status = "pending_facility";
-        } else {
-          state.facilityId = existingFacility.facility_id;
-          state.facilityBuilt = true;
-          state.facilityUnderConstruction = false;
-          state.status = "monitoring";
-        }
+         if (!existingFacility || !existingFacility.facility_id) {
+           state.facilityBuilt = false;
+           state.facilityUnderConstruction = false;
+           state.status = "pending_facility";
+         } else {
+           state.facilityId = existingFacility.facility_id;
+           state.facilityBuilt = true;
+           state.facilityUnderConstruction = false;
+           state.status = "monitoring";
+         }
 
-        if (!state.facilityBuilt) {
-          state.status = "building_facility";
-          state.facilityUnderConstruction = true;
-          saveFacilityState(state);
-          yield `build_${facilityType}_${targetStation}`;
+         if (!state.facilityBuilt) {
+           state.status = "building_facility";
+           state.facilityUnderConstruction = true;
+           saveFacilityState(state);
+           yield `build_${facilityType}_${targetStation}`;
 
-          const built = await buildFacilityAtStation(ctx, bot, targetStation, facilityType, settings.homeStation);
-          if (built) {
-            state.facilityBuilt = true;
-            state.facilityUnderConstruction = false;
-            state.facilityId = state.facilityId || `faction_${Date.now()}`;
-            state.status = "monitoring";
-          }
-          saveFacilityState(state);
-          continue;
-        }
+           const built = await buildFacilityAtStation(ctx, bot, targetStation, facilityType, settings.homeStation, settings.homeSystem, settings.autoCloak);
+           if (built) {
+             state.facilityBuilt = true;
+             state.facilityUnderConstruction = false;
+             state.facilityId = state.facilityId || `faction_${Date.now()}`;
+             state.status = "monitoring";
+           }
+           saveFacilityState(state);
+           continue;
+         }
 
-        if (state.facilityId) {
-          const jobs = await getFacilityJobs(bot, [state.facilityId]);
-          const job = jobs.get(state.facilityId);
+         if (state.facilityId) {
+           const jobs = await getFacilityJobs(bot, [state.facilityId]);
+           const job = jobs.get(state.facilityId);
 
-          if (job && job.runs_remaining > 0) {
-            state.craftJobId = job.job_id;
-            state.craftJobRunsDone = job.runs_done;
-            state.craftJobRunsTotal = job.runs_done + job.runs_remaining;
-            state.lastCraftJobCheck = Date.now();
-            state.status = "crafting_fuel";
-            saveFacilityState(state);
-            yield `crafting_${facilityType}_${targetStation}`;
-            continue;
-          }
+           if (job && job.runs_remaining > 0) {
+             state.craftJobId = job.job_id;
+             state.craftJobRunsDone = job.runs_done;
+             state.craftJobRunsTotal = job.runs_done + job.runs_remaining;
+             state.lastCraftJobCheck = Date.now();
+             state.status = "crafting_fuel";
+             saveFacilityState(state);
+             yield `crafting_${facilityType}_${targetStation}`;
+             continue;
+           }
 
-          if ((!job || job.runs_remaining === 0) && state.craftJobId) {
-            ctx.log("fuel", `Fuel job completed for ${facilityType} at ${targetStation}`);
-            state.craftJobId = undefined;
-            state.craftJobRunsDone = state.craftJobRunsTotal;
-            state.status = "monitoring";
-            saveFacilityState(state);
-          }
+           if ((!job || job.runs_remaining === 0) && state.craftJobId) {
+             ctx.log("fuel", `Fuel job completed for ${facilityType} at ${targetStation}`);
+             state.craftJobId = undefined;
+             state.craftJobRunsDone = state.craftJobRunsTotal;
+             state.status = "monitoring";
+             saveFacilityState(state);
+           }
 
-          yield `queue_${facilityType}_${targetStation}`;
-          
-          // Calculate fuel quantity based on actual recipe output_quantity
-          const recipe = findRecipeForItem(state.craftJobRecipeId);
-          const outputPerRun = recipe?.output_quantity || 200; // Default to 200 for peroxide
-          const targetFuel = 500000;
-          const maxRunsPerJob = 10000;
-          
-          // Check remote station fuel (not home station)
-          const remoteStorage = await getRemoteFactionStorage(bot, targetStation);
-          const haveFuel = remoteStorage["fuel"] || 0;
-          const runsNeeded = Math.max(0, Math.ceil((targetFuel - haveFuel) / outputPerRun));
-          const actualRuns = Math.max(1, Math.min(runsNeeded, maxRunsPerJob));
+           yield `queue_${facilityType}_${targetStation}`;
+             
+           // Calculate fuel quantity based on actual recipe output_quantity
+           const recipe = findRecipeForItem(state.craftJobRecipeId);
+           const outputPerRun = recipe?.output_quantity || 200; // Default to 200 for peroxide
+           const targetFuel = 500000;
+           const maxRunsPerJob = 10000;
+           
+           // Check remote station fuel (uses fuel_reserve as the item key)
+           const { reserve: haveFuel } = await getRemoteFactionFuelReserve(bot, targetStation);
+           const runsNeeded = Math.max(0, Math.ceil((targetFuel - haveFuel) / outputPerRun));
+           const actualRuns = Math.max(1, Math.min(runsNeeded, maxRunsPerJob));
 
-          const queued = await queueFuelProduction(ctx, bot, state.facilityId, state.craftJobRecipeId, actualRuns);
-          if (queued) {
-            state.status = "monitoring";
-          }
-          saveFacilityState(state);
-        }
-      }
-    }
+           // Check if input materials are available for the recipe
+           const remoteStorage = await getRemoteFactionStorage(bot, targetStation);
+           let runsPossible = actualRuns;
+           if (recipe?.components) {
+             for (const comp of recipe.components) {
+               const available = remoteStorage[comp.item_id.toLowerCase()] || 0;
+               const runsForComp = Math.floor(available / comp.quantity);
+               runsPossible = Math.min(runsPossible, runsForComp);
+             }
+           }
+           const finalRuns = Math.max(1, runsPossible);
 
-    await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-    await repairShip(ctx);
+           if (finalRuns < actualRuns) {
+             ctx.log("fuel", `Reduced runs from ${actualRuns} to ${finalRuns} due to input material constraints`);
+           }
 
-    ctx.log("fuel", "Fuel service cycle complete - waiting 5 minutes...");
-    yield "maintenance";
-    await ctx.sleep(300000);
-  }
-};
+           const queued = await queueFuelProduction(ctx, bot, state.facilityId!, state.craftJobRecipeId, finalRuns);
+           if (queued) {
+             state.status = "monitoring";
+           }
+           saveFacilityState(state);
+         }
+       }
+     }
+
+     await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+     await repairShip(ctx);
+
+     const refreshMs = (settings.refreshIntervalSec || 300) * 1000;
+     ctx.log("fuel", `Fuel service cycle complete - waiting ${settings.refreshIntervalSec || 300} seconds...`);
+     yield "maintenance";
+     await ctx.sleep(refreshMs);
+   }
+ };
 
 /** Navigate bot to target station system and dock. */
 async function navigateToStation(ctx: RoutineContext, targetSystem: string, targetStation: string): Promise<boolean> {
-  const { bot } = ctx;
-  
-  if (bot.system !== targetSystem) {
-    ctx.log("travel", `Navigating to ${targetSystem} for fuel service...`);
-    const route = mapStore.findRoute(bot.system, targetSystem);
-    if (route && route.length > 1) {
-      for (let i = 1; i < route.length; i++) {
-        if (bot.state !== "running") return false;
-        ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
-        const jumpResp = await bot.exec("jump", { target_system: route[i] });
-        if (jumpResp.error) {
-          ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          await bot.refreshLocation();
-          if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
-            return false;
-          }
-        }
-        await bot.refreshLocation();
-      }
-    } else {
-      const jumpResp = await bot.exec("jump", { target_system: targetSystem });
-      if (jumpResp.error && !jumpResp.error.message.includes("already")) {
-        ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        return false;
-      }
-      await bot.refreshLocation();
-    }
-  }
+   const { bot } = ctx;
+   
+   if (bot.system !== targetSystem) {
+     ctx.log("travel", `Navigating to ${targetSystem} for fuel service...`);
+     const route = mapStore.findRoute(bot.system, targetSystem);
+     if (route && route.length > 1) {
+       for (let i = 1; i < route.length; i++) {
+         if (bot.state !== "running") return false;
+         ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
+         const jumpResp = await bot.exec("jump", { target_system: route[i] });
+         if (jumpResp.error) {
+           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+           await bot.refreshLocation();
+           if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
+             return false;
+           }
+         }
+         await bot.refreshLocation();
+       }
+     } else {
+       const jumpResp = await bot.exec("jump", { target_system: targetSystem });
+       if (jumpResp.error && !jumpResp.error.message.includes("already")) {
+         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+         return false;
+       }
+       await bot.refreshLocation();
+     }
+   }
 
-  // Travel to station and dock
-  if (bot.poi !== targetStation) {
-    ctx.log("travel", `Traveling to ${targetStation}...`);
-    const travelResp = await bot.exec("travel", { target_poi: targetStation });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
-      ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-      return false;
-    }
-    bot.poi = targetStation;
-  }
+   // Travel to station and dock
+   if (bot.poi !== targetStation) {
+     ctx.log("travel", `Traveling to ${targetStation}...`);
+     const travelResp = await bot.exec("travel", { target_poi: targetStation });
+     if (travelResp.error && !travelResp.error.message.includes("already")) {
+       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+       return false;
+     }
+     bot.poi = targetStation;
+   }
 
-  if (!bot.docked) {
-    const dockResp = await bot.exec("dock");
-    if (dockResp.error && !dockResp.error.message.includes("already")) {
-      ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-      return false;
-    }
-    bot.docked = true;
-  }
+   if (!bot.docked) {
+     const dockResp = await bot.exec("dock");
+     if (dockResp.error && !dockResp.error.message.includes("already")) {
+       ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+       return false;
+     }
+     bot.docked = true;
+   }
 
-  return true;
+   return true;
 }

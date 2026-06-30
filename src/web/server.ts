@@ -338,17 +338,18 @@ constructor(port: number = 3000) {
       };
       saveSettings(this.settings);
     }
-    if (!this.settings.fuel_service) {
-      this.settings.fuel_service = {
-        stations: [],
-        facilityConfigs: [],
-        refuelThreshold: 35,
-        repairThreshold: 40,
-        autoCloak: false,
-        serviceAllEmpires: false,
-      };
-      saveSettings(this.settings);
-    }
+if (!this.settings.fuel_service) {
+       this.settings.fuel_service = {
+         stations: [],
+         facilityConfigs: [],
+         refuelThreshold: 35,
+         repairThreshold: 40,
+         autoCloak: false,
+         serviceAllEmpires: false,
+         refreshIntervalSec: 300,
+       };
+       saveSettings(this.settings);
+     }
     if (!this.settings.clientSync) {
       this.settings.clientSync = {
         enabled: false,

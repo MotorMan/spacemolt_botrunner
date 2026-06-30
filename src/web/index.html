@@ -4962,12 +4962,37 @@
         ];
         for (const group of flockGroups) {
           const sel = group.name === botFlock?.flockName ? " selected" : "";
-          flockOpts.push(
-            `<option value="${esc(group.name)}"${sel}>${esc(group.name)}</option>`,
-          );
-        }
+flockOpts.push(
+             `<option value="${esc(group.name)}"${sel}>${esc(group.name)}</option>`,
+           );
+         }
 
-        actions += `
+         // Per-bot target empires for fuel_service routine
+         const isFuelService =
+           (bot.state === "running" && bot.routine === "fuel_service") ||
+           (bot.state !== "running" &&
+             bot.state !== "stopping" &&
+             getProfileSelectedRoutine() === "fuel_service");
+         if (isFuelService) {
+           const botSettings = settings[bot.username] || {};
+           const globalTargetEmpires = (settings.fuel_service || {}).targetEmpires || [];
+           const botTargetEmpires = botSettings.targetEmpires || [];
+           const empireOptions = [
+             `<option value=""${!botTargetEmpires.length ? " selected" : ""}>(global: ${globalTargetEmpires.length ? globalTargetEmpires.join(", ") : "all (serviceAllEmpires=true)"})</option>`,
+           ];
+           const empireList = ["crimson", "nebula", "outerrim", "solarian", "voidborn"];
+           for (const emp of empireList) {
+             const sel = botTargetEmpires.includes(emp) ? " selected" : "";
+             empireOptions.push(
+               `<option value="${esc(emp)}"${sel}>${esc(emp)}</option>`,
+             );
+           }
+           actions += `
+       <span class="profile-ore-label" style="margin-left:8px">Target Empires:</span>
+       <select id="profile-fuelService-targetEmpires" multiple onchange="saveProfileFuelServiceTargetEmpires()" style="min-width:120px;max-width:180px;font-size:11px;padding:2px 4px;height:auto">${empireOptions.join("")}</select>`;
+         }
+
+         actions += `
     <span class="profile-ore-label" style="margin-left:8px">Flock:</span>
     <select id="profile-flockName" onclick="event.stopPropagation()" onchange="saveProfileFlock()">${flockOpts.join("")}</select>
     <label style="margin-left:4px;font-size:11px">
@@ -5347,6 +5372,22 @@
         const focusStationId = sel.value;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { focusStationId });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileFuelServiceTargetEmpires() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-fuelService-targetEmpires");
+        if (!sel) return;
+        const selectedOptions = Array.from(sel.selectedOptions).map(opt => opt.value).filter(v => v);
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetEmpires: selectedOptions });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -30630,6 +30671,7 @@ async function fetchPersonalFacilityTypes(username) {
         const repairThreshold = fs.repairThreshold ?? 40;
         const autoCloak = fs.autoCloak ?? false;
         const serviceAllEmpires = fs.serviceAllEmpires ?? false;
+        const refreshIntervalSec = fs.refreshIntervalSec ?? 300;
 
         const general = settings.general || {};
         const generalSystem = general.factionStorageSystem || "";
@@ -30763,15 +30805,23 @@ async function fetchPersonalFacilityTypes(username) {
         <input type="checkbox" id="set-fs-autoCloak" ${autoCloak ? "checked" : ""}>
       </div>
 
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Service All Empires</div>
-          <div class="setting-hint">Service stations regardless of empire (not just your own).</div>
-        </div>
-        <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
-      </div>
+<div class="setting-row">
+         <div>
+           <div class="setting-label">Service All Empires</div>
+           <div class="setting-hint">Service stations regardless of empire (not just your own).</div>
+         </div>
+         <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
+       </div>
 
-      <div class="settings-save-bar">
+      <div class="setting-row">
+         <div>
+           <div class="setting-label">Refresh Interval (seconds)</div>
+           <div class="setting-hint">How often to check fuel reserves and queue production.</div>
+         </div>
+         <input type="number" id="set-fs-refreshIntervalSec" min="30" max="3600" value="${refreshIntervalSec ?? 300}">
+       </div>
+
+       <div class="settings-save-bar">
         <button class="primary" onclick="saveFuelServiceSettings()">Save Settings</button>
       </div>
     `;
@@ -30897,18 +30947,19 @@ async function fetchPersonalFacilityTypes(username) {
         renderFuelServiceSettings(document.getElementById("settingsContent"));
       }
 
-      function saveFuelServiceSettings() {
-        const s = {
-          stations: settings.fuel_service?.stations || [],
-          facilityConfigs: settings.fuel_service?.facilityConfigs || [],
-          refuelThreshold: parseInt(document.getElementById("set-fs-refuelThreshold")?.value) || 35,
-          repairThreshold: parseInt(document.getElementById("set-fs-repairThreshold")?.value) || 40,
-          autoCloak: document.getElementById("set-fs-autoCloak")?.checked || false,
-          serviceAllEmpires: document.getElementById("set-fs-serviceAllEmpires")?.checked || false,
-        };
-        send({ type: "saveSettings", routine: "fuel_service", settings: s });
-        settings.fuel_service = s;
-      }
+function saveFuelServiceSettings() {
+         const s = {
+           stations: settings.fuel_service?.stations || [],
+           facilityConfigs: settings.fuel_service?.facilityConfigs || [],
+           refuelThreshold: parseInt(document.getElementById("set-fs-refuelThreshold")?.value) || 35,
+           repairThreshold: parseInt(document.getElementById("set-fs-repairThreshold")?.value) || 40,
+           autoCloak: document.getElementById("set-fs-autoCloak")?.checked || false,
+           serviceAllEmpires: document.getElementById("set-fs-serviceAllEmpires")?.checked || false,
+           refreshIntervalSec: parseInt(document.getElementById("set-fs-refreshIntervalSec")?.value) || 300,
+         };
+         send({ type: "saveSettings", routine: "fuel_service", settings: s });
+         settings.fuel_service = s;
+       }
 
       function fcMove() {
         const poiId = document.getElementById("fc-move-poi").value;

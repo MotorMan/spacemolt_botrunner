@@ -2117,6 +2117,7 @@ export async function navigateToSystem(
     if (!opts.skipBlacklist) {
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        bot.trackWildlife(nearbyResp.result);
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
         if (fled) {
           // We fled - navigation is aborted, caller will need to handle new position
@@ -3993,6 +3994,7 @@ export async function handleBattleNotifications(
         ctx.log("combat", "No pirates detected - checking for attacking players...");
         const nearbyResp = await ctx.bot.exec("get_nearby");
         if (!nearbyResp.error && nearbyResp.result) {
+          ctx.bot.trackWildlife(nearbyResp.result);
           const nearbyResult = parseNearbyEntities(nearbyResp.result);
           ctx.log("combat", `Nearby entities: ${nearbyResult.playerCount} players, ${nearbyResult.pirateCount} pirates`);
 

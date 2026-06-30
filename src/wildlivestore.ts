@@ -9,7 +9,6 @@ export interface WildlifeDetail {
   name: string;
   species: string;
   role: string;
-  danger?: number;
   hull: number;
   maxHull: number;
   inCombat: boolean;
@@ -94,8 +93,7 @@ export class WildlifeStore {
     role: string,
     hull: number,
     maxHull: number,
-    inCombat: boolean,
-    danger?: number
+    inCombat: boolean
   ): boolean {
     if (!name || typeof name !== "string") {
       return false;
@@ -125,7 +123,6 @@ export class WildlifeStore {
       name: name,
       species: species,
       role: role,
-      danger: danger,
       hull: hull,
       maxHull: maxHull,
       inCombat: inCombat,

@@ -3084,6 +3084,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Check for pirates at destination
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          bot.trackWildlife(nearbyResp.result);
           const { checkAndFleeFromPirates } = await import("./common.js");
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
           if (fled) {

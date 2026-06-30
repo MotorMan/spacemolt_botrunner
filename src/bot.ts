@@ -2985,9 +2985,8 @@ if (this.craftQueueTracker && jobId && recipeId) {
         const hull = (entity.hull as number) || 0;
         const maxHull = (entity.max_hull as number) || hull;
         const inCombat = (entity.in_combat as boolean) || false;
-        const danger = (entity.danger as number) || undefined;
         
-        if (wildlifeStore.add(trimmedName, this.system, this.poi, creatureId, species, role, hull, maxHull, inCombat, danger)) {
+        if (wildlifeStore.add(trimmedName, this.system, this.poi, creatureId, species, role, hull, maxHull, inCombat)) {
           wildlifeCount++;
         }
       }

@@ -4280,6 +4280,7 @@ if (configuredSystem) {
     // Check for pirates in nearby response (skip if cloaked with cloakIgnoreBlacklist)
     const isCloakedIgnoringBlacklist = bot.isCloaked && settings.cloakIgnoreBlacklist;
     if (!isCloakedIgnoringBlacklist && nearbyResp.result && typeof nearbyResp.result === "object") {
+      bot.trackWildlife(nearbyResp.result);
       const { checkAndFleeFromPirates } = await import("./common.js");
       const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
       if (fled) {
@@ -4294,11 +4295,12 @@ if (configuredSystem) {
     if (bot.isInBattle()) {
       ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - checking engagement...`);
 
-      // Check for nearby players to decide if we should engage
-      const nearbyResp = await bot.exec("get_nearby");
-      if (nearbyResp.result && typeof nearbyResp.result === "object") {
-        const { parseNearbyEntities } = await import("./common.js");
-        const nearbyResult = parseNearbyEntities(nearbyResp.result);
+// Check for nearby players to decide if we should engage
+       const nearbyResp = await bot.exec("get_nearby");
+       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+         bot.trackWildlife(nearbyResp.result);
+         const { parseNearbyEntities } = await import("./common.js");
+         const nearbyResult = parseNearbyEntities(nearbyResp.result);
 
         if (nearbyResult.hasPlayers) {
           const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
@@ -4325,11 +4327,12 @@ if (configuredSystem) {
     if (directBattleStatus && directBattleStatus.is_participant) {
       ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - checking engagement...`);
 
-      // Check for nearby players to decide if we should engage
-      const nearbyResp2 = await bot.exec("get_nearby");
-      if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
-        const { parseNearbyEntities } = await import("./common.js");
-        const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
+// Check for nearby players to decide if we should engage
+       const nearbyResp2 = await bot.exec("get_nearby");
+       if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
+         bot.trackWildlife(nearbyResp2.result);
+         const { parseNearbyEntities } = await import("./common.js");
+         const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
 
         if (nearbyResult2.hasPlayers) {
           const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);

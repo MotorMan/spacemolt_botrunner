@@ -4,7 +4,11 @@ import { join } from "path";
 const DATA_DIR = join(process.cwd(), "data");
 const TRACKING_FILE = join(DATA_DIR, "fuelServiceState.json");
 
-export type FacilityStatus = "pending_facility" | "building_facility" | "pending_materials" | "crafting_fuel" | "monitoring";
+export function getTrackingFilePath(): string {
+  return TRACKING_FILE;
+}
+
+export type FacilityStatus = "pending_facility" | "building_facility" | "pending_materials" | "crafting_fuel" | "monitoring" | "transporting_materials";
 
 export interface MaterialTransportStatus {
   itemId: string;
@@ -15,6 +19,16 @@ export interface MaterialTransportStatus {
   depositedQty: number;
   status: "pending" | "withdrawing" | "in_transit" | "depositing" | "complete" | "failed";
   error?: string;
+}
+
+export interface ActiveTransport {
+  stationId: string;
+  facilityType: string;
+  homeStation: string;
+  homeSystem: string;
+  items: Array<{ itemId: string; neededQty: number; withdrawnQty: number; depositedQty: number }>;
+  currentItemIndex: number;
+  status: "withdrawing" | "in_transit" | "depositing";
 }
 
 export interface StationFacilityState {
@@ -28,14 +42,23 @@ export interface StationFacilityState {
   craftJobRunsDone: number;
   craftJobRunsTotal: number;
   lastCraftJobCheck: number;
+  lastQueuedRuns?: number;
   status: FacilityStatus;
   buildFailures: number;
   materialTransport?: Record<string, MaterialTransportStatus>;
+  activeTransport?: ActiveTransport;
+}
+
+export interface ShipInfo {
+  shipId: string;
+  speed: number;
+  cargoCapacity: number;
 }
 
 export interface FuelServiceState {
   version: number;
   facilities: Record<string, StationFacilityState>;
+  ships: Record<string, ShipInfo>;
 }
 
 function ensureDataDir(): void {
@@ -51,17 +74,22 @@ function loadState(): FuelServiceState {
       const data = JSON.parse(raw) as FuelServiceState;
       if (!data.version) data.version = 1;
       if (!data.facilities) data.facilities = {};
+      if (!data.ships) data.ships = {};
       return data;
     }
   } catch (err) {
     console.warn("Could not load fuelServiceState.json:", err);
   }
-  return { version: 1, facilities: {} };
+  return { version: 1, facilities: {}, ships: {} };
 }
 
 function saveState(data: FuelServiceState): void {
   ensureDataDir();
-  writeFileSync(TRACKING_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  try {
+    writeFileSync(TRACKING_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("Failed to save fuelServiceState.json:", err);
+  }
 }
 
 export function getFacilityState(stationId: string, facilityType: string): StationFacilityState | null {
@@ -75,6 +103,7 @@ export function saveFacilityState(state: StationFacilityState): void {
   const key = `${state.stationId}::${state.facilityType}`;
   data.facilities[key] = state;
   saveState(data);
+  console.log(`[fuelServiceTracking] Saved facility state: ${key}, status=${state.status}`);
 }
 
 export function updateFacilityState(
@@ -93,6 +122,7 @@ export function updateFacilityState(
     craftJobRunsDone: 0,
     craftJobRunsTotal: 0,
     lastCraftJobCheck: 0,
+    lastQueuedRuns: 0,
     status: "pending_facility" as FacilityStatus,
     buildFailures: 0,
   };
@@ -114,7 +144,31 @@ export function clearFacilityState(stationId: string, facilityType: string): voi
 }
 
 export function clearAllFacilityStates(): void {
-  saveState({ version: 1, facilities: {} });
+  saveState({ version: 1, facilities: {}, ships: {} });
+}
+
+export function getShipInfo(shipId: string): ShipInfo | null {
+  const data = loadState();
+  return data.ships?.[shipId] || null;
+}
+
+export function saveShipInfo(shipId: string, info: ShipInfo): void {
+  const data = loadState();
+  if (!data.ships) data.ships = {};
+  data.ships[shipId] = info;
+  saveState(data);
+}
+
+export function getAllShipInfos(): Record<string, ShipInfo> {
+  return loadState().ships || {};
+}
+
+export function clearShipInfo(shipId: string): void {
+  const data = loadState();
+  if (data.ships && data.ships[shipId]) {
+    delete data.ships[shipId];
+    saveState(data);
+  }
 }
 
 export function incrementBuildFailures(stationId: string, facilityType: string): number {
@@ -145,6 +199,7 @@ export function updateMaterialTransportStatus(
     craftJobRunsDone: 0,
     craftJobRunsTotal: 0,
     lastCraftJobCheck: 0,
+    lastQueuedRuns: 0,
     status: "pending_facility" as FacilityStatus,
     buildFailures: 0,
   };
@@ -163,4 +218,74 @@ export function updateMaterialTransportStatus(
   const updated: StationFacilityState = { ...existing, materialTransport: currentTransport };
   data.facilities[key] = updated;
   saveState(data);
+}
+
+export function startActiveTransport(
+  stationId: string,
+  facilityType: string,
+  homeStation: string,
+  homeSystem: string,
+  items: Array<{ itemId: string; neededQty: number }>
+): ActiveTransport {
+  const data = loadState();
+  const key = `${stationId}::${facilityType}`;
+  const existing = data.facilities[key] || {
+    stationId,
+    facilityType,
+    facilityBuilt: false,
+    facilityUnderConstruction: false,
+    craftJobRecipeId: "",
+    craftJobRunsDone: 0,
+    craftJobRunsTotal: 0,
+    lastCraftJobCheck: 0,
+    lastQueuedRuns: 0,
+    status: "pending_facility" as FacilityStatus,
+    buildFailures: 0,
+  };
+
+  const activeTransport: ActiveTransport = {
+    stationId,
+    facilityType,
+    homeStation,
+    homeSystem,
+    items: items.map(i => ({ ...i, withdrawnQty: 0, depositedQty: 0 })),
+    currentItemIndex: 0,
+    status: "withdrawing",
+  };
+
+  const updated: StationFacilityState = { ...existing, activeTransport, status: "transporting_materials" };
+  data.facilities[key] = updated;
+  saveState(data);
+  console.log(`[fuelServiceTracking] Started active transport: ${key}, items=${items.length}`);
+  return activeTransport;
+}
+
+export function updateActiveTransport(
+  stationId: string,
+  facilityType: string,
+  updates: Partial<ActiveTransport>
+): ActiveTransport | null {
+  const data = loadState();
+  const key = `${stationId}::${facilityType}`;
+  const existing = data.facilities[key];
+  if (!existing?.activeTransport) return null;
+
+  const updated: ActiveTransport = { ...existing.activeTransport, ...updates };
+  const updatedState: StationFacilityState = { ...existing, activeTransport: updated };
+  data.facilities[key] = updatedState;
+  saveState(data);
+  console.log(`[fuelServiceTracking] Updated active transport: ${key}, index=${updated.currentItemIndex}, status=${updated.status}`);
+  return updated;
+}
+
+export function clearActiveTransport(stationId: string, facilityType: string): void {
+  const data = loadState();
+  const key = `${stationId}::${facilityType}`;
+  const existing = data.facilities[key];
+  if (!existing) return;
+
+  const updated: StationFacilityState = { ...existing, activeTransport: undefined };
+  data.facilities[key] = updated;
+  saveState(data);
+  console.log(`[fuelServiceTracking] Cleared active transport: ${key}`);
 }

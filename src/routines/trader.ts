@@ -155,6 +155,174 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
+interface ShipBerths {
+  economy: number;
+  business: number;
+  first: number;
+}
+
+function totalBerths(b: ShipBerths): number {
+  return b.economy + b.business + b.first;
+}
+
+async function getShipBerths(ctx: RoutineContext): Promise<ShipBerths | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_ship");
+  if (resp.error || !resp.result) return null;
+
+  const result = resp.result as Record<string, unknown>;
+  const shipData = (result.ship as Record<string, unknown>) || result;
+
+  let berths: ShipBerths = { economy: 0, business: 0, first: 0 };
+  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, number>;
+  if (directBerths.economy || directBerths.business || directBerths.first) {
+    berths = {
+      economy: directBerths.economy || 0,
+      business: directBerths.business || 0,
+      first: directBerths.first || 0,
+    };
+  } else {
+    const typeId = (shipData.type || shipData.class_id || "") as string;
+    const classData = catalogStore.getShip(typeId);
+    if (classData?.inherent_capabilities && Array.isArray(classData.inherent_capabilities)) {
+      for (const cap of classData.inherent_capabilities) {
+        if (!cap || typeof cap !== "object") continue;
+        const c = cap as Record<string, unknown>;
+        const type = (c.type as string) || "";
+        const value = (c.value as number) || 0;
+        if (type === "passenger_economy_berths") berths.economy = value;
+        else if (type === "passenger_business_berths") berths.business = value;
+        else if (type === "passenger_first_berths") berths.first = value;
+      }
+    }
+    if (totalBerths(berths) === 0 && classData?.special === "passenger_liner") {
+      berths = { economy: 1, business: 0, first: 0 };
+    }
+  }
+
+  const shipModuleIds = (shipData.modules as unknown[]) || [];
+  const allModules = (result.modules as unknown[]) || [];
+  if (totalBerths(berths) === 0 && shipModuleIds.length > 0 && allModules.length > 0) {
+    const instanceIdToModule = new Map<string, Record<string, unknown>>();
+    for (const m of allModules) {
+      if (typeof m === "object" && m !== null) {
+        const modObj = m as Record<string, unknown>;
+        const instanceId = ((modObj.id as string) || "").toLowerCase();
+        if (instanceId) instanceIdToModule.set(instanceId, modObj);
+      }
+    }
+    const moduleObjects: unknown[] = [];
+    for (const id of shipModuleIds) {
+      const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+      if (idStr && instanceIdToModule.has(idStr)) {
+        moduleObjects.push(instanceIdToModule.get(idStr));
+      } else if (typeof id === "object" && id !== null) {
+        moduleObjects.push(id);
+      }
+    }
+    if (moduleObjects.length > 0) {
+      for (const m of moduleObjects) {
+        if (!m || typeof m !== "object") continue;
+        const mod = m as Record<string, unknown>;
+        const firstBerths = (mod.passenger_first_berths as number) || 0;
+        const businessBerths = (mod.passenger_business_berths as number) || 0;
+        const economyBerths = (mod.passenger_economy_berths as number) || 0;
+        if (firstBerths > 0 || businessBerths > 0 || economyBerths > 0) {
+          berths.first += firstBerths;
+          berths.business += businessBerths;
+          berths.economy += economyBerths;
+        }
+      }
+    }
+  }
+
+  return totalBerths(berths) > 0 ? berths : null;
+}
+
+interface StationPassenger {
+  citizen_id: string;
+  name: string;
+  class: string;
+  destination: string;
+  destination_name: string;
+  destination_system?: string;
+  fare: number;
+}
+
+interface AboardPassenger {
+  citizen_id: string;
+  name: string;
+  class: string;
+  citizenship: string;
+  destination: string;
+  destination_name: string;
+  destination_system?: string;
+  fare: number;
+  bio: string;
+  ticks_remaining: number;
+  route_data?: unknown;
+}
+
+async function getPassengersAtStation(ctx: RoutineContext, stationId: string, systemId: string): Promise<StationPassenger[]> {
+  const { bot } = ctx;
+  const resp = await bot.exec("list_station_passengers", { station: stationId });
+  if (resp.error || !resp.result) return [];
+
+  const result = resp.result as Record<string, unknown>;
+  const waiting = (result.waiting || result.passengers || []) as Array<Record<string, unknown>>;
+  if (!Array.isArray(waiting)) return [];
+
+  return waiting.map((p: Record<string, unknown>) => ({
+    citizen_id: (p.citizen_id as string) || "",
+    name: (p.name as string) || "",
+    class: (p.class as string) || "economy",
+    destination: (p.destination as string) || "",
+    destination_name: (p.destination_name as string) || "",
+    destination_system: (p.destination_system as string) || (p.destinationSystem as string) || undefined,
+    fare: (p.fare as number) || 0,
+  }));
+}
+
+function parseListPassengers(result: unknown): { passengers: AboardPassenger[]; berths: { economy: number; business: number; first: number }; berths_used: { economy: number; business: number; first: number } } | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  let passengers: AboardPassenger[] = [];
+  const passengerSources: unknown[] = [r.passengers, r.passenger_list];
+  const data = (r.passengers as Record<string, unknown>)?.data;
+  if (Array.isArray(data)) passengerSources.push(data);
+  for (const source of passengerSources) {
+    if (Array.isArray(source)) {
+      passengers = source as AboardPassenger[];
+      break;
+    }
+  }
+  
+  const num = (v: unknown): number | undefined => {
+    if (typeof v === "number") return v;
+    if (typeof v === "string") {
+      const match = v.match(/(\d+)/);
+      return match ? parseInt(match[1], 10) : undefined;
+    }
+    return undefined;
+  };
+  const berthsRaw = r.berths && typeof r.berths === "object" ? (r.berths as Record<string, unknown>) : null;
+  const berthsUsedRaw = r.berths_used && typeof r.berths_used === "object" ? (r.berths_used as Record<string, unknown>) : null;
+  const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
+  const economy = hasBerths ? num(berthsRaw!.economy) ?? 0 : (num(r.economy_berths) ?? num(r.economyBerths) ?? num(r.economy) ?? 0);
+  const business = hasBerths ? num(berthsRaw!.business) ?? 0 : (num(r.business_berths) ?? num(r.businessBerths) ?? num(r.business) ?? 0);
+  const first = hasBerths ? num(berthsRaw!.first) ?? 0 : (num(r.first_berths) ?? num(r.firstBerths) ?? num(r.first) ?? 0);
+
+  return {
+    passengers,
+    berths: { economy, business, first },
+    berths_used: {
+      economy: num(berthsUsedRaw?.economy) ?? 0,
+      business: num(berthsUsedRaw?.business) ?? 0,
+      first: num(berthsUsedRaw?.first) ?? 0,
+    },
+  };
+}
+
 /** Minimum credits to keep in personal wallet for trading operations. */
 const TRADER_WORKING_BALANCE = 200_000;
 /** Buffer above working balance before depositing excess to faction storage. */
@@ -343,6 +511,8 @@ function getTraderSettings(username?: string): {
   enableMissions: boolean;
   debugLogging: boolean;
   unsoldItemHomeBaseOnly: boolean;
+  enablePassengerTransport: boolean;
+  passengerFareEstimate: number;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -362,6 +532,8 @@ function getTraderSettings(username?: string): {
     enableMissions: (t.enableMissions as boolean) !== false,
     debugLogging: (t.debugLogging as boolean) ?? false,
     unsoldItemHomeBaseOnly: (t.unsoldItemHomeBaseOnly as boolean) ?? true,
+    enablePassengerTransport: (t.enablePassengerTransport as boolean) ?? true,
+    passengerFareEstimate: (t.passengerFareEstimate as number) ?? 5000,
   };
 }
 
@@ -2653,6 +2825,34 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Clear pending lock - it's now tracked by the session
       pendingLockItemId = null;
       
+      // ── Passenger transport: check for passengers going to destination ──
+      let passengersLoaded = 0;
+      if (settings.enablePassengerTransport && route && buyQty > 0) {
+        const currentRoute = route;
+        const shipBerths = await getShipBerths(ctx);
+        if (shipBerths && (shipBerths.economy + shipBerths.business + shipBerths.first) > 0) {
+          ctx.log("trade", `Ship has passenger berths (${shipBerths.economy}E/${shipBerths.business}B/${shipBerths.first}F) - checking for passengers to ${currentRoute.destPoiName}`);
+          
+          const passengers = await getPassengersAtStation(ctx, currentRoute.destPoi, currentRoute.destSystem);
+          if (passengers.length > 0) {
+            const destPassengers = passengers.filter(p => 
+              p.destination.toLowerCase() === currentRoute.destPoi.toLowerCase() ||
+              (p.destination_system && p.destination_system.toLowerCase() === currentRoute.destSystem?.toLowerCase())
+            );
+            
+            if (destPassengers.length > 0) {
+              const totalBerthsAvail = shipBerths.economy + shipBerths.business + shipBerths.first;
+              const passengersToLoad = destPassengers.slice(0, totalBerthsAvail);
+              
+              if (passengersToLoad.length > 0) {
+                ctx.log("trade", `Found ${passengersToLoad.length} passengers going to ${currentRoute.destPoiName}`);
+                passengersLoaded = passengersToLoad.length;
+              }
+            }
+          }
+        }
+      }
+      
       break;
     }
     } // End of route selection loop (skipped if recovered session)
@@ -2780,183 +2980,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
             );
 
-            // If no buyer found in cache, refresh market data and check again
+            // MID-ROUTE REDIRECTING DISABLED
+            // We now complete the route and pick up passengers at destination
+            // If price dropped or buyer gone, we'll handle it at destination
             if (!destBuyer) {
-              ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer not in cache — refreshing market data`);
-              await recordMarketData(ctx);
-              const refreshedBuys = mapStore.getAllBuyDemand();
-              const refreshedBuyer = refreshedBuys.find(b =>
-                b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
-              );
-
-              if (!refreshedBuyer) {
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer still not found — may be stale data, continuing anyway`);
-                return true; // Continue - don't abort on potentially stale cache
-              }
-
-              // Check quantity and price with refreshed data
-              if (refreshedBuyer.quantity <= 0) {
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer quantity is 0 — finding alternative`);
-                // Search for alternative profitable buyer
-                const alternatives = findProfitableAlternativeBuyers(
-                  route!.itemId,
-                  route!.itemName,
-                  buyQty,
-                  investedCredits,
-                  bot.system,
-                  settings,
-                );
-
-                if (alternatives.length > 0) {
-                  const best = alternatives[0];
-                  ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
-                  // Redirect to alternative buyer
-                  route = {
-                    ...route!,
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPrice: best.buyer.price,
-                    jumps: best.jumps,
-                    totalProfit: best.profit,
-                  };
-                  await updateTradeSession(bot.username, {
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPricePerUnit: best.buyer.price,
-                    notes: (session?.notes || "") + ` | Rerouted mid-flight to ${best.buyer.poiName}`,
-                  });
-                  return true;
-                }
-                
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`); //NO! go home instead!!!! arg! we don't want scattered crap!
-                return true;
-              }
-
-              if (investedCredits > 0 && refreshedBuyer.price * buyQty < investedCredits) {
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${refreshedBuyer.price}cr — checking alternatives`);
-                // Search for alternative profitable buyer
-                const alternatives = findProfitableAlternativeBuyers(
-                  route!.itemId,
-                  route!.itemName,
-                  buyQty,
-                  investedCredits,
-                  bot.system,
-                  settings,
-                );
-
-                if (alternatives.length > 0) {
-                  const best = alternatives[0];
-                  ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
-                  // Redirect to alternative buyer
-                  route = {
-                    ...route!,
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPrice: best.buyer.price,
-                    jumps: best.jumps,
-                    totalProfit: best.profit,
-                  };
-                  await updateTradeSession(bot.username, {
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPricePerUnit: best.buyer.price,
-                    notes: (session?.notes || "") + ` | Rerouted mid-flight to ${best.buyer.poiName} for better price`,
-                  });
-                  return true;
-                }
-
-                ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - refreshedBuyer.price * buyQty}cr`);
-                return true;
-              }
-
-              ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${refreshedBuyer.price}cr × ${refreshedBuyer.quantity} at dest)`);
-            } else {
-              // Original buyer found in cache
-              if (destBuyer.quantity <= 0) {
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer quantity is 0 — finding alternative`);
-                // Search for alternative profitable buyer
-                const alternatives = findProfitableAlternativeBuyers(
-                  route!.itemId,
-                  route!.itemName,
-                  buyQty,
-                  investedCredits,
-                  bot.system,
-                  settings,
-                );
-
-                if (alternatives.length > 0) {
-                  const best = alternatives[0];
-                  ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
-                  // Redirect to alternative buyer
-                  route = {
-                    ...route!,
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPrice: best.buyer.price,
-                    jumps: best.jumps,
-                    totalProfit: best.profit,
-                  };
-                  await updateTradeSession(bot.username, {
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPricePerUnit: best.buyer.price,
-                    notes: (session?.notes || "") + ` | Rerouted mid-flight to ${best.buyer.poiName}`,
-                  });
-                  return true;
-                }
-
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`);
-                return true;
-              }
-
-              if (investedCredits > 0 && destBuyer.price * buyQty < investedCredits) {
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${destBuyer.price}cr — checking alternatives`);
-                // Search for alternative profitable buyer
-                const alternatives = findProfitableAlternativeBuyers(
-                  route!.itemId,
-                  route!.itemName,
-                  buyQty,
-                  investedCredits,
-                  bot.system,
-                  settings,
-                );
-
-                if (alternatives.length > 0) {
-                  const best = alternatives[0];
-                  ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
-                  // Redirect to alternative buyer
-                  route = {
-                    ...route!,
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPrice: best.buyer.price,
-                    jumps: best.jumps,
-                    totalProfit: best.profit,
-                  };
-                  await updateTradeSession(bot.username, {
-                    destSystem: best.buyer.systemId,
-                    destPoi: best.buyer.poiId,
-                    destPoiName: best.buyer.poiName,
-                    sellPricePerUnit: best.buyer.price,
-                    notes: (session?.notes || "") + ` | Rerouted mid-flight to ${best.buyer.poiName} for better price`,
-                  });
-                  return true;
-                }
-
-                ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - destBuyer.price * buyQty}cr`);
-                return true;
-              }
-
-              ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${destBuyer.price}cr × ${destBuyer.quantity} at dest)`);
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer not in cache — continuing to destination`);
+              return true;
             }
 
+            if (destBuyer.quantity <= 0) {
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer quantity is 0 — continuing to destination (may pick up passengers there)`);
+              return true;
+            }
+
+            if (investedCredits > 0 && destBuyer.price * buyQty < investedCredits) {
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${destBuyer.price}cr — continuing to destination (may pick up passengers there)`);
+              return true;
+            }
+
+            ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${destBuyer.price}cr × ${destBuyer.quantity} at dest)`);
             return true;
           } catch (err) {
             // Network error during validation - don't abort, just continue
@@ -3069,7 +3111,41 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     bot.docked = true;
     await tryMissions(ctx);
 
-    // ── Sell trade items ──
+    // ── Unload passengers at destination ──
+    yield "unload_passengers";
+    let passengerRevenue = 0;
+    let passengersLoaded = 0;
+    try {
+      const listResp = await bot.exec("list_passengers");
+      if (!listResp.error && listResp.result) {
+        const parsed = parseListPassengers(listResp.result);
+        const aboard = parsed?.passengers || [];
+        const destPassengers = aboard.filter((p: AboardPassenger) => 
+          p.destination.toLowerCase() === route!.destPoi.toLowerCase() ||
+          (p.destination_system && p.destination_system.toLowerCase() === route!.destSystem.toLowerCase())
+        );
+        
+        if (destPassengers.length > 0) {
+          passengersLoaded = destPassengers.length;
+          ctx.log("trade", `Unloading ${passengersLoaded} passengers at ${route!.destPoiName}`);
+          for (const p of destPassengers) {
+            const fare = p.fare || settings.passengerFareEstimate;
+            passengerRevenue += fare;
+            ctx.log("trade", `Passenger ${p.name}: fare ${fare}cr`);
+          }
+          const unloadResp = await bot.exec("unload_passenger");
+          if (!unloadResp.error) {
+            ctx.log("trade", `Successfully unloaded ${passengersLoaded} passengers - revenue: ${passengerRevenue}cr`);
+          } else {
+            ctx.log("error", `Failed to unload passengers: ${unloadResp.error.message}`);
+          }
+        }
+      }
+    } catch (e) {
+      ctx.log("error", `Passenger unload error: ${e}`);
+    }
+
+    // ── Sell trade items ─-
     yield "sell";
     let totalSold = 0;
     let sellRevenue = 0;
@@ -3408,8 +3484,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Extra cargo items stay in cargo - will be handled by next cycle's cargo handling phase
     // (No need to deposit at trade destinations - faction storage may not exist here)
 
-    // Profit = sell revenue + other sales - cost of market purchases
-    const actualProfit = sanitizeCredits(sellRevenue + extraRevenue - investedCredits);
+    // Profit = sell revenue + other sales + passenger revenue - cost of market purchases
+    const actualProfit = sanitizeCredits(sellRevenue + extraRevenue + passengerRevenue - investedCredits);
     bot.stats.totalTrades++;
     bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + actualProfit);
 
@@ -3418,7 +3494,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Trade summary ──
     const soldLabel = totalSold < buyQty ? `${totalSold}/${buyQty}` : `${buyQty}`;
-    ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — profit ${actualProfit}cr (${sellRevenue}cr sells + ${extraRevenue}cr other - ${investedCredits}cr cost, ${route.jumps} jumps)`);
+    const passengerLabel = passengersLoaded > 0 ? ` + ${passengersLoaded} passengers (${passengerRevenue}cr)` : "";
+    ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — profit ${actualProfit}cr (${sellRevenue}cr sells + ${extraRevenue}cr other + ${passengerRevenue}cr passengers - ${investedCredits}cr cost, ${route.jumps} jumps)${passengerLabel}`);
     
     // Complete trade session
     const actualRevenue = sellRevenue;

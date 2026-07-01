@@ -12425,6 +12425,7 @@
         ];
         const refuelThreshold = crafter.refuelThreshold ?? 50;
         const repairThreshold = crafter.repairThreshold ?? 40;
+        const finalItemThreshold = crafter.finalItemThreshold ?? 1;
         const botQuotaOverrides = crafter.botQuotaOverrides || {};
 
         // Use catalog recipes if available, fall back to API fetch
@@ -12748,12 +12749,20 @@
       <input type="number" id="set-crafter-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
     </div>
 
-    <div class="setting-row">
+<div class="setting-row">
       <div>
         <div class="setting-label">Repair Threshold</div>
         <div class="setting-hint">Repair hull when HP drops below this %.</div>
       </div>
       <input type="number" id="set-crafter-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Final Item Threshold</div>
+        <div class="setting-hint">Number of assemblies to wait for before starting the final item. Set to 1 to start final item as soon as any assembly is complete.</div>
+      </div>
+      <input type="number" id="set-crafter-finalItemThreshold" min="1" max="99" value="${finalItemThreshold}">
     </div>
 
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
@@ -13092,6 +13101,10 @@
             excludeCategories: autoBuyExcludeCategories,
           },
           craftingPreset,
+          finalItemThreshold:
+            parseInt(
+              document.getElementById("set-crafter-finalItemThreshold")?.value,
+            ) || 1,
           requestItems,
           blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
         };

@@ -48,6 +48,7 @@ async function getCrafterSettings(): Promise<{
   blacklistedRecipes: string[];
   useQueuedCrafting: boolean;
   craftingPreset: string;
+  finalItemThreshold: number;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -144,6 +145,7 @@ async function getCrafterSettings(): Promise<{
     blacklistedRecipes,
     useQueuedCrafting,
     craftingPreset: (c.craftingPreset as string) || "fast",
+    finalItemThreshold: (c.finalItemThreshold as number) || 1,
   };
 }
 
@@ -660,6 +662,7 @@ async function executeCraftingPlan(
   tracker: CraftQueueTracker,
   recipes: Recipe[],
   preset: string = "fast",
+  finalItemThreshold: number = 1,
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -667,10 +670,44 @@ async function executeCraftingPlan(
 
   ctx.log("craft", `Queue-based crafting plan: ${planItems.length} steps`);
 
-  const queuedItems = await queueAllRecipes(ctx, planItems, tracker, recipes, preset);
+  const byDepth = new Map<number, typeof planItems>();
+  for (const item of planItems) {
+    if (!byDepth.has(item.depth)) {
+      byDepth.set(item.depth, []);
+    }
+    byDepth.get(item.depth)!.push(item);
+  }
+  const depths = Array.from(byDepth.keys()).sort((a, b) => b - a);
 
-  const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
-  crafted.push(...completed);
+  for (const depth of depths) {
+    const itemsAtDepth = byDepth.get(depth)!;
+    const isFinalDepth = depth === 0;
+
+    if (isFinalDepth) {
+      const finalRecipe = itemsAtDepth[0].recipe;
+      const finalOutputId = finalRecipe.output_item_id;
+      const progress = tracker.getProgress(finalRecipe.recipe_id);
+      const completedAssemblies = progress.completed;
+
+      if (completedAssemblies < finalItemThreshold) {
+        ctx.log("craft", `Waiting for ${finalItemThreshold} assemblies of ${finalOutputId} (have ${completedAssemblies})`);
+        continue;
+      }
+    }
+
+    ctx.log("craft", `Processing depth ${depth} (${itemsAtDepth.length} items)`);
+    const queuedItems = await queueAllRecipes(ctx, itemsAtDepth, tracker, recipes, preset);
+
+    if (isFinalDepth) {
+      const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
+      crafted.push(...completed);
+    } else {
+      await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
+      for (const item of queuedItems) {
+        prereqs.push(`${item.quantity}x ${recipes.find(r => r.recipe_id === item.recipeId)?.name || item.recipeId}`);
+      }
+    }
+  }
 
   return { crafted, prereqs };
 }
@@ -960,7 +997,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     ctx.log("craft", `Executing queue-based plan (${settings.goalProcessingMode} mode)`);
-    const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset);
+    const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold);
     const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];

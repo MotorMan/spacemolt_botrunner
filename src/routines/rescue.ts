@@ -2974,10 +2974,10 @@ if (travelSucceeded) {
           let fuelDelivered = 0;
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            const fuelDelta = result.fuel as number || 0;
-            const fuelNow = result.fuel_now as number || bot.fuel;
-            const targetFuelNow = result.target_fuel_now as number || 0;
-            const targetName = result.target_player_name as string || target.username;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const fuelNow = result.fuel_now as number || result.fuel as number || bot.fuel;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+            const targetName = result.target_player_name as string || result.targetName as string || target.username;
             fuelDelivered = Math.abs(fuelDelta);
 
             ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${targetName}`);
@@ -3713,8 +3713,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         } else {
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            const fuelDelta = result.fuel as number || 0;
-            const targetFuelNow = result.target_fuel_now as number || 0;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
             ctx.log("rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${player.username}`);
             ctx.log("rescue", `  Their fuel: ${targetFuelNow}`);
           } else {
@@ -4354,13 +4354,14 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
           continue;
         }
 
-        if (refuelResp.error) {
+if (refuelResp.error) {
           ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         } else {
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            fuelTransferred = Math.abs(result.fuel as number || 0);
-            const targetFuelNow = result.target_fuel_now as number || 0;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+            fuelTransferred = Math.abs(fuelDelta);
             ctx.log("mayday", `✓ Transferred ${fuelTransferred} fuel to ${mayday.sender}`);
             ctx.log("mayday", `  Their fuel: ${targetFuelNow}`);
           }
@@ -6582,8 +6583,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const result = refuelResp.result as Record<string, unknown> | undefined;
         let fuelDelivered = 0;
         if (result) {
-          const fuelDelta = result.fuel as number || 0;
-          const targetFuelNow = result.target_fuel_now as number || 0;
+          const fuelDelta = result.fuel as number || result.quantity as number || 0;
+          const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
           fuelDelivered = Math.abs(fuelDelta);
           ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${target.username}`);
           ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);

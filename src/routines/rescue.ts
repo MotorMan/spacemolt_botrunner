@@ -2869,58 +2869,50 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
            ctx.log("error", `Travel failed: ${travelResp.error.message}`);
          }
          
-         if (travelSucceeded) {
-           // Success - update bot.poi with the resolved name
-           bot.poi = targetPoiName;
-         } else {
-           // Travel failed - target may be at an unknown/hidden POI
-           ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden or unknown`);
-           ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
-           
-           // Scan for nearby players to find the target
-           const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
-           if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
-             ctx.log("combat", "Battle detected during scan - fleeing!");
-             continue;
-           }
-           
-           if (!nearbyResp.error && nearbyResp.result) {
-             const data = nearbyResp.result as Record<string, unknown>;
-             const players = Array.isArray(data.players) ? data.players :
-                             Array.isArray(data.nearby) ? data.nearby :
-                             Array.isArray(data.ships) ? data.ships : [];
-             
-             let foundTarget = false;
-             for (const p of players as Array<Record<string, unknown>>) {
-               const username = (p.username as string) || (p.name as string);
-               if (username && username.toLowerCase() === target.username.toLowerCase()) {
-                 ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
-                 foundTarget = true;
-                 // Update our position to be at the same POI as target
-                 bot.poi = (p.poi as string) || target.poi;
-                 break;
-               }
-             }
-             
-             if (!foundTarget) {
-               ctx.log("error", `${target.username} not found in nearby scan after failed POI travel`);
-               ctx.log("rescue", `Marking rescue as failed - target unreachable at this location`);
-               if (recoveredSession || getActiveRescueSession(bot.username)) {
-                 await failRescueSession(bot.username, `Target not found at ${target.system}/${target.poi} after POI travel failure`);
-                 const activeSession = getActiveRescueSession(bot.username);
-                 if (activeSession) {
-                   await completeRescueSession(bot.username);
-                 }
-               }
-               await ctx.sleep(settings.scanIntervalSec * 1000);
-               continue;
-             }
-           } else {
-             ctx.log("error", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
-             await ctx.sleep(settings.scanIntervalSec * 1000);
-             continue;
-           }
-         }
+if (travelSucceeded) {
+            // Success - update bot.poi with the resolved name
+            bot.poi = targetPoiName;
+          } else {
+            // Travel failed - target may be at an unknown/hidden POI or cloaked
+            ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden, unknown, or target may be cloaked`);
+            ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
+            
+            // Scan for nearby players to find the target
+            const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
+            if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+              ctx.log("combat", "Battle detected during scan - fleeing!");
+              continue;
+            }
+            
+            if (!nearbyResp.error && nearbyResp.result) {
+              const data = nearbyResp.result as Record<string, unknown>;
+              const players = Array.isArray(data.players) ? data.players :
+                              Array.isArray(data.nearby) ? data.nearby :
+                              Array.isArray(data.ships) ? data.ships : [];
+              
+              let foundTarget = false;
+              for (const p of players as Array<Record<string, unknown>>) {
+                const username = (p.username as string) || (p.name as string);
+                if (username && username.toLowerCase() === target.username.toLowerCase()) {
+                  ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
+                  foundTarget = true;
+                  // Update our position to be at the same POI as target
+                  bot.poi = (p.poi as string) || target.poi;
+                  break;
+                }
+              }
+              
+              if (!foundTarget) {
+                // Target not found in get_nearby - could be cloaked
+                // Proceed with refuel attempt anyway - the refuel command may succeed if target is actually present
+                ctx.log("rescue", `${target.username} not found in get_nearby scan - may be cloaked or at hidden POI`);
+                ctx.log("rescue", `Proceeding with refuel attempt - target may be present but cloaked`);
+              }
+            } else {
+              ctx.log("warn", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
+              ctx.log("rescue", `Proceeding with refuel attempt anyway - target may be present but cloaked`);
+            }
+          }
          
          // Update session state after traveling to POI (or confirming presence via get_nearby)
          if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -4635,7 +4627,13 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
           return playerId;
         }
       }
-    }
+
+      // Fallback: return username when player ID cannot be found via get_nearby
+      // This handles cloaked players who won't appear in nearby scans
+      // The refuel command may accept username as target
+      ctx.log("rescue", `Player ${username} not found in get_nearby scan (possibly cloaked) - using username as fallback target`);
+      return username;
+      }
   } catch (e) {
     ctx.log("warn", `Error getting nearby players: ${e}`);
   }
@@ -6551,117 +6549,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         });
 
         if (!targetHere) {
-          targetFound = false;
-          ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
-
-          // For our own bots, NEVER record as ghost - they're just in a hidden POI
-          if (isOurBot) {
-            ctx.log("rescue", `👻 Our bot ${target.username} not found - likely in hidden POI, will keep trying`);
-            ctx.log("rescue", `💡 Hidden POI detected: ${target.poi} in ${target.system}`);
-            
-            // Don't fail the session - keep retrying by not marking mayday as handled
-            // and returning to the start of the loop
-            ctx.log("rescue", `🔄 Will retry rescue for ${target.username}...`);
-            
-            // Return home first
-            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
-              ctx.log("rescue", `🏠 Returning home before retry...`);
-              await ensureUndocked(ctx);
-              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-              if (arrived) {
-                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-              }
-            }
-            
-            // Retry by continuing the loop without failing the session
-            await ctx.sleep(5000);
-            continue;
-          }
-
-          // Record ghost incident in BlackBook (skipped for our own bots)
-          recordGhost(target.username);
-          const currentGhosts = getPlayerRecord(target.username).ghostCount;
-          if (currentGhosts < 0) {
-            ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
-          } else {
-             ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-             if (currentGhosts >= 5) {
-               ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
-             }
-           }
-
-          // Send grumpy faction chat message about being ghosted
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await aiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_no_show",
-                targetName: target.username,
-                isMayday: isMaydayTarget,
-                isBot: !isMaydayTarget,
-                currentSystem: bot.system,
-                targetSystem: target.system,
-                targetPoi: target.poi || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
-              }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
-            }
-          }
-
-          // Fail the session and return home
-          if (recoveredSession || getActiveRescueSession(bot.username)) {
-            await failRescueSession(bot.username, "Target not found at location");
-          }
-          markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
-
-          // Return home after failed rescue (potential ambush)
-          if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
-            ctx.log("rescue", `🚨 Target not found - returning home to safety...`);
-            await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-            if (arrived) {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-
-              // If home station is configured, travel there and dock
-              if (settings.homeStation) {
-                const [expectedSystem, stationId] = settings.homeStation.split('|');
-                if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station...`);
-                  const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  // CRITICAL: Check for battle interrupt error
-                  if (travelResp.error) {
-                    const errMsg = travelResp.error.message.toLowerCase();
-                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                      await fleeFromBattle(ctx);
-                      await ctx.sleep(5000);
-                      continue;
-                    }
-                  }
-                  if (!travelResp.error) {
-                    ctx.log("rescue", `⚓ Docking at home station...`);
-                    const dockResp = await bot.exec("dock");
-                    if (!dockResp.error) {
-                      ctx.log("rescue", `✓ Docked at home station`);
-                      // Refuel after docking
-                      ctx.log("rescue", `⛽ Refueling at home station...`);
-                      const refuelResp = await bot.exec("refuel");
-                      if (!refuelResp.error) {
-                        await bot.refreshShip();
-                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          continue;
+          // Target not found in get_nearby - may be cloaked
+          ctx.log("rescue", `${target.username} not found in get_nearby scan - may be cloaked or at hidden POI`);
+          ctx.log("rescue", `Proceeding with refuel attempt - target may be present but cloaked`);
         }
       }
     }

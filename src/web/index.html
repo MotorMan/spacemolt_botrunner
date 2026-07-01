@@ -1317,6 +1317,7 @@
           <button class="back-btn" onclick="closeProfile()">&larr;</button>
           <h2 id="profileName">-</h2>
           <span class="profile-ship" id="profileShip"></span>
+          <span id="profileCloakStatus"></span>
           <span id="profileBadge"></span>
           <div class="profile-actions" id="profileActions"></div>
         </div>
@@ -4424,13 +4425,14 @@
       function renderProfileTopbar() {
         const bot = getProfileBot();
         if (!bot) {
-          // Don't return - still try to render something
           const nameEl = document.getElementById("profileName");
           const shipEl = document.getElementById("profileShip");
           const badgeEl = document.getElementById("profileBadge");
+          const cloakStatusEl = document.getElementById("profileCloakStatus");
           if (nameEl) nameEl.textContent = "-";
           if (shipEl) shipEl.textContent = "-";
           if (badgeEl) badgeEl.innerHTML = "";
+          if (cloakStatusEl) cloakStatusEl.innerHTML = "";
           return;
         }
 
@@ -4445,6 +4447,15 @@
           bot.shipName || "No ship";
         document.getElementById("profileBadge").innerHTML =
           `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
+        
+        const cloakStatusEl = document.getElementById("profileCloakStatus");
+        if (cloakStatusEl) {
+          if (bot.isCloaked) {
+            cloakStatusEl.innerHTML = '<span class="cloak-status cloaked">CLOAKED</span>';
+          } else {
+            cloakStatusEl.innerHTML = '<span class="cloak-status">Uncloak</span>';
+          }
+        }
 
         const actionsEl = document.getElementById("profileActions");
         if (!actionsEl) return;

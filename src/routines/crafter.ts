@@ -679,26 +679,23 @@ async function executeCraftingPlan(
   }
   const depths = Array.from(byDepth.keys()).sort((a, b) => b - a);
 
+  const finalDepth = Math.min(...depths);
+  const hasNonFinalDepths = depths.some(d => d > finalDepth);
+
   for (const depth of depths) {
     const itemsAtDepth = byDepth.get(depth)!;
-    const isFinalDepth = depth === 0;
-
-    if (isFinalDepth) {
-      const finalRecipe = itemsAtDepth[0].recipe;
-      const finalOutputId = finalRecipe.output_item_id;
-      const progress = tracker.getProgress(finalRecipe.recipe_id);
-      const completedAssemblies = progress.completed;
-
-      if (completedAssemblies < finalItemThreshold) {
-        ctx.log("craft", `Waiting for ${finalItemThreshold} assemblies of ${finalOutputId} (have ${completedAssemblies})`);
-        continue;
-      }
-    }
+    const isFinalDepth = depth === finalDepth;
 
     ctx.log("craft", `Processing depth ${depth} (${itemsAtDepth.length} items)`);
     const queuedItems = await queueAllRecipes(ctx, itemsAtDepth, tracker, recipes, preset);
 
-    if (isFinalDepth) {
+    if (isFinalDepth && hasNonFinalDepths) {
+      ctx.log("craft", `Waiting for prerequisite assemblies to complete before starting final items`);
+      await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
+      for (const item of queuedItems) {
+        prereqs.push(`${item.quantity}x ${recipes.find(r => r.recipe_id === item.recipeId)?.name || item.recipeId}`);
+      }
+    } else if (isFinalDepth) {
       const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
       crafted.push(...completed);
     } else {

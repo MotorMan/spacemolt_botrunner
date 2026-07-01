@@ -27,6 +27,7 @@ import { civilianTransportRoutine } from "./routines/civilianTransport.js";
 import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { fuelServiceRoutine } from "./routines/fuelService.js";
+import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -133,6 +134,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
   fuel_service: { name: "FuelService", fn: fuelServiceRoutine },
+  stealth_skill_grind: { name: "StealthSkillGrind", fn: stealthSkillGrindRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────

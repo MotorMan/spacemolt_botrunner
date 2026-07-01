@@ -3306,6 +3306,9 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     path.push(bot.system);
   }
 
+  // Track if we've already enabled cloak (mutation command - don't re-issue)
+  let cloakEnabled = false;
+
   while (bot.state === "running") {
     // Check for battle
     if (await checkAndFleeFromBattle(ctx, "achievement")) {
@@ -3318,6 +3321,25 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (modeCheck.mode !== "achievement") {
       ctx.log("system", "Mode changed from achievement — switching to new mode");
       return;
+    }
+
+    // ── Enable cloak if autoCloak is enabled and not already cloaked ──
+    const cloakSettings = getExplorerSettings(bot.username);
+    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
+      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
+      const cloakResp = await bot.exec("cloak", { enable: true });
+      if (!cloakResp.error) {
+        cloakEnabled = true;
+        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
+      } else {
+        const msg = cloakResp.error.message.toLowerCase();
+        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+          cloakEnabled = true;
+          ctx.log("info", "Cloak already active");
+        } else {
+          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
+        }
+      }
     }
 
     await bot.refreshShip();
@@ -3335,7 +3357,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const stats = mapStore.getVisitStats();
       if (stats.unvisited === 0 || connections.length === 0) {
         ctx.log("warn", `At pirate system ${bot.system} with no viable route - returning home`);
-        const homeArrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+        const homeArrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
         if (homeArrived) {
           ctx.log("system", "Returned to Sol from pirate system - continuing achievement mode");
           await ctx.sleep(5000);
@@ -3358,7 +3380,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Return home first
       const homeSystem = "sol";
       if (bot.system.toLowerCase() !== homeSystem) {
-        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
       }
       setExplorerMode(bot.username, "explore");
       return;
@@ -3404,7 +3426,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check if we're in a pirate system and need to return
         if (isPirateSystem(bot.system)) {
           ctx.log("warn", "In pirate system with no route to unvisited - returning home");
-          await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+          await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
           await ctx.sleep(5000);
         } else {
           await ctx.sleep(30000);
@@ -3430,7 +3452,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // Navigate to target system
     // Use skipBlacklist: true for achievement mode - we need to visit ALL systems
-    const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: true });
+    const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
     if (!arrived) {
       ctx.log("error", `Could not reach ${target.name} — will retry next loop`);
       await ctx.sleep(10000);
@@ -3441,6 +3463,41 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     bot.stats.totalSystems++;
     path.push(target.id);
     lastSystem = target.id;
+
+    // Check for pirates after arrival
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      // Track wildlife from nearby scan
+      bot.trackWildlife(nearbyResp.result);
+      
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      if (!bot.isCloaked || !cloakSettings.ignorePirateFleeWhenCloaked) {
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - fled, will retry");
+          fledFromSystems.add(target.id);
+          await ctx.sleep(30000);
+          continue;
+        }
+      } else if (bot.isCloaked && cloakSettings.ignorePirateFleeWhenCloaked) {
+        ctx.log("combat", `[INFO] Pirates detected but cloaked - ignoring flee (ignorePirateFleeWhenCloaked enabled)`);
+      }
+    }
+
+    // Survey the system to reveal hidden POIs
+    yield "survey_system";
+    const surveyResp = await bot.exec("survey_system");
+
+    // Check for battle after survey
+    if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+      ctx.log("combat", "Battle detected during survey - fleeing!");
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    if (!surveyResp.error) {
+      ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
+    }
 
     // Update map with visited status and refresh from server
     mapStore.markSystemVisited(target.id);

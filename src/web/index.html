@@ -14086,7 +14086,9 @@
             `<span class="resp-cmd">Depositing removed modules to faction storage</span>`,
           );
 
+          let depositFailed = false;
           for (const mod of removedModules) {
+            const modName = catalog.items?.[mod.catalogId]?.name || mod.catalogId;
             await new Promise((resolve) => {
               sendExec(
                 bot.username,
@@ -14097,10 +14099,26 @@
                   item_id: mod.catalogId,
                   quantity: 1,
                 },
-                () => resolve(),
+                (result) => {
+                  if (!result.ok) {
+                    depositFailed = true;
+                    logResponse(
+                      `<span class="resp-err">Failed to deposit ${esc(modName)}: ${esc(result.error || "unknown")}</span>`,
+                    );
+                  }
+                  resolve();
+                },
               );
             });
             await new Promise((r) => setTimeout(r, 400));
+          }
+          if (depositFailed) {
+            statusEl.textContent = "Deposit failed!";
+            statusEl.style.color = "var(--red)";
+            logResponse(
+              `<span class="resp-err">Failed to deposit some modules to faction storage. Aborting loadout change.</span>`,
+            );
+            return;
           }
           logResponse(
             `<span class="resp-ok">Deposited removed modules to faction</span>`,
@@ -14113,7 +14131,9 @@
           `<span class="resp-cmd">Withdrawing needed modules from faction storage</span>`,
         );
 
+        const missingModules = [];
         for (const modId of neededModules) {
+          const modName = catalog.items?.[modId]?.name || modId;
           await new Promise((resolve) => {
             sendExec(
               bot.username,
@@ -14125,10 +14145,27 @@
                 quantity: 1,
                 source: "faction",
               },
-              () => resolve(),
+              (result) => {
+                if (!result.ok) {
+                  missingModules.push(modName);
+                  logResponse(
+                    `<span class="resp-err">Failed to withdraw ${esc(modName)}: ${esc(result.error || "unknown")}</span>`,
+                  );
+                }
+                resolve();
+              },
             );
           });
           await new Promise((r) => setTimeout(r, 400));
+        }
+
+        if (missingModules.length > 0) {
+          statusEl.textContent = "Missing modules!";
+          statusEl.style.color = "var(--red)";
+          logResponse(
+            `<span class="resp-err">Cannot complete loadout: ${missingModules.length} module(s) missing from faction storage: ${missingModules.map((m) => esc(m)).join(", ")}</span>`,
+          );
+          return;
         }
         logResponse(
           `<span class="resp-ok">Withdrawn needed modules to station storage</span>`,

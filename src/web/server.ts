@@ -13,6 +13,7 @@ import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
+import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -765,6 +766,20 @@ if (!this.settings.fuel_service) {
         }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
+        }
+        if (url.pathname === "/api/insurance") {
+          if (req.method === "GET") {
+            const botName = url.searchParams.get("bot");
+            if (botName) {
+              const record = getInsuranceRecord(botName);
+              if (!record) {
+                return Response.json({ record: null, status: "not_found" });
+              }
+              return Response.json({ record, status: "found" });
+            }
+            return Response.json(getAllInsuranceRecords());
+          }
+          return new Response("Method not allowed", { status: 405 });
         }
         if (url.pathname === "/api/taxes") {
           const taxesPath = join(DATA_DIR, "taxes.json");

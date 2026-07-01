@@ -46,6 +46,7 @@ import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
 import { buyInsurance } from "./routines/common.js";
+import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
 import { logSkills, refreshSkillNames } from "./skillTracker.js";
 
 interface BotState {
@@ -433,6 +434,22 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   const routineKey = action.routine || "miner";
   const routine = ROUTINES[routineKey];
   if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
+
+  // Check insurance status using persistent log before starting routine
+  // This avoids the 10sec delay of calling get_insurance_quote on every start
+  const insuranceRecord = getInsuranceRecord(botName);
+  if (insuranceRecord && bot.shipId) {
+    const status = getInsuranceStatus(botName, bot.shipId);
+    const timestamp = new Date(insuranceRecord.timestamp).toLocaleString("en-US", { hour12: false });
+    
+    if (!status.needsRepurchase && status.isInsured) {
+      server.logSystem(`${botName}: Ship ${bot.shipId} has valid insurance (${status.timeRemaining} remaining, purchased: ${timestamp})`);
+    } else if (bot.shipId !== insuranceRecord.shipId) {
+      server.logSystem(`${botName}: Ship changed from ${insuranceRecord.shipId} to ${bot.shipId} - needs insurance check`);
+    } else {
+      server.logSystem(`${botName}: Insurance expiring soon (${status.timeRemaining}) - will check on dock`);
+    }
+  }
 
   saveLastUsedRoutine(botName, routineKey);
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);

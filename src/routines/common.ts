@@ -5,6 +5,7 @@
  * ore parsing, and safety checks.
  */
 import type { RoutineContext } from "../bot.js";
+import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
@@ -3161,6 +3162,22 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
     const msg = (r?.message as string) || `Insurance purchased for 7 days`;
     ctx.log("insurance", msg);
     logFactionActivity(ctx, "insurance", `Bought insurance: ${msg}`);
+    
+    const quoteResp = await bot.exec("get_insurance_quote");
+    let coverage = 7;
+    let cost = 0;
+    let analysis: Record<string, unknown> | undefined;
+    if (!quoteResp.error && quoteResp.result) {
+      const q = quoteResp.result as Record<string, unknown>;
+      const quoteObj = (q.quote as Record<string, unknown>) ?? q;
+      cost = (quoteObj.cost as number) || (quoteObj.premium as number) || 0;
+      coverage = (quoteObj.coverage as number) || 7;
+      analysis = q as Record<string, unknown>;
+    }
+    
+    recordInsurancePurchase(bot.username, bot.shipId, bot.shipName, cost, coverage, analysis);
+    ctx.log("insurance", `Recorded insurance: shipId=${bot.shipId}, coverage=${coverage} days`);
+    
     await bot.refreshLocation();
   } else {
     const errMsg = insureResp.error?.message || "Unknown error";

@@ -745,34 +745,34 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   if (!resp.error && resp.result && command === "get_skills") {
     // The API returns skills directly in resp.result (normalized from structuredContent)
     const r = resp.result as Record<string, unknown>;
-    const skillsObj: Record<string, unknown> | null = 
+const skillsObj: Record<string, unknown> | null = 
       (r.skills && typeof r.skills === "object") 
         ? r.skills as Record<string, unknown>
         : r;
     
-if (skillsObj) {
-       const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
-       for (const [skillId, s] of Object.entries(skillsObj)) {
-         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
-         
-         if (s && typeof s === "object") {
-           const skillObj = s as Record<string, unknown>;
-           const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
-           const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
-           const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
-           skillData[skillId] = {
-             level: level || 0,
-             xp: xp || 0,
-             nextLevelXp: xpToNext || 0
-           };
-         }
-       }
-       server.broadcastSkillsUpdate(botName, skillData);
-     }
-     logSkills(bot);
-   }
+    if (skillsObj) {
+      const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
+      for (const [skillId, s] of Object.entries(skillsObj)) {
+        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+        
+        if (s && typeof s === "object") {
+          const skillObj = s as Record<string, unknown>;
+          const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
+          const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
+          const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
+          skillData[skillId] = {
+            level: level || 0,
+            xp: xp || 0,
+            nextLevelXp: xpToNext || 0
+          };
+        }
+      }
+      server.broadcastSkillsUpdate(botName, skillData);
+    }
+    logSkills(bot);
+  }
 
-// Refresh cached state after mutating commands
+  // Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
     "refuel", "repair", "deposit_items", "withdraw_items", "jettison",
@@ -786,7 +786,7 @@ if (skillsObj) {
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
 
-    if (command === "switch_ship") {
+    if (command === "switch_ship" && !resp.error) {
       await buyInsurance({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
     }
 

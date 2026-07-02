@@ -1316,8 +1316,11 @@ class MapStore {
     return sys?.connections ?? [];
   }
 
-/** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
-  findOreLocations(oreId: string): Array<{
+/** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included.
+   *  @param blacklist - Optional blacklist for route calculation.
+   *  @param skipPirateSystems - Whether to skip pirate systems (default: true). Set to false when cloaked with cloakIgnoreBlacklist.
+   */
+  findOreLocations(oreId: string, blacklist?: string[], skipPirateSystems: boolean = true): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1352,8 +1355,11 @@ class MapStore {
       richness: number;
     }> = [];
 
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
-      if (this.isPirateSystem(sysId)) {
+      if (skipPirateSystems && this.isPirateSystem(sysId)) {
         continue;
       }
       const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
@@ -1483,7 +1489,7 @@ class MapStore {
     /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness, hidden status */
     score: number;
   }> {
-const locations = this.findOreLocations(oreId);
+const locations = this.findOreLocations(oreId, blacklist);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
     
@@ -1659,7 +1665,7 @@ const locations = this.findOreLocations(oreId);
     richness: number;
     score: number;
   }> {
-    const locations = this.findOreLocations(oreId);
+const locations = this.findOreLocations(oreId, blacklist);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
 

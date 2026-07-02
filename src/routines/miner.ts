@@ -1130,6 +1130,7 @@ export function findFirstAvailableQuotaTarget(
   canMineHiddenRadioactive: boolean,
   canMineHiddenIce: boolean,
   excludeTargets?: string | string[],
+  skipPirateSystems?: boolean,
 ): string {
   const excludeSet = new Set<string>();
   if (excludeTargets) {
@@ -1166,7 +1167,7 @@ export function findFirstAvailableQuotaTarget(
 
   // Check each ore in priority order to see if it has available locations
   for (const entry of entries) {
-    const rawLocations = mapStore.findOreLocations(entry.resourceId);
+    const rawLocations = mapStore.findOreLocations(entry.resourceId, undefined, skipPirateSystems);
     if (rawLocations.length === 0) {
       continue;
     }
@@ -1637,7 +1638,7 @@ function findBestHiddenPoiForOre(
   minRichness: number = 50, // Only consider POIs with richness >= this
   blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
 ): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean } | null {
-  const locations = mapStore.findOreLocations(oreId).filter(loc => {
+  const locations = mapStore.findOreLocations(oreId, blacklist, blacklist.length === 0).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
     
@@ -1709,7 +1710,7 @@ function areAllHiddenPoisDepleted(
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
 ): boolean {
-  const allHiddenLocations = mapStore.findOreLocations(oreId).filter(loc => {
+  const allHiddenLocations = mapStore.findOreLocations(oreId, undefined, true).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
     
@@ -1831,7 +1832,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Validate session - check if target resource is still valid
     if (activeSession.targetResourceId) {
-      const locations = mapStore.findOreLocations(activeSession.targetResourceId);
+      const locations = mapStore.findOreLocations(activeSession.targetResourceId, [], true);
       if (locations.length > 0) {
         // Also check if we have equipment for this resource type
         const sessionMiningType = getMiningTypeForResource(activeSession.targetResourceId);
@@ -2395,7 +2396,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             ctx.log("mining", `Quota cycling: ${quotaTargetResource} (all met, smallest surplus)`);
           }
-          const pickLocations = mapStore.findOreLocations(quotaTargetResource);
+          const pickLocations = mapStore.findOreLocations(quotaTargetResource, blacklist, blacklist.length > 0);
           if (pickLocations.length === 0) {
             ctx.log("warn", `Quota pick "${quotaTargetResource}" has no recorded locations in map — skipping, will mine without specific target`);
             quotaTargetResource = "";
@@ -2406,7 +2407,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
         if (quotaTargetResource) {
           ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
-          const pickLocations = mapStore.findOreLocations(quotaTargetResource);
+          const pickLocations = mapStore.findOreLocations(quotaTargetResource, blacklist, blacklist.length > 0);
           if (pickLocations.length === 0) {
             ctx.log("warn", `Quota pick "${quotaTargetResource}" has no recorded locations in map — clearing quota target`);
             quotaTargetResource = "";
@@ -2669,7 +2670,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // Try each deep core ore to find an available target
           for (const deepCoreOre of oresToCheck) {
-            const locations = mapStore.findOreLocations(deepCoreOre).filter(loc => {
+            const locations = mapStore.findOreLocations(deepCoreOre, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               // Deep core ores are in hidden POIs, so check for ore belts (they might be hidden)
@@ -2861,7 +2862,7 @@ if (configuredSystem) {
   if (miningType === "radioactive" && canMineHiddenRadioactive) {
     await surveySystemForHiddenPois(ctx);
   }
-      const allLocations = mapStore.findOreLocations(effectiveTarget);
+      const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
       const botSys = mapStore.getSystem(bot.system);
       const mapSystemIds = mapStore.getAllSystems();
       const mapDebug = mapStore.getDebugInfo();
@@ -2986,7 +2987,7 @@ if (configuredSystem) {
       }
 
       if (locations.length === 0) {
-        const debugLocations = mapStore.findOreLocations(effectiveTarget);
+        const debugLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
         const allOres = mapStore.getAllKnownOres();
         const oreExists = allOres.some(o => o.item_id === effectiveTarget);
         
@@ -3054,13 +3055,13 @@ if (configuredSystem) {
           // Ignore depletion for alternative targets to allow selection of POIs that may have respawned
           const availableQuotaTarget = findFirstAvailableQuotaTarget(
             quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce
+            canMineHiddenRadioactive, canMineHiddenIce, undefined, !isCloaked
           );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
             ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
             // Re-check locations with new target
-            const newLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+            const newLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
@@ -3137,7 +3138,7 @@ if (configuredSystem) {
           const isCommonOre = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
           const allSystemLocations = isCommonOre
             ? mapStore.findClosestMiningLocations(effectiveTarget, bot.system, blacklist)
-            : mapStore.findOreLocations(effectiveTarget);
+            : mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
           ctx.log("debug", `DEBUG: allSystemLocations.length=${allSystemLocations.length}`);
           const systemLocations = allSystemLocations
             .filter(loc => {
@@ -3166,7 +3167,7 @@ if (configuredSystem) {
             targetSystemId = bot.system;
           }
         } else {
-          const allOreLocations = mapStore.findOreLocations(effectiveTarget);
+          const allOreLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
           ctx.log("debug", `DEBUG: Calculating scoredLocations from ${allOreLocations.length} allOreLocations`);
           const scoredLocationsLocal = allOreLocations
             .filter(loc => {
@@ -3217,11 +3218,11 @@ if (configuredSystem) {
 
         ctx.log("debug", `[FINAL_CHECK] scoredLocations.length=${scoredLocations.length} configuredSystem=${configuredSystem ?? "none"}`);
         if (scoredLocations.length === 0 && !configuredSystem) {
-          ctx.log("debug", `[FINAL_CHECK] locations.length=${locations.length} allOreLocations.length=${mapStore.findOreLocations(effectiveTarget).length} blacklist=${JSON.stringify(blacklist)}`);
+          ctx.log("debug", `[FINAL_CHECK] locations.length=${locations.length} allOreLocations.length=${mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).length} blacklist=${JSON.stringify(blacklist)}`);
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps`);
           
           // Debug: Explain why no locations were found
-          const allLocations = mapStore.findOreLocations(effectiveTarget);
+const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
           ctx.log("debug", `DEBUG: ${allLocations.length} total locations in map for "${effectiveTarget}"`);
           ctx.log("debug", `DEBUG: bot.system="${bot.system}", blacklist=${JSON.stringify(blacklist)}`);
           
@@ -3276,7 +3277,7 @@ if (configuredSystem) {
             ctx.log("mining", `Trying alternative quota target: ${oreId}`);
             
             // Find locations for this target
-            const altLocations = mapStore.findOreLocations(oreId).filter(loc => {
+            const altLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
@@ -3306,14 +3307,14 @@ if (configuredSystem) {
             
             if (altLocations.length === 0) {
               // Debug: Why no locations for this ore
-              const oreLocations = mapStore.findOreLocations(oreId);
+              const oreLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0);
               ctx.log("debug", `DEBUG: Ore ${oreId} has ${oreLocations.length} locations in map, 0 pass filters`);
               ctx.log("mining", `No locations found for ${oreId} — trying next ore`);
               continue;
             }
             
             // Check if any locations are within range
-            const allAltLocations = mapStore.findOreLocations(oreId);
+            const allAltLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0);
             const altScoredLocations = allAltLocations
               .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
               .map(loc => {
@@ -3895,7 +3896,7 @@ if (configuredSystem) {
         if (!searchTarget && Object.keys(quotas).length > 0) {
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce
+            canMineHiddenRadioactive, canMineHiddenIce, undefined, !bot.isCloaked
           );
           if (newTarget) {
             searchTarget = newTarget;
@@ -3903,7 +3904,7 @@ if (configuredSystem) {
           }
         }
         
-        const broaderLocationsRaw = mapStore.findOreLocations(searchTarget);
+        const broaderLocationsRaw = mapStore.findOreLocations(searchTarget, blacklist, blacklist.length > 0);
         const broaderLocations = broaderLocationsRaw.filter(loc => {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -4713,7 +4714,7 @@ if (configuredSystem) {
           ctx.log("mining", `Richness check: current POI has richness ${currentRichness}, ${((1 - depletionPercent) * 100).toFixed(1)}% depleted — searching for better options...`);
 
           // Find best available POI for this resource
-          const allLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+          const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
             if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -4959,7 +4960,7 @@ if (configuredSystem) {
                   if (fillRatio < cargoThresholdRatio) {
                     ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching for next POI...");
                     const searchSystem = configuredSystem || bot.system;
-                    const newLocs = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+                    const newLocs = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
                       if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
                       if (loc.systemId !== searchSystem) return false; // HARD GATE: stay within configured system
                       const sys = mapStore.getSystem(loc.systemId);
@@ -5634,7 +5635,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             }
           } else if (searchTarget) {
             ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);
-            const globalTargetLocs = mapStore.findOreLocations(searchTarget).filter(loc => {
+            const globalTargetLocs = mapStore.findOreLocations(searchTarget, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
@@ -5698,7 +5699,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
 
             if (newQuotaTarget) {
               // Find locations for the new quota target
-              const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
+              const newLocs = mapStore.findOreLocations(newQuotaTarget, blacklist, blacklist.length > 0).filter(loc => {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");

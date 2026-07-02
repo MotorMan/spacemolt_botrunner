@@ -684,9 +684,8 @@ async function buildFacilityAtStation(
 
         // Navigate to target station to deposit
         ctx.log("fuel", `Navigating to ${stationId} to deposit build materials...`);
-        const stationParts = stationId.split("|").length > 1 ? stationId.split("|") : [null, stationId];
-        const targetSys = stationParts[0] || stationId;
-        await navigateToStation(ctx, targetSys, stationId);
+        const parts = stationId.includes("|") ? stationId.split("|") : [homeSystem, stationId];
+        await navigateToStation(ctx, parts[0], stationId);
         if (bot.state !== "running") break;
 
         // Deposit phase - deposit what we have in cargo

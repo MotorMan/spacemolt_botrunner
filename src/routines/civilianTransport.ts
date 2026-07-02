@@ -1885,42 +1885,49 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         destDrafts.push({ system: resolved?.system || "", poi: resolved?.poi || destId, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
 
-      const plannedRoute = await planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps, bot);
-      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${destDrafts.filter(d => !d.system).length} could not resolve`);
-      for (const d of destDrafts.filter(d => !d.system)) {
+      const currentPoi = bot.poi || "";
+      const filteredDrafts = destDrafts.filter(d => {
+        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === currentPoi.toLowerCase()) {
+          ctx.log("transport", `Filtering out passenger already at destination: ${d.poiName}`);
+          return false;
+        }
+        return true;
+      });
+      const plannedRoute = await planTourRoute(bot.system || "", filteredDrafts.filter(d => d.system), settings.maxJumps, bot);
+      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${filteredDrafts.filter(d => !d.system).length} could not resolve`);
+      for (const d of filteredDrafts.filter(d => !d.system)) {
         ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
       }
-      const outsideJumpLimit = destDrafts.filter(d => !d.system);
+      const outsideJumpLimit = filteredDrafts.filter(d => !d.system);
 
-      if (waiting.length > 0 && byDest.size === 0 && destDrafts.length === 0) {
-        ctx.log("transport", `All ${waiting.length} passengers filtered out (likely pirates). Moving to next station.`);
-        state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-        ctx.log("transport", `No valid passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
-        if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
-          ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          const nextPickup = await selectNextPickupStation(ctx, state, settings);
-          if (nextPickup) {
-            const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-            if (!isSameStation) {
-              state.pickupStation = nextPickup.poi;
-              state.pickupSystem = nextPickup.system;
-              state.roundsWithoutPassengers = 0;
-              state.needsTravel = true;
-              state.status = "idle";
-              saveTransportState(state);
-              await ctx.sleep(5000);
-              continue;
-            }
-            ctx.log("transport", `Next pickup is same station, resetting counter`);
-            state.roundsWithoutPassengers = 0;
+      const atDestinationCount = destDrafts.length - filteredDrafts.length;
+      if (atDestinationCount > 0) {
+        ctx.log("transport", `${atDestinationCount} passengers already at their destination - considering delivered`);
+      }
+
+      if (waiting.length > 0 && filteredDrafts.length === 0) {
+        ctx.log("transport", `All ${waiting.length} passengers have destinations at current station. Moving to next station.`);
+        state.roundsWithoutPassengers = 0;
+        const nextPickup = await selectNextPickupStation(ctx, state, settings);
+        if (nextPickup) {
+          const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+          if (!isSameStation) {
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
-          } else if (settings.homeSystem) {
-            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-            state.pickupStation = settings.homeStation || null;
-            state.pickupSystem = settings.homeSystem || null;
-            state.roundsWithoutPassengers = 0;
+            state.needsTravel = true;
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+          } else {
+            ctx.log("transport", `Next pickup is same station, continuing`);
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(60000);
           }
+        } else if (settings.homeSystem) {
+          ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
         }
         state.status = "idle";
         saveTransportState(state);
@@ -1941,6 +1948,15 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       for (const leg of plannedRoute) {
         const legPoiLower = leg.poi.toLowerCase();
+        const legSysLower = leg.system.toLowerCase();
+        const currentPoiLower = (bot.poi || "").toLowerCase();
+        const currentSysLower = (bot.system || "").toLowerCase();
+        
+        if (legSysLower === currentSysLower && legPoiLower === currentPoiLower) {
+          ctx.log("transport", `Skipping leg - destination ${leg.poiName} is current station`);
+          continue;
+        }
+        
         const passengers = byDest.get(leg.poi) || byDest.get(legPoiLower) || [];
         const passengersByOrigDest = leg.origDest ? (byDest.get(leg.origDest) || byDest.get(leg.origDest.toLowerCase()) || []) : passengers;
         const passengersFinal = passengersByOrigDest.length > 0 ? passengersByOrigDest : passengers;
@@ -2054,7 +2070,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
                 destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
               }
             }
-            const routeDests = Array.from(destMap.values()).filter(d => d.system);
+const routeDests = Array.from(destMap.values()).filter(d => {
+        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
+          return false;
+        }
+        return d.system;
+      });
             state.route = await planTourRoute(bot.system || "", routeDests, 6, bot);
             state.currentRouteIndex = 0;
             state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
@@ -2131,7 +2153,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
       }
 
-      const routeDests = Array.from(destMap.values()).filter(d => d.system);
+      const routeDests = Array.from(destMap.values()).filter(d => {
+        if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
+          return false;
+        }
+        return d.system;
+      });
       ctx.log("transport", `Route destinations: ${routeDests.length} valid out of ${destMap.size}`);
       const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
       ctx.log("transport", `planTourRoute result: ${planned.length} waypoints, currentSystem=${bot.system || 'none'}`);
@@ -2341,7 +2369,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
               ctx.log("transport", `FAILED to resolve ${p.destination}`);
             }
           }
-          const validDests = Array.from(destMap.values()).filter(d => d.system);
+          const validDests = Array.from(destMap.values()).filter(d => {
+            if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+              ctx.log("transport", `Filtering out rebuild destination same as current station: ${d.poi}`);
+              return false;
+            }
+            return d.system;
+          });
           ctx.log("transport", `Route rebuild: ${validDests.length} valid destinations out of ${destMap.size}`);
           if (validDests.length > 0) {
             const newRoute = await planTourRoute(bot.system || "", validDests, 6, bot);

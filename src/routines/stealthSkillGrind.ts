@@ -39,13 +39,23 @@ export const stealthSkillGrindRoutine: Routine = async function* (ctx: RoutineCo
           ctx.log("error", `Failed to enable cloak: ${cloakOnResp.error.message}`);
         }
       } else {
-        const cloakDetails = cloakOnResp.details as Record<string, unknown> | undefined;
-        const msg = cloakDetails?.message as string | undefined;
-        const cloakPower = cloakDetails?.cloningPower as number | undefined;
+        const result = cloakOnResp.result as Record<string, unknown> | undefined;
+        const details = cloakOnResp.details as Record<string, unknown> | undefined;
+        const cloakResponse = details || (result?.details as Record<string, unknown>) || result;
+        const msg = cloakResponse?.message as string | undefined;
+        const cloakStrength = (cloakResponse?.cloak_strength as number | string | undefined)
+          || (details?.cloak_strength as number | string | undefined)
+          || (result?.cloak_strength as number | string | undefined);
+        const enabled = cloakResponse?.enabled as boolean | undefined;
         if (msg) {
           ctx.log("stealth", msg);
+        } else if (cloakStrength !== undefined) {
+          const strengthStr = typeof cloakStrength === "string" ? cloakStrength : String(cloakStrength);
+          ctx.log("stealth", `Cloak enabled (cloak strength: ${strengthStr})`);
+        } else if (enabled === true) {
+          ctx.log("stealth", "Cloak enabled");
         } else {
-          ctx.log("stealth", `Cloak enabled${cloakPower !== undefined ? ` (cloaking power: ${cloakPower})` : ""}`);
+          ctx.log("stealth", "Cloak enabled");
         }
       }
 

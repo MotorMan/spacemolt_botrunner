@@ -32,7 +32,6 @@ export const stealthSkillGrindRoutine: Routine = async function* (ctx: RoutineCo
         break;
       }
 
-      ctx.log("stealth", "Enabling cloak...");
       const cloakOnResp = await bot.exec("cloak", { enable: true });
       if (cloakOnResp.error) {
         const msg = cloakOnResp.error.message.toLowerCase();
@@ -41,12 +40,9 @@ export const stealthSkillGrindRoutine: Routine = async function* (ctx: RoutineCo
         }
       } else {
         const details = cloakOnResp.details as Record<string, unknown> | undefined;
-        const cloakStrength = details?.cloak_strength as number | undefined;
         const msg = details?.message as string | undefined;
-        if (cloakStrength !== undefined) {
-          ctx.log("stealth", `Cloak enabled (power: ${cloakStrength})`);
-        } else if (msg) {
-          ctx.log("stealth", `Cloak enabled: ${msg}`);
+        if (msg) {
+          ctx.log("stealth", msg);
         } else {
           ctx.log("stealth", "Cloak enabled");
         }

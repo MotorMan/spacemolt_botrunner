@@ -39,8 +39,8 @@ export const stealthSkillGrindRoutine: Routine = async function* (ctx: RoutineCo
           ctx.log("error", `Failed to enable cloak: ${cloakOnResp.error.message}`);
         }
       } else {
-        const details = cloakOnResp.details as Record<string, unknown> | undefined;
-        const msg = details?.message as string | undefined;
+        const cloakDetails = cloakOnResp.details as Record<string, unknown> | undefined;
+        const msg = cloakDetails?.message as string | undefined;
         if (msg) {
           ctx.log("stealth", msg);
         } else {

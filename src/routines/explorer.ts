@@ -1619,6 +1619,7 @@ async function* scanResourcePoi(
       remaining: (r.remaining as number) || 0,
       max_remaining: (r.max_remaining as number) || 0,
       depletion_percent: (r.depletion_percent as number) || 100,
+      supported_power: (r.supported_power as number) || 0,
     }));
 
     mapStore.registerPoiFromScan(systemId, {
@@ -1648,6 +1649,7 @@ async function* scanResourcePoi(
       remaining: (r.remaining as number) || 0,
       max_remaining: (r.max_remaining as number) || 0,
       depletion_percent: (r.depletion_percent as number) || 100,
+      supported_power: (r.supported_power as number) || 0,
     }));
 
     // Store resource data in map

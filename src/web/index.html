@@ -11447,6 +11447,12 @@
                                     <span class="resource-label">Richness:</span>
                                     <span class="resource-value">${richness}%</span>
                                   </div>
+                                  ${resource.supported_power != null && resource.supported_power > 0 ? `
+                                  <div class="resource-row">
+                                    <span class="resource-label">Power:</span>
+                                    <span class="resource-value">${resource.supported_power.toLocaleString()}</span>
+                                  </div>
+                                  ` : ""}
                                 </div>
                                 <div class="resource-depletion-bar">
                                   <div class="resource-depletion-fill" style="width:${fullness}%; background: ${depletionColor}"></div>

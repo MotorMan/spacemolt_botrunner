@@ -36,6 +36,7 @@ export interface ResourceRecord {
   last_scanned: string;
   depleted?: boolean;
   depleted_at?: string;
+  supported_power?: number;
 }
 
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
@@ -822,7 +823,7 @@ class MapStore {
     this.scheduleSave();
   }
 
-  /** Update POI resource data from get_poi scan. */
+/** Update POI resource data from get_poi scan. */
   updatePoiResources(systemId: string, poiId: string, resources: Array<{
     resource_id: string;
     name: string;
@@ -830,7 +831,8 @@ class MapStore {
     remaining: number;
     max_remaining: number;
     depletion_percent: number;
-  }>): void {
+    supported_power?: number;
+ }>): void {
     const sys = this.data.systems[systemId];
     if (!sys) return;
 
@@ -848,6 +850,7 @@ class MapStore {
         max_remaining: r.max_remaining,
         depletion_percent: r.depletion_percent,
         last_scanned: timestamp,
+        supported_power: r.supported_power,
       }));
 
     poi.last_updated = timestamp;
@@ -868,6 +871,7 @@ class MapStore {
       remaining: number;
       max_remaining: number;
       depletion_percent: number;
+      supported_power?: number;
     }>;
   }): void {
     let sys = this.data.systems[systemId];
@@ -931,6 +935,7 @@ class MapStore {
           max_remaining: r.max_remaining,
           depletion_percent: r.depletion_percent,
           last_scanned: now(),
+          supported_power: r.supported_power,
         }));
     }
 
@@ -1339,6 +1344,8 @@ class MapStore {
     isHidden: boolean;
     /** Richness of the resource (mining efficiency) */
     richness: number;
+    /** Supported power - max mining power that can extract from this deposit */
+    supportedPower: number;
   }> {
     const results: Array<{
       systemId: string;
@@ -1353,6 +1360,7 @@ class MapStore {
       minutesSinceScan: number;
       isHidden: boolean;
       richness: number;
+      supportedPower: number;
     }> = [];
 
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
@@ -1410,6 +1418,7 @@ class MapStore {
         const maxRemaining = resource?.max_remaining ?? 0;
         const depletionPercent = resource?.depletion_percent ?? 0;
         const richness = resource?.richness ?? 0;
+        const supportedPower = resource?.supported_power ?? 0;
         const minutesSinceScan = resource?.last_scanned
           ? (Date.now() - new Date(resource.last_scanned).getTime()) / 60000
           : Infinity;
@@ -1428,6 +1437,7 @@ class MapStore {
           minutesSinceScan,
           isHidden: poi.hidden ?? false,
           richness,
+          supportedPower,
         });
       }
     }

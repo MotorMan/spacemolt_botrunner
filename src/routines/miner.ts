@@ -2900,6 +2900,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Determine mining destination ──
     yield "find_destination";
+    const totalMiningPower = getTotalMiningPower(cachedModules || []);
     // targetSystemId, targetPoiId, targetPoiName already declared above
 
     // Smart system selection: check the matching mining type first, but fall back
@@ -3016,6 +3017,11 @@ if (configuredSystem) {
         if (!oreEntry?.depleted) return true;
         // Depleted but expired - can re-check
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+      }).filter(loc => {
+        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+          return false;
+        }
+        return true;
       });
 
       const afterPoiFilter = allLocations.filter(loc => {
@@ -3999,6 +4005,9 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
         }).filter(loc => {
+          if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            return false;
+          }
           // No depletion filtering - trust the map data
           return true;
         });

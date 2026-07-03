@@ -2901,6 +2901,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Determine mining destination ──
     yield "find_destination";
     const totalMiningPower = getTotalMiningPower(cachedModules || []);
+    ctx.log("debug", `Equipment total mining power: ${totalMiningPower}`);
     // targetSystemId, targetPoiId, targetPoiName already declared above
 
     // Smart system selection: check the matching mining type first, but fall back
@@ -3018,7 +3019,7 @@ if (configuredSystem) {
         // Depleted but expired - can re-check
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       }).filter(loc => {
-        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
           return false;
         }
         return true;
@@ -3057,7 +3058,13 @@ if (configuredSystem) {
         if (!oreEntry?.depleted) return true;
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       });
-      ctx.log("debug", `[FILTER_STATS] allLocations=${allLocations.length} afterPoiType=${afterPoiFilter.length} afterDepletion=${afterDepletionFilter.length}`);
+      const afterPowerFilter = afterDepletionFilter.filter(loc => {
+        if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
+          return false;
+        }
+        return true;
+      });
+      ctx.log("debug", `[FILTER_STATS] allLocations=${allLocations.length} afterPoiType=${afterPoiFilter.length} afterDepletion=${afterDepletionFilter.length} afterPower=${afterPowerFilter.length}`);
 
       ctx.log("debug", `DEBUG: After all filters, locations.length = ${locations.length}`);
       for (const loc of locations) {
@@ -3937,6 +3944,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
+        if (p.id === bot.poi) return false;
         // No filtering by POI type - trust the map data
         const isMatchingPoi = (miningType === "ore") ||
           (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
@@ -4005,7 +4013,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
         }).filter(loc => {
-          if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+          if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
             return false;
           }
           // No depletion filtering - trust the map data

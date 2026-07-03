@@ -6911,12 +6911,12 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
     const isDepleted = stopReason && stopReason.includes("depleted");
     const isFuelLowStop = stopReason && stopReason.includes("fuel low");
 
-    // CRITICAL FIX: When stopping due to fuel low mid-mining and stayOutUntilFull is enabled:
+    // When stopping due to fuel low mid-mining:
     // - Don't deposit cargo at the refuel station
     // - Refuel and continue mining instead of returning home
     // This prevents depositing at random stations during refuel detours
     const isCargoFull = fillRatio >= cargoThresholdRatio;
-    const shouldStayOutDueToFuel = isFuelLowStop && settings.stayOutUntilFull && !isCargoFull;
+    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull;
 
     const shouldReturnHome = settings.noMidMiningRetarget
       ? (bot.system !== homeSystem && homeSystem)
@@ -6927,7 +6927,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
     if (shouldStayOutDueToFuel) {
       // CRITICAL FIX: Fuel low stop with stayOutUntilFull enabled - refuel and continue mining
       // DO NOT deposit cargo at random station, DO NOT return home yet
-      ctx.log("mining", `Fuel low but stayOutUntilFull enabled and cargo not full (${(fillRatio * 100).toFixed(0)}%) — refueling and continuing mining`);
+      ctx.log("mining", `Fuel low but cargo not full (${(fillRatio * 100).toFixed(0)}%) — refueling and continuing mining`);
       
       // Refuel at local/current station - do NOT deposit cargo here
       const { pois: currentPois } = await getSystemInfo(ctx);

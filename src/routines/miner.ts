@@ -5397,15 +5397,24 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
             (isOreBeltPoi(p.type) || p.hidden === true));
           if (altPoi) {
-            const resourceEntry = altPoi.resources?.find(r => r.resource_id === effectiveTarget);
+            const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
+            const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
+            const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+            // Check if this POI has the resource available and not depleted
             if (resourceEntry) {
               const remaining = resourceEntry.remaining;
               if (remaining > 0) {
-                newTarget = effectiveTarget;
-                newPoiId = altPoi.id;
-                newPoiName = altPoi.name;
-                newSystemId = bot.system;
-                ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                  ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                } else if (totalMiningPower > 0 && resourceEntry.supported_power && totalMiningPower > resourceEntry.supported_power * 4) {
+                  ctx.log("debug", `Skipping ${altPoi.name}: deposit too sparse (supported_power=${resourceEntry.supported_power}, equipment=${totalMiningPower})`);
+                } else {
+                  newTarget = effectiveTarget;
+                  newPoiId = altPoi.id;
+                  newPoiName = altPoi.name;
+                  newSystemId = bot.system;
+                  ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                }
               }
             }
           }
@@ -5578,17 +5587,22 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
               (isOreBeltPoi(p.type) || p.hidden === true));
             if (altPoi) {
-              const storedPoi = altPoi;
+              const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
               const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
-              // Check if this POI has the resource available (using resources data which has remaining)
+              const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+              // Check if this POI has the resource available and not depleted
               if (resourceEntry) {
                 const remaining = resourceEntry.remaining;
                 if (remaining > 0) {
-                  newTarget = effectiveTarget;
-                  newPoiId = altPoi.id;
-                  newPoiName = altPoi.name;
-                  newSystemId = bot.system;
-                  ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                    ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                  } else {
+                    newTarget = effectiveTarget;
+                    newPoiId = altPoi.id;
+                    newPoiName = altPoi.name;
+                    newSystemId = bot.system;
+                    ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  }
                 }
               }
             }
@@ -5722,17 +5736,22 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
               (isOreBeltPoi(p.type) || p.hidden === true));
             if (altPoi) {
-              const storedPoi = altPoi;
+              const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
               const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
-              // Check if this POI has the resource available (using resources data which has remaining)
+              const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+              // Check if this POI has the resource available and not depleted
               if (resourceEntry) {
                 const remaining = resourceEntry.remaining;
                 if (remaining > 0) {
-                  newTarget = effectiveTarget;
-                  newPoiId = altPoi.id;
-                  newPoiName = altPoi.name;
-                  newSystemId = bot.system;
-                  ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                    ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                  } else {
+                    newTarget = effectiveTarget;
+                    newPoiId = altPoi.id;
+                    newPoiName = altPoi.name;
+                    newSystemId = bot.system;
+                    ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  }
                 }
               }
             }

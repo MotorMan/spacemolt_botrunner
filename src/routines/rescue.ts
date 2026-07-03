@@ -1808,12 +1808,17 @@ skipToReturnHome = true;
        }
 
         // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-        const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-        if (!isFleetRescuePrimary) {
-          ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-        }
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      if (!isFleetRescuePrimary) {
+        const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+        ctx.log("rescue", primaryFleetBusy
+          ? `🤝 Primary fleet bot is busy, covering fleet rescues`
+          : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
+      }
 
-        const targets = isFleetRescuePrimary
+      const targets = (!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
+        ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+        : isFleetRescuePrimary
           ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
           : [];
 
@@ -1824,19 +1829,25 @@ skipToReturnHome = true;
       // Check if we're the primary MAYDAY rescue bot
       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
       if (!isMaydayRescuePrimary) {
-        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+        if (!primaryMaydayBusy) {
+          ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+        }
       }
 
       let maydayTarget: RescueTarget | null = null;
-if (targets.length === 0) {
-        if (!isMaydayRescuePrimary) {
+      if (targets.length === 0) {
+        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+        const shouldProcessMayday = isMaydayRescuePrimary || primaryMaydayBusy;
+
+        if (!shouldProcessMayday) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
             markMaydayHandled(ignoredMayday);
             await ctx.sleep(5000);
             continue;
           }
-          // No pending MAYDAY — fall through to idle/return-home check below
+          // No pending MAYDAY from primary — fall through to idle/return-home check below
         }
         const mayday = getNextMayday();
         if (mayday) {
@@ -4954,12 +4965,17 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
       if (!isFleetRescuePrimary) {
-        ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
+        const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+        ctx.log("rescue", primaryFleetBusy
+          ? `🤝 Primary fleet bot is busy, covering fleet rescues`
+          : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
       }
 
-      let targets = isFleetRescuePrimary
+      let targets = (!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
         ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-        : [];
+        : isFleetRescuePrimary
+          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+          : [];
 
       // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
       const now = Date.now();
@@ -4978,12 +4994,18 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check if we're the primary MAYDAY rescue bot
       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
       if (!isMaydayRescuePrimary) {
-        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+        if (!primaryMaydayBusy) {
+          ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+        }
       }
 
       let maydayTarget: RescueTarget | null = null;
+      const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+      const shouldProcessMayday = isMaydayRescuePrimary || primaryMaydayBusy;
+
       if (targets.length === 0) {
-        if (!isMaydayRescuePrimary) {
+        if (!shouldProcessMayday) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
             markMaydayHandled(ignoredMayday);

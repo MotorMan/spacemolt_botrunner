@@ -844,6 +844,32 @@ async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
   return true;
 }
 
+async function checkAndRefuelWithCloak(ctx: RoutineContext, threshold: number): Promise<void> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+
+  if (fuelPct >= threshold) return;
+
+  if (bot.isCloaked) {
+    ctx.log("craft", `Fuel low (${fuelPct}%) while cloaked - refueling directly`);
+    await ensureFueled(ctx, threshold);
+    return;
+  }
+
+  // Get to a station for cloak/refuel
+  await ensureUndocked(ctx);
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (!cloaked) {
+    ctx.log("warn", "Could not enable cloak - attempting to refuel undocked");
+  }
+  await ensureFueled(ctx, threshold);
+  if (!bot.docked) {
+    ctx.log("craft", "Redocking after refuel...");
+    await ensureDocked(ctx);
+  }
+}
+
 async function cloakAwareRefuel(ctx: RoutineContext, threshold: number): Promise<void> {
   const { bot } = ctx;
   await bot.refreshShip();

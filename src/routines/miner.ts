@@ -5055,6 +5055,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
               max_remaining: (r.max_remaining as number) || 0,
               depletion_percent: (r.depletion_percent as number) || 100,
+              supported_power: (r.supported_power as number) ?? 0,
             }));
 
             mapStore.registerPoiFromScan(bot.system, {
@@ -5886,7 +5887,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 ? (result.resources as Array<Record<string, unknown>>)
                 : Array.isArray(poiData?.resources)
                 ? (poiData.resources as Array<Record<string, unknown>>)
-                : [];
+                 : [];
 
               // CRITICAL FIX: Update mapstore with the scan data from get_poi
               const resourceData = (resources as Array<Record<string, unknown>>).map((r) => ({
@@ -5896,6 +5897,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                 remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
                 max_remaining: (r.max_remaining as number) ?? 0,
                 depletion_percent: (r.depletion_percent as number) ?? 100,
+                supported_power: (r.supported_power as number) ?? 0,
               }));
 
               if (resourceData.length > 0) {
@@ -6640,6 +6642,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
                 max_remaining: (r.max_remaining as number) ?? 0,
                 depletion_percent: (r.depletion_percent as number) ?? 100,
+                supported_power: (r.supported_power as number) ?? 0,
               }));
 
               if (resourceData.length > 0) {

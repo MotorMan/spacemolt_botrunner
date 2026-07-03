@@ -57,6 +57,9 @@
     let caGiftSendAllRunning = false;
     let caDepositAllRunning = false;
 
+    // ── Command send queue for send-before-open or closed socket ──
+    let wsSendQueue = [];
+
     // ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
     /** Resolve a system ID + optional POI ID to display names using mapData. */
@@ -155,71 +158,74 @@
     }
 
       function connect() {
-        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${proto}//${location.host}/ws`);
-
-      // Fallback: if WebSocket doesn't connect quickly, fetch data via REST
-      clearTimeout(wsInitTimer);
-      wsInitTimer = setTimeout(() => {
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          console.warn('WebSocket slow, fetching initial data via REST...');
-          fetchInitialData();
-        }
-      }, 500);
-
-      ws.onopen = () => {
         clearTimeout(wsInitTimer);
-        reconnectDelay = 1000;
-      };
 
-      ws.onclose = () => {
-        setTimeout(connect, reconnectDelay);
-        reconnectDelay = Math.min(reconnectDelay * 2, 10000);
-      };
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
 
-      ws.onerror = () => {};
+        wsInitTimer = setTimeout(() => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            console.warn('WebSocket slow, fetching initial data via REST...');
+            fetchInitialData();
+          }
+        }, 500);
 
-      ws.onmessage = (ev) => {
-        let msg;
-        try { msg = JSON.parse(ev.data); } catch { return; }
-        switch (msg.type) {
-          case 'init':
-            clearTimeout(wsInitTimer);
-            bots = msg.bots || [];
-            routines = msg.routines || [];
-            settings = msg.settings || {};
-            window.currentSettings = settings;
-            knownSystems = msg.knownSystems || [];
-            knownOres = msg.knownOres || [];
-            mobileCapitol = msg.mobileCapitol || null;
-            renderCommandAllControls();
-            break;
-          case 'mapData':
-            mapData = msg.data.systems || msg.data || {};
-            break;
-          case 'catalog':
-            catalog = msg.data;
-            break;
-          case 'statsDaily':
-            statsDaily = msg.data;
-            break;
-          case 'status':
-            bots = msg.bots || [];
-            updateCommandAllBotList();
-            break;
-          case 'execResult':
-            handleExecResult(msg);
-            break;
-          case 'actionResult':
-            if (msg.error) {
-              caLog(`Error: ${msg.error}`);
-            } else if (msg.message) {
-              caLog(msg.message);
-            }
-            break;
-        }
-      };
-    }
+        ws.onopen = () => {
+          clearTimeout(wsInitTimer);
+          reconnectDelay = 1000;
+          flushWsSendQueue();
+        };
+
+        ws.onclose = () => {
+          clearTimeout(wsInitTimer);
+          ws = null;
+          setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+        };
+
+        ws.onerror = () => {};
+
+        ws.onmessage = (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch { return; }
+          switch (msg.type) {
+            case 'init':
+              clearTimeout(wsInitTimer);
+              bots = msg.bots || [];
+              routines = msg.routines || [];
+              settings = msg.settings || {};
+              window.currentSettings = settings;
+              knownSystems = msg.knownSystems || [];
+              knownOres = msg.knownOres || [];
+              mobileCapitol = msg.mobileCapitol || null;
+              renderCommandAllControls();
+              break;
+            case 'mapData':
+              mapData = msg.data.systems || msg.data || {};
+              break;
+            case 'catalog':
+              catalog = msg.data;
+              break;
+            case 'statsDaily':
+              statsDaily = msg.data;
+              break;
+            case 'status':
+              bots = msg.bots || [];
+              updateCommandAllBotList();
+              break;
+            case 'execResult':
+              handleExecResult(msg);
+              break;
+            case 'actionResult':
+              if (msg.error) {
+                caLog(`Error: ${msg.error}`);
+              } else if (msg.message) {
+                caLog(msg.message);
+              }
+              break;
+          }
+        };
+      }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // COMMAND ALL TAB - Fleet-wide manual controls
@@ -1141,7 +1147,30 @@
       const seq = Date.now();
       const msg = { type: 'exec', bot, command, params, _seq: seq };
       execCallbacks.set(seq, callback);
+
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        wsSendQueue.push(msg);
+        if (!wsInitTimer && !ws) {
+          caLog(`<span class="resp-warn">WebSocket not connected, queuing command...</span>`);
+        }
+        return;
+      }
+
       ws.send(JSON.stringify(msg));
+    }
+
+    function flushWsSendQueue() {
+      if (wsSendQueue.length === 0) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      while (wsSendQueue.length > 0) {
+        const msg = wsSendQueue.shift();
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch {
+          break;
+        }
+      }
     }
 
     function handleExecResult(msg) {

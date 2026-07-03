@@ -3111,30 +3111,48 @@ const INSURANCE_CREDIT_FLOOR = 500;
  */
 export async function ensureInsured(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
-  if (!bot.docked) return;
+  if (!bot.docked) {
+    ctx.log("insurance", "Skipping insurance check - not docked");
+    return;
+  }
 
   const all = readSettings();
-  if ((all.general?.autoInsure as boolean) === false) return;
+  if ((all.general?.autoInsure as boolean) === false) {
+    ctx.log("insurance", "Skipping insurance check - autoInsure disabled in settings");
+    return;
+  }
 
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && !stationHasService(currentStation, "insurance")) return;
+  if (currentStation && !stationHasService(currentStation, "insurance")) {
+    ctx.log("insurance", `Skipping insurance check - station ${currentStation.name} does not have insurance service`);
+    return;
+  }
 
   const quoteResp = await bot.exec("get_insurance_quote");
-  if (quoteResp.error || !quoteResp.result) return;
+  if (quoteResp.error || !quoteResp.result) {
+    ctx.log("insurance", `Skipping insurance check - quote failed: ${quoteResp.error?.message || "no result"}`);
+    return;
+  }
 
   const q = quoteResp.result as Record<string, unknown>;
   const quoteObj = (q.quote as Record<string, unknown>) ?? q;
 
   // Already insured?
   const insured = (quoteObj.insured as boolean) ?? (q.insured as boolean) ?? false;
-  if (insured) return;
+  if (insured) {
+    ctx.log("insurance", "Already insured - skipping purchase");
+    return;
+  }
 
   const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
-  if (cost <= 0) return;
+  if (cost <= 0) {
+    ctx.log("insurance", "Skipping insurance check - no valid quote cost");
+    return;
+  }
 
   // We are not insured and have a quote. Inform the user.
-  ctx.log("info", `Insurance quote: ${cost}cr. Purchase manually if desired.`);
+  ctx.log("insurance", `Insurance quote: ${cost}cr. Purchase manually if desired.`);
   // Do not buy automatically; leave it to the user.
   return;
 }

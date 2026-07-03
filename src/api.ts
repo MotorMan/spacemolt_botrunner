@@ -375,9 +375,11 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'sell_wreck': 'sell',
    'scrap_wreck': 'scrap',
 'release_tow': 'release',
-  'buy_insurance': 'insure',
+   'buy_insurance': 'insure',
+  'get_insurance_quote': 'quote',
+   'view_insurance': 'policies',
   'set_home_base': 'set_home',
-};
+ };
 
 // Commands that use payload.action for the action (like facility and battle)
 const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
@@ -436,6 +438,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
+  get_insurance_quote: 10_000,
   get_notifications: 5_000, //throttled to once per tick (10s)
   catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
   get_map: 3600_000, //cached once per session, invalidated on server version change or client restart.

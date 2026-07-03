@@ -1,6 +1,7 @@
 import type { Routine, RoutineContext, CargoItem } from "../bot.js";
 import {
   ensureDocked,
+  ensureUndocked,
   repairShip,
   ensureFueled,
   detectAndRecoverFromDeath,
@@ -802,6 +803,72 @@ async function craftFromCategories(
   return crafted;
 }
 
+// ── Cloaking refuel helpers ───────────────────────────────────
+
+async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const checkStr = `${(modObj?.id as string) || (modObj?.type_id as string) || ""} ${(modObj?.name as string) || ""} ${(modObj?.special as string) || ""}`.toLowerCase();
+    if (checkStr.includes("cloak")) return true;
+  }
+  return false;
+}
+
+async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.isCloaked) {
+    ctx.log("craft", "Bot is already cloaked - no action needed");
+    return true;
+  }
+  if (!(await hasCloakingModule(ctx))) {
+    ctx.log("craft", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+  ctx.log("craft", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      ctx.log("craft", "Bot is already cloaked");
+      return true;
+    }
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+  ctx.log("craft", "Cloaking enabled successfully");
+  return true;
+}
+
+async function cloakAwareRefuel(ctx: RoutineContext, threshold: number): Promise<void> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+
+  if (fuelPct >= threshold) {
+    ctx.log("craft", `Fuel at ${fuelPct}% - above refuel threshold ${threshold}%`);
+    return;
+  }
+
+  if (bot.isCloaked) {
+    ctx.log("craft", `Fuel low (${fuelPct}%) while cloaked - refueling directly`);
+    await ensureFueled(ctx, threshold);
+    return;
+  }
+
+  ctx.log("craft", `Fuel low (${fuelPct}%) - enabling cloak before refueling`);
+  await ensureUndocked(ctx);
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (!cloaked) {
+    ctx.log("warn", "Could not enable cloak - attempting to refuel undocked");
+  }
+  await ensureFueled(ctx, threshold);
+}
+
 // ── Main routine ──────────────────────────────────────────────
 
 export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -1024,7 +1091,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     yield "refuel";
-    await ensureFueled(ctx, settings.refuelThreshold);
+    await cloakAwareRefuel(ctx, settings.refuelThreshold);
     yield "repair";
     await repairShip(ctx);
 

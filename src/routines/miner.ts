@@ -3033,7 +3033,15 @@ if (configuredSystem) {
         // Depleted but expired - can re-check
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       }).filter(loc => {
-        if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
+        // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+        // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+        const hasScanData = loc.minutesSinceScan !== Infinity;
+        const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        if (isLowRemainingWithUnknownPower) {
+          return false;
+        }
+        // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
         return true;
@@ -3073,7 +3081,15 @@ if (configuredSystem) {
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       });
       const afterPowerFilter = afterDepletionFilter.filter(loc => {
-        if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
+        // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+        // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+        const hasScanData = loc.minutesSinceScan !== Infinity;
+        const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        if (isLowRemainingWithUnknownPower) {
+          return false;
+        }
+        // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
         return true;
@@ -4026,13 +4042,21 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
-        }).filter(loc => {
-          if (totalMiningPower > 0 && (!loc.supportedPower || loc.supportedPower <= 0 || totalMiningPower > loc.supportedPower * 4)) {
-            return false;
-          }
-          // No depletion filtering - trust the map data
-          return true;
-        });
+}).filter(loc => {
+           // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+           // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+           const hasScanData = loc.minutesSinceScan !== Infinity;
+           const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+           if (isLowRemainingWithUnknownPower) {
+             return false;
+           }
+           // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+           if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+             return false;
+           }
+           // No depletion filtering - trust the map data
+           return true;
+         });
 
         ctx.log("debug", `[BROADER_SEARCH] raw=${broaderLocationsRaw.length} afterPOIType+depletion=${broaderLocations.length} searchTarget=${searchTarget} miningType=${miningType}`);
 

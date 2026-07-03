@@ -170,6 +170,34 @@ function getBotPersonality(botName: string): string {
   return DEFAULT_PERSONALITY;
 }
 
+const DAILY_UPDATES_FILE = join(process.cwd(), "data", "daily_updates.json");
+
+interface DailyUpdatesData {
+   lastStatusUpdate: number;
+   lastColorUpdate: number;
+   nextUpdateId?: number; // For rate limiting coordination
+ }
+
+function loadDailyUpdates(): DailyUpdatesData {
+   try {
+     if (existsSync(DAILY_UPDATES_FILE)) {
+       const data = JSON.parse(readFileSync(DAILY_UPDATES_FILE, "utf-8")) as DailyUpdatesData;
+       return {
+         lastStatusUpdate: data.lastStatusUpdate || 0,
+         lastColorUpdate: data.lastColorUpdate || 0,
+         nextUpdateId: data.nextUpdateId || 0,
+       };
+     }
+   } catch { /* start fresh */ }
+   return { lastStatusUpdate: 0, lastColorUpdate: 0, nextUpdateId: 0 };
+ }
+
+function saveDailyUpdates(updates: DailyUpdatesData): void {
+   const dir = join(process.cwd(), "data");
+   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+   writeFileSync(DAILY_UPDATES_FILE, JSON.stringify(updates, null, 2) + "\n", "utf-8");
+ }
+
 function getAiChatSettings(): {
    enabled: boolean;
    model: string;
@@ -191,7 +219,13 @@ function getAiChatSettings(): {
    factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
    llmTimeoutSec: number; // Timeout for LLM API calls in seconds
    maxTokens: number; // Maximum tokens for LLM response
-} {
+   // Daily status/color update settings
+   autoStatusUpdateEnabled: boolean; // Enable automatic daily status updates
+   autoStatusUpdateIntervalSec: number; // Interval in seconds (default 86400 = 24 hours)
+   autoStatusUpdateMaxRetries: number; // Max retries for char limit
+   autoColorUpdateEnabled: boolean; // Enable automatic daily color updates
+   autoColorUpdateIntervalSec: number; // Interval in seconds (default 86400 = 24 hours)
+ } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
 
@@ -210,28 +244,34 @@ function getAiChatSettings(): {
     (s.model as string) ||
     "llama3.2";
 
-   return {
-     enabled: (s.enabled as boolean) ?? false,
-     model,
-     baseUrl,
-     apiKey,
-     cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
-     respondToMentions: (s.respondToMentions as boolean) ?? true,
-     respondToQuestions: (s.respondToQuestions as boolean) ?? false,
-     respondToAll: (s.respondToAll as boolean) ?? false,
-     respondToSystem: (s.respondToSystem as boolean) ?? false,
-     respondToMayday: (s.respondToMayday as boolean) ?? true,
-     respondToCustoms: (s.respondToCustoms as boolean) ?? true,
-     customsResponseChance: (s.customsResponseChance as number) ?? 10,
-     karenModeChance: (s.karenModeChance as number) ?? 100,
-     respondToBattleMessages: (s.respondToBattleMessages as boolean) ?? true,
-     personality: (s.personality as string) || DEFAULT_PERSONALITY,
-     lockDurationSec: (s.lockDurationSec as number) || 60,
-     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
-     factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
-     llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
-     maxTokens: (s.maxTokens as number) ?? 1000,
-   };
+return {
+      enabled: (s.enabled as boolean) ?? false,
+      model,
+      baseUrl,
+      apiKey,
+      cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
+      respondToMentions: (s.respondToMentions as boolean) ?? true,
+      respondToQuestions: (s.respondToQuestions as boolean) ?? false,
+      respondToAll: (s.respondToAll as boolean) ?? false,
+      respondToSystem: (s.respondToSystem as boolean) ?? false,
+      respondToMayday: (s.respondToMayday as boolean) ?? true,
+      respondToCustoms: (s.respondToCustoms as boolean) ?? true,
+      customsResponseChance: (s.customsResponseChance as number) ?? 10,
+      karenModeChance: (s.karenModeChance as number) ?? 100,
+      respondToBattleMessages: (s.respondToBattleMessages as boolean) ?? true,
+      personality: (s.personality as string) || DEFAULT_PERSONALITY,
+      lockDurationSec: (s.lockDurationSec as number) || 60,
+      conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
+      factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
+      llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+      maxTokens: (s.maxTokens as number) ?? 1000,
+      // Daily status/color update settings
+      autoStatusUpdateEnabled: (s.autoStatusUpdateEnabled as boolean) ?? false,
+      autoStatusUpdateIntervalSec: (s.autoStatusUpdateIntervalSec as number) ?? 86400,
+      autoStatusUpdateMaxRetries: (s.autoStatusUpdateMaxRetries as number) ?? 3,
+      autoColorUpdateEnabled: (s.autoColorUpdateEnabled as boolean) ?? false,
+      autoColorUpdateIntervalSec: (s.autoColorUpdateIntervalSec as number) ?? 86400,
+    };
 }
 
 // ── Memory ────────────────────────────────────────────────────
@@ -797,30 +837,35 @@ export class AiChatService {
     return first ?? null;
   }
 
-  private async runLoop(): Promise<void> {
-    let lastCycleTime = 0;
+private async runLoop(): Promise<void> {
+     let lastCycleTime = 0;
 
-    while (this.running) {
-      try {
-        const settings = getAiChatSettings();
+     while (this.running) {
+       try {
+         const settings = getAiChatSettings();
 
-        // Check if enabled
-        if (!settings.enabled) {
-          // Clear the queue to prevent processing stale messages when re-enabled
-          this.chatMessageQueue = [];
-          await sleep(5000);
-          continue;
-        }
+         // Check if enabled
+         if (!settings.enabled) {
+           // Clear the queue to prevent processing stale messages when re-enabled
+           this.chatMessageQueue = [];
+           await sleep(5000);
+           continue;
+         }
 
-        // Rate limit cycles
-        const now = Date.now();
-        if (now - lastCycleTime < settings.cycleIntervalSec * 1000) {
-          await sleep(500);
-          continue;
-        }
-        lastCycleTime = now;
+         // Rate limit cycles
+         const now = Date.now();
+         if (now - lastCycleTime < settings.cycleIntervalSec * 1000) {
+           await sleep(500);
+           continue;
+         }
+         lastCycleTime = now;
 
-        if (!settings.baseUrl) {
+         // Check for daily updates (includes status and color updates)
+         if (settings.autoStatusUpdateEnabled || settings.autoColorUpdateEnabled) {
+           await this.runDailyUpdates();
+         }
+
+         if (!settings.baseUrl) {
           this.logFn("error", "AI Chat: Base URL not set — check settings");
           await sleep(30_000);
           continue;
@@ -2335,7 +2380,7 @@ ${playerName ? `Player name to include: ${playerName}` : ""}`;
     }
   }
 
-  async sendRescueEnRouteNotification(
+async sendRescueEnRouteNotification(
     bot: Bot,
     targetPlayer: string,
     jumpsAway: number
@@ -2361,7 +2406,7 @@ ${playerName ? `Player name to include: ${playerName}` : ""}`;
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ Rescue en-route notification to ${targetPlayer}: ${message}`);
         
-        // Log to chat.log file (same as other private messages)
+        // Log outgoing message to chat log file (same as other private messages)
         this.logChat({
           timestamp: new Date().toISOString(),
           direction: "OUT",
@@ -2369,11 +2414,11 @@ ${playerName ? `Player name to include: ${playerName}` : ""}`;
           sender: bot.username,
           content: message,
         });
-        
+
         // Log to bot's activity log (shows in UI)
         bot.log("chat", `📤 Private to ${targetPlayer}: ${message}`);
         bot.log("rescue", `📧 Sent en-route notification to ${targetPlayer}`);
-        
+
         return { ok: true, message };
       } else {
         this.logFn("error", `Rescue notification to ${targetPlayer} failed: ${chatResp.error.message}`);
@@ -2385,6 +2430,243 @@ ${playerName ? `Player name to include: ${playerName}` : ""}`;
       this.logFn("error", `Rescue notification error: ${errMsg}`);
       bot.log("warn", `📧 En-route notification error: ${errMsg}`);
       return { ok: false, error: errMsg };
+    }
+  }
+
+  /**
+   * Generate and set a bot's status message using LLM and personality.
+   * Returns true on success, false on failure.
+   */
+  private async generateAndSetBotStatus(bot: Bot): Promise<boolean> {
+    const settings = getAiChatSettings();
+
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", `Status update skipped: AI Chat is disabled`);
+      return false;
+    }
+
+    if (!settings.autoStatusUpdateEnabled) {
+      this.logFn("ai_chat_debug", `Status update skipped: autoStatusUpdateEnabled is false`);
+      return false;
+    }
+
+    // Check if bot is available
+    const bots = AiChatService.getBots();
+    const botRef = bots.find(b => b.username === bot.username);
+    if (!botRef || (!botRef.state || botRef.state === "idle")) {
+      this.logFn("ai_chat", `Bot ${bot.username} not in running state (state: ${botRef?.state}), skipping status update`);
+      return false;
+    }
+
+    if (!botRef.api.getSession()) {
+      this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping status update`);
+      return false;
+    }
+
+    const personality = getBotPersonality(bot.username);
+    const botContext = await this.gatherBotContext(bot);
+
+    // Try to generate status with retry on char limit
+    for (let attempt = 0; attempt < settings.autoStatusUpdateMaxRetries; attempt++) {
+      const maxCharHint = attempt > 0
+        ? `\n\nIMPORTANT: Keep your response under ${100 - attempt * 10} characters. Count carefully.`
+        : "";
+
+      const systemPrompt = `${personality}
+
+## Your Current Context
+- Your name in the game is: ${bot.username}
+- You are currently in system: ${bot.system || "unknown"}
+- Location: ${bot.poi || "unknown"}
+
+## Real-Time Game State
+${botContext}
+
+## Task
+Generate a status message (max 100 characters) that reflects your current situation, personality, and activity.
+Be creative but concise. Think like you're setting a social status that other players will see.${maxCharHint}`;
+
+      const userMessage = `Generate a status message for ${bot.username}. Keep it under ${100 - attempt * 10} characters.`;
+
+      const llmMessages: LlmMessage[] = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ];
+
+      try {
+        const response = await callLlm(llmMessages, settings);
+        let status = response.trim().replace(/^["']|["']$/g, "").slice(0, 100);
+
+        if (!status) {
+          this.logFn("ai_chat_debug", `Empty status response from LLM for ${bot.username}`);
+          return false;
+        }
+
+        // Try to set the status
+        const statusResp = await bot.exec("set_status", { content: status });
+
+        if (!statusResp.error) {
+          this.logFn("ai_chat", `✅ Status updated for ${bot.username}: "${status}"`);
+          bot.log("status", `🎨 Status set: "${status}"`);
+          saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
+          return true;
+        }
+
+        // Check for char limit error (400)
+        const errorMsg = statusResp.error.message || "";
+        if (errorMsg.includes("100") || errorMsg.toLowerCase().includes("char")) {
+          this.logFn("ai_chat", `Status for ${bot.username} exceeded limit (attempt ${attempt + 1}/${settings.autoStatusUpdateMaxRetries}), retrying with shorter prompt`);
+          continue;
+        }
+
+        // Other errors (e.g., 429 rate limit) - wait and retry
+        if (statusResp.error.code === "429" || errorMsg.includes("rate") || errorMsg.includes("limit")) {
+          this.logFn("ai_chat", `Rate limited on status update for ${bot.username}, waiting 10s before retry`);
+          await sleep(10000);
+          continue;
+        }
+
+        this.logFn("error", `Status update failed for ${bot.username}: ${errorMsg}`);
+        return false;
+      } catch (llmErr) {
+        this.logFn("error", `LLM error during status generation for ${bot.username}: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+        return false;
+      }
+    }
+
+    this.logFn("error", `Status update failed for ${bot.username} after ${settings.autoStatusUpdateMaxRetries} retries`);
+    return false;
+  }
+
+  /**
+   * Generate and set a bot's ship colors using LLM and personality.
+   * Returns true on success, false on failure.
+   */
+  private async generateAndSetBotColors(bot: Bot): Promise<boolean> {
+    const settings = getAiChatSettings();
+
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", `Color update skipped: AI Chat is disabled`);
+      return false;
+    }
+
+    if (!settings.autoColorUpdateEnabled) {
+      this.logFn("ai_chat_debug", `Color update skipped: autoColorUpdateEnabled is false`);
+      return false;
+    }
+
+    // Check if bot is available
+    const bots = AiChatService.getBots();
+    const botRef = bots.find(b => b.username === bot.username);
+    if (!botRef || (!botRef.state || botRef.state === "idle")) {
+      this.logFn("ai_chat", `Bot ${bot.username} not in running state (state: ${botRef?.state}), skipping color update`);
+      return false;
+    }
+
+    if (!botRef.api.getSession()) {
+      this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping color update`);
+      return false;
+    }
+
+    const personality = getBotPersonality(bot.username);
+
+    const systemPrompt = `${personality}
+
+## Task
+Pick two hex colors (#RRGGBB format) that match this bot's character and style.
+Return ONLY the two colors in format: #RRGGBB,#RRGGBB
+No other text, formatting, or explanation.`;
+
+    const userMessage = `Pick two colors for ${bot.username}'s ship. Format: #RRGGBB,#RRGGBB`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    // Hex color validation regex
+    const hexColorRegex = /^#([0-9A-Fa-f]{6}),#([0-9A-Fa-f]{6})$/;
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+
+// Parse and validate the colors
+       const match = cleanResponse.match(hexColorRegex);
+       if (!match) {
+         this.logFn("ai_chat", `Invalid color format from LLM for ${bot.username}: "${cleanResponse}"`);
+         return false;
+       }
+
+       const primaryColor = `#${match[1]}`;
+       const secondaryColor = `#${match[2]}`;
+
+      // Try to set the colors
+      const colorResp = await bot.exec("set_colors", { primary_color: primaryColor, secondary_color: secondaryColor });
+
+      if (!colorResp.error) {
+        this.logFn("ai_chat", `✅ Colors updated for ${bot.username}: primary=${primaryColor}, secondary=${secondaryColor}`);
+        bot.log("status", `🎨 Colors set: ${primaryColor}, ${secondaryColor}`);
+        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
+        return true;
+      }
+
+      // Check for rate limit error
+      const errorMsg = colorResp.error.message || "";
+      if (colorResp.error.code === "429" || errorMsg.includes("rate") || errorMsg.includes("limit")) {
+        this.logFn("ai_chat", `Rate limited on color update for ${bot.username}, waiting 10s before retry`);
+        await sleep(10000);
+        return false;
+      }
+
+      this.logFn("error", `Color update failed for ${bot.username}: ${errorMsg}`);
+      return false;
+    } catch (llmErr) {
+      this.logFn("error", `LLM error during color generation for ${bot.username}: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Run daily updates for all bots (status and/or colors based on settings).
+   * Called from runLoop when intervals have elapsed.
+   */
+  private async runDailyUpdates(): Promise<void> {
+    const settings = getAiChatSettings();
+    const now = Date.now();
+    const updates = loadDailyUpdates();
+
+    const bots = AiChatService.getBots();
+    if (!bots || bots.length === 0) return;
+
+    // Check status update interval
+    if (settings.autoStatusUpdateEnabled && settings.autoStatusUpdateIntervalSec > 0) {
+      const statusIntervalMs = settings.autoStatusUpdateIntervalSec * 1000;
+      if (now - updates.lastStatusUpdate >= statusIntervalMs) {
+        this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
+
+        // Update each bot's status
+        for (const bot of bots) {
+          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          await this.generateAndSetBotStatus(bot);
+          await sleep(2000); // Small delay between updates to avoid rate limiting
+        }
+      }
+    }
+
+// Check color update interval
+    if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
+      const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
+      if (now - updates.lastColorUpdate >= colorIntervalMs) {
+        this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
+
+        // Update each bot's colors
+        for (const bot of bots) {
+          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          await this.generateAndSetBotColors(bot);
+          await sleep(2000); // Small delay between updates to avoid rate limiting
+        }
+      }
     }
   }
 }

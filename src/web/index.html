@@ -16554,28 +16554,34 @@
 
       // ── AI Chat Settings ────────────────────────────────────────────
 
-      function renderAiChatSettings(panel) {
-        const ac = settings.ai_chat || {};
-        const enabled = ac.enabled ?? false;
-        const baseUrl = ac.baseUrl || "";
-        const apiKey = ac.apiKey || "";
-        const model = ac.model || "";
-        const cycleIntervalSec = ac.cycleIntervalSec ?? 5;
-        const respondToMentions = ac.respondToMentions ?? true;
-        const respondToQuestions = ac.respondToQuestions ?? false;
-        const respondToAll = ac.respondToAll ?? false;
-        const respondToSystem = ac.respondToSystem ?? false;
-        const respondToMayday = ac.respondToMayday ?? true;
-        const respondToCustoms = ac.respondToCustoms ?? true;
-        const respondToBattleMessages = ac.respondToBattleMessages ?? false;
-        const customsResponseChance = ac.customsResponseChance ?? 25; // 1 in X chance
-        const karenModeChance = ac.karenModeChance ?? 500; // 1 in X chance
-        const personality = ac.personality || "";
-        const lockDurationSec = ac.lockDurationSec ?? 60;
-        const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
-        const factionChatRoundsLimit = ac.factionChatRoundsLimit ?? 5;
-        const llmTimeoutSec = ac.llmTimeoutSec ?? 30;
-        const maxTokens = ac.maxTokens ?? 1000;
+function renderAiChatSettings(panel) {
+         const ac = settings.ai_chat || {};
+         const enabled = ac.enabled ?? false;
+         const baseUrl = ac.baseUrl || "";
+         const apiKey = ac.apiKey || "";
+         const model = ac.model || "";
+         const cycleIntervalSec = ac.cycleIntervalSec ?? 5;
+         const respondToMentions = ac.respondToMentions ?? true;
+         const respondToQuestions = ac.respondToQuestions ?? false;
+         const respondToAll = ac.respondToAll ?? false;
+         const respondToSystem = ac.respondToSystem ?? false;
+         const respondToMayday = ac.respondToMayday ?? true;
+         const respondToCustoms = ac.respondToCustoms ?? true;
+         const respondToBattleMessages = ac.respondToBattleMessages ?? false;
+         const customsResponseChance = ac.customsResponseChance ?? 25; // 1 in X chance
+         const karenModeChance = ac.karenModeChance ?? 500; // 1 in X chance
+         const personality = ac.personality || "";
+         const lockDurationSec = ac.lockDurationSec ?? 60;
+         const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
+         const factionChatRoundsLimit = ac.factionChatRoundsLimit ?? 5;
+         const llmTimeoutSec = ac.llmTimeoutSec ?? 30;
+         const maxTokens = ac.maxTokens ?? 1000;
+         // Daily update settings
+         const autoStatusUpdateEnabled = ac.autoStatusUpdateEnabled ?? false;
+         const autoStatusUpdateIntervalSec = ac.autoStatusUpdateIntervalSec ?? 86400;
+         const autoStatusUpdateMaxRetries = ac.autoStatusUpdateMaxRetries ?? 3;
+         const autoColorUpdateEnabled = ac.autoColorUpdateEnabled ?? false;
+         const autoColorUpdateIntervalSec = ac.autoColorUpdateIntervalSec ?? 86400;
 
         const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
         const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -16720,18 +16726,51 @@
       <input type="number" id="set-aichat-karenModeChance" min="0" max="1000" value="${karenModeChance}" style="width:80px">
     </div>
 
-    <div class="setting-row">
-      <div style="width:100%;">
-        <div class="setting-label">Bot Personality</div>
-        <div class="setting-hint">Instructions for the AI's personality and behavior. Leave blank for default friendly helper.</div>
-        <textarea id="set-aichat-personality" ${textareaStyle}>${esc(personality || DEFAULT_AI_CHAT_PERSONALITY)}</textarea>
-      </div>
-    </div>
+</div>
+     </div>
 
-    <div class="settings-save-bar">
-      <button class="primary" onclick="saveAiChatSettings()">Save Settings</button>
-    </div>
-  `;
+     <div class="setting-row">
+       <div style="width:100%;">
+         <div class="setting-label">Bot Personality</div>
+         <div class="setting-hint">Instructions for the AI's personality and behavior. Leave blank for default friendly helper.</div>
+         <textarea id="set-aichat-personality" ${textareaStyle}>${esc(personality || DEFAULT_AI_CHAT_PERSONALITY)}</textarea>
+       </div>
+     </div>
+
+     <div class="setting-row" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
+       <div style="width:100%;">
+         <div class="setting-label">Daily Status & Color Updates</div>
+         <div class="setting-hint">Automatically update bots' in-game status messages and ship colors using their personalities.</div>
+         <div style="display:flex;flex-direction:column;gap:10px;margin-top:8px;">
+
+           <div style="display:flex;align-items:center;gap:8px;">
+             <input type="checkbox" id="set-aichat-autoStatusUpdateEnabled" ${autoStatusUpdateEnabled ? "checked" : ""}>
+             <span style="font-size:12px;color:var(--text)">Enable automatic daily status updates</span>
+           </div>
+
+           <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
+             <span style="font-size:12px;color:var(--text-dim);min-width:100px;">Interval (hours):</span>
+             <input type="number" id="set-aichat-autoStatusUpdateIntervalSec" min="1" max="168" value="${Math.round(autoStatusUpdateIntervalSec / 3600)}" style="width:80px;font-size:12px;padding:4px;">
+           </div>
+
+           <div style="display:flex;align-items:center;gap:8px;">
+             <input type="checkbox" id="set-aichat-autoColorUpdateEnabled" ${autoColorUpdateEnabled ? "checked" : ""}>
+             <span style="font-size:12px;color:var(--text)">Enable automatic daily color updates</span>
+           </div>
+
+<div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
+              <span style="font-size:12px;color:var(--text-dim);min-width:100px;">Interval (hours):</span>
+              <input type="number" id="set-aichat-autoColorUpdateIntervalSec" min="1" max="168" value="${Math.round(autoColorUpdateIntervalSec / 3600)}" style="width:80px;font-size:12px;padding:4px;">
+            </div>
+
+          </div>
+        </div>
+      </div>
+
+      <div class="settings-save-bar">
+        <button class="primary" onclick="saveAiChatSettings()">Save Settings</button>
+      </div>
+    `;
       }
 
       function saveAiChatSettings() {
@@ -16744,14 +16783,14 @@
             parseInt(
               document.getElementById("set-aichat-cycleIntervalSec").value,
             ) || 5,
-          respondToMentions: document.getElementById(
-            "set-aichat-respondToMentions",
-          ).checked,
-          respondToQuestions: document.getElementById(
-            "set-aichat-respondToQuestions",
-          ).checked,
-          respondToAll: document.getElementById("set-aichat-respondToAll")
-            .checked,
+respondToMentions: document.getElementById(
+             "set-aichat-respondToMentions",
+           ).checked,
+           respondToQuestions: document.getElementById(
+             "set-aichat-respondToQuestions",
+           ).checked,
+           respondToAll: document.getElementById("set-aichat-respondToAll")
+             .checked,
           respondToSystem: document.getElementById("set-aichat-respondToSystem")
             .checked,
           respondToMayday: document.getElementById("set-aichat-respondToMayday")
@@ -16794,6 +16833,19 @@
           maxTokens:
             parseInt(document.getElementById("set-aichat-maxTokens").value) ||
             1000,
+          // Daily update settings
+          autoStatusUpdateEnabled: document.getElementById("set-aichat-autoStatusUpdateEnabled").checked,
+          autoStatusUpdateIntervalSec: (parseInt(
+            document.getElementById("set-aichat-autoStatusUpdateIntervalSec").value,
+          ) || 24) * 3600,
+          autoStatusUpdateMaxRetries:
+            parseInt(
+              document.getElementById("set-aichat-autoStatusUpdateMaxRetries")?.value,
+            ) || 3,
+          autoColorUpdateEnabled: document.getElementById("set-aichat-autoColorUpdateEnabled").checked,
+          autoColorUpdateIntervalSec: (parseInt(
+            document.getElementById("set-aichat-autoColorUpdateIntervalSec").value,
+          ) || 24) * 3600,
         };
         send({ type: "saveSettings", routine: "ai_chat", settings: s });
         settings.ai_chat = s;

@@ -6321,6 +6321,11 @@
     </div>
 
     <div class="cmd-group">
+      <button class="sm" onclick="mcExec('cloak', { enable: 'true' })">Cloak</button>
+      <button class="sm" onclick="mcExec('cloak')">Decloak</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Refuel Player</label>
       <select id="mc-refuel-player"><option value="">Loading...</option></select>
       <button class="sm" onclick="mcRefreshNearbyPlayers()" title="Refresh nearby players list">Refresh</button>

@@ -45,6 +45,15 @@ export interface TradeSession {
   isCargoRoute?: boolean;
   hasInsurance?: boolean;
   notes?: string;
+  passengersOnboard?: Array<{
+    citizenId: string;
+    name: string;
+    class: string;
+    destination: string;
+    destinationName: string;
+    destinationSystem?: string;
+    fare: number;
+  }>;
 }
 
 export interface TraderActivityData {

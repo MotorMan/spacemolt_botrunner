@@ -553,6 +553,37 @@ async function recoverTradeSession(
   
   ctx.log("trade", `Found incomplete trade session: ${session.itemName} (${session.state})`);
 
+  // Check for passengers on board - must deliver them first to avoid rep penalties
+  if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
+    await bot.refreshLocation();
+    // Check for passengers regardless of docked status
+    const listResp = await bot.exec("list_passengers");
+    if (!listResp.error && listResp.result) {
+      const parsed = parseListPassengers(listResp.result);
+      const aboard = parsed?.passengers || [];
+      const destPassengers = aboard.filter((p: AboardPassenger) => 
+        p.destination.toLowerCase() === session.destPoi.toLowerCase() ||
+        (p.destination_system && p.destination_system.toLowerCase() === session.destSystem.toLowerCase())
+      );
+      
+      if (destPassengers.length > 0) {
+        ctx.log("trade", `Found ${destPassengers.length} passengers on board for ${session.destPoiName} - must deliver first!`);
+        const updated = await updateTradeSession(session.botUsername, {
+          passengersOnboard: destPassengers.map(p => ({
+            citizenId: p.citizen_id,
+            name: p.name,
+            class: p.class,
+            destination: p.destination,
+            destinationName: p.destination_name,
+            destinationSystem: p.destination_system,
+            fare: p.fare,
+          })),
+        });
+        if (updated) session = updated;
+      }
+    }
+  }
+
   // Verify items are still in cargo (for non-cargo routes)
   if (!session.isCargoRoute) {
     await bot.refreshCargo();
@@ -1649,6 +1680,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     };
     let extraRevenue = 0;
     let recoveredSessionHandled = false; // Track if we've handled a recovered session
+    let recoveredSessionAtDestination = false; // Track if recovered session already arrived at dest and docked
     let route: TradeRoute | null = null; // Declare route early for recovered session handler
     let buyQty = 0;
     let investedCredits = 0;
@@ -1793,8 +1825,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       bot.docked = true;
       ctx.log("trade", "Arrived at destination — proceeding to sell trade items");
 
-      // Mark as handled and skip remaining setup phases
+// Mark as handled and skip remaining setup phases
       recoveredSessionHandled = true;
+      recoveredSessionAtDestination = true; // We're already at destination and docked
       // route, buyQty, investedCredits already set - will proceed to sell phase
     }
 
@@ -2825,15 +2858,15 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Clear pending lock - it's now tracked by the session
       pendingLockItemId = null;
       
-      // ── Passenger transport: check for passengers going to destination ──
+// ── Passenger transport: check for passengers going to destination ──
       let passengersLoaded = 0;
       if (settings.enablePassengerTransport && route && buyQty > 0) {
         const currentRoute = route;
         const shipBerths = await getShipBerths(ctx);
-        if (shipBerths && (shipBerths.economy + shipBerths.business + shipBerths.first) > 0) {
+        if (shipBerths && (shipBerths.economy + shipBerths.business + shipBerths.first > 0)) {
           ctx.log("trade", `Ship has passenger berths (${shipBerths.economy}E/${shipBerths.business}B/${shipBerths.first}F) - checking for passengers to ${currentRoute.destPoiName}`);
           
-          const passengers = await getPassengersAtStation(ctx, currentRoute.destPoi, currentRoute.destSystem);
+          const passengers = await getPassengersAtStation(ctx, currentRoute.sourcePoi, currentRoute.sourceSystem);
           if (passengers.length > 0) {
             const destPassengers = passengers.filter(p => 
               p.destination.toLowerCase() === currentRoute.destPoi.toLowerCase() ||
@@ -2845,8 +2878,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const passengersToLoad = destPassengers.slice(0, totalBerthsAvail);
               
               if (passengersToLoad.length > 0) {
-                ctx.log("trade", `Found ${passengersToLoad.length} passengers going to ${currentRoute.destPoiName}`);
-                passengersLoaded = passengersToLoad.length;
+                ctx.log("trade", `Found ${passengersToLoad.length} passengers going to ${currentRoute.destPoiName} - loading...`);
+                const loadResp = await bot.exec("load_passenger", { destination: currentRoute.destPoi });
+                if (!loadResp.error) {
+                  await ctx.sleep(11000);
+                  // Verify passengers loaded
+                  const verifyResp = await bot.exec("list_passengers");
+                  if (!verifyResp.error && verifyResp.result) {
+                    const parsed = parseListPassengers(verifyResp.result);
+                    const aboard = parsed?.passengers || [];
+                    const loadedPassengers = aboard.filter((p: AboardPassenger) => 
+                      p.destination.toLowerCase() === currentRoute.destPoi.toLowerCase() ||
+                      (p.destination_system && p.destination_system.toLowerCase() === currentRoute.destSystem?.toLowerCase())
+                    );
+                    passengersLoaded = loadedPassengers.length;
+                    ctx.log("trade", `Loaded ${passengersLoaded} passengers for ${currentRoute.destPoiName}`);
+                  }
+                } else {
+                  ctx.log("error", `Failed to load passengers: ${loadResp.error.message}`);
+                }
               }
             }
           }
@@ -2934,25 +2984,27 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
       await ctx.sleep(60000);
       continue;
-    }
+}
 
-    // ── Phase 2: Travel to destination and sell ──
-    yield "travel_to_dest";
-    await ensureUndocked(ctx);
+// ── Phase 2: Travel to destination and sell ──
+    // Skip if recovered session already arrived at destination
+    if (!recoveredSessionAtDestination) {
+      yield "travel_to_dest";
+      await ensureUndocked(ctx);
 
-    // Ensure fuel for the trip — never jettison trade cargo
-    const cargoSafetyOpts = { ...safetyOpts, noJettison: true };
-    const fueled2 = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
-    if (!fueled2) {
-      ctx.log("error", "Cannot refuel for delivery — selling locally instead");
-      await ensureDocked(ctx);
-      await bot.exec("sell", { item_id: route.itemId, quantity: buyQty });
-      await bot.refreshLocation();
-      continue;
-    }
+      // Ensure fuel for the trip — never jettison trade cargo
+      const cargoSafetyOpts = { ...safetyOpts, noJettison: true };
+      const fueled2 = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+      if (!fueled2) {
+        ctx.log("error", "Cannot refuel for delivery — selling locally instead");
+        await ensureDocked(ctx);
+        await bot.exec("sell", { item_id: route.itemId, quantity: buyQty });
+        await bot.refreshLocation();
+        continue;
+      }
 
-    if (bot.system !== route.destSystem) {
-      ctx.log("travel", `Heading to ${route.destPoiName} in ${route.destSystem}...`);
+      if (bot.system !== route.destSystem) {
+        ctx.log("travel", `Heading to ${route.destPoiName} in ${route.destSystem}...`);
       
       // Update session state to in_transit
       const activeSession = getActiveSession(bot.username);
@@ -3111,11 +3163,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     bot.docked = true;
     await tryMissions(ctx);
+    } // End of if (!recoveredSessionAtDestination)
 
-    // ── Unload passengers at destination ──
+    // ── Unload passengers at destination (auto-unloads on dock at destination) ──
     yield "unload_passengers";
     let passengerRevenue = 0;
-    let passengersLoaded = 0;
+    let passengersDelivered = 0;
     try {
       const listResp = await bot.exec("list_passengers");
       if (!listResp.error && listResp.result) {
@@ -3126,24 +3179,23 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           (p.destination_system && p.destination_system.toLowerCase() === route!.destSystem.toLowerCase())
         );
         
-        if (destPassengers.length > 0) {
-          passengersLoaded = destPassengers.length;
-          ctx.log("trade", `Unloading ${passengersLoaded} passengers at ${route!.destPoiName}`);
-          for (const p of destPassengers) {
-            const fare = p.fare || settings.passengerFareEstimate;
-            passengerRevenue += fare;
-            ctx.log("trade", `Passenger ${p.name}: fare ${fare}cr`);
+        if (destPassengers.length === 0) {
+          // Passengers were auto-unloaded on dock - check session for expected count
+          const activeSession = getActiveSession(bot.username);
+          passengersDelivered = activeSession?.passengersOnboard?.length || 0;
+          if (passengersDelivered > 0 && activeSession?.passengersOnboard) {
+            passengerRevenue = activeSession.passengersOnboard.reduce((sum, p) => sum + (p.fare || settings.passengerFareEstimate), 0);
+            ctx.log("trade", `Auto-unloaded ${passengersDelivered} passengers at ${route!.destPoiName} - revenue: ${passengerRevenue}cr`);
           }
-          const unloadResp = await bot.exec("unload_passenger");
-          if (!unloadResp.error) {
-            ctx.log("trade", `Successfully unloaded ${passengersLoaded} passengers - revenue: ${passengerRevenue}cr`);
-          } else {
-            ctx.log("error", `Failed to unload passengers: ${unloadResp.error.message}`);
-          }
+        } else {
+          // Still on board - they wanted a different destination or weren't unloaded
+          passengersDelivered = destPassengers.length;
+          ctx.log("trade", `${passengersDelivered} passengers still aboard for ${route!.destPoiName} (may need manual unload at correct station)`);
+          passengerRevenue = destPassengers.reduce((sum, p) => sum + (p.fare || settings.passengerFareEstimate), 0);
         }
       }
     } catch (e) {
-      ctx.log("error", `Passenger unload error: ${e}`);
+      ctx.log("error", `Passenger check error: ${e}`);
     }
 
     // ── Sell trade items ─-
@@ -3495,7 +3547,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Trade summary ──
     const soldLabel = totalSold < buyQty ? `${totalSold}/${buyQty}` : `${buyQty}`;
-    const passengerLabel = passengersLoaded > 0 ? ` + ${passengersLoaded} passengers (${passengerRevenue}cr)` : "";
+    const passengerLabel = passengersDelivered > 0 ? ` + ${passengersDelivered} passengers (${passengerRevenue}cr)` : "";
     ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — profit ${actualProfit}cr (${sellRevenue}cr sells + ${extraRevenue}cr other + ${passengerRevenue}cr passengers - ${investedCredits}cr cost, ${route.jumps} jumps)${passengerLabel}`);
     
     // Complete trade session

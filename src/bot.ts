@@ -16,7 +16,7 @@ import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderC
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
-import { buyInsurance } from "./routines/common.js";
+import { ensureInsured } from "./routines/common.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1599,7 +1599,7 @@ async refreshSkills(): Promise<ApiResponse> {
       getAllBotNames: opts?.getAllBotNames,
     };
 
-    await buyInsurance(ctx);
+    await ensureInsured(ctx);
 
     try {
       for await (const stateName of routine(ctx)) {

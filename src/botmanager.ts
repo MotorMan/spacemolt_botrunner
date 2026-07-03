@@ -45,7 +45,7 @@ import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
-import { buyInsurance } from "./routines/common.js";
+import { ensureInsured } from "./routines/common.js";
 import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
 import { logSkills, refreshSkillNames } from "./skillTracker.js";
 
@@ -806,7 +806,7 @@ const skillsObj: Record<string, unknown> | null =
     await bot.refreshStatus();
 
     if (command === "switch_ship" && !resp.error) {
-      await buyInsurance({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
+      await ensureInsured({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
     }
 
     // Also refresh the recipient bot after gift/trade

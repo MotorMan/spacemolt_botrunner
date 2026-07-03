@@ -243,7 +243,7 @@ function getHunterSettings(username?: string): {
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
 onlyNPCs: (h.onlyNPCs as boolean) !== false,
-  huntCreatures: (h.huntCreatures as boolean) !== false,
+  huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
   autoCloak: (h.autoCloak as boolean) ?? false,
   cloakOnStart: (h.cloakOnStart as boolean) ?? false,
   ammoThreshold: (h.ammoThreshold as number) || 5,

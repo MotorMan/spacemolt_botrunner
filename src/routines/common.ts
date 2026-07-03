@@ -3133,20 +3133,10 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
   const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
   if (cost <= 0) return;
 
-  if (bot.credits < cost + INSURANCE_CREDIT_FLOOR) {
-    ctx.log("info", `Insurance: can't afford ${cost}cr (need ${INSURANCE_CREDIT_FLOOR}cr floor) — skipping`);
-    return;
-  }
-
-  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
-  if (!insureResp.error) {
-    const r = insureResp.result as Record<string, unknown> | undefined;
-    const msg = (r?.message as string) || `Insurance purchased for ${cost}cr`;
-    ctx.log("info", msg);
-    await bot.refreshLocation();
-  } else if (insureResp.error.message.toLowerCase().includes("already")) {
-    // silently skip
-  }
+  // We are not insured and have a quote. Inform the user.
+  ctx.log("info", `Insurance quote: ${cost}cr. Purchase manually if desired.`);
+  // Do not buy automatically; leave it to the user.
+  return;
 }
 
 export async function buyInsurance(ctx: RoutineContext): Promise<void> {

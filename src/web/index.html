@@ -4510,6 +4510,85 @@
               `<option value="${esc(botOre)}" selected>${esc(botOre)}</option>`,
             );
           }
+
+          const globalGas = (settings.miner || {}).targetGas || "";
+          const botGas = botSettings.targetGas || "";
+          const effectiveGas = botGas || globalGas;
+          const gasOptsList = [
+            `<option value=""${!botGas ? " selected" : ""}>(global: ${globalGas ? esc(getOreName(globalGas)) : "any"})</option>`,
+          ];
+          for (const ore of [...knownOres].sort((a, b) =>
+            (a.name || "").localeCompare(b.name || ""),
+          )) {
+            const sel = ore.item_id === botGas ? " selected" : "";
+            gasOptsList.push(
+              `<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`,
+            );
+          }
+          if (botGas && !knownOres.find((o) => o.item_id === botGas)) {
+            gasOptsList.push(
+              `<option value="${esc(botGas)}" selected>${esc(botGas)}</option>`,
+            );
+          }
+
+          const globalIce = (settings.miner || {}).targetIce || "";
+          const botIce = botSettings.targetIce || "";
+          const effectiveIce = botIce || globalIce;
+          const iceOptsList = [
+            `<option value=""${!botIce ? " selected" : ""}>(global: ${globalIce ? esc(getOreName(globalIce)) : "any"})</option>`,
+          ];
+          for (const ore of [...knownOres].sort((a, b) =>
+            (a.name || "").localeCompare(b.name || ""),
+          )) {
+            const sel = ore.item_id === botIce ? " selected" : "";
+            iceOptsList.push(
+              `<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`,
+            );
+          }
+          if (botIce && !knownOres.find((o) => o.item_id === botIce)) {
+            iceOptsList.push(
+              `<option value="${esc(botIce)}" selected>${esc(botIce)}</option>`,
+            );
+          }
+
+          const globalRadioactive = (settings.miner || {}).targetRadioactive || "";
+          const botRadioactive = botSettings.targetRadioactive || "";
+          const radioactiveOptsList = [
+            `<option value=""${!botRadioactive ? " selected" : ""}>(global: ${globalRadioactive ? esc(getOreName(globalRadioactive)) : "any"})</option>`,
+          ];
+          for (const ore of [...knownOres].sort((a, b) =>
+            (a.name || "").localeCompare(b.name || ""),
+          )) {
+            const sel = ore.item_id === botRadioactive ? " selected" : "";
+            radioactiveOptsList.push(
+              `<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`,
+            );
+          }
+          if (botRadioactive && !knownOres.find((o) => o.item_id === botRadioactive)) {
+            radioactiveOptsList.push(
+              `<option value="${esc(botRadioactive)}" selected>${esc(botRadioactive)}</option>`,
+            );
+          }
+
+          const globalDeepCore = (settings.miner || {}).targetDeepCore || "";
+          const botDeepCore = botSettings.targetDeepCore || "";
+          const deepCoreOptsList = [
+            `<option value=""${!botDeepCore ? " selected" : ""}>(global: ${globalDeepCore ? esc(getOreName(globalDeepCore)) : "any"})</option>`,
+          ];
+          for (const ore of [...knownOres].sort((a, b) =>
+            (a.name || "").localeCompare(b.name || ""),
+          )) {
+            const sel = ore.item_id === botDeepCore ? " selected" : "";
+            deepCoreOptsList.push(
+              `<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`,
+            );
+          }
+          if (botDeepCore && !knownOres.find((o) => o.item_id === botDeepCore)) {
+            deepCoreOptsList.push(
+              `<option value="${esc(botDeepCore)}" selected>${esc(botDeepCore)}</option>`,
+            );
+          }
+
           const globalHome = (settings.miner || {}).homeSystem || "";
           const botHome = botSettings.homeSystem || "";
           const sysOpts = [
@@ -4529,10 +4608,19 @@
             );
           }
           actions += `
-      <span class="profile-ore-label">Target Ore:</span>
-      <select id="profile-targetOre" onchange="saveProfileTargetOre()">${oreOpts.join("")}</select>
-      <span class="profile-ore-label" style="margin-left:8px">Home:</span>
-      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join("")}</select>`;
+        <span class="profile-ore-label">Target Ore:</span>
+        <select id="profile-targetOre" onchange="saveProfileTargetOre()">${oreOpts.join("")}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Gas:</span>
+        <select id="profile-targetGas" onchange="saveProfileTargetGas()">${gasOptsList.join("")}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Ice:</span>
+        <select id="profile-targetIce" onchange="saveProfileTargetIce()">${iceOptsList.join("")}</select>
+        <br style="margin-top:4px">
+        <span class="profile-ore-label">Radioactive:</span>
+        <select id="profile-targetRadioactive" onchange="saveProfileTargetRadioactive()">${radioactiveOptsList.join("")}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Deep Core:</span>
+        <select id="profile-targetDeepCore" onchange="saveProfileTargetDeepCore()">${deepCoreOptsList.join("")}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Home:</span>
+        <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join("")}</select>`;
         }
 
         // Per-bot explorer mode selector (visible when explorer is selected or running)
@@ -5059,6 +5147,70 @@
         const targetOre = sel.value;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { targetOre });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileTargetGas() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-targetGas");
+        if (!sel) return;
+        const targetGas = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetGas });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileTargetIce() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-targetIce");
+        if (!sel) return;
+        const targetIce = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetIce });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileTargetRadioactive() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-targetRadioactive");
+        if (!sel) return;
+        const targetRadioactive = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetRadioactive });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileTargetDeepCore() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-targetDeepCore");
+        if (!sel) return;
+        const targetDeepCore = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetDeepCore });
         send({
           type: "saveSettings",
           routine: bot.username,

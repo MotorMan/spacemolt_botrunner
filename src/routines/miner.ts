@@ -2513,6 +2513,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const hasGlobalTarget = !!targetResource;
     if (hasGlobalTarget) {
       ctx.log("mining", `Global ${resourceLabel} target configured: ${targetResource} — overriding quotas`);
+    } else {
+      ctx.log("debug", `No global target configured for ${miningType} mining — targetResource is empty (global targetGas="${settings.targetGas}", targetOre="${settings.targetOre}", targetIce="${settings.targetIce}", targetRadioactive="${settings.targetRadioactive}", targetDeepCore="${settings.targetDeepCore}")`);
     }
 
     // CRITICAL FIX: Always refresh faction storage before quota evaluation

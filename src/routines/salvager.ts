@@ -170,6 +170,42 @@ function cleanupTemporaryBlacklist(): void {
   }
 }
 
+/**
+ * Ensure minimum military fuel cells are available.
+ * Withdraws from faction storage at current station.
+ * Called after salvaging and at startup to ensure spare fuel for cloak-powered return.
+ */
+async function ensureMinimumFuelCells(ctx: RoutineContext, minCells: number): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+  
+  await bot.refreshCargo();
+  let fuelInCargo = 0;
+  for (const item of bot.inventory) {
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+  }
+  
+  if (fuelInCargo >= minCells) return;
+  
+  // Prefer military_fuel_cell (100 fuel, 3 space), then premium_fuel_cell (50 fuel, 2.5 space), then fuel_cell (20 fuel, 1 space)
+  const stillNeeded = minCells - fuelInCargo;
+  const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
+  if (!milResp.error) {
+    ctx.log("salvage", `Withdrew ${Math.ceil(stillNeeded / 3)} military_fuel_cell(s) from faction storage`);
+    return;
+  }
+  const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+  if (!premResp.error) {
+    ctx.log("salvage", `Withdrew ${Math.ceil(stillNeeded / 2.5)} premium_fuel_cell(s) from faction storage`);
+    return;
+  }
+  const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) * 2 });
+  if (!regResp.error) {
+    ctx.log("salvage", `Withdrew fuel cells from faction storage`);
+  }
+}
+
 type DepositMode = "storage" | "faction" | "sell";
 
 async function getSalvagerSettings(username?: string): Promise<{
@@ -925,26 +961,16 @@ await bot.refreshLocation();
         await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
       }
     }
-    const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
     ctx.log("salvage", `Startup: deposited ${names} — cargo clear for salvaging`);
   }
 
-// Startup: ensure min military fuel cells at home before first outing
-   if (homeSystem0 && bot.system === homeSystem0) {
-     await bot.refreshCargo();
-     let fuel0 = 0;
-     for (const item of bot.inventory) {
-       const lower = item.itemId.toLowerCase();
-       if (lower.includes("fuel") || lower.includes("energy_cell")) fuel0 += item.quantity;
-     }
-     const min0 = settings0.minimumFuelCells;
-     if (fuel0 < min0) {
-       const m0 = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: min0 });
-       if (!m0.error) ctx.log("salvage", `Startup: withdrew ${min0} military fuel cells from storage`);
-     }
-   }
+// Startup: ensure min military fuel cells before first outing (from any station's faction storage)
+  if (settings0.minimumFuelCells > 0 && bot.docked) {
+    await ensureMinimumFuelCells(ctx, settings0.minimumFuelCells);
+  }
 
-   // ── Startup: Enable cloaking if configured and module available ──
+  // ── Startup: Enable cloaking if configured and module available ──
    // Best practice: manually undock before cloaking to have full control over state
    // This avoids race conditions with auto-undock and ensures we can re-dock for resupply
    let wasCloakingAttempted = false;
@@ -1990,29 +2016,8 @@ for (const poi of roamVisit) {
       ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${label}`);
     }
 
-    // Top up to min military fuel cells when at home (ensures buffer even for 0-jump home routes at deposit time)
-    if (homeSystem && bot.system === homeSystem) {
-      await bot.refreshCargo();
-      let fuelInCargo = 0;
-      for (const item of bot.inventory) {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-      }
-      const minFuel = settings.minimumFuelCells;
-      if (fuelInCargo < minFuel) {
-        const mil = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: minFuel });
-        if (!mil.error) {
-          ctx.log("salvage", `Withdrew ${minFuel} military fuel cells from storage`);
-        } else {
-          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: minFuel });
-          if (!prem.error) ctx.log("salvage", `Withdrew ${minFuel} premium fuel cells from storage`);
-          else {
-            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: minFuel * 2 });
-            if (!reg.error) ctx.log("salvage", `Withdrew fuel cells from storage`);
-          }
-        }
-      }
-    }
+    // Ensure minimum fuel cells from ANY station's faction storage (stations now have faction storage)
+    await ensureMinimumFuelCells(ctx, settings.minimumFuelCells);
 
     // Ensure fuel cells for return home + min buffer of military (route estimated_fuel)
     await bot.refreshCargo();
@@ -2028,29 +2033,13 @@ for (const poi of roamVisit) {
         const needed = Math.ceil(deficit / 20);
         const minFuel = settings.minimumFuelCells;
         if (fuelInCargo < Math.max(needed, minFuel)) {
-          const isAtHome = homeSystem && bot.system === homeSystem;
           let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
-          if (isAtHome) {
-            // Prefer military_fuel_cell (100 fuel, 3 space)
-            const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
-            if (!milResp.error) stillNeeded = Math.max(0, stillNeeded - 100);
-            if (stillNeeded > 0) {
-              const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-              if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
-            }
-            if (stillNeeded > 0) {
-              const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
-              if (!regResp.error) stillNeeded = 0;
-            }
-            if (stillNeeded <= 0) ctx.log("salvage", `Withdrew fuel cells from faction storage`);
-          }
-          if (stillNeeded > 0) {
-            const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
-            const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
-            if (buyQty > 0) {
-              ctx.log("salvage", `Buying ${buyQty} military fuel cells for return (last resort)`);
-              await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
-            }
+          // Check if we have enough free cargo space for fuel cells
+          const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
+          const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
+          if (buyQty > 0) {
+            ctx.log("salvage", `Buying ${buyQty} military fuel cells for return (last resort)`);
+            await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
           }
         }
       }

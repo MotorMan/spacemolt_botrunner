@@ -24096,7 +24096,7 @@ async function fetchPersonalFacilityTypes(username) {
         const salvageYardStation = sv.salvageYardStation || "";
         const enableFullSalvage = sv.enableFullSalvage !== false;
         const enableTowing = sv.enableTowing ?? false;
-        const minTowValue = sv.minTowValue ?? 500;
+        const minTowValue = sv.minTowValue ?? 0;
         const preferScrap = sv.preferScrap ?? false;
         const autoCloak = sv.autoCloak ?? false;
         const maxRoamJumps = sv.maxRoamJumps ?? 0;
@@ -24105,6 +24105,7 @@ async function fetchPersonalFacilityTypes(username) {
           : sv.roamBaseSystems || "";
         const depositAtSalvageYard = sv.depositAtSalvageYard ?? false;
         const ignoreBlacklist = sv.ignoreBlacklist ?? false;
+        const minimumFuelCells = sv.minimumFuelCells ?? 20;
 
         // Salvage yard stations list - mobile_capital is dynamic
         const mcLocation = mobileCapitol
@@ -24370,6 +24371,14 @@ async function fetchPersonalFacilityTypes(username) {
       <label class="checkbox-label"><input type="checkbox" id="set-salvager-ignoreBlacklist"${ignoreBlacklist ? " checked" : ""}> Ignore system blacklist</label>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Minimum Military Fuel Cells</div>
+        <div class="setting-hint">Minimum military fuel cells to withdraw from faction storage before leaving station. Ensures spare fuel for cloak-powered return trips.</div>
+      </div>
+      <input type="number" id="set-salvager-minimumFuelCells" min="4" max="100" value="${minimumFuelCells}" style="width:80px">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveSalvagerSettings()">Save Settings</button>
     </div>
@@ -24412,7 +24421,7 @@ async function fetchPersonalFacilityTypes(username) {
           minTowValue:
             parseInt(
               document.getElementById("set-salvager-minTowValue").value,
-            ) || 1,
+            ) || 0,
           preferScrap: document.getElementById("set-salvager-preferScrap")
             .checked,
           autoCloak: document.getElementById("set-salvager-autoCloak").checked,
@@ -24432,9 +24441,13 @@ async function fetchPersonalFacilityTypes(username) {
           depositAtSalvageYard: document.getElementById(
             "set-salvager-depositAtSalvageYard",
           ).checked,
-          ignoreBlacklist: document.getElementById(
-            "set-salvager-ignoreBlacklist",
-          ).checked,
+ignoreBlacklist: document.getElementById(
+             "set-salvager-ignoreBlacklist",
+           ).checked,
+          minimumFuelCells:
+            parseInt(
+              document.getElementById("set-salvager-minimumFuelCells").value,
+            ) || 20,
         };
         send({ type: "saveSettings", routine: "salvager", settings: s });
         settings.salvager = s;

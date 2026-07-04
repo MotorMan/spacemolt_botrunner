@@ -2578,6 +2578,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           reason = hasGlobalTarget ? `global target override (${targetResource})` : `quota priority changed (${quotaTargetResource})`;
         }
 
+        // CRITICAL FIX: If the current POI doesn't have the target resource, abandon the recovered session.
+        // This handles the case where broader search found a new target in a different location.
+        if (!shouldAbandon && recoveredSession && bot.poi && bot.system !== recoveredSession.targetSystemId) {
+          const sysData = mapStore.getSystem(bot.system);
+          const currentPoi = sysData?.pois.find(p => p.id === bot.poi);
+          const hasTargetResource = currentPoi?.resources?.some(r => r.resource_id === sessionTarget) ||
+                                   currentPoi?.ores_found?.some(o => o.item_id === sessionTarget);
+          if (!hasTargetResource) {
+            shouldAbandon = true;
+            reason = `no longer in target system (${recoveredSession.targetSystemId}), found alternative target`;
+          }
+        }
+
         // CRITICAL FIX: If quotas are now all met (no quota target), but session target's quota is now met,
         // abandon the session so the miner can switch to the next ore with a deficit
         if (!shouldAbandon && !hasGlobalTarget && Object.keys(quotas).length > 0) {
@@ -3813,7 +3826,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
     const station = findStation(pois);
     if (station) stationPoi = { id: station.id, name: station.name };
 
-    // ── Check if already at a suitable POI ──
+// ── Check if already at a suitable POI ──
     // Only apply for hidden POIs or deep core ores (to allow extractor-only mining in hidden POIs)
     if (bot.poi && bot.poi !== "") {
       const currentPoiData = pois.find(p => p.id === bot.poi);
@@ -3837,30 +3850,39 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           if (miningType === "radioactive") {
             const isOreBelt = isOreBeltPoi(currentPoi.type) || 
                               (currentPoi.name && (currentPoi.name.toLowerCase().includes('belt') || 
-                                                   currentPoi.name.toLowerCase().includes('mineral field') ||
-                                                   currentPoi.name.toLowerCase().includes('asteroid')));
+                                                    currentPoi.name.toLowerCase().includes('mineral field') ||
+                                                    currentPoi.name.toLowerCase().includes('asteroid')));
             return isOreBelt || (isHidden && canMineHiddenRadioactive);
           }
           return true;
         })();
 
-        const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
-        if ((knownTarget && canMineHere) || scanResources.length > 0) {
-          miningPoi = { id: bot.poi, name: currentPoi.name };
-        }
-
-          if (scanResources.length > 0) {
+        // ── CRITICAL FIX: Fetch actual POI resources before deciding if target is available ──
+        // This prevents incorrectly marking POIs as depleted when we haven't actually scanned them
+        const poiScanResp = await bot.exec("get_poi", { poi_id: bot.poi });
+        if (!poiScanResp.error && poiScanResp.result) {
+          const scanData = poiScanResp.result as Record<string, unknown>;
+          scanResources = Array.isArray(scanData.resources) ? (scanData.resources as Array<any>) : [];
+          const shouldCheckAsDepleted = (currentPoi.resources !== undefined) || (scanResources.length > 0 && scanResources.some(r => r.resource_id === effectiveTarget));
+          if (shouldCheckAsDepleted) {
             const resourceData = scanResources.map((raw: any) => ({
               resource_id: String(raw.resource_id ?? raw.resourceId ?? raw.id ?? ""),
               name: String(raw.name ?? raw.resourceName ?? raw.resource_id ?? ""),
               richness: Number(raw.richness ?? 0),
               remaining: Number(raw.remaining ?? raw.amount ?? raw.count ?? 0),
               max_remaining: Number(raw.max_remaining ?? raw.maxRemaining ?? raw.max ?? 0),
-              depletion_percent: Number(raw.depletion_percent ?? raw.depletionPercent ?? 0),
+              depletion_percent: Number(raw.depletion_percent ?? raw.depletionPercent ?? 100),
               supported_power: Number(raw.supported_power ?? 0),
             }));
             mapStore.updatePoiResources(bot.system, bot.poi, resourceData);
           }
+        }
+
+        const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
+        const hasTargetInScan = scanResources.some((r: any) => r.resource_id === effectiveTarget);
+        if ((knownTarget && canMineHere) || hasTargetInScan) {
+          miningPoi = { id: bot.poi, name: currentPoi.name };
+        }
 
         const targetResource = scanResources.find((r: any) => (r.resource_id as string) === effectiveTarget);
         const remaining = (targetResource?.remaining as number) ?? 0;
@@ -3931,9 +3953,13 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
             canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower
           );
-          if (newTarget) {
+          if (newTarget && newTarget !== effectiveTarget) {
             searchTarget = newTarget;
+            effectiveTarget = newTarget;
             ctx.log("mining", `Switching to new quota target for alternative search: "${searchTarget}"`);
+          } else if (newTarget) {
+            searchTarget = newTarget;
+            ctx.log("mining", `Quota target confirmed: "${searchTarget}"`);
           }
         }
         

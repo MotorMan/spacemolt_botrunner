@@ -1435,18 +1435,15 @@ class MapStore {
           maxRemaining,
           depletionPercent,
           minutesSinceScan,
-          isHidden: poi.hidden ?? false,
-          richness,
-          supportedPower,
-        });
+isHidden: poi.hidden ?? false,
+           richness,
+           supportedPower,
+         });
       }
     }
 
     results.sort((a, b) => b.totalMined - a.totalMined);
-    console.log(`[FIND_ORE_LOCATIONS] oreId="${oreId}" found ${results.length} locations`);
-    if (results.length > 0) {
-      console.log(`[FIND_ORE_LOCATIONS] Sample systemIds: ${results.slice(0, 3).map(r => r.systemId).join(", ")}`);
-    }
+
     return results;
   }
 
@@ -1529,15 +1526,8 @@ const locations = this.findOreLocations(oreId, blacklist);
         if (fromSystem && fromSystem !== loc.systemId) {
           const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
           jumpsAway = route ? route.length - 1 : 999;
-          // Debug logging for route calculation issues
-          if (jumpsAway === 999 && fromSystem && loc.systemId) {
-            const fromSys = this.getSystem(fromSystem);
-            const toSys = this.getSystem(loc.systemId);
-            console.log(`[ROUTE_DEBUG] findBestMiningLocation: fromSystem="${fromSystem}" toSystem="${loc.systemId}" fromExists=${!!fromSys} toExists=${!!toSys} fromName="${fromSys?.name}" toName="${toSys?.name}"`);
-            console.log(`[ROUTE_DEBUG] findBestMiningLocation: fromConnections=${fromSys?.connections?.length || 0} toConnections=${toSys?.connections?.length || 0}`);
-          }
         }
-        
+
         // Score components:
         // 1. Resource abundance — based on TOTAL remaining, not percentage
         // This way, 19K remaining beats 8K remaining regardless of percentage mined

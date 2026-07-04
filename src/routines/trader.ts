@@ -2291,9 +2291,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (failedSources.has(sourceKey)) continue;
       attempts++;
       const isCargoRoute = candidate.sourcePoi === "cargo";
+      const isUnsoldRoute = candidate.sourcePoiName?.startsWith("Storage at ") ?? false;
 
       if (isCargoRoute) {
         ctx.log("trade", `Route #${ri + 1}: ${candidate.itemName} — sell ${candidate.buyQty}x from cargo → ${candidate.destPoiName} (${candidate.sellPrice}cr/ea) — est. profit ${Math.round(candidate.totalProfit)}cr (${candidate.jumps} jumps)`);
+      } else if (isUnsoldRoute) {
+        ctx.log("trade", `Route #${ri + 1}: ${candidate.itemName} — withdraw ${candidate.buyQty}x from storage → sell at ${candidate.destPoiName} (${candidate.sellPrice}cr/ea) — est. profit ${Math.round(candidate.totalProfit)}cr (${candidate.jumps} jumps)`);
       } else {
         ctx.log("trade", `Route #${ri + 1}: ${candidate.itemName} — buy ${candidate.buyQty}x at ${candidate.sourcePoiName} (${candidate.buyPrice}cr) → sell at ${candidate.destPoiName} (${candidate.sellPrice}cr) — est. profit ${Math.round(candidate.totalProfit)}cr (${candidate.jumps} jumps)`);
       }
@@ -2313,136 +2316,130 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         break;
       }
 
-      const isUnsoldRoute = candidate.sourcePoi.startsWith("Storage at ");
+// Handle unsold route lock
       if (isUnsoldRoute) {
-        ctx.log("trade", `Route #${ri + 1}: ${candidate.itemName} — withdraw ${candidate.buyQty}x from storage → sell at ${candidate.destPoiName} (${candidate.sellPrice}cr/ea) — est. profit ${Math.round(candidate.totalProfit)}cr (${candidate.jumps} jumps)`);
-        
-        const storageMatch = candidate.sourcePoi.match(/Storage at (.+)/);
-        const storagePoi = storageMatch ? storageMatch[1] : candidate.sourcePoi;
-        
+        // sourcePoi already contains the raw storage POI ID (e.g., "sol_central")
         const lockAcquired = acquireTradeLock({
           botUsername: bot.username,
           itemId: candidate.itemId,
           itemName: candidate.itemName,
           sourceSystem: candidate.sourceSystem,
-          sourcePoi: storagePoi,
+          sourcePoi: candidate.sourcePoi,
           destSystem: candidate.destSystem,
           destPoi: candidate.destPoi,
           quantityCommitted: candidate.buyQty,
           sessionId: `${bot.username}_unsold_${Date.now()}`,
         });
-        
+
         if (!lockAcquired) {
           ctx.log("trade", `Route locked by another bot — skipping ${candidate.itemName}`);
           failedSources.add(sourceKey);
           continue;
         }
-        
+
         pendingLockItemId = candidate.itemId;
         pendingLockReleased = false;
         ctx.log("trade", `Fleet lock acquired for unsold item: ${candidate.itemName}`);
-        
+
         route = candidate;
         buyQty = candidate.buyQty;
         investedCredits = 0;
-        break;
-      }
+      } else {
+        // ── Normal market route: travel to source and buy ──
+        // Acquire tentative lock BEFORE traveling to prevent other bots from taking same route
+        const lockAcquired = acquireTradeLock({
+          botUsername: bot.username,
+          itemId: candidate.itemId,
+          itemName: candidate.itemName,
+          sourceSystem: candidate.sourceSystem,
+          sourcePoi: candidate.sourcePoi,
+          destSystem: candidate.destSystem,
+          destPoi: candidate.destPoi,
+          quantityCommitted: candidate.buyQty,
+          sessionId: `${bot.username}_pending_${Date.now()}`,
+        });
 
-      // ── Normal market route: travel to source and buy ──
-      // Acquire tentative lock BEFORE traveling to prevent other bots from taking same route
-      const tentativeLockId = `${candidate.sourceSystem}:${candidate.sourcePoi}:${candidate.itemId}`;
-      const lockAcquired = acquireTradeLock({
-        botUsername: bot.username,
-        itemId: candidate.itemId,
-        itemName: candidate.itemName,
-        sourceSystem: candidate.sourceSystem,
-        sourcePoi: candidate.sourcePoi,
-        destSystem: candidate.destSystem,
-        destPoi: candidate.destPoi,
-        quantityCommitted: candidate.buyQty,
-        sessionId: `${bot.username}_pending_${Date.now()}`,
-      });
-      
-      if (!lockAcquired) {
-        ctx.log("trade", `Route locked by another bot — skipping ${candidate.itemName}`);
-        failedSources.add(sourceKey);
-        continue;
-      }
-      
-      // Track the lock so we can release it if route fails
-      pendingLockItemId = candidate.itemId;
-      pendingLockReleased = false; // Reset for this route attempt
+        if (!lockAcquired) {
+          ctx.log("trade", `Route locked by another bot — skipping ${candidate.itemName}`);
+          failedSources.add(sourceKey);
+          continue;
+        }
 
-      ctx.log("trade", `Fleet lock acquired: ${candidate.itemName} (${candidate.sourceSystem} → ${candidate.destSystem})`);
+        // Track the lock so we can release it if route fails
+        pendingLockItemId = candidate.itemId;
+        pendingLockReleased = false; // Reset for this route attempt
 
-      // Check affordability BEFORE traveling — include faction withdrawal fallback
-      const affordability = await canAffordRoute(ctx, candidate, settings);
+        ctx.log("trade", `Fleet lock acquired: ${candidate.itemName} (${candidate.sourceSystem} → ${candidate.destSystem})`);
 
-      const totalCost = candidate.buyPrice * candidate.buyQty;
-      const maxAffordableWithStorage = affordability.maxAffordableQty;
-      const maxAffordableOwnCredits = Math.floor(bot.credits / candidate.buyPrice);
+        // Check affordability BEFORE traveling — include faction withdrawal fallback
+        const affordability = await canAffordRoute(ctx, candidate, settings);
 
-      // Can't afford even a single unit with all available credits — skip
-      if (maxAffordableWithStorage <= 0) {
-        ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage: ${affordability.withdrawalNeeded > 0 ? 'insufficient' : 'empty'}) — skipping`);
-        releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
-        pendingLockItemId = null;
-        pendingLockReleased = true;
-        failedSources.add(sourceKey);
-        continue;
-      }
+        const totalCost = candidate.buyPrice * candidate.buyQty;
+        const maxAffordableWithStorage = affordability.maxAffordableQty;
+        const maxAffordableOwnCredits = Math.floor(bot.credits / candidate.buyPrice);
 
-      // Determine the actual quantity we can afford and should buy
-      let targetQty = candidate.buyQty;
-      let needsWithdrawal = false;
-
-      if (maxAffordableOwnCredits <= 0) {
-        // Can't afford any with own credits — need withdrawal
-        if (!affordability.canAffordWithWithdrawal) {
-          // Storage also can't help — skip
-          ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage empty) — skipping`);
+        // Can't afford even a single unit with all available credits — skip
+        if (maxAffordableWithStorage <= 0) {
+          ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage: ${affordability.withdrawalNeeded > 0 ? 'insufficient' : 'empty'}) — skipping`);
           releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
           pendingLockItemId = null;
           pendingLockReleased = true;
           failedSources.add(sourceKey);
           continue;
         }
-        // Use storage to fund the route
-        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
-        needsWithdrawal = true;
-      } else if (maxAffordableOwnCredits < candidate.buyQty) {
-        // Can afford some with own credits — adjust quantity (no withdrawal needed)
-        targetQty = maxAffordableOwnCredits;
-        ctx.log("trade", `Can only afford ${targetQty}/${candidate.buyQty}x with current credits — adjusting route`);
-      } else if (!affordability.canAfford && affordability.canAffordWithWithdrawal) {
-        // Can afford with storage help — use storage to get full quantity
-        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
-        needsWithdrawal = true;
-      }
 
-      // Adjust the route quantity if needed
-      if (targetQty < candidate.buyQty) {
-        ctx.log("trade", `Adjusted route: ${targetQty}/${candidate.buyQty}x ${candidate.itemName} (affordable quantity)`);
-        const adjustedProfitPerUnit = candidate.profitPerUnit;
-        candidate.buyQty = targetQty;
-        candidate.sellQty = targetQty;
-        candidate.totalProfit = adjustedProfitPerUnit * targetQty;
-      }
+        // Determine the actual quantity we can afford and should buy
+        let targetQty = candidate.buyQty;
+        let needsWithdrawal = false;
 
-      // Withdraw from storage if needed
-      if (needsWithdrawal) {
-        const adjustedCost = candidate.buyPrice * candidate.buyQty;
-        const withdrawalNeeded = Math.max(0, adjustedCost - bot.credits);
-        if (withdrawalNeeded > 0) {
-          ctx.log("trade", `Need ${withdrawalNeeded}cr from faction storage`);
-          const withdrew = await withdrawCreditsForTrade(ctx, candidate, settings);
-          if (!withdrew) {
-            ctx.log("error", "Failed to withdraw credits from faction storage — skipping route");
-            releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");
+        if (maxAffordableOwnCredits <= 0) {
+          // Can't afford any with own credits — need withdrawal
+          if (!affordability.canAffordWithWithdrawal) {
+            // Storage also can't help — skip
+            ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage empty) — skipping`);
+            releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
             pendingLockItemId = null;
             pendingLockReleased = true;
             failedSources.add(sourceKey);
             continue;
+          }
+          // Use storage to fund the route
+          targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+          needsWithdrawal = true;
+        } else if (maxAffordableOwnCredits < candidate.buyQty) {
+          // Can afford some with own credits — adjust quantity (no withdrawal needed)
+          targetQty = maxAffordableOwnCredits;
+          ctx.log("trade", `Can only afford ${targetQty}/${candidate.buyQty}x with current credits — adjusting route`);
+        } else if (!affordability.canAfford && affordability.canAffordWithWithdrawal) {
+          // Can afford with storage help — use storage to get full quantity
+          targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+          needsWithdrawal = true;
+        }
+
+        // Adjust the route quantity if needed
+        if (targetQty < candidate.buyQty) {
+          ctx.log("trade", `Adjusted route: ${targetQty}/${candidate.buyQty}x ${candidate.itemName} (affordable quantity)`);
+          const adjustedProfitPerUnit = candidate.profitPerUnit;
+          candidate.buyQty = targetQty;
+          candidate.sellQty = targetQty;
+          candidate.totalProfit = adjustedProfitPerUnit * targetQty;
+        }
+
+        // Withdraw from storage if needed
+        if (needsWithdrawal) {
+          const adjustedCost = candidate.buyPrice * candidate.buyQty;
+          const withdrawalNeeded = Math.max(0, adjustedCost - bot.credits);
+          if (withdrawalNeeded > 0) {
+            ctx.log("trade", `Need ${withdrawalNeeded}cr from faction storage`);
+            const withdrew = await withdrawCreditsForTrade(ctx, candidate, settings);
+            if (!withdrew) {
+              ctx.log("error", "Failed to withdraw credits from faction storage — skipping route");
+              releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");
+              pendingLockItemId = null;
+              pendingLockReleased = true;
+              failedSources.add(sourceKey);
+              continue;
+            }
           }
         }
       }
@@ -2450,8 +2447,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       yield "travel_to_source";
 
       if (isUnsoldRoute) {
-        const storagePoi = candidate.sourcePoi.replace("Storage at ", "");
-        
+        // sourcePoi already contains the raw storage POI ID (e.g., "sol_central")
+        const storagePoi = candidate.sourcePoi;
+
         if (bot.system !== candidate.sourceSystem) {
           await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { homeSystem });

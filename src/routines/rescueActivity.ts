@@ -206,6 +206,39 @@ export function getActiveRescueSession(botUsername: string): RescueSession | und
   return getBotActivity(botUsername).activeSession;
 }
 
+/**
+ * Check if another bot already has an active rescue session for this target.
+ * This prevents duplicate rescues when multiple bots process the same MAYDAY.
+ * 
+ * @returns the bot username that has the active session, or undefined if no other bot is handling it
+ */
+export function getOtherBotHandlingRescue(
+  excludeBot: string,
+  targetUsername: string,
+  targetSystem: string,
+  targetPoi?: string
+): string | undefined {
+  const data = loadRescueActivity();
+  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  
+  for (const [botName, activity] of Object.entries(data)) {
+    if (botName === excludeBot) continue;
+    const session = activity.activeSession;
+    if (session && session.state !== "completed" && session.state !== "failed") {
+      const playerMatch = normalize(session.targetUsername) === normalize(targetUsername);
+      const systemMatch = normalize(session.targetSystem) === normalize(targetSystem);
+      const poiMatch = !targetPoi || !session.targetPoi ||
+                       normalize(session.targetPoi) === normalize(targetPoi);
+      
+      if (playerMatch && systemMatch && poiMatch) {
+        return botName;
+      }
+    }
+  }
+  
+  return undefined;
+}
+
 export async function clearActiveRescueSession(botUsername: string): Promise<void> {
   const activity = getBotActivity(botUsername);
   activity.activeSession = undefined;

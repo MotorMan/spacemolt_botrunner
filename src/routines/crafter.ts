@@ -404,7 +404,7 @@ function calculateMaxCraftable(
   let maxRuns = Infinity;
 
   for (const comp of recipe.components) {
-    const available = countItemFn(comp.item_id);
+    const available = countItemFn(comp.item_id.toLowerCase());
     const neededPerRun = comp.quantity;
     const runsPossible = Math.floor(available / neededPerRun);
     maxRuns = Math.min(maxRuns, runsPossible);
@@ -565,6 +565,16 @@ async function queueAllRecipes(
   const { bot } = ctx;
   const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
 
+  // Create a mutable inventory counter that accounts for items we queue in this pass
+  const reservedMaterials = new Map<string, number>();
+  
+  const getAvailableCount = (itemId: string): number => {
+    const lowerId = itemId.toLowerCase();
+    const reserved = reservedMaterials.get(lowerId) || 0;
+    const available = countItemFn(lowerId);
+    return Math.max(0, available - reserved);
+  };
+
   await syncCraftingQueue(ctx, tracker, recipes, true);
 
   for (const item of planItems) {
@@ -587,7 +597,7 @@ async function queueAllRecipes(
     }
 
     ctx.log("craft", `Queueing ${remainingItems}x ${item.recipe.name} (${item.reason})`);
-    const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, countItemFn, recipes, preset);
+    const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, getAvailableCount, recipes, preset);
     if (!queueResult.success) {
       if (queueResult.error === "insufficient_inputs") {
         ctx.log("error", `Insufficient materials for ${item.recipe.name} - need ${remainingItems}x output`);
@@ -601,6 +611,15 @@ async function queueAllRecipes(
     queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
     if (actualQueued * outputQty < remainingItems) {
       ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x`);
+    }
+    
+    // Track materials that will be consumed by this job
+    const recipe = item.recipe;
+    const runsQueued = actualQueued;
+    for (const comp of recipe.components) {
+      const consumed = comp.quantity * runsQueued;
+      const lowerCompId = comp.item_id.toLowerCase();
+      reservedMaterials.set(lowerCompId, (reservedMaterials.get(lowerCompId) || 0) + consumed);
     }
   }
 
@@ -685,27 +704,18 @@ async function executeCraftingPlan(
 
   // Create a wrapper that accounts for materials in progress at this depth
   // Start with the provided countItemFn, or a default that checks all storage
-  let materialCountFn = countItemFn || (() => 0);
-  let materialCountCache: Map<string, number> | null = null;
-  
   const getMaterialCount = (itemId: string): number => {
-    if (countItemFn) return countItemFn(itemId);
-    if (!materialCountCache) {
-      materialCountCache = new Map();
-      const allItems = new Set<string>();
-      for (const r of recipes) {
-        allItems.add(r.output_item_id);
-        r.components.forEach(c => allItems.add(c.item_id));
-      }
-      for (const id of allItems) {
-        let total = 0;
-        for (const i of bot.inventory) { if (i.itemId === id) total += i.quantity; }
-        for (const i of bot.storage) { if (i.itemId === id) total += i.quantity; }
-        for (const i of bot.factionStorage || []) { if (i.itemId === id) total += i.quantity; }
-        materialCountCache.set(id, total);
-      }
-    }
-    return materialCountCache.get(itemId) || 0;
+    const lowerId = itemId.toLowerCase();
+    // Always use the provided countItemFn to get fresh values including in-progress jobs
+    // We don't cache because the tracker state changes during the loop
+    if (countItemFn) return countItemFn(lowerId);
+    
+    // Fallback: count from bot's storage locations
+    let total = 0;
+    for (const i of bot.inventory) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+    for (const i of bot.storage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+    for (const i of bot.factionStorage || []) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+    return total;
   };
 
   for (const depth of depths) {
@@ -780,10 +790,11 @@ async function craftFromCategories(
 
   // Create countItem function for this bot
   function countItemForCraft(itemId: string): number {
+    const lowerId = itemId.toLowerCase();
     let total = 0;
-    for (const i of bot.inventory) { if (i.itemId === itemId) total += i.quantity; }
-    for (const i of bot.storage) { if (i.itemId === itemId) total += i.quantity; }
-    for (const i of bot.factionStorage || []) { if (i.itemId === itemId) total += i.quantity; }
+    for (const i of bot.inventory) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+    for (const i of bot.storage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+    for (const i of bot.factionStorage || []) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
     return total;
   }
 
@@ -1014,10 +1025,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const factionStorage = bot.factionStorage || [];
     function countItem(itemId: string): number {
+      const lowerId = itemId.toLowerCase();
       let total = 0;
-      for (const i of bot.inventory) { if (i.itemId === itemId) total += i.quantity; }
-      for (const i of bot.storage) { if (i.itemId === itemId) total += i.quantity; }
-      for (const i of factionStorage) { if (i.itemId === itemId) total += i.quantity; }
+      for (const i of bot.inventory) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+      for (const i of bot.storage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+      for (const i of factionStorage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
       return total;
     }
 

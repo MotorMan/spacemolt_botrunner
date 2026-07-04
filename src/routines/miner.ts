@@ -851,14 +851,14 @@ function isStripMinerOre(oreId: string): boolean {
 function getTotalMiningPower(modules: unknown[]): number {
   let totalPower = 0;
 
-  const nameToPower: Record<string, number> = {};
-  for (const item of Object.values(catalogStore.getAll().items)) {
-    const iname = (item.name || "").toLowerCase();
-    if (iname.includes("mining") || iname.includes("mineral")) {
-      const p = (item.mining_power as number) ?? 0;
-      if (p > 0) nameToPower[iname] = (nameToPower[iname] || 0) + p;
-    }
-  }
+const nameToPower: Record<string, number> = {};
+   for (const item of Object.values(catalogStore.getAll().items)) {
+     const iname = (item.name || "").toLowerCase();
+     if (iname.includes("mining") || iname.includes("mineral") || iname.includes("harvester")) {
+       const p = (item.mining_power as number) ?? 0;
+       if (p > 0) nameToPower[iname] = (nameToPower[iname] || 0) + p;
+     }
+   }
 
   for (const mod of modules) {
     const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
@@ -866,10 +866,11 @@ function getTotalMiningPower(modules: unknown[]): number {
 
     const modId = ((modObj.id as string) || (modObj.type_id as string) || "").toLowerCase();
     const modName = ((modObj.name as string) || "").toLowerCase();
+    const modType = ((modObj.type as string) || "").toLowerCase();
     const modSpecial = ((modObj.special as string) || "").toLowerCase();
 
-    const checkStr = `${modId} ${modName} ${modSpecial}`;
-    if (!checkStr.includes("mining") && !checkStr.includes("mineral")) continue;
+    const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`;
+    if (!checkStr.includes("mining") && !checkStr.includes("mineral") && !checkStr.includes("harvesting")) continue;
 
     const catalogEntry = catalogStore.getItem(modId) || (modObj.type_id ? catalogStore.getItem(modObj.type_id as string) : undefined);
     const power =

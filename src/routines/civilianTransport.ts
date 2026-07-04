@@ -68,6 +68,21 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
     return false;
   }
 
+  // Cloaking requires being undocked - handle state explicitly
+  const wasDocked = bot.docked;
+  if (wasDocked) {
+    ctx.log("transport", "Undocking before enabling cloak...");
+    const undockResp = await bot.exec("undock");
+    if (undockResp.error && !undockResp.error.message.includes("already")) {
+      ctx.log("error", `Undock failed before cloak: ${undockResp.error.message}`);
+      return false;
+    }
+    bot.docked = false;
+    // Wait a tick for state to settle
+    await ctx.sleep(2000);
+    await bot.refreshLocation();
+  }
+
   ctx.log("transport", "Enabling cloaking module...");
   const resp = await bot.exec("cloak", { enable: true });
   if (resp.error) {
@@ -75,26 +90,40 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
     return false;
   }
 
+  bot.isCloaked = true;
   ctx.log("transport", "Cloaking enabled successfully");
+
+  // Redock if we were initially docked
+  if (wasDocked) {
+    ctx.log("transport", "Redocking after enabling cloak...");
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.includes("already")) {
+      ctx.log("error", `Redock failed after cloak: ${dockResp.error.message}`);
+      return false;
+    }
+    bot.docked = true;
+    await bot.refreshLocation();
+  }
+
   return true;
 }
 
 async function checkAndRecloak(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
-  
+
   if (!settings.enableCloak) {
     return;
   }
-  
+
   if (bot.isCloaked) {
     return;
   }
-  
+
   if (bot.fuel <= 0) {
     ctx.log("transport", "Cannot recloak - no fuel available");
     return;
   }
-  
+
   ctx.log("transport", "Bot is decloaked, attempting to recloak...");
   await enableCloakingIfPossible(ctx);
 }
@@ -1474,7 +1503,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
     ctx.log("transport", `Fuel after collection: ${Math.round(fuelPct)}%`);
   }
 
-  if (state && state.status !== "idle") {
+if (state && state.status !== "idle") {
     const verifyResp = await bot.exec("list_passengers");
     if (verifyResp.error || !verifyResp.result) {
       state.status = "idle";
@@ -1483,6 +1512,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       state.currentRouteIndex = 0;
       state.currentDestination = null;
       state.berths_used = { economy: 0, business: 0, first: 0 };
+      state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+      state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
       saveTransportState(state);
     } else {
       const vParsed = parseListPassengers(verifyResp.result);
@@ -1494,6 +1525,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         state.currentRouteIndex = 0;
         state.currentDestination = null;
         state.berths_used = { economy: 0, business: 0, first: 0 };
+        state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+        state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
         saveTransportState(state);
       } else {
         const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
@@ -1737,7 +1770,20 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
           } else {
-            await ctx.sleep(60000);
+            // No pickup found - dock at nearest station
+            ctx.log("transport", "No passengers anywhere - docking at nearest station");
+            const dockOk = await ensureDocked(ctx);
+            if (!dockOk) {
+              ctx.log("error", "Cannot find any station to dock - waiting 60s");
+              await ctx.sleep(60000);
+              continue;
+            }
+            // After docking, set current station as pickup and increment counter
+            state.pickupStation = bot.poi || null;
+            state.pickupSystem = bot.system || null;
+            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+            ctx.log("transport", `Docked at ${state.pickupStation}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+            saveTransportState(state);
             continue;
           }
         } else {
@@ -2397,6 +2443,9 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         }
         state.status = "idle";
         state.routeRebuildAttempts = 0;
+        // Set pickupStation to current location if docked, otherwise null
+        state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+        state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
         saveTransportState(state);
         continue;
       }

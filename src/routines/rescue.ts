@@ -45,6 +45,7 @@ import {
   markMaydayReceived,
   isMaydayDeclined,
   markMaydayDeclined,
+  getOtherBotHandlingRescue,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -1989,15 +1990,23 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
 
-          // ── RESCUE COORDINATION: Check if another bot is already handling this ──
-          const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
-          if (handledBy) {
-            ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
-            markMaydayHandled(mayday);
-            continue;
-          }
+// ── RESCUE COORDINATION: Check if another bot is already handling this ──
+           const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
+           if (handledBy) {
+             ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
+             markMaydayHandled(mayday);
+             continue;
+           }
 
-          // ── RESCUE COOPERATION: Check with partner bot if enabled ──
+           // ── ACTIVE SESSION CHECK: Check if another bot has an active rescue session for this target ──
+           const otherBotActive = getOtherBotHandlingRescue(bot.username, mayday.sender, mayday.system, mayday.poi);
+           if (otherBotActive) {
+             ctx.log("mayday", `⚠️ Another bot (${otherBotActive}) already has an active rescue session for ${mayday.sender} - skipping to avoid duplicate rescue`);
+             markMaydayHandled(mayday);
+             continue;
+           }
+
+           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
           if (isCooperationEnabled()) {

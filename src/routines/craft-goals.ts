@@ -98,7 +98,7 @@ export function scoreRecipeAvailability(
   let totalNeeded = 0;
 
   for (const comp of recipe.components) {
-    const have = countItemFn(comp.item_id);
+    const have = countItemFn(comp.item_id.toLowerCase());
     const needed = comp.quantity;
     totalNeeded += needed;
     totalAvailability += Math.min(have, needed);
@@ -120,7 +120,7 @@ export function hasRecipeMaterials(
   countItemFn: (itemId: string) => number,
 ): boolean {
   for (const comp of recipe.components) {
-    const have = countItemFn(comp.item_id);
+    const have = countItemFn(comp.item_id.toLowerCase());
     if (have < comp.quantity) return false;
   }
   return true;
@@ -234,7 +234,7 @@ function buildCraftingTree(
   // Calculate total components needed for all items
   for (const comp of goalRecipe.components) {
     const totalCompNeeded = comp.quantity * quantityToCraftInItems;
-    const compHave = countItemFn(comp.item_id);
+    const compHave = countItemFn(comp.item_id.toLowerCase());
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 
     if (compToCraft <= 0) continue;

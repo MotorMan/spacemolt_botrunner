@@ -115,7 +115,7 @@ export function scoreRecipeAvailability(
   return score;
 }
 
-function hasRecipeMaterials(
+export function hasRecipeMaterials(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): boolean {

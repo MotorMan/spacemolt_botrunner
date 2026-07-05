@@ -234,8 +234,6 @@ const SAVE_DEBOUNCE_MS = 5000;
 const BACKUP_DIR = join(DATA_DIR, "Backups");
 const BACKUP_FILES = [
   'map.json',
-  'preCalcMap.json',
-  'preCalcMap_noPirate.json',
   'customsStops.json',
   'factionTradeCoordination.json',
   'fcStations.json',

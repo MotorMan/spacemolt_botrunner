@@ -23336,7 +23336,7 @@ async function fetchPersonalFacilityTypes(username) {
           <div class="setting-label">Minimum Fuel Cells</div>
           <div class="setting-hint">Minimum military fuel cells each miner must carry (military_fuel_cell = 100 fuel / 3 space). Default 20 prevents stranding at distant stations.</div>
         </div>
-        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${m.minimumFuelCells ?? 20}" style="width:80px" />
+        <input type="number" id="set-miner-minimumFuelCells" min="0" max="1000" value="${m.minimumFuelCells ?? 20}" style="width:80px" />
       </div>
 
       <div class="setting-row">
@@ -24376,7 +24376,7 @@ async function fetchPersonalFacilityTypes(username) {
         <div class="setting-label">Minimum Military Fuel Cells</div>
         <div class="setting-hint">Minimum military fuel cells to withdraw from faction storage before leaving station. Ensures spare fuel for cloak-powered return trips.</div>
       </div>
-      <input type="number" id="set-salvager-minimumFuelCells" min="4" max="100" value="${minimumFuelCells}" style="width:80px">
+      <input type="number" id="set-salvager-minimumFuelCells" min="0" max="100" value="${minimumFuelCells}" style="width:80px">
     </div>
 
     <div class="settings-save-bar">
@@ -24447,7 +24447,7 @@ ignoreBlacklist: document.getElementById(
           minimumFuelCells:
             parseInt(
               document.getElementById("set-salvager-minimumFuelCells").value,
-            ) || 20,
+            ) || 3,
         };
         send({ type: "saveSettings", routine: "salvager", settings: s });
         settings.salvager = s;

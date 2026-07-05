@@ -867,40 +867,46 @@ docked = false;
           const player = (r.player as Record<string, unknown>) || {};
           const p = location || player || r;
 
-          if (command === "get_status") {
-            this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
-            this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
-            this.docked = location?.docked_at != null
-              ? !!(location.docked_at)
-              : (p.docked_at_base != null
-                ? !!(p.docked_at_base)
-                : (p.docked as boolean) ?? (p.status === "docked"));
-            this.location =
-              (location?.system_name as string) ||
-              (location?.system_id as string) ||
-              (p.current_system as string) ||
-              (p.location as string) ||
-              this.location;
+if (command === "get_status") {
+             this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+             this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+             this.docked = location?.docked_at != null
+               ? !!(location.docked_at)
+               : (p.docked_at_base != null
+                 ? !!(p.docked_at_base)
+                 : (p.docked as boolean) ?? (p.status === "docked"));
+             this.location =
+               (location?.system_name as string) ||
+               (location?.system_id as string) ||
+               (p.current_system as string) ||
+               (p.location as string) ||
+               this.location;
 
-            this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
-            this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
-            if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
-              this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
-            }
+             this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+             this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+             if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
+               this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
+             }
 
-            if (ship) {
-              this.fuel = (ship.fuel as number) ?? this.fuel;
-              this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
-              this.cargo = (ship.cargo_used as number) ?? this.cargo;
-              this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-              this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
-              this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
-              this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
-              this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-              this.shipSpeed = (ship.speed as number) || 1;
-              this.shipId = (ship.id as string) || "";
-            }
-          } else if (command === "mine") {
+             const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+             if (towingWreckId != null) {
+               this.towingWreck = true;
+               this.towingWreckId = towingWreckId;
+             }
+
+             if (ship) {
+               this.fuel = (ship.fuel as number) ?? this.fuel;
+               this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+               this.cargo = (ship.cargo_used as number) ?? this.cargo;
+               this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+               this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+               this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+        this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        this.shipSpeed = (ship.speed as number) || 1;
+        this.shipId = (ship.id as string) || "";
+             }
+           } else if (command === "mine") {
             // Mine response is nested under 'details' per OpenAPI spec
             const details = (r.details as Record<string, unknown>) || r;
             const qty = (details.quantity as number) || (details.count as number) || 0;
@@ -1096,19 +1102,19 @@ docked = false;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
         this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-        this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
         this.shipSpeed = (ship.speed as number) || 1;
         this.shipId = (ship.id as string) || "";
-        
+
         const modulesArray = (
           Array.isArray(r.modules) ? r.modules :
           Array.isArray(ship.modules) ? ship.modules :
           []
         ) as Array<Record<string, unknown>>;
-        
+
         let totalAmmo = 0;
         for (const mod of modulesArray) {
           if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
@@ -1123,26 +1129,28 @@ docked = false;
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
+      // Towing state handling - moved outside ship block since it's on player/location
       if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
 
-      const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
-      if (towingField != null) {
-        this.towingWreck = towingField;
-      }
-      if (ship) {
-        const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
-        if (shipTowing != null) {
-          this.towingWreck = shipTowing;
+      const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+      // Only update towing state if the field is present in the response
+      if (towingWreckId !== undefined && towingWreckId !== null) {
+        if (towingWreckId !== "") {
+          this.towingWreck = true;
+          this.towingWreckId = towingWreckId;
+        } else {
+          this.towingWreck = false;
+          this.towingWreckId = null;
         }
       }
+      // If field is not present, preserve existing towing state
 
       playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
-      if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
-          (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
-        this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
+      if (p.towing_wreck_id !== undefined || (ship && ship.towing_wreck_id !== undefined) || r.towing_wreck_id !== undefined) {
+        this.log("debug", `Tow fields in status: p.towing_wreck_id=${p.towing_wreck_id}, this.towingWreck=${this.towingWreck}`);
       }
 
       if (this.hull <= 0 && this.maxHull > 0) {
@@ -1188,6 +1196,18 @@ docked = false;
       if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
+      const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+      // Only update towing state if the field is present in the response (get_location may not include it)
+      if (towingWreckId !== undefined && towingWreckId !== null) {
+        if (towingWreckId !== "") {
+          this.towingWreck = true;
+          this.towingWreckId = towingWreckId;
+        } else {
+          this.towingWreck = false;
+          this.towingWreckId = null;
+        }
+      }
+      // If field is not present, preserve existing towing state
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }

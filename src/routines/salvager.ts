@@ -346,7 +346,7 @@ salvageYardSystem: (botOverrides.salvageYardSystem as string) || (m.salvageYardS
      enableCloak: (m.enableCloak as boolean) ?? false,
      enableFullSalvage: (m.enableFullSalvage as boolean) !== false,
     enableTowing: (m.enableTowing as boolean) ?? false,
-    minTowValue: (m.minTowValue as number) || 500,
+    minTowValue: (m.minTowValue as number) ?? 500,
     preferScrap: (m.preferScrap as boolean) ?? false,
     maxRoamJumps: (m.maxRoamJumps as number) || 0, // 0 = no roaming beyond neighbors
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
@@ -1077,18 +1077,10 @@ const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
     }
 
 // ── Verify tow status — sync with server but DON'T release (we may be heading to salvage yard) ──
-     await bot.refreshShip();
-     if (bot.towingWreck) {
-       // Check if server confirms we're towing (don't release — we might be heading to salvage yard)
-       const statusResp = await bot.exec("get_status");
-       const towingOnServer = (statusResp.result as Record<string, unknown>)?.towing_wreck as boolean || false;
-       if (!towingOnServer) {
-         ctx.log("warn", "Bot thought it was towing but server says no — clearing stale tow flag");
-         bot.towingWreck = false;
-       } else {
-         ctx.log("scavenge", `Still towing wreck — will head to salvage yard this cycle`);
-       }
-     }
+      await bot.refreshStatus();
+      if (bot.towingWreck) {
+        ctx.log("scavenge", `Still towing wreck ${bot.towingWreckId} — will head to salvage yard this cycle`);
+      }
 
      // ── Cloak status check ──
      // Verify bot is still cloaked (cloak can expire or be lost).
@@ -1658,24 +1650,32 @@ for (const poi of roamVisit) {
     }
 
     // ── Cargo full check: deposit cargo if full ──
+    // When towing, prioritize salvage yard over local station for cargo deposit
     if (cargoFull && !settings.ignoreCargoFull) {
-      ctx.log("salvage", "Cargo is full — navigating to station to deposit");
-      const { pois: currentPois } = await getSystemInfo(ctx);
-      const station = findStation(currentPois);
-      if (station) {
-        const stationId = station.id;
-        const atStation = bot.poi && bot.poi.toLowerCase() === stationId.toLowerCase();
-        if (!atStation) {
-          const travelResp = await bot.exec("travel", { target_poi: stationId });
-          if (travelResp.error && !travelResp.error.message.includes("already")) {
-            ctx.log("error", `Failed to travel to station: ${travelResp.error.message}`);
-          } else {
-            ctx.log("travel", `Traveled to ${station.name} to deposit cargo`);
+      await bot.refreshShip();
+      if (bot.towingWreck && settings.salvageYardStation) {
+        // When towing and salvage yard configured, go directly to salvage yard to deposit
+        // (will process tow and refuel there)
+        ctx.log("salvage", "Cargo full while towing — skipping local deposit, will go to salvage yard");
+      } else {
+        ctx.log("salvage", "Cargo is full — navigating to station to deposit");
+        const { pois: currentPois } = await getSystemInfo(ctx);
+        const station = findStation(currentPois);
+        if (station) {
+          const stationId = station.id;
+          const atStation = bot.poi && bot.poi.toLowerCase() === stationId.toLowerCase();
+          if (!atStation) {
+            const travelResp = await bot.exec("travel", { target_poi: stationId });
+            if (travelResp.error && !travelResp.error.message.includes("already")) {
+              ctx.log("error", `Failed to travel to station: ${travelResp.error.message}`);
+            } else {
+              ctx.log("travel", `Traveled to ${station.name} to deposit cargo`);
+            }
           }
         }
+        await ensureDocked(ctx);
+        await depositNonFuelCargo(ctx);
       }
-      await ensureDocked(ctx);
-      await depositNonFuelCargo(ctx);
     }
 
     // ── Process towed wrecks: navigate to salvage yard if towing ──
@@ -1684,6 +1684,15 @@ for (const poi of roamVisit) {
     let reachedSalvageYard = false;
     if (bot.towingWreck) {
       ctx.log("scavenge", "Towing wreck — navigating to salvage yard...");
+
+      // Ensure we have enough fuel before navigating to salvage yard
+      // Critical: salvage yard journey may be multiple jumps, ensure adequate fuel
+      const towFuelCheck = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (!towFuelCheck) {
+        ctx.log("error", "Cannot secure fuel for salvage yard journey — aborting navigation, will retry next cycle");
+        await ctx.sleep(5000);
+        continue; // Skip this cycle, let next cycle retry
+      }
 
       // Determine salvage yard destination
       const configuredStation = settings.salvageYardStation || "";
@@ -1913,6 +1922,11 @@ for (const poi of roamVisit) {
       continue;
     }
     bot.docked = true;
+
+    // Refuel immediately after docking (critical for towed wrecks journey)
+    if (reachedSalvageYard) {
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+    }
 
     // ── Process towed wrecks at salvage yard ──
     let processedTow = false;

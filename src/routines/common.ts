@@ -1787,9 +1787,9 @@ export async function navigateToSystem(
       }
     }
 
-    // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist }); //changed to 1.
-    if (!fueled) {
+// Fuel check — MUST have adequate fuel before jumping
+     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist });
+     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }
@@ -2481,7 +2481,7 @@ export async function fullSalvageWrecks(
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
 
   const enableTow = opts?.enableTow ?? false;
-  const minTowValue = opts?.minTowValue ?? 500;
+  const minTowValue = opts?.minTowValue ?? 0;
   const fuelOnly = opts?.fuelOnly ?? false;
   const battleState = opts?.battleState;
   const coop = opts?.salvageCoop;
@@ -2666,14 +2666,12 @@ export async function fullSalvageWrecks(
     ctx.log("scavenge", `Looted ${lootedItems.join(", ")} from ${wrecks.length} wreck(s)`);
   }
 
-  if (towedWrecks.length > 0) {
-    ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
-  }
+if (towedWrecks.length > 0) {
+     ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
+   }
 
-  // Refresh location to get latest towing state
-  await bot.refreshLocation();
-  ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
-  return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+   ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
+   return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
 
 /**
@@ -2838,18 +2836,19 @@ export async function processTowedWrecks(
   // Try to scrap if preferred and skill allows, with retries
   if (preferScrap && canScrap) {
     let scrapSuccess = false;
-    
+
     for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
       ctx.log("scavenge", `🔄 Scrap attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
       const scrapResp = await bot.exec("scrap_wreck");
-      
-      if (!scrapResp.error && scrapResp.result) {
-        const sr = scrapResp.result as Record<string, unknown>;
+
+      // V2 API returns command result in 'details' field, not 'result'
+      const scrapDetails = (scrapResp.details as Record<string, unknown>) || (scrapResp.result as Record<string, unknown>);
+      if (!scrapResp.error && scrapDetails) {
         // Scrap response uses 'materials' field
-        const materials = (sr.materials as Array<Record<string, unknown>>) || [];
-        const totalValue = (sr.total_value as number) || 0;
-        const message = (sr.message as string) || "";
-        
+        const materials = (scrapDetails.materials as Array<Record<string, unknown>>) || [];
+        const totalValue = (scrapDetails.total_value as number) || 0;
+        const message = (scrapDetails.message as string) || "";
+
         if (materials.length > 0) {
           const names = materials.map(m => `${(m.quantity as number) || 1}x ${(m.name as string) || "material"}`).join(", ");
           ctx.log("scavenge", `✅ Scrapped wreck for: ${names} (total value: ${totalValue}cr)`);
@@ -2877,13 +2876,13 @@ export async function processTowedWrecks(
           ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
         }
       }
-      
+
       // Wait briefly before retry (give server time to process)
       if (attempt < MAX_SALVAGE_RETRIES) {
         await sleep(2000);
       }
     }
-    
+
     if (!scrapSuccess && bot.towingWreck) {
       ctx.log("warn", `All ${MAX_SALVAGE_RETRIES} scrap attempts failed — falling back to sell`);
     }
@@ -2892,25 +2891,27 @@ export async function processTowedWrecks(
   // If scrap failed or not preferred, sell the wreck (also with retries)
   if (processed === 0 && bot.towingWreck) {
     let sellSuccess = false;
-    
+
     for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
       ctx.log("scavenge", `💰 Sell attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
       const sellResp = await bot.exec("sell_wreck");
-      
-      if (!sellResp.error && sellResp.result) {
-        const sr = sellResp.result as Record<string, unknown>;
-        const credits = (sr.credits as number) || (sr.earned as number) || 0;
-        const xp = (sr.xp as number) || (sr.experience as number) || 0;
-        const items = (sr.items as Array<Record<string, unknown>>) || [];
 
-        if (credits > 0 || xp > 0 || items.length > 0) {
-          const itemDetails = items.length > 0 ? ` + ${items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ")}` : "";
-          ctx.log("scavenge", `✅ Sold wreck for ${credits}cr + ${xp} XP${itemDetails}`);
+      // V2 API returns command result in 'details' field, not 'result'
+      const sellDetails = (sellResp.details as Record<string, unknown>) || (sellResp.result as Record<string, unknown>);
+      if (!sellResp.error && sellDetails) {
+        // SellWreckResponse uses total_payout, cargo_value, salvage_value
+        const totalPayout = (sellDetails.total_payout as number) || 0;
+        const cargoValue = (sellDetails.cargo_value as number) || 0;
+        const salvageValue = (sellDetails.salvage_value as number) || 0;
+        const message = (sellDetails.message as string) || "";
+
+        if (totalPayout > 0) {
+          ctx.log("scavenge", `✅ Sold wreck for ${totalPayout}cr (cargo: ${cargoValue}, salvage: ${salvageValue})${message ? ` — ${message}` : ""}`);
           processed++;
           sellSuccess = true;
           break; // Success - exit retry loop
         } else {
-          ctx.log("warn", `Sell attempt ${attempt} returned no credits, XP, or items — retrying...`);
+          ctx.log("warn", `Sell attempt ${attempt} returned no payout (${totalPayout}) — retrying...`);
         }
       } else if (sellResp.error) {
         const errMsg = sellResp.error.message.toLowerCase();
@@ -2929,13 +2930,13 @@ export async function processTowedWrecks(
           ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
         }
       }
-      
+
       // Wait briefly before retry (give server time to process)
       if (attempt < MAX_SALVAGE_RETRIES) {
         await sleep(2000);
       }
     }
-    
+
     if (!sellSuccess && bot.towingWreck) {
       ctx.log("error", `All ${MAX_SALVAGE_RETRIES} sell attempts failed — wreck may be lost`);
     }

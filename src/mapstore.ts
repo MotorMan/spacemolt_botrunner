@@ -2293,14 +2293,26 @@ const locations = this.findOreLocations(oreId, blacklist);
     };
   }
 
-  /**
-   * Check if a POI is the mobile_capitol station.
-   * Returns true if the system_id and poi_id match the current known location.
-   */
-  isMobileCapitol(systemId: string, poiId: string): boolean {
+/**
+    * Check if a POI is the mobile_capitol station.
+    * Returns true if the system_id and poi_id match the current known location.
+    */
+   isMobileCapitol(systemId: string, poiId: string): boolean {
     if (!this.data.mobile_capitol) return false;
     return this.data.mobile_capitol.system_id === systemId && 
            this.data.mobile_capitol.poi_id === poiId;
+  }
+
+  /**
+   * Find system ID by system name (case-insensitive). Returns null if not found.
+   */
+  findSystemIdByName(systemName: string): string | null {
+    const lower = systemName.toLowerCase().replace(/_/g, " ");
+    for (const [id, sys] of Object.entries(this.data.systems)) {
+      const name = (sys.name || sys.id || "").toLowerCase().replace(/_/g, " ");
+      if (name === lower) return id;
+    }
+    return null;
   }
 
   findStationInSystem(systemId: string, stationIdPattern?: string): { poiId: string; poiName: string; baseId: string } | null {

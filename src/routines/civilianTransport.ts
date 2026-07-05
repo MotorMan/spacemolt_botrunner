@@ -188,7 +188,7 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
 const fs = require("fs");
 const path = require("path");
 
-const MOBILE_STATIONS = new Set(["mobile_capitol", "frontier_station"]);
+const MOBILE_STATIONS = new Set(["mobile_capital", "frontier_station"]);
 
 function isMobileStation(poiId: string): boolean {
   return MOBILE_STATIONS.has(poiId.toLowerCase());
@@ -209,10 +209,16 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       const result = routeResp.result as Record<string, unknown>;
       const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
       if (isFound) {
+        const resolvedSystem = (result.target_system as string) || "";
+        const resolvedPoi = (result.target_poi as string) || destinationId;
+        const resolvedPoiName = (result.target_poi_name as string) || destinationName || destinationId;
+        if (destinationId === "mobile_capital" && resolvedSystem && resolvedPoi) {
+          mapStore.updateMobileCapitolLocation(resolvedSystem, resolvedSystem, resolvedPoi);
+        }
         return {
-          system: (result.target_system as string) || "",
-          poi: (result.target_poi as string) || destinationId,
-          poiName: (result.target_poi_name as string) || destinationName || destinationId,
+          system: resolvedSystem,
+          poi: resolvedPoi,
+          poiName: resolvedPoiName,
           origDest: destinationId,
         };
       }
@@ -2472,17 +2478,36 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         if (tr.error) {
           const errMsg = tr.error.message || "";
           if (isMobileStation(waypoint.poi) && state.routeRebuildAttempts < 3) {
-            ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Re-resolving destination.`);
-            const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
-            if (resolved && resolved.system && resolved.poi) {
-              const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
-              if (newRoute.length > 0) {
-                state.route = newRoute;
-                state.currentRouteIndex = 0;
-                state.currentDestination = newRoute[0].poiName;
-                state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
-                ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
-                continue;
+            const suggestedMatch = errMsg.match(/jump to (.+?) to find it/i);
+            if (suggestedMatch) {
+              const suggestedSystemName = suggestedMatch[1].trim();
+              ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Suggested system: ${suggestedSystemName}`);
+              const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
+              if (resolved && resolved.system && resolved.poi) {
+                mapStore.updateMobileCapitolLocation(resolved.system, suggestedSystemName, resolved.poi);
+                const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
+                if (newRoute.length > 0) {
+                  state.route = newRoute;
+                  state.currentRouteIndex = 0;
+                  state.currentDestination = newRoute[0].poiName;
+                  state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
+                  ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
+                  continue;
+                }
+              }
+            } else {
+              ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Re-resolving destination.`);
+              const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
+              if (resolved && resolved.system && resolved.poi) {
+                const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
+                if (newRoute.length > 0) {
+                  state.route = newRoute;
+                  state.currentRouteIndex = 0;
+                  state.currentDestination = newRoute[0].poiName;
+                  state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
+                  ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
+                  continue;
+                }
               }
             }
           }

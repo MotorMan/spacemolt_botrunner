@@ -5,6 +5,11 @@ import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import {
+  registerMinerTarget as registerCoordinationTarget,
+  unregisterMinerTarget as unregisterCoordinationTarget,
+  getMinerCountForSystem,
+} from "./minerCoordination.js";
+import {
   isOreBeltPoi,
   isGasCloudPoi,
   isIceFieldPoi,
@@ -432,13 +437,17 @@ async function getMinerSettings(username?: string): Promise<{
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
-  enableFighting: boolean;
+enableFighting: boolean;
 
-  // Flock mining settings
-  flockEnabled: boolean;
-  flockName: string;
-  flockRole: FlockRole;
-  flockGroups: FlockGroupConfig[];
+   // Miner coordination settings - prevent all miners from going to the same location
+   enableCoordination: boolean;
+   maxBotsPerSystem: number;
+
+   // Flock mining settings
+   flockEnabled: boolean;
+   flockName: string;
+   flockRole: FlockRole;
+   flockGroups: FlockGroupConfig[];
 }> {
   const all = readSettings();
   const m = all.miner || {};
@@ -512,7 +521,7 @@ async function getMinerSettings(username?: string): Promise<{
     targetDeepCore: (botOverrides.targetDeepCore as string) || (m.targetDeepCore as string) || "",
     oreQuotas: (m.oreQuotas as Record<string, number>) || {},
     gasQuotas: (m.gasQuotas as Record<string, number>) || {},
-    iceQuotas: (m.iceQuotas as Record<string, number>) || {},
+iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     radioactiveQuotas: (m.radioactiveQuotas as Record<string, number>) || {},
     deepCoreQuotas: (m.deepCoreQuotas as Record<string, number>) || {},
     jettisonOres: (m.jettisonOres as string[]) || [],
@@ -535,6 +544,10 @@ async function getMinerSettings(username?: string): Promise<{
     flockGroups,
     desiredEmergencyWarpDevices: (m.desiredEmergencyWarpDevices as number) ?? 3,
     enableFighting: (m.enableFighting as boolean) ?? false,
+
+    // Miner coordination settings
+    enableCoordination: (m.enableCoordination as boolean) ?? true,
+    maxBotsPerSystem: (m.maxBotsPerSystem as number) ?? 3,
   };
 }
 
@@ -2607,11 +2620,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        if (shouldAbandon) {
-          ctx.log("mining", `Abandoning recovered session: ${reason}`);
-          await failMiningSession(bot.username, reason);
-          recoveredSession = null;
-        } else {
+if (shouldAbandon) {
+           ctx.log("mining", `Abandoning recovered session: ${reason}`);
+           // Unregister from coordination before failing session
+           if (settings.enableCoordination) {
+             unregisterCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+           }
+           await failMiningSession(bot.username, reason);
+           recoveredSession = null;
+         } else {
           ctx.log("mining", `Resuming recovered session: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
           
           // CRITICAL FIX: Check cargo BEFORE deciding to continue mining
@@ -3287,24 +3304,30 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
             .filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
-            .sort((a, b) => {
-              if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-              if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-              const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
-              if (isCommon) {
-                if (a.jumps !== b.jumps) return a.jumps - b.jumps;
-                const aRem = a.remaining ?? 0;
-                const bRem = b.remaining ?? 0;
-                if (aRem !== bRem) return bRem - aRem;
-                return (b.richness ?? 0) - (a.richness ?? 0);
-              }
-              const aRem = a.remaining ?? 0;
-              const bRem = b.remaining ?? 0;
-              if (aRem !== bRem) return bRem - aRem;
-              if (a.jumps !== b.jumps) return a.jumps - b.jumps;
-              return 0;
-            });
-          scoredLocations = scoredLocationsLocal;
+.sort((a, b) => {
+               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+               if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+               const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+               if (isCommon) {
+                 if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                 const aRem = a.remaining ?? 0;
+                 const bRem = b.remaining ?? 0;
+                 if (aRem !== bRem) return bRem - aRem;
+                 return (b.richness ?? 0) - (a.richness ?? 0);
+               }
+               const aRem = a.remaining ?? 0;
+               const bRem = b.remaining ?? 0;
+               if (aRem !== bRem) return bRem - aRem;
+               if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+               // Coordination: prefer systems with fewer miners assigned
+               if (settings.enableCoordination) {
+                 const aMinerCount = getMinerCountForSystem(a.systemId, bot.username);
+                 const bMinerCount = getMinerCountForSystem(b.systemId, bot.username);
+                 if (aMinerCount !== bMinerCount) return aMinerCount - bMinerCount;
+               }
+               return 0;
+             });
+           scoredLocations = scoredLocationsLocal;
         }
 
         const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
@@ -3506,6 +3529,11 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           await startMiningSession(session);
           recoveredSession = session;
           ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
+
+          // Register with coordination system
+          if (settings.enableCoordination) {
+            registerCoordinationTarget(bot.username, targetSystemId, targetPoiId);
+          }
         }
 
         // ── Flock leader announces target ──
@@ -7208,6 +7236,10 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
 
     // Complete mining session after successful deposit
     if (recoveredSession) {
+      // Unregister from coordination before completing session
+      if (settings.enableCoordination) {
+        unregisterCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+      }
       await completeMiningSession(bot.username);
       ctx.log("mining", `Mining session completed: ${recoveredSession.cyclesMined} cycles, ${Object.entries(recoveredSession.resourcesMined).map(([k, v]) => `${v}x ${k}`).join(", ")}`);
       recoveredSession = null;

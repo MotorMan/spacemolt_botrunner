@@ -45,7 +45,6 @@ import {
   markMaydayReceived,
   isMaydayDeclined,
   markMaydayDeclined,
-  getOtherBotHandlingRescue,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -1298,12 +1297,20 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     if (member.state !== "running" && member.state !== "idle") continue;
 
     // Fetch fresh credits for this bot using get_location if available
+    if (!shouldContinueCreditTopOff()) {
+      return false;
+    }
     let currentCredits = member.credits;
     if (ctx.getBotFreshStatus) {
       const freshStatus = await ctx.getBotFreshStatus(member.username);
       if (freshStatus) {
         currentCredits = freshStatus.credits;
       }
+    }
+
+    // Check again after async operation
+    if (!shouldContinueCreditTopOff()) {
+      return false;
     }
 
     // Track consecutive 0 credit readings
@@ -1321,10 +1328,22 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       const needed = targetAmount - currentCredits;
       ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
+      // Check if routine was stopped before making API calls
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
+
       //const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
       const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
       if (withdrawResp.error) {
         ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        return false;
+      }
+
+      // Check if routine was stopped after withdraw
+      if (!shouldContinueCreditTopOff()) {
+        // Refund the withdrawn credits
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed });
         return false;
       }
 
@@ -1348,10 +1367,20 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       continue;
     }
 
+    // Check before expensive log read operation
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     // Verify actual credits via debug log
     ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
     const actualCredits = await getActualCreditsFromLog(member.username, ctx);
-    
+
+    // Check after log read
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     if (actualCredits === null) {
       ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, but has ${consecutiveCount} consecutive 0 readings - proceeding with top-off as fallback`);
     } else if (actualCredits >= minThreshold) {
@@ -1366,9 +1395,21 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     const needed = targetAmount - verifiedCredits;
     ctx.log("rescue", `💰 ${member.username} verified credits: ${verifiedCredits}, needs ${needed}cr to reach ${targetAmount}cr`);
 
+    // Check if routine was stopped before making API calls
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+      return false;
+    }
+
+    // Check if routine was stopped after withdraw
+    if (!shouldContinueCreditTopOff()) {
+      // Refund the withdrawn credits
+      await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed });
       return false;
     }
 
@@ -1386,8 +1427,16 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
   }
 
   // Top off self if needed
+  if (!shouldContinueCreditTopOff()) {
+    return false;
+  }
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
   await bot.refreshLocation();
+
+  // Check again after async
+  if (!shouldContinueCreditTopOff()) {
+    return false;
+  }
 
   // Track consecutive 0 credits for self
   if (bot.credits === 0) {
@@ -1418,7 +1467,13 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     let actualSelfCredits = bot.credits;
     if (bot.credits === 0) {
       ctx.log("rescue", `💰 Self has 0 credits, verifying via debug log...`);
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
       const verified = await getActualCreditsFromLog(bot.username, ctx);
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
       if (verified !== null) actualSelfCredits = verified;
       if (actualSelfCredits >= minThreshold) {
         ctx.log("rescue", `💰 Verified self has ${actualSelfCredits}cr, false 0 reading. Resetting count.`);
@@ -1429,6 +1484,10 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
     const needed = targetAmount - actualSelfCredits;
     ctx.log("rescue", `💰 Self has ${actualSelfCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    if (!shouldContinueCreditTopOff()) {
+      return false;
+    }
 
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
@@ -1450,6 +1509,14 @@ let creditTopOffIntervalId: NodeJS.Timeout | null = null;
 let creditTopOffRoutineActive = false;
 const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
+
+/**
+ * Check if credit top-off background loop should continue running.
+ * Returns false if the routine was stopped.
+ */
+function shouldContinueCreditTopOff(): boolean {
+  return creditTopOffRoutineActive;
+}
 
 /**
  * Background credit top-off loop — runs independently every 60 seconds,
@@ -1486,6 +1553,11 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
       // Refresh bot status to get current docked state, system, AND credits
       await bot.refreshStatus();
 
+      // Check again after async operation - routine may have been stopped
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
+
       ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
 
       // Only run when docked
@@ -1504,8 +1576,19 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
       }
 
       ctx.log("rescue", `💰 At ${expectedSystem}, checking fleet credits...`);
+
+      // Check again before the expensive topOffOneBot operation
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
+
       const minThreshold = settings.creditTopOffMinThreshold;
       const toppedOff = await topOffOneBot(ctx, targetAmount, minThreshold);
+
+      // Check again after async operation
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
 
       if (toppedOff) {
         ctx.log("rescue", `💰 Successfully topped off a bot — will check again in ${intervalMs / 1000}s`);
@@ -1513,7 +1596,9 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
         ctx.log("rescue", `💰 No bots need topping off this cycle`);
       }
     } catch (err) {
-      ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+      if (creditTopOffRoutineActive) {
+        ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+      }
     }
   };
 
@@ -1524,13 +1609,14 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
 
 /**
  * Stop the background credit top-off loop.
+ * Sets the active flag BEFORE clearing interval to prevent new iterations.
  */
 function stopCreditTopOffBackground(): void {
+  creditTopOffRoutineActive = false; // Set flag FIRST to prevent new loop iterations
   if (creditTopOffIntervalId !== null) {
     clearInterval(creditTopOffIntervalId);
     creditTopOffIntervalId = null;
   }
-  creditTopOffRoutineActive = false;
   console.log("[rescue] 💰 Credit top-off background loop stopped");
 }
 
@@ -1990,23 +2076,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
 
-// ── RESCUE COORDINATION: Check if another bot is already handling this ──
-           const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
-           if (handledBy) {
-             ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
-             markMaydayHandled(mayday);
-             continue;
-           }
+          // ── RESCUE COORDINATION: Check if another bot is already handling this ──
+          const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
+          if (handledBy) {
+            ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
+            markMaydayHandled(mayday);
+            continue;
+          }
 
-           // ── ACTIVE SESSION CHECK: Check if another bot has an active rescue session for this target ──
-           const otherBotActive = getOtherBotHandlingRescue(bot.username, mayday.sender, mayday.system, mayday.poi);
-           if (otherBotActive) {
-             ctx.log("mayday", `⚠️ Another bot (${otherBotActive}) already has an active rescue session for ${mayday.sender} - skipping to avoid duplicate rescue`);
-             markMaydayHandled(mayday);
-             continue;
-           }
-
-           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
+          // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
           if (isCooperationEnabled()) {

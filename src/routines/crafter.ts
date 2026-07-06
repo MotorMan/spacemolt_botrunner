@@ -554,195 +554,173 @@ async function waitForCompletion(
   return false;
 }
 
-async function queueAllRecipes(
-  ctx: RoutineContext,
-  planItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
-  tracker: CraftQueueTracker,
-  recipes: Recipe[],
-  preset: string,
-  countItemFn: (itemId: string) => number,
-): Promise<Array<{ recipeId: string; quantity: number; outputQty: number }>> {
-  const { bot } = ctx;
-  const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
-
-  // Create a mutable inventory counter that accounts for items we queue in this pass
-  const reservedMaterials = new Map<string, number>();
-  
-  const getAvailableCount = (itemId: string): number => {
-    const lowerId = itemId.toLowerCase();
-    const reserved = reservedMaterials.get(lowerId) || 0;
-    const available = countItemFn(lowerId);
-    return Math.max(0, available - reserved);
-  };
-
-  await syncCraftingQueue(ctx, tracker, recipes, true);
-
-  for (const item of planItems) {
-    if (bot.state !== "running") break;
-
-    const outputQty = item.recipe.output_quantity || 1;
-    const progress = tracker.getProgress(item.recipe.recipe_id);
-    const queuedItems = progress.queued * outputQty;
-    const completedItems = progress.completed * outputQty;
-
-    if (queuedItems >= item.quantityToCraft) {
-      ctx.log("craft", `Already queued: ${item.recipe.name} (${queuedItems} items queued)`);
-      continue;
-    }
-
-    const remainingItems = item.quantityToCraft - completedItems - queuedItems;
-    if (remainingItems <= 0) {
-      ctx.log("craft", `Already completed or queued: ${item.recipe.name}`);
-      continue;
-    }
-
-    ctx.log("craft", `Queueing ${remainingItems}x ${item.recipe.name} (${item.reason})`);
-    const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, getAvailableCount, recipes, preset);
-    if (!queueResult.success) {
-      if (queueResult.error === "insufficient_inputs") {
-        ctx.log("error", `Insufficient materials for ${item.recipe.name} - need ${remainingItems}x output`);
-      } else if (queueResult.error !== "Job already queued") {
-        ctx.log("error", `Failed to queue ${item.recipe.name}: ${queueResult.error}`);
-      }
-      continue;
-    }
-
-    const actualQueued = queueResult.queuedRuns || 0;
-    queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-    if (actualQueued * outputQty < remainingItems) {
-      ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x`);
-    }
-    
-    // Track materials that will be consumed by this job
-    const recipe = item.recipe;
-    const runsQueued = actualQueued;
-    for (const comp of recipe.components) {
-      const consumed = comp.quantity * runsQueued;
-      const lowerCompId = comp.item_id.toLowerCase();
-      reservedMaterials.set(lowerCompId, (reservedMaterials.get(lowerCompId) || 0) + consumed);
-    }
-  }
-
-  return queued;
-}
-
 async function waitForAllCompletions(
-  ctx: RoutineContext,
-  queuedItems: Array<{ recipeId: string; quantity: number; outputQty: number }>,
-  tracker: CraftQueueTracker,
-  bot: any,
-  recipes: Recipe[],
+   ctx: RoutineContext,
+   initialQueuedItems: Array<{ recipeId: string; quantity: number; outputQty: number }>,
+   tracker: CraftQueueTracker,
+   bot: any,
+   recipes: Recipe[],
 ): Promise<string[]> {
-  const { log } = ctx;
-  const crafted: string[] = [];
+   const { log } = ctx;
+   const crafted: string[] = [];
 
-  const recipeNames = new Map<string, string>();
-  for (const r of recipes) {
-    recipeNames.set(r.recipe_id, r.name);
-  }
+   const recipeNames = new Map<string, string>();
+   for (const r of recipes) {
+     recipeNames.set(r.recipe_id, r.name);
+   }
 
-  let lastSync = 0;
+   let lastSync = 0;
+   let remainingItems = [...initialQueuedItems];
 
-  while (bot.state === "running" && queuedItems.length > 0) {
-    await ctx.sleep(5000);
+   while (bot.state === "running" && remainingItems.length > 0) {
+     await ctx.sleep(5000);
 
-    const now = Date.now();
-    if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-      const serverJobs = await checkCraftingQueue(bot, recipes);
-      tracker.syncWithServer(serverJobs);
-      tracker.save();
-      lastSync = now;
-    }
+     const now = Date.now();
+     if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
+       const serverJobs = await checkCraftingQueue(bot, recipes);
+       tracker.syncWithServer(serverJobs);
+       tracker.save();
+       lastSync = now;
+     }
 
-    const stillQueued: typeof queuedItems = [];
-    for (const item of queuedItems) {
-      const progress = tracker.getProgress(item.recipeId);
-      const completedItems = progress.completed * item.outputQty;
-      if (completedItems >= item.quantity) {
-        crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
-        bot.stats.totalCrafted += item.quantity;
-      } else {
-        stillQueued.push(item);
-      }
-    }
-    queuedItems = stillQueued;
+     const stillQueued: typeof remainingItems = [];
+     for (const item of remainingItems) {
+       const progress = tracker.getProgress(item.recipeId);
+       const completedItems = progress.completed * item.outputQty;
+       if (completedItems >= item.quantity) {
+         crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
+         bot.stats.totalCrafted += item.quantity;
+       } else {
+         stillQueued.push(item);
+       }
+     }
+     remainingItems = stillQueued;
 
-    if (queuedItems.length > 0) {
-      reportQueueStatus(ctx, tracker, recipes);
-    }
-  }
+     if (remainingItems.length > 0) {
+       reportQueueStatus(ctx, tracker, recipes);
+     }
+   }
 
-  return crafted;
+   return crafted;
+ }
+
+async function queueAllRecipesOnce(
+   ctx: RoutineContext,
+   allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
+   tracker: CraftQueueTracker,
+   recipes: Recipe[],
+   preset: string,
+   countItemFn: (itemId: string) => number,
+): Promise<Array<{ recipeId: string; quantity: number; outputQty: number }>> {
+   const { bot } = ctx;
+   const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
+
+   const reservedMaterials = new Map<string, number>();
+
+   const getAvailableCount = (itemId: string): number => {
+     const lowerId = itemId.toLowerCase();
+     const reserved = reservedMaterials.get(lowerId) || 0;
+     const available = countItemFn(lowerId);
+     return Math.max(0, available - reserved);
+   };
+
+   await syncCraftingQueue(ctx, tracker, recipes, true);
+
+   for (const item of allPlanItems) {
+     if (bot.state !== "running") break;
+
+     const outputQty = item.recipe.output_quantity || 1;
+     const progress = tracker.getProgress(item.recipe.recipe_id);
+     const queuedItems = progress.queued * outputQty;
+     const completedItems = progress.completed * outputQty;
+
+     if (queuedItems >= item.quantityToCraft) {
+       ctx.log("craft", `Already queued: ${item.recipe.name} (${queuedItems} items queued)`);
+       const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
+       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+       continue;
+     }
+
+     const remainingItems = item.quantityToCraft - completedItems - queuedItems;
+     if (remainingItems <= 0) {
+       ctx.log("craft", `Already completed or queued: ${item.recipe.name}`);
+       const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
+       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+       continue;
+     }
+
+     ctx.log("craft", `Queueing ${remainingItems}x ${item.recipe.name} (${item.reason})`);
+     const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, getAvailableCount, recipes, preset);
+     if (!queueResult.success) {
+       if (queueResult.error === "insufficient_inputs") {
+         ctx.log("error", `Insufficient materials for ${item.recipe.name} - need ${remainingItems}x output`);
+       } else if (queueResult.error !== "Job already queued") {
+         ctx.log("error", `Failed to queue ${item.recipe.name}: ${queueResult.error}`);
+       }
+       continue;
+     }
+
+     const actualQueued = queueResult.queuedRuns || 0;
+     queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+     if (actualQueued * outputQty < remainingItems) {
+       ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x`);
+     }
+
+     const recipe = item.recipe;
+     const runsQueued = actualQueued;
+     for (const comp of recipe.components) {
+       const consumed = comp.quantity * runsQueued;
+       const lowerCompId = comp.item_id.toLowerCase();
+       reservedMaterials.set(lowerCompId, (reservedMaterials.get(lowerCompId) || 0) + consumed);
+     }
+   }
+
+   return queued;
 }
 
 async function executeCraftingPlan(
-  ctx: RoutineContext,
-  planItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
-  tracker: CraftQueueTracker,
-  recipes: Recipe[],
-  preset: string = "fast",
-  finalItemThreshold: number = 1,
-  countItemFn?: (itemId: string) => number,
+   ctx: RoutineContext,
+   allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
+   tracker: CraftQueueTracker,
+   recipes: Recipe[],
+   preset: string = "fast",
+   finalItemThreshold: number = 1,
+   countItemFn?: (itemId: string) => number,
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
-  const { bot } = ctx;
-  const crafted: string[] = [];
-  const prereqs: string[] = [];
+   const { log } = ctx;
+   const crafted: string[] = [];
+   const prereqs: string[] = [];
 
-  ctx.log("craft", `Queue-based crafting plan: ${planItems.length} steps`);
+   log("craft", `Queue-based crafting plan: ${allPlanItems.length} steps`);
 
-  const byDepth = new Map<number, typeof planItems>();
-  for (const item of planItems) {
-    if (!byDepth.has(item.depth)) {
-      byDepth.set(item.depth, []);
-    }
-    byDepth.get(item.depth)!.push(item);
-  }
-  const depths = Array.from(byDepth.keys()).sort((a, b) => b - a);
+   // Queue ALL recipes in a single pass - facilities enable parallel crafting
+   const queuedItems = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, preset, countItemFn!);
 
-  const finalDepth = Math.min(...depths);
-  const hasNonFinalDepths = depths.some(d => d > finalDepth);
+   // Wait for all queued items to complete
+   const { bot } = ctx;
+   const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
+   crafted.push(...completed);
 
-  // Create a wrapper that accounts for materials in progress at this depth
-  // Start with the provided countItemFn, or a default that checks all storage
-  const getMaterialCount = (itemId: string): number => {
-    const lowerId = itemId.toLowerCase();
-    // Always use the provided countItemFn to get fresh values including in-progress jobs
-    // We don't cache because the tracker state changes during the loop
-    if (countItemFn) return countItemFn(lowerId);
-    
-    // Fallback: count from bot's storage locations
-    let total = 0;
-    for (const i of bot.inventory) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
-    for (const i of bot.storage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
-    for (const i of bot.factionStorage || []) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
-    return total;
-  };
+   // Track prerequisites (non-final depth items)
+   const byDepth = new Map<number, typeof allPlanItems>();
+   for (const item of allPlanItems) {
+     if (!byDepth.has(item.depth)) {
+       byDepth.set(item.depth, []);
+     }
+     byDepth.get(item.depth)!.push(item);
+   }
+   const depths = Array.from(byDepth.keys()).sort((a, b) => b - a);
+   const finalDepth = Math.min(...depths);
 
-  for (const depth of depths) {
-    const itemsAtDepth = byDepth.get(depth)!;
-    const isFinalDepth = depth === finalDepth;
+   for (const depth of depths) {
+     if (depth > finalDepth) {
+       for (const item of byDepth.get(depth)!) {
+         prereqs.push(`${item.quantityToCraft}x ${item.recipe.name}`);
+       }
+     }
+   }
 
-    ctx.log("craft", `Processing depth ${depth} (${itemsAtDepth.length} items)`);
-    const queuedItems = await queueAllRecipes(ctx, itemsAtDepth, tracker, recipes, preset, getMaterialCount);
-
-    if (isFinalDepth && hasNonFinalDepths) {
-      ctx.log("craft", `Waiting for prerequisite assemblies to complete before starting final items`);
-      await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
-      for (const item of queuedItems) {
-        prereqs.push(`${item.quantity}x ${recipes.find(r => r.recipe_id === item.recipeId)?.name || item.recipeId}`);
-      }
-    } else if (isFinalDepth) {
-      const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
-      crafted.push(...completed);
-    } else {
-      await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
-      for (const item of queuedItems) {
-        prereqs.push(`${item.quantity}x ${recipes.find(r => r.recipe_id === item.recipeId)?.name || item.recipeId}`);
-      }
-    }
-  }
-
-  return { crafted, prereqs };
+   return { crafted, prereqs };
 }
 
 // ── Craft from enabled categories ─────────────────────────────

@@ -151,7 +151,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
   }
 
   private async pullCoordination(): Promise<void> {
-    const files = ["tradeCoordination.json", "cargoMoverCoordination.json", "cargoMoverInTransit.json", "rescueQueue.json", "rescueBlackBook.json"];
+    const files = ["minerCoordination.json", "tradeCoordination.json", "cargoMoverCoordination.json", "cargoMoverInTransit.json", "rescueQueue.json", "rescueBlackBook.json"];
     for (const file of files) {
       const data = await this.request<Record<string, unknown>>(`/api/client-sync/coordination?file=${encodeURIComponent(file)}`);
       if (data && typeof data === "object") {

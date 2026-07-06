@@ -1440,6 +1440,14 @@
       let activeSettingsTab = "general";
       let mapLoading = false;
       let profileBot = null;
+      let manualCollapseState = {
+        wreck: true,
+        shipLoadout: true,
+        modulePreset: true,
+        fleetActions: true,
+        gifting: true,
+      };
+      let wrecksScanned = false;
       let activeOreFilters = new Set();
       let battleState = {};
       let missionsSubTab = "bot";
@@ -6123,6 +6131,11 @@
         }
       }
 
+      function toggleManualSection(section) {
+        manualCollapseState[section] = !manualCollapseState[section];
+        renderManualControls();
+      }
+
       async function renderManualControls(isFreshRender) {
         // Block re-render if we just rendered with fresh data from storage refresh
         if (
@@ -6283,6 +6296,10 @@
           ? otherBotOpts + '<option value="__custom__">Enter name...</option>'
           : '<option value="__custom__">Enter name...</option>';
 
+        const fleetBoardOpts = hasOtherBots
+          ? otherBotOpts + '<option value="__custom__">Enter name...</option>'
+          : '<option value="__custom__">Enter name...</option>';
+
         // Build gift item options from both cargo and storage
         const giftItems = [];
         if (freshCargo.length > 0) {
@@ -6408,10 +6425,6 @@
 
         // Build wreck salvage section
         const wreckSection = `
-    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
-      <label style="color:var(--text-bright);font-weight:600">Wreck Salvage</label>
-    </div>
-    
     <div class="cmd-group">
       <button class="sm" onclick="mcScanWrecks()">🔍 Scan Wrecks</button>
       <button class="primary sm" onclick="mcLootAllWrecks()">💰 Loot All Wrecks</button>
@@ -6516,7 +6529,15 @@
 
     ${weaponReloadSection}
 
-    ${wreckSection}
+    <div class="manual-section ${manualCollapseState.wreck ? 'collapsed' : ''}" data-section="wreck">
+      <div class="manual-section-header" onclick="toggleManualSection('wreck')">
+        <span class="manual-section-title">Wreck Salvage</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        ${wreckSection}
+      </div>
+    </div>
 
     <div class="cmd-group">
       <label>Sell</label>
@@ -6592,38 +6613,46 @@
       <button class="sm" onclick="mcRefreshStorageForDepositAll()" title="Refresh storage lists">Refresh</button>
     </div>
 
-    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
-      <label style="color:var(--text-bright);font-weight:600">Ship Loadout Withdrawal</label>
-    </div>
-    
-    <div class="cmd-group">
-      <label>Loadout</label>
-      <select id="mc-loadout-select" style="min-width:150px">
-        <option value="">-- Select Loadout --</option>
-      </select>
-      <input type="number" id="mc-loadout-multiplier" min="1" max="99" value="1" style="width:70px" title="Multiply loadout quantities by this number">
-      <button class="primary sm" onclick="mcStartLoadoutWithdrawal()">Withdraw</button>
-      <button class="sm" onclick="mcStopLoadoutWithdrawal()">Stop</button>
-    </div>
-    
-    <div class="cmd-group">
-      <label>Withdrawal Status</label>
-      <span id="mc-loadout-withdrawal-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
-      <button class="sm" onclick="mcRefreshFactionStorage()" title="Refresh faction storage">Refresh</button>
+    <div class="manual-section ${manualCollapseState.shipLoadout ? 'collapsed' : ''}" data-section="shipLoadout">
+      <div class="manual-section-header" onclick="toggleManualSection('shipLoadout')">
+        <span class="manual-section-title">Ship Build Materials Withdrawal</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        <div class="cmd-group">
+          <label>Loadout</label>
+          <select id="mc-loadout-select" style="min-width:150px">
+            <option value="">-- Select Loadout --</option>
+          </select>
+          <input type="number" id="mc-loadout-multiplier" min="1" max="99" value="1" style="width:70px" title="Multiply loadout quantities by this number">
+          <button class="primary sm" onclick="mcStartLoadoutWithdrawal()">Withdraw</button>
+          <button class="sm" onclick="mcStopLoadoutWithdrawal()">Stop</button>
+        </div>
+        
+        <div class="cmd-group">
+          <label>Withdrawal Status</label>
+          <span id="mc-loadout-withdrawal-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+          <button class="sm" onclick="mcRefreshFactionStorage()" title="Refresh faction storage">Refresh</button>
+        </div>
+      </div>
     </div>
 
-    <!-- Phase 1: Module Loadout Preset Selector -->
-    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
-      <label style="color:var(--text-bright);font-weight:600">Module Loadout Preset</label>
-    </div>
-    <div class="cmd-group">
-      <label>Preset</label>
-      <select id="mc-module-preset-select" style="min-width:180px">
-        <option value="">-- Select Module Preset --</option>
-      </select>
-      <button class="primary sm" onclick="loadModulePresetInManualControls()">Load Preset</button>
-      <button class="primary sm" onclick="changeToModulePreset()" style="margin-left:6px;">Change Module Loadout</button>
-      <span id="mc-module-preset-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+    <div class="manual-section ${manualCollapseState.modulePreset ? 'collapsed' : ''}" data-section="modulePreset">
+      <div class="manual-section-header" onclick="toggleManualSection('modulePreset')">
+        <span class="manual-section-title">Module Loadout Preset</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        <div class="cmd-group">
+          <label>Preset</label>
+          <select id="mc-module-preset-select" style="min-width:180px">
+            <option value="">-- Select Module Preset --</option>
+          </select>
+          <button class="primary sm" onclick="loadModulePresetInManualControls()">Load Preset</button>
+          <button class="primary sm" onclick="changeToModulePreset()" style="margin-left:6px;">Change Module Loadout</button>
+          <span id="mc-module-preset-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+        </div>
+      </div>
     </div>
 
     <!-- Crafting Loadout Section -->
@@ -6644,39 +6673,47 @@
       <button class="sm" onclick="mcRefreshCraftingLoadouts()" title="Refresh loadouts">Refresh</button>
     </div>
 
-    <div class="cmd-group">
-      <label>Gift Item</label>
-      <select id="mc-gift-source">
-        <option value="cargo">From Cargo</option>
-        <option value="storage" selected>From Storage</option>
-      </select>
-      <select id="mc-gift-target" onchange="handleGiftTargetSelect(this, 'mc-gift-custom-input')">${giftBotOpts}</select>
-      <input type="text" class="gift-custom-input" id="mc-gift-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
-      <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${giftItemOpts}</select>
-      <input type="number" id="mc-gift-qty" min="1" value="1">
-      <button class="sm" onclick="mcSendGift()">Send</button>
-    </div>
+    <div class="manual-section ${manualCollapseState.gifting ? 'collapsed' : ''}" data-section="gifting">
+      <div class="manual-section-header" onclick="toggleManualSection('gifting')">
+        <span class="manual-section-title">Gifting</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        <div class="cmd-group">
+          <label>Gift Item</label>
+          <select id="mc-gift-source">
+            <option value="cargo">From Cargo</option>
+            <option value="storage" selected>From Storage</option>
+          </select>
+          <select id="mc-gift-target" onchange="handleGiftTargetSelect(this, 'mc-gift-custom-input')">${giftBotOpts}</select>
+          <input type="text" class="gift-custom-input" id="mc-gift-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
+          <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${giftItemOpts}</select>
+          <input type="number" id="mc-gift-qty" min="1" value="1">
+          <button class="sm" onclick="mcSendGift()">Send</button>
+        </div>
 
-    <div class="cmd-group">
-      <label>Gift Send All</label>
-      <select id="mc-giftall-target" onchange="handleGiftTargetSelect(this, 'mc-giftall-custom-input')">${giftBotOpts}</select>
-      <input type="text" class="gift-custom-input" id="mc-giftall-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
-      <button class="primary sm" onclick="mcGiftSendAll()">Start Queue</button>
-      <button class="sm" onclick="mcStopGiftSendAll()">Stop</button>
-    </div>
+        <div class="cmd-group">
+          <label>Gift Send All</label>
+          <select id="mc-giftall-target" onchange="handleGiftTargetSelect(this, 'mc-giftall-custom-input')">${giftBotOpts}</select>
+          <input type="text" class="gift-custom-input" id="mc-giftall-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
+          <button class="primary sm" onclick="mcGiftSendAll()">Start Queue</button>
+          <button class="sm" onclick="mcStopGiftSendAll()">Stop</button>
+        </div>
 
-    <div class="cmd-group">
-      <label>Gift Queue Status</label>
-      <span id="mc-gift-queue-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
-      <button class="sm" onclick="mcRefreshStorageForGiftSendAll()" title="Refresh storage lists">Refresh</button>
-    </div>
+        <div class="cmd-group">
+          <label>Gift Queue Status</label>
+          <span id="mc-gift-queue-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+          <button class="sm" onclick="mcRefreshStorageForGiftSendAll()" title="Refresh storage lists">Refresh</button>
+        </div>
 
-    <div class="cmd-group">
-      <label>Send Credits</label>
-      <select id="mc-credits-target" onchange="handleGiftTargetSelect(this, 'mc-credits-custom-input')">${giftBotOpts}</select>
-      <input type="text" class="gift-custom-input" id="mc-credits-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
-      <input type="number" id="mc-credits-amount" min="1" value="100" style="width:90px">
-      <button class="sm" onclick="mcSendCredits()">Send</button>
+        <div class="cmd-group">
+          <label>Send Credits</label>
+          <select id="mc-credits-target" onchange="handleGiftTargetSelect(this, 'mc-credits-custom-input')">${giftBotOpts}</select>
+          <input type="text" class="gift-custom-input" id="mc-credits-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
+          <input type="number" id="mc-credits-amount" min="1" value="100" style="width:90px">
+          <button class="sm" onclick="mcSendCredits()">Send</button>
+        </div>
+      </div>
     </div>
 
     <div class="cmd-group">
@@ -6693,6 +6730,31 @@
       <input type="text" id="mc-custom-cmd" placeholder="command" style="min-width:100px">
       <input type="text" id="mc-custom-params" placeholder='{"key":"val"}' style="min-width:160px">
       <button class="primary sm" onclick="mcExecCustom()">Run</button>
+    </div>
+
+    <div class="manual-section ${manualCollapseState.fleetActions ? 'collapsed' : ''}" data-section="fleetActions">
+      <div class="manual-section-header" onclick="toggleManualSection('fleetActions')">
+        <span class="manual-section-title">Fleet Actions</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        <div class="cmd-group">
+          <label>Board Ship</label>
+          <select id="mc-fleet-board-target" onchange="handleGiftTargetSelect(this, 'mc-fleet-board-custom-input')">${fleetBoardOpts}</select>
+          <input type="text" class="gift-custom-input" id="mc-fleet-board-custom-input" placeholder="Player name..." style="display:${hasOtherBots ? "none" : "inline-block"};width:120px;font-size:11px;padding:2px 6px;">
+          <button class="primary sm" onclick="mcFleetBoard()">Board</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Leave Fleet</label>
+          <button class="primary sm" onclick="mcFleetLeave()">Leave Fleet</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Fleet Status</label>
+          <button class="primary sm" onclick="mcFleetStatus()">Status</button>
+        </div>
+      </div>
     </div>
   `;
 
@@ -7231,6 +7293,9 @@
 
                 // Auto-update items for first wreck
                 mcUpdateWreckItems();
+                wrecksScanned = true;
+                manualCollapseState.wreck = false;
+                renderManualControls();
               }
             }
           } else {
@@ -9849,6 +9914,33 @@
           }
         }
         mcExec(cmd, params);
+      }
+
+      function mcFleetBoard() {
+        if (!profileBot) return;
+        const selectEl = document.getElementById("mc-fleet-board-target");
+        const inputEl = document.getElementById("mc-fleet-board-custom-input");
+        let playerId = selectEl ? selectEl.value : "";
+        if (playerId === "__custom__") {
+          playerId = inputEl ? inputEl.value.trim() : "";
+        }
+        if (!playerId) {
+          logResponse(
+            '<span class="resp-err">Select or enter a player name</span>',
+          );
+          return;
+        }
+        mcExec("fleet", { action: "board", player_id: playerId });
+      }
+
+      function mcFleetLeave() {
+        if (!profileBot) return;
+        mcExec("fleet", { action: "leave" });
+      }
+
+      function mcFleetStatus() {
+        if (!profileBot) return;
+        mcExec("fleet", { action: "status" });
       }
 
       // Send exec command and invoke callback with result
@@ -14721,11 +14813,13 @@
       function renderMultiShipList() {
         const listEl = document.getElementById("multi-ship-list");
         const countEl = document.getElementById("multi-ship-count");
+        const loadBtn = document.getElementById("ship-load-multi-btn");
         if (!listEl || !countEl) return;
 
         if (multiShipLoadoutState.ships.length === 0) {
           listEl.innerHTML = '<div style="color:var(--dim);font-size:11px">No ships added. Select ships above to build them together.</div>';
           countEl.textContent = "0";
+          if (loadBtn) loadBtn.disabled = true;
           return;
         }
 
@@ -14746,6 +14840,8 @@
             `;
           })
           .join("");
+
+        if (loadBtn) loadBtn.disabled = false;
       }
 
       function removeMultiShip(index) {
@@ -14883,7 +14979,7 @@
           <div class="craft-limit-name">${esc(itemName)} ${catBadge}</div>
           <div class="craft-limit-detail">Size: ${itemSize} | Base: ${baseValue}cr | Requested: ${req.quantity || 100}</div>
         </div>
-        <input type="number" class="request-item-qty" data-item-id="${esc(req.itemId)}" placeholder="Qty" min="1" value="${req.quantity || 100}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <input type="number" class="request-item-qty" data-item-id="${esc(req.itemId)}" placeholder="Qty" min="1" value="${req.quantity || 100}" style="background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCrafterRequestItem('${esc(req.itemId)}')">✕ Remove</button>
       </div>`;
           })
@@ -16080,7 +16176,7 @@
           <div class="craft-limit-name">${esc(itemName)} ${catBadge}</div>
           <div class="craft-limit-detail">Size: ${itemSize} | Base: ${baseValue}cr ${maxPrice ? `| Max: ${maxPrice}cr` : ""}</div>
         </div>
-        <input type="number" class="trade-buyer-max-price" data-item-id="${esc(itemId)}" placeholder="Max price (cr)" min="0" value="${maxPrice}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <input type="number" class="trade-buyer-max-price" data-item-id="${esc(itemId)}" placeholder="Max price (cr)" min="0" value="${maxPrice}" style="background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeTradeBuyerItem('${esc(itemId)}')">✕ Remove</button>
       </div>`;
           })
@@ -18259,7 +18355,7 @@ When responding:
         <button class="sm" onclick="factionSendGift('${esc(username)}')">Send Gift</button>
       </div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
-        <input type="number" id="faction-credits-amt" value="100" min="1" style="width:100px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <input type="number" id="faction-credits-amt" value="100" min="1" style="width:100px;background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <span style="color:var(--text-dim);font-size:11px">credits for deposit/withdraw/gift</span>
       </div>
     </div>
@@ -18352,7 +18448,7 @@ When responding:
         <select id="faction-dep-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
           ${getFactionDepositOptions(username)}
         </select>
-        <input type="number" id="faction-dep-qty" value="1" min="1" style="width:70px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <input type="number" id="faction-dep-qty" value="1" min="1" style="width:70px;background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <button class="primary sm" onclick="factionDepositItems('${esc(username)}')" ${!docked ? "disabled" : ""}>Deposit</button>
       </div>
     </div>
@@ -18740,7 +18836,7 @@ When responding:
         <input type="text" id="faction-mission-title" placeholder="Mission title" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <textarea id="faction-mission-desc" placeholder="Mission description / objectives" rows="3" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px;resize:vertical"></textarea>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input type="number" id="faction-mission-reward" placeholder="Reward (credits)" min="0" style="width:140px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+          <input type="number" id="faction-mission-reward" placeholder="Reward (credits)" min="0" style="width:140px;background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
           <select id="faction-mission-type" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
             <option value="">Type (optional)</option>
             <option value="combat">Combat</option>
@@ -19163,7 +19259,7 @@ When responding:
           container.innerHTML = `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="faction-wit-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">${opts}</select>
-        <input type="number" id="faction-wit-qty" value="1" min="1" style="width:70px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <input type="number" id="faction-wit-qty" value="1" min="1" style="width:70px;background:#000;color:#fff;border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <button class="primary sm" onclick="factionWithdrawItems('${esc(username)}')">Withdraw</button>
         <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer">
           <input type="checkbox" id="faction-wit-sort" onchange="toggleFactionWithdrawSort('${esc(username)}')"${sortChecked}>
@@ -23391,6 +23487,30 @@ async function fetchPersonalFacilityTypes(username) {
         </label>
       </div>
 
+      <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+        <div class="setting-label" style="margin-bottom:8px">🤝 Miner Coordination</div>
+        <div class="setting-hint" style="margin-bottom:12px">Prevents multiple miners from crowding the same system. Bots announce targets via bot chat and coordinate to spread out.</div>
+        
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Enable Coordination</div>
+            <div class="setting-hint">When enabled, miners coordinate via bot chat to avoid crowding the same systems.</div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="set-miner-enableCoordination"${settings.miner?.enableCoordination !== false ? " checked" : ""} />
+            <span>Enable coordination</span>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Max Bots Per System</div>
+            <div class="setting-hint">Maximum number of miners allowed in the same system simultaneously. Set to 3 by default to allow efficient mining without overcrowding.</div>
+          </div>
+          <input type="number" id="set-miner-maxBotsPerSystem" min="1" max="20" value="${settings.miner?.maxBotsPerSystem ?? 3}" style="width:80px" />
+        </div>
+      </div>
+
       <div class="setting-row">
         <div>
           <div class="setting-label">Harvesting System</div>
@@ -23804,6 +23924,11 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-miner-desiredEmergencyWarpDevices").value,
             ) || 3,
+          enableCoordination: document.getElementById(
+            "set-miner-enableCoordination",
+          ).checked,
+          maxBotsPerSystem:
+            parseInt(document.getElementById("set-miner-maxBotsPerSystem").value) || 3,
 
           // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
           // They are preserved from existing settings when saving from this page

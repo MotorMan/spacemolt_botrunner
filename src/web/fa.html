@@ -11,7 +11,7 @@
     .fa-header h3 { margin: 0 0 4px 0; font-size: 16px; }
     .fa-header p { margin: 0; color: var(--text-dim); font-size: 12px; }
     .fa-controls { flex-shrink: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .fa-controls select { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-size: 13px; min-width: 180px; }
+    .fa-controls select { background: #000; color: #fff; border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-size: 13px; min-width: 180px; }
     .fa-controls button { background: var(--accent); color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
     .fa-controls button:hover { opacity: 0.9; }
     .fa-controls button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -99,11 +99,11 @@
       <button class="fa-cat-btn" data-cat="achievement" style="background:#1a1a2e;color:#555;border-color:#333;">achievement</button>
       <button class="fa-cat-btn" data-cat="other" style="background:#1a1a2e;color:#555;border-color:#333;">other</button>
     </div>
-    <select id="faEventTypeSelect" style="display:none;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;min-width:140px;" title="Filter by event type">
+    <select id="faEventTypeSelect" style="display:none;background:#000;color:#fff;border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;min-width:140px;" title="Filter by event type">
       <option value="">event type</option>
     </select>
-    <input type="number" id="faStartPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Start page">
-    <input type="number" id="faPageCountInput" value="1" min="1" max="10" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Number of pages">
+    <input type="number" id="faStartPageInput" value="1" min="1" style="width:50px;background:#000;color:#fff;border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Start page">
+    <input type="number" id="faPageCountInput" value="1" min="1" max="10" style="width:50px;background:#000;color:#fff;border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Number of pages">
     <button id="faLoadBtn" onclick="loadActionLog()">Load Log</button>
     <button id="faLoadPagesBtn" onclick="loadMultiplePages()">Load Pages</button>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faLoadAllBots" style="width:14px;height:14px;">Load all bots</label>

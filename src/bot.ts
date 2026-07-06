@@ -1621,8 +1621,11 @@ async refreshSkills(): Promise<ApiResponse> {
 
     await ensureInsured(ctx);
 
+    const generator = routine(ctx);
     try {
-      for await (const stateName of routine(ctx)) {
+      while (true) {
+        const { value: stateName, done } = await generator.next();
+        if (done) break;
         if ((this._state as BotState) === "stopping") {
           this.log("system", `Stopped during state: ${stateName}`);
           break;
@@ -1638,6 +1641,8 @@ async refreshSkills(): Promise<ApiResponse> {
       // Re-throw so the caller's .catch() handler fires, ensuring the bot
       // assignment is cleared and "crashed" is logged rather than "finished".
       throw err;
+    } finally {
+      await generator.return(undefined);
     }
 
     this._state = "idle";

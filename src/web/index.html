@@ -15418,6 +15418,7 @@
         const stationPriority = t.stationPriority ?? false;
         const sellAllItems = t.sellAllItems ?? false;
         const creditsToHold = t.creditsToHold ?? 10000;
+        const disableCreditDeposit = t.disableCreditDeposit ?? false;
 
         // Category trade settings with defaults
         const categoryTrade = t.categoryTrade || [];
@@ -15583,6 +15584,17 @@
         <div class="setting-hint">Minimum credits the bot keeps before donating profit to faction treasury. After each sale, excess credits above this amount are donated.</div>
       </div>
       <input type="number" id="set-faction_trader-creditsToHold" min="0" max="10000000" value="${creditsToHold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Disable Credit Deposit</div>
+        <div class="setting-hint">When enabled, the bot keeps all earned credits instead of depositing excess credits (above Credits to Hold) to the faction treasury.</div>
+      </div>
+      <select id="set-faction_trader-disableCreditDeposit">
+        <option value="false" ${!disableCreditDeposit ? "selected" : ""}>Disabled</option>
+        <option value="true" ${disableCreditDeposit ? "selected" : ""}>Enabled</option>
+      </select>
     </div>
 
     <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
@@ -15856,6 +15868,9 @@
             parseInt(
               document.getElementById("set-faction_trader-creditsToHold").value,
             ) || 10000,
+          disableCreditDeposit:
+            document.getElementById("set-faction_trader-disableCreditDeposit")
+              .value === "true",
         };
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;

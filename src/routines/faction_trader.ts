@@ -83,6 +83,7 @@ function getFactionTraderSettings(username?: string): {
   categoryTrade: CategoryTradeConfig[];
   sellAllItems: boolean;
   creditsToHold: number;
+  disableCreditDeposit: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -135,6 +136,7 @@ function getFactionTraderSettings(username?: string): {
     categoryTrade,
     sellAllItems: (t.sellAllItems as boolean) || false,
     creditsToHold: (t.creditsToHold as number) || 10000,
+    disableCreditDeposit: (t.disableCreditDeposit as boolean) || false,
   };
 }
 
@@ -2214,14 +2216,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Deposit excess credits: keep only creditsToHold, deposit rest to faction ──
     yield "deposit_credits";
-    const BOT_WORKING_BALANCE = settings.creditsToHold || 10_000;
-    if (bot.credits > BOT_WORKING_BALANCE) {
-      const excessCredits = bot.credits - BOT_WORKING_BALANCE;
-      //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-      const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: excessCredits }); //fixed by human!
-      if (!depositResp.error) {
-        ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
-        logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);
+    if (settings.disableCreditDeposit) {
+      ctx.log("trade", `Credit deposit to faction storage disabled — keeping ${bot.credits}cr`);
+    } else {
+      const BOT_WORKING_BALANCE = settings.creditsToHold || 10_000;
+      if (bot.credits > BOT_WORKING_BALANCE) {
+        const excessCredits = bot.credits - BOT_WORKING_BALANCE;
+        //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: excessCredits }); //fixed by human!
+        if (!depositResp.error) {
+          ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
+          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);
+        }
       }
     }
   }

@@ -3152,10 +3152,8 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
-  // We are not insured and have a quote. Inform the user.
-  ctx.log("insurance", `Insurance quote: ${cost}cr. Purchase manually if desired.`);
-  // Do not buy automatically; leave it to the user.
-  return;
+  // We are not insured and have a valid quote — buy insurance automatically.
+  await buyInsurance(ctx);
 }
 
 export async function buyInsurance(ctx: RoutineContext): Promise<void> {

@@ -424,9 +424,50 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
+  // Double-check: verify the bot is actually docked before ending the routine.
+  // If not docked (e.g. dock call silently failed or bot got undocked), actually dock.
+  await bot.refreshLocation();
+  if (!bot.docked) {
+    ctx.log("warn", "Double-check: bot is not docked after routine — re-attempting dock...");
+    const MAX_DOCK_CHECK_ATTEMPTS = 3;
+    let docked = false;
+    for (let dockAttempt = 1; dockAttempt <= MAX_DOCK_CHECK_ATTEMPTS && !docked; dockAttempt++) {
+      ctx.log("system", `Dock double-check attempt ${dockAttempt}/${MAX_DOCK_CHECK_ATTEMPTS}...`);
+      docked = await ensureDocked(ctx, true);
+      if (!docked) {
+        await bot.refreshLocation();
+        if (bot.docked) {
+          docked = true;
+          break;
+        }
+        if (dockAttempt < MAX_DOCK_CHECK_ATTEMPTS) {
+          await ctx.sleep(3000);
+        }
+      }
+    }
+    if (!docked) {
+      ctx.log("error", "Double-check failed: bot could not be docked at home station — routine cancelled");
+      return; // Cancel routine
+    }
+
+    // After successful re-dock, ensure repair/refuel completed
+    await bot.refreshShip();
+    const reDockedHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (reDockedHullPct < 95) {
+      ctx.log("system", `Hull at ${reDockedHullPct}% — repairing after re-dock...`);
+      await repairShip(ctx);
+    }
+    const reDockedFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (reDockedFuelPct < refuelThreshold) {
+      ctx.log("system", `Fuel at ${reDockedFuelPct}% — refueling after re-dock...`);
+      await ensureFueled(ctx, refuelThreshold);
+      await ensureDocked(ctx, true);
+    }
+  }
+
   // Final status
   await bot.refreshLocation();
-  ctx.log("travel", `Return Home complete — docked at ${targetStation.name} in ${homeSystem}`);
+  ctx.log("travel", `Return Home complete — docked at ${bot.poi} in ${homeSystem}`);
   ctx.log("info", `Bot status: ${bot.credits} credits, ${bot.fuel}/${bot.maxFuel} fuel, ${bot.hull}/${bot.maxHull} hull`);
 
   // Routine complete — return to cancel it (no loop)

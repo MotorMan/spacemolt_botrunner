@@ -2020,8 +2020,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
    // ── Mining session recovery ──
    const activeSession = getActiveMiningSession(bot.username);
-   let recoveredSession: MiningSession | null = null;
+    let recoveredSession: MiningSession | null = null;
   let sessionWasReturningHome = false;
+  // Last time we refreshed our coordination registration (heartbeat) while resuming a session
+  let lastCoordinationHeartbeat = 0;
   if (activeSession) {
     ctx.log("mining", `Found incomplete mining session: ${activeSession.targetResourceName} (${activeSession.state})`);
     
@@ -2633,6 +2635,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         let shouldAbandon = false;
         let reason = "";
 
+        // (1) Register our current system with coordination on resume so the per-system
+        //     bot count reflects reality. Without this, recovered sessions never re-register
+        //     (the registration only happens on fresh target selection), so the cap is never
+        //     enforced against the already-deployed fleet. Throttled to a 60s heartbeat so we
+        //     don't rewrite the coordination file on every loop.
+        if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && bot.username && recoveredSession.targetSystemId) {
+          const now = Date.now();
+          if (now - lastCoordinationHeartbeat > 60000) {
+            registerCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+            lastCoordinationHeartbeat = now;
+          }
+        }
+
         // If there's a priority target (global or quota) that differs from session target, abandon session
         if (priorityTarget && sessionTarget !== priorityTarget) {
           shouldAbandon = true;
@@ -2662,6 +2677,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               shouldAbandon = true;
               reason = `quota met for ${sessionTarget} (${sessionCurrent}/${sessionQuota}) — switching to next deficit`;
             }
+          }
+        }
+
+        // (2) Coordination: if the recovered session's system is already at/over the per-system
+        //     bot cap, abandon the session so this bot relocates to a non-overcrowded system.
+        //     Self is excluded from the count, so only the 4th+ bot occupying a system relocates.
+        if (!shouldAbandon && settings.enableCoordination && settings.maxBotsPerSystem > 0 && bot.username) {
+          if (isSystemOvercrowded(recoveredSession.targetSystemId, settings.maxBotsPerSystem, bot.username)) {
+            shouldAbandon = true;
+            reason = `coordination: system ${recoveredSession.targetSystemId} over capacity (max ${settings.maxBotsPerSystem} bots per system)`;
           }
         }
 

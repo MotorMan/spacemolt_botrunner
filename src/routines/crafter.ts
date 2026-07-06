@@ -1112,14 +1112,14 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    if (allPlanItems.length === 0) {
-      ctx.log("info", "No crafting goals to execute");
-      await ctx.sleep(60000);
-      continue;
-    }
+if (allPlanItems.length === 0) {
+       ctx.log("info", "No crafting goals to execute");
+       await ctx.sleep(60000);
+       continue;
+     }
 
-    ctx.log("craft", `Executing queue-based plan (${settings.goalProcessingMode} mode)`);
-    const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold);
+     ctx.log("craft", `Executing queue-based plan (${settings.goalProcessingMode} mode)`);
+     const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem);
     const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];

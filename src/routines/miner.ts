@@ -8,6 +8,7 @@ import {
   registerMinerTarget as registerCoordinationTarget,
   unregisterMinerTarget as unregisterCoordinationTarget,
   getMinerCountForSystem,
+  isSystemOvercrowded,
 } from "./minerCoordination.js";
 import {
   isOreBeltPoi,
@@ -864,6 +865,19 @@ function isStripMinerOre(oreId: string): boolean {
 function getTotalMiningPower(modules: unknown[]): number {
   let totalPower = 0;
 
+  const MINING_PREFIXES = [
+    "mining_laser",
+    "strip_miner",
+    "rad_harvester",
+    "ice_harvester",
+    "gas_harvester",
+    "deep_core_extractor",
+  ];
+
+  function toSnakeCase(str: string): string {
+    return str.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
+  }
+
   for (const mod of modules) {
     const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
     if (!modObj) continue;
@@ -874,11 +888,28 @@ function getTotalMiningPower(modules: unknown[]): number {
     const modSpecial = ((modObj.special as string) || "").toLowerCase();
 
     const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`;
-    if (!checkStr.includes("mining") && !checkStr.includes("mineral") && !checkStr.includes("harvesting") && !checkStr.includes("extractor")) continue;
+    const isMiningModule = MINING_PREFIXES.some(prefix => checkStr.includes(prefix));
+    if (!isMiningModule) continue;
 
-    const catalogEntry = catalogStore.getItem(modId) ||
-      (modObj.type_id ? catalogStore.getItem(modObj.type_id as string) : undefined) ||
-      (modName ? catalogStore.getItemByName(modName) : undefined);
+    let catalogEntry = (modName ? catalogStore.getItemByName(modName) : undefined) ||
+      catalogStore.getItem(modId) ||
+      (modObj.type_id ? catalogStore.getItem(modObj.type_id as string) : undefined);
+
+    if (!catalogEntry && modName) {
+      const snake = toSnakeCase(modName);
+      catalogEntry = catalogStore.getItem(snake);
+    }
+
+    if (!catalogEntry) {
+      for (const item of Object.values(catalogStore.getAll().items)) {
+        const itemName = (item.name || "").toLowerCase();
+        if (itemName && modName && itemName.includes(modName)) {
+          catalogEntry = item;
+          break;
+        }
+      }
+    }
+
     const power =
       (catalogEntry?.mining_power as number) ??
       (modObj.mining_power as number) ??
@@ -1307,7 +1338,7 @@ export function findFirstAvailableQuotaTarget(
     // No depletion filtering - trust the map data
     const depletionFiltered = poiFiltered;
 
-    // Apply power filter to ensure locations aren't rejected later as "too sparse"
+// Apply power filter to ensure locations aren't rejected later as "too sparse"
     const powerFiltered = depletionFiltered.filter((loc: any) => {
       // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
       // This prevents high-power miners from wasting time on low-density deposits
@@ -1406,13 +1437,11 @@ function findMiningPoi(
       if (!resourceEntry) return false;
       // Check resources depletion
       if (!resourceEntry.depleted) return true;
-      if (!depletionTimeoutMs) return true;
       return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
     }
     
     // Fall back to ores_found (from mining history)
     if (!oreEntry) return false;
-    if (!depletionTimeoutMs) return true;
     if (!oreEntry.depleted) return true;
     return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
   };
@@ -1812,12 +1841,12 @@ function findBestHiddenPoiForOre(
 
   // Score and sort by distance and richness
   const scored = locations
-    .map(loc => {
-      const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
-      return { ...loc, jumps: route ? route.length - 1 : 999 };
-    })
-    .filter(loc => loc.jumps <= maxJumps)
-    .sort((a, b) => {
+.map(loc => {
+       const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
+       return { ...loc, jumps: route ? route.length - 1 : 999 };
+     })
+     .filter(loc => loc.jumps <= maxJumps)
+     .sort((a, b) => {
       // Prefer current system
       if (a.systemId === currentSystem && b.systemId !== currentSystem) return -1;
       if (b.systemId === currentSystem && a.systemId !== currentSystem) return 1;
@@ -2851,13 +2880,13 @@ if (shouldAbandon) {
 
             if (locations.length > 0) {
               // Score locations and pick best one
-              const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
-                .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
-                .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                  return { ...loc, jumps: route ? route.length - 1 : 999 };
-                })
-          .filter(loc => loc.jumps <= maxJumps || isDeepCoreOre(effectiveTarget));
+const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
+                 .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+                 .map(loc => {
+                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                   return { ...loc, jumps: route ? route.length - 1 : 999 };
+                 })
+             .filter(loc => loc.jumps <= maxJumps || isDeepCoreOre(effectiveTarget));
 
               if (scoredLocations.length > 0) {
                 const chosen = scoredLocations[0];
@@ -3055,24 +3084,30 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
         if (!oreEntry?.depleted) return true;
-        // Depleted but expired - can re-check
-        return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-      }).filter(loc => {
-        // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-        // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
-        const hasScanData = loc.minutesSinceScan !== Infinity;
-        const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-        if (isLowRemainingWithUnknownPower) {
-          return false;
-        }
-        // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-          return false;
-        }
-        return true;
-      });
+// Depleted but expired - can re-check
+         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+       }).filter(loc => {
+         // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+         // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+         const hasScanData = loc.minutesSinceScan !== Infinity;
+         const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+         if (isLowRemainingWithUnknownPower) {
+           return false;
+         }
+         // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+         if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+           return false;
+         }
+         // Coordination: reject systems that are already at max bot capacity
+         if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+           if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+             return false;
+           }
+         }
+         return true;
+       });
 
-      const afterPoiFilter = allLocations.filter(loc => {
+       const afterPoiFilter = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true;
@@ -3113,12 +3148,18 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         if (isLowRemainingWithUnknownPower) {
           return false;
         }
-        // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-          return false;
-        }
-        return true;
-      });
+// Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+               if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                 return false;
+               }
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   return false;
+                 }
+               }
+               return true;
+             });
 
       if (locations.length === 0) {
         const debugLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
@@ -3295,8 +3336,18 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               const jumps = route ? route.length - 1 : -1;
               return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
-            .filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
-.sort((a, b) => {
+.filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
+             .filter(loc => {
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   ctx.log("coordination", `Skipping ${loc.poiName} in ${loc.systemId} — already at max ${settings.maxBotsPerSystem} miners`);
+                   return false;
+                 }
+               }
+               return true;
+             })
+             .sort((a, b) => {
                if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
                if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
                const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
@@ -3383,11 +3434,20 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               continue;
             }
             
-            // Check if any locations are within range
-            const allAltLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0);
-            const altScoredLocations = allAltLocations
-              .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
-              .map(loc => {
+// Check if any locations are within range
+             const allAltLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0);
+             const altScoredLocations = allAltLocations
+               .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+               .filter(loc => {
+                 // Coordination: reject systems that are already at max bot capacity
+                 if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                   if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                     return false;
+                   }
+                 }
+                 return true;
+               })
+               .map(loc => {
                 const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
                 const jumps = route ? route.length - 1 : 999;
                 return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
@@ -4004,24 +4064,30 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               (poi?.hidden && canMineHiddenRadioactive)
             );
           }
-          if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
-          if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
-          return true;
-}).filter(loc => {
-           // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-           // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
-           const hasScanData = loc.minutesSinceScan !== Infinity;
-           const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-           if (isLowRemainingWithUnknownPower) {
-             return false;
-           }
-           // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-           if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-             return false;
-           }
-           // No depletion filtering - trust the map data
+if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
            return true;
-         });
+ }).filter(loc => {
+            // Coordination: reject systems that are already at max bot capacity
+            if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+              if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                return false;
+              }
+            }
+            // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+            // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+            const hasScanData = loc.minutesSinceScan !== Infinity;
+            const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+            if (isLowRemainingWithUnknownPower) {
+              return false;
+            }
+            // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+            if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+              return false;
+            }
+            // No depletion filtering - trust the map data
+            return true;
+          });
 
         ctx.log("debug", `[BROADER_SEARCH] raw=${broaderLocationsRaw.length} afterPOIType+depletion=${broaderLocations.length} searchTarget=${searchTarget} miningType=${miningType}`);
 
@@ -4037,8 +4103,17 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
               return { ...loc, jumps: route ? route.length - 1 : 999 };
             })
-            .filter(loc => loc.jumps <= maxJumps)
-            .sort((a, b) => {
+.filter(loc => loc.jumps <= maxJumps)
+             .filter(loc => {
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   return false;
+                 }
+               }
+               return true;
+             })
+             .sort((a, b) => {
               if (configuredSystem && a.systemId === configuredSystem && b.systemId !== configuredSystem) return -1;
               if (configuredSystem && b.systemId === configuredSystem && a.systemId !== configuredSystem) return -1;
               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
@@ -6453,7 +6528,8 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                  if (miningType === "gas" && !r.resource_id.toLowerCase().includes("gas")) return false;
                  if (miningType === "ore" && (r.resource_id.toLowerCase().includes("gas") || r.resource_id.toLowerCase().includes("ice"))) return false;
                  if (r.remaining <= 0 && r.max_remaining > 0) return false;
-                 if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
+         if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
+         if (r.depleted && !isDepletionExpired(r.depleted_at, depletionTimeoutMs)) return false;
                  if (r.supported_power && r.supported_power > 0 && totalMiningPower > r.supported_power * 4) return false;
                  return true;
                });

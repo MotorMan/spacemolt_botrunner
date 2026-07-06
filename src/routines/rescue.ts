@@ -1537,7 +1537,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
   creditTopOffRoutineActive = true;
   ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
 
-  const intervalMs = 60 * 1000; // 1 minute
+  const intervalMs = 30 * 1000; // .1 minute
 
   const loop = async () => {
     try {

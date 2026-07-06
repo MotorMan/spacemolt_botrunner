@@ -452,7 +452,7 @@ enableFighting: boolean;
 }> {
   const all = readSettings();
   const m = all.miner || {};
-  const flockCfg = await readFlockSettings();
+  const flockCfg = (await readFlockSettings()) || { assignments: {}, flockGroups: [] };
   let botOverrides = username ? (all[username] || {}) : {};
 
   if (username && flockCfg.assignments[username]) {
@@ -1278,6 +1278,7 @@ export function findFirstAvailableQuotaTarget(
   excludeTargets?: string | string[],
   skipPirateSystems?: boolean,
   totalMiningPower?: number,
+  botUsername?: string,
 ): string {
   const excludeSet = new Set<string>();
   if (excludeTargets) {
@@ -1338,7 +1339,7 @@ export function findFirstAvailableQuotaTarget(
     // No depletion filtering - trust the map data
     const depletionFiltered = poiFiltered;
 
-// Apply power filter to ensure locations aren't rejected later as "too sparse"
+  // Apply power filter to ensure locations aren't rejected later as "too sparse"
     const powerFiltered = depletionFiltered.filter((loc: any) => {
       // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
       // This prevents high-power miners from wasting time on low-density deposits
@@ -1350,6 +1351,11 @@ export function findFirstAvailableQuotaTarget(
       // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
       if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
         return false;
+      }
+      if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+        if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
+          return false;
+        }
       }
       return true;
     });
@@ -1376,7 +1382,9 @@ function pickTargetFromQuotasOrClosest(
   factionStorage: Array<{ itemId: string; quantity: number }>,
   miningType: "ore" | "gas" | "ice" | "radioactive",
   mapStore: any,
-  totalMiningPower: number = 0
+  totalMiningPower: number = 0,
+  settings?: Awaited<ReturnType<typeof getMinerSettings>>,
+  botUsername?: string,
 ): { target: string; hasDeficit: boolean } {
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
 
@@ -1385,12 +1393,29 @@ function pickTargetFromQuotasOrClosest(
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     
-    // Check if this ore has viable locations (not filtered out by power constraints)
+    // Check if this ore has viable locations using the same filters as the main location search
+    // This prevents picking targets that will fail when actually searching for POIs
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
     const hasViableLocations = rawLocations.some((loc: any) => {
-      if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+      // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+      const hasScanData = loc.minutesSinceScan !== Infinity;
+      const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+      if (isLowRemainingWithUnknownPower) {
         return false;
       }
+      
+      // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+      if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        return false;
+      }
+      
+      // Coordination: reject systems that are already at max bot capacity
+      if (settings && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+        if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
+          return false;
+        }
+      }
+      
       return true;
     });
     
@@ -1945,9 +1970,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // ── Cache ship modules at routine start ──
    // This avoids repeated get_ship calls that may return incomplete data
    // when the server is still processing (e.g. after a jump timeout).
-   let cachedModules: unknown[] | null = await cacheShipModules(ctx);
+    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
-   // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
+    // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
    // This handles the case where get_ship returns empty data due to server lag
    if (!cachedModules || cachedModules.length === 0) {
      ctx.log("warn", "Ship modules empty at startup — waiting for server to process...");
@@ -1973,10 +1998,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let lastEscortLocationBroadcast = 0;
 
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
-   ctx.log("miner", "Refreshing faction storage at startup...");
-   await bot.refreshFactionStorage();
+    ctx.log("miner", "Refreshing faction storage at startup...");
+    await bot.refreshFactionStorage();
 
-   // ── Wait for map to be seeded if needed ──
+    // ── Wait for map to be seeded if needed ──
    // The galaxy map is seeded asynchronously from the public API.
    // If the map is empty, we need to wait for it to be populated.
    if (!mapStore.isMapSeeded()) {
@@ -2095,7 +2120,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (weapons.length > 0) {
         ctx.log("mining", `Startup: checking ammo for ${weapons.length} weapon(s) at dock`);
         
-        // If at home system, resupply from faction storage first
         if (bot.system === homeSystem) {
           await ensureMinerResupply(ctx);
         }
@@ -2110,7 +2134,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     while (bot.state === "running") {
       // ── Death recovery ──
       const alive = await detectAndRecoverFromDeath(ctx);
-      if (!alive) { await ctx.sleep(30000); continue; }
+      if (!alive) { yield "death_recovery_wait"; await ctx.sleep(30000); continue; }
 
       // ── Refresh cached ship modules after death recovery ──
       // (modules could change if ship was destroyed and replaced)
@@ -2566,7 +2590,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
        if (bot.docked && bot.system === homeSystem) {
-         const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower);
+          const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username);
          quotaTargetResource = quotaResult.target;
          quotaHasDeficit = quotaResult.hasDeficit;
          if (quotaResult.target) {
@@ -3208,10 +3232,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
 
 // Ignore depletion for alternative targets to allow selection of POIs that may have respawned
-           const availableQuotaTarget = findFirstAvailableQuotaTarget(
-             quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-             canMineHiddenRadioactive, canMineHiddenIce, undefined, true, totalMiningPower
-           );
+            const availableQuotaTarget = findFirstAvailableQuotaTarget(
+              quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+              canMineHiddenRadioactive, canMineHiddenIce, originalTarget, true, totalMiningPower, bot.username
+            );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
             ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
@@ -4034,7 +4058,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const excludeTarget = effectiveTarget ? [effectiveTarget] : undefined;
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower
+            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username
           );
           if (newTarget && newTarget !== effectiveTarget) {
             searchTarget = newTarget;

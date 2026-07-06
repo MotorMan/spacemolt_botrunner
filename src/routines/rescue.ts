@@ -29,6 +29,7 @@ import {
 } from "./common.js";
 import { getNextMayday, markMaydayHandled, clearMaydayQueue, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
+import { tryClaimMayday, getMaydayLockHolder, releaseMayday } from "../maydayLock.js";
 import {
   isRescueHandled,
   parseRescueAnnouncement,
@@ -114,6 +115,9 @@ function getRescueSettings(): {
   creditTopOffBot: string;
   fleetRescueBot: string;
   maydayRescueBot: string;
+  creditTopOffEnabled: boolean;
+  fleetRescueEnabled: boolean;
+  maydayRescueEnabled: boolean;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
   ignoreBlacklist: boolean;
@@ -142,6 +146,12 @@ function getRescueSettings(): {
     creditTopOffBot: (r.creditTopOffBot as string) || '',
     fleetRescueBot: (r.fleetRescueBot as string) || '',
     maydayRescueBot: (r.maydayRescueBot as string) || '',
+    // Enable/disable flags for each capability. Default to TRUE so existing
+    // configs (which only used the *_RescueBot assignment fields) keep working.
+    // Set any of these to false to completely disable that capability on every bot.
+    creditTopOffEnabled: (r.creditTopOffEnabled as boolean) ?? true,
+    fleetRescueEnabled: (r.fleetRescueEnabled as boolean) ?? true,
+    maydayRescueEnabled: (r.maydayRescueEnabled as boolean) ?? true,
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
     ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
@@ -162,30 +172,33 @@ function isPrimaryCreditTopOffBot(botUsername: string): boolean {
 
 /**
  * Check if this bot should ONLY run credit top-off (no rescue operations).
- * Returns true if:
- * - This bot is the primary credit top-off bot, AND
- * - Fleet rescue bot is empty/none/different, AND
- * - MAYDAY rescue bot is empty/none/different
- * This allows a bot to be dedicated to credit top-off without doing actual rescues.
+ * Returns true if credit top-off is enabled for this bot AND neither fleet nor
+ * MAYDAY rescue is enabled for this bot. This lets a bot be dedicated to a
+ * single task. Respects both the explicit enable flags and the per-bot
+ * assignment fields.
  */
 function shouldOnlyCreditTopOff(botUsername: string): boolean {
   const settings = getRescueSettings();
-  
-  // Must be the primary credit top-off bot
-  if (!settings.creditTopOffBot || botUsername !== settings.creditTopOffBot) {
+
+  // Credit top-off must be enabled and this bot must be the assigned primary.
+  if (!isCreditTopOffEnabledFor(botUsername)) {
     return false;
   }
-  
-  // If no fleet rescue bot is assigned (or it's a different bot), we're not doing fleet rescues
-  const fleetBotEmpty: boolean = !settings.fleetRescueBot || settings.fleetRescueBot === 'none' || settings.fleetRescueBot === '';
-  const fleetBotDifferent: boolean = !!(settings.fleetRescueBot && settings.fleetRescueBot !== botUsername);
-  
-  // If no mayday rescue bot is assigned (or it's a different bot), we're not doing mayday rescues
-  const maydayBotEmpty: boolean = !settings.maydayRescueBot || settings.maydayRescueBot === 'none' || settings.maydayRescueBot === '';
-  const maydayBotDifferent: boolean = !!(settings.maydayRescueBot && settings.maydayRescueBot !== botUsername);
-  
-  // We should only do credit top-off if we're NOT the fleet or mayday rescue bot
-  return (fleetBotEmpty || fleetBotDifferent) && (maydayBotEmpty || maydayBotDifferent);
+
+  // Fleet rescue is "enabled for this bot" if the global flag is on AND this
+  // bot is the fleet primary (or the primary is busy, i.e. we'd cover for it).
+  const fleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+  const fleetForThisBot =
+    !!settings.fleetRescueEnabled &&
+    (isPrimaryFleetRescueBot(botUsername) || fleetBusy);
+
+  const maydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+  const maydayForThisBot =
+    !!settings.maydayRescueEnabled &&
+    (isPrimaryMaydayRescueBot(botUsername) || maydayBusy);
+
+  // Only credit top-off when neither fleet nor MAYDAY is enabled for this bot.
+  return !fleetForThisBot && !maydayForThisBot;
 }
 
 /**
@@ -210,6 +223,29 @@ function isPrimaryMaydayRescueBot(botUsername: string): boolean {
     return true;
   }
   return botUsername === settings.maydayRescueBot;
+}
+
+/**
+ * Whether credit top-off is ENABLED for this bot.
+ * Combines the global enable flag with the primary-credit-bot assignment.
+ */
+function isCreditTopOffEnabledFor(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  return !!settings.creditTopOffEnabled && isPrimaryCreditTopOffBot(botUsername);
+}
+
+/**
+ * Whether FLEET rescue is globally enabled in settings.
+ */
+function isFleetRescueEnabledSetting(): boolean {
+  return !!getRescueSettings().fleetRescueEnabled;
+}
+
+/**
+ * Whether MAYDAY rescue is globally enabled in settings.
+ */
+function isMaydayRescueEnabledSetting(): boolean {
+  return !!getRescueSettings().maydayRescueEnabled;
 }
 
 /**
@@ -1699,10 +1735,10 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
   // ── Start background credit top-off loop (non-blocking) ──
   // Only the primary credit top-off bot should run this background loop
-  if (isPrimaryCreditTopOffBot(bot.username)) {
+   if (isCreditTopOffEnabledFor(bot.username)) {
     startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
   } else {
-    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+    ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
   }
 
   // ── Register Bot Chat handler for rescue cooperation ──
@@ -1895,42 +1931,50 @@ skipToReturnHome = true;
        }
 
         // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-      if (!isFleetRescuePrimary) {
-        const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
-        ctx.log("rescue", primaryFleetBusy
-          ? `🤝 Primary fleet bot is busy, covering fleet rescues`
-          : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-      }
+       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+       const fleetRescueEnabled = isFleetRescueEnabledSetting();
+       if (!fleetRescueEnabled) {
+         ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+       } else if (!isFleetRescuePrimary) {
+         const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+         ctx.log("rescue", primaryFleetBusy
+           ? `🤝 Primary fleet bot is busy, covering fleet rescues`
+           : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
+       }
 
-      const targets = (!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
-        ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-        : isFleetRescuePrimary
-          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-          : [];
+       const targets = fleetRescueEnabled
+         ? ((!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
+             ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+             : isFleetRescuePrimary
+               ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+               : [])
+         : [];
 
-      // Clean up stale queue entries
-      cleanupStaleQueue();
+       // Clean up stale queue entries
+       cleanupStaleQueue();
 
-      // ── Check for MAYDAY requests if no fleet targets ──
-      // Check if we're the primary MAYDAY rescue bot
-      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-      if (!isMaydayRescuePrimary) {
-        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-        if (!primaryMaydayBusy) {
-          ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-        }
-      }
+       // ── Check for MAYDAY requests if no fleet targets ──
+       // Check if we're the primary MAYDAY rescue bot
+       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+       const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+       if (!maydayRescueEnabled) {
+         ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+       } else if (!isMaydayRescuePrimary) {
+         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+         if (!primaryMaydayBusy) {
+           ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+         }
+       }
 
-      let maydayTarget: RescueTarget | null = null;
-      if (targets.length === 0) {
-        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-        const shouldProcessMayday = isMaydayRescuePrimary || primaryMaydayBusy;
+       let maydayTarget: RescueTarget | null = null;
+       if (targets.length === 0) {
+         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+         const shouldProcessMayday = maydayRescueEnabled && (isMaydayRescuePrimary || primaryMaydayBusy);
 
         if (!shouldProcessMayday) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
-            markMaydayHandled(ignoredMayday);
+            ctx.log("mayday", `📡 Not the primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - leaving MAYDAY from ${ignoredMayday.sender} for the primary bot`);
             await ctx.sleep(5000);
             continue;
           }
@@ -2204,6 +2248,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          // ── CROSS-PROCESS MAYDAY CLAIM LOCK: only ONE bot may launch a given MAYDAY ──
+          // Prevents the dedicated MAYDAY bot and a backup rescue bot from BOTH responding
+          // to the same distress call. Whichever bot wins the atomic claim proceeds; the
+          // other yields immediately so the two bots cooperate instead of both going out.
+          if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+            const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+            ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+            markMaydayHandled(mayday);
+            continue;
+          }
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
@@ -2243,6 +2297,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const decision = shouldProceedOrYield(myClaim, partnerClaim);
               if (decision === "yield") {
                 ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
                 maydayTarget = null; // Cancel this rescue
                 markMaydayHandled(mayday);
                 continue;
@@ -2499,6 +2554,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      if (isMaydayTarget) {
+        // Hand off exclusive ownership to the durable rescue session so the
+        // per-MAYDAY lock file is freed for future distress calls.
+        releaseMayday(target.username, target.system, target.poi, bot.username);
+      }
       ctx.log("rescue", `Created rescue session for ${target.username}`);
     }
 
@@ -3990,6 +4050,17 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
+  // ── MAYDAY enable gate ──
+  // If MAYDAY rescue is disabled in settings, this dedicated routine does
+  // nothing (it exists solely to answer distress calls).
+  if (!isMaydayRescueEnabledSetting()) {
+    ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - this routine will idle`);
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    return;
+  }
+
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
@@ -4257,6 +4328,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     
     ctx.log("mayday", `✓ Jump check passed: ${jumpsToTarget} jumps (limit: ${maxJumps})`);
 
+    // ── CROSS-PROCESS MAYDAY CLAIM LOCK: ensure only this bot launches the MAYDAY ──
+    // Defers to any other bot that already claimed this distress call, so the
+    // dedicated MAYDAY bot and a backup rescue bot cannot both fly out to it.
+    if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+      const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+      ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+      markMaydayHandled(mayday);
+      await ctx.sleep(5000);
+      continue;
+    }
+
     // ── Create rescue session if starting new mission ──
     if (!recoveredSession) {
       const session: RescueSession = {
@@ -4273,6 +4355,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
       ctx.log("mayday", `Created MAYDAY rescue session for ${mayday.sender}`);
     }
 
@@ -4817,10 +4900,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
 // ── Start background credit top-off loop (non-blocking) ──
     // Only the primary credit top-off bot should run this background loop
-    if (isPrimaryCreditTopOffBot(bot.username)) {
+    if (isCreditTopOffEnabledFor(bot.username)) {
       startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
     } else {
-      ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+      ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
     }
 
     // ── Start background faction storage update loop (non-blocking) ──
@@ -5049,53 +5132,61 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-      if (!isFleetRescuePrimary) {
-        const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
-        ctx.log("rescue", primaryFleetBusy
-          ? `🤝 Primary fleet bot is busy, covering fleet rescues`
-          : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-      }
+       // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
+       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+       const fleetRescueEnabled = isFleetRescueEnabledSetting();
+       if (!fleetRescueEnabled) {
+         ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+       } else if (!isFleetRescuePrimary) {
+         const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+         ctx.log("rescue", primaryFleetBusy
+           ? `🤝 Primary fleet bot is busy, covering fleet rescues`
+           : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
+       }
 
-      let targets = (!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
-        ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-        : isFleetRescuePrimary
-          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-          : [];
+       let targets = fleetRescueEnabled
+         ? ((!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
+             ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+             : isFleetRescuePrimary
+               ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+               : [])
+         : [];
 
-      // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
-      const now = Date.now();
-      targets = targets.filter(t => {
-        const expiry = ownBotRescueCooldown.get(t.username);
-        if (expiry && expiry > now) {
-          return false;
-        }
-        return true;
-      });
+       // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
+       const now = Date.now();
+       targets = targets.filter(t => {
+         const expiry = ownBotRescueCooldown.get(t.username);
+         if (expiry && expiry > now) {
+           return false;
+         }
+         return true;
+       });
 
-      // Clean up stale queue entries
-      cleanupStaleQueue();
+       // Clean up stale queue entries
+       cleanupStaleQueue();
 
-      // ── Check for MAYDAY requests if no fleet targets ──
-      // Check if we're the primary MAYDAY rescue bot
-      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-      if (!isMaydayRescuePrimary) {
-        const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-        if (!primaryMaydayBusy) {
-          ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-        }
-      }
+       // ── Check for MAYDAY requests if no fleet targets ──
+       // Check if we're the primary MAYDAY rescue bot
+       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+       const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+       if (!maydayRescueEnabled) {
+         ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+       } else if (!isMaydayRescuePrimary) {
+         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+         if (!primaryMaydayBusy) {
+           ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+         }
+       }
 
-      let maydayTarget: RescueTarget | null = null;
-      const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-      const shouldProcessMayday = isMaydayRescuePrimary || primaryMaydayBusy;
+       let maydayTarget: RescueTarget | null = null;
+       const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
+       const shouldProcessMayday = maydayRescueEnabled && (isMaydayRescuePrimary || primaryMaydayBusy);
 
       if (targets.length === 0) {
         if (!shouldProcessMayday) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
-            markMaydayHandled(ignoredMayday);
+            ctx.log("mayday", `📡 Not the primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - leaving MAYDAY from ${ignoredMayday.sender} for the primary bot`);
             await ctx.sleep(5000);
             continue;
           }
@@ -5314,6 +5405,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          // ── CROSS-PROCESS MAYDAY CLAIM LOCK: only ONE bot may launch a given MAYDAY ──
+          // Prevents the dedicated MAYDAY bot and a backup rescue bot from BOTH responding
+          // to the same distress call. Whichever bot wins the atomic claim proceeds; the
+          // other yields immediately so the two bots cooperate instead of both going out.
+          if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+            const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+            ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+            markMaydayHandled(mayday);
+            continue;
+          }
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
@@ -5353,6 +5454,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const decision = shouldProceedOrYield(myClaim, partnerClaim);
               if (decision === "yield") {
                 ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
                 maydayTarget = null; // Cancel this rescue
                 markMaydayHandled(mayday);
                 continue;
@@ -5702,6 +5804,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      if (isMaydayTarget) {
+        // Hand off exclusive ownership to the durable rescue session so the
+        // per-MAYDAY lock file is freed for future distress calls.
+        releaseMayday(target.username, target.system, target.poi, bot.username);
+      }
       ctx.log("rescue", `Created rescue session for ${target.username}`);
 
       // Send faction chat announcement for rescue start

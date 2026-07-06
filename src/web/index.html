@@ -15521,6 +15521,7 @@
         const homeSystem = t.homeSystem ?? "";
         const maxFactionCreditsToUse = t.maxFactionCreditsToUse ?? 0;
         const autoCloak = t.autoCloak ?? false;
+        const depositProfitsToFaction = t.depositProfitsToFaction ?? true;
 
         panel.innerHTML = `
     <h3>Trader Settings</h3>
@@ -15607,15 +15608,26 @@
       <input type="number" id="set-trader-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Home System</div>
-        <div class="setting-hint">Fallback system to return to between trades (empty = stay wherever the last trade ends).</div>
-      </div>
-      <input type="text" id="set-trader-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
-    </div>
+<div class="setting-row">
+          <div>
+            <div class="setting-label">Home System</div>
+            <div class="setting-hint">Fallback system to return to between trades (empty = stay wherever the last trade ends).</div>
+          </div>
+          <input type="text" id="set-trader-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+        </div>
 
-    <div class="settings-save-bar">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Deposit Profits to Faction</div>
+            <div class="setting-hint">When enabled, traders deposit excess credits (above working balance) to faction storage. Disable to keep all credits in personal wallet for tracking profit/loss.</div>
+          </div>
+          <select id="set-trader-depositProfitsToFaction">
+            <option value="true" ${depositProfitsToFaction !== false ? "selected" : ""}>Enabled</option>
+            <option value="false" ${depositProfitsToFaction === false ? "selected" : ""}>Disabled</option>
+          </select>
+        </div>
+
+        <div class="settings-save-bar">
       <button class="primary" onclick="saveTraderSettings()">Save Settings</button>
     </div>
   `;
@@ -15658,6 +15670,8 @@
             document.getElementById("set-trader-autoCloak").value === "true",
           debugLogging:
             document.getElementById("set-trader-debugLogging").value === "true",
+          depositProfitsToFaction:
+            document.getElementById("set-trader-depositProfitsToFaction").value === "true",
         };
         send({ type: "saveSettings", routine: "trader", settings: s });
         settings.trader = s;

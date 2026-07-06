@@ -513,6 +513,7 @@ function getTraderSettings(username?: string): {
   unsoldItemHomeBaseOnly: boolean;
   enablePassengerTransport: boolean;
   passengerFareEstimate: number;
+  depositProfitsToFaction: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -534,6 +535,7 @@ function getTraderSettings(username?: string): {
     unsoldItemHomeBaseOnly: (t.unsoldItemHomeBaseOnly as boolean) ?? true,
     enablePassengerTransport: (t.enablePassengerTransport as boolean) ?? true,
     passengerFareEstimate: (t.passengerFareEstimate as number) ?? 5000,
+    depositProfitsToFaction: (t.depositProfitsToFaction as boolean) ?? true,
   };
 }
 
@@ -3562,7 +3564,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Faction donation (10% of profit) ──
-    await factionDonateProfit(ctx, actualProfit);
+    if (settings.depositProfitsToFaction) {
+      await factionDonateProfit(ctx, actualProfit);
+    }
 
     // ── Log profit to CSV ──
     logTradeProfit(bot.username, route.itemName, route.buyPrice, route.jumpsToBuy, route.jumpsToSell, route.sellPrice, actualProfit, totalSold);
@@ -3585,13 +3589,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Deposit excess credits to faction storage ──
     // Only deposit if:
-    // 1. We're currently at the home station (convenient opportunity), OR
-    // 2. There are no more profitable trades to do
+    // 1. depositProfitsToFaction is enabled, AND
+    // 2. We're currently at the home station (convenient opportunity), OR
+    // 3. There are no more profitable trades to do
     const hasProfitableTrades = nextRoutes.length > 0;
     const isAtHomeStation = homeSystem && bot.system === homeSystem && bot.docked;
     const noTradesAndHasExcess = !hasProfitableTrades && bot.credits > TRADER_DEPOSIT_THRESHOLD;
 
-    if (bot.credits > TRADER_WORKING_BALANCE && (isAtHomeStation || noTradesAndHasExcess)) {
+    if (settings.depositProfitsToFaction && bot.credits > TRADER_WORKING_BALANCE && (isAtHomeStation || noTradesAndHasExcess)) {
       const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
       const homeSystemForDeposit = homeSystem;
 

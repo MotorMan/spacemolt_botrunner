@@ -458,6 +458,16 @@ class CatalogStore {
     return this.data.items[id];
   }
 
+  getItemByName(name: string): CatalogItem | undefined {
+    const lower = name.toLowerCase();
+    for (const item of Object.values(this.data.items)) {
+      if ((item.name || "").toLowerCase() === lower) {
+        return item;
+      }
+    }
+    return undefined;
+  }
+
   getShip(id: string): CatalogShip | undefined {
     return this.data.ships[id];
   }

@@ -6338,51 +6338,6 @@
                 .join("")
             : '<option value="">No items</option>';
 
-        // Build recipe options for crafting — only show craftable recipes
-        const have = getOwnedItems(bot);
-        let craftSection = "";
-        if (profileRecipes && profileRecipes.length > 0) {
-          const craftable = profileRecipes
-            .map((r, i) => ({ recipe: r, idx: i }))
-            .filter(({ recipe }) => canCraft(recipe, have));
-
-          if (craftable.length > 0) {
-            const recipeOpts = craftable
-              .map(({ recipe, idx }) => {
-                const name =
-                  recipe.name ||
-                  recipe.recipe_id ||
-                  recipe.id ||
-                  `Recipe ${idx}`;
-                const cat = recipe.category ? ` [${recipe.category}]` : "";
-                return `<option value="${idx}">${esc(name)}${esc(cat)}</option>`;
-              })
-              .join("");
-            craftSection = `
-      <div class="cmd-group craft-group">
-        <label>Craft</label>
-        <select id="mc-craft-recipe" onchange="showRecipeDetails()">${recipeOpts}</select>
-        <input type="number" id="mc-craft-qty" min="1" value="1" style="width:60px">
-        <button class="primary sm" onclick="mcCraft()">Craft</button>
-      </div>
-      <div class="cmd-group craft-details-group" id="craftDetailsGroup" style="width:100%">
-        <div id="craftDetails"></div>
-      </div>`;
-          } else {
-            craftSection = `
-      <div class="cmd-group">
-        <label>Craft</label>
-        <span style="font-size:11px;color:var(--text-dim)">No craftable recipes (missing resources or skills) &mdash; ${profileRecipes.length} total recipes</span>
-      </div>`;
-          }
-        } else {
-          craftSection = `
-    <div class="cmd-group">
-      <label>Craft</label>
-      <span style="font-size:11px;color:var(--text-dim)">${profileRecipes === null ? "Loading recipes..." : "No recipes available"}</span>
-    </div>`;
-        }
-
         // Build weapon reload section - show if bot has ammo in cargo or is a hunter
         let weaponReloadSection = "";
 
@@ -6525,8 +6480,6 @@
       <button class="danger sm" onclick="mcStartManualRescue()" style="width:100%">🚀 Start Rescue Mission</button>
     </div>
 
-    ${craftSection}
-
     ${weaponReloadSection}
 
     <div class="manual-section ${manualCollapseState.wreck ? 'collapsed' : ''}" data-section="wreck">
@@ -6655,24 +6608,6 @@
       </div>
     </div>
 
-    <!-- Crafting Loadout Section -->
-    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
-      <label style="color:var(--text-bright);font-weight:600">Crafter Loadout</label>
-    </div>
-    <div class="cmd-group">
-      <label>Loadout</label>
-      <select id="mc-craft-loadout-select" style="min-width:150px">
-        <option value="">-- Select Loadout --</option>
-      </select>
-      <button class="primary sm" onclick="mcLoadCraftingLoadout()">Load Loadout</button>
-      <button class="sm" onclick="mcStartCraftingFromLoadout()">Start Crafting</button>
-    </div>
-    <div class="cmd-group">
-      <label>Status</label>
-      <span id="mc-craft-loadout-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
-      <button class="sm" onclick="mcRefreshCraftingLoadouts()" title="Refresh loadouts">Refresh</button>
-    </div>
-
     <div class="manual-section ${manualCollapseState.gifting ? 'collapsed' : ''}" data-section="gifting">
       <div class="manual-section-header" onclick="toggleManualSection('gifting')">
         <span class="manual-section-title">Gifting</span>
@@ -6758,105 +6693,13 @@
     </div>
   `;
 
-// Show details for initially selected recipe
-        if (profileRecipes && profileRecipes.length > 0) showRecipeDetails();
-        // Populate ship loadout dropdown
+// Populate ship loadout dropdown
         mcPopulateLoadoutSelect();
-        // Populate crafting loadout dropdown
-        mcPopulateCraftingLoadoutSelect();
 
         // Populate module preset dropdown (Phase 1)
         populateModulePresetSelect();
         }
 
-      function showRecipeDetails() {
-        const sel = document.getElementById("mc-craft-recipe");
-        const detailEl = document.getElementById("craftDetails");
-        if (!sel || !detailEl || !profileRecipes) return;
-
-        const idx = parseInt(sel.value);
-        const recipe = profileRecipes[idx];
-        if (!recipe) {
-          detailEl.innerHTML = "";
-          return;
-        }
-
-        const bot = getProfileBot();
-        const have = getOwnedItems(bot);
-
-        const comps =
-          recipe.components ||
-          recipe.ingredients ||
-          recipe.inputs ||
-          recipe.materials ||
-          [];
-        if (comps.length === 0) {
-          detailEl.innerHTML =
-            '<span style="color:var(--text-dim);font-size:11px">No components listed</span>';
-          return;
-        }
-
-        const output = recipe.output || recipe.result || recipe.produces || {};
-        const outputName = output.name || output.item_id || recipe.name || "?";
-        const outputQty = output.quantity || 1;
-        const desc = recipe.description || "";
-
-        let html = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:4px">
-    Produces: <span style="color:var(--green)">${esc(String(outputQty))}x ${esc(outputName)}</span>
-  </div>`;
-        if (desc)
-          html += `<div style="font-size:10px;color:var(--text-dim);margin-bottom:6px;font-style:italic">${esc(desc)}</div>`;
-        html +=
-          '<table style="font-size:11px;border-collapse:collapse;width:100%">';
-        html +=
-          '<tr style="color:var(--text-dim)"><th style="text-align:left;padding:2px 8px 2px 0">Component</th><th style="text-align:right;padding:2px 4px">Need</th><th style="text-align:right;padding:2px 4px">Have</th><th></th></tr>';
-
-        for (const c of comps) {
-          const cId = c.item_id || c.id || "";
-          const cName = c.name || cId;
-          const cQty = c.quantity || 1;
-          const owned = have[cId] || 0;
-          const enough = owned >= cQty;
-          const color = enough ? "var(--green)" : "var(--red)";
-          const icon = enough ? "&#10003;" : "&#10007;";
-          html += `<tr>
-      <td style="padding:2px 8px 2px 0;color:var(--text)">${esc(cName)}</td>
-      <td style="text-align:right;padding:2px 4px;font-family:monospace">${cQty}</td>
-      <td style="text-align:right;padding:2px 4px;font-family:monospace;color:${color}">${owned}</td>
-      <td style="padding:2px 0 2px 4px;color:${color}">${icon}</td>
-    </tr>`;
-        }
-        html += "</table>";
-
-        // Skill requirement
-        const skill = recipe.required_skill || recipe.skill;
-        if (skill) {
-          const sId = skill.skill_id || skill.id || skill.name || "";
-          const sName = skill.name || sId;
-          const sLevel = skill.level || skill.min_level || 0;
-          const myLevel = profileSkills[sId] || profileSkills[sName] || 0;
-          const met = myLevel >= sLevel;
-          const sColor = met ? "var(--green)" : "var(--red)";
-          if (sName)
-            html += `<div style="font-size:10px;margin-top:4px;color:${sColor}">Requires: ${esc(sName)} Lv${sLevel} (you: Lv${myLevel})</div>`;
-        }
-
-        detailEl.innerHTML = html;
-      }
-
-      function mcCraft() {
-        const sel = document.getElementById("mc-craft-recipe");
-        if (!sel || !profileRecipes) return;
-        const idx = parseInt(sel.value);
-        const recipe = profileRecipes[idx];
-        if (!recipe) return;
-
-        const recipeId = recipe.recipe_id || recipe.id || recipe.name || "";
-        const qty = intVal("mc-craft-qty");
-        mcExec("craft", { recipe_id: recipeId, count: qty });
-      }
-
-      // Faction storage operations
       function mcFactionDeposit() {
         const itemId = val("mc-fac-dep-item");
         const qty = intVal("mc-fac-dep-qty");
@@ -14046,118 +13889,6 @@
 
         if (loadBtn) loadBtn.disabled = loadoutNames.length === 0;
         if (deleteBtn) deleteBtn.disabled = loadoutNames.length === 0;
-      }
-
-      // ── Crafting Loadout Functions ─────────────────────────────────────────────
-
-      async function loadCraftingLoadoutsForManual() {
-        try {
-          const response = await fetch("/api/crafting-loadouts");
-          if (!response.ok) {
-            console.warn("Failed to fetch crafting loadouts:", response.status);
-            return {};
-          }
-          const data = await response.json();
-          return data.loadouts || {};
-        } catch (e) {
-          console.warn("Failed to load crafting loadouts:", e);
-          return {};
-        }
-      }
-
-      async function mcPopulateCraftingLoadoutSelect() {
-        const select = document.getElementById("mc-craft-loadout-select");
-        if (!select) return;
-
-        const loadouts = await loadCraftingLoadoutsForManual();
-        const loadoutNames = Object.keys(loadouts).sort();
-
-        select.innerHTML =
-          '<option value="">-- Select Loadout --</option>' +
-          loadoutNames.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
-      }
-
-      async function mcLoadCraftingLoadout() {
-        const select = document.getElementById("mc-craft-loadout-select");
-        const statusEl = document.getElementById("mc-craft-loadout-status");
-        if (!select || !select.value) {
-          if (statusEl) statusEl.textContent = "Select a loadout first";
-          return;
-        }
-
-        const loadoutName = select.value;
-        const loadouts = await loadCraftingLoadoutsForManual();
-        const loadout = loadouts[loadoutName];
-        if (!loadout) {
-          if (statusEl) statusEl.textContent = "Loadout not found";
-          return;
-        }
-
-        // Store the selected loadout in global state
-        if (!window._selectedCraftingLoadout) window._selectedCraftingLoadout = {};
-        window._selectedCraftingLoadout[loadoutName] = loadout;
-
-        if (statusEl) {
-          statusEl.textContent = `Loaded: ${loadoutName}`;
-          statusEl.style.color = "var(--green)";
-          setTimeout(() => {
-            if (statusEl) statusEl.style.color = "var(--text-dim)";
-          }, 2000);
-        }
-
-        logResponse(`<span class="resp-cmd">Crafting loadout "${loadoutName}" loaded</span>`);
-      }
-
-      async function mcStartCraftingFromLoadout() {
-        const select = document.getElementById("mc-craft-loadout-select");
-        const statusEl = document.getElementById("mc-craft-loadout-status");
-        if (!select || !select.value) {
-          if (statusEl) statusEl.textContent = "Select a loadout first";
-          return;
-        }
-
-        const loadoutName = select.value;
-        const loadouts = await loadCraftingLoadoutsForManual();
-        const loadout = loadouts[loadoutName];
-        if (!loadout) {
-          if (statusEl) statusEl.textContent = "Loadout not found";
-          return;
-        }
-
-        const bot = getProfileBot();
-        if (!bot) {
-          if (statusEl) statusEl.textContent = "No bot selected";
-          return;
-        }
-
-        // Queue each recipe in the loadout
-        const recipeEntries = Object.entries(loadout);
-        let queuedCount = 0;
-
-        for (const [recipeId, quantity] of recipeEntries) {
-          if (quantity > 0) {
-            mcExec("craft", { id: recipeId, quantity: quantity, preset: "workshop" });
-            queuedCount++;
-          }
-        }
-
-        if (statusEl) {
-          statusEl.textContent = `Queued ${queuedCount} recipes from ${loadoutName}`;
-          statusEl.style.color = "var(--green)";
-        }
-        logResponse(`<span class="resp-cmd">Started crafting from loadout "${loadoutName}" (${queuedCount} recipes)</span>`);
-      }
-
-      async function mcRefreshCraftingLoadouts() {
-        await mcPopulateCraftingLoadoutSelect();
-        const statusEl = document.getElementById("mc-craft-loadout-status");
-        if (statusEl) {
-          statusEl.textContent = "Loadouts refreshed";
-          statusEl.style.color = "var(--green)";
-          setTimeout(() => {
-            if (statusEl) statusEl.style.color = "var(--text-dim)";
-          }, 1000);
-        }
       }
 
       // ── Module Loadout Presets (Phase 1) ─────────────────────────────

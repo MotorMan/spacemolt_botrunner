@@ -16688,8 +16688,13 @@ function renderAiChatSettings(panel) {
          const autoStatusUpdateEnabled = ac.autoStatusUpdateEnabled ?? false;
          const autoStatusUpdateIntervalSec = ac.autoStatusUpdateIntervalSec ?? 86400;
          const autoStatusUpdateMaxRetries = ac.autoStatusUpdateMaxRetries ?? 3;
-         const autoColorUpdateEnabled = ac.autoColorUpdateEnabled ?? false;
-         const autoColorUpdateIntervalSec = ac.autoColorUpdateIntervalSec ?? 86400;
+          const autoColorUpdateEnabled = ac.autoColorUpdateEnabled ?? false;
+          const autoColorUpdateIntervalSec = ac.autoColorUpdateIntervalSec ?? 86400;
+          // Captain's log settings
+          const autoCaptainLogEnabled = ac.autoCaptainLogEnabled ?? false;
+          const autoCaptainLogIntervalSec = ac.autoCaptainLogIntervalSec ?? 86400;
+          const autoCaptainLogActivityMinutes = ac.autoCaptainLogActivityMinutes ?? 60;
+          const autoCaptainLogHistoryCount = ac.autoCaptainLogHistoryCount ?? 0;
 
         const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
         const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -16875,6 +16880,36 @@ function renderAiChatSettings(panel) {
         </div>
       </div>
 
+      <div class="setting-row" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
+        <div style="width:100%;">
+          <div class="setting-label">Captain's Log Posts</div>
+          <div class="setting-hint">Periodically have each bot write a captain's log entry (in-game personal journal) summarizing its recent activity, written in its personality by the LLM.</div>
+          <div style="display:flex;flex-direction:column;gap:10px;margin-top:8px;">
+
+            <div style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="set-aichat-autoCaptainLogEnabled" ${autoCaptainLogEnabled ? "checked" : ""}>
+              <span style="font-size:12px;color:var(--text)">Enable automatic captain's log posts</span>
+            </div>
+
+            <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
+              <span style="font-size:12px;color:var(--text-dim);min-width:120px;">Interval (hours):</span>
+              <input type="number" id="set-aichat-autoCaptainLogIntervalSec" min="1" max="168" value="${Math.round(autoCaptainLogIntervalSec / 3600)}" style="width:80px;font-size:12px;padding:4px;">
+            </div>
+
+            <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
+              <span style="font-size:12px;color:var(--text-dim);min-width:120px;">Activity window (min):</span>
+              <input type="number" id="set-aichat-autoCaptainLogActivityMinutes" min="1" max="10080" value="${autoCaptainLogActivityMinutes || 60}" style="width:80px;font-size:12px;padding:4px;">
+            </div>
+
+            <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
+              <span style="font-size:12px;color:var(--text-dim);min-width:120px;">Prev. logs to use:</span>
+              <input type="number" id="set-aichat-autoCaptainLogHistoryCount" min="0" max="20" value="${autoCaptainLogHistoryCount || 0}" style="width:80px;font-size:12px;padding:4px;">
+            </div>
+
+          </div>
+        </div>
+      </div>
+
       <div class="settings-save-bar">
         <button class="primary" onclick="saveAiChatSettings()">Save Settings</button>
       </div>
@@ -16954,6 +16989,17 @@ respondToMentions: document.getElementById(
           autoColorUpdateIntervalSec: (parseInt(
             document.getElementById("set-aichat-autoColorUpdateIntervalSec").value,
           ) || 24) * 3600,
+          // Captain's log settings
+          autoCaptainLogEnabled: document.getElementById("set-aichat-autoCaptainLogEnabled").checked,
+          autoCaptainLogIntervalSec: (parseInt(
+            document.getElementById("set-aichat-autoCaptainLogIntervalSec").value,
+          ) || 24) * 3600,
+          autoCaptainLogActivityMinutes: (parseInt(
+            document.getElementById("set-aichat-autoCaptainLogActivityMinutes").value,
+          ) || 60),
+          autoCaptainLogHistoryCount: (parseInt(
+            document.getElementById("set-aichat-autoCaptainLogHistoryCount").value,
+          ) || 0),
         };
         send({ type: "saveSettings", routine: "ai_chat", settings: s });
         settings.ai_chat = s;

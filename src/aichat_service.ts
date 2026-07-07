@@ -175,21 +175,23 @@ const DAILY_UPDATES_FILE = join(process.cwd(), "data", "daily_updates.json");
 interface DailyUpdatesData {
    lastStatusUpdate: number;
    lastColorUpdate: number;
+   lastCaptainLogUpdate: number;
    nextUpdateId?: number; // For rate limiting coordination
- }
+  }
 
 function loadDailyUpdates(): DailyUpdatesData {
    try {
      if (existsSync(DAILY_UPDATES_FILE)) {
        const data = JSON.parse(readFileSync(DAILY_UPDATES_FILE, "utf-8")) as DailyUpdatesData;
-       return {
-         lastStatusUpdate: data.lastStatusUpdate || 0,
-         lastColorUpdate: data.lastColorUpdate || 0,
-         nextUpdateId: data.nextUpdateId || 0,
-       };
+        return {
+          lastStatusUpdate: data.lastStatusUpdate || 0,
+          lastColorUpdate: data.lastColorUpdate || 0,
+          lastCaptainLogUpdate: data.lastCaptainLogUpdate || 0,
+          nextUpdateId: data.nextUpdateId || 0,
+        };
      }
    } catch { /* start fresh */ }
-   return { lastStatusUpdate: 0, lastColorUpdate: 0, nextUpdateId: 0 };
+   return { lastStatusUpdate: 0, lastColorUpdate: 0, lastCaptainLogUpdate: 0, nextUpdateId: 0 };
  }
 
 function saveDailyUpdates(updates: DailyUpdatesData): void {
@@ -223,9 +225,14 @@ function getAiChatSettings(): {
    autoStatusUpdateEnabled: boolean; // Enable automatic daily status updates
    autoStatusUpdateIntervalSec: number; // Interval in seconds (default 86400 = 24 hours)
    autoStatusUpdateMaxRetries: number; // Max retries for char limit
-   autoColorUpdateEnabled: boolean; // Enable automatic daily color updates
-   autoColorUpdateIntervalSec: number; // Interval in seconds (default 86400 = 24 hours)
- } {
+    autoColorUpdateEnabled: boolean; // Enable automatic daily color updates
+    autoColorUpdateIntervalSec: number; // Interval in seconds (default 86400 = 24 hours)
+    // Captain's log settings
+    autoCaptainLogEnabled: boolean; // Enable automatic captain's log posts
+    autoCaptainLogIntervalSec: number; // Interval in seconds between log posts (default 86400 = 24 hours)
+    autoCaptainLogActivityMinutes: number; // How many minutes of the bot's activity log to feed the LLM
+    autoCaptainLogHistoryCount: number; // How many previous captain's log entries to include as context (0 = none)
+  } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
 
@@ -271,8 +278,13 @@ return {
       autoStatusUpdateMaxRetries: (s.autoStatusUpdateMaxRetries as number) ?? 3,
       autoColorUpdateEnabled: (s.autoColorUpdateEnabled as boolean) ?? false,
       autoColorUpdateIntervalSec: (s.autoColorUpdateIntervalSec as number) ?? 86400,
+      // Captain's log settings
+      autoCaptainLogEnabled: (s.autoCaptainLogEnabled as boolean) ?? false,
+      autoCaptainLogIntervalSec: (s.autoCaptainLogIntervalSec as number) ?? 86400,
+      autoCaptainLogActivityMinutes: (s.autoCaptainLogActivityMinutes as number) ?? 60,
+      autoCaptainLogHistoryCount: (s.autoCaptainLogHistoryCount as number) ?? 0,
     };
-}
+  }
 
 // ── Memory ────────────────────────────────────────────────────
 
@@ -860,10 +872,10 @@ private async runLoop(): Promise<void> {
          }
          lastCycleTime = now;
 
-         // Check for daily updates (includes status and color updates)
-         if (settings.autoStatusUpdateEnabled || settings.autoColorUpdateEnabled) {
-           await this.runDailyUpdates();
-         }
+          // Check for daily updates (includes status, color, and captain's log updates)
+          if (settings.autoStatusUpdateEnabled || settings.autoColorUpdateEnabled || settings.autoCaptainLogEnabled) {
+            await this.runDailyUpdates();
+          }
 
          if (!settings.baseUrl) {
           this.logFn("error", "AI Chat: Base URL not set — check settings");
@@ -2434,6 +2446,208 @@ async sendRescueEnRouteNotification(
   }
 
   /**
+   * Read the bot's on-disk activity log and return the entries from the last
+   * `minutes` window. Used to give the LLM real context for captain's log posts.
+   * The log format is: "<ISO timestamp> [botName] [category] message"
+   */
+  private readBotActivityLog(botName: string, minutes: number): string {
+    try {
+      const ACTIVITY_LOGS_DIR = join(process.cwd(), "data", "logs", "activity");
+      const logFile = join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`);
+      if (!existsSync(logFile)) return "";
+
+      const content = readFileSync(logFile, "utf-8");
+      const lines = content.split("\n").filter(l => l.trim().length > 0);
+
+      // If minutes <= 0, fall back to returning the last 200 lines
+      if (minutes <= 0) {
+        return lines.slice(-200).join("\n");
+      }
+
+      const cutoff = Date.now() - minutes * 60 * 1000;
+      const recent: string[] = [];
+      for (const line of lines) {
+        const sp = line.indexOf(" ");
+        const tsStr = sp > 0 ? line.slice(0, sp) : "";
+        const ts = Date.parse(tsStr);
+        if (!isNaN(ts) && ts >= cutoff) {
+          recent.push(line);
+        }
+      }
+
+      if (recent.length === 0) return "";
+
+      // Hard size cap so the activity chunk can never exceed model context,
+      // regardless of how big a single window's lines are (e.g. crafter updates).
+      // ~40k chars ≈ ~10k tokens; prefer the most recent lines that fit.
+      const MAX_ACTIVITY_CHARS = 40000;
+      let chunk = recent.slice(-500).join("\n");
+      if (chunk.length > MAX_ACTIVITY_CHARS) {
+        const kept: string[] = [];
+        let size = 0;
+        for (let i = recent.length - 1; i >= 0 && kept.length < 500; i--) {
+          const line = recent[i];
+          if (size + line.length + 1 > MAX_ACTIVITY_CHARS) break;
+          kept.push(line);
+          size += line.length + 1;
+        }
+        chunk = kept.reverse().join("\n");
+      }
+      return chunk;
+    } catch (err) {
+      this.logFn("ai_chat_debug", `Failed to read activity log for ${botName}: ${err instanceof Error ? err.message : String(err)}`);
+      return "";
+    }
+  }
+
+  /**
+   * Fetch the bot's most recent captain's log entries (via the API) to use as
+   * context for a new entry. Returns up to `count` previous entries, newest first.
+   */
+  private async getRecentCaptainLogs(bot: Bot, count: number): Promise<string[]> {
+    const logs: string[] = [];
+    if (count <= 0) return logs;
+
+    // Bound total history context so it can never dominate the prompt.
+    const MAX_HISTORY_CHARS = 20000;
+    let totalChars = 0;
+
+    try {
+      for (let i = 0; i < count; i++) {
+        const resp = await bot.exec("captains_log_list", { index: i });
+        if (resp.error || !resp.result) break;
+        const result = resp.result as {
+          entry?: { index?: number; created_at?: string; entry?: string };
+          has_next?: boolean;
+        };
+        const entry = result.entry;
+        if (entry && entry.entry) {
+          const logLine = `[${entry.index ?? i}] ${entry.created_at || ""}: ${entry.entry}`;
+          if (totalChars + logLine.length > MAX_HISTORY_CHARS && logs.length > 0) break;
+          logs.push(logLine);
+          totalChars += logLine.length;
+        }
+        if (!result.has_next) break;
+      }
+    } catch (err) {
+      this.logFn("ai_chat_debug", `Failed to fetch recent captain's logs for ${bot.username}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return logs;
+  }
+
+  /**
+   * Generate a captain's log entry using the LLM, based on the bot's recent
+   * activity log and personality, then write it via captains_log_add.
+   * Returns true on success, false on failure.
+   */
+  private async generateAndSetCaptainLog(bot: Bot): Promise<boolean> {
+    const settings = getAiChatSettings();
+
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", `Captain's log skipped: AI Chat is disabled`);
+      return false;
+    }
+
+    if (!settings.autoCaptainLogEnabled) {
+      this.logFn("ai_chat_debug", `Captain's log skipped: autoCaptainLogEnabled is false`);
+      return false;
+    }
+
+    // Check if bot is available
+    const bots = AiChatService.getBots();
+    const botRef = bots.find(b => b.username === bot.username);
+    if (!botRef || botRef.state !== "running" || !botRef.api.getSession()) {
+      this.logFn("ai_chat", `Bot ${bot.username} not in running state (state: ${botRef?.state}), skipping captain's log`);
+      return false;
+    }
+
+    const personality = getBotPersonality(bot.username);
+    const activityMinutes = settings.autoCaptainLogActivityMinutes > 0 ? settings.autoCaptainLogActivityMinutes : 60;
+    const activityChunk = this.readBotActivityLog(bot.username, activityMinutes);
+    const previousLogs = await this.getRecentCaptainLogs(bot, settings.autoCaptainLogHistoryCount);
+
+    const previousLogsSection = previousLogs.length > 0
+      ? `## Your Previous Captain's Log Entries\n${previousLogs.join("\n\n")}`
+      : "";
+
+    const systemPrompt = `${personality}
+
+## Your Current Context
+- Your name in the game is: ${bot.username}
+- You are currently in system: ${bot.system || "unknown"}
+- Location: ${bot.poi || "unknown"}
+
+## Your Activity Log (last ${activityMinutes} minutes)
+The following is your actual in-game activity from the last ${activityMinutes} minutes. Use these real events to write your log:
+
+${activityChunk || "No activity recorded in this time window."}
+
+${previousLogsSection}
+
+## Task
+Write a captain's log entry (personal journal) describing what you did during this period, in your own personality and voice. Write in the first person as if recording it in your ship's log. Be vivid but concise (aim for 2-5 sentences). Reference actual events from your activity log above. Do NOT invent events that are not in the log. Return ONLY the log entry text, with no extra commentary or formatting.`;
+
+    const userMessage = `Write your captain's log entry for the last ${activityMinutes} minutes, based on the activity above.`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      let logEntry = response.trim().replace(/^["']|["']$/g, "");
+
+      if (!logEntry) {
+        this.logFn("ai_chat_debug", `Empty captain's log response from LLM for ${bot.username}`);
+        return false;
+      }
+
+      // Captain's log entries are capped at 30000 bytes by the API
+      while (Buffer.byteLength(logEntry, "utf-8") > 30000) {
+        logEntry = logEntry.slice(0, Math.floor(logEntry.length * 0.9));
+      }
+
+      const logResp = await bot.exec("captains_log_add", { content: logEntry });
+
+      if (!logResp.error) {
+        this.logFn("ai_chat", `📔 Captain's log updated for ${bot.username}: "${logEntry.slice(0, 80)}${logEntry.length > 80 ? "…" : ""}"`);
+        bot.log("captains_log", `📔 Log: ${logEntry}`);
+        saveDailyUpdates({ ...loadDailyUpdates(), lastCaptainLogUpdate: Date.now() });
+        return true;
+      }
+
+      // Check for rate limit error (429)
+      const errorMsg = logResp.error.message || "";
+      if (logResp.error.code === "429" || errorMsg.includes("rate") || errorMsg.includes("limit")) {
+        this.logFn("ai_chat", `Rate limited on captain's log for ${bot.username}, waiting 10s before retry`);
+        await sleep(10000);
+        return false;
+      }
+
+      this.logFn("error", `Captain's log update failed for ${bot.username}: ${errorMsg}`);
+      return false;
+    } catch (llmErr) {
+      this.logFn("error", `LLM error during captain's log generation for ${bot.username}: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Truncate a string so its UTF-8 byte length does not exceed maxBytes,
+   * without splitting multi-byte characters. The set_status API enforces a
+   * byte limit, so char-count truncation alone can still overflow.
+   */
+  private truncateToBytes(str: string, maxBytes: number): string {
+    let res = str;
+    while (Buffer.byteLength(res, "utf8") > maxBytes && res.length > 0) {
+      res = res.slice(0, res.length - 1);
+    }
+    return res;
+  }
+
+  /**
    * Generate and set a bot's status message using LLM and personality.
    * Returns true on success, false on failure.
    */
@@ -2468,8 +2682,9 @@ async sendRescueEnRouteNotification(
 
     // Try to generate status with retry on char limit
     for (let attempt = 0; attempt < settings.autoStatusUpdateMaxRetries; attempt++) {
+      const maxChars = 80 - attempt * 10; // 100, 80, 60 — shrink on each retry
       const maxCharHint = attempt > 0
-        ? `\n\nIMPORTANT: Keep your response under ${100 - attempt * 10} characters. Count carefully.`
+        ? `\n\nIMPORTANT: Keep your response under ${maxChars} characters. Count carefully.`
         : "";
 
       const systemPrompt = `${personality}
@@ -2483,10 +2698,10 @@ async sendRescueEnRouteNotification(
 ${botContext}
 
 ## Task
-Generate a status message (max 100 characters) that reflects your current situation, personality, and activity.
+Generate a status message (max ${maxChars} characters) that reflects your current situation, personality, and activity.
 Be creative but concise. Think like you're setting a social status that other players will see.${maxCharHint}`;
 
-      const userMessage = `Generate a status message for ${bot.username}. Keep it under ${100 - attempt * 10} characters.`;
+      const userMessage = `Generate a status message for ${bot.username}. Keep it under ${maxChars} characters.`;
 
       const llmMessages: LlmMessage[] = [
         { role: "system", content: systemPrompt },
@@ -2495,7 +2710,7 @@ Be creative but concise. Think like you're setting a social status that other pl
 
       try {
         const response = await callLlm(llmMessages, settings);
-        let status = response.trim().replace(/^["']|["']$/g, "").slice(0, 100);
+        let status = this.truncateToBytes(response.trim().replace(/^["']|["']$/g, ""), maxChars);
 
         if (!status) {
           this.logFn("ai_chat_debug", `Empty status response from LLM for ${bot.username}`);
@@ -2512,9 +2727,9 @@ Be creative but concise. Think like you're setting a social status that other pl
           return true;
         }
 
-        // Check for char limit error (400)
+        // Check for char limit error (400) — including "too long"
         const errorMsg = statusResp.error.message || "";
-        if (errorMsg.includes("100") || errorMsg.toLowerCase().includes("char")) {
+        if (errorMsg.includes(String(maxChars)) || errorMsg.toLowerCase().includes("char") || errorMsg.toLowerCase().includes("too long")) {
           this.logFn("ai_chat", `Status for ${bot.username} exceeded limit (attempt ${attempt + 1}/${settings.autoStatusUpdateMaxRetries}), retrying with shorter prompt`);
           continue;
         }
@@ -2651,10 +2866,14 @@ No other text, formatting, or explanation.`;
           await this.generateAndSetBotStatus(bot);
           await sleep(2000); // Small delay between updates to avoid rate limiting
         }
+
+        // Record the attempt even on failure so the configured interval is honored
+        // (otherwise a permanently-failing update would retry every cycle).
+        saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
       }
     }
 
-// Check color update interval
+    // Check color update interval
     if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
       const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
       if (now - updates.lastColorUpdate >= colorIntervalMs) {
@@ -2664,6 +2883,23 @@ No other text, formatting, or explanation.`;
         for (const bot of bots) {
           if (bot.state !== "running" || !bot.api.getSession()) continue;
           await this.generateAndSetBotColors(bot);
+          await sleep(2000); // Small delay between updates to avoid rate limiting
+        }
+
+        // Record the attempt even on failure so the configured interval is honored.
+        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
+      }
+    }
+
+    // Check captain's log interval
+    if (settings.autoCaptainLogEnabled && settings.autoCaptainLogIntervalSec > 0) {
+      const captainLogIntervalMs = settings.autoCaptainLogIntervalSec * 1000;
+      if (now - updates.lastCaptainLogUpdate >= captainLogIntervalMs) {
+        this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
+
+        for (const bot of bots) {
+          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          await this.generateAndSetCaptainLog(bot);
           await sleep(2000); // Small delay between updates to avoid rate limiting
         }
       }

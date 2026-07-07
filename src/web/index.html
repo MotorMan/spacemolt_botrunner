@@ -19296,7 +19296,9 @@ When responding:
               ? d
               : Array.isArray(d.faction_facilities)
                 ? d.faction_facilities
-                : [];
+                : Array.isArray(d.facilities)
+                  ? d.facilities
+                  : [];
 
             if (facilities.length === 0) {
               container.innerHTML =
@@ -19332,7 +19334,8 @@ When responding:
                   });
                 }
 
-                container.innerHTML = facilities
+                const renderCards = () =>
+                  facilities
                   .map((fac) => {
                     const name =
                       fac.name || fac.facility_type || fac.type || "?";
@@ -19347,51 +19350,84 @@ When responding:
                     const canTransfer = !factionService;
                     const upgradeInfo = factionFacilityUpgrades[facId];
                     const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
-                    const isProduction = !!(
-                      fac.production ||
-                      fac.recipe_id ||
-                      fac.is_recycler
-                    );
-                    const isPublic = !!(
-                      fac.production && fac.production.public
-                    );
+                    if (!(facId in factionFacilityPublic)) {
+                      if (fac.production && typeof fac.production.public === "boolean")
+                        factionFacilityPublic[facId] = fac.production.public;
+                    }
+                    if (!(facId in factionFacilityPrice)) {
+                      const sp =
+                        fac.production &&
+                        typeof fac.production.output_price_per_unit === "number"
+                          ? fac.production.output_price_per_unit
+                          : fac.production &&
+                              typeof fac.production.rental_fee_per_run === "number"
+                            ? fac.production.rental_fee_per_run
+                            : null;
+                      if (sp !== null) factionFacilityPrice[facId] = sp;
+                    }
+                    const isPublic =
+                      facId in factionFacilityPublic
+                        ? factionFacilityPublic[facId]
+                        : !!(fac.production && fac.production.public);
                     const curPrice =
-                      fac.production &&
-                      typeof fac.production.output_price_per_unit === "number"
-                        ? fac.production.output_price_per_unit
+                      facId in factionFacilityPrice
+                        ? factionFacilityPrice[facId]
                         : 0;
-                    return `<div class="faction-card">
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <div>
+                    return `<div class="faction-card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
               <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
-              <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
-              <span style="margin-left:8px;font-size:10px">${status}</span>
-            </div>
-            <div style="display:flex;gap:4px">
-              ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
-              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
-              ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
-            </div>
-          </div>
-          ${
-            isProduction
-              ? `<div style="margin-top:8px;border-top:1px solid #21262d;padding-top:6px">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-              <span style="font-size:11px;color:var(--text-dim)">Public access:</span>
-              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
-              <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--text-dim)"}">${isPublic ? "Public" : "Private"}</span>
-            </div>
-            <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
-              <span style="font-size:11px;color:var(--text-dim)">Output price / unit:</span>
-              <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
-              <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
-            </div>
-          </div>`
-              : ""
-          }
+              <span style="font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
+              <span style="font-size:10px">${status}</span>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <span style="font-size:11px;color:var(--text-dim)">Public access:</span>
+                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
+                <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--text-dim)"}">${isPublic ? "Public" : "Private"}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                <span style="font-size:11px;color:var(--text-dim)">Output price / unit:</span>
+                <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
+                <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
+              </div>
+              <div style="display:flex;gap:4px;margin-left:auto">
+                ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
+                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
+                ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
+               </div>
         </div>`;
                   })
                   .join("");
+
+                container.innerHTML = renderCards();
+
+                // `list` returns faction_facilities WITH production (public + price).
+                sendExec(
+                  username,
+                  "facility",
+                  { action: "list" },
+                  (listResult) => {
+                    if (listResult.ok && listResult.data) {
+                      const ld = listResult.data;
+                      const src = Array.isArray(ld.faction_facilities)
+                        ? ld.faction_facilities
+                        : Array.isArray(ld.player_facilities)
+                          ? ld.player_facilities
+                          : Array.isArray(ld.facilities)
+                            ? ld.facilities
+                            : Array.isArray(ld)
+                              ? ld
+                              : [];
+                      const prodMap = {};
+                      src.forEach((f) => {
+                        if (f && f.facility_id && f.production)
+                          prodMap[f.facility_id] = f.production;
+                      });
+                      facilities.forEach((fac) => {
+                        const fid = fac.facility_id || fac.id;
+                        if (fid && prodMap[fid]) fac.production = prodMap[fid];
+                      });
+                    }
+                    container.innerHTML = renderCards();
+                  },
+                );
               },
             );
           },
@@ -19424,6 +19460,7 @@ When responding:
           { action: "set_access", facility_id: facilityId, access },
           (result) => {
             if (result.ok) {
+              factionFacilityPublic[facilityId] = access === "public";
               appendLine(
                 "system",
                 `${username}: facility ${facilityId} access -> ${access}`,
@@ -19452,6 +19489,7 @@ When responding:
           { action: "set_output_price", facility_id: facilityId, price },
           (result) => {
             if (result.ok) {
+              factionFacilityPrice[facilityId] = price;
               appendLine(
                 "system",
                 `${username}: facility ${facilityId} output price -> ${price}`,
@@ -19700,6 +19738,8 @@ When responding:
       let factionFacilityLoading = false;
       let factionFacilityPageSize = 20;
       let factionFacilityCategory = "faction";
+      let factionFacilityPublic = {};
+      let factionFacilityPrice = {};
 
       let personalFacilityTypes = [];
       let personalFacilityCategory = "personal";

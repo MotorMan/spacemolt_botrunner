@@ -438,9 +438,13 @@ async function getMinerSettings(username?: string): Promise<{
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
-enableFighting: boolean;
+ enableFighting: boolean;
 
-   // Miner coordination settings - prevent all miners from going to the same location
+   // Deep sleep interval (minutes) used when NO viable mining target exists anywhere in the map.
+   // Prevents the miner from hammering the server with repeated failed target searches.
+   deepSleepIntervalMin: number;
+
+    // Miner coordination settings - prevent all miners from going to the same location
    enableCoordination: boolean;
    maxBotsPerSystem: number;
 
@@ -455,7 +459,7 @@ enableFighting: boolean;
   const flockCfg = (await readFlockSettings()) || { assignments: {}, flockGroups: [] };
   let botOverrides = username ? (all[username] || {}) : {};
 
-  if (username && flockCfg.assignments[username]) {
+  if (username && flockCfg.assignments && flockCfg.assignments[username]) {
     botOverrides = { ...botOverrides, ...flockCfg.assignments[username] };
   }
 
@@ -545,6 +549,9 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     flockGroups,
     desiredEmergencyWarpDevices: (m.desiredEmergencyWarpDevices as number) ?? 3,
     enableFighting: (m.enableFighting as boolean) ?? false,
+
+    // Deep sleep interval when no target is available anywhere in the map
+    deepSleepIntervalMin: (m.deepSleepIntervalMin as number) ?? 30,
 
     // Miner coordination settings
     enableCoordination: (m.enableCoordination as boolean) ?? true,
@@ -960,6 +967,148 @@ function checkDepositPowerCompatibility(
     effectivePower: supportedPower, 
     requiredPower: supportedPower 
   };
+}
+
+/**
+ * Check whether the current system has any mineable POI of the given type,
+ * respecting hidden-POI access capability. Used to decide if "mine locally"
+ * is actually possible before giving up and deep sleeping.
+ */
+function hasLocalMiningPoiOfType(
+  botSystem: string,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+): boolean {
+  const sys = mapStore.getSystem(botSystem);
+  if (!sys) return false;
+  for (const poi of sys.pois) {
+    const hidden = poi.hidden === true;
+    if (hidden) {
+      if (miningType === "radioactive" && !canMineHiddenRadioactive) continue;
+      if (miningType === "ice" && !canMineHiddenIce) continue;
+    }
+    if (miningType === "ore") {
+      if (isOreBeltPoi(poi.type) || !hidden || ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id)) return true;
+    } else if (miningType === "gas") {
+      if (isGasCloudPoi(poi.type)) return true;
+    } else if (miningType === "ice") {
+      if (isIceFieldPoi(poi.type)) return true;
+    } else if (miningType === "radioactive") {
+      if (isOreBeltPoi(poi.type) || !hidden) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build and log a COMPLETE diagnostic of every system the miner evaluated while
+ * searching for a viable target, including the power requirement (supported_power)
+ * of each POI it found and exactly why each was rejected (too sparse for our power,
+ * depleted, blacklisted, coordination full, etc). This produces an auditable, real
+ * picture of what was actually tried so the "not available anywhere in the map"
+ * problem can be diagnosed and fixed with actual data.
+ *
+ * After reporting, the miner enters a deep sleep for the user-configured interval so
+ * it stops hammering the server with repeated failed target searches.
+ */
+async function reportNoViableTargetsAndDeepSleep(
+  ctx: RoutineContext,
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  totalMiningPower: number,
+  blacklist: string[],
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+  botUsername: string | undefined,
+  candidateOres: string[],
+): Promise<void> {
+  const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+  const oreList = [...new Set(candidateOres.filter(Boolean))].sort();
+
+  ctx.log("mining", "══════════════════════════════════════════════════════════════════");
+  ctx.log("mining", "DEEP SLEEP — NO VIABLE MINING TARGET FOUND ANYWHERE IN MAP");
+  ctx.log("mining", `miningType=${miningType} totalMiningPower=${totalMiningPower} deepSleepIntervalMin=${settings.deepSleepIntervalMin}`);
+  ctx.log("mining", `systems tried + power requirement for each (candidate ores: ${oreList.join(", ") || "(none)"})`);
+
+  const reportLines: string[] = [];
+  let systemsTried = 0;
+  let viableCount = 0;
+
+  for (const ore of oreList) {
+    const locs = mapStore.findOreLocations(ore, blacklist, blacklist.length > 0);
+    if (locs.length === 0) {
+      reportLines.push(`  • ore "${ore}": NOT PRESENT ANYWHERE IN MAP`);
+      continue;
+    }
+    const bySystem = new Map<string, any[]>();
+    for (const loc of locs) {
+      if (!bySystem.has(loc.systemId)) bySystem.set(loc.systemId, []);
+      bySystem.get(loc.systemId)!.push(loc);
+    }
+    for (const [sysId, sysLocs] of bySystem) {
+      systemsTried++;
+      const parts: string[] = [];
+      for (const loc of sysLocs) {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+        const powerReq = loc.supportedPower ?? 0;
+        let viable = true;
+        let reason = "";
+
+        if (blacklist.includes(loc.systemId)) {
+          viable = false; reason = "blacklisted system";
+        } else if (poi?.hidden === true) {
+          if (miningType === "radioactive" && !canMineHiddenRadioactive) {
+            viable = false; reason = "hidden POI (no radioactive hidden access)";
+          } else if (miningType === "ice" && !canMineHiddenIce) {
+            viable = false; reason = "hidden POI (no ice hidden access)";
+          }
+        }
+        if (viable && !settings.ignoreDepletion) {
+          const oreEntry = poi?.ores_found?.find((e: any) => e.item_id === ore);
+          if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+            viable = false; reason = "depleted (lockout)";
+          }
+        }
+        if (viable) {
+          const hasScanData = loc.minutesSinceScan !== Infinity;
+          if (hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
+            viable = false; reason = `low remaining (${loc.remaining}) + unknown power`;
+          } else if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            viable = false;
+            reason = `too sparse: our power ${totalMiningPower} > 4x deposit power req ${loc.supportedPower}`;
+          } else if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0) {
+            reason = `power OK (our ${totalMiningPower} <= req ${loc.supportedPower})`;
+          } else if (totalMiningPower > 0) {
+            reason = `no power data (our power ${totalMiningPower})`;
+          } else {
+            reason = "no power data";
+          }
+        }
+        if (viable && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+          if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
+            viable = false; reason = "coordination: system full";
+          }
+        }
+        if (viable) viableCount++;
+        parts.push(`${loc.poiName}(${loc.poiId}) powerReq=${powerReq} → ${viable ? "VIABLE" : "SKIP (" + reason + ")"}`);
+      }
+      reportLines.push(`  • system ${sysId}: ${parts.join(" | ")}`);
+    }
+  }
+
+  for (const line of reportLines) ctx.log("mining", line);
+  ctx.log("mining", `DIAGNOSTIC SUMMARY: systems evaluated=${systemsTried}, viable POIs=${viableCount}, candidate ores=${oreList.length}`);
+  if (viableCount === 0) {
+    ctx.log("mining", "CONFIRMED: zero viable mining locations for this ship anywhere in the map.");
+  }
+  ctx.log("mining", "══════════════════════════════════════════════════════════════════");
+
+  const intervalMin = Math.max(1, settings.deepSleepIntervalMin || 30);
+  const sleepMs = intervalMin * 60 * 1000;
+  ctx.log("mining", `Deep sleeping ${intervalMin} min (user-configured interval) to stop server hammering — will re-evaluate after.`);
+  await ctx.sleep(sleepMs);
 }
 
 /**
@@ -1641,7 +1790,7 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
     ctx.log("warn", `Failed to cache ship modules: ${shipResp.error.message}`);
     return null;
   }
-  const shipData = shipResp.result as Record<string, unknown>;
+  const shipData = (shipResp.result || {}) as Record<string, unknown>;
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   if (modules.length === 0) {
     ctx.log("warn", "Ship modules not returned from get_ship — server may still be processing");
@@ -2954,8 +3103,12 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
           }
 
           if (!foundDeepCoreTarget) {
-            ctx.log("error", "No deep core ore targets found — waiting 60s before retry");
-            await ctx.sleep(60000);
+            ctx.log("error", "No deep core ore targets found anywhere in map");
+            const candidateOres = oresToCheck && oresToCheck.length > 0 ? oresToCheck : Object.keys(quotas);
+            await reportNoViableTargetsAndDeepSleep(
+              ctx, settings, "ore", totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+            );
             continue;
           }
         }
@@ -3326,6 +3479,14 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
           // If still no locations, target locally (either no quotas configured or no available quota targets)
           if (locations.length === 0) {
+            if (!hasLocalMiningPoiOfType(bot.system, miningType, canMineHiddenRadioactive, canMineHiddenIce)) {
+              const candidateOres = [originalTarget, ...Object.keys(quotas)];
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, miningType, totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+              );
+              continue;
+            }
             targetSystemId = bot.system;
           }
         }
@@ -3544,8 +3705,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               targetPoiName = localPoi.name;
               ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
             } else {
-              ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
-              await ctx.sleep(60000);
+              ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available`);
+              const candidateOres = [effectiveTarget, ...allQuotaOres];
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, miningType, totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+              );
               continue;
             }
           }
@@ -4333,8 +4498,12 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       }
     }
 
-    // miningPoi is guaranteed non-null here after the depletion check
-    if (!miningPoi) continue;
+    if (!miningPoi) {
+      ctx.log("mining", "No mining POI available after destination search — will retry next cycle");
+      yield "no_mining_poi";
+      await ctx.sleep(5000);
+      continue;
+    }
 
     // ── Travel to mining location ──
     yield (miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "travel_to_belt" : "travel_to_cloud"));
@@ -5510,7 +5679,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
       let totalMiningPower = 0;
       const shipResp = await bot.exec("get_ship");
       if (!shipResp.error && shipResp.result) {
-        const shipData = shipResp.result as Record<string, unknown>;
+  const shipData = (shipResp.result || {}) as Record<string, unknown>;
         const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
         totalMiningPower = getTotalMiningPower(modules);
       }
@@ -6412,9 +6581,12 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             }
 
             if (!newTarget) {
-              ctx.log("mining", "No radioactive ores available — waiting for next cycle to retry");
+              ctx.log("mining", "No radioactive ores available anywhere in map");
               stopReason = "no radioactive ores available";
-              break;
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, "radioactive", totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, oresToSearch,
+              );
             }
           } else if (searchTarget) {
             ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);
@@ -6546,8 +6718,14 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
           if (!newTarget && !targetResource) {
             // For deep core miners, don't fall back to regular ores
             if (isDeepCoreMiner) {
-              ctx.log("mining", "Deep core miner — no target found, will wait for next cycle");
+              ctx.log("mining", "Deep core miner — no target found anywhere in map");
               stopReason = "no deep core target available";
+              const candidateOres = Object.keys(quotas).filter((o) => isDeepCoreOre(o));
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, "ore", totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+                candidateOres.length > 0 ? candidateOres : Object.keys(quotas),
+              );
               break;
             }
             

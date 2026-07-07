@@ -19347,6 +19347,19 @@ When responding:
                     const canTransfer = !factionService;
                     const upgradeInfo = factionFacilityUpgrades[facId];
                     const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
+                    const isProduction = !!(
+                      fac.production ||
+                      fac.recipe_id ||
+                      fac.is_recycler
+                    );
+                    const isPublic = !!(
+                      fac.production && fac.production.public
+                    );
+                    const curPrice =
+                      fac.production &&
+                      typeof fac.production.output_price_per_unit === "number"
+                        ? fac.production.output_price_per_unit
+                        : 0;
                     return `<div class="faction-card">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
@@ -19360,6 +19373,22 @@ When responding:
               ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
             </div>
           </div>
+          ${
+            isProduction
+              ? `<div style="margin-top:8px;border-top:1px solid #21262d;padding-top:6px">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <span style="font-size:11px;color:var(--text-dim)">Public access:</span>
+              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
+              <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--text-dim)"}">${isPublic ? "Public" : "Private"}</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:6px;margin-top:6px">
+              <span style="font-size:11px;color:var(--text-dim)">Output price / unit:</span>
+              <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
+              <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
+            </div>
+          </div>`
+              : ""
+          }
         </div>`;
                   })
                   .join("");
@@ -19382,6 +19411,56 @@ When responding:
               appendLine(
                 "system",
                 `Toggle failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      function factionSetFacilityAccess(username, facilityId, access) {
+        sendExec(
+          username,
+          "facility",
+          { action: "set_access", facility_id: facilityId, access },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username}: facility ${facilityId} access -> ${access}`,
+              );
+              fetchFactionFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `set_access failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      function factionSetFacilityPrice(username, facilityId) {
+        const input = document.getElementById(`ff-price-${facilityId}`);
+        const price = input ? parseFloat(input.value) : NaN;
+        if (isNaN(price) || price < 0) {
+          appendLine("system", "Enter a valid non-negative price");
+          return;
+        }
+        sendExec(
+          username,
+          "facility",
+          { action: "set_output_price", facility_id: facilityId, price },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username}: facility ${facilityId} output price -> ${price}`,
+              );
+              fetchFactionFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `set_output_price failed: ${result.error || "unknown"}`,
               );
             }
           },
@@ -23324,6 +23403,14 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Deep Sleep Interval (minutes)</div>
+          <div class="setting-hint">When the miner cannot find ANY viable target anywhere in the map (after logging every system it tried and that system's power requirement), it enters a deep sleep for this many minutes instead of hammering the server with repeated failed searches. Default 30.</div>
+        </div>
+        <input type="number" id="set-miner-deepSleepIntervalMin" min="1" max="1440" value="${m.deepSleepIntervalMin ?? 30}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Ignore Depletion Markings</div>
           <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
         </div>
@@ -23771,6 +23858,10 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-miner-depletionTimeoutHours").value,
             ) || 3,
+          deepSleepIntervalMin:
+            parseInt(
+              document.getElementById("set-miner-deepSleepIntervalMin").value,
+            ) || 30,
           ignoreDepletion: document.getElementById("set-miner-ignoreDepletion")
             .checked,
           noMidMiningRetarget: document.getElementById(

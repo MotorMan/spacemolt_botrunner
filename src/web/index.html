@@ -1446,6 +1446,7 @@
         modulePreset: true,
         fleetActions: true,
         gifting: true,
+        crafting: true,
       };
       let wrecksScanned = false;
       let activeOreFilters = new Set();
@@ -6667,6 +6668,22 @@
       <button class="primary sm" onclick="mcExecCustom()">Run</button>
     </div>
 
+    <div class="manual-section ${manualCollapseState.crafting ? 'collapsed' : ''}" data-section="crafting">
+      <div class="manual-section-header" onclick="toggleManualSection('crafting')">
+        <span class="manual-section-title">Crafting</span>
+        <span class="manual-section-chevron">▼</span>
+      </div>
+      <div class="manual-section-body">
+        <div class="cmd-group">
+          <button class="danger sm" onclick="mcCancelAllCraftJobs()" style="width:100%" title="Fetch the craft queue and cancel every job one at a time">🛑 Cancel All Craft Jobs</button>
+        </div>
+        <div class="cmd-group">
+          <label>Cancel Status</label>
+          <span id="mc-cancel-craft-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+        </div>
+      </div>
+    </div>
+
     <div class="manual-section ${manualCollapseState.fleetActions ? 'collapsed' : ''}" data-section="fleetActions">
       <div class="manual-section-header" onclick="toggleManualSection('fleetActions')">
         <span class="manual-section-title">Fleet Actions</span>
@@ -6756,6 +6773,84 @@
           factionWithdrawSortOrder = checkbox.checked ? "quantity" : "alpha";
           renderManualControls();
         }
+      }
+
+      // ── Cancel All Craft Jobs ──────────────────────────────────
+      // Fetches the current craft queue (craft action=queue), then cancels
+      // each job one at a time by sending `craft job_id=<id>` for every
+      // job_id returned. Spacing out each cancel respects the 1s action
+      // tick cooldown so every job actually gets cancelled.
+
+      function mcCancelAllCraftJobs() {
+        if (!profileBot) return;
+        const statusEl = document.getElementById("mc-cancel-craft-status");
+        const setStatus = (t) => {
+          if (statusEl) statusEl.textContent = t;
+        };
+
+        if (statusEl) setStatus("Fetching queue...");
+        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+        logResponse(
+          `<span class="resp-cmd">${ts} > cancel all craft jobs (fetch queue)</span>`,
+        );
+
+        sendExec(profileBot, "craft", { action: "queue" }, (res) => {
+          if (!res.ok) {
+            logResponse(
+              `<span class="resp-err">Error fetching craft queue: ${esc(res.error || "unknown")}</span>`,
+            );
+            setStatus("Error fetching queue");
+            return;
+          }
+
+          const jobs =
+            (res.data && res.data.jobs) ||
+            (Array.isArray(res.data) ? res.data : []);
+          const jobIds = jobs
+            .map((j) => j.job_id || j.id)
+            .filter(Boolean);
+
+          if (jobIds.length === 0) {
+            logResponse(
+              `<span class="resp-ok">No active craft jobs to cancel.</span>`,
+            );
+            setStatus("No jobs");
+            return;
+          }
+
+          logResponse(
+            `<span class="resp-cmd">Cancelling ${jobIds.length} craft job(s) one at a time...</span>`,
+          );
+          setStatus(`0/${jobIds.length}`);
+
+          let i = 0;
+          const cancelNext = () => {
+            if (i >= jobIds.length) {
+              logResponse(
+                `<span class="resp-ok">Cancelled all ${jobIds.length} craft job(s).</span>`,
+              );
+              setStatus(`Done (${jobIds.length})`);
+              return;
+            }
+            const id = jobIds[i];
+            sendExec(profileBot, "craft", { job_id: id }, (r) => {
+              i++;
+              setStatus(`${i}/${jobIds.length}`);
+              if (r.ok) {
+                logResponse(
+                  `<span class="resp-ok">Cancelled job ${esc(id)}</span>`,
+                );
+              } else {
+                logResponse(
+                  `<span class="resp-err">Failed to cancel job ${esc(id)}: ${esc(r.error || "unknown")}</span>`,
+                );
+              }
+              // Respect the 1s action tick cooldown before the next cancel
+              setTimeout(cancelNext, 1100);
+            });
+          };
+          cancelNext();
+        });
       }
 
       // ── Jettison Command ────────────────────────────────────────
@@ -19209,6 +19304,14 @@ When responding:
               return;
             }
 
+            facilities.sort((a, b) =>
+              (a.name || a.facility_type || a.type || "?")
+                .toLowerCase()
+                .localeCompare(
+                  (b.name || b.facility_type || b.type || "?").toLowerCase(),
+                ),
+            );
+
             sendExec(
               username,
               "facility",
@@ -20539,6 +20642,14 @@ When responding:
             personalFacilityUpgrades = {};
             return;
           }
+
+          facilities.sort((a, b) =>
+            (a.name || a.facility_type || a.type || "?")
+              .toLowerCase()
+              .localeCompare(
+                (b.name || b.facility_type || b.type || "?").toLowerCase(),
+              ),
+          );
 
           sendExec(username, "facility", { action: "upgrades" }, (upResult) => {
             personalFacilityUpgrades = {};

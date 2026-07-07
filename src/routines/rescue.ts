@@ -2331,7 +2331,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -2396,7 +2396,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           yield "return_home";
           await ensureUndocked(ctx);
-          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
           const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -3328,7 +3328,7 @@ if (travelSucceeded) {
       if (!atHomeSystem) {
         ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -3710,7 +3710,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     if (targetSystem && targetSystem !== bot.system) {
       ctx.log("rescue", `Navigating to ${targetSystem}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${targetSystem} — aborting mission`);
@@ -3930,7 +3930,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       if (!atHomeSystem) {
         ctx.log("rescue", `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -4393,7 +4393,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
 
     if (mayday.system && mayday.system !== bot.system) {
       ctx.log("mayday", `Jumping to ${mayday.system}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
       const arrived = await navigateToSystem(ctx, mayday.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
@@ -4623,7 +4623,7 @@ if (refuelResp.error) {
       if (!atHomeSystem) {
         ctx.log("mayday", `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -5486,7 +5486,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -5551,7 +5551,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           yield "return_home";
           await ensureUndocked(ctx);
-          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
           const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -6617,7 +6617,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
               ctx.log("rescue", `🏠 Returning home before retry...`);
               await ensureUndocked(ctx);
-              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
               const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
               if (arrived) {
                 ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
@@ -6671,7 +6671,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
             ctx.log("rescue", `🚨 All rescue attempts failed - returning home to safety...`);
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (arrived) {
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
@@ -7039,7 +7039,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       yield "return_home";
       ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
       const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);

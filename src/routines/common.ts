@@ -1674,8 +1674,9 @@ export async function navigateToSystem(
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
-  // Fleet hunters BYPASS blacklist — they MUST enter pirate systems
-  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
+  // Fleet hunters BYPASS blacklist — they MUST enter pirate systems.
+  // A cloaked ship also bypasses the blacklist (cloaking alone is enough).
+  const blacklist = (opts.skipBlacklist || bot.isCloaked) ? [] : getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -1723,12 +1724,12 @@ export async function navigateToSystem(
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
         
-        const isCloaked = bot.isCloaked && opts.skipBlacklist;
+        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
         
-        if (blacklistedOnRoute && !isCloaked) {
+        if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
-        } else if (blacklistedOnRoute && isCloaked) {
-          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked, using route`);
+        } else if (blacklistedOnRoute && bypassBlacklist) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route`);
           nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
@@ -1788,7 +1789,7 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist });
+     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || bot.isCloaked });
      if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
@@ -1832,12 +1833,12 @@ export async function navigateToSystem(
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
         
-        const isCloaked = bot.isCloaked && opts.skipBlacklist;
+        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
         
-        if (blacklistedOnRoute && !isCloaked) {
+        if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
-        } else if (blacklistedOnRoute && isCloaked) {
-          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked, using route (post-fuel)`);
+        } else if (blacklistedOnRoute && bypassBlacklist) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route (post-fuel)`);
           nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);

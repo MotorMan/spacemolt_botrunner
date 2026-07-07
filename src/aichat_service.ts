@@ -270,7 +270,7 @@ return {
       lockDurationSec: (s.lockDurationSec as number) || 60,
       conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
       factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
-      llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+      llmTimeoutSec: (s.llmTimeoutSec as number) ?? 900,
       maxTokens: (s.maxTokens as number) ?? 1000,
       // Daily status/color update settings
       autoStatusUpdateEnabled: (s.autoStatusUpdateEnabled as boolean) ?? false,
@@ -477,17 +477,27 @@ async function callLlm(
     temperature: 0.8,
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${settings.apiKey}`,
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(settings.llmTimeoutSec * 1000),
-  });
+  const controller = new AbortController();
+  const timeoutMs = settings.llmTimeoutSec > 0 ? settings.llmTimeoutSec * 1000 : 0;
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  if (timeoutMs > 0) {
+    timeoutHandle = setTimeout(() => {
+      console.warn(`[ai_chat] LLM call to ${settings.model || "(default)"} timed out after ${settings.llmTimeoutSec}s — aborting fetch`);
+      controller.abort();
+    }, timeoutMs);
+  }
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${settings.apiKey}`,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
 
-  if (!resp.ok) {
+    if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`LLM HTTP ${resp.status}: ${text.slice(0, 300)}`);
   }
@@ -515,7 +525,10 @@ async function callLlm(
     return "";
   }
   
-  return responseContent;
+    return responseContent;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 // ── AI Chat Service Class ────────────────────────────────────
@@ -2543,6 +2556,7 @@ async sendRescueEnRouteNotification(
    */
   private async generateAndSetCaptainLog(bot: Bot): Promise<boolean> {
     const settings = getAiChatSettings();
+    this.logFn("ai_chat_debug", `Captain's log: effective llmTimeoutSec=${settings.llmTimeoutSec}s, activityMinutes=${settings.autoCaptainLogActivityMinutes}, model=${settings.model || "(default)"}`);
 
     if (!settings.enabled) {
       this.logFn("ai_chat_debug", `Captain's log skipped: AI Chat is disabled`);

@@ -14,6 +14,7 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
+  enableCloakingIfPossible,
   logStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -121,6 +122,8 @@ function getRescueSettings(): {
   premiumFuelReserve: number;
   maxFuelDelivery: number;
   ignoreBlacklist: boolean;
+  enableCloak: boolean;
+  dontRejectMaydaysInBlacklistSystems: boolean;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -155,7 +158,24 @@ function getRescueSettings(): {
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
     ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
+    enableCloak: (r.enableCloak as boolean) ?? false,
+    dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
   };
+}
+
+/**
+ * Enable cloaking on this bot if the rescue settings request it (enableCloak).
+ * A cloaked rescue ship is immune to pirate ambushes, allowing it to safely
+ * enter blacklisted/pirate systems when the corresponding setting is enabled.
+ */
+async function enableRescueCloak(ctx: RoutineContext, settings: ReturnType<typeof getRescueSettings>): Promise<void> {
+  if (!settings.enableCloak) return;
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("rescue", "🛡️ Cloaking enabled (enableCloak setting) — pirates can't ambush us");
+  } else {
+    ctx.log("rescue", "⚠️ enableCloak is set but no cloaking module is available on this ship");
+  }
 }
 
 /**
@@ -1675,6 +1695,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
+  await enableRescueCloak(ctx, settings);
+
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
 
   // Check if this bot should ONLY do credit top-off (no rescue operations)
@@ -2147,10 +2169,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
           const runtimeBlacklist = getSystemBlacklist();
-          const blacklist = settings.ignoreBlacklist ? [] : runtimeBlacklist;
+          const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
+          const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -3612,6 +3635,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
   const settings = getRescueSettings();
 
+  await enableRescueCloak(ctx, settings);
+
   // Persistent battle state across cycles
   const battleState: BattleState = {
     inBattle: false,
@@ -4050,6 +4075,8 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
+  await enableRescueCloak(ctx, settings);
+
   // ── MAYDAY enable gate ──
   // If MAYDAY rescue is disabled in settings, this dedicated routine does
   // nothing (it exists solely to answer distress calls).
@@ -4393,7 +4420,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
 
     if (mayday.system && mayday.system !== bot.system) {
       ctx.log("mayday", `Jumping to ${mayday.system}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist || settings.dontRejectMaydaysInBlacklistSystems };
       const arrived = await navigateToSystem(ctx, mayday.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
@@ -4843,6 +4870,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  await enableRescueCloak(ctx, settings);
 
   // Check if this bot should ONLY do credit top-off (no rescue operations)
   if (shouldOnlyCreditTopOff(bot.username)) {
@@ -5304,10 +5333,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
           const runtimeBlacklist = getSystemBlacklist();
-          const blacklist = settings.ignoreBlacklist ? [] : runtimeBlacklist;
+          const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
+          const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;

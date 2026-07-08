@@ -3059,6 +3059,34 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
   return false;
 }
 
+/**
+ * Unconditionally attempt to enable cloaking (e.g. when a routine's settings
+ * request permanent cloaking). Returns true if the bot ends up cloaked.
+ * Skips gracefully when already cloaked or when no cloak module is available.
+ */
+export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.isCloaked) return true;
+  try {
+    const resp = await bot.exec("cloak", { enable: true });
+    if (!resp.error) {
+      bot.isCloaked = true;
+      ctx.log("system", `Cloaking enabled in ${bot.system}`);
+      return true;
+    }
+    const msg = String(resp.error.message || "").toLowerCase();
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+      return true;
+    }
+    ctx.log("warn", `Could not enable cloaking: ${resp.error.message}`);
+    return false;
+  } catch (e) {
+    ctx.log("warn", `Could not enable cloaking: ${e}`);
+    return false;
+  }
+}
+
 // ── Transit Detection ───────────────────────────────────────────
 
 /**

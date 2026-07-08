@@ -2548,6 +2548,14 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     }
     await ensureDocked(ctx);
     await collectFromStorage(ctx);
+
+    // Load fuel cells to max cargo (explorers don't use their inventory for anything)
+    const startupSettings = getExplorerSettings(bot.username);
+    if (startupSettings.loadFuelCellsAtHome) {
+      yield "startup_load_fuel_cells";
+      await loadFuelCellsToMax(ctx);
+    }
+
     await tryRefuel(ctx);
     await bot.refreshLocation();
   }

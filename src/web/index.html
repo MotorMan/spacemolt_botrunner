@@ -14978,6 +14978,8 @@
         const fleetRescueBot = r.fleetRescueBot || "";
         const maydayRescueBot = r.maydayRescueBot || "";
         const ignoreBlacklist = r.ignoreBlacklist === true;
+        const enableCloak = r.enableCloak === true;
+        const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
 
         // Build system options from mapData
         const systems = Object.keys(mapData || {}).sort();
@@ -15175,6 +15177,16 @@
       <small style="color:var(--dim)">Allow fleet rescue bots to enter blacklisted systems when needed</small>
     </div>
 
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-enableCloak" ${enableCloak ? "checked" : ""}> Enable cloaking</label>
+      <small style="color:var(--dim)">Keep the ship cloaked so pirates can't ambush it while rescuing (requires a cloaking module)</small>
+    </div>
+
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-dontRejectMaydaysInBlacklistSystems" ${dontRejectMaydaysInBlacklistSystems ? "checked" : ""}> Don't reject MAYDAYs in blacklisted systems</label>
+      <small style="color:var(--dim)">When cloaking is enabled AND active, accept MAYDAYs in blacklisted/pirate systems (cloak keeps you safe from ambush)</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
   `;
       }
@@ -15242,6 +15254,10 @@
             document.getElementById("set-rescue-maydayRescueBot").value || "",
           ignoreBlacklist: document.getElementById(
             "set-rescue-ignoreBlacklist",
+          ).checked,
+          enableCloak: document.getElementById("set-rescue-enableCloak").checked,
+          dontRejectMaydaysInBlacklistSystems: document.getElementById(
+            "set-rescue-dontRejectMaydaysInBlacklistSystems",
           ).checked,
         };
         send({ type: "saveSettings", routine: "rescue", settings: s });
@@ -16892,8 +16908,8 @@ function renderAiChatSettings(panel) {
             </div>
 
             <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
-              <span style="font-size:12px;color:var(--text-dim);min-width:120px;">Interval (hours):</span>
-              <input type="number" id="set-aichat-autoCaptainLogIntervalSec" min="1" max="168" value="${Math.round(autoCaptainLogIntervalSec / 3600)}" style="width:80px;font-size:12px;padding:4px;">
+              <span style="font-size:12px;color:var(--text-dim);min-width:120px;">Interval (minutes):</span>
+              <input type="number" id="set-aichat-autoCaptainLogIntervalSec" min="1" max="10080" value="${Math.round(autoCaptainLogIntervalSec / 60)}" style="width:80px;font-size:12px;padding:4px;">
             </div>
 
             <div style="display:flex;align-items:center;gap:8px;margin-left:24px;">
@@ -16993,7 +17009,7 @@ respondToMentions: document.getElementById(
           autoCaptainLogEnabled: document.getElementById("set-aichat-autoCaptainLogEnabled").checked,
           autoCaptainLogIntervalSec: (parseInt(
             document.getElementById("set-aichat-autoCaptainLogIntervalSec").value,
-          ) || 24) * 3600,
+          ) || 1440) * 60,
           autoCaptainLogActivityMinutes: (parseInt(
             document.getElementById("set-aichat-autoCaptainLogActivityMinutes").value,
           ) || 60),
@@ -19321,6 +19337,14 @@ When responding:
         <button class="sm" onclick="fetchFacilityHelp('${esc(username)}')" ${!docked ? "disabled" : ""}>Show API Help</button>
       </div>
     </div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Facility Queue Usage</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <button class="sm" onclick="fetchFactionFacilityQueueUsage('${esc(username)}')">Analyze Queue Usage</button>
+        <span style="font-size:11px;color:var(--text-dim)">Queries each facility's job list (non-mutating) to split total queued runs into your own vs. other players' (external/public) usage.</span>
+      </div>
+      <div id="factionFacilityQueueUsage"><div class="faction-no-data" style="font-size:11px">Click "Analyze Queue Usage" to load data.</div></div>
+    </div>
   `;
       }
 
@@ -19471,6 +19495,7 @@ When responding:
                         if (fid && prodMap[fid]) fac.production = prodMap[fid];
                       });
                     }
+                    factionFacilitiesData = facilities;
                     container.innerHTML = renderCards();
                   },
                 );
@@ -19478,6 +19503,220 @@ When responding:
             );
           },
         );
+      }
+
+      async function fetchFactionFacilityQueueUsage(username) {
+        const container = document.getElementById("factionFacilityQueueUsage");
+        if (!container) return;
+        container.innerHTML =
+          '<div class="faction-no-data">Loading queue usage...</div>';
+
+        // 1) Always pull a fresh `facility list` — it carries authoritative
+        //    production.queued_runs / queued_items and the facility IDs we need.
+        const listResult = await new Promise((resolve) => {
+          sendExec(username, "facility", { action: "list" }, resolve);
+        });
+        let listFacilities = [];
+        const listProdMap = {};
+        if (listResult.ok && listResult.data) {
+          const ld = listResult.data;
+          listFacilities = Array.isArray(ld.faction_facilities)
+            ? ld.faction_facilities
+            : Array.isArray(ld.player_facilities)
+              ? ld.player_facilities
+              : Array.isArray(ld.facilities)
+                ? ld.facilities
+                : Array.isArray(ld)
+                  ? ld
+                  : [];
+          listFacilities.forEach((f) => {
+            const fid = f.facility_id || f.id;
+            if (fid && f.production) listProdMap[fid] = f.production;
+          });
+        }
+
+        // Base facility scope: cached faction facilities if available (correct
+        // scope), else the fresh facility list we just pulled.
+        let facilities =
+          factionFacilitiesData && factionFacilitiesData.length
+            ? factionFacilitiesData
+            : listFacilities;
+
+        if (!facilities || facilities.length === 0) {
+          container.innerHTML =
+            '<div class="faction-no-data">No facilities found. Load facilities first (bot must be docked at a station).</div>';
+          return;
+        }
+
+        // Build per-facility map; prefer authoritative queued_runs/queued_items
+        // from the fresh facility list, fall back to the cached production.
+        const facMap = {};
+        facilities.forEach((f) => {
+          const fid = f.facility_id || f.id || "";
+          if (!fid) return;
+          const lp = listProdMap[fid] || {};
+          const cp = f.production || {};
+          const queuedRuns =
+            typeof lp.queued_runs === "number"
+              ? lp.queued_runs
+              : typeof cp.queued_runs === "number"
+                ? cp.queued_runs
+                : 0;
+          const queuedItems =
+            typeof lp.queued_items === "number"
+              ? lp.queued_items
+              : typeof cp.queued_items === "number"
+                ? cp.queued_items
+                : 0;
+          facMap[fid] = {
+            id: fid,
+            ownerId: f.owner_id || "",
+            name: f.name || f.facility_type || f.type || fid,
+            level: f.level ?? f.tier ?? "",
+            public: !!(lp.public ?? cp.public),
+            queuedRuns,
+            queuedItems,
+            ourRuns: 0,
+            externalOrderers: new Set(),
+            jobListOk: null,
+          };
+        });
+
+        // 2) Query job_list only for facilities that actually have queued runs.
+        //    job_list is non-mutating. Each job carries an `orderer` field, so we
+        //    can split our own runs from other players' (external) runs directly.
+        const withJobs = Object.values(facMap).filter(
+          (fac) => fac.queuedRuns > 0,
+        );
+
+        await Promise.all(
+          withJobs.map(
+            (fac) =>
+              new Promise((resolve) => {
+                sendExec(
+                  username,
+                  "facility",
+                  { action: "job_list", facility_id: fac.id },
+                  (res) => {
+                    if (!res.ok || !res.data) {
+                      fac.jobListOk = false;
+                      resolve();
+                      return;
+                    }
+                    fac.jobListOk = true;
+                    const d = res.data;
+                    const jobs = Array.isArray(d.jobs)
+                      ? d.jobs
+                      : Array.isArray(d)
+                        ? d
+                        : [];
+                    jobs.forEach((job) => {
+                      const orderer = job.orderer;
+                      const isSelf =
+                        orderer === "self" ||
+                        orderer === username ||
+                        (fac.ownerId && orderer === fac.ownerId);
+                      if (!isSelf) {
+                        fac.externalOrderers.add(orderer || "?");
+                        return;
+                      }
+                      const remaining =
+                        typeof job.runs_remaining === "number"
+                          ? job.runs_remaining
+                          : typeof job.runs_total === "number"
+                            ? job.runs_total
+                            : 0;
+                      fac.ourRuns += remaining;
+                    });
+                    resolve();
+                  },
+                );
+              }),
+          ),
+        );
+
+        const rows = Object.values(facMap).map((fac) => {
+          const hasJobs = fac.queuedRuns > 0;
+          const known = fac.jobListOk === true;
+          // External = total queued minus our own runs (orderer === "self")
+          const ourRuns = known ? fac.ourRuns : hasJobs ? null : 0;
+          const externalRuns = known
+            ? Math.max(0, fac.queuedRuns - fac.ourRuns)
+            : hasJobs
+              ? null
+              : 0;
+          const outputPerRun =
+            fac.queuedRuns > 0 ? fac.queuedItems / fac.queuedRuns : 1;
+          const externalItems =
+            externalRuns == null ? null : externalRuns * outputPerRun;
+          const onlyUs = externalRuns != null && externalRuns <= 0;
+          const unknown = externalRuns == null;
+          const statusColor = unknown
+            ? "var(--text-dim)"
+            : onlyUs
+              ? "var(--green)"
+              : "var(--orange)";
+          const statusText = unknown
+            ? "Unknown"
+            : onlyUs
+              ? "Private (only you)"
+              : "Public / External";
+          const levelStr = fac.level ? ` (L${fac.level})` : "";
+          const orderers =
+            fac.externalOrderers.size > 0
+              ? ` <span style="font-size:10px;color:var(--text-dim)">(${[...fac.externalOrderers].join(", ")})</span>`
+              : "";
+          const fmt = (v) =>
+            v == null ? "—" : Math.round(v).toLocaleString();
+          return `<tr>
+            <td style="text-align:left;padding:4px 8px;color:var(--text-bright)">${esc(fac.name)}${esc(levelStr)}</td>
+            <td style="text-align:center;padding:4px 8px">${fac.public ? '<span style="color:var(--green)">Public</span>' : '<span style="color:var(--text-dim)">Private</span>'}</td>
+            <td style="text-align:right;padding:4px 8px">${fac.queuedRuns.toLocaleString()}</td>
+            <td style="text-align:right;padding:4px 8px">${fmt(ourRuns)}</td>
+            <td style="text-align:right;padding:4px 8px;color:${statusColor};font-weight:600">${fmt(externalRuns)}</td>
+            <td style="text-align:right;padding:4px 8px;color:${statusColor}">${fmt(externalItems)}</td>
+            <td style="text-align:center;padding:4px 8px;color:${statusColor}">${statusText}${orderers}</td>
+          </tr>`;
+        });
+
+        const totalExternalRuns = Object.values(facMap)
+          .filter((fac) => fac.jobListOk === true)
+          .reduce(
+            (sum, fac) => sum + Math.max(0, fac.queuedRuns - fac.ourRuns),
+            0,
+          );
+        const externalFacilityCount = Object.values(facMap).filter(
+          (fac) => fac.jobListOk === true && fac.queuedRuns - fac.ourRuns > 0,
+        ).length;
+        const unknownCount = Object.values(facMap).filter(
+          (fac) => fac.queuedRuns > 0 && fac.jobListOk !== true,
+        ).length;
+
+        let summary =
+          '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">';
+        summary += `Total external (other players') queued runs: <span style="color:var(--orange);font-weight:600">${totalExternalRuns.toLocaleString()}</span> across <span style="color:var(--orange);font-weight:600">${externalFacilityCount}</span> facility${externalFacilityCount === 1 ? "" : "ies"}`;
+        if (unknownCount > 0) {
+          summary += ` <span style="color:var(--red)">(${unknownCount} facility with jobs could not be checked)</span>`;
+        }
+        summary += ".</div>";
+
+        container.innerHTML = `
+          ${summary}
+          <table class="bot-table" style="font-size:12px">
+            <thead>
+              <tr>
+                <th style="text-align:left;padding:4px 8px">Facility</th>
+                <th style="text-align:center;padding:4px 8px">Access</th>
+                <th style="text-align:right;padding:4px 8px">Total Runs</th>
+                <th style="text-align:right;padding:4px 8px">Our Runs</th>
+                <th style="text-align:right;padding:4px 8px">External Runs</th>
+                <th style="text-align:right;padding:4px 8px">External Items</th>
+                <th style="text-align:center;padding:4px 8px">Usage</th>
+              </tr>
+            </thead>
+            <tbody>${rows.join("")}</tbody>
+          </table>
+        `;
       }
 
       function factionToggleFacility(username, facilityId) {
@@ -19786,6 +20025,7 @@ When responding:
       let factionFacilityCategory = "faction";
       let factionFacilityPublic = {};
       let factionFacilityPrice = {};
+      let factionFacilitiesData = [];
 
       let personalFacilityTypes = [];
       let personalFacilityCategory = "personal";
@@ -25830,8 +26070,8 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-hint">Stay cloaked until just before attacking, then re-cloak after battle. Helps avoid detection by enemy players watching the external map.</div>
       </div>
       <select id="set-fleet-hunter-cloakOnStart">
-        <option value="false"${!(h.cloakOnStart ?? false) ? " selected" : ""}>Disabled (autoCloak only for travel)</option>
-        <option value="true"${(h.cloakOnStart ?? false) ? " selected" : ""}>Enabled (always cloaked in combat)</option>
+        <option value="false"${!(fh.cloakOnStart ?? false) ? " selected" : ""}>Disabled (autoCloak only for travel)</option>
+        <option value="true"${(fh.cloakOnStart ?? false) ? " selected" : ""}>Enabled (always cloaked in combat)</option>
       </select>
     </div>
 
@@ -30945,29 +31185,6 @@ ignoreBlacklist: document.getElementById(
 
       <div id="clientSyncOptionsPanel" style="${mode === "slave" ? "" : "display:none"}">
         <div style="margin-top:8px;margin-bottom:4px;font-size:13px;font-weight:500;color:var(--text-bright)">Sync Options</div>
-        
-<div class="setting-row">
-        <div>
-          <label>Cargo to Faction Storage</label>
-          <div class="setting-hint">Sell items at market then deposit fuel from cargo into faction storage. Used by cargo mover.</div>
-        </div>
-        <input type="checkbox" id="set-fs-cargoToFactionStorage" ${cargoToFactionStorage ? "checked" : ""}>
-      </div>
-
-      <div class="setting-row">
-        <div class="setting-label">Service All Empires</div>
-        <input type="checkbox" id="set-fs-serviceAllEmpires" ${serviceAllEmpires ? "checked" : ""}>
-      </div>
-
-      <div class="setting-row">
-        <div class="setting-label">Use All Stations in Empire</div>
-        <input type="checkbox" id="set-fs-useAllStationsInEmpire" ${useAllStationsInEmpire ? "checked" : ""}>
-      </div>
-
-      <div class="setting-row">
-        <div class="setting-label">Refresh Interval (seconds)</div>
-        <input type="number" id="set-fs-refreshIntervalSec" min="30" max="3600" value="${refreshIntervalSec ?? 300}">
-      </div>
         <div class="setting-row">
           <div><div class="setting-label">Sync Market</div></div>
           <input type="checkbox" id="set-client_sync-syncMarket" ${syncMarket ? "checked" : ""}>
@@ -31183,7 +31400,7 @@ ignoreBlacklist: document.getElementById(
                 document.getElementById("set-client_sync-pollIntervalSec")
                   .value,
               ) || 15,
-            syncMap: document.getElementById("set-client_sync-syncMap").checked,
+            syncMap: cs.syncMap !== false,
             syncMarket: document.getElementById("set-client_sync-syncMarket")
               .checked,
             syncCatalog: document.getElementById("set-client_sync-syncCatalog")

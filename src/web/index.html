@@ -14980,6 +14980,7 @@
         const ignoreBlacklist = r.ignoreBlacklist === true;
         const enableCloak = r.enableCloak === true;
         const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
+        const disableFactionAnnouncements = r.disableFactionAnnouncements === true;
 
         // Build system options from mapData
         const systems = Object.keys(mapData || {}).sort();
@@ -15187,8 +15188,13 @@
       <small style="color:var(--dim)">When cloaking is enabled AND active, accept MAYDAYs in blacklisted/pirate systems (cloak keeps you safe from ambush)</small>
     </div>
 
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-disableFactionAnnouncements" ${disableFactionAnnouncements ? "checked" : ""}> Disable faction announcements</label>
+      <small style="color:var(--dim)">Don't send rescue start/complete messages to faction chat (quieter operation)</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
-  `;
+    `;
       }
 
       function saveRescueSettings() {
@@ -15258,6 +15264,9 @@
           enableCloak: document.getElementById("set-rescue-enableCloak").checked,
           dontRejectMaydaysInBlacklistSystems: document.getElementById(
             "set-rescue-dontRejectMaydaysInBlacklistSystems",
+          ).checked,
+          disableFactionAnnouncements: document.getElementById(
+            "set-rescue-disableFactionAnnouncements",
           ).checked,
         };
         send({ type: "saveSettings", routine: "rescue", settings: s });

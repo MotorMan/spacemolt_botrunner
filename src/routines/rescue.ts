@@ -2,6 +2,8 @@ import type { Routine, RoutineContext, BotStatus } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
 import * as fs from 'fs';
 import * as path from 'path';
+import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
+import { updateFactionStorageCache, getFactionStorageCache, type FactionStorageEntry } from "../factionStorageCache.js";
 import {
   findStation,
   getSystemInfo,
@@ -124,6 +126,7 @@ function getRescueSettings(): {
   ignoreBlacklist: boolean;
   enableCloak: boolean;
   dontRejectMaydaysInBlacklistSystems: boolean;
+  disableFactionAnnouncements: boolean;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -160,6 +163,7 @@ function getRescueSettings(): {
     ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
     enableCloak: (r.enableCloak as boolean) ?? false,
     dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
+    disableFactionAnnouncements: (r.disableFactionAnnouncements as boolean) ?? false,
   };
 }
 
@@ -2585,15 +2589,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log("rescue", `Created rescue session for ${target.username}`);
     }
 
-    // ── Log the rescue target ──
-    if (isManualRescueTarget) {
-      ctx.log("rescue", `🎯 MANUAL RESCUE: ${target.username} at ${target.system}/${target.poi || "unknown"}`);
-    } else if (isMaydayTarget) {
-      ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
-    } else {
-      ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
-    }
-
     // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
     // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
     // Calculate jumps to target for the notification
@@ -3492,59 +3487,67 @@ if (travelSucceeded) {
         recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
         // ── Send faction announcement (send immediately, not in setTimeout) ──
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
-            } else {
-              ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
-            }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
-          }
-        }
-      } else {
-        const aiChatSettings = ((globalThis as any).aiChatService)?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
             try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
+              const result = await aiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
               });
               if (!result.ok) {
                 ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              } else {
+                ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
               }
             } catch (e) {
               ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
           }
-        }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
+      } else {
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = ((globalThis as any).aiChatService)?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+              }
+            }
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       }
     }
 
@@ -4935,36 +4938,69 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
     }
 
-    // ── Start background faction storage update loop (non-blocking) ──
-    // Cycles through approved fuel stations to update faction storage data
-    let currentFuelStationIndex = 0;
-    const general = readSettings().general || {};
-    const approvedFuelStations: string[] = (general as any).approvedFuelStations as string[] || [];
-    
-    if (approvedFuelStations.length > 0) {
-      ctx.log("rescue", `📡 Starting faction storage update cycle for ${approvedFuelStations.length} approved fuel stations`);
-      
-      // Start background update loop
+    // ── Start background remote faction-station fuel monitor (non-blocking) ──
+    // Iterates ALL faction stations one at a time, reading each station's full
+    // faction storage (including the faction fuel facility's current level) via
+    // view_faction_storage. This works REMOTELY — no docking required — so the
+    // rescue bot keeps an accurate, up-to-date picture of every station's faction
+    // fuel reserve/capacity. One station is polled per minute (~stations ≈ full
+    // scan time in minutes). NOTE: this is purely a storage/fuel-level read;
+    // the fuel service's facility job monitoring is a separate, at-station concern.
+    const allFactionStations: string[] = getAllStationsForEmpires(Object.keys(EMPIRE_STATIONS));
+    let remoteStationIndex = 0;
+
+    if (allFactionStations.length > 0) {
+      ctx.log("rescue", `📡 Starting remote faction-station fuel monitor for ${allFactionStations.length} stations (1 per minute via view_faction_storage)`);
+
       (async () => {
         while (bot.state === "running") {
           try {
-            const stationKey = approvedFuelStations[currentFuelStationIndex];
-            const stationId = stationKey.split("|")[1];
-            if (stationId && bot.docked && bot.poi === stationId) {
-              ctx.log("rescue", `📡 Updating faction storage at ${stationId}...`);
-              const storageResp = await bot.exec("view_storage", { target: "faction", station_id: stationId });
-              if (!storageResp.error && storageResp.result) {
-                const result = storageResp.result as Record<string, unknown>;
-                const items = (result.items as any[]) || [];
-                ctx.log("rescue", `📡 Faction storage updated: ${items.length} items`);
-              }
+            const stationRef = allFactionStations[remoteStationIndex];
+            const stationId = stationRef.includes("|") ? stationRef.split("|")[1] : stationRef;
+
+            // Read the REMOTE station's faction storage from anywhere — docking not needed.
+            const storageResp = await bot.exec("view_faction_storage", { station_id: stationId });
+            if (!storageResp.error && storageResp.result) {
+              const result = storageResp.result as Record<string, unknown>;
+              const reserve = (result.faction_fuel_reserve as number) || 0;
+              const capacity = (result.faction_fuel_capacity as number) || 0;
+              // IMPORTANT: view_faction_storage returns the BOT's own faction data, so the
+              // cache must be written under the bot's actual faction (bot.faction). Do NOT
+              // trust result.faction_name / result.faction_id from the response — those
+              // reflect the station's controlling faction and are unreliable, producing
+              // mislabeled cache files (e.g. "solarian--station.json") instead of the
+              // correct "Busy Being Dead--station.json".
+              const factionName = bot.faction || "";
+
+              // Preserve existing cached item entries; only refresh the fuel facility levels
+              // so a partial read never wipes the item list.
+              const existing = getFactionStorageCache(factionName, stationId);
+              const rawItems = (result.items as Array<Record<string, unknown>>) || [];
+              const entries: FactionStorageEntry[] = rawItems.map((i) => ({
+                itemId: (i.item_id as string) || (i.id as string) || "",
+                quantity: (i.quantity as number) || 0,
+                name: (i.name as string) || (i.item_id as string) || (i.id as string) || "",
+              }));
+
+              updateFactionStorageCache(
+                factionName,
+                entries.length > 0 ? entries : (existing?.entries || []),
+                stationId,
+                reserve,
+                capacity,
+              );
+
+              ctx.log("rescue", `📡 Remote ${stationId}: faction fuel facility = ${reserve}/${capacity} (${entries.length} item types)`);
+            } else if (storageResp.error) {
+              ctx.log("warn", `📡 Failed to read faction storage at remote station ${stationId}: ${storageResp.error.message}`);
             }
-            currentFuelStationIndex = (currentFuelStationIndex + 1) % approvedFuelStations.length;
           } catch (e) {
-            ctx.log("warn", `Failed to update faction storage: ${e}`);
+            ctx.log("warn", `📡 Error in remote faction-station fuel monitor: ${e}`);
           }
-          // Wait 1 minute before next station update
-          await new Promise(resolve => setTimeout(resolve, 60000));
+
+          remoteStationIndex = (remoteStationIndex + 1) % allFactionStations.length;
+          // ~1 minute between station reads
+          await new Promise((resolve) => setTimeout(resolve, 60000));
         }
       })();
     }
@@ -5841,7 +5877,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
       ctx.log("rescue", `Created rescue session for ${target.username}`);
 
-      // Send faction chat announcement for rescue start
+}
+
+    // Send faction chat announcement for rescue start
+    if (!settings.disableFactionAnnouncements) {
       const aiChatService = (globalThis as any).aiChatService;
       if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
         try {
@@ -6997,70 +7036,78 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         // ── Send faction announcement in background (non-blocking) ──
         // This allows immediate return home instead of waiting for cooldown
-        const aiChatSettings = aiChatService?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = aiChatService?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          }
-        }, cooldownSec * 1000);
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       } else {
         // No bill to send, but still send faction announcement in background
-        const aiChatSettings = aiChatService?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = aiChatService?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill?.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill?.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill?.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill?.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          }
-        }, cooldownSec * 1000);
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       }
     }
 
@@ -7160,7 +7207,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Refuel self ──
     yield "self_refuel";
-await bot.refreshShip();
+    await bot.refreshShip();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
     if (fuelAfterRescue < settings.refuelThreshold) {

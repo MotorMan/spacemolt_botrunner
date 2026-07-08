@@ -1029,29 +1029,69 @@ if (url.pathname === "/data/shipsForSale.json") {
 
           const stationsData: Array<{ stationId: string; systemId: string; fuelReserve: number; fuelCapacity: number }> = [];
 
+          // The bot's own faction (from live status). Cache files are written under
+          // this faction name (e.g. "Busy Being Dead--sol_central.json"). Anything
+          // else is a mislabeled/bugged file and must NOT be used for the dashboard.
+          const ourFaction = (this.latestStatuses || []).map((b) => b.faction).find((f) => !!f) || null;
+
           for (const stationKey of approvedStations) {
             const [systemId, stationId] = stationKey.split("|");
             if (!stationId) continue;
 
             try {
               const files = readdirSync(CACHE_DIR);
+              let ourFactionData: any = null; // preferred: matches the bot's own faction
+              let fallbackData: any = null;   // most recent valid (non-legacy) file
+
+              // The faction storage cache keeps a separate file PER faction for the
+              // same station. Some are mislabeled (the monitor used to trust an
+              // unreliable response field), so we must prefer the bot's own faction
+              // file and only fall back to the most-recent valid file if none exists.
+              const consider = (faction: string, data: any): void => {
+                const updated = data.lastUpdated || 0;
+                const isOurs = ourFaction && (data.factionName === ourFaction || faction === ourFaction);
+                if (isOurs) {
+                  if (!ourFactionData || updated > (ourFactionData.lastUpdated || 0)) ourFactionData = data;
+                  return;
+                }
+                if (ourFactionData) return; // already have the authoritative faction file
+                if (!fallbackData || updated > (fallbackData.lastUpdated || 0)) fallbackData = data;
+              };
+
               for (const file of files) {
                 if (!file.endsWith(".json")) continue;
                 const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
                 if (!match) continue;
-                const [, , fileStationId] = match;
-                if (fileStationId === stationId) {
-                  const factionStoragePath = join(CACHE_DIR, file);
-                  const raw = readFileSync(factionStoragePath, "utf-8");
-                  const data = JSON.parse(raw);
-                  stationsData.push({
-                    stationId,
-                    systemId,
-                    fuelReserve: data.factionFuelReserve || 0,
-                    fuelCapacity: data.factionFuelCapacity || 0,
-                  });
-                  break;
+                const faction = match[1];
+                const fileStationId = match[2];
+                if (fileStationId !== stationId) continue;
+                if (/^[0-9a-f]{8,}$/i.test(faction)) continue; // skip hex hash faction ids
+                if (faction.toLowerCase() === "default") continue;
+                const raw = readFileSync(join(CACHE_DIR, file), "utf-8");
+                consider(faction, JSON.parse(raw));
+              }
+
+              // Fallback: if only hex/default faction files existed for this station,
+              // take the most recent of those rather than reporting nothing.
+              if (!ourFactionData && !fallbackData) {
+                for (const file of files) {
+                  if (!file.endsWith(".json")) continue;
+                  const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
+                  if (!match || match[2] !== stationId) continue;
+                  const raw = readFileSync(join(CACHE_DIR, file), "utf-8");
+                  consider(match[1], JSON.parse(raw));
                 }
+              }
+
+              const bestData = ourFactionData || fallbackData;
+
+              if (bestData) {
+                stationsData.push({
+                  stationId,
+                  systemId,
+                  fuelReserve: bestData.factionFuelReserve || 0,
+                  fuelCapacity: bestData.factionFuelCapacity || 0,
+                });
               }
             } catch {
               // Ignore errors for individual stations

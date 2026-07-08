@@ -45,6 +45,7 @@ export interface StationFacilityState {
   lastQueuedRuns?: number;
   status: FacilityStatus;
   buildFailures: number;
+  buildIssuedAt?: number;
   materialTransport?: Record<string, MaterialTransportStatus>;
   activeTransport?: ActiveTransport;
 }

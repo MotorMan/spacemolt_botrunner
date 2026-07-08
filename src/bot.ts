@@ -64,6 +64,7 @@ export interface BotStatus {
   skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
   factionFuelReserve?: number;
   factionFuelCapacity?: number;
+  faction: string | null;
   isCloaked: boolean;
 }
 
@@ -3206,6 +3207,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       skills: this.getSkillsSnapshot(),
       factionFuelReserve: this.factionFuelReserve,
       factionFuelCapacity: this.factionFuelCapacity,
+      faction: this.faction,
       isCloaked: this.isCloaked,
     };
   }

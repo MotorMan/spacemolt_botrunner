@@ -176,7 +176,17 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   await bot.refreshLocation();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
-      ctx.log("travel", "Already at home station — checking repair status...");
+      ctx.log("travel", "Already at home station — checking dock/repair status...");
+      // The bot can be at the station POI but not docked (idle in orbit).
+      // If so, dock it before treating the routine as complete.
+      if (!bot.docked) {
+        ctx.log("travel", "At home station but not docked — docking now...");
+        const docked = await ensureDocked(ctx, true);
+        if (!docked) {
+          ctx.log("error", "Failed to dock at home station — routine cancelled");
+          return; // Cancel routine
+        }
+      }
       // Check and repair if needed before leaving
       const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (hullPct < 95) {

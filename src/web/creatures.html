@@ -200,14 +200,17 @@
       });
 
       const k = sortBy;
+      const field = (k === "hull") ? "maxHull" : k;
       const numeric = (k === "hull" || k === "count");
+      if (sortKey !== k) { sortKey = k; sortDir = (k === "hull" || k === "count" || k === "seen") ? -1 : 1; }
+      const dir = sortDir;
       rows.sort((a, b) => {
         let av, bv;
-        if (k === "seen") { av = a.seen; bv = b.seen; return av > bv ? -1 : av < bv ? 1 : 0; }
-        av = a[k]; bv = b[k];
-        if (numeric) return (av || 0) - (bv || 0);
+        if (k === "seen") { av = a.seen; bv = b.seen; return dir * (av > bv ? -1 : av < bv ? 1 : 0); }
+        av = a[field]; bv = b[field];
+        if (numeric) return dir * ((av || 0) - (bv || 0));
         av = String(av || ""); bv = String(bv || "");
-        return av < bv ? -1 : av > bv ? 1 : 0;
+        return dir * (av < bv ? -1 : av > bv ? 1 : 0);
       });
       return rows;
     }
@@ -266,9 +269,12 @@
     function setSort(key) {
       const sel = document.getElementById("sortBy");
       if (sel.value === key) {
-        // toggle direction handled implicitly by re-sort; keep simple asc
+        sortDir = -sortDir;
+      } else {
+        sortDir = (key === "hull" || key === "count" || key === "seen") ? -1 : 1;
       }
       sel.value = key;
+      sortKey = key;
       render();
     }
 

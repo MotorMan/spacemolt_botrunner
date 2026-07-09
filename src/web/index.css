@@ -457,15 +457,9 @@ table.bot-table.compact-mode .row-actions button {
   border-radius: 3px;
   transition: width 0.3s;
 }
-.grid-bar-fill.bar-fuel {
-  /* Dynamic gradient set by JS based on fuel level */
-}
 .grid-bar-fill.bar-fuel.low {
   /* Dynamic gradient set by JS, animation for low fuel */
   animation: pulse-fuel 2s ease-in-out infinite;
-}
-.grid-bar-fill.bar-cargo {
-  /* Dynamic gradient set by JS based on cargo level */
 }
 .grid-bar-value {
   width: 55px;

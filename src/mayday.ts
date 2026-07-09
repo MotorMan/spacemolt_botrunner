@@ -85,6 +85,22 @@ export function addMaydayRequest(mayday: MaydayRequest): boolean {
 }
 
 /**
+ * Count how many MAYDAY requests are currently pending (not yet expired).
+ * Used by the rescue routines to decide whether a backup (non-primary) bot
+ * should step in — only when there is a genuine surge (2+ at once).
+ */
+export function getPendingMaydayCount(): number {
+  const now = Date.now();
+  let count = 0;
+  for (const mayday of maydayQueue) {
+    if (now - mayday.timestamp <= MAYDAY_EXPIRY_MS) {
+      count++;
+    }
+  }
+  return count;
+}
+
+/**
  * Get the next pending MAYDAY request (oldest first).
  * Filters out expired MAYDAYs automatically.
  * Returns null if no pending requests.

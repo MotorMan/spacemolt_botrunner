@@ -30,7 +30,7 @@ import {
   type PirateDetectionResult,
   type NearbyEntity,
 } from "./common.js";
-import { getNextMayday, markMaydayHandled, clearMaydayQueue, type MaydayRequest } from "../mayday.js";
+import { getNextMayday, markMaydayHandled, clearMaydayQueue, getPendingMaydayCount, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
 import { tryClaimMayday, getMaydayLockHolder, releaseMayday } from "../maydayLock.js";
 import {
@@ -209,20 +209,53 @@ function shouldOnlyCreditTopOff(botUsername: string): boolean {
     return false;
   }
 
-  // Fleet rescue is "enabled for this bot" if the global flag is on AND this
-  // bot is the fleet primary (or the primary is busy, i.e. we'd cover for it).
-  const fleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
+  // A bot is "fleet for this bot" only if it is the assigned fleet primary.
+  // We deliberately do NOT fall back to "the primary is busy" here — otherwise a
+  // pure credit-top-off bot would be pulled into the main rescue loop whenever
+  // the fleet bot was occupied, even though it was configured to do nothing but
+  // credit top-off. The same applies to MAYDAY below.
   const fleetForThisBot =
     !!settings.fleetRescueEnabled &&
-    (isPrimaryFleetRescueBot(botUsername) || fleetBusy);
+    isPrimaryFleetRescueBot(botUsername);
 
-  const maydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
   const maydayForThisBot =
     !!settings.maydayRescueEnabled &&
-    (isPrimaryMaydayRescueBot(botUsername) || maydayBusy);
+    isPrimaryMaydayRescueBot(botUsername);
 
-  // Only credit top-off when neither fleet nor MAYDAY is enabled for this bot.
+  // Only credit top-off when neither fleet nor MAYDAY is owned by this bot.
   return !fleetForThisBot && !maydayForThisBot;
+}
+
+/**
+ * Whether THIS bot should handle fleet rescues this cycle.
+ *
+ * - The assigned fleet-primary bot always handles fleet rescues.
+ * - A NON-primary bot (e.g. the credit-top-off or MAYDAY bot) must NOT piggyback
+ *   on fleet rescues just because the primary happens to be busy with one. It
+ *   only steps in when there is a genuine surge: 2+ stranded fleet members that
+ *   the single primary cannot service alone.
+ */
+function shouldHandleFleetRescue(botUsername: string, strandedCount: number): boolean {
+  const settings = getRescueSettings();
+  if (!settings.fleetRescueEnabled) return false;
+  if (isPrimaryFleetRescueBot(botUsername)) return true;
+  return strandedCount >= 2;
+}
+
+/**
+ * Whether THIS bot should handle a MAYDAY this cycle.
+ *
+ * - The assigned MAYDAY-primary bot always handles MAYDAYs.
+ * - A NON-primary bot (e.g. the credit-top-off or fleet bot) must NOT respond to
+ *   a MAYDAY just because the MAYDAY-primary is busy with one. It only steps in
+ *   when there is a genuine surge: 2+ pending MAYDAYs, so the two bots can cover
+ *   DIFFERENT calls (the per-MAYDAY claim lock prevents both taking the same one).
+ */
+function shouldHandleMaydayRescue(botUsername: string, pendingMaydayCount: number): boolean {
+  const settings = getRescueSettings();
+  if (!settings.maydayRescueEnabled) return false;
+  if (isPrimaryMaydayRescueBot(botUsername)) return true;
+  return pendingMaydayCount >= 2;
 }
 
 /**
@@ -1956,56 +1989,58 @@ skipToReturnHome = true;
          continue;
        }
 
-        // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-       const fleetRescueEnabled = isFleetRescueEnabledSetting();
-       if (!fleetRescueEnabled) {
-         ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
-       } else if (!isFleetRescuePrimary) {
-         const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
-         ctx.log("rescue", primaryFleetBusy
-           ? `🤝 Primary fleet bot is busy, covering fleet rescues`
-           : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-       }
-
-       const targets = fleetRescueEnabled
-         ? ((!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
-             ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-             : isFleetRescuePrimary
-               ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-               : [])
-         : [];
-
-       // Clean up stale queue entries
-       cleanupStaleQueue();
-
-       // ── Check for MAYDAY requests if no fleet targets ──
-       // Check if we're the primary MAYDAY rescue bot
-       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-       const maydayRescueEnabled = isMaydayRescueEnabledSetting();
-       if (!maydayRescueEnabled) {
-         ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
-       } else if (!isMaydayRescuePrimary) {
-         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-         if (!primaryMaydayBusy) {
-           ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-         }
-       }
-
-       let maydayTarget: RescueTarget | null = null;
-       if (targets.length === 0) {
-         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-         const shouldProcessMayday = maydayRescueEnabled && (isMaydayRescuePrimary || primaryMaydayBusy);
-
-        if (!shouldProcessMayday) {
-          const ignoredMayday = getNextMayday();
-          if (ignoredMayday) {
-            ctx.log("mayday", `📡 Not the primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - leaving MAYDAY from ${ignoredMayday.sender} for the primary bot`);
-            await ctx.sleep(5000);
-            continue;
+        // Check if we're the primary FLEET rescue bot. A non-primary bot only
+        // helps when there are 2+ stranded fleet members (a surge the single
+        // primary can't service alone) — never just because the primary is busy.
+        const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+        const fleetRescueEnabled = isFleetRescueEnabledSetting();
+        const strandedBots = fleetRescueEnabled
+          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+          : [];
+        if (!fleetRescueEnabled) {
+          ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+        } else if (!isFleetRescuePrimary) {
+          if (strandedBots.length >= 2) {
+            ctx.log("rescue", `🤝 ${strandedBots.length} stranded fleet bots pending - covering overflow fleet rescues`);
+          } else {
+            ctx.log("rescue", `📡 Not primary fleet rescue bot - leaving fleet rescues for ${settings.fleetRescueBot || 'primary bot'}`);
           }
-          // No pending MAYDAY from primary — fall through to idle/return-home check below
         }
+
+        const targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
+
+        // Clean up stale queue entries
+        cleanupStaleQueue();
+
+        // ── Check for MAYDAY requests if no fleet targets ──
+        // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
+        // surge) — never just because the MAYDAY-primary is busy with one.
+        const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+        const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+        const pendingMaydays = getPendingMaydayCount();
+        if (!maydayRescueEnabled) {
+          ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+        } else if (!isMaydayRescuePrimary) {
+          if (pendingMaydays >= 2) {
+            ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
+          } else {
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
+          }
+        }
+
+        let maydayTarget: RescueTarget | null = null;
+        if (targets.length === 0) {
+          const shouldProcessMayday = shouldHandleMaydayRescue(bot.username, pendingMaydays);
+
+         if (!shouldProcessMayday) {
+           const ignoredMayday = getNextMayday();
+           if (ignoredMayday) {
+             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+             await ctx.sleep(5000);
+             continue;
+           }
+           // No pending MAYDAY — fall through to idle/return-home check below
+         }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
@@ -5197,25 +5232,25 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-       // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-       const fleetRescueEnabled = isFleetRescueEnabledSetting();
-       if (!fleetRescueEnabled) {
-         ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
-       } else if (!isFleetRescuePrimary) {
-         const primaryFleetBusy = !!getActiveRescueSession(settings.fleetRescueBot);
-         ctx.log("rescue", primaryFleetBusy
-           ? `🤝 Primary fleet bot is busy, covering fleet rescues`
-           : `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-       }
+        // Check if we're the primary FLEET rescue bot. A non-primary bot only
+        // helps when there are 2+ stranded fleet members (a surge the single
+        // primary can't service alone) — never just because the primary is busy.
+        const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+        const fleetRescueEnabled = isFleetRescueEnabledSetting();
+        const strandedBots = fleetRescueEnabled
+          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+          : [];
+        if (!fleetRescueEnabled) {
+          ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+        } else if (!isFleetRescuePrimary) {
+          if (strandedBots.length >= 2) {
+            ctx.log("rescue", `🤝 ${strandedBots.length} stranded fleet bots pending - covering overflow fleet rescues`);
+          } else {
+            ctx.log("rescue", `📡 Not primary fleet rescue bot - leaving fleet rescues for ${settings.fleetRescueBot || 'primary bot'}`);
+          }
+        }
 
-       let targets = fleetRescueEnabled
-         ? ((!isFleetRescuePrimary && !!getActiveRescueSession(settings.fleetRescueBot))
-             ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-             : isFleetRescuePrimary
-               ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-               : [])
-         : [];
+        let targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
 
        // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
        const now = Date.now();
@@ -5230,33 +5265,35 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
        // Clean up stale queue entries
        cleanupStaleQueue();
 
-       // ── Check for MAYDAY requests if no fleet targets ──
-       // Check if we're the primary MAYDAY rescue bot
-       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-       const maydayRescueEnabled = isMaydayRescueEnabledSetting();
-       if (!maydayRescueEnabled) {
-         ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
-       } else if (!isMaydayRescuePrimary) {
-         const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-         if (!primaryMaydayBusy) {
-           ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-         }
-       }
-
-       let maydayTarget: RescueTarget | null = null;
-       const primaryMaydayBusy = !!getActiveRescueSession(settings.maydayRescueBot);
-       const shouldProcessMayday = maydayRescueEnabled && (isMaydayRescuePrimary || primaryMaydayBusy);
-
-      if (targets.length === 0) {
-        if (!shouldProcessMayday) {
-          const ignoredMayday = getNextMayday();
-          if (ignoredMayday) {
-            ctx.log("mayday", `📡 Not the primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - leaving MAYDAY from ${ignoredMayday.sender} for the primary bot`);
-            await ctx.sleep(5000);
-            continue;
+        // ── Check for MAYDAY requests if no fleet targets ──
+        // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
+        // surge) — never just because the MAYDAY-primary is busy with one.
+        const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+        const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+        const pendingMaydays = getPendingMaydayCount();
+        if (!maydayRescueEnabled) {
+          ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+        } else if (!isMaydayRescuePrimary) {
+          if (pendingMaydays >= 2) {
+            ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
+          } else {
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
           }
-          // No pending MAYDAY — fall through to idle/return-home check below
         }
+
+        let maydayTarget: RescueTarget | null = null;
+        const shouldProcessMayday = shouldHandleMaydayRescue(bot.username, pendingMaydays);
+
+       if (targets.length === 0) {
+         if (!shouldProcessMayday) {
+           const ignoredMayday = getNextMayday();
+           if (ignoredMayday) {
+             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+             await ctx.sleep(5000);
+             continue;
+           }
+           // No pending MAYDAY — fall through to idle/return-home check below
+         }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);

@@ -163,10 +163,19 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
   private async pullWildlife(): Promise<void> {
     const data = await this.request<Record<string, unknown>>("/api/client-sync/wildlife");
     if (data && typeof data === "object" && "systems" in data) {
-      wildlifeStore.importAll(data as any);
+      wildlifeStore.mergeFrom(data as any);
       const counts = wildlifeStore.getCounts();
       this.log(`Updated wildlife: ${counts.creatures} types across ${counts.systems} systems`);
     }
+  }
+
+  /**
+   * Push this node's local wildlife findings up to the master so every
+   * connected client converges on the union of all discoveries.
+   */
+  private async pushWildlife(): Promise<void> {
+    const data = wildlifeStore.getFullData();
+    await this.request<{ ok: boolean }>("/api/client-sync/wildlife-update", { method: "POST" }, data);
   }
 
 private async pushStatuses(): Promise<void> {
@@ -186,7 +195,10 @@ private async pushStatuses(): Promise<void> {
       if (this.settings.syncCatalog) await this.pullCatalog();
       if (this.settings.syncBotChat) await this.pullChat();
       if (this.settings.syncCoordination) await this.pullCoordination();
-      if (this.settings.syncWildlife) await this.pullWildlife();
+      if (this.settings.syncWildlife) {
+        await this.pushWildlife();
+        await this.pullWildlife();
+      }
       await this.pushStatuses();
       if (this.settings.pushLocalDiscoveries) {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });

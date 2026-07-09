@@ -323,22 +323,64 @@ export class WildlifeStore {
   }
 
   /**
-   * Replace the store contents from an aggregated snapshot (used by sync slaves
-   * that pull the full dataset from the master). Writes per-system files.
+   * Merge an aggregated snapshot into this store. Unlike a replace, this unions
+   * creatures by (system, poi, name, maxHull) and unions their `ids`, keeping the
+   * most recently seen metadata. This prevents data loss when two synced nodes
+   * exchange wildlife (e.g. a slave pulling the master's data must not wipe out
+   * creatures the slave discovered locally).
    */
-  importAll(data: WildlifeFullData): void {
+  mergeFrom(data: WildlifeFullData): void {
     if (!data || !data.systems) return;
     for (const sys of Object.values(data.systems)) {
       if (!sys || !sys.system) continue;
       const key = sanitizeSystemName(sys.system);
-      const normalized: SystemWildlife = {
-        system: key,
-        lastUpdated: sys.lastUpdated || new Date().toISOString(),
-        pois: sys.pois || {},
-      };
-      this.cache.set(key, normalized);
-      this.writeSystemFile(normalized);
+      const target = this.loadSystem(key);
+      let changed = false;
+
+      for (const [poi, list] of Object.entries(sys.pois || {})) {
+        if (!list || list.length === 0) continue;
+        const tlist = (target.pois[poi] = target.pois[poi] || []);
+        for (const entry of list) {
+          if (!entry || !entry.n) continue;
+          const existing = tlist.find((e) => e.n === entry.n && e.h === entry.h);
+          if (existing) {
+            for (const id of entry.ids || []) {
+              if (id && !existing.ids.includes(id)) existing.ids.push(id);
+            }
+            if (entry.seen && entry.seen > existing.seen) {
+              existing.seen = entry.seen;
+              if (entry.s) existing.s = entry.s;
+              if (entry.r) existing.r = entry.r;
+            }
+            changed = true;
+          } else {
+            tlist.push({
+              n: entry.n,
+              h: entry.h || 0,
+              s: entry.s || "",
+              r: entry.r || "",
+              ids: [...(entry.ids || [])],
+              seen: entry.seen || new Date().toISOString(),
+            });
+            changed = true;
+          }
+        }
+      }
+
+      if (changed) {
+        target.lastUpdated = new Date().toISOString();
+        this.writeSystemFile(target);
+      }
+      this.cache.set(key, target);
     }
+  }
+
+  /**
+   * Import a full snapshot from the master (used by sync slaves). Merges rather
+   * than replaces so locally-discovered creatures are preserved.
+   */
+  importAll(data: WildlifeFullData): void {
+    this.mergeFrom(data);
   }
 }
 

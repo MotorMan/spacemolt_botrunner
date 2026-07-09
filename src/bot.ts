@@ -7,7 +7,7 @@ import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
-import { wildlifeStore } from "./wildlivestore.js";
+import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
@@ -3076,6 +3076,50 @@ if (this.craftQueueTracker && jobId && recipeId) {
 
     if (wildlifeCount > 0) {
       this.log("wildlife", `Discovered ${wildlifeCount} new wildlife creature(s) from nearby scan`);
+    }
+  }
+
+  /**
+   * Extract potential-creature data from a survey_system response and persist it.
+   * Unlike trackWildlife (live get_nearby sightings with creature IDs), this
+   * captures the survey's `wildlife` (species that may be present, with estimate
+   * and abundance) and `faint_signatures` (hints about where creatures hide).
+   */
+  trackSurveyWildlife(surveyResult: unknown): void {
+    if (!surveyResult || typeof surveyResult !== "object") return;
+    const data = surveyResult as Record<string, unknown>;
+
+    const rawWildlife = Array.isArray(data.wildlife) ? data.wildlife : [];
+    const rawSignatures = Array.isArray(data.faint_signatures) ? data.faint_signatures : [];
+
+    if (rawWildlife.length === 0 && rawSignatures.length === 0) return;
+
+    const wildlife: SurveyWildlifeEntry[] = rawWildlife.map((e) => {
+      const w = e as Record<string, unknown>;
+      return {
+        species: (w.species as string) || "",
+        name: (w.name as string) || "",
+        role: (w.role as string) || "",
+        estimate: Number(w.estimate) || 0,
+        abundance: (w.abundance as string) || "",
+      };
+    });
+    const faintSignatures: FaintSignature[] = rawSignatures.map((e) => {
+      const s = e as Record<string, unknown>;
+      return {
+        type: (s.type as string) || "",
+        hint: (s.hint as string) || "",
+        difficulty: (s.difficulty as string) || undefined,
+      };
+    });
+
+    wildlifeStore.recordSurvey(this.system, wildlife, faintSignatures);
+
+    if (wildlife.length > 0) {
+      this.log("wildlife", `Survey spotted ${wildlife.length} potential species in ${this.system}: ${wildlife.map((w) => w.name).join(", ")}`);
+    }
+    if (faintSignatures.length > 0) {
+      this.log("wildlife", `Faint signatures in ${this.system}: ${faintSignatures.map((s) => s.hint).join("; ")}`);
     }
   }
 

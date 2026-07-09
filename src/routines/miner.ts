@@ -1157,6 +1157,7 @@ async function surveySystemForHiddenPois(ctx: RoutineContext): Promise<boolean> 
   
   // Survey was successful - update map with newly revealed POIs
   ctx.log("mining", "System surveyed successfully - hidden POIs now accessible");
+  bot.trackSurveyWildlife(surveyResp.result);
   
   // Refresh system info to get the newly revealed POIs
   const { pois: newPois, systemId } = await getSystemInfo(ctx);

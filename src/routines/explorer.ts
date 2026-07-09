@@ -2,6 +2,7 @@ import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
+import type { FaintSignature } from "../wildlivestore.js";
 import {
   type SystemPOI,
   type Connection,
@@ -321,6 +322,7 @@ function getExplorerSettings(username?: string): {
   autoCloak: boolean;
   ignoreBlacklistWhenCloaked: boolean;
   ignorePirateFleeWhenCloaked: boolean;
+  coordinateExplorers: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -407,6 +409,13 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.ignorePirateFleeWhenCloaked)
       : true;
 
+  // Coordinate with other explorers (avoid their targets): per-bot > global explorer > default true
+  const coordinateExplorers = botOverrides.coordinateExplorers !== undefined
+    ? Boolean(botOverrides.coordinateExplorers)
+    : e.coordinateExplorers !== undefined
+      ? Boolean(e.coordinateExplorers)
+      : true;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : "explore") as ExplorerMode,
     acceptMissions,
@@ -423,6 +432,7 @@ function getExplorerSettings(username?: string): {
     autoCloak,
     ignoreBlacklistWhenCloaked,
     ignorePirateFleeWhenCloaked,
+    coordinateExplorers,
   };
 }
 
@@ -929,6 +939,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Only survey if scanPois is enabled
     const explorerSettings = getExplorerSettings(bot.username);
 
+    // Faint signatures (creature hints) reported by the most recent survey this cycle.
+    let currentFaintSignatures: FaintSignature[] = [];
+
     if (explorerSettings.scanPois) {
       yield "survey_system";
       const surveyResp = await bot.exec("survey_system");
@@ -969,6 +982,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             
             ctx.log("info", `🌌 Wormhole registered: ${wormholeExit.name} -> ${wormholeDestination}${wormholeExpiresIn ? ` (expires in ${wormholeExpiresIn})` : ""}`);
           }
+
+          // Capture potential-creature data reported by the survey
+          bot.trackSurveyWildlife(surveyResp.result);
+          currentFaintSignatures = extractFaintSignatures(surveyResult);
         }
         
         // Re-fetch system info to pick up any hidden POIs that were revealed
@@ -1028,6 +1045,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (explorerSettings.surveyMode === "quick") { skippedCount++; continue; }
         if (minutesAgo < RESOURCE_REFRESH_MINS) { skippedCount++; continue; }
         toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+      }
+    }
+
+    // ── Chase faint signatures (creature hints) ──
+    // visit_all mode already visits every POI, so only do this in other modes.
+    if (currentFaintSignatures.length > 0 && explorerSettings.mode !== "visit_all") {
+      const sigPois = findPoisFromFaintSignatures(currentFaintSignatures, pois);
+      for (const poi of sigPois) {
+        if (!toVisit.some((t) => t.poi.id === poi.id)) {
+          toVisit.push({ poi, reason: "faint-signature" });
+        }
+      }
+      if (sigPois.length > 0) {
+        ctx.log("wildlife", `Following ${sigPois.length} faint signature(s) to potential creature location(s): ${sigPois.map((p) => p.name).join(", ")}`);
       }
     }
 
@@ -1367,10 +1398,13 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
       ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
     }
 
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
-    
+    // ── Coordination: avoid systems other active explorers are targeting ──
+    const claimedTargets = currentSettings.coordinateExplorers ? getClaimedTargets() : null;
+
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked, claimedTargets);
+
     // ── Coordination: Announce our target to other explorers ──
-    if (sendBotChat && getAllBotNames && nextSystem) {
+    if (currentSettings.coordinateExplorers && sendBotChat && getAllBotNames && nextSystem) {
       const allBots = getAllBotNames();
       const otherBots = allBots.filter(name => name !== bot.username);
       if (otherBots.length > 0) {
@@ -2085,6 +2119,73 @@ async function* scanStation(
 }
 
 /** Visit a non-minable, non-station POI — check what's nearby. */
+/**
+ * Extract faint signatures (creature hints) from a survey_system result.
+ * Returns [] when the survey produced none or the result is malformed.
+ */
+function extractFaintSignatures(surveyResult: Record<string, unknown> | undefined): FaintSignature[] {
+  if (!surveyResult || typeof surveyResult !== "object") return [];
+  const raw = Array.isArray(surveyResult.faint_signatures) ? surveyResult.faint_signatures : [];
+  return (raw as Array<Record<string, unknown>>)
+    .filter((s) => s && (s.hint || s.type))
+    .map((s) => ({
+      type: (s.type as string) || "",
+      hint: (s.hint as string) || "",
+      difficulty: (s.difficulty as string) || undefined,
+    }));
+}
+
+/**
+ * Map faint signatures from a survey to candidate POIs in the current system.
+ * A signature's `type` is matched against POI types first (exact, then
+ * substring both ways); failing that, the free-text `hint` is scanned for a
+ * POI name or any POI-type keyword. Returns the unique POIs best matched by
+ * each signature.
+ */
+function findPoisFromFaintSignatures(
+  signatures: FaintSignature[],
+  pois: SystemPOI[],
+): SystemPOI[] {
+  const result: SystemPOI[] = [];
+  const seen = new Set<string>();
+
+  for (const sig of signatures) {
+    if (!sig.hint && !sig.type) continue;
+    const match = matchFaintSignatureToPoi(sig, pois);
+    if (match && !seen.has(match.id)) {
+      seen.add(match.id);
+      result.push(match);
+    }
+  }
+  return result;
+}
+
+function matchFaintSignatureToPoi(sig: FaintSignature, pois: SystemPOI[]): SystemPOI | null {
+  const type = (sig.type || "").toLowerCase().trim();
+  if (type) {
+    const exact = pois.find((p) => p.type.toLowerCase() === type);
+    if (exact) return exact;
+    const partial = pois.find(
+      (p) => p.type.toLowerCase().includes(type) || type.includes(p.type.toLowerCase()),
+    );
+    if (partial) return partial;
+  }
+
+  const hint = (sig.hint || "").toLowerCase();
+  if (hint) {
+    const byName = pois.find(
+      (p) => hint.includes(p.name.toLowerCase()) || p.name.toLowerCase().includes(hint),
+    );
+    if (byName) return byName;
+
+    for (const p of pois) {
+      const words = p.type.toLowerCase().split(/[_\s-]+/).filter((w) => w.length > 2);
+      if (words.some((w) => hint.includes(w))) return p;
+    }
+  }
+  return null;
+}
+
 async function* visitOtherPoi(
   ctx: RoutineContext,
   systemId: string,
@@ -2185,6 +2286,14 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (bot.docked) {
       await collectFromStorage(ctx);
+
+      // Load fuel cells to max cargo (deep core scans involve long trips between hidden POIs)
+      const startupSettings = getExplorerSettings(bot.username);
+      if (startupSettings.loadFuelCellsAtHome) {
+        yield "startup_load_fuel_cells";
+        await loadFuelCellsToMax(ctx);
+      }
+
       yield "startup_refuel";
       await tryRefuel(ctx);
       await bot.refreshShip();
@@ -2280,6 +2389,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (!surveyResp.error) {
         ctx.log("info", `Surveyed ${bot.system} — hidden POIs should now be accessible`);
+        bot.trackSurveyWildlife(surveyResp.result);
       } else {
         const msg = surveyResp.error.message.toLowerCase();
         if (!msg.includes("already") && !msg.includes("cooldown")) {
@@ -3072,6 +3182,80 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
 
   const blacklist = getSystemBlacklist();
 
+  // ── Startup: dock at local station to clear cargo, pack fuel cells & refuel ──
+  yield "startup_prep";
+  await bot.refreshLocation();
+  const { pois: startPois } = await getSystemInfo(ctx);
+  const startStation = findStation(startPois);
+  if (startStation) {
+    ctx.log("system", `Startup: docking at ${startStation.name} to clear cargo & refuel...`);
+
+    if (bot.poi !== startStation.id) {
+      await ensureUndocked(ctx);
+      const tResp = await bot.exec("travel", { target_poi: startStation.id });
+      if (!tResp.error || tResp.error.message.includes("already")) {
+        bot.poi = startStation.id;
+      }
+    }
+
+    if (!bot.docked) {
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) {
+        bot.docked = true;
+      }
+    }
+
+    if (bot.docked) {
+      // Collect gifted credits/items from storage
+      await collectFromStorage(ctx);
+
+      // Deposit non-fuel cargo
+      yield "startup_deposit";
+      const cargoResp = await bot.exec("get_cargo");
+      if (cargoResp.result && typeof cargoResp.result === "object") {
+        const cResult = cargoResp.result as Record<string, unknown>;
+        const cargoItems = (
+          Array.isArray(cResult) ? cResult :
+          Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+          Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+          []
+        );
+        let deposited = 0;
+        for (const item of cargoItems) {
+          const itemId = (item.item_id as string) || "";
+          const quantity = (item.quantity as number) || 0;
+          if (!itemId || quantity <= 0) continue;
+          const lower = itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          const displayName = (item.name as string) || itemId;
+          ctx.log("trade", `Depositing ${quantity}x ${displayName}...`);
+          await bot.exec("deposit_items", { item_id: itemId, quantity });
+          deposited += quantity;
+        }
+        if (deposited > 0) ctx.log("trade", `Deposited ${deposited} items to storage`);
+      }
+
+      // Load fuel cells to max cargo (long trips visiting every system)
+      const startupSettings = getExplorerSettings(bot.username);
+      if (startupSettings.loadFuelCellsAtHome) {
+        yield "startup_load_fuel_cells";
+        await loadFuelCellsToMax(ctx);
+      }
+
+      // Refuel
+      yield "startup_refuel";
+      await tryRefuel(ctx);
+      await bot.refreshShip();
+      const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
+    }
+  } else {
+    ctx.log("system", "No station in current system — skipping startup prep");
+  }
+
+  // ── Register for exploration coordination messages ──
+  botChatChannel.onMessage(bot.username, processExplorationTarget);
+
   while (bot.state === "running") {
     // Check for battle
     if (await checkAndFleeFromBattle(ctx, "visit_all")) {
@@ -3109,6 +3293,9 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Find unvisited systems reachable from current position
     const unvisited = findUnvisitedSystemsByServerFlag(ctx, systemId, blacklist, fledFromSystems);
 
+    // Coordination: avoid systems other active explorers are currently targeting
+    const visitAllClaimed = settings.coordinateExplorers ? getClaimedTargets() : null;
+
     if (unvisited.length === 0) {
       ctx.log("info", "No unvisited systems in connected region — picking nearest unvisited from map...");
       
@@ -3138,10 +3325,18 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
         return aDist - bDist;
       });
 
-      const target = allUnvisited[0];
+      const target = pickCoordinatedTarget(allUnvisited, visitAllClaimed, u => u.systemId);
       if (!target) {
         ctx.log("info", "All systems visited! Explore mode complete.");
         return;
+      }
+
+      // Announce our target to other explorers for coordination
+      if (settings.coordinateExplorers && ctx.sendBotChat && ctx.getAllBotNames) {
+        const otherBots = ctx.getAllBotNames().filter(n => n !== bot.username);
+        if (otherBots.length > 0) {
+          announceExplorationTarget(ctx, target.systemId);
+        }
       }
 
       ctx.log("travel", `Navigating to ${target.systemName} (${target.systemId})...`);
@@ -3157,7 +3352,20 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     }
 
     // Jump to nearest unvisited system
-    const target = unvisited[0];
+    const target = pickCoordinatedTarget(unvisited, visitAllClaimed, u => u.id);
+    if (!target) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Announce our target to other explorers for coordination
+    if (settings.coordinateExplorers && ctx.sendBotChat && ctx.getAllBotNames) {
+      const otherBots = ctx.getAllBotNames().filter(n => n !== bot.username);
+      if (otherBots.length > 0) {
+        announceExplorationTarget(ctx, target.id);
+      }
+    }
+
     ctx.log("travel", `Jumping to ${target.name} (${target.id}) - ${target.distance} jumps away`);
 
     // Ensure fueled
@@ -3507,6 +3715,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     if (!surveyResp.error) {
       ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
+      bot.trackSurveyWildlife(surveyResp.result);
     }
 
     // Update map with visited status and refresh from server
@@ -4507,7 +4716,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * Skips pirate systems, blacklisted systems, and systems we've fled from.
  * When cloaked and ignoreBlacklistWhenCloaked is enabled, skips blacklist/flee filtering.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -4549,6 +4758,19 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
 
   // Work with non-pirate connections first
   let candidates = nonPirateConns.length > 0 ? nonPirateConns : pirateConns;
+
+  // Coordination: avoid systems other active explorers are currently targeting.
+  // Falls back to the full candidate set if every candidate is claimed (so we
+  // never get stuck), matching findUnknownSystemsWithCoordination behaviour.
+  if (claimedTargets && claimedTargets.size > 0) {
+    const unclaimed = candidates.filter(c => !claimedTargets.has(c.id.toLowerCase()));
+    if (unclaimed.length > 0) {
+      ctx.log("exploration", `Coordination: skipping ${candidates.length - unclaimed.length} system(s) targeted by other explorers`);
+      candidates = unclaimed;
+    } else {
+      ctx.log("exploration", `Coordination: all candidate systems are targeted by other explorers — proceeding anyway`);
+    }
+  }
 
   // If we're seeing the same 3-system loop, penalize connections that are part of the current path
   if (path && path.length >= 3) {
@@ -4983,4 +5205,21 @@ function findUnknownSystemsWithCoordination(
   
   ctx.log("exploration", `Filtered out ${unknowns.length - unclaimed.length} systems being targeted by other explorers`);
   return unclaimed;
+}
+
+/**
+ * From a list of candidate targets, return the first that isn't currently
+ * claimed by another explorer. Falls back to the first candidate if every one
+ * is claimed, so we never get stuck waiting for a free system.
+ */
+function pickCoordinatedTarget<T>(
+  candidates: T[],
+  claimed: Set<string> | null,
+  keyOf: (c: T) => string,
+): T | undefined {
+  if (!claimed || claimed.size === 0 || candidates.length === 0) {
+    return candidates[0];
+  }
+  const unclaimed = candidates.filter(c => !claimed.has(keyOf(c).toLowerCase()));
+  return (unclaimed.length > 0 ? unclaimed : candidates)[0];
 }

@@ -21,6 +21,31 @@ export interface SystemWildlife {
   system: string;
   lastUpdated: string;
   pois: Record<string, CreatureEntry[]>;
+  /** Potential creature data reported by survey_system (species that *could* be present). */
+  survey?: SystemSurveyWildlife;
+}
+
+/** A species reported by survey_system as potentially present in a system. */
+export interface SurveyWildlifeEntry {
+  species: string;
+  name: string;
+  role: string;
+  estimate: number;
+  abundance: string;
+}
+
+/** A faint signature reported by survey_system — a hint about where creatures could be. */
+export interface FaintSignature {
+  type: string;
+  hint: string;
+  difficulty?: string;
+}
+
+/** Latest survey_system-derived potential-creature snapshot for a system. */
+export interface SystemSurveyWildlife {
+  lastUpdated: string;
+  wildlife: SurveyWildlifeEntry[];
+  faintSignatures: FaintSignature[];
 }
 
 // Expanded, human-friendly view used by the API / search.
@@ -41,6 +66,8 @@ export interface WildlifeCounts {
   pois: number;
   creatures: number;
   individuals: number;
+  surveySystems: number;
+  surveySpecies: number;
 }
 
 export interface WildlifeFullData {
@@ -295,6 +322,8 @@ export class WildlifeStore {
     let pois = 0;
     let creatures = 0;
     let individuals = 0;
+    let surveySystems = 0;
+    let surveySpecies = 0;
     for (const sys of this.cache.values()) {
       systems++;
       for (const list of Object.values(sys.pois)) {
@@ -304,8 +333,12 @@ export class WildlifeStore {
           individuals += e.ids.length;
         }
       }
+      if (sys.survey && sys.survey.wildlife.length > 0) {
+        surveySystems++;
+        surveySpecies += sys.survey.wildlife.length;
+      }
     }
-    return { systems, pois, creatures, individuals };
+    return { systems, pois, creatures, individuals, surveySystems, surveySpecies };
   }
 
   getFullData(): WildlifeFullData {
@@ -322,6 +355,51 @@ export class WildlifeStore {
     return this.loadSystem(system);
   }
 
+  /**
+   * Record potential-creature data reported by a survey_system result. This is
+   * distinct from live `get_nearby` sightings: it describes species that *could*
+   * be present in the system (with an estimate/abundance) plus faint signatures
+   * that hint at where creatures may be hiding. The latest survey snapshot fully
+   * replaces any previous one for the system.
+   */
+  recordSurvey(
+    system: string,
+    wildlife: SurveyWildlifeEntry[],
+    faintSignatures: FaintSignature[]
+  ): void {
+    if (!system) system = "unknown";
+    const normalized = wildlife
+      .filter((w) => w && w.name)
+      .map((w) => ({
+        species: w.species || "",
+        name: w.name || "",
+        role: w.role || "",
+        estimate: Number(w.estimate) || 0,
+        abundance: w.abundance || "",
+      }));
+    const signatures = (faintSignatures || [])
+      .filter((s) => s && s.hint)
+      .map((s) => ({
+        type: s.type || "",
+        hint: s.hint || "",
+        difficulty: s.difficulty || undefined,
+      }));
+
+    const sys = this.loadSystem(system);
+    sys.survey = {
+      lastUpdated: new Date().toISOString(),
+      wildlife: normalized,
+      faintSignatures: signatures,
+    };
+    sys.lastUpdated = sys.survey.lastUpdated;
+    this.writeSystemFile(sys);
+    void onWildlifeUpdate({ system: sys.system, data: sys });
+  }
+
+  /** Latest survey_system-derived potential-creature snapshot for a system, if any. */
+  getSurvey(system: string): SystemSurveyWildlife | null {
+    return this.loadSystem(system).survey ?? null;
+  }
   /**
    * Merge an aggregated snapshot into this store. Unlike a replace, this unions
    * creatures by (system, poi, name, maxHull) and unions their `ids`, keeping the

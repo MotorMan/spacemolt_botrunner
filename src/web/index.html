@@ -79,6 +79,13 @@
           >
             Achievements
           </div>
+          <div
+            class="top-tab"
+            data-tab="creatures"
+            onclick="switchTab('creatures')"
+          >
+            Creatures
+          </div>
           </div>
       </div>
       <div class="header-right">
@@ -1342,6 +1349,11 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- ══ Creatures Tab ══ -->
+      <div class="tab-page" id="page-creatures">
+        <iframe id="creaturesFrame" src="/creatures.html" style="width: 100%; height: 100%; border: none;"></iframe>
       </div>
     </main>
 
@@ -12635,6 +12647,7 @@
         const refuelThreshold = crafter.refuelThreshold ?? 50;
         const repairThreshold = crafter.repairThreshold ?? 40;
         const finalItemThreshold = crafter.finalItemThreshold ?? 1;
+        const cycleTimeSec = crafter.cycleTimeSec ?? 30;
         const botQuotaOverrides = crafter.botQuotaOverrides || {};
 
         // Use catalog recipes if available, fall back to API fetch
@@ -12972,6 +12985,14 @@
         <div class="setting-hint">Number of assemblies to wait for before starting the final item. Set to 1 to start final item as soon as any assembly is complete.</div>
       </div>
       <input type="number" id="set-crafter-finalItemThreshold" min="1" max="99" value="${finalItemThreshold}">
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Cycle Time (seconds)</div>
+        <div class="setting-hint">How long the crafter waits between full crafting cycles. Lower values craft more aggressively; higher values are gentler on the server and facilities.</div>
+      </div>
+      <input type="number" id="set-crafter-cycleTimeSec" min="1" max="3600" value="${cycleTimeSec}">
     </div>
 
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
@@ -13314,6 +13335,10 @@
             parseInt(
               document.getElementById("set-crafter-finalItemThreshold")?.value,
             ) || 1,
+          cycleTimeSec:
+            parseInt(
+              document.getElementById("set-crafter-cycleTimeSec")?.value,
+            ) || 30,
           requestItems,
           blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
         };

@@ -162,17 +162,10 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
 
   private async pullWildlife(): Promise<void> {
     const data = await this.request<Record<string, unknown>>("/api/client-sync/wildlife");
-    if (data && typeof data === "object" && "wildlife" in data) {
-      const wildlifeData = data.wildlife as Record<string, any>;
-      for (const [normalized, entry] of Object.entries(wildlifeData)) {
-        if (entry && typeof entry === "object") {
-          const e = entry as Record<string, unknown>;
-          wildlifeStore["data"].wildlife[normalized] = e as any;
-        }
-      }
-      wildlifeStore["data"].lastUpdated = data.lastUpdated as string;
-      wildlifeStore["data"].counts.wildlife = Object.keys(wildlifeData).length;
-      this.log(`Updated wildlife: ${Object.keys(wildlifeData).length} entities`);
+    if (data && typeof data === "object" && "systems" in data) {
+      wildlifeStore.importAll(data as any);
+      const counts = wildlifeStore.getCounts();
+      this.log(`Updated wildlife: ${counts.creatures} types across ${counts.systems} systems`);
     }
   }
 

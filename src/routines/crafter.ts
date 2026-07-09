@@ -51,6 +51,8 @@ async function getCrafterSettings(): Promise<{
   useQueuedCrafting: boolean;
   craftingPreset: string;
   finalItemThreshold: number;
+  allowExternalFacilities: boolean;
+  cycleTimeSec: number;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -148,6 +150,8 @@ async function getCrafterSettings(): Promise<{
     useQueuedCrafting,
     craftingPreset: (c.craftingPreset as string) || "fast",
     finalItemThreshold: (c.finalItemThreshold as number) || 1,
+    allowExternalFacilities: (c.allowExternalFacilities as boolean) ?? false,
+    cycleTimeSec: (c.cycleTimeSec as number) || 30,
   };
 }
 
@@ -414,6 +418,85 @@ function calculateMaxCraftable(
   return maxRuns;
 }
 
+// ── External facility guard (dry-run cost check) ──────────────
+
+interface CraftQuote {
+  external: boolean;
+  fee: number;
+  labor: number;
+  creditsTotal: number;
+  venue: string;
+  venueType: string;
+  recipe: string;
+}
+
+function parseCraftQuote(result: unknown): CraftQuote {
+  const r = (result || {}) as Record<string, unknown>;
+  const cost = (r.cost as Record<string, unknown>) || {};
+  return {
+    external: r.external === true,
+    fee: typeof cost.fee === "number" ? (cost.fee as number) : 0,
+    labor: typeof cost.labor === "number" ? (cost.labor as number) : 0,
+    creditsTotal: typeof r.credits_total === "number" ? (r.credits_total as number) : 0,
+    venue: (r.venue as string) || "",
+    venueType: (r.venue_type as string) || "",
+    recipe: (r.recipe as string) || "",
+  };
+}
+
+// A craft routes to a rented/public facility when `external` is true or the
+// quote carries a per-run rental fee (anything beyond the flat labor cost).
+function isExternalRental(q: CraftQuote): boolean {
+  return q.external === true || q.fee > 0;
+}
+
+async function checkCraftVenue(
+  ctx: RoutineContext,
+  bot: any,
+  recipeId: string,
+  recipeName: string,
+  runs: number,
+  preset: string,
+  allowExternal: boolean,
+): Promise<{ blocked: boolean }> {
+  const { log } = ctx;
+
+  const runDryRun = async () => bot.exec("craft", { id: recipeId, quantity: runs, preset, dry_run: true });
+  let dryRunResp = await runDryRun();
+  if (dryRunResp.error) {
+    const msg = (dryRunResp.error.message || "").toLowerCase();
+    // Retry once on rate limiting so the safety check isn't skipped under load.
+    if (dryRunResp.error.code === "429" || msg.includes("rate") || msg.includes("limit")) {
+      await ctx.sleep(2000);
+      dryRunResp = await runDryRun();
+    }
+  }
+
+  if (dryRunResp.error) {
+    // We could not confirm the venue is safe. Fail closed (block) unless the
+    // operator explicitly opted into external facilities.
+    if (allowExternal) {
+      log("warn", `Could not verify craft venue via dry_run for ${recipeName}: ${dryRunResp.error.message} - proceeding per allowExternalFacilities`);
+      return { blocked: false };
+    }
+    log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${dryRunResp.error.message}). Blocking to avoid an accidental external facility rental.`);
+    return { blocked: true };
+  }
+
+  const quote = parseCraftQuote(dryRunResp.result);
+  if (!isExternalRental(quote)) {
+    return { blocked: false };
+  }
+
+  if (allowExternal) {
+    log("warn", `⚠ Allowing external facility "${quote.venue || recipeName}" for ${quote.fee} credits (recipe ${recipeName}) per allowExternalFacilities setting`);
+    return { blocked: false };
+  }
+
+  log("error", `🔴 EXTERNAL FACILITY BLOCKED: would have rented "${quote.venue || recipeName}" for ${quote.fee} credits (recipe ${recipeName}). Aborting to avoid accidental rental.`);
+  return { blocked: true };
+}
+
 async function queueCraftJob(
   ctx: RoutineContext,
   recipeId: string,
@@ -423,6 +506,7 @@ async function queueCraftJob(
   countItemFn: (itemId: string) => number,
   recipes?: Recipe[],
   preset: string = "fast",
+  allowExternal: boolean = false,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -450,6 +534,14 @@ async function queueCraftJob(
 
   if (runs < originalRuns) {
     log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
+  }
+
+  // SAFETY: dry-run quote to detect accidental external/rental facilities
+  // (a rental prepays a per-run fee and sets external=true). Block before
+  // spending credits if one is selected by auto-routing.
+  const venue = await checkCraftVenue(ctx, bot, recipeId, recipe?.name || recipeId, runs, preset, allowExternal);
+  if (venue.blocked) {
+    return { success: false, error: "external_facility_blocked" };
   }
 
   log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
@@ -569,37 +661,39 @@ async function waitForAllCompletions(
      recipeNames.set(r.recipe_id, r.name);
    }
 
-   let lastSync = 0;
-   let remainingItems = [...initialQueuedItems];
+    let lastSync = 0;
+    let lastStatusReport = Date.now();
+    let remainingItems = [...initialQueuedItems];
 
-   while (bot.state === "running" && remainingItems.length > 0) {
-     await ctx.sleep(5000);
+    while (bot.state === "running" && remainingItems.length > 0) {
+      await ctx.sleep(5000);
 
-     const now = Date.now();
-     if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-       const serverJobs = await checkCraftingQueue(bot, recipes);
-       tracker.syncWithServer(serverJobs);
-       tracker.save();
-       lastSync = now;
-     }
+      const now = Date.now();
+      if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
+        const serverJobs = await checkCraftingQueue(bot, recipes);
+        tracker.syncWithServer(serverJobs);
+        tracker.save();
+        lastSync = now;
+      }
 
-     const stillQueued: typeof remainingItems = [];
-     for (const item of remainingItems) {
-       const progress = tracker.getProgress(item.recipeId);
-       const completedItems = progress.completed * item.outputQty;
-       if (completedItems >= item.quantity) {
-         crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
-         bot.stats.totalCrafted += item.quantity;
-       } else {
-         stillQueued.push(item);
-       }
-     }
-     remainingItems = stillQueued;
+      const stillQueued: typeof remainingItems = [];
+      for (const item of remainingItems) {
+        const progress = tracker.getProgress(item.recipeId);
+        const completedItems = progress.completed * item.outputQty;
+        if (completedItems >= item.quantity) {
+          crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
+          bot.stats.totalCrafted += item.quantity;
+        } else {
+          stillQueued.push(item);
+        }
+      }
+      remainingItems = stillQueued;
 
-     if (remainingItems.length > 0) {
-       reportQueueStatus(ctx, tracker, recipes);
-     }
-   }
+      if (remainingItems.length > 0 && Date.now() - lastStatusReport >= 60000) {
+        reportQueueStatus(ctx, tracker, recipes);
+        lastStatusReport = Date.now();
+      }
+    }
 
    return crafted;
  }
@@ -610,19 +704,12 @@ async function queueAllRecipesOnce(
    tracker: CraftQueueTracker,
    recipes: Recipe[],
    preset: string,
-   countItemFn: (itemId: string) => number,
-): Promise<Array<{ recipeId: string; quantity: number; outputQty: number }>> {
+   availableFn: (itemId: string) => number,
+   allowExternal: boolean = false,
+): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
    const { bot } = ctx;
    const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
-
-   const reservedMaterials = new Map<string, number>();
-
-   const getAvailableCount = (itemId: string): number => {
-     const lowerId = itemId.toLowerCase();
-     const reserved = reservedMaterials.get(lowerId) || 0;
-     const available = countItemFn(lowerId);
-     return Math.max(0, available - reserved);
-   };
+   let queuedItemsTotal = 0;
 
    await syncCraftingQueue(ctx, tracker, recipes, true);
 
@@ -634,26 +721,17 @@ async function queueAllRecipesOnce(
      const queuedItems = progress.queued * outputQty;
      const completedItems = progress.completed * outputQty;
 
-     if (queuedItems >= item.quantityToCraft) {
-       ctx.log("craft", `Already queued: ${item.recipe.name} (${queuedItems} items queued)`);
-       const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
-       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-       continue;
-     }
-
      const remainingItems = item.quantityToCraft - completedItems - queuedItems;
      if (remainingItems <= 0) {
-       ctx.log("craft", `Already completed or queued: ${item.recipe.name}`);
        const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
        continue;
      }
 
-     ctx.log("craft", `Queueing ${remainingItems}x ${item.recipe.name} (${item.reason})`);
-     const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, getAvailableCount, recipes, preset);
+      const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, preset, allowExternal);
      if (!queueResult.success) {
        if (queueResult.error === "insufficient_inputs") {
-         ctx.log("error", `Insufficient materials for ${item.recipe.name} - need ${remainingItems}x output`);
+         ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
        } else if (queueResult.error !== "Job already queued") {
          ctx.log("error", `Failed to queue ${item.recipe.name}: ${queueResult.error}`);
        }
@@ -662,62 +740,150 @@ async function queueAllRecipesOnce(
 
      const actualQueued = queueResult.queuedRuns || 0;
      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+     queuedItemsTotal += actualQueued * outputQty;
      if (actualQueued * outputQty < remainingItems) {
-       ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x`);
-     }
-
-     const recipe = item.recipe;
-     const runsQueued = actualQueued;
-     for (const comp of recipe.components) {
-       const consumed = comp.quantity * runsQueued;
-       const lowerCompId = comp.item_id.toLowerCase();
-       reservedMaterials.set(lowerCompId, (reservedMaterials.get(lowerCompId) || 0) + consumed);
+       ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x (awaiting sub-materials)`);
      }
    }
 
-   return queued;
+   return { queued, queuedItems: queuedItemsTotal };
 }
 
 async function executeCraftingPlan(
    ctx: RoutineContext,
-   allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
+   goalsToAchieve: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }>,
    tracker: CraftQueueTracker,
    recipes: Recipe[],
    preset: string = "fast",
    finalItemThreshold: number = 1,
    countItemFn?: (itemId: string) => number,
+   facilityAvailableRecipes?: Set<string>,
+   allowExternal: boolean = false,
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
-   const { log } = ctx;
+   const { log, bot } = ctx;
    const crafted: string[] = [];
    const prereqs: string[] = [];
 
-   log("craft", `Queue-based crafting plan: ${allPlanItems.length} steps`);
+   const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+   const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
 
-   // Queue ALL recipes in a single pass - facilities enable parallel crafting
-   const queuedItems = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, preset, countItemFn!);
+   const recipeIdForGoal = (g: { itemId: string; recipe?: Recipe }): string => {
+     if (g.recipe) return g.recipe.recipe_id;
+     const r = findRecipeForItem(g.itemId, recipes, countItemFn!, facilityAvailableRecipes);
+     return r ? r.recipe_id : "";
+   };
 
-   // Wait for all queued items to complete
-   const { bot } = ctx;
-   const completed = await waitForAllCompletions(ctx, queuedItems, tracker, bot, recipes);
-   crafted.push(...completed);
-
-   // Track prerequisites (non-final depth items)
-   const byDepth = new Map<number, typeof allPlanItems>();
-   for (const item of allPlanItems) {
-     if (!byDepth.has(item.depth)) {
-       byDepth.set(item.depth, []);
+   // Account for materials already committed to in-flight jobs so we don't
+   // re-spend them, while crediting outputs those jobs will produce so we can
+   // keep building higher-tier items as soon as their sub-materials appear.
+   const accountPending = (): { consumed: Map<string, number>; produced: Map<string, number> } => {
+     const consumed = new Map<string, number>();
+     const produced = new Map<string, number>();
+     for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
+       const pending = prog.queued - prog.completed;
+       if (pending <= 0) continue;
+       const r = recipeIndex.get(recipeId);
+       if (!r) continue;
+       for (const c of r.components) {
+         const id = c.item_id.toLowerCase();
+         consumed.set(id, (consumed.get(id) || 0) + c.quantity * pending);
+       }
+       const outId = r.output_item_id.toLowerCase();
+       produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
      }
-     byDepth.get(item.depth)!.push(item);
-   }
-   const depths = Array.from(byDepth.keys()).sort((a, b) => b - a);
-   const finalDepth = Math.min(...depths);
+     return { consumed, produced };
+   };
 
-   for (const depth of depths) {
-     if (depth > finalDepth) {
-       for (const item of byDepth.get(depth)!) {
-         prereqs.push(`${item.quantityToCraft}x ${item.recipe.name}`);
+   let lastStatusReport = Date.now();
+   let stagnationIterations = 0;
+   const MAX_STAGNATION = 12;
+   const ACTIVE_LOOP_CAP = 600;
+   let loopCount = 0;
+
+   // Active loop: keep re-planning and queueing as sub-materials become available.
+   while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
+     loopCount++;
+     await syncCraftingQueue(ctx, tracker, recipes, true);
+
+     // Recompute which goals still need production using live stock + in-flight output.
+     const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
+     for (const g of goalsToAchieve) {
+       const recipeId = recipeIdForGoal(g);
+       if (!recipeId) continue;
+       const liveStock = countItemFn!(g.itemId.toLowerCase());
+       const prog = tracker.getProgress(recipeId);
+       const queuedOutput = prog.queued * outputQtyOf(recipeId);
+       if (liveStock + queuedOutput < g.limit) {
+         remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
        }
      }
+
+     if (remainingGoals.length === 0) {
+       log("craft", "All goals covered by stock + in-flight queue - waiting for production to finish");
+       break;
+     }
+
+     // Whether anything is still in production (including sub-materials we're waiting on).
+     const { consumed, produced } = accountPending();
+     const anyPending = consumed.size > 0;
+     const availableFn = (itemId: string): number => {
+       const id = itemId.toLowerCase();
+       return Math.max(0, countItemFn!(id) - (consumed.get(id) || 0) + (produced.get(id) || 0));
+     };
+
+     const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes);
+     const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
+     for (const plan of plans) {
+       log("craft", formatCraftingPlan(plan));
+       for (const item of plan.flatOrder) {
+         allPlanItems.push({
+           recipe: item.recipe,
+           quantityToCraft: Math.max(1, Math.floor(item.quantityToCraft)),
+           reason: item.reason,
+           depth: item.depth,
+         });
+       }
+     }
+
+     const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, preset, availableFn, allowExternal);
+
+     // Progress is being made if we queued something this pass, or if the queue
+     // still has jobs producing sub-materials we're waiting on.
+     if (queuedItems > 0 || anyPending) {
+       stagnationIterations = 0;
+     } else {
+       stagnationIterations++;
+     }
+
+     if (Date.now() - lastStatusReport >= 60000) {
+       reportQueueStatus(ctx, tracker, recipes);
+       lastStatusReport = Date.now();
+     }
+
+     if (stagnationIterations >= MAX_STAGNATION) {
+       log("craft", "No new materials to progress crafting - pausing active crafting until next cycle");
+       break;
+     }
+
+     await ctx.sleep(5000);
+   }
+
+   // Wait for the final goal items to actually be produced before returning.
+   const finalItems = goalsToAchieve.map(g => {
+     const recipeId = recipeIdForGoal(g);
+     if (!recipeId) return null;
+     const outputQty = outputQtyOf(recipeId);
+     const prog = tracker.getProgress(recipeId);
+     const target = prog.queued * outputQty;
+     return { recipeId, quantity: target, outputQty };
+   }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
+
+   const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes);
+   crafted.push(...completed);
+
+   for (const g of goalsToAchieve) {
+     const recipeId = recipeIdForGoal(g);
+     if (recipeId) prereqs.push(`${g.limit}x ${recipeIndex.get(recipeId)?.name || recipeId}`);
    }
 
    return { crafted, prereqs };
@@ -731,6 +897,7 @@ async function craftFromCategories(
   enabledCategories: string[],
   tracker: CraftQueueTracker,
   preset: string = "fast",
+  allowExternal: boolean = false,
 ): Promise<string[]> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -817,7 +984,7 @@ async function craftFromCategories(
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, preset);
+    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, preset, allowExternal);
     if (!queueResult.success) {
       ctx.log("error", `Failed to queue ${target.name}: ${queueResult.error}`);
       await ctx.sleep(2000);
@@ -941,6 +1108,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.state !== "running") break;
 
     const settings = await getCrafterSettings();
+    const cycleWaitMs = (settings.cycleTimeSec || 30) * 1000;
 
     yield "scavenge";
 
@@ -1017,7 +1185,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
 
     ctx.log("craft", "Processing crafting goals...");
-    const goalItems: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
+    const goalItems: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }> = [];
 
     for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
       if (bot.state !== "running") break;
@@ -1060,20 +1228,20 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       ctx.log("craft", `Goal: ${needed}x ${recipe.name} (have ${currentStock}/${limit}, plus ${queuedItems} in queue)`);
-      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, recipe: isItemGoal ? undefined : recipe });
+      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {
       if (settings.enabledCategories.length > 0) {
         ctx.log("craft", "No goal items configured - crafting from enabled categories");
       }
-      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, settings.craftingPreset);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, settings.craftingPreset, settings.allowExternalFacilities);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
         ctx.log("info", "No materials available for enabled categories");
       }
-      await ctx.sleep(60000);
+       await ctx.sleep(cycleWaitMs);
       continue;
     }
 
@@ -1081,45 +1249,24 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (assignedCategories.length > 0) {
         ctx.log("craft", "No goals match assigned categories - crafting from categories");
       }
-      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, settings.craftingPreset);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, settings.craftingPreset, settings.allowExternalFacilities);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
         ctx.log("info", "No materials available for assigned categories");
       }
-      await ctx.sleep(60000);
+      await ctx.sleep(cycleWaitMs);
       continue;
     }
 
-    const plans = calculateMultiGoalPlan(
-      goalItems.map(g => ({ itemId: g.itemId, quantity: g.quantity, recipe: g.recipe })),
-      recipes,
-      countItem,
-      facilityAvailableRecipes,
-    );
-
-    const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
-    for (const plan of plans) {
-      ctx.log("craft", formatCraftingPlan(plan));
-      for (const item of plan.flatOrder) {
-        const qty = Math.max(1, Math.floor(item.quantityToCraft));
-        allPlanItems.push({
-          recipe: item.recipe,
-          quantityToCraft: qty,
-          reason: item.reason,
-          depth: item.depth,
-        });
-      }
+    if (goalItems.length === 0) {
+      ctx.log("info", "No crafting goals to execute");
+      await ctx.sleep(cycleWaitMs);
+      continue;
     }
 
-if (allPlanItems.length === 0) {
-       ctx.log("info", "No crafting goals to execute");
-       await ctx.sleep(60000);
-       continue;
-     }
-
-     ctx.log("craft", `Executing queue-based plan (${settings.goalProcessingMode} mode)`);
-     const result = await executeCraftingPlan(ctx, allPlanItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem);
+    ctx.log("craft", `Executing active queue-based plan (${settings.goalProcessingMode} mode)`);
+    const result = await executeCraftingPlan(ctx, goalItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem, facilityAvailableRecipes, settings.allowExternalFacilities);
     const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];
@@ -1153,7 +1300,7 @@ if (allPlanItems.length === 0) {
     yield "repair";
     await repairShip(ctx);
 
-    ctx.log("info", "Waiting 60s before next crafting cycle...");
-    await ctx.sleep(60000);
+    ctx.log("info", `Waiting ${settings.cycleTimeSec}s before next crafting cycle...`);
+    await ctx.sleep(cycleWaitMs);
   }
 };

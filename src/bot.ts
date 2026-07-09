@@ -687,6 +687,12 @@ docked = false;
               break;
             }
 
+            // Honor a stop request immediately instead of retrying for minutes
+            if (this._state !== "running") {
+              this.log("system", `Stop requested — aborting 502 retry for "${command}"`);
+              break;
+            }
+
             // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
             if (MUTATION_COMMANDS.has(command) && retry >= 2) {
               await this.refreshStatus();
@@ -736,6 +742,12 @@ docked = false;
                 result: undefined,
                 notifications: [],
               };
+              break;
+            }
+
+            // Honor a stop request immediately instead of retrying for minutes
+            if (this._state !== "running") {
+              this.log("system", `Stop requested — aborting 524 retry for "${command}"`);
               break;
             }
 
@@ -809,14 +821,32 @@ docked = false;
           if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
             debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
             this.log("system", "Action pending — waiting for server to process...");
-            await sleep(10_000);
-            resp = await this.api.execute(command, payload);
+            // Honor a stop request instead of blocking on the pending action
+            if (this._state !== "running") {
+              this.log("system", "Stop requested — aborting pending action wait");
+            } else {
+              await sleep(10_000);
+              // Re-check stop before issuing the retry
+              if (this._state !== "running") {
+                this.log("system", "Stop requested — aborting pending action retry");
+              } else {
+                resp = await this.api.execute(command, payload);
 
-            // If still pending, wait a bit longer and try one more time
-            if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
-              this.log("system", "Action still pending — waiting additional 5s...");
-              await sleep(5_000);
-              resp = await this.api.execute(command, payload);
+                // If still pending, wait a bit longer and try one more time
+                if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+                  // Honor a stop request instead of blocking further
+                  if (this._state !== "running") {
+                    this.log("system", "Stop requested — aborting pending action wait");
+                  } else {
+                    this.log("system", "Action still pending — waiting additional 5s...");
+                    await sleep(5_000);
+                    // Re-check stop before issuing the final retry
+                    if (this._state === "running") {
+                      resp = await this.api.execute(command, payload);
+                    }
+                  }
+                }
+              }
             }
           }
         }

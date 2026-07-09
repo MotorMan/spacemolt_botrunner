@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Creatures - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 14px; display:flex; flex-direction:column; overflow:hidden; font-family: inherit; }
+    .creatures-layout { flex:1; min-height:0; display:flex; flex-direction:column; gap:10px; }
+    .creatures-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .creatures-header h3 { margin:0; color:var(--text-bright); }
+    .creatures-stats { color:var(--text-dim); font-size:12px; }
+    .creatures-stats b { color:var(--text-bright); font-weight:600; }
+    .creatures-stats .apex-count { color:#ff5cc8; }
+
+    .toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .search-input { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; flex:1; min-width:200px; max-width:420px; }
+    .filter-select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
+    .chk { display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--text-dim); cursor:pointer; user-select:none; }
+    .chk input { accent-color:#ff3db2; }
+    .btn { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--card-bg); color:var(--text); font-size:12px; cursor:pointer; }
+    .btn:hover { border-color:var(--accent); }
+
+    .table-wrap { flex:1; min-height:0; overflow:auto; border:1px solid var(--border); border-radius:6px; background: var(--card-bg); }
+    table.creatures-table { width:100%; border-collapse:collapse; font-size:12px; }
+    table.creatures-table thead th {
+      position:sticky; top:0; z-index:2;
+      text-align:left; padding:7px 10px;
+      background:#161b22; border-bottom:1px solid var(--border);
+      color:var(--text-dim); font-weight:600; white-space:nowrap; cursor:pointer;
+    }
+    table.creatures-table thead th:hover { color:var(--text); }
+    table.creatures-table thead th .arrow { color:var(--accent); font-size:10px; }
+    table.creatures-table td { padding:5px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    table.creatures-table tbody tr:hover { background:var(--hover); }
+    .c-name { color:var(--text-bright); font-weight:600; }
+    .c-role { color:var(--text-dim); }
+    .c-hull { text-align:right; font-variant-numeric:tabular-nums; color:var(--text); }
+    .c-count { text-align:right; font-variant-numeric:tabular-nums; color:var(--text-dim); }
+    .c-system, .c-poi { color:var(--text-dim); }
+    .c-species { color:var(--text); }
+    .c-seen { color:var(--text-dim); font-size:11px; }
+    .badge { display:inline-block; padding:1px 6px; border-radius:3px; font-size:10px; font-weight:700; letter-spacing:.3px; }
+    .badge-apex { background:#ff3db2; color:#fff; box-shadow:0 0 6px rgba(255,61,178,.7); }
+
+    /* Apex / leviathan rows: bright and impossible to miss in the sea of regular creatures */
+    tr.apex td { background: rgba(255, 61, 178, 0.14); border-bottom-color: rgba(255,61,178,.35); }
+    tr.apex td.c-name { color:#ff8fe0; text-shadow:0 0 6px rgba(255,80,200,.7); }
+    tr.apex td.c-role { color:#ffb0ec; }
+    tr.apex:hover td { background: rgba(255, 61, 178, 0.22); }
+    tr.apex td:first-child { box-shadow: inset 3px 0 0 #ff3db2; }
+
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+    .pill { display:inline-block; padding:1px 7px; border-radius:10px; background:var(--border); color:var(--text); font-size:11px; }
+  </style>
+</head>
+<body>
+  <div class="creatures-layout">
+    <div class="creatures-header">
+      <h3>Creatures</h3>
+      <span class="creatures-stats" id="creaturesStats">Loading…</span>
+    </div>
+
+    <div class="toolbar">
+      <input type="text" class="search-input" id="search" placeholder="Search name, species, system, POI, role…" oninput="onFilterChange()">
+      <select class="filter-select" id="roleFilter" onchange="onFilterChange()"><option value="">All Roles</option></select>
+      <select class="filter-select" id="systemFilter" onchange="onFilterChange()"><option value="">All Systems</option></select>
+      <label class="chk"><input type="checkbox" id="apexOnly" onchange="onFilterChange()"> Apex only</label>
+      <select class="filter-select" id="sortBy" onchange="onFilterChange()">
+        <option value="name">Sort: Name</option>
+        <option value="hull">Sort: Max Hull</option>
+        <option value="count">Sort: Count</option>
+        <option value="seen">Sort: Last Seen</option>
+        <option value="system">Sort: System</option>
+      </select>
+      <button class="btn" onclick="loadData(true)">Refresh</button>
+    </div>
+
+    <div class="table-wrap" id="tableWrap">
+      <div class="empty-state">Loading creature data…</div>
+    </div>
+  </div>
+
+  <script>
+    // Roles / hull that mark a creature as an apex / leviathan-class threat.
+    // Tune APEX_ROLES / APEX_HULL_THRESHOLD to match what the game actually sends.
+    const APEX_ROLES = ["boss", "apex", "leviathan", "titan", "kraken", "dread", "wyrm", "colossus", "behemoth", "elder"];
+    const APEX_HULL_THRESHOLD = 4000;
+
+    let allRows = [];
+    let lastUpdated = "";
+    let ws = null;
+    let sortDir = 1; // 1 asc, -1 desc (toggle on header click)
+    let sortKey = "name";
+
+    function isApex(role, maxHull) {
+      const r = (role || "").toLowerCase();
+      if (APEX_ROLES.some(k => r.includes(k))) return true;
+      return (maxHull || 0) >= APEX_HULL_THRESHOLD;
+    }
+
+    function esc(s) {
+      if (s === undefined || s === null) return "";
+      const d = document.createElement("div");
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    function getTimeAgo(iso) {
+      if (!iso) return "—";
+      const diff = Date.now() - new Date(iso).getTime();
+      const m = Math.floor(diff / 60000);
+      if (m < 1) return "just now";
+      if (m < 60) return m + "m ago";
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + "h " + (m % 60) + "m ago";
+      const d = Math.floor(h / 24);
+      return d + "d ago";
+    }
+
+    // ── Data loading ──────────────────────────────────────
+    async function loadData(force) {
+      try {
+        const res = await fetch("/api/wildlife?_=" + Date.now());
+        const data = await res.json();
+        if (!force && data.lastUpdated === lastUpdated) return;
+        lastUpdated = data.lastUpdated || "";
+        allRows = flatten(data);
+        populateFilters();
+        render();
+      } catch (e) {
+        console.error("Failed to load creature data:", e);
+        const wrap = document.getElementById("tableWrap");
+        if (wrap) wrap.innerHTML = '<div class="empty-state">Failed to load creature data.</div>';
+      }
+    }
+
+    function flatten(data) {
+      const rows = [];
+      const systems = data.systems || {};
+      for (const sysName of Object.keys(systems)) {
+        const sys = systems[sysName];
+        const pois = sys.pois || {};
+        for (const poiName of Object.keys(pois)) {
+          for (const e of (pois[poiName] || [])) {
+            rows.push({
+              name: e.n,
+              species: e.s || "",
+              role: e.r || "",
+              maxHull: e.h || 0,
+              count: (e.ids || []).length,
+              ids: e.ids || [],
+              system: sysName,
+              poi: poiName,
+              seen: e.seen || "",
+              apex: isApex(e.r, e.h),
+            });
+          }
+        }
+      }
+      return rows;
+    }
+
+    function populateFilters() {
+      const roleSel = document.getElementById("roleFilter");
+      const sysSel = document.getElementById("systemFilter");
+      const curRole = roleSel.value;
+      const curSys = sysSel.value;
+      const roles = [...new Set(allRows.map(r => r.role).filter(Boolean))].sort();
+      const systems = [...new Set(allRows.map(r => r.system).filter(Boolean))].sort();
+      roleSel.innerHTML = '<option value="">All Roles</option>' +
+        roles.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+      sysSel.innerHTML = '<option value="">All Systems</option>' +
+        systems.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+      roleSel.value = curRole;
+      sysSel.value = curSys;
+    }
+
+    // ── Rendering ─────────────────────────────────────────
+    function onFilterChange() { render(); }
+
+    function getFiltered() {
+      const q = (document.getElementById("search").value || "").toLowerCase().trim();
+      const role = document.getElementById("roleFilter").value;
+      const system = document.getElementById("systemFilter").value;
+      const apexOnly = document.getElementById("apexOnly").checked;
+      const sortBy = document.getElementById("sortBy").value;
+
+      let rows = allRows.filter(r => {
+        if (apexOnly && !r.apex) return false;
+        if (role && r.role !== role) return false;
+        if (system && r.system !== system) return false;
+        if (q) {
+          const hay = (r.name + " " + r.species + " " + r.system + " " + r.poi + " " + r.role).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      });
+
+      const k = sortBy;
+      const numeric = (k === "hull" || k === "count");
+      rows.sort((a, b) => {
+        let av, bv;
+        if (k === "seen") { av = a.seen; bv = b.seen; return av > bv ? -1 : av < bv ? 1 : 0; }
+        av = a[k]; bv = b[k];
+        if (numeric) return (av || 0) - (bv || 0);
+        av = String(av || ""); bv = String(bv || "");
+        return av < bv ? -1 : av > bv ? 1 : 0;
+      });
+      return rows;
+    }
+
+    function render() {
+      const rows = getFiltered();
+      const wrap = document.getElementById("tableWrap");
+
+      const totalTypes = allRows.length;
+      const totalIndividuals = allRows.reduce((s, r) => s + r.count, 0);
+      const systemsCovered = new Set(allRows.map(r => r.system)).size;
+      const apexCount = allRows.filter(r => r.apex).length;
+
+      document.getElementById("creaturesStats").innerHTML =
+        `<b>${rows.length}</b> shown · ` +
+        `<b>${totalTypes}</b> types · ` +
+        `<b>${totalIndividuals}</b> individuals · ` +
+        `<b>${systemsCovered}</b> systems · ` +
+        `<span class="apex-count">${apexCount} apex</span>`;
+
+      if (!rows.length) {
+        wrap.innerHTML = '<div class="empty-state">No creatures match the current filters.</div>';
+        return;
+      }
+
+      const body = rows.map(r => {
+        const apexCls = r.apex ? " apex" : "";
+        const roleBadge = r.apex ? `<span class="badge badge-apex">APEX</span> ${esc(r.role)}` : esc(r.role);
+        return `<tr class="${apexCls.trim()}">
+          <td class="c-name">${esc(r.name)}</td>
+          <td class="c-role">${roleBadge}</td>
+          <td class="c-hull">${r.maxHull.toLocaleString()}</td>
+          <td class="c-count">${r.count}</td>
+          <td class="c-species">${esc(r.species)}</td>
+          <td class="c-system">${esc(r.system)}</td>
+          <td class="c-poi">${esc(r.poi)}</td>
+          <td class="c-seen">${getTimeAgo(r.seen)}</td>
+        </tr>`;
+      }).join("");
+
+      wrap.innerHTML = `<table class="creatures-table">
+        <thead><tr>
+          <th onclick="setSort('name')">Name</th>
+          <th onclick="setSort('role')">Role</th>
+          <th class="c-hull" onclick="setSort('hull')">Max Hull</th>
+          <th class="c-count" onclick="setSort('count')">Count</th>
+          <th onclick="setSort('species')">Species</th>
+          <th onclick="setSort('system')">System</th>
+          <th>POI</th>
+          <th onclick="setSort('seen')">Last Seen</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>`;
+    }
+
+    function setSort(key) {
+      const sel = document.getElementById("sortBy");
+      if (sel.value === key) {
+        // toggle direction handled implicitly by re-sort; keep simple asc
+      }
+      sel.value = key;
+      render();
+    }
+
+    // ── Live updates ──────────────────────────────────────
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      try {
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.onopen = () => loadData(true);
+        ws.onmessage = (ev) => {
+          let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'init') loadData(true);
+        };
+        ws.onclose = () => setTimeout(connect, 3000);
+      } catch { setTimeout(connect, 3000); }
+    }
+
+    connect();
+    loadData(true);
+    setInterval(() => loadData(false), 5000);
+  </script>
+</body>
+</html>

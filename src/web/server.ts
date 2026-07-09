@@ -881,14 +881,9 @@ if (url.pathname === "/data/shipsForSale.json") {
           return Response.json(wildlifeStore.getFullData());
         }
         if (url.pathname === "/data/wildlifeInfo.json") {
-          const wildlifePath = join(DATA_DIR, "wildlifeInfo.json");
-          if (existsSync(wildlifePath)) {
-            return new Response(readFileSync(wildlifePath, "utf-8"), {
-              headers: { "Content-Type": "application/json" },
-            });
-          } else {
-            return Response.json({ error: "Wildlife info file not found" }, { status: 404 });
-          }
+          return Response.json(wildlifeStore.getFullData(), {
+            headers: { "Content-Type": "application/json" },
+          });
         }
         if (url.pathname === "/api/logs/main") {
           // Return persisted main logs (activity, broadcast, system, faction)
@@ -1902,6 +1897,17 @@ if (url.pathname === "/data/shipsForSale.json") {
         if (url.pathname === "/fa.html") {
           const faPath = join(import.meta.dir, "fa.html");
           return new Response(readFileSync(faPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve creatures.html for creatures route
+        if (url.pathname === "/creatures.html") {
+          const creaturesPath = join(import.meta.dir, "creatures.html");
+          return new Response(readFileSync(creaturesPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

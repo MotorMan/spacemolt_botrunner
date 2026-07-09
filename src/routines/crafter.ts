@@ -22,6 +22,13 @@ const QUEUE_REFRESH_COOLDOWN = 60000;
 let lastQueueCheck = 0;
 let cachedQueueJobs: ServerJobInfo[] = [];
 
+// Round-robin cursor per recipe so multiple same-type facilities share the load.
+const facilityRoundRobin = new Map<string, number>();
+// Recipes we've already warned about not having an owned facility for (dedupe per run).
+const notifiedMissingFacilities = new Set<string>();
+// Cumulative rental spend since the bot started (gated by rentalSpendingLimit).
+let rentalSpentThisSession = 0;
+
 interface CraftLimit {
   recipeId: string;
   limit: number;
@@ -52,6 +59,10 @@ async function getCrafterSettings(): Promise<{
   craftingPreset: string;
   finalItemThreshold: number;
   allowExternalFacilities: boolean;
+  forceOwnFacility: boolean;
+  noFacilityFallback: string;
+  allowRentalPurchase: boolean;
+  rentalSpendingLimit: number;
   cycleTimeSec: number;
 }> {
   const { join } = require("path");
@@ -151,6 +162,10 @@ async function getCrafterSettings(): Promise<{
     craftingPreset: (c.craftingPreset as string) || "fast",
     finalItemThreshold: (c.finalItemThreshold as number) || 1,
     allowExternalFacilities: (c.allowExternalFacilities as boolean) ?? false,
+    forceOwnFacility: (c.forceOwnFacility as boolean) ?? true,
+    noFacilityFallback: (c.noFacilityFallback as string) || "auto",
+    allowRentalPurchase: (c.allowRentalPurchase as boolean) ?? false,
+    rentalSpendingLimit: (c.rentalSpendingLimit as number) || 0,
     cycleTimeSec: (c.cycleTimeSec as number) || 30,
   };
 }
@@ -315,6 +330,132 @@ function getRecipesAvailableAtFacilities(
   return availableRecipes;
 }
 
+// ── Own-facility → recipe matching ──────────────────────────
+//
+// The catalog stores, per facility TYPE, the single recipe it can produce
+// (facility.recipe_id). faction_list tells us which facilities we actually
+// OWN (faction_service === "") and their live server facility_id. We join the
+// two on the facility type so we know exactly which owned facility_id can
+// build a given recipe — that is what we hand to the craft command as
+// `facility_id`, which forces the server to use OUR facility instead of
+// auto-routing (the bug: when our facility already had a job, auto-routing
+// "fast" skipped it for an external rental).
+
+type OwnFacilityMap = Map<string, FactionFacility[]>;
+
+function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFacilityMap {
+  const map: OwnFacilityMap = new Map();
+  const catalogFacilities = catalogStore.getAll().facilities;
+  for (const f of factionFacilities) {
+    if (f.faction_service !== "") continue; // only facilities we personally own
+    if (!f.facility_id || !f.type) continue;
+    const catFac = catalogFacilities[f.type] as Record<string, unknown> | undefined;
+    if (!catFac) continue;
+    const recipeId = (catFac.recipe_id as string) || "";
+    if (!recipeId) continue;
+    const list = map.get(recipeId) || [];
+    list.push(f);
+    map.set(recipeId, list);
+  }
+  return map;
+}
+
+// Distribute jobs across multiple owned facilities of the same type by
+// round-robining through them in a stable order.
+function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[]): FactionFacility {
+  const idx = (facilityRoundRobin.get(recipeId) || 0) % facilities.length;
+  facilityRoundRobin.set(recipeId, idx + 1);
+  return facilities[idx];
+}
+
+interface ResolvedVenue {
+  facilityId?: string;
+  preset: string;
+  allowRental: boolean;
+  usedOwnFacility: boolean;
+  missingFacility: boolean;
+}
+
+interface CrafterSettings {
+  crafters: CrafterProfile[];
+  botCrafterAssignments: Record<string, string>;
+  enabledCategories: string[];
+  refuelThreshold: number;
+  repairThreshold: number;
+  categoryAssignments: Record<string, string[]>;
+  botQuotaOverrides: Record<string, Record<string, number>>;
+  goalProcessingMode: string;
+  autoBuy: {
+    enabled: boolean;
+    maxPricePercentOverBase: number;
+    maxCreditsPerCycle: number;
+    excludeCategories: string[];
+  };
+  blacklistedRecipes: string[];
+  useQueuedCrafting: boolean;
+  craftingPreset: string;
+  finalItemThreshold: number;
+  allowExternalFacilities: boolean;
+  forceOwnFacility: boolean;
+  noFacilityFallback: string;
+  allowRentalPurchase: boolean;
+  rentalSpendingLimit: number;
+  cycleTimeSec: number;
+}
+
+function isRentalAllowed(settings: CrafterSettings): boolean {
+  if (settings.allowExternalFacilities) return true;
+  if (!settings.allowRentalPurchase) return false;
+  if (settings.rentalSpendingLimit <= 0) return true;
+  return rentalSpentThisSession < settings.rentalSpendingLimit;
+}
+
+// Decide where a single recipe should be crafted given the owned-facility map
+// and the operator's settings.
+function resolveVenueForRecipe(
+  recipeId: string,
+  recipeName: string,
+  ownFacilityMap: OwnFacilityMap,
+  settings: CrafterSettings,
+): ResolvedVenue {
+  if (settings.forceOwnFacility) {
+    const facs = ownFacilityMap.get(recipeId) || [];
+    if (facs.length > 0) {
+      const fac = pickRoundRobinFacility(recipeId, facs);
+      return {
+        facilityId: fac.facility_id,
+        preset: settings.craftingPreset,
+        allowRental: isRentalAllowed(settings),
+        usedOwnFacility: true,
+        missingFacility: false,
+      };
+    }
+    // We wanted to use our own facility but don't have one for this recipe.
+    // The warning is emitted (once per recipe per run) by the caller, which
+    // has access to the logger.
+    const missingFacility = true;
+
+    if (settings.noFacilityFallback === "workshop") {
+      return { preset: "workshop", allowRental: false, usedOwnFacility: false, missingFacility };
+    }
+    return {
+      preset: settings.craftingPreset,
+      allowRental: isRentalAllowed(settings),
+      usedOwnFacility: false,
+      missingFacility,
+    };
+  }
+
+  // forceOwnFacility disabled: just use the configured preset / auto-routing.
+  return {
+    preset: settings.craftingPreset,
+    allowRental: isRentalAllowed(settings),
+    usedOwnFacility: false,
+    missingFacility: false,
+  };
+}
+
+
 // ── Queue-focused crafting logic ──────────────────────────────
 
 async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
@@ -444,57 +585,125 @@ function parseCraftQuote(result: unknown): CraftQuote {
   };
 }
 
-// A craft routes to a rented/public facility when `external` is true or the
-// quote carries a per-run rental fee (anything beyond the flat labor cost).
-function isExternalRental(q: CraftQuote): boolean {
-  return q.external === true || q.fee > 0;
+interface FinalVenue {
+  facilityId?: string;
+  preset?: string;
+  blocked: boolean;
+  rentalFee: number;
+  label: string;
 }
 
-async function checkCraftVenue(
+// Resolve the final craft venue via a dry-run, applying all the safety rules:
+//  - an explicitly targeted OWN facility is always honored (never external)
+//  - if auto-routing would hit an external rental but rental isn't allowed, we
+//    transparently fall back to the Station Workshop (hand-crafting) instead of
+//    blocking, so we still produce the item without an accidental rental
+//  - if rental IS allowed but would breach the spending limit, fall back to workshop
+async function resolveFinalVenue(
   ctx: RoutineContext,
   bot: any,
   recipeId: string,
   recipeName: string,
   runs: number,
-  preset: string,
-  allowExternal: boolean,
-): Promise<{ blocked: boolean }> {
+  v: ResolvedVenue,
+  settings: CrafterSettings,
+): Promise<FinalVenue> {
   const { log } = ctx;
 
-  const runDryRun = async () => bot.exec("craft", { id: recipeId, quantity: runs, preset, dry_run: true });
-  let dryRunResp = await runDryRun();
-  if (dryRunResp.error) {
-    const msg = (dryRunResp.error.message || "").toLowerCase();
-    // Retry once on rate limiting so the safety check isn't skipped under load.
-    if (dryRunResp.error.code === "429" || msg.includes("rate") || msg.includes("limit")) {
-      await ctx.sleep(2000);
-      dryRunResp = await runDryRun();
+  const dryRun = async (preset?: string, facilityId?: string) => {
+    const payload: Record<string, unknown> = { id: recipeId, quantity: runs, dry_run: true };
+    if (preset) payload.preset = preset;
+    if (facilityId) payload.facility_id = facilityId;
+    let r = await bot.exec("craft", payload);
+    if (r.error) {
+      const m = (r.error.message || "").toLowerCase();
+      if (r.error.code === "429" || m.includes("rate") || m.includes("limit")) {
+        await ctx.sleep(2000);
+        r = await bot.exec("craft", payload);
+      }
+    }
+    return r;
+  };
+
+  let attemptedFacility = v.facilityId;
+  let attemptedPreset: string | undefined = v.facilityId ? undefined : v.preset;
+
+  let resp = await dryRun(attemptedPreset, attemptedFacility);
+
+  if (resp.error) {
+    const errMsg = resp.error.message;
+    // If our own facility was unusable (busy/offline) and rental is allowed,
+    // fall back to normal auto-routing.
+    if (attemptedFacility && v.allowRental) {
+      log("warn", `Own facility ${attemptedFacility} unavailable for ${recipeName} (${errMsg}) - falling back to auto-routing`);
+      attemptedFacility = undefined;
+      attemptedPreset = settings.craftingPreset;
+      resp = await dryRun(attemptedPreset, undefined);
+    } else if (!v.allowRental) {
+      // Couldn't verify a safe venue and we can't rent — try workshop as a last resort.
+      log("warn", `Craft venue unusable for ${recipeName} (${errMsg}) - trying workshop fallback`);
+      attemptedFacility = undefined;
+      attemptedPreset = "workshop";
+      resp = await dryRun("workshop", undefined);
+      if (resp.error) {
+        log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${resp.error.message}). Blocking to avoid an accidental external facility rental.`);
+        return { blocked: true, rentalFee: 0, label: "unverified" };
+      }
+      return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (fallback)" };
+    } else {
+      // Rental allowed but venue still errored unexpectedly — block closed.
+      log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${errMsg}). Blocking to avoid an accidental external facility rental.`);
+      return { blocked: true, rentalFee: 0, label: "unverified" };
     }
   }
 
-  if (dryRunResp.error) {
-    // We could not confirm the venue is safe. Fail closed (block) unless the
-    // operator explicitly opted into external facilities.
-    if (allowExternal) {
-      log("warn", `Could not verify craft venue via dry_run for ${recipeName}: ${dryRunResp.error.message} - proceeding per allowExternalFacilities`);
-      return { blocked: false };
+  let quote = parseCraftQuote(resp.result);
+
+  // If auto-routing would rent an external facility but rental isn't allowed,
+  // fall back to the Station Workshop (hand-crafting) so we still produce it.
+  if (!attemptedFacility && quote.external && !v.allowRental) {
+    log("warn", `Would rent external facility "${quote.venue || recipeName}" for ${quote.fee}cr but rental is not allowed - falling back to workshop (hand-crafting)`);
+    attemptedFacility = undefined;
+    attemptedPreset = "workshop";
+    const ws = await dryRun("workshop", undefined);
+    if (ws.error) {
+      log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
+      return { blocked: true, rentalFee: 0, label: "workshop-failed" };
     }
-    log("error", `🔴 CRAFT VENUE UNVERIFIED: dry_run failed for ${recipeName} (${dryRunResp.error.message}). Blocking to avoid an accidental external facility rental.`);
-    return { blocked: true };
+    quote = parseCraftQuote(ws.result);
+    return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (rental avoided)" };
   }
 
-  const quote = parseCraftQuote(dryRunResp.result);
-  if (!isExternalRental(quote)) {
-    return { blocked: false };
+  // External rental is allowed — enforce the spending limit.
+  let rentalFee = 0;
+  if (!attemptedFacility && quote.external && v.allowRental) {
+    rentalFee = quote.fee;
+    if (settings.allowRentalPurchase && settings.rentalSpendingLimit > 0) {
+      if (rentalSpentThisSession + rentalFee > settings.rentalSpendingLimit) {
+        log("warn", `Rental fee ${rentalFee}cr would exceed spending limit ${settings.rentalSpendingLimit}cr for ${recipeName} - falling back to workshop (hand-crafting)`);
+        attemptedFacility = undefined;
+        attemptedPreset = "workshop";
+        const ws = await dryRun("workshop", undefined);
+        if (ws.error) {
+          log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
+          return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+        }
+        quote = parseCraftQuote(ws.result);
+        return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
+      }
+    }
   }
 
-  if (allowExternal) {
-    log("warn", `⚠ Allowing external facility "${quote.venue || recipeName}" for ${quote.fee} credits (recipe ${recipeName}) per allowExternalFacilities setting`);
-    return { blocked: false };
-  }
-
-  log("error", `🔴 EXTERNAL FACILITY BLOCKED: would have rented "${quote.venue || recipeName}" for ${quote.fee} credits (recipe ${recipeName}). Aborting to avoid accidental rental.`);
-  return { blocked: true };
+  const label = attemptedFacility
+    ? `facility ${attemptedFacility}`
+    : `preset=${attemptedPreset}`;
+  return {
+    facilityId: attemptedFacility,
+    preset: attemptedPreset,
+    blocked: false,
+    rentalFee,
+    label,
+  };
 }
 
 async function queueCraftJob(
@@ -504,9 +713,9 @@ async function queueCraftJob(
   bot: any,
   tracker: CraftQueueTracker,
   countItemFn: (itemId: string) => number,
-  recipes?: Recipe[],
-  preset: string = "fast",
-  allowExternal: boolean = false,
+  recipes: Recipe[],
+  venue: ResolvedVenue,
+  settings: CrafterSettings,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -526,7 +735,7 @@ async function queueCraftJob(
 
   const maxCraftable = calculateMaxCraftable(recipe, countItemFn);
   const runs = Math.min(originalRuns, maxCraftable);
-  
+
   if (runs <= 0) {
     log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
     return { success: false, error: "insufficient_inputs" };
@@ -536,22 +745,35 @@ async function queueCraftJob(
     log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
   }
 
-  // SAFETY: dry-run quote to detect accidental external/rental facilities
-  // (a rental prepays a per-run fee and sets external=true). Block before
-  // spending credits if one is selected by auto-routing.
-  const venue = await checkCraftVenue(ctx, bot, recipeId, recipe?.name || recipeId, runs, preset, allowExternal);
-  if (venue.blocked) {
+  // Notify (once per recipe per run) when we wanted our own facility but lack one.
+  if (venue.missingFacility) {
+    const key = recipe?.name || recipeId;
+    if (!notifiedMissingFacilities.has(key)) {
+      notifiedMissingFacilities.add(key);
+      log("warn", `⚠ No OWNED facility produces "${key}" - falling back per noFacilityFallback=${settings.noFacilityFallback}`);
+    }
+  }
+
+  const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, runs, venue, settings);
+  if (finalVenue.blocked) {
     return { success: false, error: "external_facility_blocked" };
   }
 
-  log("craft", `Queueing ${runs} runs of ${recipeId} (preset=${preset})...`);
-  const craftResp = await bot.exec("craft", {
-    id: recipeId,
-    quantity: runs,
-    preset: preset,
-  });
+  log("craft", `Queueing ${runs} runs of ${recipeId} (${finalVenue.label})...`);
+  const craftPayload: Record<string, unknown> = { id: recipeId, quantity: runs };
+  if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
+  if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
+
+  const craftResp = await bot.exec("craft", craftPayload);
 
   if (!craftResp.error) {
+    if (finalVenue.rentalFee > 0) {
+      rentalSpentThisSession += finalVenue.rentalFee;
+      const limitNote = settings.rentalSpendingLimit > 0
+        ? ` (session rental spend ${rentalSpentThisSession}/${settings.rentalSpendingLimit}cr)`
+        : "";
+      log("craft", `Rented external facility for ${recipe?.name || recipeId}: ${finalVenue.rentalFee}cr${limitNote}`);
+    }
     return handleSuccess(craftResp, recipeId, runs, log, tracker, bot);
   }
 
@@ -563,6 +785,7 @@ async function queueCraftJob(
 
   return { success: false, error: msg };
 }
+
 
 function handleSuccess(
   resp: any,
@@ -699,66 +922,71 @@ async function waitForAllCompletions(
  }
 
 async function queueAllRecipesOnce(
-   ctx: RoutineContext,
-   allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
-   tracker: CraftQueueTracker,
-   recipes: Recipe[],
-   preset: string,
-   availableFn: (itemId: string) => number,
-   allowExternal: boolean = false,
+    ctx: RoutineContext,
+    allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
+    tracker: CraftQueueTracker,
+    recipes: Recipe[],
+    availableFn: (itemId: string) => number,
+    ownFacilityMap: OwnFacilityMap,
+    settings: CrafterSettings,
 ): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
-   const { bot } = ctx;
-   const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
-   let queuedItemsTotal = 0;
+    const { bot } = ctx;
+    const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
+    let queuedItemsTotal = 0;
 
-   await syncCraftingQueue(ctx, tracker, recipes, true);
+    await syncCraftingQueue(ctx, tracker, recipes, true);
 
-   for (const item of allPlanItems) {
-     if (bot.state !== "running") break;
+    for (const item of allPlanItems) {
+      if (bot.state !== "running") break;
 
-     const outputQty = item.recipe.output_quantity || 1;
-     const progress = tracker.getProgress(item.recipe.recipe_id);
-     const queuedItems = progress.queued * outputQty;
-     const completedItems = progress.completed * outputQty;
+      const outputQty = item.recipe.output_quantity || 1;
+      const progress = tracker.getProgress(item.recipe.recipe_id);
+      const queuedItems = progress.queued * outputQty;
+      const completedItems = progress.completed * outputQty;
 
-     const remainingItems = item.quantityToCraft - completedItems - queuedItems;
-     if (remainingItems <= 0) {
-       const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
-       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-       continue;
-     }
+      const remainingItems = item.quantityToCraft - completedItems - queuedItems;
+      if (remainingItems <= 0) {
+        const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
+        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+        continue;
+      }
 
-      const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, preset, allowExternal);
-     if (!queueResult.success) {
-       if (queueResult.error === "insufficient_inputs") {
-         ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
-       } else if (queueResult.error !== "Job already queued") {
-         ctx.log("error", `Failed to queue ${item.recipe.name}: ${queueResult.error}`);
+       const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
+       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, venue, settings);
+       if (!queueResult.success) {
+         if (queueResult.error === "insufficient_inputs") {
+           ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
+         } else if (queueResult.error && queueResult.error.includes("aborted")) {
+           ctx.log("warn", `Crafting halted: ${queueResult.error}`);
+           break;
+         } else if (queueResult.error !== "Job already queued") {
+           ctx.log("error", `Failed to queue ${item.recipe.name}: ${queueResult.error}`);
+         }
+         continue;
        }
-       continue;
-     }
 
-     const actualQueued = queueResult.queuedRuns || 0;
-     queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-     queuedItemsTotal += actualQueued * outputQty;
-     if (actualQueued * outputQty < remainingItems) {
-       ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x (awaiting sub-materials)`);
-     }
-   }
+      const actualQueued = queueResult.queuedRuns || 0;
+      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+      queuedItemsTotal += actualQueued * outputQty;
+      if (actualQueued * outputQty < remainingItems) {
+        ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x (awaiting sub-materials)`);
+      }
+    }
 
-   return { queued, queuedItems: queuedItemsTotal };
+    return { queued, queuedItems: queuedItemsTotal };
 }
 
 async function executeCraftingPlan(
-   ctx: RoutineContext,
-   goalsToAchieve: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }>,
-   tracker: CraftQueueTracker,
-   recipes: Recipe[],
-   preset: string = "fast",
-   finalItemThreshold: number = 1,
-   countItemFn?: (itemId: string) => number,
-   facilityAvailableRecipes?: Set<string>,
-   allowExternal: boolean = false,
+    ctx: RoutineContext,
+    goalsToAchieve: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }>,
+    tracker: CraftQueueTracker,
+    recipes: Recipe[],
+    preset: string = "fast",
+    finalItemThreshold: number = 1,
+    countItemFn?: (itemId: string) => number,
+    facilityAvailableRecipes?: Set<string>,
+    ownFacilityMap: OwnFacilityMap = new Map(),
+    settings: CrafterSettings | null = null,
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
    const { log, bot } = ctx;
    const crafted: string[] = [];
@@ -794,11 +1022,13 @@ async function executeCraftingPlan(
      return { consumed, produced };
    };
 
-   let lastStatusReport = Date.now();
-   let stagnationIterations = 0;
-   const MAX_STAGNATION = 12;
-   const ACTIVE_LOOP_CAP = 600;
-   let loopCount = 0;
+    let lastStatusReport = Date.now();
+    let stagnationIterations = 0;
+    let stagnationMs = 0;
+    const STAGNATION_BUDGET_MS = 60000;
+    const ACTIVE_LOOP_CAP = 600;
+    let loopCount = 0;
+    const cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
 
    // Active loop: keep re-planning and queueing as sub-materials become available.
    while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
@@ -845,28 +1075,32 @@ async function executeCraftingPlan(
        }
      }
 
-     const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, preset, availableFn, allowExternal);
+      const effectiveSettings = settings || await getCrafterSettings();
+      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings);
 
-     // Progress is being made if we queued something this pass, or if the queue
-     // still has jobs producing sub-materials we're waiting on.
-     if (queuedItems > 0 || anyPending) {
-       stagnationIterations = 0;
-     } else {
-       stagnationIterations++;
-     }
+      // Progress is being made if we queued something this pass, or if the queue
+      // still has jobs producing sub-materials we're waiting on.
+      if (queuedItems > 0 || anyPending) {
+        stagnationIterations = 0;
+        stagnationMs = 0;
+      } else {
+        stagnationIterations++;
+        stagnationMs += cycleWaitMs;
+      }
 
-     if (Date.now() - lastStatusReport >= 60000) {
-       reportQueueStatus(ctx, tracker, recipes);
-       lastStatusReport = Date.now();
-     }
+      if (Date.now() - lastStatusReport >= 60000) {
+        reportQueueStatus(ctx, tracker, recipes);
+        lastStatusReport = Date.now();
+      }
 
-     if (stagnationIterations >= MAX_STAGNATION) {
-       log("craft", "No new materials to progress crafting - pausing active crafting until next cycle");
-       break;
-     }
+      if (stagnationIterations >= ACTIVE_LOOP_CAP || stagnationMs >= STAGNATION_BUDGET_MS) {
+        log("craft", "No new materials to progress crafting - pausing active crafting until next cycle");
+        break;
+      }
 
-     await ctx.sleep(5000);
-   }
+      log("craft", `Active plan pass ${loopCount} done - waiting ${cycleWaitMs / 1000}s before next pass`);
+      await ctx.sleep(cycleWaitMs);
+    }
 
    // Wait for the final goal items to actually be produced before returning.
    const finalItems = goalsToAchieve.map(g => {
@@ -896,8 +1130,8 @@ async function craftFromCategories(
   recipes: Recipe[],
   enabledCategories: string[],
   tracker: CraftQueueTracker,
-  preset: string = "fast",
-  allowExternal: boolean = false,
+  ownFacilityMap: OwnFacilityMap,
+  settings: CrafterSettings,
 ): Promise<string[]> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -984,8 +1218,13 @@ async function craftFromCategories(
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, preset, allowExternal);
+    const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
+    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings);
     if (!queueResult.success) {
+      if (queueResult.error && queueResult.error.includes("aborted")) {
+        ctx.log("warn", `Crafting halted: ${queueResult.error}`);
+        break;
+      }
       ctx.log("error", `Failed to queue ${target.name}: ${queueResult.error}`);
       await ctx.sleep(2000);
       continue;
@@ -1182,7 +1421,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const factionFacilities = await fetchFactionFacilities(bot);
     const facilityRecipeMap = getFacilityRecipeMap();
     const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap);
+    const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities);
     ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
+    ctx.log("craft", `Own facilities: ${[...ownFacilityMap.values()].reduce((n, l) => n + l.length, 0)} covering ${ownFacilityMap.size} recipes (forceOwnFacility=${settings.forceOwnFacility})`);
+    if (settings.allowRentalPurchase) {
+      const remaining = settings.rentalSpendingLimit > 0
+        ? `${settings.rentalSpendingLimit - rentalSpentThisSession}cr remaining of ${settings.rentalSpendingLimit}cr`
+        : "no spending limit";
+      ctx.log("craft", `Rental purchase enabled: ${remaining} (session spent ${rentalSpentThisSession}cr)`);
+    }
 
     ctx.log("craft", "Processing crafting goals...");
     const goalItems: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }> = [];
@@ -1235,7 +1482,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (settings.enabledCategories.length > 0) {
         ctx.log("craft", "No goal items configured - crafting from enabled categories");
       }
-      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, settings.craftingPreset, settings.allowExternalFacilities);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, tracker!, ownFacilityMap, settings);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
@@ -1249,7 +1496,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (assignedCategories.length > 0) {
         ctx.log("craft", "No goals match assigned categories - crafting from categories");
       }
-      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, settings.craftingPreset, settings.allowExternalFacilities);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, tracker!, ownFacilityMap, settings);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
@@ -1266,7 +1513,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     ctx.log("craft", `Executing active queue-based plan (${settings.goalProcessingMode} mode)`);
-    const result = await executeCraftingPlan(ctx, goalItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem, facilityAvailableRecipes, settings.allowExternalFacilities);
+    const result = await executeCraftingPlan(ctx, goalItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem, facilityAvailableRecipes, ownFacilityMap, settings);
     const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];

@@ -12922,6 +12922,44 @@
 
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div>
+        <div class="setting-label">Force Own Facility</div>
+        <div class="setting-hint">When enabled (default), crafts are routed to YOUR OWN facility via its <code>facility_id</code>. This fixes the bug where preset=fast skipped your facility (when it already had a job) and rented an external one. Multiple facilities of the same type share the load automatically.</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px">
+        <input type="checkbox" id="set-crafter-forceOwnFacility" ${crafter.forceOwnFacility !== false ? "checked" : ""}>
+        Force own facility_id
+      </label>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">No-Facility Fallback</div>
+        <div class="setting-hint">What to do when you don't own a facility for a recipe. <b>auto</b> uses normal crafting (may use faction facility or, if allowed, a rental). <b>workshop</b> forces by-hand crafting at the Station Workshop (never rents).</div>
+      </div>
+      <select id="set-crafter-noFacilityFallback" style="min-width:150px">
+        <option value="auto" ${(crafter.noFacilityFallback || "auto") === "auto" ? "selected" : ""}>auto - Regular crafting</option>
+        <option value="workshop" ${(crafter.noFacilityFallback || "auto") === "workshop" ? "selected" : ""}>workshop - Hand-crafting (no rental)</option>
+      </select>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Allow Rental Purchase</div>
+        <div class="setting-hint">When you lack a facility and the fallback is <b>auto</b>, allow renting an external facility up to the spending limit below. Tracks spend for the current session and stops renting once the limit is hit (then falls back to workshop).</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;min-width:220px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px">
+          <input type="checkbox" id="set-crafter-allowRentalPurchase" ${crafter.allowRentalPurchase ? "checked" : ""}>
+          Allow renting external facilities
+        </label>
+        <label style="font-size:11px;color:var(--text-dim)">Spending limit:
+          <input type="number" id="set-crafter-rentalSpendingLimit" min="0" step="1000" value="${crafter.rentalSpendingLimit || 0}" style="width:110px;margin-left:4px"> cr (0 = no limit)
+        </label>
+      </div>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
         <div class="setting-label">Goal Processing Mode</div>
         <div class="setting-hint">How to process multiple goal items: <b>Batch</b> completes each goal fully before moving to the next, <b>Round-Robin</b> crafts one batch of each goal in rotation.</div>
       </div>
@@ -13270,6 +13308,21 @@
           document.getElementById("set-crafter-craftingPreset")?.value ||
           "fast";
 
+        // Collect force-own-facility + rental settings
+        const forceOwnFacility =
+          document.getElementById("set-crafter-forceOwnFacility")?.checked ||
+          false;
+        const noFacilityFallback =
+          document.getElementById("set-crafter-noFacilityFallback")?.value ||
+          "auto";
+        const allowRentalPurchase =
+          document.getElementById("set-crafter-allowRentalPurchase")?.checked ||
+          false;
+        const rentalSpendingLimit =
+          parseInt(
+            document.getElementById("set-crafter-rentalSpendingLimit")?.value,
+          ) || 0;
+
         // Collect auto-buy settings
         const autoBuyEnabled =
           document.getElementById("set-crafter-autoBuy-enabled")?.checked ||
@@ -13355,6 +13408,10 @@
             ) || 30,
           requestItems,
           blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
+          forceOwnFacility,
+          noFacilityFallback,
+          allowRentalPurchase,
+          rentalSpendingLimit,
         };
         send({ type: "saveSettings", routine: "crafter", settings: s });
 

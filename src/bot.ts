@@ -392,16 +392,28 @@ docked = false;
     try {
       return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
-      if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
-        // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
-        // to prevent timeout cascades during heavy combat
-        if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
-          return {
-            error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
-            result: undefined,
-            notifications: [],
-          };
-        }
+      if (!(err instanceof Error) || (err.message !== "TIMEOUT" && err.message !== "ABORTED")) {
+        throw err;
+      }
+
+      // A user-initiated stop/abort should never be reported as a timeout.
+      if (err.message === "ABORTED") {
+        return {
+          error: { code: "aborted", message: `${command} aborted by user` },
+          result: undefined,
+          notifications: [],
+        };
+      }
+
+      // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
+      // to prevent timeout cascades during heavy combat
+      if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
+        return {
+          error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+          result: undefined,
+          notifications: [],
+        };
+      }
 
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
@@ -469,9 +481,6 @@ docked = false;
           result: undefined,
           notifications: [],
         };
-      }
-      // Re-throw other errors
-      throw err;
     }
   }
 

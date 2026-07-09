@@ -7225,27 +7225,20 @@
                   '<span class="resp-warn">No wrecks found at current location</span>',
                 );
               } else {
-                select.innerHTML = cachedWrecks
-                  .map((w, idx) => {
-                    const wreckId = w.wreck_id || w.id;
-                    const name = w.name || w.type || "Wreck";
-                    const itemCount = (w.items || w.cargo || []).length;
-                    const moduleCount = (w.modules || []).length;
-                    const totalLoot = itemCount + moduleCount;
-                    const moduleText =
-                      moduleCount > 0 ? ` + ${moduleCount} module(s)` : "";
-                    return `<option value="${idx}">${esc(name)} (${esc(wreckId.substring(0, 8))}...) - ${totalLoot} item(s)${esc(moduleText)}</option>`;
-                  })
-                  .join("");
                 logResponse(
                   `<span class="resp-ok">Found ${cachedWrecks.length} wreck(s) at current location</span>`,
                 );
 
-                // Auto-update items for first wreck
-                mcUpdateWreckItems();
+                // Expand the wreck section and re-render manual controls.
+                // renderManualControls() rebuilds the controls and resets the
+                // wreck dropdown to its default <option>, so we must repopulate
+                // it afterwards from the cached scan results.
                 wrecksScanned = true;
                 manualCollapseState.wreck = false;
                 renderManualControls();
+                mcPopulateWreckSelect();
+                // Auto-update items for first wreck
+                mcUpdateWreckItems();
               }
             }
           } else {
@@ -7256,7 +7249,28 @@
         });
       }
 
-      /** Update item and module dropdowns when wreck selection changes */
+      /** Populate the wreck dropdown from the cached scan results. */
+      function mcPopulateWreckSelect() {
+        const select = document.getElementById("mc-wreck-select");
+        if (!select) return;
+        if (cachedWrecks.length === 0) {
+          select.innerHTML = '<option value="">No wrecks found</option>';
+          return;
+        }
+        select.innerHTML = cachedWrecks
+          .map((w, idx) => {
+            const wreckId = w.wreck_id || w.id;
+            const name = w.name || w.type || "Wreck";
+            const itemCount = (w.items || w.cargo || []).length;
+            const moduleCount = (w.modules || []).length;
+            const totalLoot = itemCount + moduleCount;
+            const moduleText =
+              moduleCount > 0 ? ` + ${moduleCount} module(s)` : "";
+            return `<option value="${idx}">${esc(name)} (${esc(wreckId.substring(0, 8))}...) - ${totalLoot} item(s)${esc(moduleText)}</option>`;
+          })
+          .join("");
+      }
+
       function mcUpdateWreckItems() {
         const select = document.getElementById("mc-wreck-select");
         const itemSelect = document.getElementById("mc-wreck-item-select");
@@ -24928,6 +24942,7 @@ ignoreBlacklist: document.getElementById(
         const desiredEmergencyWarpDevices = h.desiredEmergencyWarpDevices ?? 3;
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
+        const coordinateHunts = h.coordinateHunts !== false;
         const responseRange = h.responseRange ?? 3;
         const maxAttackTier = h.maxAttackTier || "large";
         const fleeFromTier = h.fleeFromTier || "boss";
@@ -25188,6 +25203,17 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Coordinated Hunts (Bot Chat)</div>
+        <div class="setting-hint">When engaging a creature or pirate, broadcast on the bot chat channel so other hunters in the same POI pull in and join the fight. Disable to hunt solo.</div>
+      </div>
+      <select id="set-hunter-coordinateHunts">
+        <option value="true"${coordinateHunts ? " selected" : ""}>Enabled</option>
+        <option value="false"${!coordinateHunts ? " selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Max Attack Tier</div>
         <div class="setting-hint">Maximum pirate tier to engage. Pirates above this tier will be ignored.</div>
       </div>
@@ -25329,6 +25355,8 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-onlyNPCs").value === "true",
           huntCreatures:
             document.getElementById("set-hunter-huntCreatures").value === "true",
+          coordinateHunts:
+            document.getElementById("set-hunter-coordinateHunts").value === "true",
           maxAttackTier: document.getElementById("set-hunter-maxAttackTier")
             .value,
           fleeFromTier: document.getElementById("set-hunter-fleeFromTier")

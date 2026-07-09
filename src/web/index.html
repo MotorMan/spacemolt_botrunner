@@ -22692,6 +22692,7 @@ async function fetchPersonalFacilityTypes(username) {
         const autoCloak = explorer.autoCloak ?? false;
         const ignoreBlacklistWhenCloaked = explorer.ignoreBlacklistWhenCloaked ?? true;
         const ignorePirateFleeWhenCloaked = explorer.ignorePirateFleeWhenCloaked ?? true;
+        const coordinateExplorers = explorer.coordinateExplorers ?? true;
 
         // Per-bot focus area overrides for trade_update mode
         const explorerBots = bots.filter((b) => {
@@ -22821,6 +22822,17 @@ async function fetchPersonalFacilityTypes(username) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Coordinate with Explorers</div>
+        <div class="setting-hint">Announce target systems over the bot chat channel and avoid systems other active explorers are already heading to. Best when running multiple explorer bots.</div>
+      </div>
+      <select id="set-explorer-coordinateExplorers">
+        <option value="false"${!coordinateExplorers ? " selected" : ""}>No</option>
+        <option value="true"${coordinateExplorers ? " selected" : ""}>Yes (avoid collisions)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Scavenge Wrecks</div>
         <div class="setting-hint" style="color:var(--red)">⚠ WARNING: Scavenging takes extra ticks and is unsafe near pirates (they attack on tick 3). Disabled by default.</div>
       </div>
@@ -22917,6 +22929,9 @@ async function fetchPersonalFacilityTypes(username) {
             "true",
           groupUnknowns:
             document.getElementById("set-explorer-groupUnknowns").value ===
+            "true",
+          coordinateExplorers:
+            document.getElementById("set-explorer-coordinateExplorers").value ===
             "true",
           scavengeEnabled:
             document.getElementById("set-explorer-scavengeEnabled").value ===

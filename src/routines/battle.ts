@@ -775,18 +775,43 @@ export async function fightFreshBattle(
     ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
   }
 
-  let attackResp = await bot.exec("attack", { target_id: target.id });
-  if (attackResp.error) {
-    const msg = attackResp.error.message.toLowerCase();
-    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
-      ctx.log("combat", `${target.name} is no longer available`);
-      return false;
+  // A battle may already be active by the time we get here: engageTarget already
+  // issued the attack, or the server pulled us in (COMBAT WARNING). Re-issuing the
+  // attack command is redundant AND, under the newer server combat code, can hang /
+  // time out for ~60s while we sit idle in the outer ring. If we're already in a
+  // battle, skip the attack and go straight into the combat loop (advance/engage).
+  const preAttackStatus = await getBattleStatus(ctx);
+  let battleActive = !!preAttackStatus;
+  let attackErrMsg: string | null = null;
+
+  if (!battleActive) {
+    const atk = await bot.exec("attack", { target_id: target.id });
+    if (atk.error) {
+      const msg = atk.error.message.toLowerCase();
+      if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+        ctx.log("combat", `${target.name} is no longer available`);
+        return false;
+      }
+      attackErrMsg = atk.error.message;
+    } else {
+      battleActive = true;
     }
-    ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+  }
+
+  if (!battleActive) {
+    ctx.log("error", `Attack failed on ${target.name}: ${attackErrMsg ?? "unknown error"}`);
     return false;
   }
 
-  ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+  if (attackErrMsg) {
+    // The attack command errored/timed out, but a live battle exists — don't bail.
+    // Enter the combat loop so we can advance and close the distance.
+    ctx.log("combat", `⚠️ Attack command errored ("${attackErrMsg}") but battle ${preAttackStatus?.battle_id} is active — entering combat loop to advance/engage`);
+  } else if (preAttackStatus) {
+    ctx.log("combat", `⚔️ Battle already active with ${target.name} — setting initial stance`);
+  } else {
+    ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+  }
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 

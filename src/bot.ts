@@ -956,6 +956,10 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             if (r.auto_docked || location.docked_at) this.docked = true;
             if (r.auto_undocked) this.docked = false;
             if (typeof r.fuel === "number") this.fuel = r.fuel;
+            // Auto-scan nearby after arriving at a new system/POI so creature &
+            // player tracking never misses spawns. Covers miners, traders,
+            // civilian transport, explorers, and every other routine.
+            await this.autoScanAndTrackNearby();
           } else if (command === "dock") {
             this.docked = true;
             if (location.docked_at) this.poi = (location.docked_at as string);
@@ -1242,6 +1246,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
+
     return resp;
   }
 
@@ -1319,6 +1324,27 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
 
   async refreshNearby(): Promise<ApiResponse> {
     return this.api.execute("get_nearby");
+  }
+
+  /**
+   * Scan the immediate area with get_nearby and feed the result into the
+   * player and creature (wildlife) tracking systems.
+   *
+   * This is invoked automatically after every successful jump/travel so that
+   * creature & player discoveries are never missed when a bot arrives at a new
+   * system or POI (miners, traders, civilian transport, explorers, etc.).
+   */
+  async autoScanAndTrackNearby(): Promise<void> {
+    try {
+      const resp = await this.api.execute("get_nearby");
+      if (!resp.error && resp.result) {
+        this.trackNearbyPlayers(resp.result);
+        this.trackWildlife(resp.result);
+      }
+    } catch (e) {
+      // Never let a scan failure interrupt navigation/routines
+      this.log("debug", `autoScanAndTrackNearby failed: ${e}`);
+    }
   }
 
 async refreshSkills(): Promise<ApiResponse> {

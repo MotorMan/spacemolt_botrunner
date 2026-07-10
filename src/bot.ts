@@ -1556,7 +1556,9 @@ async refreshSkills(): Promise<ApiResponse> {
     return resp.result as Record<string, unknown>;
   }
 
-  /** Fetch faction storage contents and cache them. Uses view_faction_storage with station_id for remote access. */
+  /**
+   * Fetch faction storage contents and cache them. Uses view_faction_storage with station_id for remote access.
+   */
   async refreshFactionStorage(): Promise<void> {
     const settings = loadSettings();
     const generalSettings = (settings.general as Record<string, unknown>) || {};
@@ -1564,35 +1566,45 @@ async refreshSkills(): Promise<ApiResponse> {
     
     if (!homeStationId) {
       this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");
-      this.factionStorage = [];
       return;
     }
 
+    const factionName = this.faction || "unknown";
     const resp = await this.exec("view_faction_storage", { station_id: homeStationId });
     if (resp.error) {
       this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
-      return;
+      // Fall back to the last-known-good cached storage so the crafter doesn't
+      // see an empty store and re-queue materials it already has.
+      const cached = getFactionStorageCache(factionName, homeStationId);
+      if (cached?.entries?.length) {
+        this.factionStorage = cached.entries.map((e) => ({
+          itemId: e.itemId,
+          name: e.name || e.itemId,
+          quantity: e.quantity,
+        }));
+        this.factionFuelReserve = cached.factionFuelReserve || 0;
+        this.factionFuelCapacity = cached.factionFuelCapacity || 0;
+        this.log("info", `Fell back to cached faction storage for ${homeStationId}: ${this.factionStorage.length} items`);
+      }
+    } else {
+      const result = resp.result as Record<string, unknown> | null;
+      // Use the robust item parser (same one used for view_storage) so we
+      // correctly handle whichever field view_faction_storage returns its items
+      // under (items / faction_items / stored_items / data wrapper, etc.). The
+      // fragile inline parser here previously missed the real field, leaving
+      // factionStorage empty so the crafter undercounted holdings.
+      const entries = this.parseItemList(result);
+
+      if (entries.length === 0) {
+        this.log("warn", "Faction storage refresh returned 0 items");
+      }
+
+      this.factionStorage = entries;
+      this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
+      this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;
+      updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
+      this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items`);
     }
-    
-    const result = resp.result as Record<string, unknown>;
-    const items = (result.items as Array<Record<string, unknown>>) || [];
-    const entries: CargoItem[] = items.map((i) => ({
-      itemId: (i.item_id as string) || (i.itemId as string) || "",
-      name: (i.name as string) || (i.item_id as string) || (i.itemId as string) || "",
-      quantity: (i.quantity as number) || 0,
-    }));
-    
-    if (entries.length === 0) {
-      this.log("warn", "Faction storage refresh returned 0 items");
-    }
-    
-    this.factionStorage = entries;
-    this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
-    this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    
-    const factionName = this.faction || "unknown";
-    updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
-    this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items`);
   }
 
   /** Start running a routine. */

@@ -471,6 +471,19 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
+/**
+ * Resolve the bare POI id for the configured home station.
+ *
+ * `homeStation` is stored as "system|poi" (e.g. general.factionStorageStation)
+ * but `bot.poi` is only the bare POI id. Comparing/using them directly causes
+ * the bot to think it is "home" whenever `bot.poi` gets set to the malformed
+ * "system|poi" string (or to never match a real home station). Always normalize.
+ */
+function getHomeStationPoi(homeStation: string): string {
+  if (!homeStation) return "";
+  return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+}
+
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number = 50): { jumps: number; cost: number } {
   const blacklist = getSystemBlacklist();
@@ -1129,7 +1142,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         clearFactionStorageCache();
         bot.factionStorage = [];
         const homeSystem = settings.homeSystem || startSystem;
-        const homeStationPoi = settings.homeStation || null;
+        const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
         if (homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi))) {
           ctx.log("travel", `Heading home to access faction storage...`);
           yield "return_home";
@@ -1165,7 +1178,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group
     if (settings.stationPriority && settings.homeSystem) {
-      const homeStationId = settings.homeStation;
+      const homeStationId = getHomeStationPoi(settings.homeStation);
       if (homeStationId) {
         const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStationId);
         const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStationId));
@@ -1259,9 +1272,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       if (!route) {
         // If not at home, go there — storage is only visible at the home station
         const storageType = personalMode ? "personal" : "faction";
-        const homeSystem = settings.homeSystem || startSystem;
-        const homeStationPoi = settings.homeStation || null;
-        const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
+      const homeSystem = settings.homeSystem || startSystem;
+      const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
+      const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
         if (!atHome) {
           ctx.log("trade", `No ${storageType} storage items to sell — returning home to check ${storageType} storage`);
           yield "return_home";
@@ -2166,7 +2179,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Return to home station ──
     const homeSystem = settings.homeSystem || startSystem;
-    const homeStationPoi = settings.homeStation || null;
+    const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
     const needsReturn = homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi));
 
     if (needsReturn) {

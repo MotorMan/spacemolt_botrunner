@@ -842,13 +842,13 @@
       </div>
 
       <!-- ══ Market Tab ══ -->
-      <div class="tab-page" id="page-market">
-        <div class="market-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;">
+      <div class="tab-page" id="page-market" style="padding: 0; gap: 0;">
+        <div class="market-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); padding: 12px 16px 0 16px;">
           <button class="active" onclick="switchMarketView('overview')" id="marketViewOverview">Market Overview</button>
           <button onclick="switchMarketView('browser')" id="marketViewBrowser">Market Browser</button>
         </div>
-        <div id="marketOverviewView">
-          <div style="padding: 16px; overflow-y: auto; height: calc(100% - 50px)">
+        <div id="marketOverviewView" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
+          <div style="padding: 16px; overflow-y: auto; flex: 1; min-height: 0">
             <div
               style="
                 display: flex;
@@ -881,8 +881,8 @@
             <div id="marketTableWrap"></div>
           </div>
         </div>
-        <div id="marketBrowserView" style="display: none; height: calc(100% - 50px)">
-          <iframe id="marketbrowserFrame" src="/market.html" style="width: 100%; height: 100%; border: none;"></iframe>
+        <div id="marketBrowserView" style="display: none; flex: 1; min-height: 0; position: relative;">
+          <iframe id="marketbrowserFrame" src="/market.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
         </div>
       </div>
 
@@ -1617,6 +1617,7 @@
         if (name === "market") renderMarketPage();
         if (name === "missions") renderMissionsPage();
         if (name === "faction") renderFactionPage();
+        if (name !== "faction") stopFactionQueueUsageAutoRefresh();
         if (name === "shipyard") renderShipyardPage();
         if (name === "stats") {
           renderStatsTab();
@@ -18282,6 +18283,7 @@ When responding:
           "members",
           "storage",
           "facilities",
+          "queueusage",
           "personal",
           "rooms",
           "missions",
@@ -18289,10 +18291,13 @@ When responding:
           "intel",
           "activity",
         ];
+        const panelLabels = {
+          queueusage: "Queue Usage",
+        };
         const panelNav = panels
           .map((p) => {
             const active = factionActivePanel === p ? " active" : "";
-            const label = p.charAt(0).toUpperCase() + p.slice(1);
+            const label = panelLabels[p] || p.charAt(0).toUpperCase() + p.slice(1);
             return `<button class="faction-nav-btn${active}" style="display:inline-block;width:auto;padding:5px 12px;font-size:11px" onclick="switchFactionPanel('${p}')">${label}</button>`;
           })
           .join("");
@@ -18310,6 +18315,9 @@ When responding:
             break;
           case "facilities":
             panelHtml = renderFactionFacilities(f, username);
+            break;
+          case "queueusage":
+            panelHtml = renderFactionQueueUsage(f, username);
             break;
           case "personal":
             panelHtml = renderPersonalFacilities(f, username);
@@ -18342,9 +18350,35 @@ When responding:
   `;
       }
 
+      let factionQueueUsageTimer = null;
+
+      function stopFactionQueueUsageAutoRefresh() {
+        if (factionQueueUsageTimer) {
+          clearInterval(factionQueueUsageTimer);
+          factionQueueUsageTimer = null;
+        }
+      }
+
+      function startFactionQueueUsageAutoRefresh(username) {
+        stopFactionQueueUsageAutoRefresh();
+        fetchFactionFacilityQueueUsage(username);
+        factionQueueUsageTimer = setInterval(() => {
+          const c = document.getElementById("factionFacilityQueueUsage");
+          if (!c) {
+            stopFactionQueueUsageAutoRefresh();
+            return;
+          }
+          fetchFactionFacilityQueueUsage(username);
+        }, 60000);
+      }
+
       function switchFactionPanel(panel) {
+        if (panel !== "queueusage") stopFactionQueueUsageAutoRefresh();
         factionActivePanel = panel;
         if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+        if (panel === "queueusage" && factionSelectedBot) {
+          startFactionQueueUsageAutoRefresh(factionSelectedBot);
+        }
       }
 
       function renderFactionOverview(f, username) {
@@ -19442,13 +19476,24 @@ When responding:
         <button class="sm" onclick="fetchFacilityHelp('${esc(username)}')" ${!docked ? "disabled" : ""}>Show API Help</button>
       </div>
     </div>
-    <div class="faction-section" style="margin-top:16px">
+  `;
+      }
+
+      function renderFactionQueueUsage(f, username) {
+        const bot = bots.find((b) => b.username === username);
+        const docked = bot ? bot.docked : false;
+        const dockWarning = !docked
+          ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to analyze queue usage.</div>'
+          : "";
+        return `
+    ${dockWarning}
+    <div class="faction-section">
       <div class="faction-section-title">Facility Queue Usage</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
-        <button class="sm" onclick="fetchFactionFacilityQueueUsage('${esc(username)}')">Analyze Queue Usage</button>
-        <span style="font-size:11px;color:var(--text-dim)">Queries each facility's job list (non-mutating) to split total queued runs into your own vs. other players' (external/public) usage.</span>
+        <button class="sm" onclick="fetchFactionFacilityQueueUsage('${esc(username)}')">Refresh Now</button>
+        <span style="font-size:11px;color:var(--text-dim)">Queries each facility's job list (non-mutating) to split total queued runs into your own vs. other players' (external/public) usage. Auto-loads and refreshes every 60s while this tab is open.</span>
       </div>
-      <div id="factionFacilityQueueUsage"><div class="faction-no-data" style="font-size:11px">Click "Analyze Queue Usage" to load data.</div></div>
+      <div id="factionFacilityQueueUsage"><div class="faction-no-data" style="font-size:11px">Loading queue usage...</div></div>
     </div>
   `;
       }
@@ -19523,6 +19568,7 @@ When responding:
                     const levelStr = level ? ` (Level ${level})` : "";
                     const factionService = fac.faction_service || "";
                     const canTransfer = !factionService;
+                    const canManage = !factionService;
                     const upgradeInfo = factionFacilityUpgrades[facId];
                     const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
                     if (!(facId in factionFacilityPublic)) {
@@ -19552,16 +19598,17 @@ When responding:
               <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
               <span style="font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="font-size:10px">${status}</span>
+              ${canManage ? `
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)">Public access:</span>
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
-                <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--text-dim)"}">${isPublic ? "Public" : "Private"}</span>
+                <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)">Output price / unit:</span>
                 <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
                 <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
-              </div>
+              </div>` : ``}
               <div style="display:flex;gap:4px;margin-left:auto">
                 ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
@@ -19740,7 +19787,7 @@ When responding:
           ),
         );
 
-        const rows = Object.values(facMap).map((fac) => {
+        const data = Object.values(facMap).map((fac) => {
           const hasJobs = fac.queuedRuns > 0;
           const known = fac.jobListOk === true;
           // External = total queued minus our own runs (orderer === "self")
@@ -19766,35 +19813,58 @@ When responding:
             : onlyUs
               ? "Private (only you)"
               : "Public / External";
-          const levelStr = fac.level ? ` (L${fac.level})` : "";
-          const orderers =
-            fac.externalOrderers.size > 0
-              ? ` <span style="font-size:10px;color:var(--text-dim)">(${[...fac.externalOrderers].join(", ")})</span>`
-              : "";
-          const fmt = (v) =>
-            v == null ? "—" : Math.round(v).toLocaleString();
-          return `<tr>
-            <td style="text-align:left;padding:4px 8px;color:var(--text-bright)">${esc(fac.name)}${esc(levelStr)}</td>
-            <td style="text-align:center;padding:4px 8px">${fac.public ? '<span style="color:var(--green)">Public</span>' : '<span style="color:var(--text-dim)">Private</span>'}</td>
-            <td style="text-align:right;padding:4px 8px">${fac.queuedRuns.toLocaleString()}</td>
-            <td style="text-align:right;padding:4px 8px">${fmt(ourRuns)}</td>
-            <td style="text-align:right;padding:4px 8px;color:${statusColor};font-weight:600">${fmt(externalRuns)}</td>
-            <td style="text-align:right;padding:4px 8px;color:${statusColor}">${fmt(externalItems)}</td>
-            <td style="text-align:center;padding:4px 8px;color:${statusColor}">${statusText}${orderers}</td>
-          </tr>`;
+          return {
+            name: fac.name,
+            level: fac.level,
+            public: fac.public,
+            queuedRuns: fac.queuedRuns,
+            ourRuns,
+            externalRuns,
+            externalItems,
+            statusColor,
+            statusText,
+            orderers: [...fac.externalOrderers],
+          };
         });
 
-        const totalExternalRuns = Object.values(facMap)
-          .filter((fac) => fac.jobListOk === true)
-          .reduce(
-            (sum, fac) => sum + Math.max(0, fac.queuedRuns - fac.ourRuns),
-            0,
-          );
-        const externalFacilityCount = Object.values(facMap).filter(
-          (fac) => fac.jobListOk === true && fac.queuedRuns - fac.ourRuns > 0,
+        factionQueueUsageData = data;
+        renderFactionQueueUsageTable();
+      }
+
+      function renderFactionQueueUsageTable(sortBy) {
+        if (sortBy) factionQueueUsageSort = sortBy;
+        const container = document.getElementById("factionFacilityQueueUsage");
+        if (!container) return;
+        if (!factionQueueUsageData) {
+          container.innerHTML =
+            '<div class="faction-no-data" style="font-size:11px">Loading queue usage...</div>';
+          return;
+        }
+
+        const sort = factionQueueUsageSort;
+        const exVal = (v) => (v == null ? -Infinity : v);
+        const rowsData = [...factionQueueUsageData].sort((a, b) => {
+          switch (sort) {
+            case "name":
+              return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+            case "total":
+              return b.queuedRuns - a.queuedRuns;
+            case "our":
+              return exVal(b.ourRuns) - exVal(a.ourRuns);
+            case "external":
+            default:
+              return exVal(b.externalRuns) - exVal(a.externalRuns);
+          }
+        });
+
+        const totalExternalRuns = factionQueueUsageData
+          .filter((fac) => fac.externalRuns != null)
+          .reduce((sum, fac) => sum + Math.max(0, fac.externalRuns), 0);
+        const externalFacilityCount = factionQueueUsageData.filter(
+          (fac) => fac.externalRuns != null && fac.externalRuns > 0,
         ).length;
-        const unknownCount = Object.values(facMap).filter(
-          (fac) => fac.queuedRuns > 0 && fac.jobListOk !== true,
+        const unknownCount = factionQueueUsageData.filter(
+          (fac) => fac.queuedRuns > 0 && fac.externalRuns == null,
         ).length;
 
         let summary =
@@ -19805,8 +19875,39 @@ When responding:
         }
         summary += ".</div>";
 
+        const sortBtn = (key, label) =>
+          `<button class="sm" style="font-size:10px;padding:2px 8px${sort === key ? ";background:var(--accent);color:#fff" : ""}" onclick="renderFactionQueueUsageTable('${key}')">${label}</button>`;
+
+        const fmt = (v) =>
+          v == null ? "—" : Math.round(v).toLocaleString();
+        const rows = rowsData
+          .map((fac) => {
+            const levelStr = fac.level ? ` (L${fac.level})` : "";
+            const orderers =
+              fac.orderers.length > 0
+                ? ` <span style="font-size:10px;color:var(--text-dim)">(${esc(fac.orderers.join(", "))})</span>`
+                : "";
+            return `<tr>
+            <td style="text-align:left;padding:4px 8px;color:var(--text-bright)">${esc(fac.name)}${esc(levelStr)}</td>
+            <td style="text-align:center;padding:4px 8px">${fac.public ? '<span style="color:var(--green)">Public</span>' : '<span style="color:var(--text-dim)">Private</span>'}</td>
+            <td style="text-align:right;padding:4px 8px">${fac.queuedRuns.toLocaleString()}</td>
+            <td style="text-align:right;padding:4px 8px">${fmt(fac.ourRuns)}</td>
+            <td style="text-align:right;padding:4px 8px;color:${fac.statusColor};font-weight:600">${fmt(fac.externalRuns)}</td>
+            <td style="text-align:right;padding:4px 8px;color:${fac.statusColor}">${fmt(fac.externalItems)}</td>
+            <td style="text-align:center;padding:4px 8px;color:${fac.statusColor}">${fac.statusText}${orderers}</td>
+          </tr>`;
+          })
+          .join("");
+
         container.innerHTML = `
           ${summary}
+          <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+            <span style="font-size:11px;color:var(--text-dim)">Sort by:</span>
+            ${sortBtn("name", "Facility (A–Z)")}
+            ${sortBtn("external", "External Runs")}
+            ${sortBtn("total", "Total Runs")}
+            ${sortBtn("our", "Our Runs")}
+          </div>
           <table class="bot-table" style="font-size:12px">
             <thead>
               <tr>
@@ -19819,7 +19920,7 @@ When responding:
                 <th style="text-align:center;padding:4px 8px">Usage</th>
               </tr>
             </thead>
-            <tbody>${rows.join("")}</tbody>
+            <tbody>${rows}</tbody>
           </table>
         `;
       }
@@ -20131,6 +20232,8 @@ When responding:
       let factionFacilityPublic = {};
       let factionFacilityPrice = {};
       let factionFacilitiesData = [];
+      let factionQueueUsageData = null;
+      let factionQueueUsageSort = "external";
 
       let personalFacilityTypes = [];
       let personalFacilityCategory = "personal";
@@ -21034,6 +21137,7 @@ When responding:
     <button class="faction-nav-btn ${activePanel === "members" ? "active" : ""}" onclick="switchFactionPanel('members')">Members</button>
     <button class="faction-nav-btn ${activePanel === "storage" ? "active" : ""}" onclick="switchFactionPanel('storage')">Storage</button>
     <button class="faction-nav-btn ${activePanel === "facilities" ? "active" : ""}" onclick="switchFactionPanel('facilities')">Facilities</button>
+    <button class="faction-nav-btn ${activePanel === "queueusage" ? "active" : ""}" onclick="switchFactionPanel('queueusage')">Queue Usage</button>
     <button class="faction-nav-btn ${activePanel === "personal" ? "active" : ""}" onclick="switchFactionPanel('personal')">Personal Facilities</button>
     <button class="faction-nav-btn ${activePanel === "rooms" ? "active" : ""}" onclick="switchFactionPanel('rooms')">Rooms</button>
     <button class="faction-nav-btn ${activePanel === "missions" ? "active" : ""}" onclick="switchFactionPanel('missions')">Missions</button>

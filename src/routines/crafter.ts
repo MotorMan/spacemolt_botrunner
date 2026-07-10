@@ -348,6 +348,7 @@ function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFac
   const catalogFacilities = catalogStore.getAll().facilities;
   for (const f of factionFacilities) {
     if (f.faction_service !== "") continue; // only facilities we personally own
+    if (f.status && f.status.toLowerCase() === "inactive") continue; // skip non-functional ones
     if (!f.facility_id || !f.type) continue;
     const catFac = catalogFacilities[f.type] as Record<string, unknown> | undefined;
     if (!catFac) continue;
@@ -374,6 +375,7 @@ interface ResolvedVenue {
   allowRental: boolean;
   usedOwnFacility: boolean;
   missingFacility: boolean;
+  ownFacilities?: FactionFacility[];
 }
 
 interface CrafterSettings {
@@ -428,6 +430,7 @@ function resolveVenueForRecipe(
         allowRental: isRentalAllowed(settings),
         usedOwnFacility: true,
         missingFacility: false,
+        ownFacilities: facs,
       };
     }
     // We wanted to use our own facility but don't have one for this recipe.
@@ -706,6 +709,37 @@ async function resolveFinalVenue(
   };
 }
 
+// Split a bulk run count across the owned facilities that can produce a recipe.
+// When a user owns more than one facility of the same type (e.g. 3 platinum
+// mints), the entire bulk would otherwise land on a single facility. Splitting
+// the runs across all of them lets the work proceed in parallel for N times the
+// throughput of a single facility.
+function buildFacilityChunks(
+  recipeId: string,
+  runs: number,
+  venue: ResolvedVenue,
+  ownFacilityMap: OwnFacilityMap,
+): Array<{ facilityId?: string; preset?: string; runs: number }> {
+  const ownFacs = venue.usedOwnFacility
+    ? (ownFacilityMap.get(recipeId) || venue.ownFacilities || [])
+    : [];
+
+  if (ownFacs.length <= 1) {
+    return [{ facilityId: venue.facilityId, preset: venue.preset, runs }];
+  }
+
+  const chunks: Array<{ facilityId?: string; preset?: string; runs: number }> = [];
+  const base = Math.floor(runs / ownFacs.length);
+  let remainder = runs - base * ownFacs.length;
+  for (const f of ownFacs) {
+    const chunkRuns = base + (remainder > 0 ? 1 : 0);
+    if (remainder > 0) remainder--;
+    if (chunkRuns <= 0) continue;
+    chunks.push({ facilityId: f.facility_id, runs: chunkRuns });
+  }
+  return chunks;
+}
+
 async function queueCraftJob(
   ctx: RoutineContext,
   recipeId: string,
@@ -716,6 +750,7 @@ async function queueCraftJob(
   recipes: Recipe[],
   venue: ResolvedVenue,
   settings: CrafterSettings,
+  ownFacilityMap: OwnFacilityMap = new Map(),
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -754,36 +789,66 @@ async function queueCraftJob(
     }
   }
 
-  const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, runs, venue, settings);
-  if (finalVenue.blocked) {
-    return { success: false, error: "external_facility_blocked" };
+  // Distribute the bulk run count across every owned facility that can produce
+  // this recipe so multiple facilities run in parallel.
+  const chunks = buildFacilityChunks(recipeId, runs, venue, ownFacilityMap);
+  if (chunks.length > 1) {
+    log("craft", `Splitting ${runs} runs of ${recipeId} across ${chunks.length} owned facilities for parallel production`);
   }
 
-  log("craft", `Queueing ${runs} runs of ${recipeId} (${finalVenue.label})...`);
-  const craftPayload: Record<string, unknown> = { id: recipeId, quantity: runs };
-  if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
-  if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
+  let totalQueuedRuns = 0;
+  let firstError: string | undefined;
 
-  const craftResp = await bot.exec("craft", craftPayload);
+  for (const chunk of chunks) {
+    const chunkVenue: ResolvedVenue = {
+      facilityId: chunk.facilityId,
+      preset: chunk.preset ?? venue.preset,
+      allowRental: venue.allowRental,
+      usedOwnFacility: !!chunk.facilityId,
+      missingFacility: false,
+    };
 
-  if (!craftResp.error) {
-    if (finalVenue.rentalFee > 0) {
-      rentalSpentThisSession += finalVenue.rentalFee;
-      const limitNote = settings.rentalSpendingLimit > 0
-        ? ` (session rental spend ${rentalSpentThisSession}/${settings.rentalSpendingLimit}cr)`
-        : "";
-      log("craft", `Rented external facility for ${recipe?.name || recipeId}: ${finalVenue.rentalFee}cr${limitNote}`);
+    const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, chunk.runs, chunkVenue, settings);
+    if (finalVenue.blocked) {
+      firstError = firstError || "external_facility_blocked";
+      continue;
     }
-    return handleSuccess(craftResp, recipeId, runs, log, tracker, bot);
+
+    log("craft", `Queueing ${chunk.runs} runs of ${recipeId} (${finalVenue.label})...`);
+    const craftPayload: Record<string, unknown> = { id: recipeId, quantity: chunk.runs };
+    if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
+    if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
+
+    const craftResp = await bot.exec("craft", craftPayload);
+
+    if (!craftResp.error) {
+      if (finalVenue.rentalFee > 0) {
+        rentalSpentThisSession += finalVenue.rentalFee;
+        const limitNote = settings.rentalSpendingLimit > 0
+          ? ` (session rental spend ${rentalSpentThisSession}/${settings.rentalSpendingLimit}cr)`
+          : "";
+        log("craft", `Rented external facility for ${recipe?.name || recipeId}: ${finalVenue.rentalFee}cr${limitNote}`);
+      }
+      const res = handleSuccess(craftResp, recipeId, chunk.runs, log, tracker, bot);
+      if (res.success) {
+        totalQueuedRuns += chunk.runs;
+      } else {
+        firstError = firstError || res.error;
+      }
+    } else {
+      const msg = craftResp.error.message;
+      if (msg.toLowerCase().includes("insufficient") || msg.toLowerCase().includes("cannot_craft")) {
+        log("craft", `Insufficient materials for ${recipeId} - will retry next cycle`);
+        return { success: false, error: "insufficient_inputs" };
+      }
+      firstError = firstError || msg;
+    }
   }
 
-  const msg = craftResp.error.message;
-  if (msg.toLowerCase().includes("insufficient") || msg.toLowerCase().includes("cannot_craft")) {
-    log("craft", `Insufficient materials for ${recipeId} - will retry next cycle`);
-    return { success: false, error: "insufficient_inputs" };
+  if (totalQueuedRuns === 0) {
+    return { success: false, error: firstError || "no_jobs_queued" };
   }
-
-  return { success: false, error: msg };
+  return { success: true, queuedRuns: totalQueuedRuns };
 }
 
 
@@ -952,7 +1017,7 @@ async function queueAllRecipesOnce(
       }
 
        const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
-       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, venue, settings);
+       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
            ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
@@ -1219,7 +1284,7 @@ async function craftFromCategories(
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
     const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings);
+    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap);
     if (!queueResult.success) {
       if (queueResult.error && queueResult.error.includes("aborted")) {
         ctx.log("warn", `Crafting halted: ${queueResult.error}`);

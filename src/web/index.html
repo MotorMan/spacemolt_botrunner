@@ -9446,10 +9446,17 @@
 
         sendExec(profileBot, command, params, (result) => {
           if (result.ok) {
-            logResponse(
-              `<span class="resp-ok">OK</span>` +
-                formatResult(command, result.data),
-            );
+            if (command === "view_storage" && params && params.target === "faction") {
+              const facItems = (result.data && (result.data.items || result.data.storage)) || [];
+              logResponse(
+                `<span class="resp-ok">OK</span> faction storage refreshed (${facItems.length} item${facItems.length === 1 ? "" : "s"})`,
+              );
+            } else {
+              logResponse(
+                `<span class="resp-ok">OK</span>` +
+                  formatResult(command, result.data),
+              );
+            }
           } else {
             logResponse(
               `<span class="resp-err">Error: ${esc(result.error || "unknown")}</span>`,

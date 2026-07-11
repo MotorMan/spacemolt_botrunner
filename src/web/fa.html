@@ -25,6 +25,18 @@
     .fa-stat-value.credits-out { color: #f97316; }
     .fa-stat-value.net { color: var(--accent); }
     .fa-stat-value.count { color: var(--text); }
+    .fa-breakdown { flex-shrink: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 230px; overflow-y: auto; }
+    .fa-breakdown h4 { margin: 0 0 6px 0; font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-breakdown table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .fa-breakdown th, .fa-breakdown td { padding: 3px 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .fa-breakdown th { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-breakdown tr.total td { border-top: 1px solid var(--border); border-bottom: none; font-weight: 600; }
+    .fa-breakdown .amt { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .fa-breakdown .amt.in { color: #4ade80; }
+    .fa-breakdown .amt.out { color: #f97316; }
+    .fa-breakdown .amt.net { color: var(--accent); }
+    .fa-breakdown .src { color: var(--text); }
+    .fa-breakdown .empty { color: var(--text-dim); padding: 4px 0; }
     .fa-bot-summary { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 12px; }
     .fa-bot-summary table { width: 100%; border-collapse: collapse; }
     .fa-bot-summary th, .fa-bot-summary td { padding: 4px 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); }
@@ -110,6 +122,8 @@
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faShowBotSummary" style="width:14px;height:14px;">Bot summary</label>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
     <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
     <button onclick="clearFaResults()" style="background:#21262d;border:1px solid var(--border);color:var(--text);">Clear Log</button>
@@ -122,6 +136,11 @@
     <div class="fa-stat-card"><div class="fa-stat-label">Net</div><div class="fa-stat-value net" id="faNet">0</div></div>
     <div class="fa-stat-card"><div class="fa-stat-label">Entries</div><div class="fa-stat-value count" id="faEntryCount">0</div></div>
     <div class="fa-stat-card"><div class="fa-stat-label">Filtered</div><div class="fa-stat-value count" id="faFilteredCount">0</div></div>
+  </div>
+
+  <div class="fa-breakdown" id="faBreakdown">
+    <h4>Credit Breakdown by Source</h4>
+    <div id="faBreakdownBody"><div class="empty">Load a log to see where credits came in from and went out to.</div></div>
   </div>
 
   <div class="fa-body">
@@ -470,13 +489,36 @@
       const eventType = e.event_type || e.action || e.subtype || e.event || '';
       const summary = e.summary || e.message || e.msg || e.description || '';
       const d = e.data || {};
-      const credits = typeof d.credits === 'number' ? d.credits
-        : typeof d.total_cost === 'number' ? -d.total_cost
-        : typeof d.cost === 'number' ? -d.cost : 0;
+      const credits = extractCredits(e, d, summary, eventType);
       const itemId = d.item_id || d.itemId || d.item || '';
       const id = e.id ?? e._i ?? i;
       return { id, bot, category, timestamp, eventType, summary, credits, itemId, raw: e };
     });
+  }
+
+  // Pull credits from structured fields first; fall back to parsing the
+  // summary text (e.g. "Sold 12x Power Cell @ 2671 each (32052 credits)").
+  function extractCredits(e, d, summary, eventType) {
+    if (typeof d.credits === 'number') return d.credits;
+    if (typeof d.total_cost === 'number') return -d.total_cost;
+    if (typeof d.cost === 'number') return -d.cost;
+
+    const ev = String(eventType || '').toLowerCase();
+    const text = String(summary || '');
+    const m = text.match(/\(([\d,]+)\s*credits?\)/i) || text.match(/([\d,]+)\s*credits?/i);
+    if (m) {
+      const amt = parseInt(m[1].replace(/,/g, ''), 10);
+      if (!isNaN(amt)) {
+        let sign = 1;
+        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || ev === 'buy') {
+          sign = -1;
+        } else if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || ev === 'sell') {
+          sign = 1;
+        }
+        return sign * amt;
+      }
+    }
+    return 0;
   }
 
   function ingestEntries(entries, skipRender = false) {
@@ -493,11 +535,15 @@
   function applyFilter() {
     const excludeGifts = document.getElementById('faExcludeGifts').checked;
     const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
+    const excludeExchangeFill = document.getElementById('faExcludeExchangeFill').checked;
+    const excludePassengerFare = document.getElementById('faExcludePassengerFare').checked;
     filteredEntries = rawEntries.filter(e => {
       if (activeCat && e.category !== activeCat) return false;
       if (activeEventType && e.eventType !== activeEventType) return false;
       if (excludeGifts && e.category === 'trading' && (e.eventType.includes('gift_sent') || e.eventType.includes('gift_received'))) return false;
       if (excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) return false;
+      if (excludeExchangeFill && e.eventType.includes('exchange_fill')) return false;
+      if (excludePassengerFare && e.eventType.includes('passenger_fare')) return false;
       return true;
     });
     creditsIn = 0;
@@ -511,6 +557,45 @@
     document.getElementById('faNet').textContent = fmt(creditsIn - creditsOut);
     document.getElementById('faEntryCount').textContent = rawEntries.length;
     document.getElementById('faFilteredCount').textContent = filteredEntries.length;
+    renderBreakdown(filteredEntries);
+  }
+
+  function renderBreakdown(entries) {
+    const body = document.getElementById('faBreakdownBody');
+    if (!body) return;
+    if (entries.length === 0) {
+      body.innerHTML = '<div class="empty">No entries match the current filter.</div>';
+      return;
+    }
+    const map = {};
+    for (const e of entries) {
+      const key = e.category + '.' + (e.eventType || '—');
+      if (!map[key]) map[key] = { in: 0, out: 0 };
+      if (e.credits > 0) map[key].in += e.credits;
+      else if (e.credits < 0) map[key].out += Math.abs(e.credits);
+    }
+    const rows = Object.entries(map)
+      .map(([key, v]) => ({ key, in: v.in, out: v.out, net: v.in - v.out, vol: v.in + v.out }))
+      .filter(r => r.vol > 0)
+      .sort((a, b) => b.vol - a.vol);
+    if (rows.length === 0) {
+      body.innerHTML = '<div class="empty">No credited activity to break down.</div>';
+      return;
+    }
+    const tIn = rows.reduce((s, r) => s + r.in, 0);
+    const tOut = rows.reduce((s, r) => s + r.out, 0);
+    const rowHtml = rows.map(r => {
+      return `<tr><td class="src">${esc(r.key)}</td>` +
+        `<td class="amt in">${r.in ? fmt(r.in) : '-'}</td>` +
+        `<td class="amt out">${r.out ? fmt(r.out) : '-'}</td>` +
+        `<td class="amt net">${fmt(r.net)}</td></tr>`;
+    }).join('');
+    const totalHtml = `<tr class="total"><td class="src">TOTAL</td>` +
+      `<td class="amt in">${fmt(tIn)}</td>` +
+      `<td class="amt out">${fmt(tOut)}</td>` +
+      `<td class="amt net">${fmt(tIn - tOut)}</td></tr>`;
+    body.innerHTML = `<table><thead><tr><th>Source</th><th class="amt">In</th><th class="amt">Out</th><th class="amt">Net</th></tr></thead>` +
+      `<tbody>${rowHtml}${totalHtml}</tbody></table>`;
   }
 
   function updateEventTypeOptions() {
@@ -557,6 +642,8 @@
     document.getElementById('faNet').textContent = '0';
     document.getElementById('faEntryCount').textContent = '0';
     document.getElementById('faFilteredCount').textContent = '0';
+    const breakdownBody = document.getElementById('faBreakdownBody');
+    if (breakdownBody) breakdownBody.innerHTML = '<div class="empty">Load a log to see where credits came in from and went out to.</div>';
     document.getElementById('faLog').innerHTML = '<div class="fa-empty">Cleared. Load new data.</div>';
     document.getElementById('faBotSummary').innerHTML = '';
     document.getElementById('faBotSummary').style.display = 'none';
@@ -657,6 +744,16 @@
   });
 
   document.getElementById('faExcludeFactionWithdraw').addEventListener('change', () => {
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faExcludeExchangeFill').addEventListener('change', () => {
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faExcludePassengerFare').addEventListener('change', () => {
     applyFilter();
     renderResults();
   });

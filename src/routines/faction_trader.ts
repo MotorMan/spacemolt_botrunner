@@ -1121,6 +1121,60 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await repairShip(ctx);
     } // End if (!recoveredSessionHandled)
 
+    // ── Ensure we are at the faction home base before trading ──
+    // Faction storage is per-station: reading the home base's storage remotely
+    // (via refreshFactionStorage) is fine for planning, but items can ONLY be
+    // withdrawn from the home base station itself. If we are not physically at
+    // the home base — and we are not resuming an in-progress session or selling
+    // items already in cargo — return home first instead of trying to withdraw
+    // items that don't exist at this station (which would loop forever failing).
+    if (!recoveredSessionHandled && pendingCargo.length === 0) {
+      const homeStationRaw = settings.homeStation || "";
+      const homeStationPoi = getHomeStationPoi(homeStationRaw) || null;
+      const homeSystem = settings.homeSystem ||
+        (homeStationRaw.includes("|") ? homeStationRaw.split("|")[0] : startSystem);
+      const atHomeBase = (!homeSystem || bot.system === homeSystem) &&
+        (!homeStationPoi || bot.poi === homeStationPoi);
+
+      if (!atHomeBase) {
+        ctx.log("travel", `Not at faction home base (currently at ${bot.system}${bot.poi ? "/" + bot.poi : ""}) — returning home to trade`);
+        yield "return_home";
+        if (homeSystem && bot.system !== homeSystem) {
+          await ensureUndocked(ctx);
+          const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+          if (homeFueled) {
+            await navigateToSystem(ctx, homeSystem, {
+              fuelThresholdPct: settings.refuelThreshold,
+              hullThresholdPct: settings.repairThreshold,
+            });
+          }
+        }
+        if (homeStationPoi && bot.poi !== homeStationPoi) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+
+          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+            ctx.log("combat", "Battle detected during travel home - fleeing!");
+            await ctx.sleep(5000);
+            continue;
+          }
+          if (tResp.error) {
+            const errMsg = tResp.error.message.toLowerCase();
+            if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel home interrupted by battle! ${tResp.error.message} - fleeing!`);
+              await ctx.sleep(5000);
+              continue;
+            }
+          }
+          if (!tResp.error || tResp.error.message.includes("already")) {
+            bot.poi = homeStationPoi;
+          }
+        }
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
+
     // ── Find sell routes from faction storage ──
     yield "find_sales";
 

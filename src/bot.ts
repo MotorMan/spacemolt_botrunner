@@ -5,6 +5,8 @@ import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
+import { WebSocketV2Client, type MarketUpdatePayload, type WsV2Status } from "./wsv2.js";
+import { marketStreamStore } from "./marketstreamstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature } from "./wildlivestore.js";
@@ -192,6 +194,12 @@ docked = false;
 
   /** Bot-specific settings loaded from disk. */
   settings?: Record<string, unknown>;
+
+  /** Optional WebSocket v2 client for realtime market subscriptions (opt-in static bots). */
+  wsV2: WebSocketV2Client | null = null;
+
+  /** Maps a subscribed base_id to the {systemId, poiId} it was subscribed from (for dashboard mirror). */
+  private wsV2BaseMapping: Record<string, { systemId: string; poiId: string }> = {};
 
   // Action log (last N entries)
   readonly actionLog: string[] = [];
@@ -1007,6 +1015,8 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.logPosition();
           this.lastSystem = this.system;
           this.lastPoi = this.poi;
+          // Re-evaluate WS v2 subscription for the (possibly new) docked station.
+          this.ensureWebSocketV2();
         }
 
         return resp;
@@ -1558,8 +1568,16 @@ async refreshSkills(): Promise<ApiResponse> {
 
   /**
    * Fetch faction storage contents and cache them. Uses view_faction_storage with station_id for remote access.
+   *
+   * @param forceLive When true, bypasses the API response cache so callers (the
+   *   crafter) always get the current on-disk server inventory. The underlying
+   *   `view_faction_storage` command is cached for 120s in api.ts, and the bot's
+   *   own crafting jobs constantly consume/produce materials — so a cached read
+   *   is routinely minutes behind reality and makes the planner undercount
+   *   holdings (e.g. think it has 714k steel_plate when it really has 1.1M),
+   *   which wastes queue slots refining materials it already has enough of.
    */
-  async refreshFactionStorage(): Promise<void> {
+  async refreshFactionStorage(forceLive = false): Promise<void> {
     const settings = loadSettings();
     const generalSettings = (settings.general as Record<string, unknown>) || {};
     const homeStationId = (generalSettings.factionStorageStation as string) || "";
@@ -1570,21 +1588,33 @@ async refreshSkills(): Promise<ApiResponse> {
     }
 
     const factionName = this.faction || "unknown";
-    const resp = await this.exec("view_faction_storage", { station_id: homeStationId });
+    // Force a live API call. We never want the 120s response cache here, and we
+    // do NOT rely on the data/factionStorage/*.json cache files (they are often
+    // stale or wildly incorrect). We call api.execute directly (as get_status
+    // does) so we can pass bypassCache without going through the command
+    // bookkeeping in exec().
+    const resp = await this.api.execute(
+      "view_faction_storage",
+      { station_id: homeStationId },
+      { bypassCache: true },
+    );
     if (resp.error) {
       this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
-      // Fall back to the last-known-good cached storage so the crafter doesn't
-      // see an empty store and re-queue materials it already has.
-      const cached = getFactionStorageCache(factionName, homeStationId);
-      if (cached?.entries?.length) {
-        this.factionStorage = cached.entries.map((e) => ({
-          itemId: e.itemId,
-          name: e.name || e.itemId,
-          quantity: e.quantity,
-        }));
-        this.factionFuelReserve = cached.factionFuelReserve || 0;
-        this.factionFuelCapacity = cached.factionFuelCapacity || 0;
-        this.log("info", `Fell back to cached faction storage for ${homeStationId}: ${this.factionStorage.length} items`);
+      // Do NOT silently fall back to the on-disk cache file — those are known to
+      // be stale/misleading. Keep whatever the last successful live read gave us
+      // so counts stay consistent instead of jumping to a wrong cached value.
+      if (this.factionStorage.length === 0) {
+        const cached = getFactionStorageCache(factionName, homeStationId);
+        if (cached?.entries?.length) {
+          this.log("warn", `No live faction storage and bot store empty - falling back to stale cache for ${homeStationId}: ${cached.entries.length} items (may be inaccurate)`);
+          this.factionStorage = cached.entries.map((e) => ({
+            itemId: e.itemId,
+            name: e.name || e.itemId,
+            quantity: e.quantity,
+          }));
+          this.factionFuelReserve = cached.factionFuelReserve || 0;
+          this.factionFuelCapacity = cached.factionFuelCapacity || 0;
+        }
       }
     } else {
       const result = resp.result as Record<string, unknown> | null;
@@ -1603,7 +1633,106 @@ async refreshSkills(): Promise<ApiResponse> {
       this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
       this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;
       updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
-      this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items`);
+      this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items${forceLive ? " (live)" : ""}`);
+    }
+  }
+
+  // ── WebSocket v2 (realtime market) lifecycle ──────────────
+
+  /** Whether WS v2 market streaming is enabled for this bot. */
+  isWebSocketV2Enabled(): boolean {
+    try {
+      const settings = loadSettings();
+      const general = (settings.general as Record<string, unknown>) || {};
+      const bots = Array.isArray(general.websocketV2Bots)
+        ? (general.websocketV2Bots as string[])
+        : [];
+      return bots.includes(this.username);
+    } catch {
+      return false;
+    }
+  }
+
+  /** The base_id of the bot's current docked station, or null if not docked/unknown. */
+  getCurrentBaseId(): string | null {
+    if (!this.docked) return null;
+    const sys = mapStore.getSystem(this.system);
+    const poi = sys?.pois?.find((p) => p.id === this.poi);
+    const base = poi?.base_id || poi?.id;
+    return base || null;
+  }
+
+  /** Ensure the WS v2 client is running and subscribed to the current station. */
+  private ensureWebSocketV2(): void {
+    if (!this.isWebSocketV2Enabled()) return;
+    const baseId = this.getCurrentBaseId();
+    if (!baseId) {
+      this.log("system", "WS v2: enabled but not docked at a known station yet.");
+      return;
+    }
+    if (!this.wsV2) {
+      this.startWebSocketV2();
+      return;
+    }
+    if (this.wsV2.subscribedBaseId !== baseId && this.wsV2.isConnected) {
+      this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
+      this.wsV2.subscribeMarket(baseId).catch((err) =>
+        this.log("error", `WS v2 resubscribe failed: ${err instanceof Error ? err.message : err}`),
+      );
+    }
+  }
+
+  /** Open the WS v2 client (non-blocking). Subscription happens via onStatus "connected". */
+  private startWebSocketV2(): void {
+    const creds = this.session.loadCredentials();
+    if (!creds) return;
+    this.wsV2 = new WebSocketV2Client({
+      username: creds.username,
+      password: creds.password,
+      baseUrl: this.api.baseUrl,
+      onMarketUpdate: (payload) => this.handleWebSocketV2MarketUpdate(payload),
+      onStatus: (status: WsV2Status) => this.onWebSocketV2Status(status),
+    });
+    this.wsV2.start().catch((err) =>
+      this.log("error", `WS v2 connection error: ${err instanceof Error ? err.message : err}`),
+    );
+  }
+
+  private onWebSocketV2Status(status: WsV2Status): void {
+    this.log("system", `WS v2 status: ${status}`);
+    if (status === "connected") {
+      const baseId = this.getCurrentBaseId();
+      if (baseId && this.wsV2 && this.wsV2.subscribedBaseId !== baseId) {
+        this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
+        this.wsV2.subscribeMarket(baseId).catch((err) =>
+          this.log("error", `WS v2 subscribe failed: ${err instanceof Error ? err.message : err}`),
+        );
+      }
+    }
+  }
+
+  private handleWebSocketV2MarketUpdate(payload: MarketUpdatePayload): void {
+    const baseId = payload.base_id;
+    if (!baseId || !Array.isArray(payload.items)) return;
+    marketStreamStore.update(baseId, payload.tick, payload.items);
+
+    // Optional mirror into the dashboard's HTTP market cache, normalizing
+    // the WS order-book shape (price_each) into what mapStore expects (price).
+    const mapping = this.wsV2BaseMapping[baseId];
+    if (mapping) {
+      try {
+        const normalized = payload.items.map((it) => ({
+          item_id: it.item_id,
+          item_name: it.item_name,
+          sell_orders: Array.isArray(it.sell_orders)
+            ? it.sell_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
+            : it.sell_orders,
+          buy_orders: Array.isArray(it.buy_orders)
+            ? it.buy_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
+            : it.buy_orders,
+        }));
+        mapStore.updateMarket(mapping.systemId, mapping.poiId, { items: normalized });
+      } catch { /* ignore dashboard mirror errors */ }
     }
   }
 
@@ -1669,6 +1798,10 @@ async refreshSkills(): Promise<ApiResponse> {
 
     this.log("system", `Starting routine: ${routineName}`);
 
+    // Open the optional WebSocket v2 market stream (static/market-watcher bots).
+    // Non-blocking: failures are logged but never delay or crash the routine.
+    this.ensureWebSocketV2();
+
     const ctx: RoutineContext = {
       api: this.api,
       bot: this,
@@ -1720,6 +1853,9 @@ async refreshSkills(): Promise<ApiResponse> {
       // assignment is cleared and "crashed" is logged rather than "finished".
       throw err;
     } finally {
+      // Tear down the WS v2 stream so it isn't left reconnecting while idle.
+      this.wsV2?.close();
+      this.wsV2 = null;
       await generator.return(undefined);
     }
 
@@ -3361,6 +3497,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   skill: "\x1b[95m",
   scavenge: "\x1b[33m",
   rescue: "\x1b[96m",
+  alert: "\x1b[91m",
 };
 
 function getCategoryColor(category: string): string {

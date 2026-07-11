@@ -11,6 +11,7 @@ import { traderRoutine } from "./routines/trader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
+import { craftTradeRoutine } from "./routines/craft_trade.js";
 import { tradeBuyerRoutine } from "./routines/trade_buyer.js";
 import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
@@ -121,6 +122,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },
   fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
+  craft_trade: { name: "CraftTrade", fn: craftTradeRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
   fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },

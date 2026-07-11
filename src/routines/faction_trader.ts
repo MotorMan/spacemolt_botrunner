@@ -158,7 +158,7 @@ async function failFactionSession(botUsername: string, reason: string): Promise<
 }
 
 /** Verify that a destination POI exists as a valid station with a market. */
-function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string): boolean {
+export function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string): boolean {
   const sys = mapStore.getSystem(systemId);
   if (!sys) {
     ctx.log("error", `Destination system ${systemId} not found in map data`);
@@ -371,7 +371,7 @@ function isHighValueItem(itemId: string, minProfitThreshold: number = 1000000): 
  * Calculate optimal sell quantity based on actual buy orders at destination.
  * Calls view_market to get real buy orders with quantities.
  */
-async function calculateFactionOptimalSellQuantity(
+export async function calculateFactionOptimalSellQuantity(
   ctx: RoutineContext,
   itemId: string,
   itemName: string,
@@ -479,7 +479,7 @@ function getFreeSpace(bot: Bot): number {
  * the bot to think it is "home" whenever `bot.poi` gets set to the malformed
  * "system|poi" string (or to never match a real home station). Always normalize.
  */
-function getHomeStationPoi(homeStation: string): string {
+export function getHomeStationPoi(homeStation: string): string {
   if (!homeStation) return "";
   return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
 }

@@ -172,7 +172,7 @@ async function getCrafterSettings(): Promise<{
 
 // ── Recipe helpers ────────────────────────────────────────────
 
-interface Recipe {
+export interface Recipe {
   recipe_id: string;
   name: string;
   components: Array<{ item_id: string; name: string; quantity: number }>;
@@ -183,7 +183,7 @@ interface Recipe {
   effective_time_per_run?: number;
 }
 
-function parseRecipes(data: unknown): Recipe[] {
+export function parseRecipes(data: unknown): Recipe[] {
   if (!data || typeof data !== "object") return [];
   const d = data as Record<string, unknown>;
   let raw: Array<Record<string, unknown>> = [];
@@ -221,7 +221,7 @@ function parseRecipes(data: unknown): Recipe[] {
   }).filter(r => r.recipe_id);
 }
 
-async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
+export async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
   const { bot } = ctx;
   const all: Recipe[] = [];
   let page = 1;
@@ -241,7 +241,7 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
   return all;
 }
 
-interface FactionFacility {
+export interface FactionFacility {
   facility_id: string;
   type: string;
   name: string;
@@ -256,7 +256,7 @@ interface FacilityRecipeMap {
   recipeId: string;
 }
 
-async function fetchFactionFacilities(bot: any): Promise<FactionFacility[]> {
+export async function fetchFactionFacilities(bot: any): Promise<FactionFacility[]> {
   const resp = await bot.exec("facility", { action: "faction_list" });
   if (resp.error) {
     bot.log("error", `facility faction_list error: ${resp.error.message}`);
@@ -298,7 +298,7 @@ async function fetchFactionFacilities(bot: any): Promise<FactionFacility[]> {
   }));
 }
 
-function getFacilityRecipeMap(): FacilityRecipeMap[] {
+export function getFacilityRecipeMap(): FacilityRecipeMap[] {
   const facilities = catalogStore.getAll().facilities;
   const map: FacilityRecipeMap[] = [];
   for (const [facilityId, facility] of Object.entries(facilities)) {
@@ -341,9 +341,9 @@ function getRecipesAvailableAtFacilities(
 // auto-routing (the bug: when our facility already had a job, auto-routing
 // "fast" skipped it for an external rental).
 
-type OwnFacilityMap = Map<string, FactionFacility[]>;
+export type OwnFacilityMap = Map<string, FactionFacility[]>;
 
-function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFacilityMap {
+export function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFacilityMap {
   const map: OwnFacilityMap = new Map();
   const catalogFacilities = catalogStore.getAll().facilities;
   for (const f of factionFacilities) {
@@ -369,7 +369,7 @@ function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[])
   return facilities[idx];
 }
 
-interface ResolvedVenue {
+export interface ResolvedVenue {
   facilityId?: string;
   preset: string;
   allowRental: boolean;
@@ -378,7 +378,7 @@ interface ResolvedVenue {
   ownFacilities?: FactionFacility[];
 }
 
-interface CrafterSettings {
+export interface CrafterSettings {
   crafters: CrafterProfile[];
   botCrafterAssignments: Record<string, string>;
   enabledCategories: string[];
@@ -414,7 +414,7 @@ function isRentalAllowed(settings: CrafterSettings): boolean {
 
 // Decide where a single recipe should be crafted given the owned-facility map
 // and the operator's settings.
-function resolveVenueForRecipe(
+export function resolveVenueForRecipe(
   recipeId: string,
   recipeName: string,
   ownFacilityMap: OwnFacilityMap,
@@ -740,7 +740,7 @@ function buildFacilityChunks(
   return chunks;
 }
 
-async function queueCraftJob(
+export async function queueCraftJob(
   ctx: RoutineContext,
   recipeId: string,
   quantity: number,
@@ -1096,9 +1096,15 @@ async function executeCraftingPlan(
     const cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
 
    // Active loop: keep re-planning and queueing as sub-materials become available.
-   while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
-     loopCount++;
-     await syncCraftingQueue(ctx, tracker, recipes, true);
+    while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
+      loopCount++;
+      await syncCraftingQueue(ctx, tracker, recipes, true);
+      // Re-read faction storage LIVE each pass. As queued jobs consume/produce
+      // materials on the server, the holdings change continuously; a stale count
+      // here is what makes the planner think it needs to re-refine materials it
+      // already has enough of (e.g. steel_plate).
+      await bot.refreshFactionStorage(true);
+
 
      // Recompute which goals still need production using live stock + in-flight output.
      const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
@@ -1432,7 +1438,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     await syncCraftingQueue(ctx, tracker, recipes);
 
     yield "refresh_storage";
-    await bot.refreshFactionStorage();
+    // Force a LIVE view_faction_storage read every round. The crafter must never
+    // plan against a stale snapshot — its own jobs are constantly changing the
+    // station's holdings, so a cached read undercounts materials (e.g. steel).
+    await bot.refreshFactionStorage(true);
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {
@@ -1473,13 +1482,14 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    const factionStorage = bot.factionStorage || [];
     function countItem(itemId: string): number {
       const lowerId = itemId.toLowerCase();
       let total = 0;
       for (const i of bot.inventory) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
       for (const i of bot.storage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
-      for (const i of factionStorage) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+      // Read bot.factionStorage live (do NOT capture a snapshot const) so that
+      // re-refreshing it mid-loop in executeCraftingPlan is reflected here.
+      for (const i of (bot.factionStorage || [])) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
       return total;
     }
 

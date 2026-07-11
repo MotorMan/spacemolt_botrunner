@@ -704,7 +704,7 @@ async function recoverTradeSession(
 
 // ── Types ────────────────────────────────────────────────────
 
-interface TradeRoute {
+export interface TradeRoute {
   itemId: string;
   itemName: string;
   sourceSystem: string;
@@ -737,7 +737,7 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
 }
 
 /** Find profitable trade routes from mapStore price spreads and market insights. */
-function findTradeOpportunities(
+export function findTradeOpportunities(
   settings: ReturnType<typeof getTraderSettings>,
   currentSystem: string,
   currentPoi: string,
@@ -857,7 +857,7 @@ function findTradeOpportunities(
 }
 
 /** Find the cheapest known market sell price for an item (replacement/acquisition cost). */
-function getItemMarketCost(itemId: string): number {
+export function getItemMarketCost(itemId: string): number {
   let cheapest = Infinity;
   const systems = mapStore.getAllSystems();
   for (const sys of Object.values(systems)) {
@@ -878,7 +878,7 @@ function getItemMarketCost(itemId: string): number {
  * Process analyze_market insights to create trade opportunities.
  * Returns an array of potential trade routes based on fresh market intelligence.
  */
-function processMarketInsights(
+export function processMarketInsights(
   insights: Array<Record<string, unknown>>,
   currentSystem: string,
   currentPoi: string,

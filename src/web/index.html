@@ -642,6 +642,12 @@
             </div>
             <div
               class="sidebar-item"
+              onclick="switchSettingsTab('craft_trade')"
+            >
+              Craft Trade
+            </div>
+            <div
+              class="sidebar-item"
               onclick="switchSettingsTab('trade_buyer')"
             >
               Trade Buyer
@@ -10059,6 +10065,7 @@
         private: "log-cat-private",
         customs: "log-cat-customs",
         customs_debug: "log-cat-customs",
+        alert: "log-cat-alert",
       };
 
       function formatBotLogLine(line) {
@@ -11803,6 +11810,8 @@
           renderTraderSettings(panel);
         } else if (activeSettingsTab === "faction_trader") {
           renderFactionTraderSettings(panel);
+        } else if (activeSettingsTab === "craft_trade") {
+          renderCraftTradeSettings(panel);
         } else if (activeSettingsTab === "trade_buyer") {
           renderTradeBuyerSettings(panel);
         } else if (activeSettingsTab === "fuel_cell_seller") {
@@ -11853,6 +11862,27 @@
         const approvedFuelStations = Array.isArray(general.approvedFuelStations)
           ? general.approvedFuelStations
           : [];
+
+        // Build the WebSocket v2 bot checkbox list
+        const websocketV2Bots = Array.isArray(general.websocketV2Bots)
+          ? general.websocketV2Bots
+          : [];
+        const wsV2BotList = Array.from(
+          new Set([
+            ...Object.keys(settings.botAssignments || {}),
+            ...(window.discoveredBots || []),
+          ]),
+        ).filter((b) => b && b.trim());
+        let wsV2BotsRows = '<div class="setting-hint">No known bots — start a routine or discover bots first.</div>';
+        if (wsV2BotList.length > 0) {
+          wsV2BotsRows = wsV2BotList
+            .map((b) => {
+              const checked = websocketV2Bots.includes(b) ? " checked" : "";
+              const id = "set-general-wsv2-" + b.replace(/[^a-zA-Z0-9_-]/g, "_");
+              return `<label class="checkbox-row" for="${id}"><input type="checkbox" id="${id}" value="${esc(b)}"${checked} /> ${esc(b)}</label>`;
+            })
+            .join("");
+        }
 
         // Build station options from mapData
         let stationOpts = '<option value="">(not set)</option>';
@@ -12071,7 +12101,17 @@
           <span style="color:var(--text-secondary);font-size:12px">seconds</span>
         </div>
       </div>
-  
+
+      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
+        <div>
+          <div class="setting-label">WebSocket V2 (Realtime Market)</div>
+          <div class="setting-hint">Enable realtime market streaming over the WebSocket v2 API for static bots that stay docked at one station. The socket opens only while the bot's routine is running. All gameplay commands still go over the HTTP API.</div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:4px" id="wsv2-bot-list">
+          ${wsV2BotsRows}
+        </div>
+      </div>
+
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -12161,6 +12201,11 @@
             parseInt(
               document.getElementById("set-general-periodicRefreshSec").value,
             ) || 30,
+          websocketV2Bots: Array.from(
+            document.querySelectorAll("#wsv2-bot-list input[type='checkbox']"),
+          )
+            .filter((cb) => cb.checked)
+            .map((cb) => cb.value),
         };
         send({ type: "saveSettings", routine: "general", settings: s });
       }
@@ -16485,6 +16530,227 @@
         send({ type: "saveSettings", routine: "trade_buyer", settings: s });
         settings.trade_buyer = s;
         alert("Trade Buyer settings saved!");
+      }
+
+      // ── Craft Trade Settings ────────────────────────────────────────────
+      function renderCraftTradeSettings(panel) {
+        const ct = settings.craft_trade || {};
+        const crafterBots = (ct.crafterBots || []).join(", ");
+        const traderBots = (ct.traderBots || []).join(", ");
+        const enabledCategories = (ct.enabledCategories || ["Refining", "Components", "Consumables"]).join(", ");
+        const blacklistedRecipes = (ct.blacklistedRecipes || []).join(", ");
+        const minProfitPerUnit = ct.minProfitPerUnit ?? 10;
+        const minFacilityAlertProfit = ct.minFacilityAlertProfit ?? 100000;
+        const maxDealQty = ct.maxDealQty ?? 0;
+        const maxCargoValue = ct.maxCargoValue ?? 0;
+        const fuelCostPerJump = ct.fuelCostPerJump ?? 50;
+        const refuelThreshold = ct.refuelThreshold ?? 50;
+        const repairThreshold = ct.repairThreshold ?? 40;
+        const homeSystem = ct.homeSystem || "";
+        const homeStation = ct.homeStation || "";
+        const useAnalyzeMarket = ct.useAnalyzeMarket ?? true;
+        const forceOwnFacility = ct.forceOwnFacility ?? true;
+        const craftingPreset = ct.craftingPreset || "fast";
+        const maxConcurrentOrders = ct.maxConcurrentOrders ?? 3;
+        const orderTimeoutMin = ct.orderTimeoutMin ?? 360;
+        const minMarginPct = ct.minMarginPct ?? 10;
+
+        panel.innerHTML = `
+    <h3>Craft Trade Settings</h3>
+    <div class="settings-desc">Coordinated crafting + trading. Traders request builds for profitable craftable items; a crafter builds them on owned facilities into faction storage; traders withdraw and sell. The persisted order file (data/craft_trade_orders.json) is the source of truth.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Crafter Bots (comma separated)</div>
+        <div class="setting-hint">Bot usernames that act as crafter(s) — build orders from faction storage.</div>
+      </div>
+      <input type="text" id="set-craft_trade-crafterBots" value="${esc(crafterBots)}" style="min-width:240px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Trader Bots (comma separated)</div>
+        <div class="setting-hint">Bot usernames that find deals, request builds, and sell the output.</div>
+      </div>
+      <input type="text" id="set-craft_trade-traderBots" value="${esc(traderBots)}" style="min-width:240px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enabled Categories (comma separated)</div>
+        <div class="setting-hint">Only recipes in these categories are eligible. Default: Refining, Components, Consumables.</div>
+      </div>
+      <input type="text" id="set-craft_trade-enabledCategories" value="${esc(enabledCategories)}" style="min-width:240px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Blacklisted Recipes (comma separated)</div>
+        <div class="setting-hint">Recipe IDs to never craft.</div>
+      </div>
+      <input type="text" id="set-craft_trade-blacklistedRecipes" value="${esc(blacklistedRecipes)}" style="min-width:240px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Profit / Unit</div>
+        <div class="setting-hint">Minimum per-unit profit (after fuel) to act on a deal.</div>
+      </div>
+      <input type="number" id="set-craft_trade-minProfitPerUnit" min="0" value="${minProfitPerUnit}" style="width:100px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Facility Alert Profit</div>
+        <div class="setting-hint">Minimum total profit before logging a red "build this facility" alert for an uncraftable item.</div>
+      </div>
+      <input type="number" id="set-craft_trade-minFacilityAlertProfit" min="0" value="${minFacilityAlertProfit}" style="width:140px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Deal Qty (0 = unlimited)</div>
+        <div class="setting-hint">Cap items per build order.</div>
+      </div>
+      <input type="number" id="set-craft_trade-maxDealQty" min="0" value="${maxDealQty}" style="width:100px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Cargo Value (0 = off)</div>
+        <div class="setting-hint">Skip deals whose buy cost exceeds this total value.</div>
+      </div>
+      <input type="number" id="set-craft_trade-maxCargoValue" min="0" value="${maxCargoValue}" style="width:140px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost / Jump</div>
+        <div class="setting-hint">Used to estimate route fuel cost.</div>
+      </div>
+      <input type="number" id="set-craft_trade-fuelCostPerJump" min="1" value="${fuelCostPerJump}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-craft_trade-refuelThreshold" min="20" max="80" value="${refuelThreshold}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-craft_trade-repairThreshold" min="20" max="80" value="${repairThreshold}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">Faction-storage / crafter home system. Falls back to general.factionStorageSystem.</div>
+      </div>
+      <input type="text" id="set-craft_trade-homeSystem" value="${esc(homeSystem)}" style="min-width:200px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station</div>
+        <div class="setting-hint">Faction-storage station ("system|poi"). Falls back to general.factionStorageStation.</div>
+      </div>
+      <input type="text" id="set-craft_trade-homeStation" value="${esc(homeStation)}" style="min-width:200px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Use analyze_market</div>
+        <div class="setting-hint">Pull fresh market insights to source deals (reuses trader.ts logic).</div>
+      </div>
+      <input type="checkbox" id="set-craft_trade-useAnalyzeMarket" ${useAnalyzeMarket ? "checked" : ""} />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Force Own Facility</div>
+        <div class="setting-hint">Only craft on owned facilities; red-alert if no owned facility exists.</div>
+      </div>
+      <input type="checkbox" id="set-craft_trade-forceOwnFacility" ${forceOwnFacility ? "checked" : ""} />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Crafting Preset</div>
+        <div class="setting-hint">Preset passed to the craft command (e.g. fast, workshop).</div>
+      </div>
+      <input type="text" id="set-craft_trade-craftingPreset" value="${esc(craftingPreset)}" style="width:120px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Concurrent Orders</div>
+        <div class="setting-hint">Per-trader cap on open build orders.</div>
+      </div>
+      <input type="number" id="set-craft_trade-maxConcurrentOrders" min="1" value="${maxConcurrentOrders}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Order Timeout (min)</div>
+        <div class="setting-hint">Auto-expire stale open/crafting/ready orders after this many minutes.</div>
+      </div>
+      <input type="number" id="set-craft_trade-orderTimeoutMin" min="1" value="${orderTimeoutMin}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Margin %</div>
+        <div class="setting-hint">Require expected revenue ≥ estimated cost × (1 + margin%) before requesting a build.</div>
+      </div>
+      <input type="number" id="set-craft_trade-minMarginPct" min="0" value="${minMarginPct}" style="width:80px" />
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveCraftTradeSettings()">Save Settings</button>
+    </div>
+  `;
+      }
+
+      function saveCraftTradeSettings() {
+        const csv = (id) =>
+          (document.getElementById(id)?.value || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0);
+        const num = (id, def) => {
+          const v = parseInt(document.getElementById(id)?.value);
+          return isNaN(v) ? def : v;
+        };
+        const s = {
+          crafterBots: csv("set-craft_trade-crafterBots"),
+          traderBots: csv("set-craft_trade-traderBots"),
+          enabledCategories: csv("set-craft_trade-enabledCategories"),
+          blacklistedRecipes: csv("set-craft_trade-blacklistedRecipes"),
+          minProfitPerUnit: num("set-craft_trade-minProfitPerUnit", 10),
+          minFacilityAlertProfit: num("set-craft_trade-minFacilityAlertProfit", 100000),
+          maxDealQty: num("set-craft_trade-maxDealQty", 0),
+          maxCargoValue: num("set-craft_trade-maxCargoValue", 0),
+          fuelCostPerJump: num("set-craft_trade-fuelCostPerJump", 50),
+          refuelThreshold: num("set-craft_trade-refuelThreshold", 50),
+          repairThreshold: num("set-craft_trade-repairThreshold", 40),
+          homeSystem: document.getElementById("set-craft_trade-homeSystem")?.value?.trim() || "",
+          homeStation: document.getElementById("set-craft_trade-homeStation")?.value?.trim() || "",
+          useAnalyzeMarket: document.getElementById("set-craft_trade-useAnalyzeMarket")?.checked ?? true,
+          forceOwnFacility: document.getElementById("set-craft_trade-forceOwnFacility")?.checked ?? true,
+          craftingPreset: document.getElementById("set-craft_trade-craftingPreset")?.value?.trim() || "fast",
+          maxConcurrentOrders: num("set-craft_trade-maxConcurrentOrders", 3),
+          orderTimeoutMin: num("set-craft_trade-orderTimeoutMin", 360),
+          minMarginPct: num("set-craft_trade-minMarginPct", 10),
+        };
+        send({ type: "saveSettings", routine: "craft_trade", settings: s });
+        settings.craft_trade = s;
+        alert("Craft Trade settings saved!");
       }
 
       // ── Fuel Cell Sell Settings ────────────────────────────────────────────

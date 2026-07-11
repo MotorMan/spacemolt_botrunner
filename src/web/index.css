@@ -1077,6 +1077,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .log-entry.log-cat-trade, .log-entry.log-cat-trade .log-msg { color: #d29922; }
 .log-entry.log-cat-rescue, .log-entry.log-cat-rescue .log-msg { color: #bc8cff; }
 .log-entry.log-cat-combat, .log-entry.log-cat-combat .log-msg { color: #f85149; }
+.log-entry.log-cat-alert, .log-entry.log-cat-alert .log-msg { color: #f85149; font-weight: 700; }
 .log-entry.log-cat-info, .log-entry.log-cat-info .log-msg { color: #8b949e; }
 /* Chat message categories */
 .log-entry.log-cat-chat, .log-entry.log-cat-chat .log-msg { color: #a5d6ff; }

@@ -110,7 +110,7 @@ let globalSessionQueue: Promise<void> = Promise.resolve();
 // Command-to-Tool Mapping for V2 API
 // Note: Direct-path commands (like /command instead of /tool/command) are no longer used
 
-const COMMAND_TOOL_MAP: Record<string, string> = {
+export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Auth commands
   'login': 'spacemolt_auth',
   'register': 'spacemolt_auth',
@@ -305,7 +305,7 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
 };
 
 // Maps commands to their API action names (when different from command name)
-const COMMAND_ACTION_MAP: Record<string, string> = {
+export const COMMAND_ACTION_MAP: Record<string, string> = {
   // Battle
   'get_battle_status': 'status',      // spacemolt_battle_status -> action is 'status'
   
@@ -382,7 +382,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
  };
 
 // Commands that use payload.action for the action (like facility and battle)
-const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
+export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
 
 // ── Response cache ────────────────────────────────────────────
 

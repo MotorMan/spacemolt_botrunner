@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { SpaceMoltAPI } from "./api.js";
+import { getSpacemoltClient } from "./libClient.js";
 import { debugLog } from "./debug.js";
 
 const OPENAPI_BASE_URL = "https://game.spacemolt.com/api/v2";
@@ -203,6 +204,63 @@ class CatalogStore {
       // If we can't check, assume no change to avoid unnecessary fetch
     }
     return false;
+  }
+
+  // ── Fetch from @spacemolt/lib (replaces the HTTP bulk fetch) ─
+
+  /**
+   * Fetch the catalog through `@spacemolt/lib`'s bulk catalog cache
+   * (`client.catalog()`). Replaces the manual `get_version` + `/catalog.json`
+   * fetch used by `fetchAll`.
+   */
+  async fetchFromLib(): Promise<void> {
+    if (this._fetchPromise) return this._fetchPromise;
+    this._fetchPromise = this._doFetchFromLib().finally(() => {
+      this._fetchPromise = null;
+    });
+    return this._fetchPromise;
+  }
+
+  private async _doFetchFromLib(): Promise<void> {
+    const cache = await getSpacemoltClient().catalog();
+    const toRecord = <T extends CatalogItem>(arr: readonly { id?: string; [k: string]: unknown }[]): Record<string, T> => {
+      const out: Record<string, T> = {};
+      for (const e of arr) {
+        const id = typeof e.id === "string" ? e.id : "";
+        if (id) out[id] = e as T;
+      }
+      return out;
+    };
+    const items = toRecord<CatalogItem>(cache.items as unknown as { id?: string; [k: string]: unknown }[]);
+    const facilitiesFromItems: Record<string, CatalogFacility> = {};
+    for (const [id, it] of Object.entries(items)) {
+      if (it.category === "personal" || it.category === "production") {
+        facilitiesFromItems[id] = it as unknown as CatalogFacility;
+      }
+    }
+    this.data = {
+      version: cache.version ?? null,
+      lastFetched: new Date().toISOString(),
+      items,
+      ships: toRecord<CatalogShip>(cache.ships as unknown as { id?: string; [k: string]: unknown }[]),
+      skills: toRecord<CatalogSkill>(cache.skills as unknown as { id?: string; [k: string]: unknown }[]),
+      recipes: toRecord<CatalogRecipe>(cache.recipes as unknown as { id?: string; [k: string]: unknown }[]),
+      facilities: { ...toRecord<CatalogFacility>(cache.facilities as unknown as { id?: string; [k: string]: unknown }[]), ...facilitiesFromItems },
+    };
+    this.dirty = true;
+    this.writeToDisk();
+    debugLog("catalog", `Fetched from @spacemolt/lib: ${this.getSummary()}`);
+  }
+
+  /** Check server version via the library catalog cache. */
+  async checkVersionChangedLib(): Promise<boolean> {
+    if (this.data.version === null) return true;
+    try {
+      const cache = await getSpacemoltClient().catalog();
+      return (cache.version ?? null) !== this.data.version;
+    } catch {
+      return false;
+    }
   }
 
   // ── Fetch from API ────────────────────────────────────────

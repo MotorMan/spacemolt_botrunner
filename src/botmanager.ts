@@ -39,6 +39,7 @@ import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
+import { connectOwnedAccounts } from "./libClient.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
@@ -187,7 +188,37 @@ function refreshStatusTable(): void {
   server.updateBotStatus(statuses);
 }
 
-// ── Action handlers ─────────────────────────────────────────
+/**
+ * Connect every account the Clerk user owns through `@spacemolt/lib` and back
+ * each with a `Bot`. Skipped unless `SPACEMOLT_CLERK_API_KEY` is set (legacy
+ * credential/session discovery still runs via `discoverBots`).
+ */
+async function connectLibraryAccounts(): Promise<void> {
+  if (!process.env.SPACEMOLT_CLERK_API_KEY) {
+    server.logSystem("No SPACEMOLT_CLERK_API_KEY set — skipping @spacemolt/lib owned-account connect.");
+    return;
+  }
+  server.logSystem("Connecting owned accounts via @spacemolt/lib...");
+  try {
+    const accounts = await connectOwnedAccounts(
+      undefined,
+      (account) => {
+        const id = account.id || "";
+        if (!id || bots.has(id)) return;
+        const bot = new Bot(id, BASE_DIR, account);
+        setupBotLogging(bot);
+        bot.subscribeEvents();
+        bots.set(id, bot);
+        server.logSystem(`Connected owned account: ${id}`);
+      },
+    );
+    server.logSystem(`Connected ${accounts.length} owned account(s) via @spacemolt/lib`);
+  } catch (err) {
+    server.logSystem(`Library-owned-account connect failed: ${err}`);
+  }
+}
+
+// ── Action handlers ──────────────────────────────────────────
 
 async function handleAction(action: WebAction): Promise<WebActionResult> {
   switch (action.type) {
@@ -476,7 +507,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     log: (category: string, message: string) => server.logBot(botName, `[${category}] ${message}`),
     getBotFreshStatus: async (targetBotName: string): Promise<import("./bot.js").BotStatus | null> => {
       const targetBot = bots.get(targetBotName);
-      if (!targetBot || !targetBot.api.getSession()) return null;
+      if (!targetBot || !targetBot.isConnected()) return null;
       await targetBot.refreshLocation();
       return targetBot.status();
     },
@@ -705,7 +736,7 @@ async function handleChat(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
 
-  if (!bot.api.getSession()) {
+  if (!bot.isConnected()) {
     await bot.login();
   }
 
@@ -749,7 +780,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
 
   // Ensure session exists before executing command
-  if (!bot.api.getSession()) {
+  if (!bot.isConnected()) {
     await bot.login();
   }
 
@@ -835,7 +866,7 @@ const skillsObj: Record<string, unknown> | null =
       const recipientBot = recipient ? bots.get(recipient) : undefined;
       if (recipientBot) {
         // Credits go to recipient's storage locker — auto-withdraw if docked
-        if (recipientBot.docked && recipientBot.api.getSession()) {
+        if (recipientBot.docked && recipientBot.isConnected()) {
           const giftCredits = (params as Record<string, unknown> | undefined)?.credits as number | undefined;
           if (giftCredits && giftCredits > 0) {
             server.logSystem(`Auto-withdrawing ${giftCredits} credits from storage for ${recipient}...`);
@@ -919,6 +950,7 @@ async function main(): Promise<void> {
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");
   discoverBots();
+  await connectLibraryAccounts();
 
   const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
   chatServer = new ChatWebServer(chatPort);
@@ -1072,9 +1104,9 @@ async function main(): Promise<void> {
             } catch (err) {
               server.logSystem(`Tax collection failed for ${name}: ${err}`);
             }
-            if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+            if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
               try {
-                await catalogStore.fetchAll(bot.api);
+                await catalogStore.fetchFromLib();
                 server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
               } catch (err) {
                 server.logSystem(`Catalog fetch failed: ${err}`);
@@ -1114,9 +1146,9 @@ async function main(): Promise<void> {
               } catch (err) {
                 server.logSystem(`Tax collection failed for ${name}: ${err}`);
               }
-              if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+              if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
                 try {
-                  await catalogStore.fetchAll(bot.api);
+                  await catalogStore.fetchFromLib();
                   server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
                   refreshSkillNames();
                 } catch (err) {
@@ -1156,9 +1188,9 @@ async function main(): Promise<void> {
                 } catch (err) {
                   server.logSystem(`Tax collection failed for ${name}: ${err}`);
                 }
-                if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+                if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
                   try {
-                    await catalogStore.fetchAll(bot.api);
+                    await catalogStore.fetchFromLib();
                     server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
                     refreshSkillNames();
                   } catch (err) {
@@ -1222,16 +1254,21 @@ async function main(): Promise<void> {
         let refreshCount = 0;
         for (const [, bot] of bots) {
           // Only refresh bots that are actively running a routine
-          if (bot.state === "running" && bot.api.getSession()) {
+          if (bot.state === "running" && bot.isConnected()) {
             refreshPromises.push(bot.refreshShip().catch(() => {}));
             refreshPromises.push(bot.refreshLocation().catch(() => {}));
-            // Also do a lightweight notification check to keep session alive
-            // Use bot.exec() instead of api.execute() to process notifications properly
-            refreshPromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
-              if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
-                debugLogForBot(bot.username, "periodic:notifications", `Received ${resp.notifications.length} notification(s) during refresh`);
-              }
-            }).catch(() => {}));
+            // Library-backed bots receive notifications via push events
+            // (Bot.subscribeEvents), so polling get_notifications is redundant
+            // and just wastes a round-trip. The HTTP path still needs it.
+            if (!bot.account) {
+              // Also do a lightweight notification check to keep session alive
+              // Use bot.exec() instead of api.execute() to process notifications properly
+              refreshPromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
+                if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+                  debugLogForBot(bot.username, "periodic:notifications", `Received ${resp.notifications.length} notification(s) during refresh`);
+                }
+              }).catch(() => {}));
+            }
             refreshCount++;
           }
         }
@@ -1253,7 +1290,7 @@ async function main(): Promise<void> {
       const statusPromises = [];
       let statusCount = 0;
       for (const [, bot] of bots) {
-        if (bot.state === "running" && bot.api.getSession()) {
+        if (bot.state === "running" && bot.isConnected()) {
           statusPromises.push(bot.refreshStatus().catch(() => {}));
           statusCount++;
         }
@@ -1271,7 +1308,7 @@ async function main(): Promise<void> {
   // Periodic skill logging for all bots with active sessions - every 60 seconds
   intervals.push(setInterval(() => {
     for (const bot of bots.values()) {
-      if (bot.api.getSession()) {
+      if (bot.isConnected()) {
         logSkills(bot);
       }
     }
@@ -1285,14 +1322,18 @@ async function main(): Promise<void> {
       let keepAliveCount = 0;
       for (const [name, bot] of bots) {
         // Only hit API for idle bots (not already doing heavy refresh)
-        if (bot.state === "idle" && bot.api.getSession()) {
-          // Use bot.exec() instead of api.execute() to process notifications properly
-          keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
-            if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
-              debugLogForBot(name, "keepalive:notifications", `Received ${resp.notifications.length} notification(s) for idle bot`);
-            }
-          }).catch(() => {}));
-          keepAliveCount++;
+        if (bot.state === "idle" && bot.isConnected()) {
+          // Library-backed bots keep their connection alive via the WebSocket
+          // and receive notifications as push events, so skip the HTTP poll.
+          if (!bot.account) {
+            // Use bot.exec() instead of api.execute() to process notifications properly
+            keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
+              if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+                debugLogForBot(name, "keepalive:notifications", `Received ${resp.notifications.length} notification(s) for idle bot`);
+              }
+            }).catch(() => {}));
+            keepAliveCount++;
+          }
         }
       }
       if (keepAliveCount > 0) {
@@ -1321,16 +1362,16 @@ async function main(): Promise<void> {
     let needsRefresh = catalogStore.isStale();
     if (!needsRefresh && bots.size > 0) {
       const firstBot = bots.values().next().value;
-      if (firstBot?.api.getSession()) {
-        needsRefresh = await catalogStore.checkVersionChanged(firstBot.api);
+      if (firstBot?.isConnected()) {
+        needsRefresh = await catalogStore.checkVersionChangedLib();
       }
     }
     if (!needsRefresh) return;
     // Find first bot with an active session
     for (const [, bot] of bots) {
-      if (bot.api.getSession()) {
+      if (bot.isConnected()) {
         try {
-          await catalogStore.fetchAll(bot.api);
+          await catalogStore.fetchFromLib();
           server.logSystem(`Catalog refreshed (${catalogStore.getSummary()})`);
           refreshSkillNames();
         } catch (err) {

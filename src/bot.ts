@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
-import { SpaceMoltAPI, type ApiResponse } from "./api.js";
+import { SpaceMoltAPI, type ApiResponse, COMMAND_TOOL_MAP, COMMAND_ACTION_MAP, COMMANDS_WITH_PAYLOAD_ACTION } from "./api.js";
 import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
@@ -19,6 +19,7 @@ import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTa
 import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
+import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -112,6 +113,10 @@ export class Bot {
   readonly username: string;
   readonly api: SpaceMoltAPI;
   readonly session: SessionManager;
+  /** Live library-backed connection, set when the bot runner is driven through @spacemolt/lib. Null while the legacy HTTP `api` is still in use. */
+  account: Account | null = null;
+  /** Unsubscribe functions for the event subscriptions registered in `subscribeEvents`. */
+  private eventUnsubscribers: Array<() => void> = [];
   private baseDir: string;
   private color: string;
   private _state: BotState = "idle";
@@ -317,12 +322,13 @@ docked = false;
   /** Flag to request stop after current cycle completes (for civilian transport). */
   private _stopAfterCycle = false;
 
-  constructor(username: string, baseDir: string) {
+  constructor(username: string, baseDir: string, account?: Account | null) {
     this.username = username;
     this.baseDir = baseDir;
     this.api = new SpaceMoltAPI();
     this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
+    this.account = account ?? null;
     // Connect API to session manager for persistence
     this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
@@ -363,6 +369,17 @@ docked = false;
 
   get routineName(): string | null {
     return this._routine;
+  }
+
+  /**
+   * Typed command facade from `@spacemolt/lib`, available once this bot is
+   * backed by a live `Account` (set via the constructor). Returns `null` while
+   * the legacy HTTP `api` is still in use, so call sites can branch:
+   * `const cmds = bot.commands; if (cmds) { ... } else { await bot.exec(...) }`.
+   * Use `account.commands.<tool>.<action>(params)` per the library's API.
+   */
+  get commands(): Commands | null {
+    return this.account ? this.account.commands : null;
   }
 
   clearError(): void {
@@ -619,6 +636,186 @@ docked = false;
     }
   }
 
+  /**
+   * Library-backed command dispatch for bots connected through `@spacemolt/lib`.
+   * Translates the legacy `exec(command, params)` call into the typed
+   * `account.send(tool, action, params)` facade, normalizing the result back
+   * into the legacy `ApiResponse` shape so the existing call sites keep working
+   * until they are individually migrated to the typed accessor (P3).
+   *
+   * Mutations resolve to the typed `MutationResult.delta`; queries to
+   * `structuredContent`. Event-driven notifications (chat/battle/market) move
+   * to `account.on(...)` in P2, so `notifications` is empty here. This is the
+   * keystone that lets the whole runner run on the library without touching
+   * the ~1000 `exec` call sites yet.
+   */
+  private async libExec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    const account = this.account;
+    if (!account) {
+      return { error: { code: "no_account", message: "Library account not connected" }, result: undefined, notifications: [] };
+    }
+
+    // Transport-level auth is already handled by connectOwned(); treat it as a no-op.
+    if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
+      return { result: { ok: true }, error: undefined, notifications: [] };
+    }
+    // Notifications arrive via event subscriptions (P2) for library bots.
+    if (command === "get_notifications") {
+      return { result: { notifications: [] }, error: undefined, notifications: [] };
+    }
+
+    const blockedCommands = new Set(["jump", "travel", "dock", "undock", "mine", "salvage", "buy", "sell"]);
+    if (this.isCustomsHold() && blockedCommands.has(command)) {
+      this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
+      await this.waitForCustomsClear();
+    }
+
+    this._lastAction = command;
+    debugLogForBot(this.username, "bot:libExec", `${account.id ?? this.username} > ${command}`, payload);
+    this.captureSkillSnapshot();
+
+    const tool = COMMAND_TOOL_MAP[command] || "spacemolt";
+    let action = COMMAND_ACTION_MAP[command] || command;
+    const body: Record<string, unknown> = payload ? { ...payload } : {};
+
+    // Wrapper commands carry the real action in payload.action (battle/storage/facility/fleet).
+    if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
+      action = String(payload.action);
+      delete body.action;
+    }
+
+    // Param translations (mirror api.ts makeHttpRequest so call sites stay unchanged).
+    if (command === "faction_deposit_items" && !body.target) body.target = "faction";
+    if (command === "faction_withdraw_items" && !body.source) body.source = "faction";
+    if (command === "view_faction_storage" && !body.target) body.target = "faction";
+    if (command === "faction_deposit_credits") {
+      body.item_id = "credits";
+      if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+      if (!body.target) body.target = "faction";
+    }
+    if (command === "faction_withdraw_credits") {
+      body.item_id = "credits";
+      if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+      if (!body.source) body.source = "faction";
+    }
+    if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+    if (command === "faction_prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+    if (command === "send_gift") {
+      body.item_id = "credits";
+      if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }
+      if (body.recipient !== undefined) { body.target = body.recipient; delete body.recipient; }
+    }
+    if (command === "find_route") {
+      delete body.target_poi;
+      if (body.target !== undefined && body.target_system === undefined) { body.target_system = body.target; delete body.target; }
+    }
+    if (command === "jump" && typeof body.target_system === "string") { body.id = body.target_system; delete body.target_system; }
+    if (command === "jump" && body.target !== undefined && body.id === undefined) { body.id = body.target; delete body.target; }
+    if (command === "jump" && body.target_poi !== undefined && body.id === undefined) { body.id = body.target_poi; delete body.target_poi; }
+    if (command === "travel" && body.target_poi !== undefined) { body.id = body.target_poi; delete body.target_poi; }
+    if (command === "set_home_base" && body.base_id !== undefined) { body.id = body.base_id; delete body.base_id; }
+
+    try {
+      const res = await account.send(tool, action, body);
+      const anyRes = res as unknown as { delta?: { details?: unknown }; structuredContent?: unknown; result?: unknown };
+      let result: unknown;
+      if (anyRes.delta) {
+        result = anyRes.delta.details ?? anyRes.delta;
+      } else {
+        result = anyRes.structuredContent ?? anyRes.result;
+      }
+      return { result, error: undefined, notifications: [] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.log("error", `libExec ${command} failed: ${message}`);
+      return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+    }
+  }
+
+  /**
+   * Subscribe to the library's typed server push events for this bot. Replaces
+   * the legacy `get_notifications` polling: chat, battle, crafting, mining,
+   * market, trade, and other pushes are routed through the same
+   * `handleNotifications` business logic the HTTP path used, so customs holds,
+   * MAYDAY rescue, battle-state tracking, and AI-chat forwarding all keep
+   * working for library-backed bots. No-op when this bot has no `Account`.
+   */
+  subscribeEvents(): void {
+    const account = this.account;
+    if (!account) return;
+    this.unsubscribeEvents();
+
+    const forward = (...types: TypedNotificationType[]) => {
+      for (const t of types) {
+        const off = account.on(t, (payload) => {
+          void this.handleNotifications([{ type: t, msg_type: t, data: payload as unknown as Record<string, unknown> }]);
+        });
+        this.eventUnsubscribers.push(off);
+      }
+    };
+
+    forward(
+      "chat_message",
+      "battle_update",
+      "battle_damage",
+      "battle_started",
+      "battle_ended",
+      "battle_joined",
+      "battle_left",
+      "battle_alert",
+      "crafting_update",
+      "mining_yield",
+      "market_update",
+      "skill_level_up",
+      "achievement_unlocked",
+      "trade_offer_received",
+      "trade_complete",
+      "trade_cancelled",
+      "trade_declined",
+      "pirate_radio",
+      "scan_detected",
+      "observation_update",
+      "drone_update",
+      "drone_scan",
+      "drone_survey",
+      "drone_destroyed",
+      "pilotless_ship",
+      "pirate_destroyed",
+      "player_kill",
+      "player_died",
+      "facility_reclaimed",
+      "facility_rent_warning",
+      "base_destroyed",
+      "base_raid_update",
+    );
+
+    // Untyped pushes (legacy "system"/"combat" pirate-attack messages) arrive as
+    // RawFrame via onAny. Forward those too, skipping anything already covered
+    // by the typed handlers above to avoid double-processing.
+    const typedSet = new Set<string>(TYPED_NOTIFICATION_TYPES as readonly string[]);
+    const offAny = account.onAny((frame: RawFrame) => {
+      const type = frame.type;
+      if (typedSet.has(type)) return;
+      const data = frame.payload;
+      if (typeof data === "object" && data !== null) {
+        void this.handleNotifications([{ type, msg_type: type, data: data as Record<string, unknown> }]);
+      } else if (typeof data === "string") {
+        void this.handleNotifications([{ type, msg_type: type, data: { message: data } }]);
+      }
+    });
+    this.eventUnsubscribers.push(offAny);
+
+    this.log("system", "Subscribed to @spacemolt/lib push events (chat/battle/market/notifications).");
+  }
+
+  /** Remove all event subscriptions registered by `subscribeEvents`. */
+  unsubscribeEvents(): void {
+    for (const off of this.eventUnsubscribers) {
+      try { off(); } catch { /* ignore */ }
+    }
+    this.eventUnsubscribers = [];
+  }
+
   /** Execute an API command, log the result, handle notifications. */
   async exec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
     // Block travel/jump commands while customs hold is active (allow chat and get_nearby for interaction)
@@ -641,6 +838,13 @@ docked = false;
         }
       }
     }
+
+      // Library-backed bots dispatch through @spacemolt/lib (P3 migrates the
+      // ~1000 call sites to the typed accessor; until then the legacy command
+      // string is translated here).
+      if (this.account) {
+        return this.libExec(command, payload);
+      }
 
       this._lastAction = command;
       debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
@@ -1052,8 +1256,22 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     return this._loginPromise;
   }
 
+  /** True when this bot has a live connection — either an HTTP session or a library Account. */
+  isConnected(): boolean {
+    return !!this.account?.authenticated || !!this.api.getSession();
+  }
+
   /** Internal login implementation */
   private async doLogin(): Promise<boolean> {
+    // Backed by a library Account: connectOwned() already authenticated it,
+    // so there is no HTTP credential flow to perform.
+    if (this.account) {
+      this.log("system", `Connected via @spacemolt/lib as ${this.account.id ?? this.username} (no login needed)`);
+      await this.refreshStatus();
+      try { await this.checkSkills(); } catch { /* ignore */ }
+      return true;
+    }
+
     const creds = this.session.loadCredentials();
     if (!creds) {
       this._error = "No credentials found";
@@ -1088,6 +1306,14 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
   /** Resume session from disk without full login. Returns true if session was restored and is valid. */
   async resumeSession(): Promise<boolean> {
+    // Library-backed bots are already connected; nothing to restore.
+    if (this.account) {
+      this.log("system", `Session already active via @spacemolt/lib (${this.account.id ?? this.username})`);
+      await this.refreshStatus();
+      try { await this.checkSkills(); } catch { /* ignore */ }
+      return true;
+    }
+
     const restored = this.api.restoreSessionToken();
     if (!restored) {
       this.log("system", "No saved session token found, will require full login");
@@ -1114,7 +1340,9 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
   /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
   async refreshStatus(): Promise<ApiResponse> {
-    const resp = await this.api.execute("get_status", undefined, { bypassCache: true });
+    const resp: ApiResponse = this.account
+      ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
+      : await this.api.execute("get_status", undefined, { bypassCache: true });
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
     if (!resp.error && resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
@@ -1227,7 +1455,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async refreshLocation(): Promise<ApiResponse> {
-    const resp = await this.api.execute("get_location");
+    const resp: ApiResponse = this.account
+      ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
+      : await this.api.execute("get_location");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const location = r.location as Record<string, unknown> | undefined;
@@ -1270,7 +1500,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async refreshShip(): Promise<ApiResponse> {
-    const resp = await this.api.execute("get_ship");
+    const resp = this.account
+      ? await this.libExec("get_ship", {})
+      : await this.api.execute("get_ship");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const ship = (r.ship as Record<string, unknown>) || r;
@@ -1303,7 +1535,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async refreshCargoAndStorage(): Promise<ApiResponse> {
-    const cargoResp = await this.api.execute("get_cargo");
+    const cargoResp: ApiResponse = this.account
+      ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
+      : await this.api.execute("get_cargo");
     if (!cargoResp.error && cargoResp.result) {
       this.inventory = this.parseItemList(cargoResp.result, 'cargo');
       const r = cargoResp.result as Record<string, unknown>;
@@ -1318,7 +1552,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async refreshPOI(): Promise<ApiResponse> {
-    const resp = await this.api.execute("get_poi");
+    const resp = this.account
+      ? await this.libExec("get_poi", {})
+      : await this.api.execute("get_poi");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const poi = (r.poi as Record<string, unknown>) || {};
@@ -1334,14 +1570,17 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   async refreshMissions(): Promise<ApiResponse> {
+    if (this.account) return this.libExec("get_missions", {});
     return this.api.execute("get_missions");
   }
 
   async refreshQueue(): Promise<ApiResponse> {
+    if (this.account) return this.libExec("get_queue", {});
     return this.api.execute("get_queue");
   }
 
   async refreshNearby(): Promise<ApiResponse> {
+    if (this.account) return this.libExec("get_nearby", {});
     return this.api.execute("get_nearby");
   }
 
@@ -1355,7 +1594,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
    */
   async autoScanAndTrackNearby(): Promise<void> {
     try {
-      const resp = await this.api.execute("get_nearby");
+      const resp = this.account
+        ? await this.libExec("get_nearby", {})
+        : await this.api.execute("get_nearby");
       if (!resp.error && resp.result) {
         this.trackNearbyPlayers(resp.result);
         this.trackWildlife(resp.result);
@@ -1366,8 +1607,10 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     }
   }
 
-async refreshSkills(): Promise<ApiResponse> {
-     const resp = await this.api.execute("get_skills");
+  async refreshSkills(): Promise<ApiResponse> {
+     const resp = this.account
+       ? await this.libExec("get_skills", {})
+       : await this.api.execute("get_skills");
      if (!resp.error && resp.result) {
        const r = resp.result as Record<string, unknown>;
        let skillsData: Record<string, unknown> | null = null;

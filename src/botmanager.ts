@@ -24,7 +24,7 @@ import { escortRoutine } from "./routines/escort-fleet.js";
 import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
-import { civilianTransportRoutine } from "./routines/civilianTransport.js";
+import { civilianTransportRoutine, unloadPassengersToLounge } from "./routines/civilianTransport.js";
 import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { fuelServiceRoutine } from "./routines/fuelService.js";
@@ -754,6 +754,24 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   }
 
   debugLogForBot(botName, "exec:handler", `${botName} > ${command}`, params);
+
+  // Manual connecting-flight handoff: unload_passenger target=lounge
+  // navigates the bot to the faction home base and checks all (or the named)
+  // aboard passengers into the faction Transit Lounge for another bot to pick up.
+  if (command === "unload_passenger") {
+    const target = (params as Record<string, unknown> | undefined)?.target as string | undefined;
+    if (target && target.toLowerCase() === "lounge") {
+      const result = await unloadPassengersToLounge(bot, {
+        id: (params as Record<string, unknown> | undefined)?.id as string | undefined,
+      });
+      if (!result.ok) {
+        return { ok: false, error: result.error };
+      }
+      refreshStatusTable();
+      return { ok: true, message: result.message };
+    }
+  }
+
   let resp = await bot.exec(command, params);
 
   // Track player names from get_nearby responses

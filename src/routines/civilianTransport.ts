@@ -752,6 +752,145 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
   saveAllData(data);
 }
 
+// ── Per-bot civilian transport log (achievement tracking) ──────────
+//
+// We keep a permanent, per-bot record of every passenger a bot has ever
+// completed a transport with. File: data/CivTransportLogs/<bot>_CT.log
+// Each line: "<first-time-transported date> <passenger underline name>"
+// e.g. "2026-07-10 bob_hope"
+// This lets us cross-reference which bot has never transported a given
+// passenger so we can hand off connecting flights between faction bots.
+
+const CIV_LOG_DIR = "data/CivTransportLogs";
+
+function civLogPathForBot(botName: string): string {
+  const safe = botName.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  return path.join(process.cwd(), CIV_LOG_DIR, `${safe}_CT.log`);
+}
+
+function toUnderlineName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function todayDateStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function hasTransportedPassenger(botName: string, passengerName: string): boolean {
+  try {
+    const file = civLogPathForBot(botName);
+    if (!fs.existsSync(file)) return false;
+    const underline = toUnderlineName(passengerName);
+    const lines = fs.readFileSync(file, "utf-8").split("\n");
+    return lines.some((line: string) => {
+      const parts = line.trim().split(/\s+/);
+      const name = parts[parts.length - 1] || "";
+      return name === underline;
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function recordTransportedPassenger(botName: string, passengerName: string): void {
+  try {
+    const underline = toUnderlineName(passengerName);
+    const file = civLogPathForBot(botName);
+    if (!fs.existsSync(CIV_LOG_DIR)) {
+      fs.mkdirSync(CIV_LOG_DIR, { recursive: true });
+    }
+    if (hasTransportedPassenger(botName, passengerName)) {
+      return; // keep the original first-time date
+    }
+    fs.appendFileSync(file, `${todayDateStr()} ${underline}\n`, "utf-8");
+  } catch (err) {
+    console.error(`Failed to record transported passenger for ${botName}:`, err);
+  }
+}
+
+// ── Manual command: unload passengers into faction Transit Lounge ──
+//
+// Runs the `unload_passenger target=lounge` handoff. We gather passengers
+// from another station with the civilian transport routine, then check them
+// into the faction Transit Lounge at the home base so another faction bot
+// can board them onward later (picking them up is handled in a later session).
+
+export async function unloadPassengersToLounge(
+  bot: Bot,
+  opts: { id?: string } = {},
+): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const ctx: RoutineContext = {
+    api: bot.api,
+    bot,
+    log: (cat, msg) => bot.log(cat, msg),
+    sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
+  };
+
+  const settings = getCivilianTransportSettings(bot.username);
+  const homeStation = settings.homeStation;
+  const homeSystem = settings.homeSystem;
+
+  // The lounge lives at the faction's home base. Navigate there if configured.
+  if (homeSystem && bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+    ctx.log("transport", `unload-to-lounge: navigating to home system ${homeSystem}...`);
+    const ok = await navigateToSystem(ctx, homeSystem, {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: true,
+    });
+    if (!ok) {
+      return { ok: false, error: `Failed to navigate to home system ${homeSystem}` };
+    }
+  }
+
+  if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+    ctx.log("transport", `unload-to-lounge: traveling to home station ${homeStation}...`);
+    const tr = await bot.exec("travel", { target_poi: homeStation });
+    if (tr.error) {
+      return { ok: false, error: `Travel to home station failed: ${tr.error.message}` };
+    }
+  }
+
+  await bot.refreshStatus();
+
+  if (!bot.docked) {
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+      return { ok: false, error: `Dock failed: ${dockResp.error.message}` };
+    }
+  }
+
+  const listResp = await bot.exec("list_passengers");
+  let aboardCount = 0;
+  if (!listResp.error && listResp.result) {
+    const parsed = parseListPassengers(listResp.result);
+    aboardCount = parsed ? parsed.passengers.length : 0;
+  }
+
+  if (aboardCount === 0) {
+    return { ok: true, message: "No passengers aboard to check into the Transit Lounge." };
+  }
+
+  const id = opts.id && opts.id.trim().length > 0 ? opts.id.trim() : "all";
+  ctx.log("transport", `unload-to-lounge: handing off ${id === "all" ? aboardCount + " passengers" : id} to Transit Lounge...`);
+  const resp = await bot.exec("unload_passenger", { id, target: "lounge" });
+  if (resp.error) {
+    return { ok: false, error: `unload_passenger failed: ${resp.error.message}` };
+  }
+
+  return {
+    ok: true,
+    message: `Checked ${id === "all" ? aboardCount : id} passenger(s) into the faction Transit Lounge. They can be boarded onward by any faction bot with load_passenger.`,
+  };
+}
+
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
   await bot.refreshCargo();
@@ -2576,6 +2715,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           loadedAt: p.loadedAt,
           status: "delivered",
         });
+        recordTransportedPassenger(bot.username, p.name);
         logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }
 

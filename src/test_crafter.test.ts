@@ -338,6 +338,10 @@ describe("Crafter Profile Workflow", () => {
 });
 
 describe("Craft Goals Recipe Selection", () => {
+  beforeEach(() => {
+    vi.mocked(readSettings).mockReturnValue({});
+  });
+
   const mockRecipes = [
     {
       recipe_id: "forge_hull_plating",
@@ -485,6 +489,82 @@ describe("Craft Goals Recipe Selection", () => {
       };
       const result = findRecipeForItem("hull_plating", recipes, countFn);
       expect(result?.recipe_id).toBe("forge_hull_plating"); // should pick forge since materials available
+    });
+
+    it("should fall back to a craftable alternate when both candidate recipes are own-facility recipes", () => {
+      // Mirrors the plasma-flux vs regular titanium alloy deadlock: the preferred
+      // recipe is missing one sub-material, while an alternate recipe for the SAME
+      // output item is ALSO available at an owned facility and is fully craftable.
+      // The planner must use the craftable alternate instead of holding forever.
+      const preferred = {
+        recipe_id: "plasma_flux_titanium_alloy",
+        name: "Plasma-Flux Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+          { item_id: "plasma_residue", name: "Plasma Residue", quantity: 1 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const alternate = {
+        recipe_id: "titanium_alloy",
+        name: "Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const facilityAvailableRecipes = new Set(["plasma_flux_titanium_alloy", "titanium_alloy"]);
+      const countFn = (id: string) => {
+        if (id === "titanium_plate") return 10;
+        if (id === "plasma_residue") return 0; // preferred is missing this
+        return 0;
+      };
+      const result = findRecipeForItem("titanium_alloy", [preferred, alternate], countFn, facilityAvailableRecipes);
+      expect(result?.recipe_id).toBe("titanium_alloy"); // fall back to the craftable alternate
+    });
+
+    it("should keep using the own-facility recipe rather than rent when the only alternate has no owned facility", () => {
+      // forceOwnFacility regression: the preferred recipe has an owned facility
+      // but is missing a sub-material; the alternate is craftable but has NO owned
+      // facility (offline). The bot must keep using the own-facility recipe and
+      // wait for sub-materials rather than auto-routing to an external rental.
+      const preferred = {
+        recipe_id: "plasma_flux_titanium_alloy",
+        name: "Plasma-Flux Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+          { item_id: "plasma_residue", name: "Plasma Residue", quantity: 1 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const alternate = {
+        recipe_id: "titanium_alloy",
+        name: "Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const facilityAvailableRecipes = new Set(["plasma_flux_titanium_alloy"]); // alternate has no facility
+      const countFn = (id: string) => {
+        if (id === "titanium_plate") return 10;
+        if (id === "plasma_residue") return 0; // preferred is missing this
+        return 0;
+      };
+      const result = findRecipeForItem("titanium_alloy", [preferred, alternate], countFn, facilityAvailableRecipes);
+      expect(result?.recipe_id).toBe("plasma_flux_titanium_alloy"); // keep using own facility, avoid rental
     });
   });
 

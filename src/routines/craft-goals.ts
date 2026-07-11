@@ -133,20 +133,27 @@ export function hasRecipeMaterials(
  */
 // Comparator that ranks recipes producing the same item.
 //
-// KEY INVARIANT: a recipe that can actually be crafted RIGHT NOW (all of its
-// materials are on hand) always beats one that is missing a material — even if
-// the missing-material recipe scores higher on partial availability. This is
-// what makes the planner fall back to an alternate recipe (e.g. regular
-// titanium alloy) when the preferred one (e.g. plasma-flux titanium alloy) is
-// out of a sub-material, instead of holding forever on the un-craftable recipe.
-// Only when NO candidate is craftable do we fall back to scoring, which is the
-// legitimate "awaiting sub-materials, will retry next pass" case.
+// PRIORITY ORDER:
+//   1. OWN-FACILITY availability (isFacilityRecipe) — when forceOwnFacility is
+//      on we must never rent an external facility if we own the gear to make the
+//      item, so a recipe we can run on our own facilities always outranks one
+//      that would require auto-routing/rental. This is why a preferred recipe
+//      whose only owned facility is offline still wins over a craftable recipe
+//      that has no owned facility (the latter would force a rental).
+//   2. canCraft (all sub-materials on hand right now) — among recipes we can run
+//      on our own gear, prefer one we can actually build. This is what lets the
+//      planner fall back to an alternate OWN-FACILITY recipe (e.g. regular
+//      titanium alloy) when the preferred one (e.g. plasma-flux) is out of a
+//      sub-material, instead of holding forever on the un-craftable recipe.
+//   3. Material-availability score — tiebreaker for recipes equally ranked above.
+// Only when NO candidate is an own-facility recipe do we consider rental-prone
+// recipes (the legitimate "awaiting sub-materials, will retry next pass" case).
 function compareRecipeCandidates(
   a: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
   b: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
 ): number {
-  if (a.canCraft !== b.canCraft) return a.canCraft ? -1 : 1;
   if (a.isFacilityRecipe !== b.isFacilityRecipe) return a.isFacilityRecipe ? -1 : 1;
+  if (a.canCraft !== b.canCraft) return a.canCraft ? -1 : 1;
   if (a.score !== b.score) return b.score - a.score;
   return 0;
 }

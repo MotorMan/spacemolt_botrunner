@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getCrafterSettings } from "./routines/crafter.js";
+import { getCrafterSettings, resolveFinalVenue } from "./routines/crafter.js";
 import { readSettings } from "./routines/common.js";
 import {
   calculateCraftingPlan,
@@ -606,5 +606,75 @@ describe("Craft Goals Recipe Selection", () => {
       expect(plan?.flatOrder).toHaveLength(1); // Just the forge, since reforge not better
       expect(plan?.flatOrder[0].recipe.recipe_id).toBe("forge_hull_plating");
     });
+  });
+});
+
+describe("resolveFinalVenue rental gating", () => {
+  const baseSettings = (overrides: Partial<any> = {}) => ({
+    craftingPreset: "prefer_own",
+    allowRentalPurchase: false,
+    allowExternalFacilities: false,
+    rentalSpendingLimit: 0,
+    ...overrides,
+  }) as any;
+
+  const externalQuote = {
+    external: true,
+    cost: { fee: 43200 },
+    venue: "Alloy Foundry",
+    venue_type: "external",
+    recipe: "forge_titanium_alloy",
+  };
+  const workshopQuote = {
+    external: false,
+    cost: { fee: 0 },
+    venue: "Station Workshop",
+    venue_type: "workshop",
+    recipe: "forge_titanium_alloy",
+  };
+
+  const makeBot = (onExec?: (payload: any) => void) => ({
+    exec: async (_cmd: string, payload: any) => {
+      onExec?.(payload);
+      if (payload.preset === "workshop") return { result: workshopQuote };
+      return { result: externalQuote };
+    },
+  });
+
+  const ctx = { log: () => {}, sleep: async () => {} } as any;
+
+  it("never rents an external facility when rental is disabled, even under prefer_own", async () => {
+    const v = { preset: "prefer_own", allowRental: false, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 1728,
+      v as any, baseSettings(),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.facilityId).toBeUndefined();
+    expect(result.preset).toBe("workshop");
+    expect(result.rentalFee).toBe(0);
+    expect(result.label).toContain("rental avoided");
+  });
+
+  it("same protection under the default fast preset with rental disabled", async () => {
+    const v = { preset: "fast", allowRental: false, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 10,
+      v as any, baseSettings({ craftingPreset: "fast" }),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.preset).toBe("workshop");
+    expect(result.rentalFee).toBe(0);
+  });
+
+  it("does rent (as last resort) under prefer_own when rental is allowed", async () => {
+    const v = { preset: "prefer_own", allowRental: true, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 1728,
+      v as any, baseSettings({ allowRentalPurchase: true }),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.rentalFee).toBe(43200);
+    expect(result.preset).toBe("prefer_own");
   });
 });

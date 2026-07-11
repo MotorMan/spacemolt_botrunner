@@ -602,10 +602,10 @@ interface FinalVenue {
 //    transparently fall back to the Station Workshop (hand-crafting) instead of
 //    blocking, so we still produce the item without an accidental rental
 //  - if rental IS allowed but would breach the spending limit, fall back to workshop
-//  - when the prefer_own preset is active we trust the server's own->faction->
-//    public-rental-as-last-resort routing and honor an external quote instead
-//    of forcing a workshop fallback (subject to the spending limit)
-async function resolveFinalVenue(
+//  - the prefer_own preset is handled server-side (own -> faction -> rental-as-
+//    last-resort); client-side we still gate every external rental on
+//    allowRental, so a disabled rental always falls back to hand-crafting
+export async function resolveFinalVenue(
   ctx: RoutineContext,
   bot: any,
   recipeId: string,
@@ -615,14 +615,6 @@ async function resolveFinalVenue(
   settings: CrafterSettings,
 ): Promise<FinalVenue> {
   const { log } = ctx;
-
-  // The prefer_own preset is server-side routing: it keeps a job on your own
-  // facility first, then your faction's, and only rents a public facility as a
-  // deliberate last resort when no owned/faction facility can run the recipe.
-  // When this preset is active we must TRUST the server's routing decision and
-  // not second-guess an external quote with our workshop fallback/block — that
-  // external venue is exactly what the user asked for.
-  const preferOwn = settings.craftingPreset === "prefer_own";
 
   const dryRun = async (preset?: string, facilityId?: string) => {
     const payload: Record<string, unknown> = { id: recipeId, quantity: runs, dry_run: true };
@@ -646,15 +638,14 @@ async function resolveFinalVenue(
 
   if (resp.error) {
     const errMsg = resp.error.message;
-    // If our own facility was unusable (busy/offline) and rental is allowed (or
-    // we're using the prefer_own preset, which falls back through tiers on its
-    // own), fall back to normal auto-routing.
-    if (attemptedFacility && (v.allowRental || preferOwn)) {
+    // If our own facility was unusable (busy/offline) and rental is allowed,
+    // fall back to normal auto-routing.
+    if (attemptedFacility && v.allowRental) {
       log("warn", `Own facility ${attemptedFacility} unavailable for ${recipeName} (${errMsg}) - falling back to auto-routing`);
       attemptedFacility = undefined;
       attemptedPreset = settings.craftingPreset;
       resp = await dryRun(attemptedPreset, undefined);
-    } else if (!v.allowRental && !preferOwn) {
+    } else if (!v.allowRental) {
       // Couldn't verify a safe venue and we can't rent — try workshop as a last resort.
       log("warn", `Craft venue unusable for ${recipeName} (${errMsg}) - trying workshop fallback`);
       attemptedFacility = undefined;
@@ -674,12 +665,11 @@ async function resolveFinalVenue(
 
   let quote = parseCraftQuote(resp.result);
 
-  // If auto-routing would rent an external facility:
-  //  - under the prefer_own preset this is the server's deliberate last-resort
-  //    rental (no owned/faction facility exists), so we honor it;
-  //  - otherwise, if rental isn't allowed, fall back to the Station Workshop;
-  //  - if rental IS allowed, enforce the spending limit.
-  if (!attemptedFacility && quote.external && !v.allowRental && !preferOwn) {
+  // If auto-routing would rent an external facility but rental isn't allowed,
+  // fall back to the Station Workshop (hand-crafting) so we still produce it.
+  // This applies regardless of preset (incl. prefer_own): a disabled rental is
+  // always honored and never bypassed.
+  if (!attemptedFacility && quote.external && !v.allowRental) {
     log("warn", `Would rent external facility "${quote.venue || recipeName}" for ${quote.fee}cr but rental is not allowed - falling back to workshop (hand-crafting)`);
     attemptedFacility = undefined;
     attemptedPreset = "workshop";
@@ -692,10 +682,9 @@ async function resolveFinalVenue(
     return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (rental avoided)" };
   }
 
-  // External rental is allowed (or is the deliberate prefer_own last resort) —
-  // enforce the spending limit so last-resort rentals stay within budget.
+  // External rental is allowed — enforce the spending limit.
   let rentalFee = 0;
-  if (!attemptedFacility && quote.external && (v.allowRental || preferOwn)) {
+  if (!attemptedFacility && quote.external && v.allowRental) {
     rentalFee = quote.fee;
     if (settings.allowRentalPurchase && settings.rentalSpendingLimit > 0) {
       if (rentalSpentThisSession + rentalFee > settings.rentalSpendingLimit) {

@@ -12957,12 +12957,13 @@
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div>
         <div class="setting-label">Crafting Preset</div>
-        <div class="setting-hint">Which crafting facility to use. <b>Fast</b> auto-routes to your facility, faction facility, or public rental. <b>Workshop</b> forces hand-crafting at station. <b>Cheap</b> uses lowest fee.</div>
+        <div class="setting-hint">Which crafting facility to use. <b>Fast</b> auto-routes to your facility, faction facility, or public rental. <b>Workshop</b> forces hand-crafting at station. <b>Cheap</b> uses lowest fee. <b>Prefer Own</b> keeps the job on your own facility first, then your faction's, only renting a public facility as a last resort.</div>
       </div>
       <select id="set-crafter-craftingPreset" style="min-width:150px">
         <option value="fast" ${(crafter.craftingPreset || "fast") === "fast" ? "selected" : ""}>fast - Auto-routing (default)</option>
         <option value="cheap" ${(crafter.craftingPreset || "fast") === "cheap" ? "selected" : ""}>cheap - Lowest fee</option>
         <option value="workshop" ${(crafter.craftingPreset || "fast") === "workshop" ? "selected" : ""}>workshop - Hand-crafting</option>
+        <option value="prefer_own" ${(crafter.craftingPreset || "fast") === "prefer_own" ? "selected" : ""}>prefer_own - Own/faction first, rent last</option>
       </select>
     </div>
 

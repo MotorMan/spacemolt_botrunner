@@ -2,7 +2,18 @@ import type { RoutineContext } from "../bot.js";
 import type { BattleStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
+import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
+
+/**
+ * Returns true if the given display name belongs to a known creature (wildlife).
+ * Creatures are NOT players — even with onlyNPCs=true the hunter should fight
+ * (or at least not flee from) a creature that attacks it.
+ */
+export function isCreatureName(name: string | undefined): boolean {
+  if (!name) return false;
+  return !!wildlifeStore.getWildlifeDetail(name);
+}
 
 // ── Types ─────────────────────────────────────────────
 
@@ -58,10 +69,13 @@ export interface NearbyEntity {
   faction: string;
   isNPC: boolean;
   isPirate: boolean;
+  isCreature?: boolean;
+  creatureId?: string;
   tier?: PirateTier;
   isBoss?: boolean;
   hull?: number;
   maxHull?: number;
+  inCombat?: boolean;
   shield?: number;
   maxShield?: number;
   status?: string;
@@ -155,6 +169,28 @@ export function parseNearby(result: unknown): NearbyEntity[] {
     }
   }
 
+  if (Array.isArray(r.creatures)) {
+    const rawCreatures = r.creatures as Array<Record<string, unknown>>;
+    for (const c of rawCreatures) {
+      const creatureId = (c.creature_id as string) || "";
+      if (!creatureId) continue;
+
+      entities.push({
+        id: creatureId,
+        name: (c.name as string) || "",
+        type: "creature",
+        faction: "",
+        isNPC: true,
+        isPirate: false,
+        isCreature: true,
+        creatureId: creatureId,
+        hull: c.hull as number,
+        maxHull: c.max_hull as number,
+        inCombat: c.in_combat as boolean,
+      });
+    }
+  }
+
   return entities.filter(e => e.id);
 }
 
@@ -162,8 +198,6 @@ export function parseNearby(result: unknown): NearbyEntity[] {
 
 export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttackTier: PirateTier = "large"): boolean {
   if (entity.isPirate) {
-    // Server already filtered this into the pirates list — attack it
-    // (tier system is still incomplete, so we ignore tier gating for now)
     return true;
   }
   if (onlyNPCs && !entity.isNPC) return false;
@@ -173,6 +207,11 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
   const nameMatch = entity.name ? PIRATE_KEYWORDS.some(kw => entity.name.toLowerCase().includes(kw)) : false;
 
   return factionMatch || typeMatch || (entity.isNPC && nameMatch);
+}
+
+export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
+  if (!huntCreatures) return false;
+  return !!(entity.isCreature || entity.type === "creature");
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────
@@ -199,7 +238,7 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
     if (!isWeapon) continue;
 
     // V2 API provides ammo_type directly, fall back to catalog lookup
-    let ammoType = (mod.ammo_type as string) || (mod.loaded_ammo_id as string);
+    let ammoType = (mod.ammo_type as string) || "";
     if (!ammoType && modId) {
       const catalogModule = catalogStore.getItem(modId);
       if (catalogModule) {
@@ -250,6 +289,7 @@ export async function ensureAmmoLoaded(
   percentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
+  await bot.refreshShip();
   const weapons = await getWeaponModules(ctx);
   if (weapons.length === 0) {
     ctx.log("warn", "No weapon modules found — skipping reload");
@@ -264,7 +304,20 @@ export async function ensureAmmoLoaded(
 
   let anyReloaded = false;
   for (const weapon of weapons) {
-    if (!weapon.ammoType) {
+    ctx.log("debug", `Weapon "${weapon.name}": currentAmmo=${weapon.currentAmmo}, maxAmmo=${weapon.maxAmmo}, ammoType="${weapon.ammoType || 'empty'}"`);
+    
+    let effectiveAmmoType = weapon.ammoType;
+    if (!effectiveAmmoType && weapon.loadedAmmoId) {
+      const ammoIndex = catalogStore.getAmmoTypeIndex();
+      for (const [ammoType, ammoIds] of Object.entries(ammoIndex)) {
+        if (ammoIds.includes(weapon.loadedAmmoId)) {
+          effectiveAmmoType = ammoType;
+          break;
+        }
+      }
+    }
+    
+    if (!effectiveAmmoType) {
       ctx.log("combat", `Weapon "${weapon.name}" does not use ammo — skipping reload check`);
       continue;
     }
@@ -280,25 +333,25 @@ export async function ensureAmmoLoaded(
         ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (abs:${absThreshold}, pct:${pctThreshold}%)`);
       }
     } else {
-      const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);
+      const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
       if (matchingAmmo.length > 0) {
-        ctx.log("combat", `Weapon "${weapon.name}" ammo state unknown - attempting reload with ${weapon.ammoType}`);
+        ctx.log("combat", `Weapon "${weapon.name}" ammo state unknown - attempting reload with ${effectiveAmmoType}`);
         needsReload = true;
       } else {
-        ctx.log("warn", `Weapon "${weapon.name}" needs ${weapon.ammoType} but none in cargo`);
+        ctx.log("warn", `Weapon "${weapon.name}" needs ${effectiveAmmoType} but none in cargo`);
       }
     }
 
     if (!needsReload) continue;
 
-    const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);
+    const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
     if (matchingAmmo.length === 0) {
-      ctx.log("combat", `⚠️ No ${weapon.ammoType} ammo in cargo for "${weapon.name}" — need to resupply`);
+      ctx.log("combat", `⚠️ No ${effectiveAmmoType} ammo in cargo for "${weapon.name}" — need to resupply`);
       continue;
     }
 
     const ammoItem = matchingAmmo[0];
-    ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${weapon.ammoType}) — reloading "${weapon.name}"...`);
+    ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${effectiveAmmoType}) — reloading "${weapon.name}"...`);
 
     for (let i = 0; i < maxAttempts; i++) {
       const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId });
@@ -310,7 +363,7 @@ export async function ensureAmmoLoaded(
           break;
         }
         if (msg.includes("no ammo") || msg.includes("no_ammo") || msg.includes("empty")) {
-          ctx.log("combat", `No ${weapon.ammoType} ammo available — need to resupply at station`);
+          ctx.log("combat", `No ${effectiveAmmoType} ammo available — need to resupply at station`);
           return false;
         }
         if (msg.includes("must specify") || msg.includes("missing")) {
@@ -470,32 +523,17 @@ export async function analyzeExistingBattle(
     sideId: number;
     playerCount: number;
     pirateCount: number;
+    creatureCount: number;
     pirateTiers: string[];
     playerNames: string[];
     pirateNames: string[];
+    creatureNames: string[];
   }
 
   const sideAnalysis: SideAnalysis[] = sides.map(side => {
     const sideParticipants = participants.filter(p => p.side_id === side.side_id);
-    const players = sideParticipants.filter(p => {
-      const username = p.username || "";
-      const isPirate = username.toLowerCase().includes("pirate") ||
-                       username.toLowerCase().includes("drifter") ||
-                       username.toLowerCase().includes("executioner") ||
-                       username.toLowerCase().includes("sentinel") ||
-                       username.toLowerCase().includes("prowler") ||
-                       username.toLowerCase().includes("apex") ||
-                       username.toLowerCase().includes("razor") ||
-                       username.toLowerCase().includes("striker") ||
-                       username.toLowerCase().includes("rampart") ||
-                       username.toLowerCase().includes("stalwart") ||
-                       username.toLowerCase().includes("bastion") ||
-                       username.toLowerCase().includes("onslaught") ||
-                       username.toLowerCase().includes("iron") ||
-                       username.toLowerCase().includes("strike");
-      return !isPirate && !p.username?.startsWith("[POLICE]");
-    });
 
+    // Classify each participant as pirate / creature / real player.
     const pirates = sideParticipants.filter(p => {
       const username = p.username || "";
       return username.toLowerCase().includes("pirate") ||
@@ -514,32 +552,51 @@ export async function analyzeExistingBattle(
              username.toLowerCase().includes("strike");
     });
 
+    const creatures = sideParticipants.filter(p => isCreatureName(p.username || ""));
+
+    const players = sideParticipants.filter(p => {
+      const username = p.username || "";
+      // Real players: not a pirate keyword and not a known creature.
+      if (isCreatureName(username)) return false;
+      return !pirates.some(pir => pir === p) && !p.username?.startsWith("[POLICE]");
+    });
+
     return {
       sideId: side.side_id,
       playerCount: players.length,
       pirateCount: pirates.length,
+      creatureCount: creatures.length,
       pirateTiers: pirates.map(p => "unknown"),
       playerNames: players.map(p => p.username || p.player_id),
       pirateNames: pirates.map(p => p.username || p.player_id),
+      creatureNames: creatures.map(p => p.username || p.player_id),
     };
   });
 
   ctx.log("combat", `   Side analysis: ${sideAnalysis.map(s =>
-    `Side ${s.sideId}: ${s.playerCount} player(s) [${s.playerNames.join(",")}] vs ${s.pirateCount} pirate(s) [${s.pirateNames.join(",")}]`
+    `Side ${s.sideId}: ${s.playerCount} player(s) [${s.playerNames.join(",")}] vs ${s.pirateCount} pirate(s) [${s.pirateNames.join(",")}] + ${s.creatureCount} creature(s) [${s.creatureNames.join(",")}]`
   ).join(" | ")}`);
 
-  const playerVsPirateSides = sideAnalysis.filter(s => s.playerCount > 0 && s.pirateCount > 0);
-  if (playerVsPirateSides.length === 0) {
+  // A "player side" is any side with real players; a "hostile side" is any side
+  // with pirates OR creatures. We join a player side that is fighting a hostile
+  // side (they may be on the same side, or on opposite sides — e.g. one player vs
+  // one creature). This lets allied hunters pull in to help a faction member who
+  // got attacked by a creature.
+  const playerSides = sideAnalysis.filter(s => s.playerCount > 0);
+  const hostileSides = sideAnalysis.filter(s => s.pirateCount > 0 || s.creatureCount > 0);
+
+  if (playerSides.length === 0 || hostileSides.length === 0) {
     // If our bot (or our drones/faction) is in the battle, we are already fighting — do NOT re-engage
     const ourName = bot.username;
     const weAreInBattle = participants.some(p => p.username === ourName || (ourName && p.username?.includes(ourName.split(" ")[0])));
     if (weAreInBattle || battleStatus.is_participant) {
       const ourSide = battleStatus.your_side_id ?? sides.find(s => participants.some(p => p.side_id === s.side_id && (p.username === ourName || p.username?.includes(ourName?.split(" ")[0] || ""))))?.side_id ?? sides[0]?.side_id ?? 1;
-      return { shouldJoin: true, sideId: ourSide, reason: "Already in battle with our bot/drones — fighting" };
+      return { shouldJoin: true, sideId: ourSide, reason: "Already in battle — fighting" };
     }
 
     const allPlayers = participants.filter(p => {
       const username = p.username || "";
+      if (isCreatureName(username)) return false;
       return !username.startsWith("[POLICE]") &&
              !username.toLowerCase().includes("pirate") &&
              !username.toLowerCase().includes("drifter");
@@ -548,22 +605,23 @@ export async function analyzeExistingBattle(
     if (allPlayers.length >= 2 && sides.length >= 2) {
       return { shouldJoin: false, reason: "PvP battle detected — staying out" };
     }
-    return { shouldJoin: false, reason: "Pirate vs pirate battle — not engaging" };
+    return { shouldJoin: false, reason: "Hostile vs hostile battle — not engaging" };
   }
 
-  const sideToJoin = playerVsPirateSides.find(s => s.playerCount > 0);
-  if (!sideToJoin) {
-    return { shouldJoin: false, reason: "Could not determine which side to join" };
-  }
+  // Join the player side to help against the hostile side.
+  const sideToJoin = playerSides[0];
+  const hostileSide = hostileSides[0];
 
   // NOTE: Combat routines (like fleet hunter) NEVER flee based on pirate count or police.
   // They ONLY flee when hull <= fleeThreshold.
   // This is intentional — they are combat bots designed to fight.
 
+  const hostileDesc = `${hostileSide.pirateCount} pirate(s)` +
+    (hostileSide.creatureCount > 0 ? ` + ${hostileSide.creatureCount} creature(s)` : "");
   return {
     shouldJoin: true,
     sideId: sideToJoin.sideId,
-    reason: `Joining side ${sideToJoin.sideId} (${sideToJoin.playerCount} player(s)) vs ${sideToJoin.pirateCount} pirate(s)`,
+    reason: `Joining side ${sideToJoin.sideId} (${sideToJoin.playerCount} player(s)) vs ${hostileDesc}`,
   };
 }
 
@@ -580,6 +638,7 @@ export async function engageTarget(
   skipScan: boolean = false,
   repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
   onlyNPCs: boolean = false,     // if true, flee when encountering players
+  cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -592,7 +651,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -616,10 +675,20 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
+
+  // Disable cloak before attacking if cloakOnStart is enabled
+  if (cloakOnStart && bot.isCloaked) {
+    ctx.log("combat", `Disabling cloak before attacking ${target.name}...`);
+    const cloakResp = await bot.exec("cloak", { enable: false });
+    if (cloakResp.error) {
+      ctx.log("warn", `Failed to disable cloak: ${cloakResp.error.message}`);
+    }
+  }
+
   if (!skipScan) {
     let scanResp = await bot.exec("scan", { target_id: target.id });
     if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
@@ -662,17 +731,34 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
+        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
       }
     }
     return false;
   }
 
   ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
+
+/** Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module. */
+export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
+  const { bot } = ctx;
+  if (!cloakOnStart) return;
+  if (bot.isCloaked) return;
+  
+  const resp = await bot.exec("cloak", { enable: true });
+  if (!resp.error) {
+    ctx.log("combat", "Re-cloaked after battle victory");
+  } else {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to re-cloak after battle: ${resp.error.message}`);
+    }
+  }
+}
 
 export async function fightFreshBattle(
   ctx: RoutineContext,
@@ -681,6 +767,7 @@ export async function fightFreshBattle(
   fleeFromTier: PirateTier,
   maxAttackTier: PirateTier,
   repairThreshold: number = 0,
+  cloakOnStart: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -704,18 +791,43 @@ export async function fightFreshBattle(
     ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
   }
 
-  let attackResp = await bot.exec("attack", { target_id: target.id });
-  if (attackResp.error) {
-    const msg = attackResp.error.message.toLowerCase();
-    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
-      ctx.log("combat", `${target.name} is no longer available`);
-      return false;
+  // A battle may already be active by the time we get here: engageTarget already
+  // issued the attack, or the server pulled us in (COMBAT WARNING). Re-issuing the
+  // attack command is redundant AND, under the newer server combat code, can hang /
+  // time out for ~60s while we sit idle in the outer ring. If we're already in a
+  // battle, skip the attack and go straight into the combat loop (advance/engage).
+  const preAttackStatus = await getBattleStatus(ctx);
+  let battleActive = !!preAttackStatus;
+  let attackErrMsg: string | null = null;
+
+  if (!battleActive) {
+    const atk = await bot.exec("attack", { target_id: target.id });
+    if (atk.error) {
+      const msg = atk.error.message.toLowerCase();
+      if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+        ctx.log("combat", `${target.name} is no longer available`);
+        return false;
+      }
+      attackErrMsg = atk.error.message;
+    } else {
+      battleActive = true;
     }
-    ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+  }
+
+  if (!battleActive) {
+    ctx.log("error", `Attack failed on ${target.name}: ${attackErrMsg ?? "unknown error"}`);
     return false;
   }
 
-  ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+  if (attackErrMsg) {
+    // The attack command errored/timed out, but a live battle exists — don't bail.
+    // Enter the combat loop so we can advance and close the distance.
+    ctx.log("combat", `⚠️ Attack command errored ("${attackErrMsg}") but battle ${preAttackStatus?.battle_id} is active — entering combat loop to advance/engage`);
+  } else if (preAttackStatus) {
+    ctx.log("combat", `⚔️ Battle already active with ${target.name} — setting initial stance`);
+  } else {
+    ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+  }
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 
@@ -723,6 +835,7 @@ export async function fightFreshBattle(
   let status = await getBattleStatus(ctx);
   if (!status) {
     ctx.log("combat", `✅ Battle ended during setup — ${target.name} eliminated!`);
+    await recloakAfterBattle(ctx, cloakOnStart);
     return true;
   }
 
@@ -736,6 +849,7 @@ export async function fightFreshBattle(
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -743,10 +857,11 @@ export async function fightFreshBattle(
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
-    const targetParticipant = status.participants.find(
+    let targetParticipant = status.participants.find(
       p => p.player_id === target.id || p.username === target.name
     );
 
@@ -764,9 +879,22 @@ export async function fightFreshBattle(
         await bot.exec("battle", { action: "target", target_id: better.id });
         await ctx.sleep(300);
       } else if (!better) {
-        ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks, victory!)`);
-        await checkAndPraiseMorgThar(ctx, true);
-        return true;
+        // Newer server combat code omits the enemy from participants, so pickRealBattleTarget
+        // is almost always null. Re-acquire the attacker from the nearby scan and keep
+        // fighting instead of falsely declaring victory while we're still being shot.
+        const nearbyEnemy = await acquireEnemyFromNearby(ctx, target.name, maxAttackTier, true);
+        if (nearbyEnemy) {
+          ctx.log("combat", `🎯 Re-acquired live enemy ${nearbyEnemy.name} from nearby scan — engaging`);
+          target = nearbyEnemy;
+          await attackTarget(ctx, target);
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          await ctx.sleep(300);
+          targetParticipant = undefined as any;
+        } else {
+          ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks, victory!)`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
       }
     }
 
@@ -795,6 +923,28 @@ export async function fightFreshBattle(
 
     const enemyStance = targetParticipant?.stance || "unknown";
     const enemyZone = targetParticipant?.zone || "unknown";
+
+    // Enemy isn't in the participants roster (newer server combat code). We still know
+    // who we're fighting via `target` (re-acquired from the nearby scan), so keep
+    // attacking, hold fire stance, and close to engaged range.
+    if (!targetParticipant && target) {
+      ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${target.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
+      await attackTarget(ctx, target);
+      await bot.exec("battle", { action: "target", target_id: target.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      const ourZoneNow = status.your_zone || ourCurrentZone;
+      if (ourZoneNow !== "engaged") {
+        const adv = await bot.exec("battle", { action: "advance" });
+        if (adv.error && /not in battle/.test(adv.error.message.toLowerCase())) {
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
+      }
+      await ctx.sleep(10000);
+      continue;
+    }
+
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
 
     const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
@@ -856,9 +1006,35 @@ export async function fightFreshBattle(
 
 const PLAYER_KEYWORDS = ["pirate", "drifter", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile", "executioner", "sentinel", "prowler", "apex", "razor", "striker", "rampart", "stalwart", "bastion", "onslaught", "iron", "strike"];
 
-function isPlayerParticipant(participant: import("../types/game.js").BattleParticipant): boolean {
-  const name = (participant.username || "").toLowerCase();
-  return !PLAYER_KEYWORDS.some(kw => name.includes(kw));
+/**
+ * Like isPlayerParticipant, but also probes the live get_nearby to disambiguate
+ * a "player-looking" battle participant that is actually a creature or pirate we
+ * should be fighting (e.g. a creature that attacked us from outside scan range and
+ * isn't yet in the wildlife store). Returns true only for genuine human/player foes.
+ */
+async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): Promise<boolean> {
+  if (!name) return false;
+  // Fast local checks first.
+  if (isCreatureName(name)) return false;
+  const lower = name.toLowerCase();
+  if (PLAYER_KEYWORDS.some(kw => lower.includes(kw))) return false; // pirate keyword
+  // Fall back to the live nearby scan to see if this name is a creature/pirate.
+  try {
+    const resp = await ctx.bot.exec("get_nearby");
+    if (!resp.error && resp.result) {
+      const entities = parseNearby(resp.result);
+      const match = entities.find(e =>
+        e.name === name || e.name.toLowerCase() === lower || e.name.toLowerCase().includes(lower)
+      );
+      if (match) {
+        if (isCreatureTarget(match, true)) return false;       // creature -> not a player
+        if (isPirateTarget(match, false, "boss")) return false; // pirate -> not a player
+      }
+    }
+  } catch {
+    /* non-fatal — fall through to treating as a player */
+  }
+  return true;
 }
 
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
@@ -896,6 +1072,76 @@ function pickRealBattleTarget(
     id: chosen.player_id || chosen.username || "",
     name: chosen.username || chosen.player_id || "enemy",
   } as NearbyEntity;
+}
+
+/**
+ * Re-acquire a live enemy from get_nearby.
+ *
+ * NOTE: The newer server combat code OMITS the attacking enemy from
+ * get_battle_status().participants — every battle reports only our own bot as a
+ * participant. We therefore can't trust the battle roster to tell us who is shooting
+ * us. get_nearby still lists pirate (and optionally creature) targets, so we fall back
+ * to it. `preferName` biases the pick toward the known attacker (e.g. from a COMBAT
+ * WARNING) when several pirates are visible.
+ */
+async function acquireEnemyFromNearby(
+  ctx: RoutineContext,
+  preferName?: string,
+  maxAttackTier: PirateTier = "large",
+  onlyNPCs = true,
+  huntCreatures = false,
+): Promise<NearbyEntity | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_nearby");
+  if (resp.error || !resp.result) return null;
+  const entities = parseNearby(resp.result);
+  const pirates = entities.filter(e => isPirateTarget(e, onlyNPCs, maxAttackTier));
+  if (pirates.length > 0) {
+    if (preferName) {
+      const hit = pirates.find(p =>
+        p.name === preferName || p.name.toLowerCase().includes(preferName.toLowerCase())
+      );
+      if (hit) return hit;
+    }
+    return pirates[0];
+  }
+  // Re-acquire creatures too. This is both for huntCreatures mode AND for
+  // self-defense: a creature that pulls us into battle must be fought back even
+  // if huntCreatures is disabled (a creature is not a player).
+  const creatures = entities.filter(e => isCreatureTarget(e, true));
+  if (creatures.length > 0) {
+    if (preferName && isCreatureName(preferName)) {
+      const hit = creatures.find(c =>
+        c.name === preferName || c.name.toLowerCase().includes(preferName.toLowerCase())
+      );
+      if (hit) return hit;
+    }
+    if (huntCreatures || (preferName && isCreatureName(preferName))) {
+      return creatures[0];
+    }
+  }
+  return null;
+}
+
+/** Issue attack on a target, falling back to the name if the id is rejected. */
+async function attackTarget(ctx: RoutineContext, target: NearbyEntity): Promise<boolean> {
+  const { bot } = ctx;
+  let resp = await bot.exec("attack", { target_id: target.id });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in") || msg.includes("at your location")) {
+      ctx.log("combat", `Attack with id failed for ${target.name} — trying name...`);
+      resp = await bot.exec("attack", { target_id: target.name });
+    }
+  }
+  if (resp.error) {
+    // "already in a battle" / "already engaged" are fine — it just means we're in.
+    if (!/already/.test(resp.error.message.toLowerCase())) {
+      ctx.log("combat", `Attack on ${target.name} failed: ${resp.error.message}`);
+    }
+    return false;
+  }
+  return true;
 }
 
 const MORG_THAR_NAME = "Morg'Thar";
@@ -968,6 +1214,7 @@ export async function fightJoinedBattle(
   canFlee: boolean = true,
   shieldRechargePct: number = 80,
   onlyNPCs: boolean = false,
+  cloakOnStart: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -990,10 +1237,24 @@ export async function fightJoinedBattle(
     }
   }
 
+  // The newer server combat code OMITS the enemy from participants, so
+  // pickRealBattleTarget is usually null. Re-acquire the real attacker from the
+  // nearby scan (which still lists pirates) so we have someone to actually fight.
+  if (!currentTarget || (status && !status.participants.some(p => p.player_id === currentTarget!.id || p.username === currentTarget!.name))) {
+    const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
+    if (nearbyEnemy) {
+      ctx.log("combat", `Re-acquired enemy from nearby scan: ${nearbyEnemy.name}`);
+      currentTarget = nearbyEnemy;
+    }
+  }
+
   ctx.log("combat", `🎯 Fighting in joined battle${currentTarget ? ` — targeting ${currentTarget.name}` : ''}`);
 
-  ctx.log("combat", `Setting target and stance...`);
+  // Actually engage the enemy with the attack command. The server requires an active
+  // attack to register us as "in" the battle for `battle` advance/stance commands —
+  // otherwise advance fails with "You are not in a battle. Use attack to engage...".
   if (currentTarget) {
+    await attackTarget(ctx, currentTarget);
     await bot.exec("battle", { action: "target", target_id: currentTarget.id });
   }
   await bot.exec("battle", { action: "stance", stance: "fire" });
@@ -1012,6 +1273,14 @@ export async function fightJoinedBattle(
       ctx.log("combat", `Advancing to ${zoneName}...`);
       const advResp = await bot.exec("battle", { action: "advance" });
       if (advResp.error) {
+        const msg = advResp.error.message.toLowerCase();
+        if (msg.includes("no active battle") || msg.includes("not in battle")) {
+          // We may not be registered as engaged yet — try re-attacking the enemy once.
+          if (currentTarget) await attackTarget(ctx, currentTarget);
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
         ctx.log("error", `Advance to ${zoneName} failed: ${advResp.error.message}`);
       }
       await ctx.sleep(10000);
@@ -1028,6 +1297,7 @@ export async function fightJoinedBattle(
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -1035,6 +1305,7 @@ export async function fightJoinedBattle(
     if (!status) {
       ctx.log("combat", `✅ Battle complete — victory! (${tickCount} ticks)`);
       await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
 
@@ -1056,17 +1327,32 @@ export async function fightJoinedBattle(
         targetParticipant = status.participants.find(
           p => p.player_id === better.id || p.username === better.name
         );
-        // Check if new target is a player and we should flee
-        if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+        // Check if new target is a real player (not a creature/pirate) and we should flee
+        if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
           ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
           await emergencyFleeSpam(ctx, `target switched to player`);
           return false;
         }
       } else if (!better) {
+        // Newer server combat code omits enemies from participants, so pickRealBattleTarget
+        // is almost always null. Re-acquire the attacker from the nearby scan and actually
+        // attack it instead of falsely declaring victory while we're still being shot.
+        const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
+        if (nearbyEnemy) {
+          ctx.log("combat", `🎯 Re-acquired live enemy ${nearbyEnemy.name} from nearby scan — engaging`);
+          currentTarget = nearbyEnemy;
+          await attackTarget(ctx, currentTarget);
+          await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          await ctx.sleep(300);
+          targetParticipant = undefined;
+        } else {
         ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks)!`);
+        await checkAndPraiseMorgThar(ctx, true);
+        await recloakAfterBattle(ctx, cloakOnStart);
         return true;
       }
     }
+  }
 
     if (targetParticipant && targetParticipant.is_destroyed && currentTarget) {
       ctx.log("combat", `⚠️ ${currentTarget.name} marked destroyed but battle still active — waiting...`);
@@ -1074,7 +1360,7 @@ export async function fightJoinedBattle(
       continue;
     }
 
-    if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+    if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
       ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
       await emergencyFleeSpam(ctx, `target is a player`);
       return false;
@@ -1114,6 +1400,29 @@ export async function fightJoinedBattle(
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+
+    // If the enemy isn't in the participants roster (newer server combat code omits
+    // them), we have no zone info for them. We still know who we're fighting via
+    // currentTarget (re-acquired from the nearby scan), so keep attacking, hold fire
+    // stance, and close to engaged range — exactly what the server's
+    // "advance to close the distance" directive wants.
+    if (!targetParticipant && currentTarget) {
+      ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${currentTarget.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}%`);
+      await attackTarget(ctx, currentTarget);
+      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      const ourZoneNow = status.your_zone || "outer";
+      if (ourZoneNow !== "engaged") {
+        const adv = await bot.exec("battle", { action: "advance" });
+        if (adv.error && /not in battle/.test(adv.error.message.toLowerCase())) {
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
+      }
+      await ctx.sleep(10000);
+      continue;
+    }
 
     const enemyZone = targetParticipant?.zone || "outer";
     const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;

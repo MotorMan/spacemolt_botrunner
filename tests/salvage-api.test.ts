@@ -88,9 +88,10 @@ class MockBot {
         }
         this.towingWreck = false;
         return {
-          result: {
-            credits: 450,
-            xp: 25,
+          details: {
+            total_payout: 450,
+            cargo_value: 200,
+            salvage_value: 250,
             message: 'Wreck sold successfully'
           }
         };
@@ -103,7 +104,7 @@ class MockBot {
         }
         this.towingWreck = false;
         return {
-          result: {
+          details: {
             materials: [
               { name: 'Iron', quantity: 20 },
               { name: 'Copper', quantity: 15 }
@@ -188,14 +189,14 @@ const salvageTestScenarios: SalvageTestScenario[] = [
     expectedErrorCode: 'not_towing'
   },
 
-  // sell_wreck tests
-  {
-    name: 'sell_wreck succeeds when towing',
-    setup: (bot) => { bot.towingWreck = true; },
-    command: 'sell_wreck',
-    expectedSuccess: true,
-    expectedResultKeys: ['credits', 'xp']
-  },
+// sell_wreck tests
+   {
+     name: 'sell_wreck succeeds when towing',
+     setup: (bot) => { bot.towingWreck = true; },
+     command: 'sell_wreck',
+     expectedSuccess: true,
+     expectedResultKeys: ['total_payout', 'cargo_value', 'salvage_value']
+   },
   {
     name: 'sell_wreck fails when not towing',
     command: 'sell_wreck',
@@ -245,27 +246,29 @@ describe('Salvage API Commands', () => {
       // Execute command
       const response = await bot.exec(scenario.command, scenario.payload);
 
-      // Assertions
-      if (scenario.expectedSuccess) {
-        expect(response.error).toBeUndefined();
-        expect(response.result).toBeDefined();
+// Assertions
+       if (scenario.expectedSuccess) {
+         expect(response.error).toBeUndefined();
+         // V2 API returns command result in 'details' for mutation commands
+         const resultOrDetails = response.details ?? response.result;
+         expect(resultOrDetails).toBeDefined();
 
-        if (scenario.expectedResultKeys) {
-          if (Array.isArray(response.result)) {
-            // For get_wrecks which returns an array
-            expect(response.result.length).toBeGreaterThan(0);
-            const firstItem = response.result[0];
-            scenario.expectedResultKeys.forEach(key => {
-              expect(firstItem).toHaveProperty(key);
-            });
-          } else {
-            // For single object responses
-            scenario.expectedResultKeys.forEach(key => {
-              expect(response.result).toHaveProperty(key);
-            });
-          }
-        }
-      } else {
+         if (scenario.expectedResultKeys) {
+           if (Array.isArray(resultOrDetails)) {
+             // For get_wrecks which returns an array
+             expect(resultOrDetails.length).toBeGreaterThan(0);
+             const firstItem = resultOrDetails[0];
+             scenario.expectedResultKeys.forEach(key => {
+               expect(firstItem).toHaveProperty(key);
+             });
+           } else {
+             // For single object responses
+             scenario.expectedResultKeys.forEach(key => {
+               expect(resultOrDetails).toHaveProperty(key);
+             });
+           }
+         }
+       } else {
         expect(response.error).toBeDefined();
         if (scenario.expectedErrorCode) {
           expect(response.error.code).toBe(scenario.expectedErrorCode);
@@ -300,12 +303,11 @@ describe('Salvage API Commands', () => {
       expect(towResp.error).toBeUndefined();
       expect(bot.towingWreck).toBe(true);
 
-      // 3. Sell wreck
-      const sellResp = await bot.exec('sell_wreck');
-      expect(sellResp.error).toBeUndefined();
-      expect(sellResp.result.credits).toBeDefined();
-      expect(sellResp.result.xp).toBeDefined();
-      expect(bot.towingWreck).toBe(false);
+// 3. Sell wreck
+       const sellResp = await bot.exec('sell_wreck');
+       expect(sellResp.error).toBeUndefined();
+       expect(sellResp.details.total_payout).toBeDefined();
+       expect(bot.towingWreck).toBe(false);
 
       // Verify command sequence
       expect(bot.commandHistory.map(c => c.command)).toEqual([
@@ -330,12 +332,12 @@ describe('Salvage API Commands', () => {
       expect(towResp.error).toBeUndefined();
       expect(bot.towingWreck).toBe(true);
 
-      // 3. Scrap wreck
-      const scrapResp = await bot.exec('scrap_wreck');
-      expect(scrapResp.error).toBeUndefined();
-      expect(scrapResp.result.materials).toBeDefined();
-      expect(scrapResp.result.total_value).toBeDefined();
-      expect(bot.towingWreck).toBe(false);
+// 3. Scrap wreck
+       const scrapResp = await bot.exec('scrap_wreck');
+       expect(scrapResp.error).toBeUndefined();
+       expect(scrapResp.details.materials).toBeDefined();
+       expect(scrapResp.details.total_value).toBeDefined();
+       expect(bot.towingWreck).toBe(false);
 
       // Verify command sequence
       expect(bot.commandHistory.map(c => c.command)).toEqual([

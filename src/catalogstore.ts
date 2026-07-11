@@ -3,7 +3,7 @@ import { join } from "path";
 import type { SpaceMoltAPI } from "./api.js";
 import { debugLog } from "./debug.js";
 
-// ── Data model ──────────────────────────────────────────────
+const OPENAPI_BASE_URL = "https://game.spacemolt.com/api/v2";
 
 export interface CatalogItem {
   id: string;
@@ -34,6 +34,13 @@ export interface CatalogRecipe {
   [key: string]: unknown;
 }
 
+export interface CatalogFacility {
+  id: string;
+  name: string;
+  category?: string;
+  [key: string]: unknown;
+}
+
 export interface CatalogData {
   version: string | null;
   lastFetched: string | null;
@@ -41,6 +48,7 @@ export interface CatalogData {
   ships: Record<string, CatalogShip>;
   skills: Record<string, CatalogSkill>;
   recipes: Record<string, CatalogRecipe>;
+  facilities: Record<string, CatalogFacility>;
 }
 
 // ── CatalogStore singleton ──────────────────────────────────
@@ -69,12 +77,72 @@ class CatalogStore {
     if (existsSync(CATALOG_FILE)) {
       try {
         const raw = readFileSync(CATALOG_FILE, "utf-8");
-        return JSON.parse(raw) as CatalogData;
+        const parsed = JSON.parse(raw) as Partial<CatalogData> & { 
+          items?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          ships?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          skills?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          recipes?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          facilities?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+        };
+        
+        const itemsData = parsed.items as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
+        const shipsData = parsed.ships as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const skillsData = parsed.skills as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const recipesData = parsed.recipes as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const facilitiesData = parsed.facilities as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
+        
+        const items: Record<string, CatalogItem> = {};
+        const facilities: Record<string, CatalogFacility> = {};
+        
+        const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
+        for (const item of itemsEntries) {
+          const id = (item as { id?: unknown; category?: string })?.id;
+          const category = (item as { category?: string })?.category;
+          if (typeof id === "string") {
+            items[id] = item as CatalogItem;
+            if (category === "personal" || category === "production") {
+              facilities[id] = item as unknown as CatalogFacility;
+            }
+          }
+        }
+        const ships: Record<string, CatalogShip> = {};
+        const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
+        for (const ship of shipsEntries) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
+        const skills: Record<string, CatalogSkill> = {};
+        const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
+        for (const skill of skillsEntries) {
+          const id = (skill as { id?: unknown })?.id;
+          if (typeof id === "string") skills[id] = skill as CatalogSkill;
+        }
+        const recipes: Record<string, CatalogRecipe> = {};
+        const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
+        for (const recipe of recipesEntries) {
+          const id = (recipe as { id?: unknown })?.id;
+          if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
+        }
+        const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
+        for (const facility of facilitiesEntries) {
+          const id = (facility as { id?: unknown })?.id;
+          if (typeof id === "string") facilities[id] = facility as CatalogFacility;
+        }
+        
+        return {
+          version: parsed.version ?? null,
+          lastFetched: parsed.lastFetched ?? null,
+          items,
+          ships,
+          skills,
+          recipes,
+          facilities,
+        };
       } catch {
         // Corrupt file — start fresh
       }
     }
-    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {} };
+    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {}, facilities: {} };
   }
 
   private scheduleSave(): void {
@@ -128,7 +196,7 @@ class CatalogStore {
       const versionResp = await api.execute("get_version");
       if (!versionResp.error && versionResp.result) {
         const v = versionResp.result as Record<string, unknown>;
-        const currentVersion = (v.version as string) || null;
+        const currentVersion = (v.version as string) || String(versionResp.result);
         return currentVersion !== this.data.version;
       }
     } catch {
@@ -139,19 +207,21 @@ class CatalogStore {
 
   // ── Fetch from API ────────────────────────────────────────
 
-  /** Paginate all 4 catalog types and store results. */
+  /**
+   * Fetch catalog from the API. Returns a promise that resolves when complete.
+   * Also fetches the OpenAPI spec if this was a version change.
+   */
   async fetchAll(api: SpaceMoltAPI): Promise<void> {
-    // If a fetch is already in progress, wait for it rather than running a
-    // concurrent fetch that would partially overwrite results.
     if (this._fetchPromise) return this._fetchPromise;
-
-    debugLog("catalog", `Starting catalog fetch (lastFetched: ${this.data.lastFetched})`);
-    this._fetchPromise = this._doFetchAll(api).finally(() => {
+    this._fetchPromise = this._doFetchAll(api).then(async () => {
+      if (this.data.version) {
+        await this.fetchOpenApi();
+      }
+    }).finally(() => {
       this._fetchPromise = null;
     });
     return this._fetchPromise;
   }
-
   private async _doFetchAll(api: SpaceMoltAPI): Promise<void> {
     let serverVersion: string | null = null;
     try {
@@ -165,12 +235,121 @@ class CatalogStore {
       debugLog("catalog", `Failed to fetch server version: ${err}`);
     }
 
-    const types = ["items", "ships", "skills", "recipes"] as const;
+    debugLog("catalog", `Fetching catalog from /api/catalog.json`);
+    try {
+      const baseUrl = api.baseUrl.replace(/\/api\/v2$/, "/api");
+      const resp = await fetch(`${baseUrl}/catalog.json`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const catalogData = await resp.json() as Record<string, unknown>;
+      const versionFromCatalog = catalogData.version as string | null;
+      
+      // Handle both array format (from catalog.json file) and keyed format (from API)
+      const itemsData = catalogData.items as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
+      const shipsData = catalogData.ships as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const skillsData = catalogData.skills as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const recipesData = catalogData.recipes as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const facilitiesData = catalogData.facilities as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
+      
+      const items: Record<string, CatalogItem> = {};
+      const facilities: Record<string, CatalogFacility> = {};
+      
+      // Extract items from either array or keyed format
+      const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
+      for (const item of itemsEntries) {
+        const id = (item as { id?: unknown; category?: string })?.id;
+        const category = (item as { category?: string })?.category;
+        if (typeof id === "string") {
+          items[id] = item as CatalogItem;
+          if (category === "personal" || category === "production") {
+            facilities[id] = item as unknown as CatalogFacility;
+          }
+        }
+      }
+      
+      const ships: Record<string, CatalogShip> = {};
+      const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
+      for (const ship of shipsEntries) {
+        const id = (ship as { id?: unknown })?.id;
+        if (typeof id === "string") ships[id] = ship as CatalogShip;
+      }
+      const skills: Record<string, CatalogSkill> = {};
+      const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
+      for (const skill of skillsEntries) {
+        const id = (skill as { id?: unknown })?.id;
+        if (typeof id === "string") skills[id] = skill as CatalogSkill;
+      }
+      const recipes: Record<string, CatalogRecipe> = {};
+      const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
+      for (const recipe of recipesEntries) {
+        const id = (recipe as { id?: unknown })?.id;
+        if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
+      }
+      
+      const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
+      for (const facility of facilitiesEntries) {
+        const id = (facility as { id?: unknown })?.id;
+        if (typeof id === "string") facilities[id] = facility as CatalogFacility;
+      }
+
+      this.data.version = serverVersion;
+      this.data.lastFetched = new Date().toISOString();
+      this.data.items = items;
+      this.data.ships = ships;
+      this.data.skills = skills;
+      this.data.recipes = recipes;
+      this.data.facilities = facilities;
+
+      this.dirty = true;
+      this.writeToDisk();
+
+      const counts = [
+        `${Object.keys(this.data.items).length} items`,
+        `${Object.keys(this.data.ships).length} ships`,
+        `${Object.keys(this.data.skills).length} skills`,
+        `${Object.keys(this.data.recipes).length} recipes`,
+        `${Object.keys(this.data.facilities).length} facilities`,
+      ];
+      debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
+
+      if (versionFromCatalog && versionFromCatalog !== serverVersion) {
+        debugLog("catalog", `Catalog version ${versionFromCatalog} differs from server version ${serverVersion}`);
+      }
+
+      return void counts;
+    } catch (err) {
+      debugLog("catalog", `Catalog fetch failed, falling back to paginated approach: ${err}`);
+      await this._doFetchAllPaginated(api);
+    }
+  }
+
+  /**
+   * Fallback: Paginate all 5 catalog types and store results.
+   * Used when the new /api/catalog.json endpoint is unavailable.
+   */
+  private async _doFetchAllPaginated(api: SpaceMoltAPI): Promise<void> {
+    let serverVersion: string | null = null;
+    try {
+      const versionResp = await api.execute("get_version");
+      if (!versionResp.error && versionResp.result) {
+        const v = versionResp.result as Record<string, unknown>;
+        serverVersion = (v.version as string) || null;
+        debugLog("catalog", `Server version: ${serverVersion}`);
+      }
+    } catch (err) {
+      debugLog("catalog", `Failed to fetch server version: ${err}`);
+    }
+
+    const types = ["items", "ships", "skills", "recipes", "facilities"] as const;
     const results: Record<string, Record<string, unknown>> = {
       items: {},
       ships: {},
       skills: {},
       recipes: {},
+      facilities: {},
     };
 
     for (const type of types) {
@@ -191,7 +370,6 @@ class CatalogStore {
           break;
         }
 
-        // Log the shape of the response for debugging
         const dataKeys = Object.keys(data);
         debugLog("catalog", `Response keys for ${type} page ${page}: ${dataKeys.join(", ")}`);
 
@@ -199,9 +377,8 @@ class CatalogStore {
         debugLog("catalog", `Extracted ${entries.length} entries for ${type} page ${page}`);
 
         for (const entry of entries) {
-          const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || "";
+          const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || (entry.facility_id as string) || "";
           if (id) {
-            // Normalize: ensure id field is set
             entry.id = id;
             results[type][id] = entry;
           }
@@ -209,6 +386,10 @@ class CatalogStore {
 
         totalPages = (data.total_pages as number) || (data.totalPages as number) || 1;
         page++;
+
+        if (page <= totalPages) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
       }
       debugLog("catalog", `Finished ${type}: ${Object.keys(results[type]).length} total entries`);
     }
@@ -217,6 +398,7 @@ class CatalogStore {
     this.data.ships = results.ships as Record<string, CatalogShip>;
     this.data.skills = results.skills as Record<string, CatalogSkill>;
     this.data.recipes = results.recipes as Record<string, CatalogRecipe>;
+    this.data.facilities = results.facilities as Record<string, CatalogFacility>;
     this.data.version = serverVersion;
     this.data.lastFetched = new Date().toISOString();
 
@@ -228,15 +410,62 @@ class CatalogStore {
       `${Object.keys(this.data.ships).length} ships`,
       `${Object.keys(this.data.skills).length} skills`,
       `${Object.keys(this.data.recipes).length} recipes`,
+      `${Object.keys(this.data.facilities).length} facilities`,
     ];
     debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
-    return void counts; // logged by caller
+    return void counts;
+  }
+
+  // ── OpenAPI fetch ──────────────────────────────────────────
+
+  /**
+   * Download openapi.json from the server and save as openapi-V2-{version}.json in the root.
+   * Only downloads if the version has changed since last save.
+   */
+  async fetchOpenApi(): Promise<void> {
+    const version = this.data.version;
+    if (!version) {
+      debugLog("catalog", "Cannot fetch OpenAPI: no version available");
+      return;
+    }
+
+    const openapiPath = join(process.cwd(), `openapi-V2-${version}.json`);
+
+    if (existsSync(openapiPath)) {
+      debugLog("catalog", `OpenAPI already exists at ${openapiPath}`);
+      return;
+    }
+
+    debugLog("catalog", `Fetching OpenAPI spec for version ${version}`);
+    try {
+      const resp = await fetch(`${OPENAPI_BASE_URL}/openapi.json`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const spec = await resp.text();
+      writeFileSync(openapiPath, spec, "utf-8");
+      debugLog("catalog", `OpenAPI spec saved to ${openapiPath} (${spec.length} bytes)`);
+    } catch (err) {
+      debugLog("catalog", `Failed to fetch OpenAPI: ${err}`);
+    }
   }
 
   // ── Lookup methods ────────────────────────────────────────
 
   getItem(id: string): CatalogItem | undefined {
     return this.data.items[id];
+  }
+
+  getItemByName(name: string): CatalogItem | undefined {
+    const lower = name.toLowerCase();
+    for (const item of Object.values(this.data.items)) {
+      if ((item.name || "").toLowerCase() === lower) {
+        return item;
+      }
+    }
+    return undefined;
   }
 
   getShip(id: string): CatalogShip | undefined {
@@ -251,21 +480,26 @@ class CatalogStore {
     return this.data.recipes[id];
   }
 
+  getFacility(id: string): CatalogFacility | undefined {
+    return this.data.facilities[id];
+  }
+
   /** Resolve a human-readable name for any catalog ID. Falls back to formatted ID. */
   resolveItemName(id: string): string {
-    const entry = this.data.items[id] || this.data.ships[id] || this.data.skills[id] || this.data.recipes[id];
+    const entry = this.data.items[id] || this.data.ships[id] || this.data.skills[id] || this.data.recipes[id] || this.data.facilities[id];
     if (entry?.name) return entry.name as string;
     return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
   /** Return full catalog data for WS broadcast / REST endpoint. */
-  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; lastFetched: string | null } {
+  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; facilities: Record<string, CatalogFacility>; lastFetched: string | null } {
     return {
       version: this.data.version,
       items: this.data.items,
       ships: this.data.ships,
       skills: this.data.skills,
       recipes: this.data.recipes,
+      facilities: this.data.facilities,
       lastFetched: this.data.lastFetched,
     };
   }
@@ -275,7 +509,8 @@ class CatalogStore {
     return Object.keys(this.data.items).length === 0
       && Object.keys(this.data.ships).length === 0
       && Object.keys(this.data.skills).length === 0
-      && Object.keys(this.data.recipes).length === 0;
+      && Object.keys(this.data.recipes).length === 0
+      && Object.keys(this.data.facilities).length === 0;
   }
 
   /** Check if an item appears as a component in any crafting recipe. */
@@ -336,7 +571,7 @@ class CatalogStore {
 
   /** Summary string for logging. */
   getSummary(): string {
-    return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes`;
+    return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes, ${Object.keys(this.data.facilities).length} facilities`;
   }
 }
 

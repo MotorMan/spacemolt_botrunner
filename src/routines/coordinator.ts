@@ -433,7 +433,12 @@ function computeOreQuotas(
       const oreBeltLocations = oreLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
-        return poi ? isOreBeltPoi(poi.type) : false;
+        if (!poi) return false;
+        const isOreBelt = isOreBeltPoi(poi.type) ||
+                          loc.poiName.toLowerCase().includes('belt') ||
+                          loc.poiName.toLowerCase().includes('mineral field') ||
+                          loc.poiName.toLowerCase().includes('asteroid');
+        return isOreBelt;
       });
       if (oreBeltLocations.length > 0) {
         oreNeeds[itemId] = (oreNeeds[itemId] || 0) + qtyPerBatch * limit;

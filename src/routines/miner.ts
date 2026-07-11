@@ -5,6 +5,12 @@ import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import {
+  registerMinerTarget as registerCoordinationTarget,
+  unregisterMinerTarget as unregisterCoordinationTarget,
+  getMinerCountForSystem,
+  isSystemOvercrowded,
+} from "./minerCoordination.js";
+import {
   isOreBeltPoi,
   isGasCloudPoi,
   isIceFieldPoi,
@@ -34,6 +40,12 @@ import {
   RADIOACTIVE_ORES,
 } from "./miner_radioactive.js";
 import {
+  ensureAmmoLoaded,
+  getWeaponModules,
+} from "./battle.js";
+import { catalogStore } from "../catalogstore.js";
+import { getItemSize } from "./common.js";
+import {
   getActiveMiningSession,
   startMiningSession,
   updateMiningSession,
@@ -62,10 +74,89 @@ import {
   type FlockState,
 } from "./flock.js";
 
-// ── Deep core mining constants ───────────────────────────────────────────
+// ── Cloaking module detection and enablement ────────────────────────────────
 
 /**
- * Ores that require deep core equipment (survey scanner + extractor) to mine.
+ * Check if the ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * This is a one-time command - once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  // First check if already cloaked (from get_status)
+  if (bot.isCloaked) {
+    ctx.log("mining", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  // Check if we have a cloaking module
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("mining", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  // Enable cloaking
+  ctx.log("mining", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("mining", "Cloaking enabled successfully");
+  return true;
+}
+
+/**
+ * Get the system blacklist to use for mining navigation.
+ * When the bot is cloaked and cloakIgnoreBlacklist is enabled, returns an empty array
+ * to allow mining in pirate/hot zones that would otherwise be blacklisted.
+ */
+function getMiningBlacklist(settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
+  const baseBlacklist = getSystemBlacklist();
+  if (isCloaked && settings.cloakIgnoreBlacklist) {
+    // Logging is done by the caller since ctx is not available here
+    return [];
+  }
+  return baseBlacklist;
+}
+
+/**
+ * List of ores that require deep core equipment (survey scanner + extractor) to mine.
  * These are typically found in hidden POIs with extreme high density.
  */
 const DEEP_CORE_ORES = new Set([
@@ -337,25 +428,38 @@ async function getMinerSettings(username?: string): Promise<{
   jettisonOres: string[]; // Ore IDs to jettison when found in cargo during mining
   deepCoreJettisonOres: string[]; // Ore IDs to jettison when mining deep core (hidden POIs)
   radioactiveJettisonOres: string[]; // Ore IDs to jettison when mining radioactive ores
+  jettisonGas: string[]; // Gas IDs to jettison when gas harvesting
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
-    maxJumps: number;
-    minimumFuelCells: number;
-    noMidMiningRetarget: boolean;
+  maxJumps: number;
+  minimumFuelCells: number;
+  noMidMiningRetarget: boolean;
+  enableCloak: boolean;
+  cloakIgnoreBlacklist: boolean;
+  desiredEmergencyWarpDevices: number;
+ enableFighting: boolean;
 
-  // Flock mining settings
-  flockEnabled: boolean;
-  flockName: string;
-  flockRole: FlockRole;
-  flockGroups: FlockGroupConfig[];
+   // Deep sleep interval (minutes) used when NO viable mining target exists anywhere in the map.
+   // Prevents the miner from hammering the server with repeated failed target searches.
+   deepSleepIntervalMin: number;
+
+    // Miner coordination settings - prevent all miners from going to the same location
+   enableCoordination: boolean;
+   maxBotsPerSystem: number;
+
+   // Flock mining settings
+   flockEnabled: boolean;
+   flockName: string;
+   flockRole: FlockRole;
+   flockGroups: FlockGroupConfig[];
 }> {
   const all = readSettings();
   const m = all.miner || {};
-  const flockCfg = await readFlockSettings();
+  const flockCfg = (await readFlockSettings()) || { assignments: {}, flockGroups: [] };
   let botOverrides = username ? (all[username] || {}) : {};
 
-  if (username && flockCfg.assignments[username]) {
+  if (username && flockCfg.assignments && flockCfg.assignments[username]) {
     botOverrides = { ...botOverrides, ...flockCfg.assignments[username] };
   }
 
@@ -422,24 +526,36 @@ async function getMinerSettings(username?: string): Promise<{
     targetDeepCore: (botOverrides.targetDeepCore as string) || (m.targetDeepCore as string) || "",
     oreQuotas: (m.oreQuotas as Record<string, number>) || {},
     gasQuotas: (m.gasQuotas as Record<string, number>) || {},
-    iceQuotas: (m.iceQuotas as Record<string, number>) || {},
+iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     radioactiveQuotas: (m.radioactiveQuotas as Record<string, number>) || {},
     deepCoreQuotas: (m.deepCoreQuotas as Record<string, number>) || {},
     jettisonOres: (m.jettisonOres as string[]) || [],
     deepCoreJettisonOres: (m.deepCoreJettisonOres as string[]) || [],
     radioactiveJettisonOres: (m.radioactiveJettisonOres as string[]) || [],
+    jettisonGas: (m.jettisonGas as string[]) || [],
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
+    enableCloak: (m.enableCloak as boolean) ?? false,
+    cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
     flockName: (botOverrides.flockName as string) || "",
     flockRole: parseFlockRole(botOverrides.flockRole) ?? "follower",
     flockGroups,
+    desiredEmergencyWarpDevices: (m.desiredEmergencyWarpDevices as number) ?? 3,
+    enableFighting: (m.enableFighting as boolean) ?? false,
+
+    // Deep sleep interval when no target is available anywhere in the map
+    deepSleepIntervalMin: (m.deepSleepIntervalMin as number) ?? 30,
+
+    // Miner coordination settings
+    enableCoordination: (m.enableCoordination as boolean) ?? true,
+    maxBotsPerSystem: (m.maxBotsPerSystem as number) ?? 3,
   };
 }
 
@@ -510,13 +626,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   if (hasIceHarvester) detectedTypes.push("ice");
   if (hasRadioactiveEquipment) detectedTypes.push("radioactive");
 
-  if (detectedTypes.length > 1) {
-    ctx.log("info", `Multiple mining modules detected (${detectedTypes.join(", ")}) — using settings preference`);
-    return "ore"; // Default to ore if multiple present
-  }
+  // Radioactive equipment takes priority over other mining types
   if (hasRadioactiveEquipment) {
     ctx.log("info", "Radioactive mining equipment detected — radioactive mining mode");
     return "radioactive";
+  }
+
+  if (detectedTypes.length > 1) {
+    ctx.log("info", `Multiple mining modules detected (${detectedTypes.join(", ")}) — using settings preference`);
+    return "ore"; // Default to ore if multiple present (but not radioactive)
   }
   if (hasIceHarvester) {
     ctx.log("info", "Ice harvester detected — ice mining mode");
@@ -746,6 +864,254 @@ function isStripMinerOre(oreId: string): boolean {
 }
 
 /**
+ * Calculate total mining power from ship modules.
+ * Sums mining_power from all mining-related modules.
+ * @param modules - Array of module objects from get_ship
+ * @returns Total mining power
+ */
+function getTotalMiningPower(modules: unknown[]): number {
+  let totalPower = 0;
+
+  const MINING_PREFIXES = [
+    "mining_laser",
+    "strip_miner",
+    "rad_harvester",
+    "ice_harvester",
+    "gas_harvester",
+    "deep_core_extractor",
+  ];
+
+  function toSnakeCase(str: string): string {
+    return str.toLowerCase().replace(/\s+/g, "_").replace(/[^a-z0-9_]/g, "");
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    if (!modObj) continue;
+
+    const modId = ((modObj.id as string) || (modObj.type_id as string) || "").toLowerCase();
+    const modName = ((modObj.name as string) || "").toLowerCase();
+    const modType = ((modObj.type as string) || "").toLowerCase();
+    const modSpecial = ((modObj.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`;
+    const isMiningModule = MINING_PREFIXES.some(prefix => checkStr.includes(prefix));
+    if (!isMiningModule) continue;
+
+    let catalogEntry = (modName ? catalogStore.getItemByName(modName) : undefined) ||
+      catalogStore.getItem(modId) ||
+      (modObj.type_id ? catalogStore.getItem(modObj.type_id as string) : undefined);
+
+    if (!catalogEntry && modName) {
+      const snake = toSnakeCase(modName);
+      catalogEntry = catalogStore.getItem(snake);
+    }
+
+    if (!catalogEntry) {
+      for (const item of Object.values(catalogStore.getAll().items)) {
+        const itemName = (item.name || "").toLowerCase();
+        if (itemName && modName && itemName.includes(modName)) {
+          catalogEntry = item;
+          break;
+        }
+      }
+    }
+
+    const power =
+      (catalogEntry?.mining_power as number) ??
+      (modObj.mining_power as number) ??
+      (modObj.power as number) ??
+      0;
+    totalPower += power;
+  }
+
+  return totalPower;
+}
+
+/**
+ * Check if the deposit's supported_power is sufficient for our mining equipment.
+ * Returns an object with:
+ *   - canMine: true if we can mine at this POI
+ *   - reason: explanation if canMine is false
+ *   - effectivePower: the capped power we'll actually use
+ *   - requiredPower: the supported_power threshold
+ */
+function checkDepositPowerCompatibility(
+  totalMiningPower: number,
+  supportedPower: number | undefined,
+): { canMine: boolean; reason: string; effectivePower: number; requiredPower: number } {
+  // If supported_power is not available, assume we can mine
+  if (supportedPower === undefined || supportedPower === null || supportedPower <= 0) {
+    return { canMine: true, reason: "no supported_power data", effectivePower: totalMiningPower, requiredPower: 0 };
+  }
+  
+  // If our power is at or below supported_power, we can mine at full rate
+  if (totalMiningPower <= supportedPower) {
+    return { canMine: true, reason: "power within limit", effectivePower: totalMiningPower, requiredPower: supportedPower };
+  }
+  
+  // If our power is more than 4x the supported_power, deposit is too sparse
+  if (totalMiningPower > supportedPower * 4) {
+    return { 
+      canMine: false, 
+      reason: `equipment power (${totalMiningPower}) exceeds 4x deposit density (${supportedPower})`, 
+      effectivePower: 0, 
+      requiredPower: supportedPower 
+    };
+  }
+  
+  // Power is above supported_power but not 4x - we can mine but power is capped
+  return { 
+    canMine: true, 
+    reason: `power capped at ${supportedPower} (equipment: ${totalMiningPower})`, 
+    effectivePower: supportedPower, 
+    requiredPower: supportedPower 
+  };
+}
+
+/**
+ * Check whether the current system has any mineable POI of the given type,
+ * respecting hidden-POI access capability. Used to decide if "mine locally"
+ * is actually possible before giving up and deep sleeping.
+ */
+function hasLocalMiningPoiOfType(
+  botSystem: string,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+): boolean {
+  const sys = mapStore.getSystem(botSystem);
+  if (!sys) return false;
+  for (const poi of sys.pois) {
+    const hidden = poi.hidden === true;
+    if (hidden) {
+      if (miningType === "radioactive" && !canMineHiddenRadioactive) continue;
+      if (miningType === "ice" && !canMineHiddenIce) continue;
+    }
+    if (miningType === "ore") {
+      if (isOreBeltPoi(poi.type) || !hidden || ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id)) return true;
+    } else if (miningType === "gas") {
+      if (isGasCloudPoi(poi.type)) return true;
+    } else if (miningType === "ice") {
+      if (isIceFieldPoi(poi.type)) return true;
+    } else if (miningType === "radioactive") {
+      if (isOreBeltPoi(poi.type) || !hidden) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build and log a COMPLETE diagnostic of every system the miner evaluated while
+ * searching for a viable target, including the power requirement (supported_power)
+ * of each POI it found and exactly why each was rejected (too sparse for our power,
+ * depleted, blacklisted, coordination full, etc). This produces an auditable, real
+ * picture of what was actually tried so the "not available anywhere in the map"
+ * problem can be diagnosed and fixed with actual data.
+ *
+ * After reporting, the miner enters a deep sleep for the user-configured interval so
+ * it stops hammering the server with repeated failed target searches.
+ */
+async function reportNoViableTargetsAndDeepSleep(
+  ctx: RoutineContext,
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  totalMiningPower: number,
+  blacklist: string[],
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+  botUsername: string | undefined,
+  candidateOres: string[],
+): Promise<void> {
+  const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+  const oreList = [...new Set(candidateOres.filter(Boolean))].sort();
+
+  ctx.log("mining", "══════════════════════════════════════════════════════════════════");
+  ctx.log("mining", "DEEP SLEEP — NO VIABLE MINING TARGET FOUND ANYWHERE IN MAP");
+  ctx.log("mining", `miningType=${miningType} totalMiningPower=${totalMiningPower} deepSleepIntervalMin=${settings.deepSleepIntervalMin}`);
+  ctx.log("mining", `systems tried + power requirement for each (candidate ores: ${oreList.join(", ") || "(none)"})`);
+
+  const reportLines: string[] = [];
+  let systemsTried = 0;
+  let viableCount = 0;
+
+  for (const ore of oreList) {
+    const locs = mapStore.findOreLocations(ore, blacklist, blacklist.length > 0);
+    if (locs.length === 0) {
+      reportLines.push(`  • ore "${ore}": NOT PRESENT ANYWHERE IN MAP`);
+      continue;
+    }
+    const bySystem = new Map<string, any[]>();
+    for (const loc of locs) {
+      if (!bySystem.has(loc.systemId)) bySystem.set(loc.systemId, []);
+      bySystem.get(loc.systemId)!.push(loc);
+    }
+    for (const [sysId, sysLocs] of bySystem) {
+      systemsTried++;
+      const parts: string[] = [];
+      for (const loc of sysLocs) {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+        const powerReq = loc.supportedPower ?? 0;
+        let viable = true;
+        let reason = "";
+
+        if (blacklist.includes(loc.systemId)) {
+          viable = false; reason = "blacklisted system";
+        } else if (poi?.hidden === true) {
+          if (miningType === "radioactive" && !canMineHiddenRadioactive) {
+            viable = false; reason = "hidden POI (no radioactive hidden access)";
+          } else if (miningType === "ice" && !canMineHiddenIce) {
+            viable = false; reason = "hidden POI (no ice hidden access)";
+          }
+        }
+        if (viable && !settings.ignoreDepletion) {
+          const oreEntry = poi?.ores_found?.find((e: any) => e.item_id === ore);
+          if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+            viable = false; reason = "depleted (lockout)";
+          }
+        }
+        if (viable) {
+          const hasScanData = loc.minutesSinceScan !== Infinity;
+          if (hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
+            viable = false; reason = `low remaining (${loc.remaining}) + unknown power`;
+          } else if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            viable = false;
+            reason = `too sparse: our power ${totalMiningPower} > 4x deposit power req ${loc.supportedPower}`;
+          } else if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0) {
+            reason = `power OK (our ${totalMiningPower} <= req ${loc.supportedPower})`;
+          } else if (totalMiningPower > 0) {
+            reason = `no power data (our power ${totalMiningPower})`;
+          } else {
+            reason = "no power data";
+          }
+        }
+        if (viable && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+          if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
+            viable = false; reason = "coordination: system full";
+          }
+        }
+        if (viable) viableCount++;
+        parts.push(`${loc.poiName}(${loc.poiId}) powerReq=${powerReq} → ${viable ? "VIABLE" : "SKIP (" + reason + ")"}`);
+      }
+      reportLines.push(`  • system ${sysId}: ${parts.join(" | ")}`);
+    }
+  }
+
+  for (const line of reportLines) ctx.log("mining", line);
+  ctx.log("mining", `DIAGNOSTIC SUMMARY: systems evaluated=${systemsTried}, viable POIs=${viableCount}, candidate ores=${oreList.length}`);
+  if (viableCount === 0) {
+    ctx.log("mining", "CONFIRMED: zero viable mining locations for this ship anywhere in the map.");
+  }
+  ctx.log("mining", "══════════════════════════════════════════════════════════════════");
+
+  const intervalMin = Math.max(1, settings.deepSleepIntervalMin || 30);
+  const sleepMs = intervalMin * 60 * 1000;
+  ctx.log("mining", `Deep sleeping ${intervalMin} min (user-configured interval) to stop server hammering — will re-evaluate after.`);
+  await ctx.sleep(sleepMs);
+}
+
+/**
  * Survey the current system to reveal hidden POIs.
  * This is required before a bot can travel to a hidden POI it hasn't discovered yet.
  * Returns true if the survey was successful (or already surveyed), false on error.
@@ -791,6 +1157,7 @@ async function surveySystemForHiddenPois(ctx: RoutineContext): Promise<boolean> 
   
   // Survey was successful - update map with newly revealed POIs
   ctx.log("mining", "System surveyed successfully - hidden POIs now accessible");
+  bot.trackSurveyWildlife(surveyResp.result);
   
   // Refresh system info to get the newly revealed POIs
   const { pois: newPois, systemId } = await getSystemInfo(ctx);
@@ -986,33 +1353,68 @@ function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" | "
   return "ore";
 }
 
-/** Pick target resource based on quota deficits. Returns the resource ID with biggest deficit. */
+/** Pick target resource based on quota deficits, considering power constraints. Returns the resource ID with biggest deficit that has viable locations. */
 export function pickTargetFromQuotas(
   quotas: Record<string, number>,
   factionStorage: Array<{ itemId: string; quantity: number }>,
-  miningType: "ore" | "gas" | "ice" | "radioactive"
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  mapStore: any,
+  totalMiningPower: number = 0
 ): string {
-  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
+  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
-      entries.push({ resourceId, deficit, current, target });
+      // Check if this ore has viable locations (not filtered out by power constraints)
+      const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
+      const hasViableLocations = rawLocations.some((loc: any) => {
+        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+          return false;
+        }
+        return true;
+      });
+      entries.push({ resourceId, deficit, current, target, hasViableLocations });
+    }
+  }
+
+  // CRITICAL FIX: Also include ores with no deficit for cycling when all quotas are met
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
+      // Check if this ore has viable locations (not filtered out by power constraints)
+      const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
+      const hasViableLocations = rawLocations.some((loc: any) => {
+        if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+          return false;
+        }
+        return true;
+      });
+      entries.push({ resourceId, deficit, current, target, hasViableLocations });
     }
   }
 
   if (entries.length === 0) return "";
 
-  // Sort: biggest deficit first
-  entries.sort((a, b) => b.deficit - a.deficit);
-  return entries[0].resourceId;
+  const withViable = entries.filter(e => e.hasViableLocations);
+  if (withViable.length > 0) {
+    // Sort: biggest deficit first among viable locations
+    withViable.sort((a, b) => b.deficit - a.deficit);
+    return withViable[0].resourceId;
+  }
+
+  // No viable locations - return empty
+  return "";
 }
 
 /**
  * Find the first quota target that has available locations in the map.
  * Returns the resource ID of the first quota ore that can actually be mined.
+ * @param excludeTarget - Optional ore ID to exclude from the search (for cycling)
  */
 export function findFirstAvailableQuotaTarget(
   quotas: Record<string, number>,
@@ -1023,11 +1425,21 @@ export function findFirstAvailableQuotaTarget(
   depletionTimeoutMs: number,
   canMineHiddenRadioactive: boolean,
   canMineHiddenIce: boolean,
+  excludeTargets?: string | string[],
+  skipPirateSystems?: boolean,
+  totalMiningPower?: number,
+  botUsername?: string,
 ): string {
+  const excludeSet = new Set<string>();
+  if (excludeTargets) {
+    const targets = Array.isArray(excludeTargets) ? excludeTargets : [excludeTargets];
+    targets.forEach(t => excludeSet.add(t));
+  }
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
+    if (excludeSet.has(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
@@ -1035,9 +1447,10 @@ export function findFirstAvailableQuotaTarget(
     }
   }
 
-  // Also include ores with no deficit but still in quotas (for cycling when all quotas met)
+  // Also include ores with no deficit but still in quotas (for cycling when all quotas are met)
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
+    if (excludeSet.has(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
@@ -1052,56 +1465,59 @@ export function findFirstAvailableQuotaTarget(
 
   // Check each ore in priority order to see if it has available locations
   for (const entry of entries) {
-    const rawLocations = mapStore.findOreLocations(entry.resourceId);
+    const rawLocations = mapStore.findOreLocations(entry.resourceId, undefined, skipPirateSystems);
     if (rawLocations.length === 0) {
       continue;
     }
     const poiFiltered = rawLocations.filter((loc: any) => {
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
-      if (!poi) return true; // keep if type unknown
-      if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+      if (!poi) return true;
+      // No filtering by POI type - trust map data for ore/gas/ice types
+      if (miningType === "ore") return true;
       if (miningType === "radioactive") {
         if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-        return isOreBeltPoi(poi.type) || poi.hidden === true;
+        return true;
       }
-      if (miningType === "gas") return isGasCloudPoi(poi.type);
+      if (miningType === "gas") return true;
       if (miningType === "ice") {
         if (poi.hidden === true && !canMineHiddenIce) return false;
-        return isIceFieldPoi(poi.type);
+        return true;
       }
       return true;
     });
-    const depletionFiltered = poiFiltered.filter((loc: any) => {
-      // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)
-      if (settings.ignoreDepletion) {
-        // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining)
-        if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+    // No depletion filtering - trust the map data
+    const depletionFiltered = poiFiltered;
+
+  // Apply power filter to ensure locations aren't rejected later as "too sparse"
+    const powerFiltered = depletionFiltered.filter((loc: any) => {
+      // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+      // This prevents high-power miners from wasting time on low-density deposits
+      const hasScanData = loc.minutesSinceScan !== Infinity;
+      const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+      if (isLowRemainingWithUnknownPower) {
+        return false;
+      }
+      // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+      if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        return false;
+      }
+      if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+        if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
           return false;
         }
-        return true;
       }
-      const sys = mapStore.getSystem(loc.systemId);
-      const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
-      // Check both ores_found (mining history) AND resources (scan data) for depletion status
-      // Hidden POIs often only have data in resources (from get_poi scans)
-      const oreEntry = poi?.ores_found.find((o: any) => o.item_id === entry.resourceId);
-      const resourceEntry = poi?.resources?.find((r: any) => r.resource_id === entry.resourceId);
-      // If resourceEntry exists and shows depleted, check expiry
-      if (resourceEntry?.depleted) {
-        return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
-      }
-      // Otherwise check ores_found depletion
-      if (!oreEntry?.depleted) return true;
-      // Depleted but expired - can re-check
-      return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+      return true;
     });
 
-    if (depletionFiltered.length > 0) {
+    if (powerFiltered.length > 0) {
       return entry.resourceId;
     }
   }
 
+  // No ores have available locations - return empty string
+  // This signals to the caller that no targets are available
+  // The caller will then try the next ore in the quota list on the next cycle
   return "";
 }
 
@@ -1109,34 +1525,69 @@ export function findFirstAvailableQuotaTarget(
  * Enhanced quota picker that always returns a target, even when all quotas are met.
  * When all quotas are met, picks the resource closest to deficit (smallest surplus).
  * This ensures the miner keeps cycling through ores based on quota priorities.
+ * Also verifies the target has viable locations for the miner's power level.
  */
 function pickTargetFromQuotasOrClosest(
   quotas: Record<string, number>,
   factionStorage: Array<{ itemId: string; quantity: number }>,
-  miningType: "ore" | "gas" | "ice" | "radioactive"
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  mapStore: any,
+  totalMiningPower: number = 0,
+  settings?: Awaited<ReturnType<typeof getMinerSettings>>,
+  botUsername?: string,
 ): { target: string; hasDeficit: boolean } {
-  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
+  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
-    entries.push({ resourceId, deficit, current, target });
+    
+    // Check if this ore has viable locations using the same filters as the main location search
+    // This prevents picking targets that will fail when actually searching for POIs
+    const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
+    const hasViableLocations = rawLocations.some((loc: any) => {
+      // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+      const hasScanData = loc.minutesSinceScan !== Infinity;
+      const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+      if (isLowRemainingWithUnknownPower) {
+        return false;
+      }
+      
+      // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+      if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        return false;
+      }
+      
+      // Coordination: reject systems that are already at max bot capacity
+      if (settings && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+        if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
+          return false;
+        }
+      }
+      
+      return true;
+    });
+    
+    entries.push({ resourceId, deficit, current, target, hasViableLocations });
   }
 
-  if (entries.length === 0) return { target: "", hasDeficit: false };
-
-  // Check if any have deficit
-  const withDeficit = entries.filter(e => e.deficit > 0);
-  if (withDeficit.length > 0) {
-    // Sort: biggest deficit first
-    withDeficit.sort((a, b) => b.deficit - a.deficit);
-    return { target: withDeficit[0].resourceId, hasDeficit: true };
+  // First, try ores with deficit that have viable locations
+  const withDeficitAndViable = entries.filter(e => e.deficit > 0 && e.hasViableLocations);
+  if (withDeficitAndViable.length > 0) {
+    withDeficitAndViable.sort((a, b) => b.deficit - a.deficit);
+    return { target: withDeficitAndViable[0].resourceId, hasDeficit: true };
+  }
+  
+  // If no deficit ores have viable locations, check surplus ores for viable locations
+  const withSurplusAndViable = entries.filter(e => e.deficit <= 0 && e.hasViableLocations);
+  if (withSurplusAndViable.length > 0) {
+    withSurplusAndViable.sort((a, b) => a.deficit - b.deficit); // smallest surplus first
+    return { target: withSurplusAndViable[0].resourceId, hasDeficit: false };
   }
 
-  // All quotas met - pick the one with smallest surplus (closest to needing more)
-  entries.sort((a, b) => a.deficit - b.deficit); // smallest surplus first (most negative deficit)
-  return { target: entries[0].resourceId, hasDeficit: false };
+  // No viable locations - return empty to signal pause
+  return { target: "", hasDeficit: false };
 }
 
 /** Find appropriate POI based on mining type. */
@@ -1149,14 +1600,28 @@ function findMiningPoi(
 ): { id: string; name: string } | null {
   const checkOreAvailable = (storedPoi: any, target: string) => {
     if (!target) return true;
-    const oreEntry = storedPoi?.ores_found.find((o: any) => o.item_id === target);
+    const oreEntry = storedPoi?.ores_found?.find((o: any) => o.item_id === target);
+    const resourceEntry = storedPoi?.resources?.find((r: any) => r.resource_id === target);
+    
+    // CRITICAL FIX: If resources data exists (from get_poi scans), check resources first.
+    // Only fall back to ores_found if there's no resources data for this POI.
+    // This prevents death loops when the ore is no longer at a POI but mining history exists.
+    const hasResourcesData = storedPoi?.resources !== undefined && storedPoi?.resources.length > 0;
+    if (hasResourcesData) {
+      // We have scan data - ore must be in resources to be available
+      if (!resourceEntry) return false;
+      // Check resources depletion
+      if (!resourceEntry.depleted) return true;
+      return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+    }
+    
+    // Fall back to ores_found (from mining history)
     if (!oreEntry) return false;
-    if (!depletionTimeoutMs) return true; // If no timeout provided, don't check depletion
     if (!oreEntry.depleted) return true;
     return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
   };
 
-  if (miningType === "ice") {
+if (miningType === "ice") {
     // Ice mining
     if (targetResource) {
       for (const poi of pois) {
@@ -1177,7 +1642,11 @@ function findMiningPoi(
     // Radioactive mining - uses ore belts (and hidden POIs if has deep core extractor)
     if (targetResource) {
       for (const poi of pois) {
-        const isMatchingPoi = isOreBeltPoi(poi.type) || (allowHiddenPois && poi.hidden === true);
+        const isOreBelt = isOreBeltPoi(poi.type) || 
+                          (poi.name && (poi.name.toLowerCase().includes('belt') || 
+                                        poi.name.toLowerCase().includes('mineral field') ||
+                                        poi.name.toLowerCase().includes('asteroid')));
+        const isMatchingPoi = isOreBelt || (allowHiddenPois && poi.hidden === true);
         if (isMatchingPoi) {
           const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
           const storedPoi = sysData?.pois.find((p: any) => p.id === poi.id);
@@ -1189,15 +1658,21 @@ function findMiningPoi(
       return null; // No POI with target ore available
     }
     // Fallback: any ore belt (or hidden POI if available)
-    const oreBelt = pois.find(p => isOreBeltPoi(p.type) || (allowHiddenPois && p.hidden === true));
+    const oreBelt = pois.find(p => {
+      const isOreBelt = isOreBeltPoi(p.type) || 
+                        (p.name && (p.name.toLowerCase().includes('belt') || 
+                                    p.name.toLowerCase().includes('mineral field') ||
+                                    p.name.toLowerCase().includes('asteroid')));
+      return isOreBelt || (allowHiddenPois && p.hidden === true);
+    });
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
-    // Ore mining
+    // Ore mining - trust map data, only filter by hidden status
     if (targetResource) {
       for (const poi of pois) {
-        const isAllowedPoi = isOreBeltPoi(poi.type) ||
-                            (allowHiddenPois && poi.hidden === true) ||
-                            (poi.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id));
+        const isAllowedPoi = !poi.hidden ||
+                              (allowHiddenPois && poi.hidden === true) ||
+                              (poi.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id));
         if (isAllowedPoi) {
           const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
           const storedPoi = sysData?.pois.find((p: any) => p.id === poi.id);
@@ -1208,14 +1683,12 @@ function findMiningPoi(
       }
       return null; // No POI with target ore available
     }
-    // Fallback: any ore belt
-    const oreBelt = pois.find(p => {
-      const isAllowedPoi = isOreBeltPoi(p.type) ||
-                          (allowHiddenPois && p.hidden === true) ||
-                          (p.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(p.id));
-      return isAllowedPoi;
+    // Fallback: any non-hidden POI (or hidden POI if allowed)
+    const orePoi = pois.find(p => {
+      return !p.hidden || (allowHiddenPois && p.hidden === true) ||
+             (p.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(p.id));
     });
-    return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
+    return orePoi ? { id: orePoi.id, name: orePoi.name } : null;
   } else {
     // Gas harvesting
     if (targetResource) {
@@ -1318,7 +1791,7 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
     ctx.log("warn", `Failed to cache ship modules: ${shipResp.error.message}`);
     return null;
   }
-  const shipData = shipResp.result as Record<string, unknown>;
+  const shipData = (shipResp.result || {}) as Record<string, unknown>;
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   if (modules.length === 0) {
     ctx.log("warn", "Ship modules not returned from get_ship — server may still be processing");
@@ -1326,6 +1799,174 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
   }
   ctx.log("system", `Cached ${modules.length} ship modules for routine use`);
   return modules;
+}
+
+/**
+ * Miner resupply: ammo from faction storage, fuel cells, and repair kits.
+ * Called when docked at home base to ensure weapons are loaded and supplies are stocked.
+ */
+async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+
+  if (!bot.docked) {
+    ctx.log("trade", "Not docked - cannot resupply");
+    return;
+  }
+
+  await bot.refreshLocation();
+  await bot.refreshCargo();
+
+  const weapons = await getWeaponModules(ctx);
+  ctx.log("debug", `Miner resupply: detected ${weapons.length} weapons`);
+
+  for (const w of weapons) {
+    ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
+  }
+
+  const weaponAmmoTypes = new Set<string>();
+  for (const w of weapons) {
+    if (w.ammoType && w.ammoType !== "none") {
+      weaponAmmoTypes.add(w.ammoType);
+    }
+  }
+
+  let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
+  if (freeSpace < 5) {
+    ctx.log("trade", "Cargo almost full — skipping resupply");
+    return;
+  }
+
+  const currentRepair = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentFuel = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("fuel_cell"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentShield = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  for (const ammoType of weaponAmmoTypes) {
+    const ammoIndex = catalogStore.getAmmoTypeIndex();
+    const possibleAmmo = ammoIndex[ammoType] || [];
+    ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
+
+    if (possibleAmmo.length === 0) {
+      ctx.log("trade", `No catalog options for ${ammoType} — skipping`);
+      continue;
+    }
+
+    const currentAmmoForType = bot.inventory
+      .filter(i => possibleAmmo.includes(i.itemId))
+      .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+    const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
+    const maxAmmoForType = weaponsUsingThisAmmo.length > 0
+      ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0))
+      : 0;
+    let ammoToGet: number;
+    if (maxAmmoForType > 50) {
+      ammoToGet = Math.max(0, 20 - currentAmmoForType);
+    } else if (maxAmmoForType > 0) {
+      ammoToGet = Math.max(0, 40 - currentAmmoForType);
+    } else {
+      ammoToGet = Math.max(0, 30 - currentAmmoForType);
+    }
+
+    let chosenAmmoId: string | null = null;
+    const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
+    if (loadedAmmo && loadedAmmo.loadedAmmoId) {
+      chosenAmmoId = loadedAmmo.loadedAmmoId;
+      ctx.log("debug", `Preferring currently loaded ammo: ${chosenAmmoId}`);
+    } else {
+      chosenAmmoId = possibleAmmo[0];
+    }
+
+    if (!chosenAmmoId) {
+      ctx.log("trade", `No suitable ammo found for ${ammoType} — skipping`);
+      continue;
+    }
+
+    const ammoOrder = chosenAmmoId && possibleAmmo.includes(chosenAmmoId)
+      ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
+      : possibleAmmo;
+    for (const ammoId of ammoOrder) {
+      const ammoSize = getItemSize(ammoId);
+      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (actualQty <= 0) {
+        continue;
+      }
+
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: ammoId,
+        quantity: actualQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
+        freeSpace -= actualQty * ammoSize;
+        break;
+      } else {
+        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${wResp.error.message}`);
+      }
+    }
+  }
+
+  const desiredRepair = 12;
+  const repairToGet = Math.max(0, desiredRepair - currentRepair);
+  if (repairToGet > 0) {
+    const kitQty = Math.min(repairToGet, Math.floor(freeSpace / getItemSize("repair_kit")));
+    if (kitQty > 0) {
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: "advanced_repair_kit",
+        quantity: kitQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${kitQty} advanced_repair_kit from faction storage`);
+        freeSpace -= kitQty * getItemSize("advanced_repair_kit");
+      }
+    }
+  }
+
+  const desiredShield = 20;
+  const shieldToGet = Math.max(0, desiredShield - currentShield);
+  if (shieldToGet > 0 && freeSpace >= getItemSize("shield_charge")) {
+    const shQty = Math.min(shieldToGet, Math.floor(freeSpace / getItemSize("shield_charge")));
+    if (shQty > 0) {
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: "shield_charge",
+        quantity: shQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
+      }
+    }
+  }
+
+  const settings = await getMinerSettings();
+  const desiredWarp = settings.desiredEmergencyWarpDevices ?? 3;
+  const currentWarp = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const warpToGet = Math.max(0, desiredWarp - currentWarp);
+  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "emergency_warp_device",
+      quantity: warpToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
+    }
+  }
 }
 
 // ── Deep core mining efficiency helpers ───────────────────────────────────
@@ -1343,8 +1984,9 @@ function findBestHiddenPoiForOre(
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
   minRichness: number = 50, // Only consider POIs with richness >= this
-): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean } | null {
-  const locations = mapStore.findOreLocations(oreId).filter(loc => {
+  blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
+): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean; supportedPower: number } | null {
+  const locations = mapStore.findOreLocations(oreId, blacklist, blacklist.length === 0).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
     
@@ -1373,14 +2015,13 @@ function findBestHiddenPoiForOre(
   if (locations.length === 0) return null;
 
   // Score and sort by distance and richness
-  const blacklist = getSystemBlacklist();
   const scored = locations
-    .map(loc => {
-      const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
-      return { ...loc, jumps: route ? route.length - 1 : 999 };
-    })
-    .filter(loc => loc.jumps <= maxJumps)
-    .sort((a, b) => {
+.map(loc => {
+       const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
+       return { ...loc, jumps: route ? route.length - 1 : 999 };
+     })
+     .filter(loc => loc.jumps <= maxJumps)
+     .sort((a, b) => {
       // Prefer current system
       if (a.systemId === currentSystem && b.systemId !== currentSystem) return -1;
       if (b.systemId === currentSystem && a.systemId !== currentSystem) return 1;
@@ -1403,6 +2044,7 @@ function findBestHiddenPoiForOre(
     remaining: chosen.remaining,
     jumps: chosen.jumps,
     isHidden: true,
+    supportedPower: chosen.supportedPower,
   };
 }
 
@@ -1417,7 +2059,7 @@ function areAllHiddenPoisDepleted(
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
 ): boolean {
-  const allHiddenLocations = mapStore.findOreLocations(oreId).filter(loc => {
+  const allHiddenLocations = mapStore.findOreLocations(oreId, undefined, true).filter(loc => {
     // Skip current POI
     if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
     
@@ -1478,9 +2120,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // ── Cache ship modules at routine start ──
    // This avoids repeated get_ship calls that may return incomplete data
    // when the server is still processing (e.g. after a jump timeout).
-   let cachedModules: unknown[] | null = await cacheShipModules(ctx);
+    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
-   // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
+    // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
    // This handles the case where get_ship returns empty data due to server lag
    if (!cachedModules || cachedModules.length === 0) {
      ctx.log("warn", "Ship modules empty at startup — waiting for server to process...");
@@ -1506,13 +2148,32 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let lastEscortLocationBroadcast = 0;
 
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
-   ctx.log("miner", "Refreshing faction storage at startup...");
-   await bot.refreshFactionStorage();
+    ctx.log("miner", "Refreshing faction storage at startup...");
+    await bot.refreshFactionStorage();
+
+    // ── Wait for map to be seeded if needed ──
+   // The galaxy map is seeded asynchronously from the public API.
+   // If the map is empty, we need to wait for it to be populated.
+   if (!mapStore.isMapSeeded()) {
+     ctx.log("mining", "Map not yet seeded - waiting for galaxy map data...");
+     let waitCount = 0;
+     while (!mapStore.isMapSeeded() && waitCount < 10) {
+       await ctx.sleep(2000);
+       waitCount++;
+     }
+     if (!mapStore.isMapSeeded()) {
+       ctx.log("warn", "Map still not seeded after waiting - will rely on exploration data");
+     } else {
+       ctx.log("mining", "Map seeded successfully - continuing with mining");
+     }
+   }
 
    // ── Mining session recovery ──
    const activeSession = getActiveMiningSession(bot.username);
-   let recoveredSession: MiningSession | null = null;
+    let recoveredSession: MiningSession | null = null;
   let sessionWasReturningHome = false;
+  // Last time we refreshed our coordination registration (heartbeat) while resuming a session
+  let lastCoordinationHeartbeat = 0;
   if (activeSession) {
     ctx.log("mining", `Found incomplete mining session: ${activeSession.targetResourceName} (${activeSession.state})`);
     
@@ -1522,7 +2183,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Validate session - check if target resource is still valid
     if (activeSession.targetResourceId) {
-      const locations = mapStore.findOreLocations(activeSession.targetResourceId);
+      const locations = mapStore.findOreLocations(activeSession.targetResourceId, [], true);
       if (locations.length > 0) {
         // Also check if we have equipment for this resource type
         const sessionMiningType = getMiningTypeForResource(activeSession.targetResourceId);
@@ -1549,65 +2210,141 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("error", "Session invalid: no target resource - abandoning");
       await failMiningSession(bot.username, "No target resource");
     }
-  }
+}
 
-   // ── Startup: accept missions ──
-   await completeActiveMissions(ctx);
-   await checkAndAcceptMinerMissions(ctx);
+    // ── Startup: accept missions ──
+    await completeActiveMissions(ctx);
+    await checkAndAcceptMinerMissions(ctx);
 
-   // ── Startup: unload cargo if docked at home with existing cargo ──
-   if (bot.docked && bot.system === homeSystem) {
-     await bot.refreshCargo();
-     const nonFuelCargo = bot.inventory.filter(
-       i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
-     );
-     if (nonFuelCargo.length > 0) {
-       ctx.log("mining", `Startup: found ${nonFuelCargo.length} cargo items docked at home — unloading`);
-       await dumpCargo(ctx, settings0);
-     }
-   }
-
-  while (bot.state === "running") {
-    // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
-    // ── Refresh cached ship modules after death recovery ──
-    // (modules could change if ship was destroyed and replaced)
-    cachedModules = await cacheShipModules(ctx);
-    
-    // CRITICAL FIX: If modules are empty after death recovery, wait and retry
-    if (!cachedModules || cachedModules.length === 0) {
-      ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
-      let retryCount = 0;
-      while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
-        await ctx.sleep(2000);
-        cachedModules = await cacheShipModules(ctx);
-        retryCount++;
-      }
-      if (!cachedModules || cachedModules.length === 0) {
-        ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
-        await ctx.sleep(30000);
-        continue;
+    // ── Startup: unload cargo if docked at home with existing cargo ──
+    if (bot.docked && bot.system === homeSystem) {
+      await bot.refreshCargo();
+      const nonFuelCargo = bot.inventory.filter(
+        i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
+      );
+      if (nonFuelCargo.length > 0) {
+        ctx.log("mining", `Startup: found ${nonFuelCargo.length} cargo items docked at home — unloading`);
+        await dumpCargo(ctx, settings0);
       }
     }
 
-    // ── Battle state tracking (per-cycle initialization) ──
-    const battleState: BattleState = {
-      inBattle: false,
-      battleId: null,
-      battleStartTick: null,
-      lastHitTick: null,
-      isFleeing: false,
-    };
+// ── Startup: Enable cloaking if configured and module available ──
+    // Best practice: manually undock before cloaking to have full control over state
+    // This avoids race conditions with auto-undock and ensures we can re-dock for resupply
+    let wasCloakingAttempted = false;
+    if (settings0.enableCloak && bot.docked && !bot.isCloaked) {
+      ctx.log("mining", "Manually undocking before cloaking to control state...");
+      const undockResp = await bot.exec("undock");
+      await ctx.sleep(500);
+      await bot.refreshShip();
+    }
+    
+    if (settings0.enableCloak) {
+      const cloaked = await enableCloakingIfPossible(ctx, cachedModules);
+      if (cloaked) {
+        ctx.log("mining", "Cloaking enabled - bot is now invulnerable to attacks");
+        wasCloakingAttempted = true;
+      }
+    }
 
-    const settings = await getMinerSettings(bot.username);
-    const cargoThresholdRatio = settings.cargoThreshold / 100;
-    const safetyOpts = {
-      fuelThresholdPct: settings.refuelThreshold,
-      hullThresholdPct: settings.repairThreshold,
-    };
-    const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+    // ── Startup: Refuel if docked (cloaking indicates docked status) ──
+    // If cloaking was just enabled or bot is already cloaked, we're docked - refuel
+    const isDocked = bot.docked || bot.isCloaked;
+    if (isDocked) {
+      ctx.log("mining", "Bot is docked - checking fuel at startup");
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+    }
+
+    // ── Startup: Ensure ammo loaded for miners with weapons (if docked) ──
+    // Miner ships often have weapons that need ammo loaded before combat
+    // When docked at home system, also withdraw ammo from faction storage
+    if (wasCloakingAttempted && homeSystem && bot.system === homeSystem && !bot.docked) {
+      ctx.log("mining", "Re-docking at home station for resupply after cloaking");
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error) {
+        bot.docked = true;
+        ctx.log("mining", "Re-docked at home station");
+      }
+    }
+
+    if (bot.docked) {
+      const weapons = await getWeaponModules(ctx);
+      if (weapons.length > 0) {
+        ctx.log("mining", `Startup: checking ammo for ${weapons.length} weapon(s) at dock`);
+        
+        if (bot.system === homeSystem) {
+          await ensureMinerResupply(ctx);
+        }
+        
+        const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+        if (!hasAmmo) {
+          ctx.log("warn", "Startup: low on weapon ammo — will resupply at station");
+        }
+      }
+    }
+
+    while (bot.state === "running") {
+      // ── Death recovery ──
+      const alive = await detectAndRecoverFromDeath(ctx);
+      if (!alive) { yield "death_recovery_wait"; await ctx.sleep(30000); continue; }
+
+      // ── Refresh cached ship modules after death recovery ──
+      // (modules could change if ship was destroyed and replaced)
+      cachedModules = await cacheShipModules(ctx);
+
+      // CRITICAL FIX: If modules are empty after death recovery, wait and retry
+      if (!cachedModules || cachedModules.length === 0) {
+        ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
+        let retryCount = 0;
+        while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
+          await ctx.sleep(2000);
+          cachedModules = await cacheShipModules(ctx);
+          retryCount++;
+        }
+        if (!cachedModules || cachedModules.length === 0) {
+          ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+
+      // ── Compute total mining power for quota target selection ──
+       const totalMiningPower = getTotalMiningPower(cachedModules || []);
+       
+       // ── CRITICAL FIX: Early fuel check at start of cycle ──
+      // This prevents the miner from starting routine operations with low fuel
+      await bot.refreshShip();
+      const earlyFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (earlyFuelPct < settings0.refuelThreshold) {
+        ctx.log("system", `Early fuel check: ${earlyFuelPct}% fuel — ensuring fueled before starting cycle`);
+        const earlyFueled = await ensureFueled(ctx, settings0.refuelThreshold);
+        if (!earlyFueled) {
+          ctx.log("error", "Cannot refuel at routine start — waiting 30s before retry");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+
+      // ── Battle state tracking (per-cycle initialization) ──
+      const battleState: BattleState = {
+        inBattle: false,
+        battleId: null,
+        battleStartTick: null,
+        lastHitTick: null,
+        isFleeing: false,
+      };
+
+      const settings = await getMinerSettings(bot.username);
+      const cargoThresholdRatio = settings.cargoThreshold / 100;
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+        skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+      };
+      const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+      
+      // Get blacklist - use empty if cloaked and cloakIgnoreBlacklist enabled
+      const blacklist = getMiningBlacklist(settings, bot.isCloaked);
 
     // ── Flock state heartbeat for leader ──
     // Update flock state file immediately at cycle start if we're the leader
@@ -1987,6 +2724,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const hasGlobalTarget = !!targetResource;
     if (hasGlobalTarget) {
       ctx.log("mining", `Global ${resourceLabel} target configured: ${targetResource} — overriding quotas`);
+    } else {
+      ctx.log("debug", `No global target configured for ${miningType} mining — targetResource is empty (global targetGas="${settings.targetGas}", targetOre="${settings.targetOre}", targetIce="${settings.targetIce}", targetRadioactive="${settings.targetRadioactive}", targetDeepCore="${settings.targetDeepCore}")`);
     }
 
     // CRITICAL FIX: Always refresh faction storage before quota evaluation
@@ -2000,39 +2739,33 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // (also refreshed above when docked at home, but ensure it's fresh here too)
       await bot.refreshFactionStorage();
 
-      // When docked at home, use enhanced selection that always picks a target
-      // This ensures the miner keeps cycling through ores even when all quotas are met
-      if (bot.docked && bot.system === homeSystem) {
-        const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType);
-        quotaTargetResource = quotaResult.target;
-        quotaHasDeficit = quotaResult.hasDeficit;
-        if (quotaTargetResource) {
-          if (quotaHasDeficit) {
-            ctx.log("mining", `Quota pick: ${quotaTargetResource} (has deficit)`);
+// When docked at home, use enhanced selection that always picks a target
+       // This ensures the miner keeps cycling through ores even when all quotas are met
+       if (bot.docked && bot.system === homeSystem) {
+          const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username);
+         quotaTargetResource = quotaResult.target;
+         quotaHasDeficit = quotaResult.hasDeficit;
+         if (quotaResult.target) {
+           if (quotaHasDeficit) {
+             ctx.log("mining", `Quota pick: ${quotaResult.target} (has deficit)`);
+           } else {
+             ctx.log("mining", `Quota cycling: ${quotaResult.target} (all met, smallest surplus)`);
+           }
+           // pickTargetFromQuotasOrClosest already verified locations are viable
+         } else if (Object.keys(quotas).length > 0) {
+           ctx.log("mining", `No quota target has viable locations for current mining power (${totalMiningPower}) — will skip quota mining this cycle`);
+           quotaTargetResource = "";
+         }
+} else {
+          // Original behavior when not at home
+          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower);
+          if (quotaTargetResource) {
+            ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           } else {
-            ctx.log("mining", `Quota cycling: ${quotaTargetResource} (all met, smallest surplus)`);
+            ctx.log("mining", "No quota target with viable locations — no quota target selected");
           }
-          const pickLocations = mapStore.findOreLocations(quotaTargetResource);
-          if (pickLocations.length === 0) {
-            ctx.log("warn", `Quota pick "${quotaTargetResource}" has no recorded locations in map — skipping, will mine without specific target`);
-            quotaTargetResource = "";
-          }
-        }
-      } else {
-        // Original behavior when not at home
-        quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-        if (quotaTargetResource) {
-          ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
-          const pickLocations = mapStore.findOreLocations(quotaTargetResource);
-          if (pickLocations.length === 0) {
-            ctx.log("warn", `Quota pick "${quotaTargetResource}" has no recorded locations in map — clearing quota target`);
-            quotaTargetResource = "";
-          }
-        } else {
-          ctx.log("mining", "All quotas met — no quota target selected");
         }
       }
-    }
 
     const priorityTarget = hasGlobalTarget ? targetResource : quotaTargetResource;
 
@@ -2052,10 +2785,36 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         let shouldAbandon = false;
         let reason = "";
 
+        // (1) Register our current system with coordination on resume so the per-system
+        //     bot count reflects reality. Without this, recovered sessions never re-register
+        //     (the registration only happens on fresh target selection), so the cap is never
+        //     enforced against the already-deployed fleet. Throttled to a 60s heartbeat so we
+        //     don't rewrite the coordination file on every loop.
+        if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && bot.username && recoveredSession.targetSystemId) {
+          const now = Date.now();
+          if (now - lastCoordinationHeartbeat > 60000) {
+            registerCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+            lastCoordinationHeartbeat = now;
+          }
+        }
+
         // If there's a priority target (global or quota) that differs from session target, abandon session
         if (priorityTarget && sessionTarget !== priorityTarget) {
           shouldAbandon = true;
           reason = hasGlobalTarget ? `global target override (${targetResource})` : `quota priority changed (${quotaTargetResource})`;
+        }
+
+        // CRITICAL FIX: If the current POI doesn't have the target resource, abandon the recovered session.
+        // This handles the case where broader search found a new target in a different location.
+        if (!shouldAbandon && recoveredSession && bot.poi && bot.system !== recoveredSession.targetSystemId) {
+          const sysData = mapStore.getSystem(bot.system);
+          const currentPoi = sysData?.pois.find(p => p.id === bot.poi);
+          const hasTargetResource = currentPoi?.resources?.some(r => r.resource_id === sessionTarget) ||
+                                   currentPoi?.ores_found?.some(o => o.item_id === sessionTarget);
+          if (!hasTargetResource) {
+            shouldAbandon = true;
+            reason = `no longer in target system (${recoveredSession.targetSystemId}), found alternative target`;
+          }
         }
 
         // CRITICAL FIX: If quotas are now all met (no quota target), but session target's quota is now met,
@@ -2071,11 +2830,25 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        if (shouldAbandon) {
-          ctx.log("mining", `Abandoning recovered session: ${reason}`);
-          await failMiningSession(bot.username, reason);
-          recoveredSession = null;
-        } else {
+        // (2) Coordination: if the recovered session's system is already at/over the per-system
+        //     bot cap, abandon the session so this bot relocates to a non-overcrowded system.
+        //     Self is excluded from the count, so only the 4th+ bot occupying a system relocates.
+        if (!shouldAbandon && settings.enableCoordination && settings.maxBotsPerSystem > 0 && bot.username) {
+          if (isSystemOvercrowded(recoveredSession.targetSystemId, settings.maxBotsPerSystem, bot.username)) {
+            shouldAbandon = true;
+            reason = `coordination: system ${recoveredSession.targetSystemId} over capacity (max ${settings.maxBotsPerSystem} bots per system)`;
+          }
+        }
+
+if (shouldAbandon) {
+           ctx.log("mining", `Abandoning recovered session: ${reason}`);
+           // Unregister from coordination before failing session
+           if (settings.enableCoordination) {
+             unregisterCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+           }
+           await failMiningSession(bot.username, reason);
+           recoveredSession = null;
+         } else {
           ctx.log("mining", `Resuming recovered session: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
           
           // CRITICAL FIX: Check cargo BEFORE deciding to continue mining
@@ -2218,7 +2991,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           effectiveTarget = settings.targetDeepCore;
         } else {
           ctx.log("mining", "Searching for available deep core ore targets...");
-          const blacklist = getSystemBlacklist();
           let foundDeepCoreTarget = false;
 
           // CRITICAL FIX: When quotas are configured for deep core ores, use quota priority
@@ -2287,7 +3059,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // Try each deep core ore to find an available target
           for (const deepCoreOre of oresToCheck) {
-            const locations = mapStore.findOreLocations(deepCoreOre).filter(loc => {
+            const locations = mapStore.findOreLocations(deepCoreOre, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               // Deep core ores are in hidden POIs, so check for ore belts (they might be hidden)
@@ -2307,13 +3079,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
             if (locations.length > 0) {
               // Score locations and pick best one
-              const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
-                .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
-                .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                  return { ...loc, jumps: route ? route.length - 1 : 999 };
-                })
-          .filter(loc => loc.jumps <= maxJumps || isDeepCoreOre(effectiveTarget));
+const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
+                 .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+                 .map(loc => {
+                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                   return { ...loc, jumps: route ? route.length - 1 : 999 };
+                 })
+             .filter(loc => loc.jumps <= maxJumps || isDeepCoreOre(effectiveTarget));
 
               if (scoredLocations.length > 0) {
                 const chosen = scoredLocations[0];
@@ -2332,8 +3104,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           if (!foundDeepCoreTarget) {
-            ctx.log("error", "No deep core ore targets found — waiting 60s before retry");
-            await ctx.sleep(60000);
+            ctx.log("error", "No deep core ore targets found anywhere in map");
+            const candidateOres = oresToCheck && oresToCheck.length > 0 ? oresToCheck : Object.keys(quotas);
+            await reportNoViableTargetsAndDeepSleep(
+              ctx, settings, "ore", totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+            );
             continue;
           }
         }
@@ -2407,6 +3183,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "get_status";
     await bot.refreshShip();
 
+    // ── Cloak status check ──
+    // Verify bot is still cloaked (cloak can expire or be lost).
+    // If not cloaked and cloaking is enabled with fuel available, re-enable cloak.
+    // Skip check if bot has 0 fuel to avoid getting stuck.
+    if (settings0.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+      ctx.log("mining", "Cloak check: not cloaked, attempting to re-enable...");
+      const cloaked = await enableCloakingIfPossible(ctx, cachedModules || undefined);
+      if (cloaked) {
+        ctx.log("mining", "Cloaking re-enabled successfully");
+      } else {
+        ctx.log("warn", "Cloaking re-enable failed or not possible");
+      }
+    }
+
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
@@ -2429,60 +3219,59 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     await ensureUndocked(ctx);
 
-    // ── Determine mining destination ──
-    yield "find_destination";
+// ── Determine mining destination ──
+     yield "find_destination";
+     ctx.log("mining", `Equipment total mining power: ${totalMiningPower}`);
     // targetSystemId, targetPoiId, targetPoiName already declared above
 
     // Smart system selection: check the matching mining type first, but fall back
-    // to other fields or legacy `system` setting if not configured.
+    // to other fields for non-ice mining. Ice mining uses `system` as fallback for local mining.
     let configuredSystem = "";
     if (miningType === "ice") {
       configuredSystem = settings.systemIce || settings.systemOre || settings.systemGas || settings.system || "";
     } else if (miningType === "ore") {
       // Check if mining deep core ore - use systemDeepCore if set
       if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
-        configuredSystem = settings.systemDeepCore || settings.systemOre || settings.system || "";
+        configuredSystem = settings.systemDeepCore || settings.systemOre || settings.systemGas || "";
       } else {
-        configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
+        configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || "";
       }
     } else if (miningType === "radioactive") {
-      configuredSystem = settings.systemRadioactive || settings.systemOre || settings.systemGas || settings.system || "";
+      configuredSystem = settings.systemRadioactive || settings.systemOre || settings.systemGas || "";
     } else {
       // gas
-      configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";
+      configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || "";
     }
 
-    if (configuredSystem) {
+if (configuredSystem) {
       ctx.log("mining", `Configured harvesting system for ${miningType}: ${configuredSystem}`);
     }
 
-if (effectiveTarget) {
-  // Get current system POIs for local mining
-  const { pois: currentPois } = await getSystemInfo(ctx);
-
-  // Survey system for hidden POIs if radioactive mining with hidden capability
-  if (miningType === "radioactive" && canMineHiddenRadioactive) {
-    await surveySystemForHiddenPois(ctx);
-  }
-      const allLocations = mapStore.findOreLocations(effectiveTarget);
+    if (effectiveTarget) {
+      const { pois: currentPois } = await getSystemInfo(ctx);
+      // Survey system for hidden POIs if radioactive mining with hidden capability
+      if (miningType === "radioactive" && canMineHiddenRadioactive) {
+        await surveySystemForHiddenPois(ctx);
+      }
+const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
+      
       // Filter to matching POI type only (skip depleted)
       const locations = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
-        if (!poi) return true; // keep if type unknown
-        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (!poi) return true;
+        // Only filter by hidden status - trust map data
+        if (miningType === "ore") return true;
         if (miningType === "radioactive") {
-          if (poi.hidden === true && !canMineHiddenRadioactive) {
-            return false;
-          }
-          return isOreBeltPoi(poi.type) || poi.hidden === true;
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
         }
-        if (miningType === "gas") return isGasCloudPoi(poi.type);
+        if (miningType === "gas") {
+          return true;
+        }
         if (miningType === "ice") {
-          if (poi.hidden === true && !canMineHiddenIce) {
-            return false;
-          }
-          return isIceFieldPoi(poi.type);
+          if (poi.hidden === true && !canMineHiddenIce) return false;
+          return true;
         }
         return true;
       }).filter(loc => {
@@ -2498,12 +3287,98 @@ if (effectiveTarget) {
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
         if (!oreEntry?.depleted) return true;
-        // Depleted but expired - can re-check
+// Depleted but expired - can re-check
+         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+       }).filter(loc => {
+         // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+         // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+         const hasScanData = loc.minutesSinceScan !== Infinity;
+         const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+         if (isLowRemainingWithUnknownPower) {
+           return false;
+         }
+         // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+         if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+           return false;
+         }
+         // Coordination: reject systems that are already at max bot capacity
+         if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+           if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+             return false;
+           }
+         }
+         return true;
+       });
+
+       const afterPoiFilter = allLocations.filter(loc => {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        if (!poi) return true;
+        // Only filter by hidden status - trust map data
+        if (miningType === "ore") return true;
+        if (miningType === "radioactive") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
+        }
+        if (miningType === "gas") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          return true;
+        }
+        if (miningType === "ice") {
+          if (poi.hidden === true && !canMineHiddenIce) return false;
+          return true;
+        }
+        return true;
+      });
+      const afterDepletionFilter = afterPoiFilter.filter(loc => {
+        if (settings.ignoreDepletion) {
+          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+            return false;
+          }
+          return true;
+        }
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry?.depleted) return true;
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       });
+      const afterPowerFilter = afterDepletionFilter.filter(loc => {
+        // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+        // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+        const hasScanData = loc.minutesSinceScan !== Infinity;
+        const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        if (isLowRemainingWithUnknownPower) {
+          return false;
+        }
+// Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+               if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                 return false;
+               }
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   return false;
+                 }
+               }
+               return true;
+             });
 
       if (locations.length === 0) {
-        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map — searching for alternative target`);
+        const debugLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
+        const allOres = mapStore.getAllKnownOres();
+        const oreExists = allOres.some(o => o.item_id === effectiveTarget);
+        
+        if (!oreExists) {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map`);
+        } else if (debugLocations.length === 0) {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map - no locations match mining type "${miningType}"`);
+        } else if (afterPoiFilter.length > 0 && afterDepletionFilter.length === 0) {
+          ctx.log("error", `All ${resourceLabel} "${effectiveTarget}" POIs are fully depleted and under lockout - no accessible locations`);
+        } else {
+          ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in accessible locations`);
+        }
+        
         // Clear session if target not found
         if (recoveredSession) {
           await failMiningSession(bot.username, "Target resource not found in map");
@@ -2526,37 +3401,40 @@ if (effectiveTarget) {
                 deepCoreQuotas[oreId] = quota;
               }
             }
-      quotaTargetsToUse = deepCoreQuotas;
-      ctx.log("mining", `Deep core miner: restricting alternative targets to deep core ores only (${Object.keys(deepCoreQuotas).length} available)`);
-    }
+            quotaTargetsToUse = deepCoreQuotas;
+            ctx.log("mining", `Deep core miner: restricting alternative targets to deep core ores only (${Object.keys(deepCoreQuotas).length} available)`);
+          }
 
-    // Survey for hidden POIs if dealing with deep core ores
-    if (Object.keys(quotaTargetsToUse).some(ore => isDeepCoreOre(ore))) {
-      await surveySystemForHiddenPois(ctx);
-    }
+          // Survey for hidden POIs if dealing with deep core ores
+          if (Object.keys(quotaTargetsToUse).some(ore => isDeepCoreOre(ore))) {
+            await surveySystemForHiddenPois(ctx);
+          }
 
-    // Ignore depletion for alternative targets to allow selection of POIs that may have respawned
-    const availableQuotaTarget = findFirstAvailableQuotaTarget(
-      quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-      canMineHiddenRadioactive, canMineHiddenIce
-    );
+// Ignore depletion for alternative targets to allow selection of POIs that may have respawned
+            const availableQuotaTarget = findFirstAvailableQuotaTarget(
+              quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+              canMineHiddenRadioactive, canMineHiddenIce, originalTarget, true, totalMiningPower, bot.username
+            );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
             ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
             // Re-check locations with new target
-            const newLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+            const newLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
-              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              // Only filter by hidden status - trust map data
+              if (miningType === "ore") return true;
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                return isOreBeltPoi(poi.type) || poi.hidden === true;
+                return true;
               }
-              if (miningType === "gas") return isGasCloudPoi(poi.type);
+              if (miningType === "gas") {
+                return true;
+              }
               if (miningType === "ice") {
                 if (poi.hidden === true && !canMineHiddenIce) return false;
-                return isIceFieldPoi(poi.type);
+                return true;
               }
               return true;
             }).filter(loc => {
@@ -2578,6 +3456,18 @@ if (effectiveTarget) {
               // Otherwise check ores_found depletion
               if (!oreEntry?.depleted) return true;
               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+            }).filter(loc => {
+              // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+              const hasScanData = loc.minutesSinceScan !== Infinity;
+              const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+              if (isLowRemainingWithUnknownPower) {
+                return false;
+              }
+              // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+              if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                return false;
+              }
+              return true;
             });
             if (newLocations.length > 0) {
               locations.push(...newLocations);
@@ -2588,13 +3478,20 @@ if (effectiveTarget) {
           } else {
             ctx.log("warn", `No quota targets have available locations — mining locally without specific target`);
           }
-        }
-        // If still no locations, target locally (either no quotas configured or no available quota targets)
-        if (locations.length === 0) {
-          targetSystemId = bot.system;
+          // If still no locations, target locally (either no quotas configured or no available quota targets)
+          if (locations.length === 0) {
+            if (!hasLocalMiningPoiOfType(bot.system, miningType, canMineHiddenRadioactive, canMineHiddenIce)) {
+              const candidateOres = [originalTarget, ...Object.keys(quotas)];
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, miningType, totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+              );
+              continue;
+            }
+            targetSystemId = bot.system;
+          }
         }
       } else {
-        const blacklist = getSystemBlacklist();
         let scoredLocations: Array<{
           systemId: string;
           systemName: string;
@@ -2616,14 +3513,19 @@ if (effectiveTarget) {
 
         if (configuredSystem) {
           const isCommonOre = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
-          const systemLocations = (isCommonOre
-            ? mapStore.findClosestMiningLocationsInSystem(effectiveTarget, configuredSystem, bot.system, blacklist)
-            : mapStore.findBestMiningLocationInSystem(effectiveTarget, configuredSystem, bot.system, blacklist))
+          const allSystemLocations = isCommonOre
+            ? mapStore.findClosestMiningLocations(effectiveTarget, bot.system, blacklist)
+            : mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
+          const systemLocations = allSystemLocations
+            .filter(loc => {
+              const matches = loc.systemId === configuredSystem;
+              return matches;
+            })
             .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
               const jumps = route ? route.length - 1 : 999;
-              return { ...loc, jumps };
+              return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             });
 
           if (systemLocations.length > 0) {
@@ -2634,109 +3536,191 @@ if (effectiveTarget) {
             targetSystemId = bot.system;
           }
         } else {
-          const scoredLocationsLocal = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
-            .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+          const allOreLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
+          const scoredLocationsLocal = allOreLocations
+            .filter(loc => {
+              const matches = locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId);
+              return matches;
+            })
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-              const jumps = route ? route.length - 1 : 999;
-              return { ...loc, jumps };
+              const jumps = route ? route.length - 1 : -1;
+              return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
-            .filter(loc => loc.jumps <= maxJumps);
-          scoredLocations = scoredLocationsLocal;
+.filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
+             .filter(loc => {
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   ctx.log("coordination", `Skipping ${loc.poiName} in ${loc.systemId} — already at max ${settings.maxBotsPerSystem} miners`);
+                   return false;
+                 }
+               }
+               return true;
+             })
+             .sort((a, b) => {
+               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+               if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+               const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+               if (isCommon) {
+                 if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                 const aRem = a.remaining ?? 0;
+                 const bRem = b.remaining ?? 0;
+                 if (aRem !== bRem) return bRem - aRem;
+                 return (b.richness ?? 0) - (a.richness ?? 0);
+               }
+               const aRem = a.remaining ?? 0;
+               const bRem = b.remaining ?? 0;
+               if (aRem !== bRem) return bRem - aRem;
+               if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+               // Coordination: prefer systems with fewer miners assigned
+               if (settings.enableCoordination) {
+                 const aMinerCount = getMinerCountForSystem(a.systemId, bot.username);
+                 const bMinerCount = getMinerCountForSystem(b.systemId, bot.username);
+                 if (aMinerCount !== bMinerCount) return aMinerCount - bMinerCount;
+               }
+               return 0;
+             });
+           scoredLocations = scoredLocationsLocal;
         }
 
-        if (scoredLocations.length === 0 && !configuredSystem) {
-          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-          targetSystemId = bot.system;
+        const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
 
-          // Try to switch to another quota ore that has accessible locations within range
-          if (effectiveTarget && Object.keys(quotas).length > 0) {
-            ctx.log("mining", `Searching for alternative quota target for ${effectiveTarget}`);
-            // Exclude the current target from alternatives
-            const altQuotas = { ...quotas };
-            delete altQuotas[effectiveTarget];
-            const alternativeTarget = findFirstAvailableQuotaTarget(
-              altQuotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-              canMineHiddenRadioactive, canMineHiddenIce
-            );
-            ctx.log("mining", `Alternative search result: ${alternativeTarget || 'none'}`);
-            if (alternativeTarget) {
-              // Re-search locations for the alternative target (use alternativeTarget, not effectiveTarget)
-              const altLocations = mapStore.findOreLocations(alternativeTarget).filter(loc => {
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                if (!poi) return true;
-                if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
-                if (miningType === "radioactive") {
-                  if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                  return isOreBeltPoi(poi.type) || poi.hidden === true;
-                }
-                if (miningType === "gas") return isGasCloudPoi(poi.type);
-                if (miningType === "ice") {
-                  if (poi.hidden === true && !canMineHiddenIce) return false;
-                  return isIceFieldPoi(poi.type);
-                }
+        if (!chosenLoc && !configuredSystem) {
+          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps`);
+          
+          // Loop through ALL quota ores to find one with locations within range
+          // This ensures we try every available ore before giving up
+          let foundAlternative = false;
+          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0);
+          
+          for (const oreId of allQuotaOres) {
+            if (oreId === effectiveTarget) continue;
+            
+            ctx.log("mining", `Trying alternative quota target: ${oreId}`);
+            
+            // Find locations for this target
+            const altLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0).filter(loc => {
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              if (!poi) return true;
+              // Only filter by hidden status - trust map data
+              if (miningType === "ore") return true;
+              if (miningType === "radioactive") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return true;
-              }).filter(loc => {
-                if (settings.ignoreDepletion) return true;
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                const oreEntry = poi?.ores_found.find(o => o.item_id === alternativeTarget);
-                if (!oreEntry?.depleted) return true;
-                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-              });
-
-              if (altLocations.length > 0) {
-                // Check if any locations are within range
-                const altScoredLocations = mapStore.findBestMiningLocation(alternativeTarget, bot.system, blacklist)
-                  .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
-                  .map(loc => {
-                    const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                    return { ...loc, jumps: route ? route.length - 1 : 999 };
-                  })
-                  .filter(loc => loc.jumps <= maxJumps)
-                  .sort((a, b) => {
-                    if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-                    if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                    if (b.richness !== a.richness) return b.richness - a.richness;
-                    return a.jumps - b.jumps;
-                  });
-
-                if (altScoredLocations.length > 0) {
-                  // Only switch if there are locations WITHIN RANGE
-                  ctx.log("mining", `Switching to alternative target ${alternativeTarget} with accessible locations`);
-                  effectiveTarget = alternativeTarget;
-                  scoredLocations = altScoredLocations;
-                  targetSystemId = altScoredLocations[0].systemId;
-                  targetPoiId = altScoredLocations[0].poiId;
-                  targetPoiName = altScoredLocations[0].poiName;
-                  ctx.log("mining", `Found ${altScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
-                } else {
-                  ctx.log("warn", `Alternative target ${alternativeTarget} has no locations within ${maxJumps} jumps — will mine locally`);
-                }
-              } else {
-                ctx.log("warn", `No accessible locations found for alternative target ${alternativeTarget}`);
               }
-  } else {
-    // Mine locally
-    targetSystemId = bot.system;
-    const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
-    if (localPoi) {
-      targetPoiId = localPoi.id;
-      targetPoiName = localPoi.name;
-      ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
-    } else {
-      ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
-      await ctx.sleep(60000);
-      continue;
-    }
-  }
+              if (miningType === "gas") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                return true;
+              }
+              if (miningType === "ice") {
+                if (poi.hidden === true && !canMineHiddenIce) return false;
+                return true;
+              }
+              return true;
+            }).filter(loc => {
+              if (settings.ignoreDepletion) return true;
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
+              if (!oreEntry?.depleted) return true;
+              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+            }).filter(loc => {
+              // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+              const hasScanData = loc.minutesSinceScan !== Infinity;
+              const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+              if (isLowRemainingWithUnknownPower) {
+                return false;
+              }
+              // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+              if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                return false;
+              }
+              return true;
+            });
+            
+            if (altLocations.length === 0) {
+              ctx.log("mining", `No locations found for ${oreId} — trying next ore`);
+              continue;
+            }
+            
+// Check if any locations are within range
+             const allAltLocations = mapStore.findOreLocations(oreId, blacklist, blacklist.length > 0);
+             const altScoredLocations = allAltLocations
+               .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+               .filter(loc => {
+                 // Coordination: reject systems that are already at max bot capacity
+                 if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                   if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                     return false;
+                   }
+                 }
+                 return true;
+               })
+               .map(loc => {
+                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                const jumps = route ? route.length - 1 : 999;
+                return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
+              })
+              .filter(loc => loc.jumps <= maxJumps)
+              .sort((a, b) => {
+                if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                const isCommonA = STRIP_MINER_ORES.has(a.resourceId.toLowerCase());
+                const isCommonB = STRIP_MINER_ORES.has(b.resourceId.toLowerCase());
+                if (isCommonA || isCommonB) {
+                  if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                  const aRem = a.remaining ?? 0;
+                  const bRem = b.remaining ?? 0;
+                  if (aRem !== bRem) return bRem - aRem;
+                  return (b.richness ?? 0) - (a.richness ?? 0);
+                }
+                const aRem = a.remaining ?? 0;
+                const bRem = b.remaining ?? 0;
+                if (aRem !== bRem) return bRem - aRem;
+                if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                return 0;
+              });
+            
+            if (altScoredLocations.length > 0) {
+              // Found a valid alternative within range
+              ctx.log("mining", `Switching to alternative target ${oreId} with accessible locations`);
+              effectiveTarget = oreId;
+              scoredLocations = altScoredLocations;
+              targetSystemId = altScoredLocations[0].systemId;
+              targetPoiId = altScoredLocations[0].poiId;
+              targetPoiName = altScoredLocations[0].poiName;
+              foundAlternative = true;
+              ctx.log("mining", `Found ${altScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
+              break;
+            }
           }
-        } else {
-          // ── Recovered session upgrade check ──
-          // If we have a recovered session, check if the best scored location is
-          // significantly better than the session's current POI. If so, abandon
-          // the old session and start fresh at the better location.
+          
+          if (!foundAlternative) {
+            ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally without specific target`);
+            targetSystemId = bot.system;
+            const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
+            if (localPoi) {
+              targetPoiId = localPoi.id;
+              targetPoiName = localPoi.name;
+              ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
+            } else {
+              ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available`);
+              const candidateOres = [effectiveTarget, ...allQuotaOres];
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, miningType, totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+              );
+              continue;
+            }
+          }
+        }
+
+        // ── Recovered session upgrade check ──
+        // If we have a recovered session, check if the best scored location is
+        // significantly better than the session's current POI. If so, abandon
+        // the old session and start fresh at the better location.
         if (scoredLocations.length > 0 && scoredLocations[0].poiId) {
           if (recoveredSession) {
             const bestLoc = scoredLocations[0];
@@ -2787,57 +3771,54 @@ if (effectiveTarget) {
           }
         }
 
-        const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
+        if (chosenLoc) {
+          targetSystemId = chosenLoc.systemId;
+          targetPoiId = chosenLoc.poiId;
+          targetPoiName = chosenLoc.poiName;
+        }
 
-          if (!chosenLoc && !configuredSystem) {
-            ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-            targetSystemId = bot.system;
-          }
+        // Create mining session if we don't have one and we're targeting a specific POI
+        if (!recoveredSession && targetPoiId) {
+          const sysData = mapStore.getSystem(targetSystemId);
+          const session = createMiningSession({
+            botUsername: bot.username,
+            miningType: miningType,
+            targetResourceId: effectiveTarget,
+            targetResourceName: effectiveTarget,
+            targetSystemId,
+            targetSystemName: sysData?.name || targetSystemId,
+            targetPoiId,
+            targetPoiName,
+            homeSystem,
+            isQuotaDriven,
+            quotaTarget: isQuotaDriven ? (quotas[effectiveTarget] || 0) : undefined,
+          });
+          await startMiningSession(session);
+          recoveredSession = session;
+          ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
 
-          if (chosenLoc) {
-            targetSystemId = chosenLoc.systemId;
-            targetPoiId = chosenLoc.poiId;
-            targetPoiName = chosenLoc.poiName;
+          // Register with coordination system
+          if (settings.enableCoordination) {
+            registerCoordinationTarget(bot.username, targetSystemId, targetPoiId);
           }
+        }
 
-          // Create mining session if we don't have one and we're targeting a specific POI
-          if (!recoveredSession && targetPoiId) {
-            const sysData = mapStore.getSystem(targetSystemId);
-            const session = createMiningSession({
-              botUsername: bot.username,
-              miningType: miningType,
-              targetResourceId: effectiveTarget,
-              targetResourceName: effectiveTarget,
-              targetSystemId,
-              targetSystemName: sysData?.name || targetSystemId,
-              targetPoiId,
-              targetPoiName,
-              homeSystem,
-              isQuotaDriven,
-              quotaTarget: isQuotaDriven ? (quotas[effectiveTarget] || 0) : undefined,
-            });
-            await startMiningSession(session);
-            recoveredSession = session;
-            ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
-          }
-
-          // ── Flock leader announces target ──
-          if (isFlockLeader && settings.flockEnabled && settings.flockName) {
-            const rallySystem = flockGroup?.rallySystem;
-            await announceFlockTarget(
-              settings.flockName,
-              bot.username,
-              targetSystemId,
-              targetPoiId,
-              targetPoiName,
-              effectiveTarget,
-              miningType,
-              rallySystem,
-            );
-            ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
-            flockPhase = "traveling";
-            await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
-          }
+        // ── Flock leader announces target ──
+        if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+          const rallySystem = flockGroup?.rallySystem;
+          await announceFlockTarget(
+            settings.flockName,
+            bot.username,
+            targetSystemId,
+            targetPoiId,
+            targetPoiName,
+            effectiveTarget,
+            miningType,
+            rallySystem,
+          );
+          ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
+          flockPhase = "traveling";
+          await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
         }
       }
     } else {
@@ -2976,6 +3957,7 @@ if (effectiveTarget) {
 
       const travelOpts = {
         ...safetyOpts,
+        skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
         onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
           const chatChannel = getBotChatChannel();
           chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
@@ -3096,11 +4078,14 @@ if (effectiveTarget) {
 
     if (bot.state !== "running") break;
 
-    // ── Determine active jettison list (deep core vs regular) ──
+    // ── Determine active jettison list (gas, deep core, or regular) ──
     const isDeepCoreMining = effectiveTarget && isDeepCoreOre(effectiveTarget);
-    const activeJettisonList = isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
-      ? settings.deepCoreJettisonOres
-      : settings.jettisonOres;
+    const isGasMining = miningType === "gas";
+    const activeJettisonList = isGasMining && settings.jettisonGas.length > 0
+      ? settings.jettisonGas
+      : isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
+        ? settings.deepCoreJettisonOres
+        : settings.jettisonOres;
 
     // ── Find mining POI and station in current system ──
     // Survey for hidden POIs if radioactive mining with capability
@@ -3109,6 +4094,11 @@ if (effectiveTarget) {
     }
     yield (miningType === "ice" ? "find_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "find_ore_belt" : "find_gas_cloud"));
     const { pois: initialPois, systemId } = await getSystemInfo(ctx);
+    ctx.log("debug", `[ARRIVAL] Arrived at systemId=${systemId}, bot.system=${bot.system}, pois=${initialPois.length}, bot.poi="${bot.poi || ''}"`);
+    if (initialPois.length > 0) {
+      const poiTypeList = initialPois.map(p => `${p.id}=${p.type}`).join(", ");
+      ctx.log("debug", `[ARRIVAL] Server POIs in ${systemId}: ${poiTypeList}`);
+    }
     if (systemId) bot.system = systemId;
     let scanResources: Array<any> = [];
 
@@ -3134,7 +4124,7 @@ if (effectiveTarget) {
     const station = findStation(pois);
     if (station) stationPoi = { id: station.id, name: station.name };
 
-    // ── Check if already at a suitable POI ──
+// ── Check if already at a suitable POI ──
     // Only apply for hidden POIs or deep core ores (to allow extractor-only mining in hidden POIs)
     if (bot.poi && bot.poi !== "") {
       const currentPoiData = pois.find(p => p.id === bot.poi);
@@ -3150,30 +4140,47 @@ if (effectiveTarget) {
         const canMineHere = (() => {
           if (miningType === "ore") {
             if (isDeepCoreOre(effectiveTarget)) return deepCoreCap.canMineVisibleDeepCore;
-            return isOreBeltPoi(currentPoi.type);
+            // Trust map data - any POI can contain regular ores
+            return true;
           }
           if (miningType === "gas") return isGasCloudPoi(currentPoi.type);
           if (miningType === "ice") return isIceFieldPoi(currentPoi.type) || (isHidden && canMineHiddenIce);
-          if (miningType === "radioactive") return isOreBeltPoi(currentPoi.type) || (isHidden && canMineHiddenRadioactive);
+          if (miningType === "radioactive") {
+            const isOreBelt = isOreBeltPoi(currentPoi.type) || 
+                              (currentPoi.name && (currentPoi.name.toLowerCase().includes('belt') || 
+                                                    currentPoi.name.toLowerCase().includes('mineral field') ||
+                                                    currentPoi.name.toLowerCase().includes('asteroid')));
+            return isOreBelt || (isHidden && canMineHiddenRadioactive);
+          }
           return true;
         })();
 
-        const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
-        if ((knownTarget && canMineHere) || scanResources.length > 0) {
-          miningPoi = { id: bot.poi, name: currentPoi.name };
-        }
-
-          if (scanResources.length > 0) {
+        // ── CRITICAL FIX: Fetch actual POI resources before deciding if target is available ──
+        // This prevents incorrectly marking POIs as depleted when we haven't actually scanned them
+        const poiScanResp = await bot.exec("get_poi", { poi_id: bot.poi });
+        if (!poiScanResp.error && poiScanResp.result) {
+          const scanData = poiScanResp.result as Record<string, unknown>;
+          scanResources = Array.isArray(scanData.resources) ? (scanData.resources as Array<any>) : [];
+          const shouldCheckAsDepleted = (currentPoi.resources !== undefined) || (scanResources.length > 0 && scanResources.some(r => r.resource_id === effectiveTarget));
+          if (shouldCheckAsDepleted) {
             const resourceData = scanResources.map((raw: any) => ({
               resource_id: String(raw.resource_id ?? raw.resourceId ?? raw.id ?? ""),
               name: String(raw.name ?? raw.resourceName ?? raw.resource_id ?? ""),
               richness: Number(raw.richness ?? 0),
               remaining: Number(raw.remaining ?? raw.amount ?? raw.count ?? 0),
               max_remaining: Number(raw.max_remaining ?? raw.maxRemaining ?? raw.max ?? 0),
-              depletion_percent: Number(raw.depletion_percent ?? raw.depletionPercent ?? 0),
+              depletion_percent: Number(raw.depletion_percent ?? raw.depletionPercent ?? 100),
+              supported_power: Number(raw.supported_power ?? 0),
             }));
             mapStore.updatePoiResources(bot.system, bot.poi, resourceData);
           }
+        }
+
+        const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
+        const hasTargetInScan = scanResources.some((r: any) => r.resource_id === effectiveTarget);
+        if ((knownTarget && canMineHere) || hasTargetInScan) {
+          miningPoi = { id: bot.poi, name: currentPoi.name };
+        }
 
         const targetResource = scanResources.find((r: any) => (r.resource_id as string) === effectiveTarget);
         const remaining = (targetResource?.remaining as number) ?? 0;
@@ -3200,8 +4207,10 @@ if (effectiveTarget) {
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
-        const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
-          (miningType === "radioactive" && isOreBeltPoi(p.type)) ||
+        if (p.id === bot.poi) return false;
+        // No filtering by POI type - trust the map data
+        const isMatchingPoi = (miningType === "ore") ||
+          (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
           (miningType === "ice" && isIceFieldPoi(p.type));
         if (!isMatchingPoi) return false;
@@ -3209,9 +4218,20 @@ if (effectiveTarget) {
         const sysData = mapStore.getSystem(bot.system);
         const storedPoi = sysData?.pois.find(sp => sp.id === p.id);
         if (!storedPoi) return false;
+// CRITICAL FIX: Check both resources (scan data) and ores_found (mining history)
+        // Prefer resources data since it's the current state
+        const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
         const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
-        if (!oreEntry) return false;
-        if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
+        // If we have resources data (even if empty array), require the ore to be in resources
+        // An empty resources array [] means the ore was scanned and is NOT present
+        const hasResourcesData = storedPoi.resources !== undefined;
+        if (hasResourcesData) {
+          if (!resourceEntry) return false;
+        } else {
+          // No resources data - fall back to mining history
+          if (!oreEntry) return false;
+        }
+        if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
         return true;
       });
       if (altPoi) {
@@ -3220,48 +4240,95 @@ if (effectiveTarget) {
       } else {
         // No alternative in current system — search broader map for non-depleted locations
         ctx.log("mining", "No alternative in current system — searching map for non-depleted locations...");
-        const broaderLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+        
+        // CRITICAL FIX: Find a new quota target that actually has viable locations
+        // (not just the current target which may have all locations filtered out as "too sparse")
+        let searchTarget = effectiveTarget;
+        if (Object.keys(quotas).length > 0) {
+          // Exclude current target since we know it has no viable locations
+          const excludeTarget = effectiveTarget ? [effectiveTarget] : undefined;
+          const newTarget = findFirstAvailableQuotaTarget(
+            quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username
+          );
+          if (newTarget && newTarget !== effectiveTarget) {
+            searchTarget = newTarget;
+            effectiveTarget = newTarget;
+            ctx.log("mining", `Switching to new quota target for alternative search: "${searchTarget}"`);
+          } else if (newTarget) {
+            searchTarget = newTarget;
+            ctx.log("mining", `Quota target confirmed: "${searchTarget}"`);
+          }
+        }
+        
+        const broaderLocationsRaw = mapStore.findOreLocations(searchTarget, blacklist, blacklist.length > 0);
+        const broaderLocations = broaderLocationsRaw.filter(loc => {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
-          if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                if (miningType === "radioactive") return canMineBasicRadioactive && (
-                  isOreBeltPoi(poi?.type || "") ||
-                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                  (poi?.hidden && canMineHiddenRadioactive)
-                );
-          if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
-          if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
-          return true;
-        }).filter(loc => {
-          // Skip completely exhausted POIs
-          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
-            return false;
+          if (!poi) return true;
+          // No filtering by POI type - trust the map data from findOreLocations
+          if (miningType === "ore") return true;
+          if (miningType === "radioactive") {
+            const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                              (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                               loc.poiName.toLowerCase().includes('mineral field') ||
+                                               loc.poiName.toLowerCase().includes('asteroid')));
+            return canMineBasicRadioactive && (
+              isOreBelt ||
+              (!poi?.hidden && canMineDeepCoreRadioactive) ||
+              (poi?.hidden && canMineHiddenRadioactive)
+            );
           }
-          if (settings.ignoreDepletion) return true;
-          const sys = mapStore.getSystem(loc.systemId);
-          const poi = sys?.pois.find(p => p.id === loc.poiId);
-          // Check both ores_found (mining history) AND resources (scan data) for depletion status
-          const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
-          const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
-          // If resourceEntry exists and shows depleted, check expiry
-          if (resourceEntry?.depleted) {
-            return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
-          }
-          // Otherwise check ores_found depletion
-          if (!oreEntry?.depleted) return true;
-          return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-        });
+if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+           return true;
+ }).filter(loc => {
+            // Coordination: reject systems that are already at max bot capacity
+            if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+              if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                return false;
+              }
+            }
+            // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+            // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+            const hasScanData = loc.minutesSinceScan !== Infinity;
+            const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+            if (isLowRemainingWithUnknownPower) {
+              return false;
+            }
+            // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+            if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+              return false;
+            }
+            // No depletion filtering - trust the map data
+            return true;
+          });
+
+        ctx.log("debug", `[BROADER_SEARCH] raw=${broaderLocationsRaw.length} afterPOIType+depletion=${broaderLocations.length} searchTarget=${searchTarget} miningType=${miningType}`);
+
+        if (broaderLocations.length === 0 && broaderLocationsRaw.length > 0) {
+          const sampleRaw = broaderLocationsRaw.slice(0,3).map(l => `${l.systemName}/${l.poiName} type(map)=${mapStore.getSystem(l.systemId)?.pois.find(p=>p.id===l.poiId)?.type}`).join("; ");
+          ctx.log("debug", `[BROADER_SEARCH] All raw locations filtered out. Sample: ${sampleRaw}`);
+        }
 
         if (broaderLocations.length > 0) {
           // Prefer configured system, then closest by jumps
-          const blacklist = getSystemBlacklist();
           const scored = broaderLocations
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
               return { ...loc, jumps: route ? route.length - 1 : 999 };
             })
-            .filter(loc => loc.jumps <= maxJumps)
-            .sort((a, b) => {
+.filter(loc => loc.jumps <= maxJumps)
+             .filter(loc => {
+               // Coordination: reject systems that are already at max bot capacity
+               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                   return false;
+                 }
+               }
+               return true;
+             })
+             .sort((a, b) => {
               if (configuredSystem && a.systemId === configuredSystem && b.systemId !== configuredSystem) return -1;
               if (configuredSystem && b.systemId === configuredSystem && a.systemId !== configuredSystem) return -1;
               if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
@@ -3270,18 +4337,33 @@ if (effectiveTarget) {
               const aRem = a.remaining ?? 0;
               const bRem = b.remaining ?? 0;
               if (aRem !== bRem) return bRem - aRem;
-              return (a.richness ?? 0) - (b.richness ?? 0);
+              const isCommonA = searchTarget && STRIP_MINER_ORES.has(searchTarget.toLowerCase());
+              const isCommonB = searchTarget && STRIP_MINER_ORES.has(searchTarget.toLowerCase());
+              if (isCommonA || isCommonB) {
+                return (a.richness ?? 0) - (b.richness ?? 0);
+              }
+              return 0;
             });
+
+          ctx.log("debug", `[BROADER_SEARCH] scored.length=${scored.length} bot.system=${bot.system}`);
+          if (scored.length === 0 && broaderLocations.length > 0) {
+            const noRouteLocs = broaderLocations.filter(l => {
+              const route = mapStore.findRoute(bot.system, l.systemId, blacklist);
+              const jumps = route ? route.length - 1 : 999;
+              return jumps > maxJumps;
+            });
+            ctx.log("debug", `[BROADER_SEARCH] scored=0 because ${noRouteLocs.length} locs exceed maxJumps=${maxJumps}: ${noRouteLocs.map(l => `${l.systemName}(${l.systemId})`).join(", ")}`);
+          }
 
           if (scored.length > 0) {
             const chosen = scored[0];
-            ctx.log("debug", `[sort] Top 3 candidates for ${effectiveTarget}: ${
+            ctx.log("debug", `[sort] Top 3 candidates for ${searchTarget}: ${
               scored.slice(0, 3).map((c, i) =>
                 `#${i+1} ${c.systemName}/${c.poiName} jumps=${c.jumps} rem=${c.remaining ?? '?'} max=${c.maxRemaining ?? '?'} rich=${c.richness ?? '?'} depleted=${c.depletionPercent ?? '?'}`
               ).join(" | ")
             }`);
-            ctx.log("debug", `[sort] Chosen for ${effectiveTarget}: ${chosen.poiName} in ${chosen.systemName} — remaining=${chosen.remaining} max=${chosen.maxRemaining} rich=${chosen.richness} depPct=${chosen.depletionPercent} jumps=${chosen.jumps}`);
-            ctx.log("mining", `Found ${effectiveTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
+            ctx.log("debug", `[sort] Chosen for ${searchTarget}: ${chosen.poiName} in ${chosen.systemName} — remaining=${chosen.remaining} max=${chosen.maxRemaining} rich=${chosen.richness} depPct=${chosen.depletionPercent} jumps=${chosen.jumps}`);
+            ctx.log("mining", `Found ${searchTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
             
              // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
              await bot.refreshCargoAndStorage();
@@ -3335,14 +4417,29 @@ if (effectiveTarget) {
               pois = newPois;
               bot.system = chosen.systemId;
             const chosenPoi = pois.find(p => p.id === chosen.poiId);
-            if (chosenPoi && ((miningType === "ore" && (isOreBeltPoi(chosenPoi.type) || chosenPoi.hidden === true)) ||
-              (miningType === "radioactive" && canMineBasicRadioactive && (
-                isOreBeltPoi(chosenPoi.type) ||
-                (!chosenPoi.hidden && canMineDeepCoreRadioactive) ||
-                (chosenPoi.hidden && canMineHiddenRadioactive)
-              )) ||
-              (miningType === "gas" && isGasCloudPoi(chosenPoi.type)) ||
-              (miningType === "ice" && isIceFieldPoi(chosenPoi.type)))) {
+            if (!chosenPoi) {
+              ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) not found in current system — clearing target and returning home`);
+              effectiveTarget = "";
+              targetResource = "";
+              await ensureUndocked(ctx);
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              await ensureDocked(ctx);
+              await dumpCargo(ctx, settings);
+              continue;
+            }
+            let isValid = false;
+            if (miningType === "ore") {
+              isValid = !chosenPoi.hidden || canMineHiddenPois;
+            } else if (miningType === "radioactive") {
+              isValid = canMineBasicRadioactive && (!chosenPoi.hidden || canMineHiddenRadioactive);
+            } else if (miningType === "gas") {
+              isValid = true;
+            } else if (miningType === "ice") {
+              isValid = true;
+            }
+            
+            if (isValid) {
               miningPoi = { id: chosenPoi.id, name: chosenPoi.name };
               ctx.log("mining", `Will travel to ${chosenPoi.name} @ ${chosen.systemName}`);
             } else {
@@ -3365,22 +4462,34 @@ if (effectiveTarget) {
               await dumpCargo(ctx, settings);
               continue;
             }
-           } else {
-             ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — clearing target and returning home to retry next cycle`);
-             effectiveTarget = "";
-             targetResource = "";
-             await ensureUndocked(ctx);
+          } else {
+            // CRITICAL FIX: No alternative within range - but don't clear target and reset!
+            // Instead, try the next ore in the quota list on the next cycle.
+            // The findFirstAvailableQuotaTarget function now always returns a target,
+            // so on the next cycle it will pick the next ore (lead_ore) instead of the same one.
+            ctx.log("warn", `No alternative ${resourceLabel} within ${maxJumps} jumps — will try next ore on next cycle`);
+            // Clear target so the next cycle picks a different ore
+            effectiveTarget = "";
+            targetResource = "";
+            // Still need to return home to deposit cargo
+            await ensureUndocked(ctx);
             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
             if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
             continue;
           }
-         } else {
-           ctx.log("error", `No alternative ${resourceLabel} found anywhere — clearing target and returning home to retry next cycle`);
-           effectiveTarget = "";
-           targetResource = "";
-           await ensureUndocked(ctx);
+        } else {
+          // CRITICAL FIX: No alternative found anywhere - but don't clear target and reset!
+          // Instead, try the next ore in the quota list on the next cycle.
+          // The findFirstAvailableQuotaTarget function now always returns a target,
+          // so on the next cycle it will pick the next ore in the priority list.
+          ctx.log("warn", `No alternative ${resourceLabel} found anywhere — will try next ore on next cycle`);
+          // Clear target so the next cycle picks a different ore
+          effectiveTarget = "";
+          targetResource = "";
+          // Still need to return home to deposit cargo
+          await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
           await ensureDocked(ctx);
@@ -3390,8 +4499,12 @@ if (effectiveTarget) {
       }
     }
 
-    // miningPoi is guaranteed non-null here after the depletion check
-    if (!miningPoi) continue;
+    if (!miningPoi) {
+      ctx.log("mining", "No mining POI available after destination search — will retry next cycle");
+      yield "no_mining_poi";
+      await ctx.sleep(5000);
+      continue;
+    }
 
     // ── Travel to mining location ──
     yield (miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "travel_to_belt" : "travel_to_cloud"));
@@ -3552,6 +4665,19 @@ if (effectiveTarget) {
       }
     }
 
+    // Check for pirates in nearby response (skip if cloaked with cloakIgnoreBlacklist)
+    const isCloakedIgnoringBlacklist = bot.isCloaked && settings.cloakIgnoreBlacklist;
+    if (!isCloakedIgnoringBlacklist && nearbyResp.result && typeof nearbyResp.result === "object") {
+      bot.trackWildlife(nearbyResp.result);
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - fled mining location, will retry");
+        await ctx.sleep(30000);
+        continue;
+      }
+    }
+
     // Also check battle status directly (in case we missed notifications)
     // CRITICAL: Check WebSocket state FIRST for fastest detection
     if (bot.isInBattle()) {
@@ -3560,10 +4686,21 @@ if (effectiveTarget) {
       // Check for nearby players to decide if we should engage
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        bot.trackWildlife(nearbyResp.result);
         const { parseNearbyEntities } = await import("./common.js");
         const nearbyResult = parseNearbyEntities(nearbyResp.result);
 
         if (nearbyResult.hasPlayers) {
+          // Check emergency fighting setting first
+          if (settings.enableFighting) {
+            ctx.log("combat", "Emergency fighting ENABLED - engaging attacking players!");
+            battleState.inBattle = true;
+            battleState.isFleeing = false;
+            await engageInBattle(ctx);
+            await ctx.sleep(30000);
+            continue;
+          }
+          
           const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
           if (shouldFight) {
             ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
@@ -3591,10 +4728,22 @@ if (effectiveTarget) {
       // Check for nearby players to decide if we should engage
       const nearbyResp2 = await bot.exec("get_nearby");
       if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
+        bot.trackWildlife(nearbyResp2.result);
         const { parseNearbyEntities } = await import("./common.js");
         const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
 
         if (nearbyResult2.hasPlayers) {
+          // Check emergency fighting setting first
+          if (settings.enableFighting) {
+            ctx.log("combat", "Emergency fighting ENABLED - engaging attacking players!");
+            battleState.inBattle = true;
+            battleState.battleId = directBattleStatus.battle_id;
+            battleState.isFleeing = false;
+            await engageInBattle(ctx);
+            await ctx.sleep(30000);
+            continue;
+          }
+          
           const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);
           if (shouldFight2) {
             ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
@@ -3614,16 +4763,6 @@ if (effectiveTarget) {
       ctx.log("error", "Battle detected via status check - fled, will retry mining");
       await ctx.sleep(30000);
       continue;
-    }
-
-    if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - fled mining location, will retry");
-        await ctx.sleep(30000);
-        continue;
-      }
     }
 
     // CRITICAL FIX: Verify we're at the intended hidden POI before mining
@@ -3676,9 +4815,26 @@ if (effectiveTarget) {
       const poiScanResp = await bot.exec("get_poi", { poi_id: targetPoiId });
       if (!poiScanResp.error && poiScanResp.result) {
         const scanData = poiScanResp.result as Record<string, unknown>;
+        const poiData = (scanData.poi as Record<string, unknown>) || {};
         const poiResources = Array.isArray(scanData.resources) ? scanData.resources : [];
         const hasTargetResource = poiResources.some((r: any) => r.resource_id === effectiveTarget);
-        
+
+// CRITICAL FIX: Update mapstore with the scan data from get_poi
+              const resourceData = (poiResources as Array<Record<string, unknown>>).map((r) => ({
+                resource_id: (r.resource_id as string) || "",
+                name: (r.name as string) || (r.resource_id as string) || "",
+                richness: (r.richness as number) || 0,
+                remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
+                max_remaining: (r.max_remaining as number) ?? 0,
+                depletion_percent: (r.depletion_percent as number) ?? 100,
+                supported_power: (r.supported_power as number) ?? 0,
+              }));
+
+        if (resourceData.length > 0) {
+          mapStore.updatePoiResources(bot.system, targetPoiId, resourceData);
+          ctx.log("map", `Updated mapstore with deep core get_poi scan for ${targetPoiId}: ${resourceData.length} resources`);
+        }
+
         if (!hasTargetResource) {
           ctx.log("error", `Deep core resource mismatch: POI ${targetPoiName} does not contain ${effectiveTarget}! Found: ${poiResources.map((r: any) => r.resource_id).join(", ")}`);
           ctx.log("error", "Target POI mismatch - re-scanning to find correct hidden POI...");
@@ -3735,8 +4891,8 @@ if (effectiveTarget) {
         const poiData = poiCheckResp.result as Record<string, unknown>;
         const resources = Array.isArray(poiData.resources)
           ? (poiData.resources as Array<Record<string, unknown>>)
-          : Array.isArray(poiData.resources)
-          ? poiData.resources
+          : Array.isArray((poiData as any).resources)
+          ? (poiData as any).resources
           : [];
 
         let targetAvailable = false;
@@ -3757,6 +4913,24 @@ if (effectiveTarget) {
           }
         }
 
+        // CRITICAL FIX: Update mapstore with the scan data from get_poi
+        // This ensures depletion info is persisted for other bots to see
+        const poiObj = (poiData.poi as Record<string, unknown>) || {};
+        const resourceData = (resources as Array<Record<string, unknown>>).map((r) => ({
+          resource_id: (r.resource_id as string) || "",
+          name: (r.name as string) || (r.resource_id as string) || "",
+          richness: (r.richness as number) || 0,
+          remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
+          max_remaining: (r.max_remaining as number) ?? 0,
+          depletion_percent: (r.depletion_percent as number) ?? 100,
+          supported_power: (r.supported_power as number) ?? 0,
+        }));
+
+        if (resourceData.length > 0) {
+          mapStore.updatePoiResources(bot.system, bot.poi, resourceData);
+          ctx.log("map", `Updated mapstore with get_poi scan data for ${bot.poi}: ${resourceData.length} resources`);
+        }
+
         if (!targetAvailable) {
           ctx.log("mining", `Target resource ${effectiveTarget} not available at ${miningPoi?.name || bot.poi} (remaining: ${targetRemaining})`);
 
@@ -3770,12 +4944,10 @@ if (effectiveTarget) {
           // For strip miners, try to switch to another available common ore
           let switchedTarget = false;
           if (usingStripMiner && targetRemaining <= 0) {
-            const availableCommonOres = resources
-              .map(res => ({
-                id: (res.resource_id as string) || (res.id as string) || "",
-                remaining: (res.remaining as number) ?? (res.quantity as number) ?? 0
-              }))
-              .filter(ore => ore.remaining > 0 && isStripMinerOre(ore.id));
+            const availableCommonOres = (resources as Array<Record<string, unknown>>).map((res) => ({
+              id: (res.resource_id as string) || (res.id as string) || "",
+              remaining: (res.remaining as number) ?? (res.quantity as number) ?? 0
+            })).filter((ore) => ore.remaining > 0 && isStripMinerOre(ore.id));
 
             if (availableCommonOres.length > 0) {
               const newTarget = availableCommonOres[0].id;
@@ -3963,7 +5135,6 @@ if (effectiveTarget) {
         // ── RICHNESS UPGRADE CHECK ──
         // Check if there's a significantly better POI available (not just depleted check)
         // This prevents miners from staying at very low richness POIs indefinitely
-        const blacklist = getSystemBlacklist();
         const currentSys = mapStore.getSystem(bot.system);
         const currentPoi = currentSys?.pois.find(p => p.id === bot.poi);
         
@@ -3984,7 +5155,7 @@ if (effectiveTarget) {
           ctx.log("mining", `Richness check: current POI has richness ${currentRichness}, ${((1 - depletionPercent) * 100).toFixed(1)}% depleted — searching for better options...`);
 
           // Find best available POI for this resource
-          const allLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+          const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
             if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -4118,6 +5289,7 @@ if (effectiveTarget) {
 
                   const travelOpts = {
                     ...safetyOpts,
+                    skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                     onJump: async (jumpNumber: number) => {
                       // Check if target POI is still available
                       const sys = mapStore.getSystem(bestLoc.systemId);
@@ -4197,6 +5369,7 @@ if (effectiveTarget) {
               remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
               max_remaining: (r.max_remaining as number) || 0,
               depletion_percent: (r.depletion_percent as number) || 100,
+              supported_power: (r.supported_power as number) ?? 0,
             }));
 
             mapStore.registerPoiFromScan(bot.system, {
@@ -4229,17 +5402,23 @@ if (effectiveTarget) {
                   if (fillRatio < cargoThresholdRatio) {
                     ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching for next POI...");
                     const searchSystem = configuredSystem || bot.system;
-                    const newLocs = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+                    const newLocs = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
                       if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
                       if (loc.systemId !== searchSystem) return false; // HARD GATE: stay within configured system
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
-                      if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return canMineBasicRadioactive && (
-                isOreBeltPoi(poi?.type || "") ||
-                (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                (poi?.hidden && canMineHiddenRadioactive)
-              );
+if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                   loc.poiName.toLowerCase().includes('mineral field') ||
+                                                   loc.poiName.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
+              }
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                       return true;
@@ -4273,7 +5452,6 @@ if (effectiveTarget) {
                     });
 
                     if (newLocs.length > 0) {
-                      const blacklist = getSystemBlacklist();
                       const locsWithDist = newLocs
                         .map(loc => {
                           const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -4347,6 +5525,7 @@ if (effectiveTarget) {
                         if (chosen.systemId !== bot.system) {
                           const travelOpts = {
                             ...safetyOpts,
+                            skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                             onJump: async (jumpNumber: number) => {
                               // Check if target POI is still available
                               const sys = mapStore.getSystem(chosen.systemId);
@@ -4490,6 +5669,188 @@ if (effectiveTarget) {
         ctx.log("mining", `Re-detected mining type: ${miningType} after equipment refresh`);
       }
 
+      // ── Check supported_power compatibility before mining ──
+      // Get the current POI's supported_power from the stored resources
+      const currentSys = mapStore.getSystem(bot.system);
+      const currentPoiData = currentSys?.pois.find(p => p.id === bot.poi);
+      const currentResourceEntry = currentPoiData?.resources?.find(r => r.resource_id === effectiveTarget);
+      const supportedPower = currentResourceEntry?.supported_power;
+      
+      // Get total mining power from ship modules
+      let totalMiningPower = 0;
+      const shipResp = await bot.exec("get_ship");
+      if (!shipResp.error && shipResp.result) {
+  const shipData = (shipResp.result || {}) as Record<string, unknown>;
+        const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+        totalMiningPower = getTotalMiningPower(modules);
+      }
+      
+      const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower);
+      if (!powerCheck.canMine) {
+        ctx.log("mining", `Power check failed: ${powerCheck.reason}`);
+        ctx.log("mining", `Deposit too sparse - equipment power (${totalMiningPower}) exceeds 4x supported_power (${supportedPower})`);
+        ctx.log("mining", "Will attempt to re-target to next ore type or POI (cannot refit modules in field)");
+        
+        if (settings.noMidMiningRetarget) {
+          ctx.log("mining", "Mid-mining retarget is disabled — returning home to deposit and retry next cycle");
+          stopReason = "deposit too sparse for equipment";
+          if (recoveredSession) {
+            await failMiningSession(bot.username, "Deposit too sparse for equipment");
+            recoveredSession = null;
+          }
+          break;
+        }
+        
+        // Try to find a new target - either next ore type or ore POI
+        let newTarget: string | null = null;
+        let newPoiId: string | null = null;
+        let newPoiName: string | null = null;
+        let newSystemId: string | null = null;
+        
+        // First try to find another POI with the same target resource in current system
+        if (currentSys) {
+          const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
+            (isOreBeltPoi(p.type) || p.hidden === true));
+          if (altPoi) {
+            const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
+            const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
+            const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+            // Check if this POI has the resource available and not depleted
+            if (resourceEntry) {
+              const remaining = resourceEntry.remaining;
+              if (remaining > 0) {
+                if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                  ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                } else if (totalMiningPower > 0 && resourceEntry.supported_power && totalMiningPower > resourceEntry.supported_power * 4) {
+                  ctx.log("debug", `Skipping ${altPoi.name}: deposit too sparse (supported_power=${resourceEntry.supported_power}, equipment=${totalMiningPower})`);
+                } else {
+                  newTarget = effectiveTarget;
+                  newPoiId = altPoi.id;
+                  newPoiName = altPoi.name;
+                  newSystemId = bot.system;
+                  ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                }
+              }
+            }
+          }
+        }
+        
+        // If no alternative in current system, try next ore from quotas
+        if (!newTarget && Object.keys(quotas).length > 0) {
+          await bot.refreshFactionStorage();
+          const quotaEntries = Object.entries(quotas)
+            .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+            .map(([oreId, target]) => {
+              const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+              return { oreId, deficit: target - current };
+            })
+            .filter(e => e.deficit > 0)
+            .sort((a, b) => b.deficit - a.deficit);
+          
+          for (const entry of quotaEntries) {
+            const nextHiddenPoi = findBestHiddenPoiForOre(
+              entry.oreId,
+              bot.system,
+              bot.poi || "",
+              maxJumps,
+              settings.ignoreDepletion,
+              depletionTimeoutMs,
+              50,
+              blacklist
+            );
+            if (nextHiddenPoi) {
+              newTarget = entry.oreId;
+              newPoiId = nextHiddenPoi.poiId;
+              newPoiName = nextHiddenPoi.poiName;
+              newSystemId = nextHiddenPoi.systemId;
+              ctx.log("mining", `Switching to next quota ore: ${entry.oreId} @ ${nextHiddenPoi.poiName}`);
+              break;
+            }
+          }
+        }
+        
+        // If still no target, check if stayOutUntilFull allows continuing
+        if (!newTarget && settings.stayOutUntilFull && effectiveTarget) {
+          ctx.log("mining", "stayOutUntilFull enabled - will search for any available POI with current target");
+          const anyPoi = findBestHiddenPoiForOre(
+            effectiveTarget,
+            bot.system,
+            bot.poi || "",
+            maxJumps,
+            settings.ignoreDepletion,
+            depletionTimeoutMs,
+            0,
+            blacklist
+          );
+          if (anyPoi) {
+            newTarget = effectiveTarget;
+            newPoiId = anyPoi.poiId;
+            newPoiName = anyPoi.poiName;
+            newSystemId = anyPoi.systemId;
+            ctx.log("mining", `Found any available POI with ${effectiveTarget}: ${anyPoi.poiName}`);
+          }
+        }
+        
+        // If we found a new target, switch to it
+        if (newTarget && newPoiId && newPoiName) {
+          effectiveTarget = newTarget;
+          miningPoi = { id: newPoiId, name: newPoiName };
+          
+          if (recoveredSession) {
+            await updateMiningSession(bot.username, {
+              targetResourceId: newTarget,
+              targetResourceName: newTarget,
+              targetPoiId: newPoiId,
+              targetPoiName: newPoiName,
+            });
+          }
+          
+          // Travel to new POI if in different system
+          if (newSystemId && newSystemId !== bot.system) {
+            ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
+            const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+            if (!arrived) {
+              ctx.log("error", "Failed to reach new system — returning home");
+              stopReason = "deposit too sparse for equipment";
+              if (recoveredSession) {
+                await failMiningSession(bot.username, "Failed to reach new target system");
+                recoveredSession = null;
+              }
+              break;
+            }
+            const { pois: newPois } = await getSystemInfo(ctx);
+            pois = newPois;
+            bot.system = newSystemId;
+          }
+          
+          if (newPoiId !== bot.poi) {
+            const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+            if (travelResp.error && !travelResp.error.message.includes("already")) {
+              ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
+              stopReason = "deposit too sparse for equipment";
+              if (recoveredSession) {
+                await failMiningSession(bot.username, "Failed to reach new target POI");
+                recoveredSession = null;
+              }
+              break;
+            }
+            bot.poi = newPoiId;
+          }
+          
+          ctx.log("mining", `Continuing mining with new target: ${newTarget}`);
+          continue;
+        }
+        
+        // No alternatives found - return home
+        ctx.log("mining", "No alternative targets available — returning home to deposit and retry next cycle");
+        stopReason = "deposit too sparse for equipment";
+        if (recoveredSession) {
+          await failMiningSession(bot.username, "Deposit too sparse for equipment");
+          recoveredSession = null;
+        }
+        break;
+      }
+
       const mineResp = await bot.exec("mine");
 
       // Check for battle notifications after mining
@@ -4514,6 +5875,319 @@ if (effectiveTarget) {
           stopReason = "battle detected (mine interrupted)";
           break;
         }
+        
+        if (msg.includes("too sparse") || msg.includes("deposit_too_sparse")) {
+          ctx.log("error", "Deposit too sparse for current mining array — equipment power exceeds deposit density");
+          ctx.log("error", "Will attempt to re-target to next ore type or POI (cannot refit modules in field)");
+          
+          if (settings.noMidMiningRetarget) {
+            ctx.log("mining", "Mid-mining retarget is disabled — returning home to deposit and retry next cycle");
+            stopReason = "deposit too sparse for equipment";
+            if (recoveredSession) {
+              await failMiningSession(bot.username, "Deposit too sparse for equipment");
+              recoveredSession = null;
+            }
+            break;
+          }
+          
+          // Try to find a new target - either next ore type or ore POI
+          let newTarget: string | null = null;
+          let newPoiId: string | null = null;
+          let newPoiName: string | null = null;
+          let newSystemId: string | null = null;
+          
+          // First try to find another POI with the same target resource in current system
+          const currentSys = mapStore.getSystem(bot.system);
+          if (currentSys) {
+            const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
+              (isOreBeltPoi(p.type) || p.hidden === true));
+            if (altPoi) {
+              const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
+              const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
+              const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+              // Check if this POI has the resource available and not depleted
+              if (resourceEntry) {
+                const remaining = resourceEntry.remaining;
+                if (remaining > 0) {
+                  if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                    ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                  } else {
+                    newTarget = effectiveTarget;
+                    newPoiId = altPoi.id;
+                    newPoiName = altPoi.name;
+                    newSystemId = bot.system;
+                    ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  }
+                }
+              }
+            }
+          }
+          
+          // If no alternative in current system, try next ore from quotas
+          if (!newTarget && Object.keys(quotas).length > 0) {
+            await bot.refreshFactionStorage();
+            const quotaEntries = Object.entries(quotas)
+              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+              .map(([oreId, target]) => {
+                const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                return { oreId, deficit: target - current };
+              })
+              .filter(e => e.deficit > 0)
+              .sort((a, b) => b.deficit - a.deficit);
+            
+            for (const entry of quotaEntries) {
+              const nextHiddenPoi = findBestHiddenPoiForOre(
+                entry.oreId,
+                bot.system,
+                bot.poi || "",
+                maxJumps,
+                settings.ignoreDepletion,
+                depletionTimeoutMs,
+                50,
+                blacklist
+              );
+              if (nextHiddenPoi) {
+                newTarget = entry.oreId;
+                newPoiId = nextHiddenPoi.poiId;
+                newPoiName = nextHiddenPoi.poiName;
+                newSystemId = nextHiddenPoi.systemId;
+                ctx.log("mining", `Switching to next quota ore: ${entry.oreId} @ ${nextHiddenPoi.poiName}`);
+                break;
+              }
+            }
+          }
+          
+          // If still no target, check if stayOutUntilFull allows continuing
+          if (!newTarget && settings.stayOutUntilFull && effectiveTarget) {
+            ctx.log("mining", "stayOutUntilFull enabled - will search for any available POI with current target");
+            const anyPoi = findBestHiddenPoiForOre(
+              effectiveTarget,
+              bot.system,
+              bot.poi || "",
+              maxJumps,
+              settings.ignoreDepletion,
+              depletionTimeoutMs,
+              0,
+              blacklist
+            );
+            if (anyPoi) {
+              newTarget = effectiveTarget;
+              newPoiId = anyPoi.poiId;
+              newPoiName = anyPoi.poiName;
+              newSystemId = anyPoi.systemId;
+              ctx.log("mining", `Found any available POI with ${effectiveTarget}: ${anyPoi.poiName}`);
+            }
+          }
+          
+          // If we found a new target, switch to it
+          if (newTarget && newPoiId && newPoiName) {
+            effectiveTarget = newTarget;
+            miningPoi = { id: newPoiId, name: newPoiName };
+            
+            if (recoveredSession) {
+              await updateMiningSession(bot.username, {
+                targetResourceId: newTarget,
+                targetResourceName: newTarget,
+                targetPoiId: newPoiId,
+                targetPoiName: newPoiName,
+              });
+            }
+            
+            // Travel to new POI if in different system
+            if (newSystemId && newSystemId !== bot.system) {
+              ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
+              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              if (!arrived) {
+                ctx.log("error", "Failed to reach new system — returning home");
+                stopReason = "deposit too sparse for equipment";
+                if (recoveredSession) {
+                  await failMiningSession(bot.username, "Failed to reach new target system");
+                  recoveredSession = null;
+                }
+                break;
+              }
+              const { pois: newPois } = await getSystemInfo(ctx);
+              pois = newPois;
+              bot.system = newSystemId;
+            }
+            
+            if (newPoiId !== bot.poi) {
+              const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              if (travelResp.error && !travelResp.error.message.includes("already")) {
+                ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
+                stopReason = "deposit too sparse for equipment";
+                if (recoveredSession) {
+                  await failMiningSession(bot.username, "Failed to reach new target POI");
+                  recoveredSession = null;
+                }
+                break;
+              }
+              bot.poi = newPoiId;
+            }
+            
+            ctx.log("mining", `Continuing mining with new target: ${newTarget}`);
+            continue;
+          }
+          
+          // No alternatives found - return home
+          ctx.log("mining", "No alternative targets available — returning home to deposit and retry next cycle");
+          stopReason = "deposit too sparse for equipment";
+          if (recoveredSession) {
+            await failMiningSession(bot.username, "Deposit too sparse for equipment");
+            recoveredSession = null;
+          }
+          break;
+        }
+        
+        if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {
+          let newTarget: string | null = null;
+          let newPoiId: string | null = null;
+          let newPoiName: string | null = null;
+          let newSystemId: string | null = null;
+          
+          // First try to find another POI with the same target resource in current system
+          const currentSys = mapStore.getSystem(bot.system);
+          if (currentSys) {
+            const altPoi = currentSys.pois.find(p => p.id !== bot.poi && 
+              (isOreBeltPoi(p.type) || p.hidden === true));
+            if (altPoi) {
+              const storedPoi = currentSys.pois.find(sp => sp.id === altPoi.id) ?? altPoi;
+              const resourceEntry = storedPoi.resources?.find(r => r.resource_id === effectiveTarget);
+              const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+              // Check if this POI has the resource available and not depleted
+              if (resourceEntry) {
+                const remaining = resourceEntry.remaining;
+                if (remaining > 0) {
+                  if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                    ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
+                  } else {
+                    newTarget = effectiveTarget;
+                    newPoiId = altPoi.id;
+                    newPoiName = altPoi.name;
+                    newSystemId = bot.system;
+                    ctx.log("mining", `Found alternative POI with ${effectiveTarget} in current system: ${altPoi.name}`);
+                  }
+                }
+              }
+            }
+          }
+          
+          // If no alternative in current system, try next ore from quotas
+          if (!newTarget && Object.keys(quotas).length > 0) {
+            await bot.refreshFactionStorage();
+            const quotaEntries = Object.entries(quotas)
+              .filter(([oreId]) => oreId !== effectiveTarget && quotas[oreId] > 0)
+              .map(([oreId, target]) => {
+                const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                return { oreId, deficit: target - current };
+              })
+              .filter(e => e.deficit > 0)
+              .sort((a, b) => b.deficit - a.deficit);
+            
+            for (const entry of quotaEntries) {
+              const nextHiddenPoi = findBestHiddenPoiForOre(
+                entry.oreId,
+                bot.system,
+                bot.poi || "",
+                maxJumps,
+                settings.ignoreDepletion,
+                depletionTimeoutMs,
+                50,
+                blacklist
+              );
+              if (nextHiddenPoi) {
+                newTarget = entry.oreId;
+                newPoiId = nextHiddenPoi.poiId;
+                newPoiName = nextHiddenPoi.poiName;
+                newSystemId = nextHiddenPoi.systemId;
+                ctx.log("mining", `Switching to next quota ore: ${entry.oreId} @ ${nextHiddenPoi.poiName}`);
+                break;
+              }
+            }
+          }
+          
+          // If still no target, check if stayOutUntilFull allows continuing
+          if (!newTarget && settings.stayOutUntilFull && effectiveTarget) {
+            ctx.log("mining", "stayOutUntilFull enabled - will search for any available POI with current target");
+            const anyPoi = findBestHiddenPoiForOre(
+              effectiveTarget,
+              bot.system,
+              bot.poi || "",
+              maxJumps,
+              settings.ignoreDepletion,
+              depletionTimeoutMs,
+              0,
+              blacklist
+            );
+            if (anyPoi) {
+              newTarget = effectiveTarget;
+              newPoiId = anyPoi.poiId;
+              newPoiName = anyPoi.poiName;
+              newSystemId = anyPoi.systemId;
+              ctx.log("mining", `Found any available POI with ${effectiveTarget}: ${anyPoi.poiName}`);
+            }
+          }
+          
+          // If we found a new target, switch to it
+          if (newTarget && newPoiId && newPoiName) {
+            effectiveTarget = newTarget;
+            miningPoi = { id: newPoiId, name: newPoiName };
+            
+            if (recoveredSession) {
+              await updateMiningSession(bot.username, {
+                targetResourceId: newTarget,
+                targetResourceName: newTarget,
+                targetPoiId: newPoiId,
+                targetPoiName: newPoiName,
+              });
+            }
+            
+            // Travel to new POI if in different system
+            if (newSystemId && newSystemId !== bot.system) {
+              ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId}`);
+              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              if (!arrived) {
+                ctx.log("error", "Failed to reach new system — returning home");
+                stopReason = "deposit too sparse for equipment";
+                if (recoveredSession) {
+                  await failMiningSession(bot.username, "Failed to reach new target system");
+                  recoveredSession = null;
+                }
+                break;
+              }
+              const { pois: newPois } = await getSystemInfo(ctx);
+              pois = newPois;
+              bot.system = newSystemId;
+            }
+            
+            if (newPoiId !== bot.poi) {
+              const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              if (travelResp.error && !travelResp.error.message.includes("already")) {
+                ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
+                stopReason = "deposit too sparse for equipment";
+                if (recoveredSession) {
+                  await failMiningSession(bot.username, "Failed to reach new target POI");
+                  recoveredSession = null;
+                }
+                break;
+              }
+              bot.poi = newPoiId;
+            }
+            
+            ctx.log("mining", `Continuing mining with new target: ${newTarget}`);
+            continue;
+          }
+          
+          // No alternatives found - return home
+          ctx.log("mining", "No alternative targets available — returning home to deposit and retry next cycle");
+          stopReason = "deposit too sparse for equipment";
+          if (recoveredSession) {
+            await failMiningSession(bot.username, "Deposit too sparse for equipment");
+            recoveredSession = null;
+          }
+          break;
+        }
+        
         if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {
           // VERIFY actual remaining resources before marking as depleted
           // This prevents false positives from transient errors that mention "depleted"
@@ -4527,8 +6201,24 @@ if (effectiveTarget) {
                 ? (result.resources as Array<Record<string, unknown>>)
                 : Array.isArray(poiData?.resources)
                 ? (poiData.resources as Array<Record<string, unknown>>)
-                : [];
-              
+                 : [];
+
+              // CRITICAL FIX: Update mapstore with the scan data from get_poi
+              const resourceData = (resources as Array<Record<string, unknown>>).map((r) => ({
+                resource_id: (r.resource_id as string) || "",
+                name: (r.name as string) || (r.resource_id as string) || "",
+                richness: (r.richness as number) || 0,
+                remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
+                max_remaining: (r.max_remaining as number) ?? 0,
+                depletion_percent: (r.depletion_percent as number) ?? 100,
+                supported_power: (r.supported_power as number) ?? 0,
+              }));
+
+              if (resourceData.length > 0) {
+                mapStore.updatePoiResources(bot.system, bot.poi, resourceData);
+                ctx.log("map", `Updated mapstore with error verification scan for ${bot.poi}: ${resourceData.length} resources`);
+              }
+
               for (const res of resources) {
                 const resId = (res.resource_id as string) || (res.id as string) || "";
                 if (resId === effectiveTarget) {
@@ -4593,7 +6283,8 @@ if (effectiveTarget) {
               maxJumps,
               settings.ignoreDepletion,
               depletionTimeoutMs,
-              50
+              50,
+              blacklist
             );
             
             if (hiddenPoi) {
@@ -4632,60 +6323,63 @@ if (effectiveTarget) {
                     return a.deficit - b.deficit;
                   });
 
-                for (const quotaEntry of sortedOres) {
-                  if (quotaEntry.oreId === effectiveTarget) continue;
-                  
-                  const nextHiddenPoi = findBestHiddenPoiForOre(
-                    quotaEntry.oreId,
-                    bot.system,
-                    bot.poi || "",
-                    maxJumps,
-                    settings.ignoreDepletion,
-                    depletionTimeoutMs,
-                    50
-                  );
-                  
-                  if (nextHiddenPoi) {
-                    newTarget = quotaEntry.oreId;
-                    newPoiId = nextHiddenPoi.poiId;
-                    newPoiName = nextHiddenPoi.poiName;
-                    newSystemId = nextHiddenPoi.systemId;
-                    ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness}, deficit: ${quotaEntry.deficit})`);
-                    break;
-                  }
-                }
-                
-                if (!newTarget) {
-                  let anyHiddenAvailable = false;
-                  for (const oreEntry of sortedOres) {
-                    const anyPoi = findBestHiddenPoiForOre(
-                      oreEntry.oreId,
+for (const quotaEntry of sortedOres) {
+                    if (quotaEntry.oreId === effectiveTarget) continue;
+                    
+                    const nextHiddenPoi = findBestHiddenPoiForOre(
+                      quotaEntry.oreId,
                       bot.system,
                       bot.poi || "",
                       maxJumps,
                       settings.ignoreDepletion,
                       depletionTimeoutMs,
-                      30
+                      50,
+                      blacklist
                     );
-                    if (anyPoi) {
-                      anyHiddenAvailable = true;
+                    
+                    if (nextHiddenPoi) {
+                      newTarget = quotaEntry.oreId;
+                      newPoiId = nextHiddenPoi.poiId;
+                      newPoiName = nextHiddenPoi.poiName;
+                      newSystemId = nextHiddenPoi.systemId;
+                      ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness}, deficit: ${quotaEntry.deficit})`);
                       break;
                     }
                   }
-
-                  if (!anyHiddenAvailable) {
-                    ctx.log("mining", "All hidden POIs depleted across all quota ores — falling back to low richness mining");
-
+                  
+                  if (!newTarget) {
+                    let anyHiddenAvailable = false;
                     for (const oreEntry of sortedOres) {
-                      const anyPoiResult = findBestHiddenPoiForOre(
+                      const anyPoi = findBestHiddenPoiForOre(
                         oreEntry.oreId,
                         bot.system,
                         bot.poi || "",
                         maxJumps,
                         settings.ignoreDepletion,
                         depletionTimeoutMs,
-                        0
+                        30,
+                        blacklist
                       );
+                      if (anyPoi) {
+                        anyHiddenAvailable = true;
+                        break;
+                      }
+                    }
+
+                    if (!anyHiddenAvailable) {
+                      ctx.log("mining", "All hidden POIs depleted across all quota ores — falling back to low richness mining");
+
+                      for (const oreEntry of sortedOres) {
+                        const anyPoiResult = findBestHiddenPoiForOre(
+                          oreEntry.oreId,
+                          bot.system,
+                          bot.poi || "",
+                          maxJumps,
+                          settings.ignoreDepletion,
+                          depletionTimeoutMs,
+                          0,
+                          blacklist
+                        );
 
                       if (anyPoiResult) {
                         newTarget = oreEntry.oreId;
@@ -4733,7 +6427,8 @@ if (effectiveTarget) {
                     maxJumps,
                     settings.ignoreDepletion,
                     depletionTimeoutMs,
-                    50
+                    50,
+                    blacklist
                   );
                   
                   if (nextHiddenPoi) {
@@ -4785,15 +6480,16 @@ if (effectiveTarget) {
 
             // Search for any available deep core ore with hidden POIs
             for (const deepCoreOre of oresToSearch) {
-              const hiddenPoiResult = findBestHiddenPoiForOre(
-                deepCoreOre,
-                bot.system,
-                bot.poi || "",
-                maxJumps,
-                settings.ignoreDepletion,
-                depletionTimeoutMs,
-                50
-              );
+const hiddenPoiResult = findBestHiddenPoiForOre(
+                  deepCoreOre,
+                  bot.system,
+                  bot.poi || "",
+                  maxJumps,
+                  settings.ignoreDepletion,
+                  depletionTimeoutMs,
+                  50,
+                  blacklist
+                );
 
               if (hiddenPoiResult) {
                 newTarget = deepCoreOre;
@@ -4816,7 +6512,8 @@ if (effectiveTarget) {
                   maxJumps,
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
-                  0
+                  0,
+                  blacklist
                 );
 
                 if (anyPoiResult) {
@@ -4870,7 +6567,8 @@ if (effectiveTarget) {
                 maxJumps,
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
-                canMineHiddenRadioactive ? 50 : 0
+                canMineHiddenRadioactive ? 50 : 0,
+                blacklist
               );
 
               if (hiddenPoiResult) {
@@ -4884,21 +6582,30 @@ if (effectiveTarget) {
             }
 
             if (!newTarget) {
-              ctx.log("mining", "No radioactive ores available — waiting for next cycle to retry");
+              ctx.log("mining", "No radioactive ores available anywhere in map");
               stopReason = "no radioactive ores available";
-              break;
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, "radioactive", totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username, oresToSearch,
+              );
             }
           } else if (searchTarget) {
             ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);
-            const globalTargetLocs = mapStore.findOreLocations(searchTarget).filter(loc => {
+            const globalTargetLocs = mapStore.findOreLocations(searchTarget, blacklist, blacklist.length > 0).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") return canMineBasicRadioactive && (
-                        isOreBeltPoi(poi?.type || "") ||
-                        (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                        (poi?.hidden && canMineHiddenRadioactive)
-                      );
+                      if (miningType === "radioactive") {
+                        const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                          (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                           loc.poiName.toLowerCase().includes('mineral field') ||
+                                                           loc.poiName.toLowerCase().includes('asteroid')));
+                        return canMineBasicRadioactive && (
+                          isOreBelt ||
+                          (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                          (poi?.hidden && canMineHiddenRadioactive)
+                        );
+                      }
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -4917,7 +6624,6 @@ if (effectiveTarget) {
             });
 
             if (globalTargetLocs.length > 0) {
-              const blacklist = getSystemBlacklist();
               const locsWithDist = globalTargetLocs
                 .map(loc => {
                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -4941,23 +6647,29 @@ if (effectiveTarget) {
             }
           }
 
-          // If no global target available, try quotas
-          if (!newTarget) {
-            ctx.log("mining", `Global target not available — checking quotas...`);
-            await bot.refreshFactionStorage();
-            const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+// If no global target available, try quotas
+           if (!newTarget) {
+             ctx.log("mining", `Global target not available — checking quotas...`);
+             await bot.refreshFactionStorage();
+             const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower);
 
             if (newQuotaTarget) {
               // Find locations for the new quota target
-              const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
+              const newLocs = mapStore.findOreLocations(newQuotaTarget, blacklist, blacklist.length > 0).filter(loc => {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-            if (miningType === "radioactive") return canMineBasicRadioactive && (
-              isOreBeltPoi(poi?.type || "") ||
-              (!poi?.hidden && canMineDeepCoreRadioactive) ||
-              (poi?.hidden && canMineHiddenRadioactive)
-            );
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                   loc.poiName.toLowerCase().includes('mineral field') ||
+                                                   loc.poiName.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
+              }
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -4979,7 +6691,6 @@ if (effectiveTarget) {
               if (newLocs.length > 0) {
                 newTarget = newQuotaTarget;
                 // Prefer current system, then closest by jumps (use blacklist)
-                const blacklist = getSystemBlacklist();
                 const locsWithDist = newLocs
                 .map(loc => {
                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -5008,49 +6719,66 @@ if (effectiveTarget) {
           if (!newTarget && !targetResource) {
             // For deep core miners, don't fall back to regular ores
             if (isDeepCoreMiner) {
-              ctx.log("mining", "Deep core miner — no target found, will wait for next cycle");
+              ctx.log("mining", "Deep core miner — no target found anywhere in map");
               stopReason = "no deep core target available";
+              const candidateOres = Object.keys(quotas).filter((o) => isDeepCoreOre(o));
+              await reportNoViableTargetsAndDeepSleep(
+                ctx, settings, "ore", totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+                candidateOres.length > 0 ? candidateOres : Object.keys(quotas),
+              );
               break;
             }
             
             // First try current system
-            const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
-                           miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
-miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
-  isOreBeltPoi(p.type) ||
-  (!p.hidden && canMineDeepCoreRadioactive) ||
-  (p.hidden && canMineHiddenRadioactive)
-)) :
+const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
+                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
+                            miningType === "radioactive" ? pois.filter(p => {
+                              const isOreBelt = isOreBeltPoi(p.type) ||
+                                (p.name && (p.name.toLowerCase().includes('belt') ||
+                                            p.name.toLowerCase().includes('mineral field') ||
+                                            p.name.toLowerCase().includes('asteroid')));
+                              return canMineBasicRadioactive && (
+                                isOreBelt ||
+                                (!p.hidden && canMineDeepCoreRadioactive) ||
+                                (p.hidden && canMineHiddenRadioactive)
+                              );
+                            }) :
                             pois.filter(p => isGasCloudPoi(p.type));
 
-            for (const poi of allPois) {
-              const sysData = mapStore.getSystem(bot.system);
-              const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-              const availableOres = storedPoi?.ores_found.filter(o => {
-                if (miningType === "ice" && !o.item_id.toLowerCase().includes("ice")) return false;
-                if (miningType === "gas" && !o.item_id.toLowerCase().includes("gas")) return false;
-                if (miningType === "ore" && (o.item_id.toLowerCase().includes("gas") || o.item_id.toLowerCase().includes("ice"))) return false;
-                if (!o.depleted) return true;
-                return isDepletionExpired(o.depleted_at, depletionTimeoutMs);
-              }) || [];
+             for (const poi of allPois) {
+               const sysData = mapStore.getSystem(bot.system);
+               const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+               if (!storedPoi?.resources) continue;
+               const availableOres = storedPoi.resources.filter(r => {
+                 const oreEntry = storedPoi.ores_found.find(o => o.item_id === r.resource_id);
+                 if (miningType === "ice" && !r.resource_id.toLowerCase().includes("ice")) return false;
+                 if (miningType === "gas" && !r.resource_id.toLowerCase().includes("gas")) return false;
+                 if (miningType === "ore" && (r.resource_id.toLowerCase().includes("gas") || r.resource_id.toLowerCase().includes("ice"))) return false;
+                 if (r.remaining <= 0 && r.max_remaining > 0) return false;
+         if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
+         if (r.depleted && !isDepletionExpired(r.depleted_at, depletionTimeoutMs)) return false;
+                 if (r.supported_power && r.supported_power > 0 && totalMiningPower > r.supported_power * 4) return false;
+                 return true;
+               });
 
-              if (availableOres.length > 0) {
-                newTarget = availableOres[0].item_id;
-                newPoiId = poi.id;
-                newPoiName = poi.name;
-                newSystemId = bot.system;
-                ctx.log("mining", `Found ${newTarget} @ ${poi.name} (no quota, mining any)`);
-                break;
-              }
-            }
+               if (availableOres.length > 0) {
+                 const resource = availableOres[0];
+                 newTarget = resource.resource_id;
+                 newPoiId = storedPoi.id;
+                 newPoiName = storedPoi.name;
+                 newSystemId = bot.system;
+                 ctx.log("mining", `Found ${newTarget} @ ${storedPoi.name} (no quota, mining any)`);
+                 break;
+               }
+             }
 
-            // If stayOutUntilFull is enabled and cargo is not full, search other systems using resource scan data
+             // If stayOutUntilFull is enabled and cargo is not full, search other systems using resource scan data
             if (!newTarget && settings.stayOutUntilFull) {
               const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
               if (fillRatio < cargoThresholdRatio) {
                 ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching other systems using resource scan data...");
                 // Use the new scoring system to find best available location
-                const blacklist = getSystemBlacklist();
                 const bestLocations = mapStore.findBestMiningLocation(effectiveTarget || (miningType === "ore" ? "iron_ore" : miningType === "gas" ? "argon_gas" : miningType === "radioactive" ? "uranium_ore" : "water_ice"), bot.system, blacklist);
 
                 for (const loc of bestLocations) {
@@ -5063,8 +6791,19 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
                   const poi = sys?.pois.find(p => p.id === loc.poiId);
                   if (!poi) continue;
 
-                  // Verify POI type matches
-                  if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
+                  // Verify POI type matches - only filter by hidden status, trust map data
+                  if (miningType === "ore") {
+                    if (poi.hidden) continue; // Hidden POIs need special handling
+                  }
+                  if (miningType === "radioactive") {
+                    if (poi.hidden && !canMineHiddenRadioactive) continue;
+                  }
+                  if (miningType === "gas") {
+                    if (poi.hidden && !canMineHiddenRadioactive) continue;
+                  }
+                  if (miningType === "ice") {
+                    if (poi.hidden && !canMineHiddenIce) continue;
+                  }
                   if (miningType === "radioactive" && !(canMineBasicRadioactive && (
                     isOreBeltPoi(poi.type) ||
                     (!poi.hidden && canMineDeepCoreRadioactive) ||
@@ -5073,20 +6812,25 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
                   if (miningType === "gas" && !isGasCloudPoi(poi.type)) continue;
                   if (miningType === "ice" && !isIceFieldPoi(poi.type)) continue;
 
-                  // Check if not depleted (or expired)
-                  const oreEntry = poi.ores_found.find(o => o.item_id === loc.resourceId || o.item_id === effectiveTarget);
-                  const resourceEntry = poi.resources?.find(r => r.resource_id === loc.resourceId || r.resource_id === effectiveTarget);
-                  // Check both ores_found and resources for depletion status
-                  if (resourceEntry?.depleted) {
-                    // Skip completely exhausted POIs regardless of settings
-                    if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
-                    if (!isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs)) continue;
-                  }
-                  if (oreEntry?.depleted) {
-                    // Skip completely exhausted POIs regardless of settings
-                    if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
-                    if (!isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
-                  }
+// Check if not depleted (or expired)
+                   const oreEntry = poi.ores_found.find(o => o.item_id === loc.resourceId || o.item_id === effectiveTarget);
+                   const resourceEntry = poi.resources?.find(r => r.resource_id === loc.resourceId || r.resource_id === effectiveTarget);
+                   // Check both ores_found and resources for depletion status
+                   if (resourceEntry?.depleted) {
+                     // Skip completely exhausted POIs regardless of settings
+                     if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
+                     if (!isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs)) continue;
+                   }
+                   if (oreEntry?.depleted) {
+                     // Skip completely exhausted POIs regardless of settings
+                     if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
+                     if (!isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+                   }
+
+                   // Check supported_power for high-power miners
+                   if (totalMiningPower > 0 && resourceEntry?.supported_power && resourceEntry.supported_power > 0 && totalMiningPower > resourceEntry.supported_power * 4) {
+                     continue;
+                   }
 
                   // Found a good target
                   const hiddenTag = loc.isHidden ? " [HIDDEN POI]" : "";
@@ -5126,6 +6870,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId} (${newPoiName}) - stayOutUntilFull`);
               const travelOpts = {
                 ...safetyOpts,
+                skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                 onJump: async (jumpNumber: number) => {
                   // Check if target POI is still available
                   const sys = mapStore.getSystem(newSystemId);
@@ -5194,12 +6939,21 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         if (msg.includes("cargo") && msg.includes("full")) {
           stopReason = "cargo full"; break;
         }
-        if (msg.includes("harvester") || msg.includes("equipment") || msg.includes("mining")) {
-          // EQUIPMENT ERROR: Verify POI resources before treating as fatal
-          // This prevents false positives from server timeouts that cause state confusion
+        if (msg.includes("harvester") || msg.includes("equipment") || msg.includes("mining") || msg.includes("too sparse") || msg.includes("deposit_too_sparse")) {
           ctx.log("warn", `Mining equipment error: ${mineResp.error.message}`);
           
-          // Verify what resources are actually available at this POI
+          if (msg.includes("too sparse") || msg.includes("deposit_too_sparse")) {
+            ctx.log("error", "Deposit too sparse for current mining array — equipment power exceeds deposit density");
+            ctx.log("error", "Cannot refit modules in the field — must return to station to adjust loadout");
+            
+            stopReason = "deposit too sparse for equipment";
+            if (recoveredSession) {
+              await failMiningSession(bot.username, "Deposit too sparse for equipment");
+              recoveredSession = null;
+            }
+            break;
+          }
+          
           let poiHasTargetResource = false;
           let poiResourceTypes: string[] = [];
           
@@ -5213,6 +6967,22 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
                 : Array.isArray(poiData?.resources)
                 ? (poiData.resources as Array<Record<string, unknown>>)
                 : [];
+
+              // CRITICAL FIX: Update mapstore with the scan data from get_poi
+              const resourceData = (resources as Array<Record<string, unknown>>).map((r) => ({
+                resource_id: (r.resource_id as string) || "",
+                name: (r.name as string) || (r.resource_id as string) || "",
+                richness: (r.richness as number) || 0,
+                remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
+                max_remaining: (r.max_remaining as number) ?? 0,
+                depletion_percent: (r.depletion_percent as number) ?? 100,
+                supported_power: (r.supported_power as number) ?? 0,
+              }));
+
+              if (resourceData.length > 0) {
+                mapStore.updatePoiResources(bot.system, bot.poi, resourceData);
+                ctx.log("map", `Updated mapstore with equipment error verification scan for ${bot.poi}: ${resourceData.length} resources`);
+              }
 
               for (const res of resources) {
                 const resId = (res.resource_id as string) || (res.id as string) || "";
@@ -5277,11 +7047,17 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
               if (miningType === "ore") return isOreBeltPoi(p.type);
-                if (miningType === "radioactive") return canMineBasicRadioactive && (
-                  isOreBeltPoi(p.type) ||
-                  (!p.hidden && canMineDeepCoreRadioactive) ||
-                  (p.hidden && canMineHiddenRadioactive)
-                );
+                if (miningType === "radioactive") {
+                  const isOreBelt = isOreBeltPoi(p.type) ||
+                                    (p.name && (p.name.toLowerCase().includes('belt') || 
+                                                p.name.toLowerCase().includes('mineral field') ||
+                                                p.name.toLowerCase().includes('asteroid')));
+                  return canMineBasicRadioactive && (
+                    isOreBelt ||
+                    (!p.hidden && canMineDeepCoreRadioactive) ||
+                    (p.hidden && canMineHiddenRadioactive)
+                  );
+                }
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;
@@ -5393,21 +7169,21 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         if (activeJettisonList.includes(oreId)) {
           const jettisonResp = await bot.exec("jettison", { item_id: oreId, quantity: 9999 });
           if (!jettisonResp.error) {
-            const dcTag = isDeepCoreMining ? " [deep core]" : "";
-            ctx.log("mining", `Jettisoned ${oreName} (low-value ore configured for jettison${dcTag})`);
+            const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
+            ctx.log("mining", `Jettisoned ${oreName} (low-value item configured for jettison${dcTag})`);
             await bot.refreshCargo();
           }
         }
 
-        // JETTISON: Also clear any other jettison-listed ores that may have accumulated in cargo
-        for (const jettisonOreId of activeJettisonList) {
-          if (jettisonOreId === oreId) continue; // Already jettisoned above
-          const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
+        // JETTISON: Also clear any other jettison-listed items that may have accumulated in cargo
+        for (const jettisonItemId of activeJettisonList) {
+          if (jettisonItemId === oreId) continue; // Already jettisoned above
+          const cargoItem = bot.inventory.find(i => i.itemId === jettisonItemId);
           if (cargoItem && cargoItem.quantity > 0) {
-            const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+            const jettisonResp = await bot.exec("jettison", { item_id: jettisonItemId, quantity: cargoItem.quantity });
             if (!jettisonResp.error) {
-              const jettisonName = cargoItem.name || jettisonOreId;
-              const dcTag = isDeepCoreMining ? " [deep core]" : "";
+              const jettisonName = cargoItem.name || jettisonItemId;
+              const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
               ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${jettisonName} (configured for jettison${dcTag})`);
               await bot.refreshCargo();
             }
@@ -5469,12 +7245,12 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     const isDepleted = stopReason && stopReason.includes("depleted");
     const isFuelLowStop = stopReason && stopReason.includes("fuel low");
 
-    // CRITICAL FIX: When stopping due to fuel low mid-mining and stayOutUntilFull is enabled:
+    // When stopping due to fuel low mid-mining:
     // - Don't deposit cargo at the refuel station
     // - Refuel and continue mining instead of returning home
     // This prevents depositing at random stations during refuel detours
     const isCargoFull = fillRatio >= cargoThresholdRatio;
-    const shouldStayOutDueToFuel = isFuelLowStop && settings.stayOutUntilFull && !isCargoFull;
+    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull;
 
     const shouldReturnHome = settings.noMidMiningRetarget
       ? (bot.system !== homeSystem && homeSystem)
@@ -5485,7 +7261,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     if (shouldStayOutDueToFuel) {
       // CRITICAL FIX: Fuel low stop with stayOutUntilFull enabled - refuel and continue mining
       // DO NOT deposit cargo at random station, DO NOT return home yet
-      ctx.log("mining", `Fuel low but stayOutUntilFull enabled and cargo not full (${(fillRatio * 100).toFixed(0)}%) — refueling and continuing mining`);
+      ctx.log("mining", `Fuel low but cargo not full (${(fillRatio * 100).toFixed(0)}%) — refueling and continuing mining`);
       
       // Refuel at local/current station - do NOT deposit cargo here
       const { pois: currentPois } = await getSystemInfo(ctx);
@@ -5618,6 +7394,24 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       bot.docked = true;
     }
 
+    // ── Ensure weapons are loaded with ammo after docking ──
+    // Miner ships may have weapons that need ammo loaded before combat
+    // When docked at home system, also withdraw ammo from faction storage
+    const weapons = await getWeaponModules(ctx);
+    if (weapons.length > 0) {
+      ctx.log("mining", `Docked: checking ammo for ${weapons.length} weapon(s)`);
+      
+      // If at home system and docked, resupply from faction storage first
+      if (bot.system === homeSystem && bot.docked) {
+        await ensureMinerResupply(ctx);
+      }
+      
+      const hasAmmo = await ensureAmmoLoaded(ctx, 5, 3, 1, 25);
+      if (!hasAmmo) {
+        ctx.log("warn", "Docked: low on weapon ammo — will resupply if at home station");
+      }
+    }
+
     // ── Collect storage + unload cargo ──
     await collectFromStorage(ctx);
     const creditsBefore = bot.credits;
@@ -5738,6 +7532,10 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
 
     // Complete mining session after successful deposit
     if (recoveredSession) {
+      // Unregister from coordination before completing session
+      if (settings.enableCoordination) {
+        unregisterCoordinationTarget(bot.username, recoveredSession.targetSystemId, recoveredSession.targetPoiId);
+      }
       await completeMiningSession(bot.username);
       ctx.log("mining", `Mining session completed: ${recoveredSession.cyclesMined} cycles, ${Object.entries(recoveredSession.resourcesMined).map(([k, v]) => `${v}x ${k}`).join(", ")}`);
       recoveredSession = null;

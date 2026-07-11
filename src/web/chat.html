@@ -50,17 +50,17 @@
 
     let currentBot = "";
     let currentChannel = "local";
-    let ws: WebSocket | null = null;
-    let pollTimer: number | null = null;
+    let ws = null;
+    let pollTimer = null;
     let lastMessageTimestamp = 0;
     let isAtBottom = true;
 
-    function formatTime(ts: number): string {
+    function formatTime(ts) {
       const d = new Date(ts);
       return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
     }
 
-    function escapeHtml(str: string): string {
+    function escapeHtml(str) {
       return str
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -69,7 +69,7 @@
         .replace(/'/g, "&#039;");
     }
 
-    function renderMessage(msg: { botUsername: string; channel: string; sender: string; content: string; timestamp: number; direction: string; targetId?: string }) {
+    function renderMessage(msg, showBot) {
       const el = document.createElement("div");
       el.className = `message ${msg.direction === "out" ? "message-out" : "message-in"}`;
 
@@ -78,8 +78,8 @@
       const content = escapeHtml(msg.content);
 
       const meta = msg.direction === "out"
-        ? `→ ${escapeHtml(msg.targetId || msg.channel)}`
-        : `← ${sender}`;
+        ? `→ ${escapeHtml(msg.targetId || msg.channel)}${showBot ? ` (${escapeHtml(msg.botUsername)})` : ""}`
+        : `← ${sender}${showBot ? ` (${escapeHtml(msg.botUsername)})` : ""}`;
 
       el.innerHTML = `
         <div class="message-meta">
@@ -120,6 +120,11 @@
           return;
         }
 
+        const allBotsOption = document.createElement("option");
+        allBotsOption.value = "__all__";
+        allBotsOption.textContent = "All Bots";
+        botSelect.appendChild(allBotsOption);
+
         for (const bot of data.bots) {
           const opt = document.createElement("option");
           opt.value = bot;
@@ -127,10 +132,10 @@
           botSelect.appendChild(opt);
         }
 
-        if (!currentBot && data.bots.length > 0) {
-          currentBot = data.bots[0];
-          botSelect.value = currentBot;
+        if (!currentBot) {
+          currentBot = "__all__";
         }
+        botSelect.value = currentBot;
       } catch (err) {
         console.error(`[Chat] Failed to load bots:`, err);
         botSelect.innerHTML = `<option value="">Failed to load bots: ${err}</option>`;
@@ -139,7 +144,9 @@
 
     async function loadChannels() {
       try {
-        const url = currentBot ? `${API_BASE}/api/channels?bot=${encodeURIComponent(currentBot)}` : `${API_BASE}/api/channels`;
+        const url = currentBot && currentBot !== "__all__" 
+          ? `${API_BASE}/api/channels?bot=${encodeURIComponent(currentBot)}` 
+          : `${API_BASE}/api/channels`;
         const res = await fetch(url);
         const data = await res.json();
         const currentVal = channelSelect.value;
@@ -152,7 +159,7 @@
           channelSelect.appendChild(opt);
         }
 
-        if (data.channels.some((ch: { name: string }) => ch.name === currentVal)) {
+        if (data.channels.some((ch) => ch.name === currentVal)) {
           channelSelect.value = currentVal;
         } else if (data.channels.length > 0) {
           channelSelect.value = data.channels[0].name;
@@ -165,7 +172,7 @@
     }
 
     function updateTargetInput() {
-      if (currentChannel === "private") {
+      if (currentChannel === "private" && currentBot !== "__all__") {
         targetInput.disabled = false;
         targetInput.placeholder = "To (player name)…";
       } else {
@@ -176,32 +183,49 @@
     }
 
     async function loadMessages() {
-      if (!currentBot) return;
+      if (!currentChannel) return;
 
       try {
-        const url = new URL(`${API_BASE}/api/messages`, window.location.origin);
-        url.searchParams.set("bot", currentBot);
-        url.searchParams.set("channel", currentChannel);
-        url.searchParams.set("limit", "200");
-        if (lastMessageTimestamp > 0) {
-          url.searchParams.set("after", String(lastMessageTimestamp));
-        }
-
-        const res = await fetch(url.toString());
-        if (!res.ok) {
-          console.error(`[Chat] /api/messages failed: ${res.status} ${res.statusText}`);
-          return;
-        }
-        const data = await res.json();
-        console.log(`[Chat] /api/messages response:`, data);
-
-        if (data.messages && data.messages.length > 0) {
-          for (const msg of data.messages) {
-            renderMessage(msg);
-            lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+        if (currentBot === "__all__") {
+          const url = new URL(`${API_BASE}/api/messages`, window.location.origin);
+          url.searchParams.set("limit", "500");
+          const res = await fetch(url.toString());
+          const data = await res.json();
+          if (data.messages && data.messages.length > 0) {
+            messagesEl.innerHTML = "";
+            lastMessageTimestamp = 0;
+            for (const msg of data.messages) {
+              renderMessage(msg, true);
+              lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+            }
+            checkEmpty();
+            scrollToBottom();
           }
-          checkEmpty();
-          if (isAtBottom) scrollToBottom();
+        } else if (currentBot) {
+          const url = new URL(`${API_BASE}/api/messages`, window.location.origin);
+          url.searchParams.set("bot", currentBot);
+          url.searchParams.set("channel", currentChannel);
+          url.searchParams.set("limit", "200");
+          if (lastMessageTimestamp > 0) {
+            url.searchParams.set("after", String(lastMessageTimestamp));
+          }
+
+          const res = await fetch(url.toString());
+          if (!res.ok) {
+            console.error(`[Chat] /api/messages failed: ${res.status} ${res.statusText}`);
+            return;
+          }
+          const data = await res.json();
+          console.log(`[Chat] /api/messages response:`, data);
+
+          if (data.messages && data.messages.length > 0) {
+            for (const msg of data.messages) {
+              renderMessage(msg, false);
+              lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+            }
+            checkEmpty();
+            if (isAtBottom) scrollToBottom();
+          }
         }
       } catch (err) {
         console.error("Failed to load messages:", err);
@@ -211,6 +235,10 @@
     async function sendMessage() {
       const content = messageInput.value.trim();
       if (!content) return;
+      if (currentBot === "__all__") {
+        alert("Select a specific bot to send messages.");
+        return;
+      }
       if (!currentBot) {
         alert("Select a bot first.");
         return;
@@ -224,7 +252,7 @@
         return;
       }
 
-      const body: Record<string, unknown> = {
+      const body = {
         bot: currentBot,
         channel: currentChannel,
         content,
@@ -270,8 +298,9 @@
             const data = JSON.parse(event.data);
             if (data.type === "new_message" && data.message) {
               const msg = data.message;
-              if (msg.botUsername === currentBot && msg.channel === currentChannel) {
-                renderMessage(msg);
+              const showBot = currentBot === "__all__";
+              if (showBot || (msg.botUsername === currentBot && msg.channel === currentChannel)) {
+                renderMessage(msg, showBot);
                 lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
                 checkEmpty();
                 if (isAtBottom) scrollToBottom();
@@ -298,7 +327,7 @@
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = window.setInterval(() => {
-        if (currentBot && currentChannel) {
+        if (currentChannel) {
           loadMessages();
         }
       }, POLL_INTERVAL_MS);
@@ -309,6 +338,7 @@
       messagesEl.innerHTML = "";
       lastMessageTimestamp = 0;
       isAtBottom = true;
+      updateTargetInput();
       loadChannels().then(() => {
         loadMessages();
       });

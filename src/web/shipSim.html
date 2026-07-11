@@ -19,8 +19,8 @@
     .shipsim-ship-select label { font-size:12px; color:var(--text-dim); }
     .shipsim-skill-select { display:flex; align-items:center; gap:8px; margin-bottom:16px; }
     .shipsim-skill-select label { font-size:12px; color:var(--text-dim); }
-    .shipsim-skill-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
-    .shipsim-ship-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipsim-skill-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
+    .shipsim-ship-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
     .shipsim-stats-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:8px; margin-bottom:16px; }
     .shipsim-stat-item { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; background:var(--bg-row); border-radius:4px; }
     .shipsim-stat-label { font-weight:500; }
@@ -49,7 +49,7 @@
     .shipsim-loadout-remove { color:var(--red); cursor:pointer; padding:2px 6px; border-radius:2px; align-self:flex-start; }
     .shipsim-loadout-remove:hover { background:var(--bg-input); }
     .shipsim-module-select { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
-    .shipsim-module-select select { flex:1; padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipsim-module-select select { flex:1; padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
     .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
   </style>
 </head>
@@ -108,7 +108,7 @@
   </div>
 
   <script>
-    let catalog = { ships: {}, items: {} };
+    let catalog = { ships: {}, items: {}, facilities: {} };
     let selectedShip = null;
     let currentLoadout = { weapons: [], defense: [], utility: [] };
     let engineeringSkillLevel = 0;
@@ -249,7 +249,8 @@ function selectShip() {
       }
 
       // Get available modules from catalog
-      const modules = Object.values(catalog.items || {}).filter(item => {
+      const itemsArray = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
+      const modules = itemsArray.filter(item => {
         const category = item.category || item.type || '';
         return category.toLowerCase().includes('weapon') ||
                category.toLowerCase().includes('defense') ||
@@ -402,7 +403,7 @@ function selectShip() {
       if (!moduleId) return;
 
       // Find the module by ID (works for any category, including mining lasers, strip miners, etc.)
-      const allItems = Object.values(catalog.items || {});
+      const allItems = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
       let module = allItems.find(m => m.id === moduleId);
 
       // Fallback for any legacy hardcoded specials that might still be referenced
@@ -610,7 +611,7 @@ function selectShip() {
 
       // Clear and apply
       currentLoadout = { weapons: [], defense: [], utility: [] };
-      const allModules = Object.values(catalog.items || {});
+      const allModules = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
       const hiddenUtilityModules = {
         'onboard_hydrogen_refinery': { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
       };

@@ -19,10 +19,137 @@ import {
   isPirateSystem,
   getItemSize,
 } from "./common.js";
+import { logTransportProfit } from "./transportProfitDebug.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
+
+// ── Cloaking module detection and enablement ────────────────────────────────
+
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("transport", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("transport", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  // Cloaking requires being undocked - handle state explicitly
+  const wasDocked = bot.docked;
+  if (wasDocked) {
+    ctx.log("transport", "Undocking before enabling cloak...");
+    const undockResp = await bot.exec("undock");
+    if (undockResp.error && !undockResp.error.message.includes("already")) {
+      ctx.log("error", `Undock failed before cloak: ${undockResp.error.message}`);
+      return false;
+    }
+    bot.docked = false;
+    // Wait a tick for state to settle
+    await ctx.sleep(2000);
+    await bot.refreshLocation();
+  }
+
+  ctx.log("transport", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  bot.isCloaked = true;
+  ctx.log("transport", "Cloaking enabled successfully");
+
+  // Redock if we were initially docked
+  if (wasDocked) {
+    ctx.log("transport", "Redocking after enabling cloak...");
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.includes("already")) {
+      ctx.log("error", `Redock failed after cloak: ${dockResp.error.message}`);
+      return false;
+    }
+    bot.docked = true;
+    await bot.refreshLocation();
+  }
+
+  return true;
+}
+
+async function checkAndRecloak(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  const { bot } = ctx;
+
+  if (!settings.enableCloak) {
+    return;
+  }
+
+  if (bot.isCloaked) {
+    return;
+  }
+
+  if (bot.fuel <= 0) {
+    ctx.log("transport", "Cannot recloak - no fuel available");
+    return;
+  }
+
+  ctx.log("transport", "Bot is decloaked, attempting to recloak...");
+  await enableCloakingIfPossible(ctx);
+}
+
+async function depositExcessCredits(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  const { bot } = ctx;
+  
+  if (!bot.docked) {
+    return;
+  }
+  
+  if (bot.credits <= settings.factionDepositThreshold) {
+    return;
+  }
+  
+  const excessToDeposit = bot.credits - settings.factionDepositThreshold;
+  ctx.log("transport", `Depositing ${excessToDeposit.toLocaleString()} credits to faction storage (above threshold of ${settings.factionDepositThreshold.toLocaleString()})`);
+  
+  const resp = await bot.exec("faction_deposit_credits", { amount: excessToDeposit });
+  
+  if (resp.error) {
+    ctx.log("error", `Failed to deposit credits: ${resp.error.message}`);
+  } else {
+    ctx.log("transport", `Successfully deposited ${excessToDeposit.toLocaleString()} credits`);
+  }
+}
 
 let stationRefCache: StationRef | null = null;
 
@@ -61,7 +188,7 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
 const fs = require("fs");
 const path = require("path");
 
-const MOBILE_STATIONS = new Set(["mobile_capitol", "frontier_station"]);
+const MOBILE_STATIONS = new Set(["mobile_capital", "frontier_station"]);
 
 function isMobileStation(poiId: string): boolean {
   return MOBILE_STATIONS.has(poiId.toLowerCase());
@@ -82,10 +209,16 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       const result = routeResp.result as Record<string, unknown>;
       const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
       if (isFound) {
+        const resolvedSystem = (result.target_system as string) || "";
+        const resolvedPoi = (result.target_poi as string) || destinationId;
+        const resolvedPoiName = (result.target_poi_name as string) || destinationName || destinationId;
+        if (destinationId === "mobile_capital" && resolvedSystem && resolvedPoi) {
+          mapStore.updateMobileCapitolLocation(resolvedSystem, resolvedSystem, resolvedPoi);
+        }
         return {
-          system: (result.target_system as string) || "",
-          poi: (result.target_poi as string) || destinationId,
-          poiName: (result.target_poi_name as string) || destinationName || destinationId,
+          system: resolvedSystem,
+          poi: resolvedPoi,
+          poiName: resolvedPoiName,
           origDest: destinationId,
         };
       }
@@ -303,7 +436,21 @@ function loadCatalog(): Record<string, CatalogShip> {
     if (fs.existsSync(catalogPath)) {
       const raw = fs.readFileSync(catalogPath, "utf-8");
       const data = JSON.parse(raw) as Record<string, unknown>;
-      const ships = (data.ships as Record<string, CatalogShip>) || {};
+      const ships: Record<string, CatalogShip> = {};
+      
+      const shipsData = data.ships as Record<string, unknown> | unknown[] | undefined;
+      if (Array.isArray(shipsData)) {
+        for (const ship of shipsData) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
+      } else if (shipsData && typeof shipsData === "object") {
+        for (const [, ship] of Object.entries(shipsData)) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
+      }
+      
       catalogCache = ships;
       return ships;
     }
@@ -351,6 +498,8 @@ interface TransportState {
   lastUpdated: string;
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
+  visitedEmpireStations: string[];
+  needsTravel: boolean;
 }
 
 interface FleetShip {
@@ -427,6 +576,8 @@ interface CivilianTransportSettings {
   allowEconomyClass: boolean;
   announceDestination: boolean;
   disableFactionMessage: boolean;
+  enableCloak: boolean;
+  factionDepositThreshold: number;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -455,6 +606,8 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
     announceDestination: (t.announceDestination as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
+    enableCloak: (t.enableCloak as boolean) ?? false,
+    factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
   };
 }
 
@@ -597,6 +750,145 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
   const data = loadAllData();
   data.fleet.bots[botUsername] = { ships, lastUpdated: new Date().toISOString() };
   saveAllData(data);
+}
+
+// ── Per-bot civilian transport log (achievement tracking) ──────────
+//
+// We keep a permanent, per-bot record of every passenger a bot has ever
+// completed a transport with. File: data/CivTransportLogs/<bot>_CT.log
+// Each line: "<first-time-transported date> <passenger underline name>"
+// e.g. "2026-07-10 bob_hope"
+// This lets us cross-reference which bot has never transported a given
+// passenger so we can hand off connecting flights between faction bots.
+
+const CIV_LOG_DIR = "data/CivTransportLogs";
+
+function civLogPathForBot(botName: string): string {
+  const safe = botName.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  return path.join(process.cwd(), CIV_LOG_DIR, `${safe}_CT.log`);
+}
+
+function toUnderlineName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function todayDateStr(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export function hasTransportedPassenger(botName: string, passengerName: string): boolean {
+  try {
+    const file = civLogPathForBot(botName);
+    if (!fs.existsSync(file)) return false;
+    const underline = toUnderlineName(passengerName);
+    const lines = fs.readFileSync(file, "utf-8").split("\n");
+    return lines.some((line: string) => {
+      const parts = line.trim().split(/\s+/);
+      const name = parts[parts.length - 1] || "";
+      return name === underline;
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function recordTransportedPassenger(botName: string, passengerName: string): void {
+  try {
+    const underline = toUnderlineName(passengerName);
+    const file = civLogPathForBot(botName);
+    if (!fs.existsSync(CIV_LOG_DIR)) {
+      fs.mkdirSync(CIV_LOG_DIR, { recursive: true });
+    }
+    if (hasTransportedPassenger(botName, passengerName)) {
+      return; // keep the original first-time date
+    }
+    fs.appendFileSync(file, `${todayDateStr()} ${underline}\n`, "utf-8");
+  } catch (err) {
+    console.error(`Failed to record transported passenger for ${botName}:`, err);
+  }
+}
+
+// ── Manual command: unload passengers into faction Transit Lounge ──
+//
+// Runs the `unload_passenger target=lounge` handoff. We gather passengers
+// from another station with the civilian transport routine, then check them
+// into the faction Transit Lounge at the home base so another faction bot
+// can board them onward later (picking them up is handled in a later session).
+
+export async function unloadPassengersToLounge(
+  bot: Bot,
+  opts: { id?: string } = {},
+): Promise<{ ok: boolean; message?: string; error?: string }> {
+  const ctx: RoutineContext = {
+    api: bot.api,
+    bot,
+    log: (cat, msg) => bot.log(cat, msg),
+    sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),
+  };
+
+  const settings = getCivilianTransportSettings(bot.username);
+  const homeStation = settings.homeStation;
+  const homeSystem = settings.homeSystem;
+
+  // The lounge lives at the faction's home base. Navigate there if configured.
+  if (homeSystem && bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+    ctx.log("transport", `unload-to-lounge: navigating to home system ${homeSystem}...`);
+    const ok = await navigateToSystem(ctx, homeSystem, {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: true,
+    });
+    if (!ok) {
+      return { ok: false, error: `Failed to navigate to home system ${homeSystem}` };
+    }
+  }
+
+  if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+    ctx.log("transport", `unload-to-lounge: traveling to home station ${homeStation}...`);
+    const tr = await bot.exec("travel", { target_poi: homeStation });
+    if (tr.error) {
+      return { ok: false, error: `Travel to home station failed: ${tr.error.message}` };
+    }
+  }
+
+  await bot.refreshStatus();
+
+  if (!bot.docked) {
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+      return { ok: false, error: `Dock failed: ${dockResp.error.message}` };
+    }
+  }
+
+  const listResp = await bot.exec("list_passengers");
+  let aboardCount = 0;
+  if (!listResp.error && listResp.result) {
+    const parsed = parseListPassengers(listResp.result);
+    aboardCount = parsed ? parsed.passengers.length : 0;
+  }
+
+  if (aboardCount === 0) {
+    return { ok: true, message: "No passengers aboard to check into the Transit Lounge." };
+  }
+
+  const id = opts.id && opts.id.trim().length > 0 ? opts.id.trim() : "all";
+  ctx.log("transport", `unload-to-lounge: handing off ${id === "all" ? aboardCount + " passengers" : id} to Transit Lounge...`);
+  const resp = await bot.exec("unload_passenger", { id, target: "lounge" });
+  if (resp.error) {
+    return { ok: false, error: `unload_passenger failed: ${resp.error.message}` };
+  }
+
+  return {
+    ok: true,
+    message: `Checked ${id === "all" ? aboardCount : id} passenger(s) into the faction Transit Lounge. They can be boarded onward by any faction bot with load_passenger.`,
+  };
 }
 
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
@@ -746,7 +1038,15 @@ function countPassengerModules(modules: unknown): { economy: number; business: n
     const typeName = ((mod.name as string) || (mod.type_name as string) || "") as string;
     const allText = (typeId + " " + typeName).toLowerCase();
     
-    if (allText.includes("passenger") || allText.includes("berth") || allText.includes("cabin")) {
+    const firstBerths = (mod.passenger_first_berths as number) || 0;
+    const businessBerths = (mod.passenger_business_berths as number) || 0;
+    const economyBerths = (mod.passenger_economy_berths as number) || 0;
+    
+    if (firstBerths > 0 || businessBerths > 0 || economyBerths > 0) {
+      first += firstBerths;
+      business += businessBerths;
+      economy += economyBerths;
+    } else if (allText.includes("passenger") || allText.includes("berth") || allText.includes("cabin")) {
       if (allText.includes("first")) first += 1;
       else if (allText.includes("business")) business += 1;
       else if (allText.includes("economy")) economy += 1;
@@ -843,13 +1143,73 @@ async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<
         berths = { economy: 1, business: 0, first: 0 };
       }
     }
+    if (totalBerths(berths) === 0 && cls) {
+      const caps = cls.inherent_capabilities;
+      const fromCaps = extractBerthsFromCapabilities(caps);
+      if (fromCaps) {
+        berths = fromCaps;
+      }
+    }
+    if (totalBerths(berths) === 0 && typeId === "midas") {
+      berths = { economy: 0, business: 0, first: 6 };
+    }
   }
   
-  const modules = (shipData.modules as unknown[]) || [];
-  if (totalBerths(berths) === 0 && Array.isArray(modules) && modules.length > 0) {
-    const fromMods = countPassengerModules(modules);
-    if (totalBerths(fromMods) > 0) {
-      berths = fromMods;
+  const shipModuleIds = (shipData.modules as unknown[]) || [];
+  const allModules = (result.modules as unknown[]) || [];
+  if (totalBerths(berths) === 0 && shipModuleIds.length > 0 && allModules.length > 0) {
+    const instanceIdToModule = new Map<string, Record<string, unknown>>();
+    for (const m of allModules) {
+      if (typeof m === "object" && m !== null) {
+        const modObj = m as Record<string, unknown>;
+        const instanceId = ((modObj.id as string) || "").toLowerCase();
+        if (instanceId) instanceIdToModule.set(instanceId, modObj);
+      }
+    }
+    const moduleObjects: unknown[] = [];
+    for (const id of shipModuleIds) {
+      const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+      if (idStr && instanceIdToModule.has(idStr)) {
+        moduleObjects.push(instanceIdToModule.get(idStr));
+      } else if (typeof id === "object" && id !== null) {
+        moduleObjects.push(id);
+      }
+    }
+    if (moduleObjects.length > 0) {
+      const fromMods = countPassengerModules(moduleObjects);
+      if (totalBerths(fromMods) > 0) {
+        berths = fromMods;
+      }
+    }
+  }
+  
+  if (totalBerths(berths) === 0 && shipModuleIds.length > 0 && allModules.length > 0) {
+    const instanceIdToType = new Map<string, string>();
+    for (const m of allModules) {
+      if (typeof m === "object" && m !== null) {
+        const modObj = m as Record<string, unknown>;
+        const instanceId = ((modObj.id as string) || "").toLowerCase();
+        const typeId = ((modObj.type_id as string) || "").toLowerCase();
+        if (instanceId && typeId) instanceIdToType.set(instanceId, typeId);
+      }
+    }
+    const moduleObjects: unknown[] = [];
+    for (const id of shipModuleIds) {
+      const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+      const typeId = instanceIdToType.get(idStr);
+      if (typeId) {
+        const modItem = catalogStore.getItem(typeId);
+        if (modItem) moduleObjects.push(modItem);
+      } else if (idStr) {
+        const modItem = catalogStore.getItem(idStr);
+        if (modItem) moduleObjects.push(modItem);
+      }
+    }
+    if (moduleObjects.length > 0) {
+      const fromMods = countPassengerModules(moduleObjects);
+      if (totalBerths(fromMods) > 0) {
+        berths = fromMods;
+      }
     }
   }
   
@@ -869,20 +1229,23 @@ async function selectPickupStation(
   berths: { economy: number; business: number; first: number },
   maxJumps: number,
   blockPirateStations: boolean,
+  excludeCurrentStation: boolean = false,
 ): Promise<{ system: string; poi: string; poiName: string; count: number } | null> {
   const { bot } = ctx;
   const stations: Array<{ system: string; poi: string; poiName: string; count: number; hops: number }> = [];
+  const currentPoi = bot.poi || "";
+  const currentSystem = bot.system || "";
 
-  // Check current station first if docked
-  if (bot.docked && bot.poi && bot.system) {
-    if (!blockPirateStations || !isPirateStation(bot.poi)) {
+  // Check current station first if docked (unless excluded)
+  if (!excludeCurrentStation && bot.docked && currentPoi && currentSystem) {
+    if (!blockPirateStations || !isPirateStation(currentPoi)) {
       const resp = await bot.exec("list_station_passengers");
       if (!resp.error && resp.result) {
         const data = parseStationPassengers(resp.result);
         if (data && data.count > 0) {
           stations.push({
-            system: bot.system,
-            poi: bot.poi,
+            system: currentSystem,
+            poi: currentPoi,
             poiName: data.station,
             count: data.count,
             hops: 0,
@@ -895,7 +1258,6 @@ async function selectPickupStation(
   // Scan nearby known systems via mapStore
   const blacklist = getSystemBlacklist();
   const knownSystems = mapStore.getAllSystems();
-  const currentSystem = bot.system || "";
 
   // Collect candidate systems within maxJumps
   const candidates = new Map<string, { hops: number; systemId: string }>();
@@ -1010,7 +1372,7 @@ async function selectNextPickupStation(
   
   if (!empire) {
     ctx.log("transport", "Cannot determine bot's empire, falling back to nearest station search");
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
     if (!pickup) return null;
     return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
   }
@@ -1020,7 +1382,7 @@ async function selectNextPickupStation(
   
   if (empireStations.length === 0) {
     ctx.log("transport", `No known stations for empire ${empire}, falling back to nearest station search`);
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
     if (!pickup) return null;
     return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
   }
@@ -1028,74 +1390,58 @@ async function selectNextPickupStation(
   const currentSystem = bot.system || "";
   const currentPoi = bot.poi || "";
   
-  const availableStations = empireStations.filter(
-    s => s.poiId !== currentPoi || s.systemId !== currentSystem
+  const visitedStations = state.visitedEmpireStations || [];
+  const currentStationKey = `${currentSystem}:${currentPoi}`.toLowerCase();
+  
+  if (!visitedStations.includes(currentStationKey)) {
+    state.visitedEmpireStations = [...visitedStations, currentStationKey];
+    saveTransportState(state);
+  }
+  
+  const unvisitedStations = empireStations.filter(
+    s => !state.visitedEmpireStations.includes(`${s.systemId}:${s.poiId}`.toLowerCase())
   );
   
-  if (availableStations.length === 0) {
-    ctx.log("transport", `All empire stations already checked, finding nearest from ${empireStations.length} total`);
-    let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
-    for (const s of empireStations) {
-      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-      const dist = hopsBetweenSync(currentSystem, s.systemId);
-      if (dist < nearest.dist) {
-        nearest = { ...s, dist };
-      }
+  if (unvisitedStations.length > 0) {
+    const stationsWithHops = unvisitedStations.map(s => {
+      const hops = hopsToStation(currentSystem, s.systemId);
+      return { ...s, hops };
+    }).filter(s => s.hops <= settings.maxJumps);
+    
+    ctx.log("transport", `Found ${stationsWithHops.length} reachable unvisited stations out of ${unvisitedStations.length} total`);
+    
+    if (stationsWithHops.length > 0) {
+      stationsWithHops.sort((a, b) => a.hops - b.hops);
+      const next = stationsWithHops[0];
+      ctx.log("transport", `Moving to unvisited station: ${next.poiName} (${next.hops} hops)`);
+      return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
     }
-    if (nearest.dist === 9999) {
-      ctx.log("transport", `No other empire stations available`);
-      return null;
-    }
-    if (nearest.dist > settings.maxJumps) {
-      ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
-    }
-    return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
-  }
-
-  if (empireLower === "solarian") {
-    const randomStation = availableStations[Math.floor(Math.random() * availableStations.length)];
-    if (randomStation.poiId === currentPoi && randomStation.systemId === currentSystem) {
-      ctx.log("transport", `Randomly selected same station, using next available`);
-      const otherStations = availableStations.filter(s => !(s.poiId === currentPoi && s.systemId === currentSystem));
-      if (otherStations.length > 0) {
-        return { system: otherStations[0].systemId, poi: otherStations[0].poiId, poiName: otherStations[0].poiName };
-      }
-    }
-    ctx.log("transport", `Solarian Empire: randomly selecting ${randomStation.poiName}`);
-    return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
-  }
-
-  const blacklist = getSystemBlacklist();
-  const knownSystems = mapStore.getAllSystems();
-  
-const stationsWithHops = availableStations.map(s => {
-    const hops = hopsBetweenSync(currentSystem, s.systemId);
-    return { ...s, hops };
-  }).filter(s => s.hops <= settings.maxJumps && !blacklist.includes(s.systemId));
-  
-  ctx.log("transport", `Found ${stationsWithHops.length} reachable stations out of ${availableStations.length}`);
-  
-  if (stationsWithHops.length === 0) {
-    let nearest: EmpireStation & { dist: number } = { ...availableStations[0], dist: 9999 };
-    for (const s of availableStations) {
-      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-      const dist = hopsBetweenSync(currentSystem, s.systemId);
-      if (dist < nearest.dist) {
-        nearest = { ...s, dist };
-      }
-    }
-    if (nearest.dist === 9999) {
-      ctx.log("transport", `No other stations within ${settings.maxJumps} hops`);
-      return null;
-    }
-    ctx.log("transport", `No stations within ${settings.maxJumps} hops, falling back to nearest: ${nearest.poiName}`);
-    return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
+    
+    const fallback = unvisitedStations[0];
+    ctx.log("transport", `No unvisited stations within ${settings.maxJumps} hops, using: ${fallback.poiName}`);
+    return { system: fallback.systemId, poi: fallback.poiId, poiName: fallback.poiName };
   }
   
-  stationsWithHops.sort((a, b) => a.hops - b.hops);
-  const next = stationsWithHops[0];
-  ctx.log("transport", `Moving to next closest station: ${next.poiName} (${next.hops} hops)`);
-  return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
+  ctx.log("transport", `All ${empireStations.length} empire stations visited, resetting and finding nearest from ${empireStations.length} total`);
+  state.visitedEmpireStations = [];
+  saveTransportState(state);
+  
+  let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
+  for (const s of empireStations) {
+    if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
+    const dist = hopsBetweenSync(currentSystem, s.systemId);
+    if (dist < nearest.dist) {
+      nearest = { ...s, dist };
+    }
+  }
+  if (nearest.dist === 9999) {
+    ctx.log("transport", `No other empire stations available`);
+    return null;
+  }
+  if (nearest.dist > settings.maxJumps) {
+    ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
+  }
+  return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
 }
 
 // ── Route planning ───────────────────────────────────────────
@@ -1184,6 +1530,13 @@ function hopsBetweenSync(a: string, b: string): number {
   return route.length - 1;
 }
 
+function hopsToStation(a: string, b: string): number {
+  if (a.toLowerCase() === b.toLowerCase()) return 0;
+  const route = mapStore.findRoute(a, b, getSystemBlacklist());
+  if (!route) return 9999;
+  return route.length - 1;
+}
+
 function makeNewState(bot: Bot, shipId: string, shipName: string, customName: string | undefined, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
   return {
     botUsername: bot.username,
@@ -1205,6 +1558,8 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     lastUpdated: new Date().toISOString(),
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
+    visitedEmpireStations: [],
+    needsTravel: false,
   };
 }
 
@@ -1224,6 +1579,21 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   if (!currentShipInfo || currentShipInfo.berths.economy + currentShipInfo.berths.business + currentShipInfo.berths.first === 0) {
     ctx.log("error", "Current ship has no passenger berths or cannot be verified. Routine cannot run.");
     return;
+  }
+
+  // ── Special handling for Midas yacht ───────────────────────────
+  const isMidas = currentShipInfo.shipName.toLowerCase() === "midas" || 
+                   currentShipInfo.customName?.toLowerCase() === "midas" ||
+                   currentShipInfo.berths.first > 0 && 
+                   currentShipInfo.berths.economy === 0 && 
+                   currentShipInfo.berths.business === 0;
+  if (isMidas) {
+    ctx.log("transport", "★ MIDAS YACHT DETECTED ★");
+    ctx.log("transport", "This is a unique, rare vessel - the Nebula billionaire's flagship.");
+    ctx.log("transport", `Only ${currentShipInfo.berths.first} first-class berth(s) available.`);
+    ctx.log("transport", "Unarmed luxury yacht built for status, not combat.");
+    ctx.log("transport", "NOTE: This ship cannot carry economy or business passengers.");
+    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=false, allowEconomyClass=false");
   }
   
   // Initialize state if none or invalid
@@ -1264,6 +1634,11 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
 
+  // Enable cloaking if configured and module is available
+  if (settings.enableCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
+
   // Collect fuel cells at home base on startup
   if (settings.homeStation && bot.docked && bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
     ctx.log("transport", "At home station - collecting fuel cells");
@@ -1273,7 +1648,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
     ctx.log("transport", `Fuel after collection: ${Math.round(fuelPct)}%`);
   }
 
-  if (state && state.status !== "idle") {
+if (state && state.status !== "idle") {
     const verifyResp = await bot.exec("list_passengers");
     if (verifyResp.error || !verifyResp.result) {
       state.status = "idle";
@@ -1282,6 +1657,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       state.currentRouteIndex = 0;
       state.currentDestination = null;
       state.berths_used = { economy: 0, business: 0, first: 0 };
+      state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+      state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
       saveTransportState(state);
     } else {
       const vParsed = parseListPassengers(verifyResp.result);
@@ -1293,6 +1670,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         state.currentRouteIndex = 0;
         state.currentDestination = null;
         state.berths_used = { economy: 0, business: 0, first: 0 };
+        state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+        state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
         saveTransportState(state);
       } else {
         const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
@@ -1473,55 +1852,59 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
       if (bot.docked && bot.poi && bot.system) {
-        // Collect fuel cells at any station when idle
-        await collectFuelCells(ctx, settings);
-        const resp = await bot.exec("list_station_passengers");
-        if (!resp.error && resp.result) {
-          const data = parseStationPassengers(resp.result);
-          if (data && data.count > 0) {
-            state.pickupStation = bot.poi;
-            state.pickupSystem = bot.system;
-            state.roundsWithoutPassengers = 0;
-            ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
-          } else {
-            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-            ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
-            if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
-              ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-              const nextPickup = await selectNextPickupStation(ctx, state, settings);
-              if (!nextPickup) {
-                // No next pickup available - try to return home
-                if (settings.homeSystem) {
-                  ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-                  state.pickupStation = settings.homeStation || null;
-                  state.pickupSystem = settings.homeSystem || null;
-                  state.roundsWithoutPassengers = 0;
+        if (state.needsTravel) {
+          // We already have a new pickup station set, proceed to travel
+        } else {
+          // Collect fuel cells at any station when idle
+          await collectFuelCells(ctx, settings);
+          const resp = await bot.exec("list_station_passengers");
+          if (!resp.error && resp.result) {
+            const data = parseStationPassengers(resp.result);
+            if (data && data.count > 0) {
+              state.pickupStation = bot.poi;
+              state.pickupSystem = bot.system;
+              ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
+            } else {
+              state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+              ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+              if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
+                ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+                const nextPickup = await selectNextPickupStation(ctx, state, settings);
+                if (!nextPickup) {
+                  // No next pickup available - try to return home
+                  if (settings.homeSystem) {
+                    ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+                    state.pickupStation = settings.homeStation || null;
+                    state.pickupSystem = settings.homeSystem || null;
+                    state.roundsWithoutPassengers = 0;
+                  } else {
+                    await ctx.sleep(60000);
+                    continue;
+                  }
                 } else {
-                  await ctx.sleep(60000);
-                  continue;
-                }
-              } else {
-                const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-                if (isSameStation) {
-                  ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                  const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+                  if (isSameStation) {
+                    ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                    state.roundsWithoutPassengers = 0;
+                    state.pickupStation = nextPickup.poi;
+                    state.pickupSystem = nextPickup.system;
+                    await ctx.sleep(5000);
+                    continue;
+                  }
                   state.roundsWithoutPassengers = 0;
                   state.pickupStation = nextPickup.poi;
                   state.pickupSystem = nextPickup.system;
-                  await ctx.sleep(5000);
-                  continue;
+                  state.needsTravel = true;
                 }
-                state.roundsWithoutPassengers = 0;
-                state.pickupStation = nextPickup.poi;
-                state.pickupSystem = nextPickup.system;
+              } else {
+                await ctx.sleep(60000);
+                continue;
               }
-            } else {
-              await ctx.sleep(60000);
-              continue;
             }
+          } else {
+            await ctx.sleep(60000);
+            continue;
           }
-        } else {
-          await ctx.sleep(60000);
-          continue;
         }
       } else {
         const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
@@ -1531,15 +1914,27 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             ctx.log("transport", `No passengers found, returning home from ${bot.system}`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
-            state.roundsWithoutPassengers = 0;
           } else {
-            await ctx.sleep(60000);
+            // No pickup found - dock at nearest station
+            ctx.log("transport", "No passengers anywhere - docking at nearest station");
+            const dockOk = await ensureDocked(ctx);
+            if (!dockOk) {
+              ctx.log("error", "Cannot find any station to dock - waiting 60s");
+              await ctx.sleep(60000);
+              continue;
+            }
+            // After docking, set current station as pickup and increment counter
+            state.pickupStation = bot.poi || null;
+            state.pickupSystem = bot.system || null;
+            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+            ctx.log("transport", `Docked at ${state.pickupStation}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+            saveTransportState(state);
             continue;
           }
         } else {
           state.pickupStation = pickup.poi;
           state.pickupSystem = pickup.system;
-          state.roundsWithoutPassengers = 0;
+          state.needsTravel = true;
         }
       }
 
@@ -1548,7 +1943,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       const sysMatch = String(bot.system || "").toLowerCase() === String(state.pickupSystem || "").toLowerCase();
       const alreadyAtPickup = bot.docked && poiMatch && sysMatch;
       
-      if (!alreadyAtPickup) {
+      if (!alreadyAtPickup || state.needsTravel) {
+        state.needsTravel = false;
         // Travel to pickup station and dock
         if (!state.pickupStation || !state.pickupSystem) {
           state.status = "idle";
@@ -1559,7 +1955,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         state.status = "traveling_to_ship";
         saveTransportState(state);
         if (state.pickupSystem !== bot.system) {
-          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
           if (!ok) {
             state.status = "idle";
             saveTransportState(state);
@@ -1583,6 +1979,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           await ctx.sleep(30000);
           continue;
         }
+        state.roundsWithoutPassengers = 0;
         await collectFuelCells(ctx, settings);
       } else {
         ctx.log("transport", `Ready at ${state.pickupStation}`);
@@ -1640,15 +2037,28 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       // Group passengers by destination
       const byDest = new Map<string, StationPassenger[]>();
+      const midasFilterLog = isMidas;
       for (const p of waiting) {
         const cls = p.class.toLowerCase();
-        if (settings.blockPirateStations && isPirateStation(p.destination)) continue;
-        if (cls === "first" && !settings.allowFirstClass) continue;
-        if (cls === "business" && !settings.allowBusinessClass) continue;
-        if (cls === "economy" && !settings.allowEconomyClass) continue;
-        const arr = byDest.get(p.destination) || [];
+        if (settings.blockPirateStations && isPirateStation(p.destination)) {
+          if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
+          continue;
+        }
+        if (cls === "first" && !settings.allowFirstClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (first disabled): ${p.name}`);
+          continue;
+        }
+        if (cls === "business" && !settings.allowBusinessClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (business disabled): ${p.name}`);
+          continue;
+        }
+        if (cls === "economy" && !settings.allowEconomyClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (economy disabled): ${p.name}`);
+          continue;
+        }
+        const arr = byDest.get(p.destination.toLowerCase()) || [];
         arr.push(p);
-        byDest.set(p.destination, arr);
+        byDest.set(p.destination.toLowerCase(), arr);
       }
 
       // For multi-destination tours, plan the route FIRST so loading order follows it.
@@ -1666,12 +2076,55 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         destDrafts.push({ system: resolved?.system || "", poi: resolved?.poi || destId, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
 
-      const plannedRoute = await planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps, bot);
-      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${destDrafts.filter(d => !d.system).length} could not resolve`);
-      for (const d of destDrafts.filter(d => !d.system)) {
+      const currentPoi = bot.poi || "";
+      const filteredDrafts = destDrafts.filter(d => {
+        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === currentPoi.toLowerCase()) {
+          ctx.log("transport", `Filtering out passenger already at destination: ${d.poiName}`);
+          return false;
+        }
+        return true;
+      });
+      const plannedRoute = await planTourRoute(bot.system || "", filteredDrafts.filter(d => d.system), settings.maxJumps, bot);
+      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${filteredDrafts.filter(d => !d.system).length} could not resolve`);
+      for (const d of filteredDrafts.filter(d => !d.system)) {
         ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
       }
-      const outsideJumpLimit = destDrafts.filter(d => !d.system);
+      const outsideJumpLimit = filteredDrafts.filter(d => !d.system);
+
+      const atDestinationCount = destDrafts.length - filteredDrafts.length;
+      if (atDestinationCount > 0) {
+        ctx.log("transport", `${atDestinationCount} passengers already at their destination - considering delivered`);
+      }
+
+      if (waiting.length > 0 && filteredDrafts.length === 0) {
+        ctx.log("transport", `All ${waiting.length} passengers have destinations at current station. Moving to next station.`);
+        state.roundsWithoutPassengers = 0;
+        const nextPickup = await selectNextPickupStation(ctx, state, settings);
+        if (nextPickup) {
+          const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+          if (!isSameStation) {
+            state.pickupStation = nextPickup.poi;
+            state.pickupSystem = nextPickup.system;
+            state.needsTravel = true;
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+          } else {
+            ctx.log("transport", `Next pickup is same station, continuing`);
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(60000);
+          }
+        } else if (settings.homeSystem) {
+          ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+        }
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
 
       // Now load in route order, one destination per loop, berth tally.
       const loadedNames = new Set<string>();
@@ -1685,8 +2138,18 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       };
 
       for (const leg of plannedRoute) {
-        const passengers = byDest.get(leg.poi) || [];
-        const passengersByOrigDest = leg.origDest ? byDest.get(leg.origDest) || [] : passengers;
+        const legPoiLower = leg.poi.toLowerCase();
+        const legSysLower = leg.system.toLowerCase();
+        const currentPoiLower = (bot.poi || "").toLowerCase();
+        const currentSysLower = (bot.system || "").toLowerCase();
+        
+        if (legSysLower === currentSysLower && legPoiLower === currentPoiLower) {
+          ctx.log("transport", `Skipping leg - destination ${leg.poiName} is current station`);
+          continue;
+        }
+        
+        const passengers = byDest.get(leg.poi) || byDest.get(legPoiLower) || [];
+        const passengersByOrigDest = leg.origDest ? (byDest.get(leg.origDest) || byDest.get(leg.origDest.toLowerCase()) || []) : passengers;
         const passengersFinal = passengersByOrigDest.length > 0 ? passengersByOrigDest : passengers;
         if (passengersFinal.length === 0) continue;
 
@@ -1716,7 +2179,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         });
 
         let loadedThisLeg = 0;
-        let loadAttempted = false;
         for (const p of sortedPassengers) {
           if (loadedNames.has(p.citizen_id)) continue;
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
@@ -1750,9 +2212,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           loadedThisLeg++;
         }
         
-        if (loadedThisLeg > 0 && !loadAttempted) {
-          loadAttempted = true;
-          const loadResp = await bot.exec("load_passenger", { destination: leg.origDest || leg.poi });
+        if (loadedThisLeg > 0) {
+          const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
           if (loadResp.error) {
             ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
           }
@@ -1800,7 +2261,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
                 destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
               }
             }
-            const routeDests = Array.from(destMap.values()).filter(d => d.system);
+const routeDests = Array.from(destMap.values()).filter(d => {
+        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
+          return false;
+        }
+        return d.system;
+      });
             state.route = await planTourRoute(bot.system || "", routeDests, 6, bot);
             state.currentRouteIndex = 0;
             state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
@@ -1811,6 +2278,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           }
         }
         bot.refreshStatus().catch(() => {});
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
       }
 
       const listResp = await bot.exec("list_passengers");
@@ -1825,6 +2294,31 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       if (aboard.length === 0) {
         state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
         ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+        if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
+          ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+          const nextPickup = await selectNextPickupStation(ctx, state, settings);
+          if (nextPickup) {
+            const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+            if (!isSameStation) {
+              state.pickupStation = nextPickup.poi;
+              state.pickupSystem = nextPickup.system;
+              state.roundsWithoutPassengers = 0;
+              state.status = "idle";
+              saveTransportState(state);
+              await ctx.sleep(5000);
+              continue;
+            }
+            ctx.log("transport", `Next pickup is same station, resetting counter`);
+            state.roundsWithoutPassengers = 0;
+            state.pickupStation = nextPickup.poi;
+            state.pickupSystem = nextPickup.system;
+          } else if (settings.homeSystem) {
+            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            state.roundsWithoutPassengers = 0;
+          }
+        }
         state.status = "idle";
         saveTransportState(state);
         await ctx.sleep(10000);
@@ -1850,7 +2344,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
       }
 
-      const routeDests = Array.from(destMap.values()).filter(d => d.system);
+      const routeDests = Array.from(destMap.values()).filter(d => {
+        if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
+          return false;
+        }
+        return d.system;
+      });
       ctx.log("transport", `Route destinations: ${routeDests.length} valid out of ${destMap.size}`);
       const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
       ctx.log("transport", `planTourRoute result: ${planned.length} waypoints, currentSystem=${bot.system || 'none'}`);
@@ -1895,6 +2395,18 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             }
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
+            state.roundsWithoutPassengers = 0;
+            state.onboardPassengers = [];
+            state.route = [];
+            state.status = "idle";
+            state.needsTravel = true;
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          } else if (settings.homeSystem) {
+            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
             state.onboardPassengers = [];
             state.route = [];
@@ -1972,6 +2484,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       }
 
       ctx.log("transport", `${onboard.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      if (isMidas && onboard.length > 0) {
+        ctx.log("transport", `MIDAS: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
+      }
       if (planned.length === 0 && onboard.length > 0) {
         ctx.log("transport", `WARNING: ${onboard.length} passengers but empty route!`);
         for (const p of onboard) {
@@ -2045,7 +2560,13 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
               ctx.log("transport", `FAILED to resolve ${p.destination}`);
             }
           }
-          const validDests = Array.from(destMap.values()).filter(d => d.system);
+          const validDests = Array.from(destMap.values()).filter(d => {
+            if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+              ctx.log("transport", `Filtering out rebuild destination same as current station: ${d.poi}`);
+              return false;
+            }
+            return d.system;
+          });
           ctx.log("transport", `Route rebuild: ${validDests.length} valid destinations out of ${destMap.size}`);
           if (validDests.length > 0) {
             const newRoute = await planTourRoute(bot.system || "", validDests, 6, bot);
@@ -2067,6 +2588,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
         state.status = "idle";
         state.routeRebuildAttempts = 0;
+        // Set pickupStation to current location if docked, otherwise null
+        state.pickupStation = bot.docked && bot.poi ? bot.poi : settings.homeStation || null;
+        state.pickupSystem = bot.docked && bot.poi ? bot.system : settings.homeSystem || null;
         saveTransportState(state);
         continue;
       }
@@ -2076,13 +2600,15 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       if (waypoint.system !== bot.system) {
         ctx.log("transport", `Navigating to system ${waypoint.system}`);
-        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
-        await bot.refreshStatus();
+        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
         if (!ok) {
           ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);
           await ctx.sleep(30000);
           continue;
         }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
         ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
@@ -2091,17 +2617,36 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         if (tr.error) {
           const errMsg = tr.error.message || "";
           if (isMobileStation(waypoint.poi) && state.routeRebuildAttempts < 3) {
-            ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Re-resolving destination.`);
-            const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
-            if (resolved && resolved.system && resolved.poi) {
-              const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
-              if (newRoute.length > 0) {
-                state.route = newRoute;
-                state.currentRouteIndex = 0;
-                state.currentDestination = newRoute[0].poiName;
-                state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
-                ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
-                continue;
+            const suggestedMatch = errMsg.match(/jump to (.+?) to find it/i);
+            if (suggestedMatch) {
+              const suggestedSystemName = suggestedMatch[1].trim();
+              ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Suggested system: ${suggestedSystemName}`);
+              const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
+              if (resolved && resolved.system && resolved.poi) {
+                mapStore.updateMobileCapitolLocation(resolved.system, suggestedSystemName, resolved.poi);
+                const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
+                if (newRoute.length > 0) {
+                  state.route = newRoute;
+                  state.currentRouteIndex = 0;
+                  state.currentDestination = newRoute[0].poiName;
+                  state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
+                  ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
+                  continue;
+                }
+              }
+            } else {
+              ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Re-resolving destination.`);
+              const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
+              if (resolved && resolved.system && resolved.poi) {
+                const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
+                if (newRoute.length > 0) {
+                  state.route = newRoute;
+                  state.currentRouteIndex = 0;
+                  state.currentDestination = newRoute[0].poiName;
+                  state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
+                  ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
+                  continue;
+                }
               }
             }
           }
@@ -2110,6 +2655,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           continue;
         }
         await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
       }
 
       const alreadyDocked = bot.docked && bot.poi === waypoint.poi;
@@ -2132,6 +2679,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       await collectFuelCells(ctx, settings);
 
       await bot.refreshStatus();
+      await checkAndRecloak(ctx, settings);
+      await depositExcessCredits(ctx, settings);
       const creditsAfter = bot.credits || 0;
       const fareEarned = creditsAfter - creditsBefore;
 
@@ -2166,6 +2715,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           loadedAt: p.loadedAt,
           status: "delivered",
         });
+        recordTransportedPassenger(bot.username, p.name);
+        logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }
 
       state.currentRouteIndex += 1;

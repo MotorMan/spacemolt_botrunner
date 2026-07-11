@@ -82,6 +82,8 @@ function getFactionTraderSettings(username?: string): {
   stationPriority: boolean;
   categoryTrade: CategoryTradeConfig[];
   sellAllItems: boolean;
+  creditsToHold: number;
+  disableCreditDeposit: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -133,6 +135,8 @@ function getFactionTraderSettings(username?: string): {
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     categoryTrade,
     sellAllItems: (t.sellAllItems as boolean) || false,
+    creditsToHold: (t.creditsToHold as number) || 10000,
+    disableCreditDeposit: (t.disableCreditDeposit as boolean) || false,
   };
 }
 
@@ -154,7 +158,7 @@ async function failFactionSession(botUsername: string, reason: string): Promise<
 }
 
 /** Verify that a destination POI exists as a valid station with a market. */
-function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string): boolean {
+export function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string): boolean {
   const sys = mapStore.getSystem(systemId);
   if (!sys) {
     ctx.log("error", `Destination system ${systemId} not found in map data`);
@@ -367,7 +371,7 @@ function isHighValueItem(itemId: string, minProfitThreshold: number = 1000000): 
  * Calculate optimal sell quantity based on actual buy orders at destination.
  * Calls view_market to get real buy orders with quantities.
  */
-async function calculateFactionOptimalSellQuantity(
+export async function calculateFactionOptimalSellQuantity(
   ctx: RoutineContext,
   itemId: string,
   itemName: string,
@@ -465,6 +469,19 @@ const eligibleBuyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell:
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
   return Math.max(0, bot.cargoMax - bot.cargo);
+}
+
+/**
+ * Resolve the bare POI id for the configured home station.
+ *
+ * `homeStation` is stored as "system|poi" (e.g. general.factionStorageStation)
+ * but `bot.poi` is only the bare POI id. Comparing/using them directly causes
+ * the bot to think it is "home" whenever `bot.poi` gets set to the malformed
+ * "system|poi" string (or to never match a real home station). Always normalize.
+ */
+export function getHomeStationPoi(homeStation: string): string {
+  if (!homeStation) return "";
+  return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
 }
 
 /** Estimate fuel cost between two systems using mapStore route data. */
@@ -1104,6 +1121,60 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await repairShip(ctx);
     } // End if (!recoveredSessionHandled)
 
+    // ── Ensure we are at the faction home base before trading ──
+    // Faction storage is per-station: reading the home base's storage remotely
+    // (via refreshFactionStorage) is fine for planning, but items can ONLY be
+    // withdrawn from the home base station itself. If we are not physically at
+    // the home base — and we are not resuming an in-progress session or selling
+    // items already in cargo — return home first instead of trying to withdraw
+    // items that don't exist at this station (which would loop forever failing).
+    if (!recoveredSessionHandled && pendingCargo.length === 0) {
+      const homeStationRaw = settings.homeStation || "";
+      const homeStationPoi = getHomeStationPoi(homeStationRaw) || null;
+      const homeSystem = settings.homeSystem ||
+        (homeStationRaw.includes("|") ? homeStationRaw.split("|")[0] : startSystem);
+      const atHomeBase = (!homeSystem || bot.system === homeSystem) &&
+        (!homeStationPoi || bot.poi === homeStationPoi);
+
+      if (!atHomeBase) {
+        ctx.log("travel", `Not at faction home base (currently at ${bot.system}${bot.poi ? "/" + bot.poi : ""}) — returning home to trade`);
+        yield "return_home";
+        if (homeSystem && bot.system !== homeSystem) {
+          await ensureUndocked(ctx);
+          const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+          if (homeFueled) {
+            await navigateToSystem(ctx, homeSystem, {
+              fuelThresholdPct: settings.refuelThreshold,
+              hullThresholdPct: settings.repairThreshold,
+            });
+          }
+        }
+        if (homeStationPoi && bot.poi !== homeStationPoi) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+
+          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+            ctx.log("combat", "Battle detected during travel home - fleeing!");
+            await ctx.sleep(5000);
+            continue;
+          }
+          if (tResp.error) {
+            const errMsg = tResp.error.message.toLowerCase();
+            if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel home interrupted by battle! ${tResp.error.message} - fleeing!`);
+              await ctx.sleep(5000);
+              continue;
+            }
+          }
+          if (!tResp.error || tResp.error.message.includes("already")) {
+            bot.poi = homeStationPoi;
+          }
+        }
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
+
     // ── Find sell routes from faction storage ──
     yield "find_sales";
 
@@ -1125,7 +1196,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         clearFactionStorageCache();
         bot.factionStorage = [];
         const homeSystem = settings.homeSystem || startSystem;
-        const homeStationPoi = settings.homeStation || null;
+        const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
         if (homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi))) {
           ctx.log("travel", `Heading home to access faction storage...`);
           yield "return_home";
@@ -1161,7 +1232,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group
     if (settings.stationPriority && settings.homeSystem) {
-      const homeStationId = settings.homeStation;
+      const homeStationId = getHomeStationPoi(settings.homeStation);
       if (homeStationId) {
         const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStationId);
         const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStationId));
@@ -1217,7 +1288,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const toDest = estimateFuelCost(bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
           const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
           const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
+          const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
           const qty = Math.min(item.quantity, bestBuyer.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+
+          const totalRevenue = qty * bestBuyer.price;
+          const costPerUnit = roundTripJumps > 0 ? roundTripFuel / qty : 0;
+          const totalProfit = totalRevenue - costPerUnit;
 
           cargoRoutes.push({
             itemId: item.itemId,
@@ -1230,13 +1306,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             sellQty: qty,
             jumps: toDest.jumps,
             roundTripJumps,
-            totalRevenue: qty * bestBuyer.price,
-            totalProfit: qty * bestBuyer.price, // No acquisition cost for recovered cargo
+            totalRevenue,
+            totalProfit,
           });
         }
 
         if (cargoRoutes.length > 0) {
-          cargoRoutes.sort((a, b) => b.totalRevenue - a.totalRevenue);
+          cargoRoutes.sort((a, b) => b.totalProfit - a.totalProfit);
           route = cargoRoutes[0];
           ctx.log("trade", `Recovery route: ${route.sellQty}x ${route.itemName} → ${route.destPoiName} (${route.sellPrice}cr/ea)`);
           // Skip to selling this cargo
@@ -1250,9 +1326,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       if (!route) {
         // If not at home, go there — storage is only visible at the home station
         const storageType = personalMode ? "personal" : "faction";
-        const homeSystem = settings.homeSystem || startSystem;
-        const homeStationPoi = settings.homeStation || null;
-        const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
+      const homeSystem = settings.homeSystem || startSystem;
+      const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
+      const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
         if (!atHome) {
           ctx.log("trade", `No ${storageType} storage items to sell — returning home to check ${storageType} storage`);
           yield "return_home";
@@ -1761,37 +1837,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         await bot.refreshStatus();
         await recordMarketData(ctx);
         bot.stats.totalTrades++;
-        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + totalRevenue);
-        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue (actual)`);
-        await factionDonateProfit(ctx, totalRevenue);
-        // Complete trade session for in-station sale
-        const session = createTradeSession({
-          botUsername: bot.username,
-          route: {
-            itemId: route!.itemId,
-            itemName: route!.itemName,
-            sourceSystem: bot.system,
-            sourcePoi: bot.poi,
-            sourcePoiName: bot.poi || "Unknown",
-            buyPrice: 0,
-            buyQty: totalSold,
-            destSystem: route!.destSystem,
-            destPoi: route!.destPoi,
-            destPoiName: route!.destPoiName,
-            sellPrice: route!.sellPrice,
-            sellQty: totalSold,
-            jumps: 0,
-            profitPerUnit: route!.sellPrice,
-            totalProfit: totalRevenue,
-          },
-          isFactionRoute: true,
-          isCargoRoute: false,
-          investedCredits: 0,
-        });
-        session.state = "completed";
-        session.completedAt = new Date().toISOString();
-        await startTradeSession(session);
-        ctx.log("trade", `In-station trade session completed: ${totalSold}x ${route!.itemName}`);
+        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue, ${route!.totalProfit}cr profit`);
+        await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
+        await completeTradeSession(bot.username, totalRevenue, route!.totalProfit);
       } else if (route) {
         // No items sold - fail any existing session
         const session = getActiveSession(bot.username);
@@ -1938,7 +1987,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           sellPrice: route!.sellPrice,
           sellQty: route!.sellQty,
           jumps: route!.jumps,
-          profitPerUnit: route!.sellPrice,
+          profitPerUnit: route!.sellQty > 0 ? route!.totalProfit / route!.sellQty : 0,
           totalProfit: route!.totalProfit,
         },
         isFactionRoute: !personalMode,
@@ -2127,21 +2176,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
               const revenue = actualRevenue;
               bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
-              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
-              await factionDonateProfit(ctx, revenue);
-              // Complete trade session
-              const actualProfit = revenue; // No acquisition cost for faction items
-              await completeTradeSession(bot.username, revenue, actualProfit);
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
+              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
+              await completeTradeSession(bot.username, revenue, route!.totalProfit);
             } else {
               const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
               bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
-              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
-              await factionDonateProfit(ctx, revenue);
-              // Complete trade session
-              const actualProfit = revenue; // No acquisition cost for faction items
-              await completeTradeSession(bot.username, revenue, actualProfit);
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
+              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
+              await completeTradeSession(bot.username, revenue, route!.totalProfit);
 
               // Release buy order lock
               const completedSession = getActiveSession(bot.username);
@@ -2188,7 +2233,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Return to home station ──
     const homeSystem = settings.homeSystem || startSystem;
-    const homeStationPoi = settings.homeStation || null;
+    const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
     const needsReturn = homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi));
 
     if (needsReturn) {
@@ -2236,16 +2281,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await tryRefuel(ctx);
     await repairShip(ctx);
 
-    // ── Deposit excess credits: keep only 10k, deposit rest to faction ──
+    // ── Deposit excess credits: keep only creditsToHold, deposit rest to faction ──
     yield "deposit_credits";
-    const BOT_WORKING_BALANCE = 10_000;
-    if (bot.credits > BOT_WORKING_BALANCE) {
-      const excessCredits = bot.credits - BOT_WORKING_BALANCE;
-      //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-      const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: excessCredits }); //fixed by human!
-      if (!depositResp.error) {
-        ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
-        logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);
+    if (settings.disableCreditDeposit) {
+      ctx.log("trade", `Credit deposit to faction storage disabled — keeping ${bot.credits}cr`);
+    } else {
+      const BOT_WORKING_BALANCE = settings.creditsToHold || 10_000;
+      if (bot.credits > BOT_WORKING_BALANCE) {
+        const excessCredits = bot.credits - BOT_WORKING_BALANCE;
+        //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: excessCredits }); //fixed by human!
+        if (!depositResp.error) {
+          ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
+          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);
+        }
       }
     }
   }

@@ -5,16 +5,20 @@ import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
+import { WebSocketV2Client, type MarketUpdatePayload, type WsV2Status } from "./wsv2.js";
+import { marketStreamStore } from "./marketstreamstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
+import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
+import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
-import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
+import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
-import { buyInsurance } from "./routines/common.js";
+import { ensureInsured } from "./routines/common.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -62,6 +66,8 @@ export interface BotStatus {
   skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
   factionFuelReserve?: number;
   factionFuelCapacity?: number;
+  faction: string | null;
+  isCloaked: boolean;
 }
 
 export interface RoutineContext {
@@ -72,6 +78,8 @@ export interface RoutineContext {
   sleep: (ms: number) => Promise<void>;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
+  /** Optional: get fresh status for a specific bot by name (used by rescue routine for credit checks). */
+  getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
   /** Optional: send a chat message to other bots. */
   sendBotChat?: (
     content: string,
@@ -164,6 +172,15 @@ docked = false;
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
+  /** Whether the bot is currently in transit (jumping/traveling). */
+  inTransit = false;
+
+  /** Type of current transit: "jump" or "travel" (if in_transit is true). */
+  transitType: "jump" | "travel" | null = null;
+
+  /** Ticks remaining until transit completes (if in_transit is true). */
+  ticksRemaining: number | null = null;
+
   /** The ID of the wreck being towed (if any). */
   towingWreckId: string | null = null;
 
@@ -177,6 +194,12 @@ docked = false;
 
   /** Bot-specific settings loaded from disk. */
   settings?: Record<string, unknown>;
+
+  /** Optional WebSocket v2 client for realtime market subscriptions (opt-in static bots). */
+  wsV2: WebSocketV2Client | null = null;
+
+  /** Maps a subscribed base_id to the {systemId, poiId} it was subscribed from (for dashboard mirror). */
+  private wsV2BaseMapping: Record<string, { systemId: string; poiId: string }> = {};
 
   // Action log (last N entries)
   readonly actionLog: string[] = [];
@@ -199,6 +222,49 @@ docked = false;
     lastUpdate: number; // Timestamp of last battle update
     participants: Array<Record<string, unknown>>;
   } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
+
+  /** Set of queued crafting job IDs to prevent duplicate submissions. */
+  private queuedCraftingJobs: Set<string> = new Set();
+
+  /** Tracks active crafting queue jobs with server-assigned job IDs. */
+  craftQueueTracker: import("./routines/craftQueueTracker.js").CraftQueueTracker | null = null;
+
+  /**
+   * Generate a unique job ID for a crafting job.
+   * Uses recipe_id (as returned in notifications) to prevent duplicates.
+   */
+  makeCraftingJobId(recipeId: string, quantity: number): string {
+    return `${recipeId}:${quantity}`;
+  }
+
+  /** Check if a crafting job is already queued. */
+  isCraftingJobQueued(recipeId: string, quantity: number): boolean {
+    return this.queuedCraftingJobs.has(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Mark a crafting job as queued. */
+  queueCraftingJob(recipeId: string, quantity: number): void {
+    this.queuedCraftingJobs.add(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Remove a crafting job from the queue (when completed or cancelled). */
+  unqueueCraftingJob(recipeId: string, quantity: number): void {
+    this.queuedCraftingJobs.delete(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Clear all queued crafting jobs. */
+  clearCraftingQueue(): void {
+    this.queuedCraftingJobs.clear();
+  }
+
+  /** Clear crafting jobs by recipe_id prefix (for server notifications that don't include quantity). */
+  clearCraftingJobByRecipe(recipeId: string): void {
+    for (const key of [...this.queuedCraftingJobs]) {
+      if (key.startsWith(`${recipeId}:`)) {
+        this.queuedCraftingJobs.delete(key);
+      }
+    }
+  }
 
   /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
   private customsClearedAt: number = 0;
@@ -266,6 +332,16 @@ docked = false;
     playerNameStore.setBotName(username);
   }
 
+  async initCraftQueueTracker(): Promise<void> {
+    const { CraftQueueTracker } = await import("./routines/craftQueueTracker.js");
+    this.craftQueueTracker = await CraftQueueTracker.create(this);
+  }
+
+  getCraftQueueTracker(): import("./routines/craftQueueTracker.js").CraftQueueTracker {
+    if (!this.craftQueueTracker) throw new Error("CraftQueueTracker not initialized");
+    return this.craftQueueTracker;
+  }
+
   private logPosition(): void {
     const dataDir = join(this.baseDir, "data");
     if (!existsSync(dataDir)) {
@@ -324,16 +400,28 @@ docked = false;
     try {
       return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
-      if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
-        // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
-        // to prevent timeout cascades during heavy combat
-        if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
-          return {
-            error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
-            result: undefined,
-            notifications: [],
-          };
-        }
+      if (!(err instanceof Error) || (err.message !== "TIMEOUT" && err.message !== "ABORTED")) {
+        throw err;
+      }
+
+      // A user-initiated stop/abort should never be reported as a timeout.
+      if (err.message === "ABORTED") {
+        return {
+          error: { code: "aborted", message: `${command} aborted by user` },
+          result: undefined,
+          notifications: [],
+        };
+      }
+
+      // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
+      // to prevent timeout cascades during heavy combat
+      if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
+        return {
+          error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+          result: undefined,
+          notifications: [],
+        };
+      }
 
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
@@ -401,9 +489,6 @@ docked = false;
           result: undefined,
           notifications: [],
         };
-      }
-      // Re-throw other errors
-      throw err;
     }
   }
 
@@ -619,6 +704,12 @@ docked = false;
               break;
             }
 
+            // Honor a stop request immediately instead of retrying for minutes
+            if (this._state !== "running") {
+              this.log("system", `Stop requested — aborting 502 retry for "${command}"`);
+              break;
+            }
+
             // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
             if (MUTATION_COMMANDS.has(command) && retry >= 2) {
               await this.refreshStatus();
@@ -668,6 +759,12 @@ docked = false;
                 result: undefined,
                 notifications: [],
               };
+              break;
+            }
+
+            // Honor a stop request immediately instead of retrying for minutes
+            if (this._state !== "running") {
+              this.log("system", `Stop requested — aborting 524 retry for "${command}"`);
               break;
             }
 
@@ -741,14 +838,32 @@ docked = false;
           if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
             debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
             this.log("system", "Action pending — waiting for server to process...");
-            await sleep(10_000);
-            resp = await this.api.execute(command, payload);
+            // Honor a stop request instead of blocking on the pending action
+            if (this._state !== "running") {
+              this.log("system", "Stop requested — aborting pending action wait");
+            } else {
+              await sleep(10_000);
+              // Re-check stop before issuing the retry
+              if (this._state !== "running") {
+                this.log("system", "Stop requested — aborting pending action retry");
+              } else {
+                resp = await this.api.execute(command, payload);
 
-            // If still pending, wait a bit longer and try one more time
-            if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
-              this.log("system", "Action still pending — waiting additional 5s...");
-              await sleep(5_000);
-              resp = await this.api.execute(command, payload);
+                // If still pending, wait a bit longer and try one more time
+                if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+                  // Honor a stop request instead of blocking further
+                  if (this._state !== "running") {
+                    this.log("system", "Stop requested — aborting pending action wait");
+                  } else {
+                    this.log("system", "Action still pending — waiting additional 5s...");
+                    await sleep(5_000);
+                    // Re-check stop before issuing the final retry
+                    if (this._state === "running") {
+                      resp = await this.api.execute(command, payload);
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -800,37 +915,46 @@ docked = false;
           const player = (r.player as Record<string, unknown>) || {};
           const p = location || player || r;
 
-          if (command === "get_status") {
-            this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
-            this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
-            this.docked = location?.docked_at != null
-              ? !!(location.docked_at)
-              : (p.docked_at_base != null
-                ? !!(p.docked_at_base)
-                : (p.docked as boolean) ?? (p.status === "docked"));
-            this.location =
-              (location?.system_name as string) ||
-              (location?.system_id as string) ||
-              (p.current_system as string) ||
-              (p.location as string) ||
-              this.location;
+if (command === "get_status") {
+             this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+             this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+             this.docked = location?.docked_at != null
+               ? !!(location.docked_at)
+               : (p.docked_at_base != null
+                 ? !!(p.docked_at_base)
+                 : (p.docked as boolean) ?? (p.status === "docked"));
+             this.location =
+               (location?.system_name as string) ||
+               (location?.system_id as string) ||
+               (p.current_system as string) ||
+               (p.location as string) ||
+               this.location;
 
-            this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
-            this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+             this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+             this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+             if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
+               this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
+             }
 
-            if (ship) {
-              this.fuel = (ship.fuel as number) ?? this.fuel;
-              this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
-              this.cargo = (ship.cargo_used as number) ?? this.cargo;
-              this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-              this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
-              this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
-              this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
-              this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-              this.shipSpeed = (ship.speed as number) || 1;
-              this.shipId = (ship.id as string) || "";
-            }
-          } else if (command === "mine") {
+             const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+             if (towingWreckId != null) {
+               this.towingWreck = true;
+               this.towingWreckId = towingWreckId;
+             }
+
+             if (ship) {
+               this.fuel = (ship.fuel as number) ?? this.fuel;
+               this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+               this.cargo = (ship.cargo_used as number) ?? this.cargo;
+               this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+               this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+               this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+        this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        this.shipSpeed = (ship.speed as number) || 1;
+        this.shipId = (ship.id as string) || "";
+             }
+           } else if (command === "mine") {
             // Mine response is nested under 'details' per OpenAPI spec
             const details = (r.details as Record<string, unknown>) || r;
             const qty = (details.quantity as number) || (details.count as number) || 0;
@@ -849,6 +973,10 @@ docked = false;
             if (r.auto_docked || location.docked_at) this.docked = true;
             if (r.auto_undocked) this.docked = false;
             if (typeof r.fuel === "number") this.fuel = r.fuel;
+            // Auto-scan nearby after arriving at a new system/POI so creature &
+            // player tracking never misses spawns. Covers miners, traders,
+            // civilian transport, explorers, and every other routine.
+            await this.autoScanAndTrackNearby();
           } else if (command === "dock") {
             this.docked = true;
             if (location.docked_at) this.poi = (location.docked_at as string);
@@ -880,95 +1008,19 @@ docked = false;
             const qty = (r.quantity as number) || (r.count as number) || 0;
             if (qty) this.cargo += qty;
           }
-
-if (Object.keys(ship).length > 0) {
-            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
-            if (typeof ship.max_fuel === "number") this.maxFuel = ship.max_fuel;
-            this.cargo = (ship.cargo_used as number) ?? this.cargo;
-            this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-            this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
-            this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
-            this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
-            this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-            // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
-            this.shipSpeed = (ship.speed as number) || 1;
-            
-            // Ship ID
-            this.shipId = (ship.id as string) || "";
-            
-            // Ammo is stored per-weapon-module, not at ship level.
-            // get_status may return modules as full objects or just IDs.
-            // Check both the ship.modules array and root-level modules array.
-            const modulesArray = (
-              Array.isArray(r.modules) ? r.modules :
-              Array.isArray(ship.modules) ? ship.modules :
-              []
-            ) as Array<Record<string, unknown>>;
-            
-            let totalAmmo = 0;
-            for (const mod of modulesArray) {
-              if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
-                totalAmmo += mod.current_ammo as number;
-              }
-            }
-            // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
-            if (totalAmmo > 0) {
-              this.ammo = totalAmmo;
-            } else if (ship.ammo != null) {
-              this.ammo = ship.ammo as number;
-            }
-            this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-          }
-
-          // Cloak detection
-          this.isCloaked = !!(p.is_cloaked || p.cloaked);
-
-          // Tow detection - check for towing_wreck flag or tow_attached status
-          const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
-          if (towingField != null) {
-            this.towingWreck = towingField;
-          }
-          // Also check ship-level tow status
-          if (ship) {
-            const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
-            if (shipTowing != null) {
-              this.towingWreck = shipTowing;
-            }
-          }
-
-          // Add this bot to the player tracking so it appears in the web UI players tab
-          playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
-
-          // Debug: log tow-related fields from status
-          if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
-              (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
-            this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
-          }
-
-          // Death detection
-          if (this.hull <= 0 && this.maxHull > 0) {
-            this.isDead = true;
-          } else if (this.hull > 0 && this.isDead) {
-            this.isDead = false; // respawned
-          }
-
-          // Fallback: fuel at top level
-          if (typeof r.fuel === "number") this.fuel = r.fuel;
-
-          // Skills are now tracked incrementally from mutation responses via exec()
-          // Use refreshSkills() for a dedicated skill refresh when needed
         }
 
-// Log position change if system or poi updated
         if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
           this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
           this.logPosition();
           this.lastSystem = this.system;
           this.lastPoi = this.poi;
+          // Re-evaluate WS v2 subscription for the (possibly new) docked station.
+          this.ensureWebSocketV2();
         }
 
         return resp;
-      } catch (err) {
+        } catch (err) {
         // Handle abort
         if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
           this.log("combat", `${command} aborted due to battle detection`);
@@ -1088,6 +1140,9 @@ if (Object.keys(ship).length > 0) {
 
       this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+      }
 
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
@@ -1101,19 +1156,19 @@ if (Object.keys(ship).length > 0) {
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
         this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-        this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
         this.shipSpeed = (ship.speed as number) || 1;
         this.shipId = (ship.id as string) || "";
-        
+
         const modulesArray = (
           Array.isArray(r.modules) ? r.modules :
           Array.isArray(ship.modules) ? ship.modules :
           []
         ) as Array<Record<string, unknown>>;
-        
+
         let totalAmmo = 0;
         for (const mod of modulesArray) {
           if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
@@ -1128,24 +1183,28 @@ if (Object.keys(ship).length > 0) {
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
-      this.isCloaked = !!(p.is_cloaked || p.cloaked);
-
-      const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
-      if (towingField != null) {
-        this.towingWreck = towingField;
+      // Towing state handling - moved outside ship block since it's on player/location
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
-      if (ship) {
-        const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
-        if (shipTowing != null) {
-          this.towingWreck = shipTowing;
+
+      const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+      // Only update towing state if the field is present in the response
+      if (towingWreckId !== undefined && towingWreckId !== null) {
+        if (towingWreckId !== "") {
+          this.towingWreck = true;
+          this.towingWreckId = towingWreckId;
+        } else {
+          this.towingWreck = false;
+          this.towingWreckId = null;
         }
       }
+      // If field is not present, preserve existing towing state
 
       playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
-      if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
-          (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
-        this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
+      if (p.towing_wreck_id !== undefined || (ship && ship.towing_wreck_id !== undefined) || r.towing_wreck_id !== undefined) {
+        this.log("debug", `Tow fields in status: p.towing_wreck_id=${p.towing_wreck_id}, this.towingWreck=${this.towingWreck}`);
       }
 
       if (this.hull <= 0 && this.maxHull > 0) {
@@ -1188,10 +1247,25 @@ if (Object.keys(ship).length > 0) {
         (p.location as string) ||
         this.location;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
-      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+      }
+      const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+      // Only update towing state if the field is present in the response (get_location may not include it)
+      if (towingWreckId !== undefined && towingWreckId !== null) {
+        if (towingWreckId !== "") {
+          this.towingWreck = true;
+          this.towingWreckId = towingWreckId;
+        } else {
+          this.towingWreck = false;
+          this.towingWreckId = null;
+        }
+      }
+      // If field is not present, preserve existing towing state
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
+
     return resp;
   }
 
@@ -1251,6 +1325,10 @@ if (Object.keys(ship).length > 0) {
       this.system = (poi.system_id as string) || (poi.system as string) || this.system;
       this.poi = (poi.id as string) || (poi.poi_id as string) || this.poi;
       this.docked = poi.docked != null ? !!(poi.docked as boolean) : this.docked;
+      this.inTransit = (r.in_transit as boolean) ?? false;
+      this.transitType = (r.transit_type as string) === "jump" ? "jump" : 
+                         (r.transit_type as string) === "travel" ? "travel" : null;
+      this.ticksRemaining = (r.ticks_remaining as number) ?? null;
     }
     return resp;
   }
@@ -1267,11 +1345,31 @@ if (Object.keys(ship).length > 0) {
     return this.api.execute("get_nearby");
   }
 
+  /**
+   * Scan the immediate area with get_nearby and feed the result into the
+   * player and creature (wildlife) tracking systems.
+   *
+   * This is invoked automatically after every successful jump/travel so that
+   * creature & player discoveries are never missed when a bot arrives at a new
+   * system or POI (miners, traders, civilian transport, explorers, etc.).
+   */
+  async autoScanAndTrackNearby(): Promise<void> {
+    try {
+      const resp = await this.api.execute("get_nearby");
+      if (!resp.error && resp.result) {
+        this.trackNearbyPlayers(resp.result);
+        this.trackWildlife(resp.result);
+      }
+    } catch (e) {
+      // Never let a scan failure interrupt navigation/routines
+      this.log("debug", `autoScanAndTrackNearby failed: ${e}`);
+    }
+  }
+
 async refreshSkills(): Promise<ApiResponse> {
      const resp = await this.api.execute("get_skills");
      if (!resp.error && resp.result) {
        const r = resp.result as Record<string, unknown>;
-       // Handle various response formats: skills.skills, skills.data, or top-level
        let skillsData: Record<string, unknown> | null = null;
        if (r.skills && typeof r.skills === "object") {
          skillsData = r.skills as Record<string, unknown>;
@@ -1301,6 +1399,7 @@ async refreshSkills(): Promise<ApiResponse> {
          }
        }
      }
+     logSkills(this);
      return resp;
    }
 
@@ -1399,16 +1498,52 @@ async refreshSkills(): Promise<ApiResponse> {
       income_tax_total: (result.income_tax_total as number) || 0,
       property_tax_total: (result.property_tax_total as number) || 0,
       assessed_property_value: (result.assessed_property_value as number) || 0,
+      tax_prepaid: (result.tax_prepaid as number) || 0,
       last_assessed_at: (result.last_assessed_at as number) || 0,
     };
 
     if (hasTaxEstimateChanged(this.username, estimate)) {
       saveTaxEstimate(this.username, estimate);
-      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}`);
+      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}, prepaid=${estimate.tax_prepaid}`);
     } else {
       this.log("system", "Tax estimate unchanged, skipping save");
     }
 
+    return estimate;
+  }
+
+  /**
+   * Fetch faction tax estimate and save to data/faction_taxes.json.
+   */
+  async updateFactionTaxEstimate(): Promise<FactionTaxEstimate | null> {
+    const resp = await this.exec("get_faction_tax_estimate");
+    if (resp.error || !resp.result) {
+      this.log("warn", `get_faction_tax_estimate failed: ${resp.error?.message}`);
+      return null;
+    }
+
+    const result = resp.result as Record<string, unknown>;
+    const estimate: FactionTaxEstimate = {
+      action: "get_faction_tax_estimate",
+      faction_id: (result.faction_id as string) || "",
+      faction_name: (result.faction_name as string) || "",
+      domicile: (result.domicile as string) || "",
+      taxable_income_to_date: (result.taxable_income_to_date as number) || 0,
+      deductible_expenses_to_date: (result.deductible_expenses_to_date as number) || 0,
+      net_taxable_profit: (result.net_taxable_profit as number) || 0,
+      income_tax: (result.income_tax as Array<any>) || [],
+      income_tax_total: (result.income_tax_total as number) || 0,
+      carried_debt: (result.carried_debt as Array<any>) || [],
+      carried_debt_total: (result.carried_debt_total as number) || 0,
+      tax_prepaid: (result.tax_prepaid as number) || 0,
+      next_assessment_approx_seconds: (result.next_assessment_approx_seconds as number) || 0,
+      tax_collection_active: (result.tax_collection_active as boolean) ?? true,
+      last_assessed_at: (result.last_assessed_at as number) || Date.now(),
+      note: (result.note as string) || "",
+    };
+
+    saveFactionTaxEstimate(estimate);
+    this.log("system", `Faction tax estimate updated: income=${estimate.taxable_income_to_date}, tax=${estimate.income_tax_total}, prepaid=${estimate.tax_prepaid}`);
     return estimate;
   }
 
@@ -1431,66 +1566,173 @@ async refreshSkills(): Promise<ApiResponse> {
     return resp.result as Record<string, unknown>;
   }
 
-  /** Fetch faction storage contents and cache them. Silently returns empty on error. */
-  async refreshFactionStorage(): Promise<void> {
-    let factionName = this.faction;
-    const station = this.poi;
-    if (!factionName) {
-      // Try to load from cache to get faction name and storage
-      try {
-        const cached = getFactionStorageCacheByStationOnly(station);
-        if (cached && cached.entries.length > 0) {
-          this.faction = cached.factionName;
-          this.factionStorage = cached.entries.map(e => ({ itemId: e.itemId, name: e.name || e.itemId, quantity: e.quantity }));
+  /**
+   * Fetch faction storage contents and cache them. Uses view_faction_storage with station_id for remote access.
+   *
+   * @param forceLive When true, bypasses the API response cache so callers (the
+   *   crafter) always get the current on-disk server inventory. The underlying
+   *   `view_faction_storage` command is cached for 120s in api.ts, and the bot's
+   *   own crafting jobs constantly consume/produce materials — so a cached read
+   *   is routinely minutes behind reality and makes the planner undercount
+   *   holdings (e.g. think it has 714k steel_plate when it really has 1.1M),
+   *   which wastes queue slots refining materials it already has enough of.
+   */
+  async refreshFactionStorage(forceLive = false): Promise<void> {
+    const settings = loadSettings();
+    const generalSettings = (settings.general as Record<string, unknown>) || {};
+    const homeStationId = (generalSettings.factionStorageStation as string) || "";
+    
+    if (!homeStationId) {
+      this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");
+      return;
+    }
+
+    const factionName = this.faction || "unknown";
+    // Force a live API call. We never want the 120s response cache here, and we
+    // do NOT rely on the data/factionStorage/*.json cache files (they are often
+    // stale or wildly incorrect). We call api.execute directly (as get_status
+    // does) so we can pass bypassCache without going through the command
+    // bookkeeping in exec().
+    const resp = await this.api.execute(
+      "view_faction_storage",
+      { station_id: homeStationId },
+      { bypassCache: true },
+    );
+    if (resp.error) {
+      this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
+      // Do NOT silently fall back to the on-disk cache file — those are known to
+      // be stale/misleading. Keep whatever the last successful live read gave us
+      // so counts stay consistent instead of jumping to a wrong cached value.
+      if (this.factionStorage.length === 0) {
+        const cached = getFactionStorageCache(factionName, homeStationId);
+        if (cached?.entries?.length) {
+          this.log("warn", `No live faction storage and bot store empty - falling back to stale cache for ${homeStationId}: ${cached.entries.length} items (may be inaccurate)`);
+          this.factionStorage = cached.entries.map((e) => ({
+            itemId: e.itemId,
+            name: e.name || e.itemId,
+            quantity: e.quantity,
+          }));
           this.factionFuelReserve = cached.factionFuelReserve || 0;
           this.factionFuelCapacity = cached.factionFuelCapacity || 0;
-          this.log("info", `Loaded faction storage from cache: ${cached.factionName} at ${station} (${cached.entries.length} items)`);
-          return;
         }
-      } catch (e) {
-        this.log("warn", "Failed to load faction storage from cache");
       }
-      this.log("warn", "No faction name set and no cache, skipping faction storage refresh");
-      this.factionStorage = [];
-      return;
-    }
+    } else {
+      const result = resp.result as Record<string, unknown> | null;
+      // Use the robust item parser (same one used for view_storage) so we
+      // correctly handle whichever field view_faction_storage returns its items
+      // under (items / faction_items / stored_items / data wrapper, etc.). The
+      // fragile inline parser here previously missed the real field, leaving
+      // factionStorage empty so the crafter undercounted holdings.
+      const entries = this.parseItemList(result);
 
-    // CRITICAL: view_storage with target: "faction" requires being docked at a station
-    // If not docked, skip the API call and keep cached data
-    if (!this.docked) {
-      return;
-    }
+      if (entries.length === 0) {
+        this.log("warn", "Faction storage refresh returned 0 items");
+      }
 
-    const resp = await this.exec("view_storage", { target: "faction" });
-    if (resp.error) {
-      // Don't log error if we're not docked - this is expected behavior
-      if (this.docked) {
-        this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
-      }
-      // Don't reset factionStorage to empty on error - keep cached data
+      this.factionStorage = entries;
+      this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
+      this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;
+      updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
+      this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items${forceLive ? " (live)" : ""}`);
+    }
+  }
+
+  // ── WebSocket v2 (realtime market) lifecycle ──────────────
+
+  /** Whether WS v2 market streaming is enabled for this bot. */
+  isWebSocketV2Enabled(): boolean {
+    try {
+      const settings = loadSettings();
+      const general = (settings.general as Record<string, unknown>) || {};
+      const bots = Array.isArray(general.websocketV2Bots)
+        ? (general.websocketV2Bots as string[])
+        : [];
+      return bots.includes(this.username);
+    } catch {
+      return false;
+    }
+  }
+
+  /** The base_id of the bot's current docked station, or null if not docked/unknown. */
+  getCurrentBaseId(): string | null {
+    if (!this.docked) return null;
+    const sys = mapStore.getSystem(this.system);
+    const poi = sys?.pois?.find((p) => p.id === this.poi);
+    const base = poi?.base_id || poi?.id;
+    return base || null;
+  }
+
+  /** Ensure the WS v2 client is running and subscribed to the current station. */
+  private ensureWebSocketV2(): void {
+    if (!this.isWebSocketV2Enabled()) return;
+    const baseId = this.getCurrentBaseId();
+    if (!baseId) {
+      this.log("system", "WS v2: enabled but not docked at a known station yet.");
       return;
     }
-    const result = resp.result as Record<string, unknown>;
-    const entries = this.parseItemList(result);
-    if (entries.length === 0) {
-      this.log("warn", "Faction storage refresh returned 0 items");
+    if (!this.wsV2) {
+      this.startWebSocketV2();
+      return;
     }
-    // Try to get faction name from response, then from existing cache, then fall back to this.faction
-    let respFactionName = (result.faction_name as string) || (result.faction_id as string);
-    if (!respFactionName && station) {
-      const cached = getFactionStorageCacheByStationOnly(station);
-      if (cached) {
-        respFactionName = cached.factionName;
+    if (this.wsV2.subscribedBaseId !== baseId && this.wsV2.isConnected) {
+      this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
+      this.wsV2.subscribeMarket(baseId).catch((err) =>
+        this.log("error", `WS v2 resubscribe failed: ${err instanceof Error ? err.message : err}`),
+      );
+    }
+  }
+
+  /** Open the WS v2 client (non-blocking). Subscription happens via onStatus "connected". */
+  private startWebSocketV2(): void {
+    const creds = this.session.loadCredentials();
+    if (!creds) return;
+    this.wsV2 = new WebSocketV2Client({
+      username: creds.username,
+      password: creds.password,
+      baseUrl: this.api.baseUrl,
+      onMarketUpdate: (payload) => this.handleWebSocketV2MarketUpdate(payload),
+      onStatus: (status: WsV2Status) => this.onWebSocketV2Status(status),
+    });
+    this.wsV2.start().catch((err) =>
+      this.log("error", `WS v2 connection error: ${err instanceof Error ? err.message : err}`),
+    );
+  }
+
+  private onWebSocketV2Status(status: WsV2Status): void {
+    this.log("system", `WS v2 status: ${status}`);
+    if (status === "connected") {
+      const baseId = this.getCurrentBaseId();
+      if (baseId && this.wsV2 && this.wsV2.subscribedBaseId !== baseId) {
+        this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
+        this.wsV2.subscribeMarket(baseId).catch((err) =>
+          this.log("error", `WS v2 subscribe failed: ${err instanceof Error ? err.message : err}`),
+        );
       }
     }
-    if (!respFactionName) {
-      respFactionName = factionName;
-    }
-    this.factionStorage = entries;
-    this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
-    this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    if (respFactionName) {
-      updateFactionStorageCache(respFactionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
+  }
+
+  private handleWebSocketV2MarketUpdate(payload: MarketUpdatePayload): void {
+    const baseId = payload.base_id;
+    if (!baseId || !Array.isArray(payload.items)) return;
+    marketStreamStore.update(baseId, payload.tick, payload.items);
+
+    // Optional mirror into the dashboard's HTTP market cache, normalizing
+    // the WS order-book shape (price_each) into what mapStore expects (price).
+    const mapping = this.wsV2BaseMapping[baseId];
+    if (mapping) {
+      try {
+        const normalized = payload.items.map((it) => ({
+          item_id: it.item_id,
+          item_name: it.item_name,
+          sell_orders: Array.isArray(it.sell_orders)
+            ? it.sell_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
+            : it.sell_orders,
+          buy_orders: Array.isArray(it.buy_orders)
+            ? it.buy_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
+            : it.buy_orders,
+        }));
+        mapStore.updateMarket(mapping.systemId, mapping.poiId, { items: normalized });
+      } catch { /* ignore dashboard mirror errors */ }
     }
   }
 
@@ -1500,6 +1742,7 @@ async refreshSkills(): Promise<ApiResponse> {
     routine: Routine,
     opts?: {
       getFleetStatus?: () => BotStatus[];
+      getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
       sendBotChat?: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => void;
       getAllBotNames?: () => string[];
     },
@@ -1555,6 +1798,10 @@ async refreshSkills(): Promise<ApiResponse> {
 
     this.log("system", `Starting routine: ${routineName}`);
 
+    // Open the optional WebSocket v2 market stream (static/market-watcher bots).
+    // Non-blocking: failures are logged but never delay or crash the routine.
+    this.ensureWebSocketV2();
+
     const ctx: RoutineContext = {
       api: this.api,
       bot: this,
@@ -1578,14 +1825,18 @@ async refreshSkills(): Promise<ApiResponse> {
         });
       },
       getFleetStatus: opts?.getFleetStatus,
+      getBotFreshStatus: opts?.getBotFreshStatus,
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
     };
 
-    await buyInsurance(ctx);
+    await ensureInsured(ctx);
 
+    const generator = routine(ctx);
     try {
-      for await (const stateName of routine(ctx)) {
+      while (true) {
+        const { value: stateName, done } = await generator.next();
+        if (done) break;
         if ((this._state as BotState) === "stopping") {
           this.log("system", `Stopped during state: ${stateName}`);
           break;
@@ -1601,6 +1852,11 @@ async refreshSkills(): Promise<ApiResponse> {
       // Re-throw so the caller's .catch() handler fires, ensuring the bot
       // assignment is cleared and "crashed" is logged rather than "finished".
       throw err;
+    } finally {
+      // Tear down the WS v2 stream so it isn't left reconnecting while idle.
+      this.wsV2?.close();
+      this.wsV2 = null;
+      await generator.return(undefined);
     }
 
     this._state = "idle";
@@ -2446,10 +2702,10 @@ getSkillLevel(skillId: string): number {
            if (battleId) {
              this.currentBattle.battleId = battleId;
            }
-           this.currentBattle.lastUpdate = Date.now();
-         }
+this.currentBattle.lastUpdate = Date.now();
+          }
 
-         debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
 
           // Check if we should send a battle response to AI chat
           const now = Date.now();
@@ -2458,68 +2714,49 @@ getSkillLevel(skillId: string): number {
             if ((totalDamage > 0 && targetName === this.username) || !this.currentBattle.inBattle) {
               this.lastBattleResponseMs = now;
               await this.sendBattleResponseToAI(attackerName, totalDamage);
+}
+          }
+        } else if ((msgType === "crafting_update" || type === "crafting_update") && data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
+          const jobs = (d.jobs as Array<Record<string, unknown>>) || [];
+
+          for (const job of jobs) {
+            const jobId = (job.job_id as string) || "";
+            const recipeId = (job.recipe_id as string) || (job.recipe as string) || "";
+            const deposited = (job.deposited as Array<Record<string, unknown>>) || [];
+            const completed = (job.completed as boolean) ?? false;
+
+if (this.craftQueueTracker && jobId && recipeId) {
+               if (completed) {
+                 this.craftQueueTracker.markCompleted(jobId);
+                 this.craftQueueTracker.save();
+               } else if (deposited.length > 0) {
+                 const depositedQty = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
+                 const runsRemaining = (job.runs_remaining as number) || 0;
+                 this.craftQueueTracker.updateDeposited(jobId, depositedQty, runsRemaining);
+                 this.craftQueueTracker.save();
+               }
+             }
+
+            if (recipeId && deposited.length > 0) {
+              const totalQuantity = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
+              const outputName = deposited[0]?.name as string || deposited[0]?.item_id as string || recipeId;
+              if (completed) {
+                this.log("craft", `Crafting completed: ${totalQuantity}x ${outputName}`);
+                this.clearCraftingJobByRecipe(recipeId);
+              } else {
+                const runsRemaining = (job.runs_remaining as number) || 0;
+                this.log("craft", `Crafting progress: ${totalQuantity}x ${outputName} - ${runsRemaining} runs remaining`);
+              }
             }
           }
-       } else if (msgType === "battle_update" && data && typeof data === "object") {
-         const battleId = (data.battle_id as string) || "";
-         const tick = (data.tick as number) || 0;
-         const participants = Array.isArray(data.participants) ? data.participants : [];
-         
-         if (battleId) {
-           // We're in battle - update global state
-           this.currentBattle.inBattle = true;
-           this.currentBattle.battleId = battleId;
-           this.currentBattle.lastUpdate = Date.now();
-           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
- 
-           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
-         }
-         
-         // Check if we should send a battle response to AI chat (when we just entered battle)
-         const now = Date.now();
-         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
-           // Only respond when we just entered battle (not already in battle)
-           if (!this.currentBattle.inBattle) {
-             this.lastBattleResponseMs = now;
-             await this.sendBattleResponseToAI("", 0);
-           }
-         }
-       } else if (type === "system" && data && typeof data === "object") {
-        const message = (data.message as string) || "";
-        const msgLower = message.toLowerCase();
-
-        // Check for disengage/battle end messages
-        if (msgLower.includes("disengaged from battle") || msgLower.includes("battle ended")) {
-          this.currentBattle.inBattle = false;
-          this.currentBattle.battleId = null;
-          this.currentBattle.participants = [];
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle ended`);
         }
-        
-        // CRITICAL: Detect battle interruption messages
-        // These come when a jump/travel action is interrupted by combat
-        if (msgLower.includes("interrupted by combat") || msgLower.includes("attacking you")) {
-          this.currentBattle.inBattle = true;
-          this.currentBattle.lastUpdate = Date.now();
-          // Try to extract battle ID if present in the message
-          const battleIdMatch = message.match(/Battle ID:\s*([a-f0-9]+)/i);
-          if (battleIdMatch && !this.currentBattle.battleId) {
-            this.currentBattle.battleId = battleIdMatch[1];
-          }
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
 
-          // Abort any pending mutation commands since we're now in battle
-          for (const controller of this.pendingCommands.values()) {
-            controller.abort();
-          }
-          this.pendingCommands.clear();
-        }
-      }
+        // Handle system messages
+        if (type === "system" && data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
 
-      if (type === "system" && data && typeof data === "object") {
-        const d = data as Record<string, unknown>;
-
-        if (d.damage !== undefined) {
+          if (d.damage !== undefined) {
           const pirateName = (d.pirate_name as string) || "Unknown";
           const pirateT    = (d.pirate_tier as string) || "";
           const damage     = (d.damage as number) ?? 0;
@@ -2579,8 +2816,9 @@ getSkillLevel(skillId: string): number {
             // }
           }
         }
+      }
 
-      } else if (type === "combat" && data && typeof data === "object") {
+      if (type === "combat" && data && typeof data === "object") {
         const d = data as Record<string, unknown>;
         const message = (d.message as string) || "";
         if (message) this.log("combat", `[COMBAT] ${message}`);
@@ -2967,6 +3205,81 @@ getSkillLevel(skillId: string): number {
     }
   }
 
+  trackWildlife(nearbyResult: unknown): void {
+    if (!nearbyResult || typeof nearbyResult !== "object") {
+      return;
+    }
+
+    const data = nearbyResult as Record<string, unknown>;
+    const creaturesArray = Array.isArray(data.creatures) ? data.creatures : [];
+
+    let wildlifeCount = 0;
+    for (const entity of creaturesArray as Array<Record<string, unknown>>) {
+      const name = (entity.name as string) || "";
+      if (name && name.trim()) {
+        const trimmedName = name.trim();
+        const creatureId = (entity.creature_id as string) || "";
+        const species = (entity.species as string) || "";
+        const role = (entity.role as string) || "";
+        const hull = (entity.hull as number) || 0;
+        const maxHull = (entity.max_hull as number) || hull;
+        const inCombat = (entity.in_combat as boolean) || false;
+        
+        if (wildlifeStore.add(trimmedName, this.system, this.poi, creatureId, species, role, hull, maxHull, inCombat)) {
+          wildlifeCount++;
+        }
+      }
+    }
+
+    if (wildlifeCount > 0) {
+      this.log("wildlife", `Discovered ${wildlifeCount} new wildlife creature(s) from nearby scan`);
+    }
+  }
+
+  /**
+   * Extract potential-creature data from a survey_system response and persist it.
+   * Unlike trackWildlife (live get_nearby sightings with creature IDs), this
+   * captures the survey's `wildlife` (species that may be present, with estimate
+   * and abundance) and `faint_signatures` (hints about where creatures hide).
+   */
+  trackSurveyWildlife(surveyResult: unknown): void {
+    if (!surveyResult || typeof surveyResult !== "object") return;
+    const data = surveyResult as Record<string, unknown>;
+
+    const rawWildlife = Array.isArray(data.wildlife) ? data.wildlife : [];
+    const rawSignatures = Array.isArray(data.faint_signatures) ? data.faint_signatures : [];
+
+    if (rawWildlife.length === 0 && rawSignatures.length === 0) return;
+
+    const wildlife: SurveyWildlifeEntry[] = rawWildlife.map((e) => {
+      const w = e as Record<string, unknown>;
+      return {
+        species: (w.species as string) || "",
+        name: (w.name as string) || "",
+        role: (w.role as string) || "",
+        estimate: Number(w.estimate) || 0,
+        abundance: (w.abundance as string) || "",
+      };
+    });
+    const faintSignatures: FaintSignature[] = rawSignatures.map((e) => {
+      const s = e as Record<string, unknown>;
+      return {
+        type: (s.type as string) || "",
+        hint: (s.hint as string) || "",
+        difficulty: (s.difficulty as string) || undefined,
+      };
+    });
+
+    wildlifeStore.recordSurvey(this.system, wildlife, faintSignatures);
+
+    if (wildlife.length > 0) {
+      this.log("wildlife", `Survey spotted ${wildlife.length} potential species in ${this.system}: ${wildlife.map((w) => w.name).join(", ")}`);
+    }
+    if (faintSignatures.length > 0) {
+      this.log("wildlife", `Faint signatures in ${this.system}: ${faintSignatures.map((s) => s.hint).join("; ")}`);
+    }
+  }
+
   /**
    * Extract and track player names from a get_system_agents response.
    */
@@ -3151,6 +3464,8 @@ getSkillLevel(skillId: string): number {
       skills: this.getSkillsSnapshot(),
       factionFuelReserve: this.factionFuelReserve,
       factionFuelCapacity: this.factionFuelCapacity,
+      faction: this.faction,
+      isCloaked: this.isCloaked,
     };
   }
 
@@ -3182,6 +3497,7 @@ const CATEGORY_COLORS: Record<string, string> = {
   skill: "\x1b[95m",
   scavenge: "\x1b[33m",
   rescue: "\x1b[96m",
+  alert: "\x1b[91m",
 };
 
 function getCategoryColor(category: string): string {

@@ -22,9 +22,9 @@ interface Recipe {
 
 interface CraftingNode {
   recipe: Recipe;
-  quantityNeeded: number;        // Total quantity needed for parent goals
+  quantityNeeded: number;        // Total quantity needed for parent goals (in items)
   quantityHave: number;          // Current inventory count
-  quantityToCraft: number;       // Net quantity to craft (needed - have)
+  quantityToCraft: number;       // Net quantity to craft (needed - have) - in ITEMS
   children: CraftingNode[];      // Prerequisite recipes
   depth: number;
 }
@@ -98,7 +98,7 @@ export function scoreRecipeAvailability(
   let totalNeeded = 0;
 
   for (const comp of recipe.components) {
-    const have = countItemFn(comp.item_id);
+    const have = countItemFn(comp.item_id.toLowerCase());
     const needed = comp.quantity;
     totalNeeded += needed;
     totalAvailability += Math.min(have, needed);
@@ -115,12 +115,12 @@ export function scoreRecipeAvailability(
   return score;
 }
 
-function hasRecipeMaterials(
+export function hasRecipeMaterials(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): boolean {
   for (const comp of recipe.components) {
-    const have = countItemFn(comp.item_id);
+    const have = countItemFn(comp.item_id.toLowerCase());
     if (have < comp.quantity) return false;
   }
   return true;
@@ -129,11 +129,52 @@ function hasRecipeMaterials(
 /**
  * Find the best recipe that produces a given item.
  * Prefers recipes with materials already available in storage.
+ * Optionally prioritizes recipes that can be crafted at available facilities.
  */
+// Comparator that ranks recipes producing the same item.
+//
+// PRIORITY ORDER:
+//   1. canCraft (all sub-materials on hand right now) — ALWAYS prefer a recipe
+//      we can actually build this pass. This is what lets the planner fall back
+//      to an alternate recipe (e.g. regular titanium alloy) when the preferred
+//      one (e.g. plasma-flux) is out of a sub-material, instead of holding
+//      forever on the un-craftable recipe just because we happen to own its
+//      facility.
+//   2. OWN-FACILITY availability (isFacilityRecipe) — when forceOwnFacility is
+//      on we must never rent an external facility if we own the gear to make the
+//      item, so among equally-craftable candidates an own-facility recipe
+//      outranks one that would require auto-routing/rental. When NEITHER
+//      candidate is craftable (legitimately "awaiting sub-materials"), the
+//      own-facility one still wins so we don't route a rental while waiting.
+//   3. Material-availability score — tiebreaker for recipes equally ranked above.
+function compareRecipeCandidates(
+  a: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
+  b: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
+): number {
+  if (a.canCraft !== b.canCraft) return a.canCraft ? -1 : 1;
+  if (a.isFacilityRecipe !== b.isFacilityRecipe) return a.isFacilityRecipe ? -1 : 1;
+  if (a.score !== b.score) return b.score - a.score;
+  return 0;
+}
+
+function scoreCandidates(
+  candidates: Recipe[],
+  countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
+): Array<{ recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean }> {
+  return candidates.map(recipe => ({
+    recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
+    score: scoreRecipeAvailability(recipe, countItemFn),
+    isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
+  }));
+}
+
 export function findRecipeForItem(
   itemId: string,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
 ): Recipe | null {
   const blacklistedRecipes = getBlacklistedRecipes();
   const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
@@ -144,39 +185,19 @@ export function findRecipeForItem(
   const unwrapCandidates = candidates.filter(isUnwrapRecipe);
   const nonUnwrapCandidates = candidates.filter(r => !isUnwrapRecipe(r));
 
+  // When both an unwrap recipe and a direct recipe exist for the same item,
+  // prefer the direct recipe (the unwrap is a convenience fallback).
   if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
     const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
     if (hasDirect) {
-      const scored = nonUnwrapCandidates.map(recipe => ({
-        recipe,
-        canCraft: hasRecipeMaterials(recipe, countItemFn),
-        score: scoreRecipeAvailability(recipe, countItemFn),
-      }));
-
-      scored.sort((a, b) => {
-        if (a.score !== b.score) {
-          return b.score - a.score;
-        }
-        return a.canCraft ? -1 : 1;
-      });
-
+      const scored = scoreCandidates(nonUnwrapCandidates, countItemFn, facilityAvailableRecipes);
+      scored.sort(compareRecipeCandidates);
       return scored[0].recipe;
     }
   }
 
-  const scored = candidates.map(recipe => ({
-    recipe,
-    canCraft: hasRecipeMaterials(recipe, countItemFn),
-    score: scoreRecipeAvailability(recipe, countItemFn),
-  }));
-
-  scored.sort((a, b) => {
-    if (a.score !== b.score) {
-      return b.score - a.score;
-    }
-    return a.canCraft ? -1 : 1;
-  });
-
+  const scored = scoreCandidates(candidates, countItemFn, facilityAvailableRecipes);
+  scored.sort(compareRecipeCandidates);
   return scored[0].recipe;
 }
 
@@ -187,6 +208,7 @@ export function findRecipeForItem(
  * @param quantityToCraftInItems - How many output items we need to craft (already net deficit)
  * @param recipes - All available recipes
  * @param countItemFn - Function to count items in inventory
+ * @param facilityAvailableRecipes - Set of recipe IDs available at facilities
  * @param depth - Current recursion depth (for cycle detection)
  * @param visited - Set of already-visited item IDs (cycle detection)
  */
@@ -195,6 +217,7 @@ function buildCraftingTree(
   quantityToCraftInItems: number,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
   depth: number = 0,
   visited: Set<string> = new Set(),
 ): CraftingNode | null {
@@ -203,12 +226,9 @@ function buildCraftingTree(
     return null;
   }
 
-  // Convert items needed to recipe batches
-  const outputQty = goalRecipe.output_quantity || 1;
-  const batchesToCraft = Math.ceil(quantityToCraftInItems / outputQty);
-
-  // If we don't need to craft any batches, skip this branch
-  if (batchesToCraft <= 0) {
+  // quantityToCraftInItems is already the deficit in items
+  // If we don't need to craft any items, skip this branch
+  if (quantityToCraftInItems <= 0) {
     return null;
   }
 
@@ -217,23 +237,23 @@ function buildCraftingTree(
   const node: CraftingNode = {
     recipe: goalRecipe,
     quantityNeeded: quantityToCraftInItems,
-    quantityHave: 0,
-    quantityToCraft: batchesToCraft,
+    quantityHave: countItemFn(goalRecipe.output_item_id),
+    quantityToCraft: quantityToCraftInItems,
     children: [],
     depth,
   };
 
   // Find prerequisites for each component
-  // Calculate total components needed for all batches
+  // Calculate total components needed for all items
   for (const comp of goalRecipe.components) {
-    const totalCompNeeded = comp.quantity * batchesToCraft;
-    const compHave = countItemFn(comp.item_id);
+    const totalCompNeeded = comp.quantity * quantityToCraftInItems;
+    const compHave = countItemFn(comp.item_id.toLowerCase());
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 
     if (compToCraft <= 0) continue;
 
     // Find recipe for this component, preferring recipes with available materials
-    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn);
+    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn, facilityAvailableRecipes);
 
     if (!prereqRecipe) {
       // No recipe to craft this - it's a base material
@@ -247,6 +267,7 @@ function buildCraftingTree(
       compToCraft,
       recipes,
       countItemFn,
+      facilityAvailableRecipes,
       depth + 1,
       new Set(visited),
     );
@@ -277,7 +298,7 @@ function flattenTree(node: CraftingNode, result: CraftingPlanItem[] = []): Craft
     quantityToCraft: node.quantityToCraft,
     reason: node.depth === 0 
       ? `Goal item` 
-      : `Need ${node.quantityToCraft * (node.recipe.output_quantity || 1)}x ${node.recipe.output_name} for ${parentNames}`,
+      : `Need ${node.quantityToCraft}x ${node.recipe.output_name} for ${parentNames}`,
     depth: node.depth,
   });
 
@@ -291,6 +312,7 @@ function flattenTree(node: CraftingNode, result: CraftingPlanItem[] = []): Craft
  * @param goalQuantity - How many we want
  * @param recipes - All available recipes
  * @param countItemFn - Function to count items in inventory
+ * @param facilityAvailableRecipes - Set of recipe IDs available at facilities
  * @returns Complete crafting plan or null if no recipe exists
  */
 export function calculateCraftingPlan(
@@ -298,8 +320,9 @@ export function calculateCraftingPlan(
   goalQuantity: number,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
 ): CraftingPlan | null {
-  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn);
+  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes);
 
   if (!goalRecipe) {
     return null;
@@ -311,6 +334,7 @@ export function calculateCraftingPlan(
     goalQuantity,
     recipes,
     countItemFn,
+    facilityAvailableRecipes,
   );
 
   if (!tree) {
@@ -338,11 +362,13 @@ export function calculateCraftingPlan(
 /**
  * Find all recipes that produce a given item and return them sorted by material availability.
  * This allows callers to pick the best recipe based on current materials.
+ * Optionally prioritizes recipes that can be crafted at available facilities.
  */
 export function findAllRecipesForItem(
   itemId: string,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
 ): Recipe[] {
   const blacklistedRecipes = getBlacklistedRecipes();
   const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
@@ -354,36 +380,14 @@ export function findAllRecipesForItem(
   if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
     const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
     if (hasDirect) {
-      const scored = nonUnwrapCandidates.map(recipe => ({
-        recipe,
-        canCraft: hasRecipeMaterials(recipe, countItemFn),
-        score: scoreRecipeAvailability(recipe, countItemFn),
-      }));
-
-      scored.sort((a, b) => {
-        if (a.score !== b.score) {
-          return b.score - a.score;
-        }
-        return a.canCraft ? -1 : 1;
-      });
-
+      const scored = scoreCandidates(nonUnwrapCandidates, countItemFn, facilityAvailableRecipes);
+      scored.sort(compareRecipeCandidates);
       return scored.map(s => s.recipe);
     }
   }
 
-  const scored = candidates.map(recipe => ({
-    recipe,
-    canCraft: hasRecipeMaterials(recipe, countItemFn),
-    score: scoreRecipeAvailability(recipe, countItemFn),
-  }));
-
-  scored.sort((a, b) => {
-    if (a.score !== b.score) {
-      return b.score - a.score;
-    }
-    return a.canCraft ? -1 : 1;
-  });
-
+  const scored = scoreCandidates(candidates, countItemFn, facilityAvailableRecipes);
+  scored.sort(compareRecipeCandidates);
   return scored.map(s => s.recipe);
 }
 
@@ -400,6 +404,7 @@ export function calculateMultiGoalPlan(
   goals: Array<{ itemId: string; quantity: number; recipe?: Recipe }>,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
 ): CraftingPlan[] {
   const plans: CraftingPlan[] = [];
 
@@ -427,7 +432,7 @@ export function calculateMultiGoalPlan(
       // Always use the specified recipe exactly as requested
       goalRecipe = goal.recipe;
     } else {
-      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0, facilityAvailableRecipes);
     }
     
     if (!goalRecipe) continue;
@@ -443,6 +448,7 @@ export function calculateMultiGoalPlan(
       quantityToCraft,
       recipes,
       (itemId) => inventory.get(itemId) || 0,
+      facilityAvailableRecipes,
     );
 
     if (tree) {

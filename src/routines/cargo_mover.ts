@@ -96,8 +96,9 @@ interface CargoMoveItem {
   category?: string;
   storageType?: 'faction' | 'personal';
   sourceBot?: string;
-  totalDelivered?: number;  // Track total items delivered for this config
-  totalToDeliver?: number;  // Optional target: when totalDelivered reaches this, item is considered complete
+  totalDelivered?: number;
+  totalToDeliver?: number;
+  shipLoadoutDestination?: string;
 }
 
 interface CargoMoverSettings {
@@ -130,6 +131,7 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
       sourceBot: item.sourceBot as string | undefined,
       totalDelivered: item.totalDelivered as number | undefined,
       totalToDeliver: item.totalToDeliver as number | undefined,
+      shipLoadoutDestination: item.shipLoadoutDestination as string | undefined,
     }));
 
   return {
@@ -613,6 +615,10 @@ function findMoveJobs(
     // Total available = in storage + already in cargo
     const totalAvailable = inStorage + inCargo;
     
+    // Determine destination station - use shipLoadoutDestination if set, otherwise global destination
+    const effectiveDestStation = configItem.shipLoadoutDestination || settings.destinationStation;
+    const effectiveDestSystem = resolveStationSystem(effectiveDestStation) || destSystem;
+    
     // Check how much is already claimed by other bots (quantity-based locking)
     let availableQty = getAvailableItemQuantity(
       configItem.itemId,
@@ -621,7 +627,7 @@ function findMoveJobs(
     );
 
     // Subtract items already in transit to this destination
-    const inTransitQty = getInTransitQuantity(configItem.itemId, settings.destinationStation);
+    const inTransitQty = getInTransitQuantity(configItem.itemId, effectiveDestStation);
     availableQty = Math.max(0, availableQty - inTransitQty);
     
     const alreadyClaimed = getBotClaimedQuantity(bot.username, configItem.itemId);
@@ -634,7 +640,7 @@ function findMoveJobs(
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
       const blacklist = getSystemBlacklist();
-      const route = mapStore.findRoute(sourceSystem, destSystem, blacklist);
+      const route = mapStore.findRoute(sourceSystem, effectiveDestSystem, blacklist);
       const jumps = route ? route.length - 1 : 999;
 
       // Limit available quantity to what fits in cargo for this item
@@ -650,8 +656,8 @@ function findMoveJobs(
         storageType,
         sourceSystem,
         sourceStation: settings.sourceStation,
-        destSystem,
-        destStation: settings.destinationStation,
+        destSystem: effectiveDestSystem,
+        destStation: effectiveDestStation,
         jumps,
       });
     } else if (availableQty <= 0 && alreadyClaimed > 0) {

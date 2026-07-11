@@ -10,8 +10,10 @@ import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
+import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
+import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -65,35 +67,9 @@ const DATA_DIR = join(process.cwd(), "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
-const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
 const FLOCK_FILE = join(DATA_DIR, "flock.json");
 const LAST_USED_ROUTINE_FILE = join(DATA_DIR, "lastUsedRoutine.json");
-
-interface CachedFacilities {
-  version: string;
-  lastUpdated: string;
-  personal: { facility_type: string; name: string; description: string; category: string; level?: number }[];
-  production: { facility_type: string; name: string; description: string; category: string; level?: number }[];
-  faction: { facility_type: string; name: string; description: string; category: string; level?: number }[];
-  details: Record<string, unknown>;
-}
-
-function loadFacilities(): CachedFacilities {
-  if (existsSync(FACILITIES_FILE)) {
-    try {
-      return JSON.parse(readFileSync(FACILITIES_FILE, "utf-8")) as CachedFacilities;
-    } catch (err) {
-      console.warn(`Warning: corrupt facilities.json, starting fresh —`, err);
-    }
-  }
-  return { version: "", lastUpdated: "", personal: [], production: [], faction: [], details: {} };
-}
-
-function saveFacilities(data: CachedFacilities): void {
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(FACILITIES_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
 
 interface MainLogs {
   activity: string[];
@@ -363,6 +339,18 @@ constructor(port: number = 3000) {
       };
       saveSettings(this.settings);
     }
+if (!this.settings.fuel_service) {
+       this.settings.fuel_service = {
+         stations: [],
+         facilityConfigs: [],
+         refuelThreshold: 35,
+         repairThreshold: 40,
+         autoCloak: false,
+         serviceAllEmpires: false,
+         refreshIntervalSec: 300,
+       };
+       saveSettings(this.settings);
+     }
     if (!this.settings.clientSync) {
       this.settings.clientSync = {
         enabled: false,
@@ -381,6 +369,7 @@ constructor(port: number = 3000) {
         syncCoordination: true,
         syncCivilianTransport: true,
         syncRescue: true,
+        syncWildlife: true,
         allowRemoteBotsInDropdowns: true,
         remoteBotNameStyle: "prefix",
         pushLocalDiscoveries: true,
@@ -542,17 +531,24 @@ constructor(port: number = 3000) {
           return Response.json({ bots: discovered });
         }
         if (url.pathname === "/api/channels" && req.method === "GET") {
-          const bot = url.searchParams.get("bot") || "";
-          let channels = bot ? chatBuffer.getChannels(bot) : [];
+          const bot = url.searchParams.get("bot") || undefined;
+          let channels = bot ? chatBuffer.getChannels(bot) : chatBuffer.getChannels();
+          const defaultChannels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }, { name: "private", displayName: "Private" }];
           if (channels.length === 0) {
-            channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
+            channels = defaultChannels;
+          } else {
+            for (const dc of defaultChannels) {
+              if (!channels.some(c => c.name === dc.name)) {
+                channels.push(dc);
+              }
+            }
           }
           return Response.json({ channels }, { headers: { "Access-Control-Allow-Origin": "*" } });
         }
         if (url.pathname === "/api/messages" && req.method === "GET") {
-          const bot = url.searchParams.get("bot") || "";
-          const channel = url.searchParams.get("channel") || "";
-          const limit = parseInt(url.searchParams.get("limit") || "200", 10);
+          const bot = url.searchParams.get("bot") || undefined;
+          const channel = url.searchParams.get("channel") || undefined;
+          const limit = parseInt(url.searchParams.get("limit") || "500", 10);
           const after = url.searchParams.get("after");
           const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
           return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) }, { headers: { "Access-Control-Allow-Origin": "*" } });
@@ -611,6 +607,36 @@ constructor(port: number = 3000) {
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
+        }
+        if (url.pathname === "/api/stationRef") {
+          const stationRefPath = join(DATA_DIR, "stationRef.json");
+          if (existsSync(stationRefPath)) {
+            try {
+              const raw = readFileSync(stationRefPath, "utf-8");
+              return Response.json(JSON.parse(raw));
+            } catch {
+              return Response.json({ stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} });
+            }
+          }
+          return Response.json({ stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} });
+        }
+        if (url.pathname === "/api/faction-station-map") {
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({});
+          }
+          const result: Record<string, string[]> = {};
+          const files = readdirSync(CACHE_DIR);
+          const factionFiles = files.filter(f => f.endsWith(".json") && !f.startsWith("Busy") && !f.startsWith("1582") && !f.startsWith("bad"));
+          for (const file of factionFiles) {
+            const match = file.match(/^(.+)--(.+)\.json$/);
+            if (match) {
+              const [, faction, station] = match;
+              if (!result[faction]) result[faction] = [];
+              if (!result[faction].includes(station)) result[faction].push(station);
+            }
+          }
+          return Response.json(result);
         }
         if (url.pathname === "/api/map/register-poi" && req.method === "POST") {
           const body = await req.json() as {
@@ -741,6 +767,20 @@ constructor(port: number = 3000) {
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
         }
+        if (url.pathname === "/api/insurance") {
+          if (req.method === "GET") {
+            const botName = url.searchParams.get("bot");
+            if (botName) {
+              const record = getInsuranceRecord(botName);
+              if (!record) {
+                return Response.json({ record: null, status: "not_found" });
+              }
+              return Response.json({ record, status: "found" });
+            }
+            return Response.json(getAllInsuranceRecords());
+          }
+          return new Response("Method not allowed", { status: 405 });
+        }
         if (url.pathname === "/api/taxes") {
           const taxesPath = join(DATA_DIR, "taxes.json");
           if (!existsSync(taxesPath)) {
@@ -750,7 +790,7 @@ constructor(port: number = 3000) {
             const raw = readFileSync(taxesPath, "utf-8");
             const taxes = JSON.parse(raw);
             const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
-            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0;
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0;
             for (const [botName, data] of Object.entries(taxes)) {
               const botData = data as { lastTaxEstimate?: any; history: any[] };
               bots[botName] = botData;
@@ -759,6 +799,7 @@ constructor(port: number = 3000) {
                 totalIncomeTax += botData.lastTaxEstimate.income_tax_total || 0;
                 totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
                 totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
+                totalTaxPrepaid += botData.lastTaxEstimate.tax_prepaid || 0;
               }
             }
             return Response.json({
@@ -768,11 +809,25 @@ constructor(port: number = 3000) {
                 totalIncomeTax,
                 totalPropertyTax,
                 totalAssessedValue,
+                totalTaxPrepaid,
                 botCount: Object.keys(taxes).length
               }
             });
           } catch {
             return Response.json({ bots: {}, fleetTotals: {} });
+          }
+        }
+        if (url.pathname === "/api/faction-tax-estimate") {
+          const factionTaxesFile = join(DATA_DIR, "faction_taxes.json");
+          if (!existsSync(factionTaxesFile)) {
+            return Response.json({ factionTaxEstimate: null });
+          }
+          try {
+            const raw = readFileSync(factionTaxesFile, "utf-8");
+            const data = JSON.parse(raw);
+            return Response.json({ factionTaxEstimate: data.lastFactionTaxEstimate || null });
+          } catch {
+            return Response.json({ factionTaxEstimate: null });
           }
         }
         if (url.pathname === "/api/catalog") {
@@ -798,15 +853,37 @@ constructor(port: number = 3000) {
             return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
-        if (url.pathname === "/data/shipsForSale.json") {
+if (url.pathname === "/data/shipsForSale.json") {
           const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
           if (existsSync(shipsForSalePath)) {
             return new Response(readFileSync(shipsForSalePath, "utf-8"), {
-              headers: { "Content-Type": "application/json" },
+              headers: {
+                "Content-Type": "application/json",
+              },
             });
           } else {
             return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
           }
+        }
+        if (url.pathname === "/data/rawMissions.json") {
+          const rawMissionsPath = join(process.cwd(), "data", "rawMissions.json");
+          if (existsSync(rawMissionsPath)) {
+            return new Response(readFileSync(rawMissionsPath, "utf-8"), {
+              headers: {
+                "Content-Type": "application/json",
+              },
+            });
+          } else {
+            return Response.json({ error: "rawMissions.json not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/api/wildlife") {
+          return Response.json(wildlifeStore.getFullData());
+        }
+        if (url.pathname === "/data/wildlifeInfo.json") {
+          return Response.json(wildlifeStore.getFullData(), {
+            headers: { "Content-Type": "application/json" },
+          });
         }
         if (url.pathname === "/api/logs/main") {
           // Return persisted main logs (activity, broadcast, system, faction)
@@ -850,6 +927,12 @@ constructor(port: number = 3000) {
           
           try {
             const files = readdirSync(CACHE_DIR);
+            const allItems: any[] = [];
+            let bestFuelReserve = 0;
+            let bestFuelCapacity = 0;
+            let bestFactionName = "";
+            let bestStation = "";
+            
             for (const file of files) {
               if (!file.endsWith(".json")) continue;
               const match1 = file.match(/^(.+)::(.+)\.json$/);
@@ -857,20 +940,31 @@ constructor(port: number = 3000) {
               const match = match1 || match2;
               if (!match) continue;
               const [, fn, st] = match;
-              if (st === station || (station === "" && st === "default")) {
+              if (st === station) {
                 const factionStoragePath = join(CACHE_DIR, file);
                 const raw = readFileSync(factionStoragePath, "utf-8");
                 const data = JSON.parse(raw);
                 const items = data.entries || data.items || [];
-                return Response.json({
-                  items,
-                  factionFuelReserve: data.factionFuelReserve || 0,
-                  factionFuelCapacity: data.factionFuelCapacity || 0,
-                  factionName: data.factionName,
-                  station: data.station,
-                });
+                allItems.push(...items);
+                if (data.factionFuelReserve > bestFuelReserve) {
+                  bestFuelReserve = data.factionFuelReserve;
+                  bestFuelCapacity = data.factionFuelCapacity || 0;
+                  bestFactionName = data.factionName || fn;
+                  bestStation = data.station || st;
+                }
               }
             }
+            
+            if (allItems.length > 0) {
+              return Response.json({
+                items: allItems,
+                factionFuelReserve: bestFuelReserve,
+                factionFuelCapacity: bestFuelCapacity,
+                factionName: bestFactionName,
+                station: bestStation,
+              });
+            }
+            
             for (const file of files) {
               if (!file.endsWith(".json")) continue;
               const match1 = file.match(/^(.+)::(.+)\.json$/);
@@ -930,29 +1024,69 @@ constructor(port: number = 3000) {
 
           const stationsData: Array<{ stationId: string; systemId: string; fuelReserve: number; fuelCapacity: number }> = [];
 
+          // The bot's own faction (from live status). Cache files are written under
+          // this faction name (e.g. "Busy Being Dead--sol_central.json"). Anything
+          // else is a mislabeled/bugged file and must NOT be used for the dashboard.
+          const ourFaction = (this.latestStatuses || []).map((b) => b.faction).find((f) => !!f) || null;
+
           for (const stationKey of approvedStations) {
             const [systemId, stationId] = stationKey.split("|");
             if (!stationId) continue;
 
             try {
               const files = readdirSync(CACHE_DIR);
+              let ourFactionData: any = null; // preferred: matches the bot's own faction
+              let fallbackData: any = null;   // most recent valid (non-legacy) file
+
+              // The faction storage cache keeps a separate file PER faction for the
+              // same station. Some are mislabeled (the monitor used to trust an
+              // unreliable response field), so we must prefer the bot's own faction
+              // file and only fall back to the most-recent valid file if none exists.
+              const consider = (faction: string, data: any): void => {
+                const updated = data.lastUpdated || 0;
+                const isOurs = ourFaction && (data.factionName === ourFaction || faction === ourFaction);
+                if (isOurs) {
+                  if (!ourFactionData || updated > (ourFactionData.lastUpdated || 0)) ourFactionData = data;
+                  return;
+                }
+                if (ourFactionData) return; // already have the authoritative faction file
+                if (!fallbackData || updated > (fallbackData.lastUpdated || 0)) fallbackData = data;
+              };
+
               for (const file of files) {
                 if (!file.endsWith(".json")) continue;
                 const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
                 if (!match) continue;
-                const [, , fileStationId] = match;
-                if (fileStationId === stationId) {
-                  const factionStoragePath = join(CACHE_DIR, file);
-                  const raw = readFileSync(factionStoragePath, "utf-8");
-                  const data = JSON.parse(raw);
-                  stationsData.push({
-                    stationId,
-                    systemId,
-                    fuelReserve: data.factionFuelReserve || 0,
-                    fuelCapacity: data.factionFuelCapacity || 0,
-                  });
-                  break;
+                const faction = match[1];
+                const fileStationId = match[2];
+                if (fileStationId !== stationId) continue;
+                if (/^[0-9a-f]{8,}$/i.test(faction)) continue; // skip hex hash faction ids
+                if (faction.toLowerCase() === "default") continue;
+                const raw = readFileSync(join(CACHE_DIR, file), "utf-8");
+                consider(faction, JSON.parse(raw));
+              }
+
+              // Fallback: if only hex/default faction files existed for this station,
+              // take the most recent of those rather than reporting nothing.
+              if (!ourFactionData && !fallbackData) {
+                for (const file of files) {
+                  if (!file.endsWith(".json")) continue;
+                  const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
+                  if (!match || match[2] !== stationId) continue;
+                  const raw = readFileSync(join(CACHE_DIR, file), "utf-8");
+                  consider(match[1], JSON.parse(raw));
                 }
+              }
+
+              const bestData = ourFactionData || fallbackData;
+
+              if (bestData) {
+                stationsData.push({
+                  stationId,
+                  systemId,
+                  fuelReserve: bestData.factionFuelReserve || 0,
+                  fuelCapacity: bestData.factionFuelCapacity || 0,
+                });
               }
             } catch {
               // Ignore errors for individual stations
@@ -1124,6 +1258,18 @@ constructor(port: number = 3000) {
           }
           if (url.pathname === "/api/client-sync/player-names" && req.method === "GET") {
             return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/wildlife" && req.method === "GET") {
+            return Response.json(wildlifeStore.getFullData(), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/wildlife-update" && req.method === "POST") {
+            try {
+              const body = await req.json() as WildlifeFullData;
+              wildlifeStore.mergeFrom(body);
+              return Response.json({ ok: true }, { headers: cors });
+            } catch {
+              return Response.json({ ok: false, error: "invalid json" }, { status: 500, headers: cors });
+            }
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
             const body = await req.json() as { apiKey: string; label: string; password?: string };
@@ -1514,32 +1660,6 @@ constructor(port: number = 3000) {
           writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
         }
 
-        // GET /api/facilities - Get cached facility types
-        if (url.pathname === "/api/facilities" && req.method === "GET") {
-          const facilities = loadFacilities();
-          return Response.json(facilities);
-        }
-
-        // POST /api/facilities - Save facility types
-        if (url.pathname === "/api/facilities" && req.method === "POST") {
-          const body = await req.json() as CachedFacilities;
-          if (!body?.version) {
-            return Response.json({ error: "Missing version" }, { status: 400 });
-          }
-          const existing = loadFacilities();
-          // Merge: keep existing details, add new ones
-          const merged: CachedFacilities = {
-            version: body.version,
-            lastUpdated: new Date().toISOString(),
-            personal: body.personal || existing.personal,
-            production: body.production || existing.production,
-            faction: body.faction || existing.faction,
-            details: { ...existing.details, ...body.details },
-          };
-          saveFacilities(merged);
-          return Response.json({ ok: true });
-        }
-
         // GET /api/crafting-loadouts - Load all loadouts
         if (url.pathname === "/api/crafting-loadouts" && req.method === "GET") {
           const loadouts = loadCraftingLoadouts();
@@ -1793,6 +1913,17 @@ constructor(port: number = 3000) {
           });
         }
 
+        // Serve creatures.html for creatures route
+        if (url.pathname === "/creatures.html") {
+          const creaturesPath = join(import.meta.dir, "creatures.html");
+          return new Response(readFileSync(creaturesPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve commandall.html for command all route
         if (url.pathname === "/commandall.html") {
           const commandallPath = join(import.meta.dir, "commandall.html");
@@ -1907,6 +2038,17 @@ constructor(port: number = 3000) {
         if (url.pathname === "/achievements.html") {
           const achievementsPath = join(import.meta.dir, "achievements.html");
           return new Response(readFileSync(achievementsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipComparison.html for ship comparison route
+        if (url.pathname === "/shipComparison.html") {
+          const shipComparisonPath = join(import.meta.dir, "shipComparison.html");
+          return new Response(readFileSync(shipComparisonPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

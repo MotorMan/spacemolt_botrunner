@@ -17,27 +17,24 @@ export async function ensureFueled(
 
   const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
 
-  if (!approvedFuelStations || approvedFuelStations.length === 0) {
-    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
-    return false;
-  }
+const { pois } = await getSystemInfo(ctx);
 
-  const { pois } = await getSystemInfo(ctx);
+const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+if (currentStation && isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
+  ctx.log("system", `Refueling at station ${currentStation.name}...`);
+  const ok = await refuelAtStation(ctx, currentStation, thresholdPct);
+  if (ok) return true;
+}
 
-  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
-    ctx.log("system", `Refueling at approved station ${currentStation.name}...`);
-    const ok = await refuelAtStation(ctx, currentStation, thresholdPct);
-    if (ok) return true;
-  }
-
-  const blacklist = getSystemBlacklist();
-  const approvedSet = new Set<string>();
+const blacklist = getSystemBlacklist();
+const approvedSet = new Set<string>();
+if (approvedFuelStations) {
   for (const entry of approvedFuelStations) {
     approvedSet.add(entry);
     const parts = entry.split("|");
     if (parts.length === 2) approvedSet.add(parts[1]);
   }
+}
 
   const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
   if (!nearest) {

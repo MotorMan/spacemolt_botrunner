@@ -8,10 +8,8 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   readSettings,
-  writeSettings,
   logFactionActivity,
   checkAndFleeFromBattle,
-  checkBattleAfterCommand,
   getBattleStatus,
   fleeFromBattle,
   getItemSize,
@@ -19,14 +17,6 @@ import {
   type BattleState,
 } from "./common.js";
 import {
-  startTrip,
-  addTripEvent,
-  completeTrip,
-  failCurrentTrip,
-  getCurrentTrip,
-  loadFuelTransferData,
-  saveFuelTransferData,
-  type FuelTripRecord,
   getFactionStorageQuantity,
   getFactionStorageLastUpdated,
   updateFactionStorageFromDeposit,
@@ -35,8 +25,91 @@ import {
   saveStationCompletion,
   type FacilityTransferLoadout,
 } from "./fuelTransferTracking.js";
+import { getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 
 const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell", "military_fuel_cell"];
+
+const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
+const factionStorageApiLastCalled: Map<string, number> = new Map();
+
+async function getRemoteFactionAllItemsRateLimited(bot: Bot, remoteStationId: string): Promise<Record<string, number>> {
+  const cache = getFactionStorageCacheByStationOnly(remoteStationId);
+  if (cache && Date.now() - cache.lastUpdated < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const result: Record<string, number> = {};
+    for (const entry of cache.entries) {
+      result[entry.itemId] = entry.quantity;
+    }
+    return result;
+  }
+
+  const now = Date.now();
+  const lastCall = factionStorageApiLastCalled.get(remoteStationId) || 0;
+  const timeSinceLastCall = now - lastCall;
+  if (timeSinceLastCall < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const waitTime = FACTION_STORAGE_API_RATE_LIMIT_MS - timeSinceLastCall;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+  factionStorageApiLastCalled.set(remoteStationId, Date.now());
+  return getRemoteFactionAllItems(bot, remoteStationId);
+}
+
+// ── Cloaking module detection and enablement ────────────────────────────────
+
+/**
+ * Check if the ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * This is a one-time command - once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("fuel", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx);
+  if (!hasCloak) {
+    ctx.log("fuel", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("fuel", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("fuel", "Cloaking enabled successfully");
+  return true;
+}
 
 function isFuelCellItem(itemId: string): boolean {
   const lower = itemId.toLowerCase();
@@ -70,6 +143,7 @@ interface FuelTransportSettings {
   items: FuelTransportItem[];
   refuelThreshold: number;
   repairThreshold: number;
+  autoCloak: boolean;
 }
 
 function getActiveLoadouts(): FacilityTransferLoadout[] {
@@ -98,6 +172,7 @@ function getFuelTransportSettings(username?: string): FuelTransportSettings {
     items,
     refuelThreshold: (t.refuelThreshold as number) || 35,
     repairThreshold: (t.repairThreshold as number) || 40,
+    autoCloak: (t.autoCloak as boolean) ?? false,
   };
 }
 
@@ -271,6 +346,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   const safetyOpts = {
     fuelThresholdPct: settings.refuelThreshold,
     hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
   };
 
   const general = readSettings().general || {};
@@ -292,6 +368,10 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   }
 
   ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
+
+  if (settings.autoCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
 
   const activeLoadouts = getActiveLoadouts();
   const useLoadoutMode = activeLoadouts.length > 0;
@@ -335,6 +415,11 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       yield "death_recovery";
       await ctx.sleep(30000);
       continue;
+    }
+
+    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
+      ctx.log("fuel", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+      await enableCloakingIfPossible(ctx);
     }
 
     if (!bot.docked || bot.poi !== homeStation || bot.system !== homeSystem) {
@@ -405,7 +490,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       const applicableLoadouts: string[] = [];
       const loadoutItemMap: Map<string, Set<string>> = new Map();
       
-      const stationQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+      const stationQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
       if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
       ctx.log("fuel", `Viewed faction storage at ${remoteStationId}: ${Object.keys(stationQtyCache).length} items found`);
 
@@ -452,7 +537,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
 
           if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
-            const freshQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+            const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
             if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
             for (const loadoutName of applicableLoadouts) {
               const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
@@ -685,6 +770,20 @@ async function getItemStatus(
   const cachedQty = getFactionStorageQuantity(remoteStationId, itemId);
   const cachedLastUpdated = getFactionStorageLastUpdated(remoteStationId);
   const hasCache = cachedLastUpdated > 0;
+
+  const cache = getFactionStorageCacheByStationOnly(remoteStationId);
+  if (cache && Date.now() - cache.lastUpdated < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    return { cachedQty, currentQty: cachedQty, hasCache };
+  }
+
+  const now = Date.now();
+  const lastCall = factionStorageApiLastCalled.get(remoteStationId) || 0;
+  const timeSinceLastCall = now - lastCall;
+  if (timeSinceLastCall < FACTION_STORAGE_API_RATE_LIMIT_MS) {
+    const waitTime = FACTION_STORAGE_API_RATE_LIMIT_MS - timeSinceLastCall;
+    await ctx.sleep(waitTime);
+  }
+  factionStorageApiLastCalled.set(remoteStationId, Date.now());
 
   const currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
   if (bot.state !== "running") return { cachedQty, currentQty, hasCache };

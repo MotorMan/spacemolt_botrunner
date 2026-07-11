@@ -37,11 +37,13 @@
  *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
  *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
  *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
+ *   cloakOnStart    — stay cloaked until attack command, then re-cloak after battle (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { botChatChannel } from "../bot_chat_channel.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { writeSettings } from "./common.js";
 import {
@@ -79,6 +81,8 @@ import type { PirateTier, NearbyEntity } from "./battle.js";
 import {
   parseNearby,
   isPirateTarget,
+  isCreatureTarget,
+  isCreatureName,
   ensureAmmoLoaded,
   engageTarget,
   emergencyFleeSpam,
@@ -123,10 +127,17 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   // Pick a real target from battle participants so we get the full combat loop
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  if (fakeTarget) {
+    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+  }
   await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct, hsettings.onlyNPCs);
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+  // Process any incoming hunter-assist requests from allies in our POI first.
+  // (No-op if disabled, docked, already busy, or no pending requests.)
+  await checkHunterCoordRequests(ctx, settings);
+
   // Check via API first to validate/clear stale WebSocket state
   let apiChecked = false;
   try {
@@ -190,7 +201,10 @@ function getHunterSettings(username?: string): {
   fleeThreshold: number;
   shieldRechargePct: number;
   onlyNPCs: boolean;
+  huntCreatures: boolean;
+  coordinateHunts: boolean;
   autoCloak: boolean;
+  cloakOnStart: boolean;
   ammoThreshold: number;
   ammoReloadAbsoluteThreshold: number;
   ammoReloadPercentThreshold: number;
@@ -207,6 +221,7 @@ function getHunterSettings(username?: string): {
   homeStation: string;
   desiredShieldCharges: number;
   desiredRepairKits: number;
+  desiredEmergencyWarpDevices: number;
   pirateBaseSystem: string;
   patrolRadius: number;
 } {
@@ -237,9 +252,12 @@ function getHunterSettings(username?: string): {
     repairThreshold: (h.repairThreshold as number) || 30,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-    onlyNPCs: (h.onlyNPCs as boolean) !== false,
-    autoCloak: (h.autoCloak as boolean) ?? false,
-    ammoThreshold: (h.ammoThreshold as number) || 5,
+onlyNPCs: (h.onlyNPCs as boolean) !== false,
+  huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
+  coordinateHunts: (h.coordinateHunts as boolean) !== false,
+  autoCloak: (h.autoCloak as boolean) ?? false,
+  cloakOnStart: (h.cloakOnStart as boolean) ?? false,
+  ammoThreshold: (h.ammoThreshold as number) || 5,
     ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
@@ -255,6 +273,7 @@ function getHunterSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
+    desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
   };
@@ -545,7 +564,7 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
     if (safeSystem) {
       const sys = mapStore.getSystem(safeSystem);
       ctx.log("travel", `Heading to safe system ${sys?.name || safeSystem} (${sys?.security_level}) for repairs...`);
-      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true });
+      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true, joinBattles: true });
       if (!arrived) {
         ctx.log("error", "Could not reach safe system — attempting local dock");
       }
@@ -661,12 +680,196 @@ const ALERT_STALENESS_SECS = 5 * 60;
 /** Map<systemId, lastRespondedTimestamp> — persists across loop iterations. */
 const respondedAlerts = new Map<string, number>();
 
+// ── Hunter-to-Hunter coordination (non-API bot chat channel) ──
+//
+// When a hunter engages a creature (or pirate) it broadcasts an "assist" message
+// on the in-memory bot chat channel. Other hunters in the SAME POI pick it up and
+// join the fight. This is how faction members get pulled into a creature battle
+// they'd otherwise miss (the server does not auto-add same-POI allies).
+
+interface HunterCoordRequest {
+  sender: string;
+  system: string;
+  poi: string;
+  targetName: string;
+  targetId: string;
+  creature: boolean;
+  timestamp: number;
+}
+
+/** Per-bot pending coordination requests (drained by the routine loop). */
+const coordRequests = new Map<string, HunterCoordRequest[]>();
+/** Per-bot dedupe set of requests we've already acted on (key: targetId|sender). */
+const coordHandled = new Map<string, Set<string>>();
+/** Bots that already have a message handler registered. */
+const coordListeners = new Set<string>();
+/** True while we are engaging a target as a coordination *response* — suppresses
+ *  our own broadcast so responders don't echo the assist request back. */
+let coordResponding = false;
+
+/**
+ * Wrapper around engageTarget that broadcasts a hunter-assist request (so same-POI
+ * allies can join) before fighting. Skips the broadcast when we are ourselves
+ * responding to someone else's assist request, to avoid echo loops.
+ */
+async function hunterEngage(
+  ctx: RoutineContext,
+  target: { id: string; name: string; isCreature?: boolean },
+  fleeThreshold: number,
+  fleeFromTier: PirateTier,
+  minPiratesToFlee: number,
+  maxAttackTier: PirateTier,
+  sideId?: number,
+  skipScan: boolean = false,
+  repairThreshold: number = 0,
+  onlyNPCs: boolean = false,
+  cloakOnStart: boolean = false,
+): Promise<boolean> {
+  if (!coordResponding) {
+    broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+  }
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart);
+}
+
+/** Register the bot's coordination listener once. */
+function ensureHunterCoordListener(username: string): void {
+  if (coordListeners.has(username)) return;
+  coordListeners.add(username);
+  if (!coordRequests.has(username)) coordRequests.set(username, []);
+  if (!coordHandled.has(username)) coordHandled.set(username, new Set());
+
+  botChatChannel.onMessage(username, (msg) => {
+    if (msg.channel !== "coordination") return;
+    if (msg.sender === username) return;
+    const meta = (msg.metadata || {}) as Record<string, unknown>;
+    if (meta.type !== "hunter_assist") return;
+    const system = (meta.system as string) || "";
+    const poi = (meta.poi as string) || "";
+    if (!system || !poi) return;
+    const req: HunterCoordRequest = {
+      sender: msg.sender,
+      system,
+      poi,
+      targetName: (meta.targetName as string) || "",
+      targetId: (meta.targetId as string) || "",
+      creature: !!(meta.creature),
+      timestamp: msg.timestamp,
+    };
+    coordRequests.get(username)!.push(req);
+  });
+}
+
+/** Broadcast that we're engaging a target so same-POI allies can join in. */
+function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: string }, creature: boolean): void {
+  const { bot } = ctx;
+  if (!bot.system || !bot.poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (!settings.coordinateHunts) return;
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[HUNTER ASSIST] ${bot.username} engaging ${target.name} (${creature ? "creature" : "pirate"}) at ${bot.system}/${bot.poi}`,
+    metadata: {
+      type: "hunter_assist",
+      system: bot.system,
+      poi: bot.poi,
+      targetName: target.name,
+      targetId: target.id,
+      creature,
+    },
+  });
+}
+
+/**
+ * Drain pending coordination requests and join any battle for a target that is in
+ * our current POI. Called from the routine's scan / battle-check cadence so the
+ * actual fighting happens inside the generator (never from the event handler).
+ */
+async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
+  const { bot } = ctx;
+  if (!settings.coordinateHunts) return;
+  if (bot.docked) return;
+
+  const queue = coordRequests.get(bot.username);
+  if (!queue || queue.length === 0) return;
+  const handled = coordHandled.get(bot.username)!;
+
+  const pending = queue.splice(0, queue.length);
+  for (const req of pending) {
+    if (bot.state !== "running") break;
+    const key = `${req.targetId}|${req.sender}`;
+    if (req.sender === bot.username || handled.has(key)) continue;
+
+    // Only respond to requests from our exact POI.
+    if (req.system !== bot.system || req.poi !== bot.poi) {
+      // Drop stale cross-POI requests so the queue doesn't grow forever.
+      if (Date.now() - req.timestamp > 5 * 60 * 1000) handled.add(key);
+      continue;
+    }
+
+    // Already fighting something? Don't pile into a second battle.
+    const existing = await getBattleStatus(ctx);
+    if (existing) {
+      handled.add(key);
+      continue;
+    }
+
+    // Health / supply gate before committing to an assist.
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      handled.add(key);
+      continue;
+    }
+
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.error) {
+      handled.add(key);
+      continue;
+    }
+    bot.trackNearbyPlayers(nearbyResp.result);
+    bot.trackWildlife(nearbyResp.result);
+
+    const entities = parseNearby(nearbyResp.result);
+    const match = entities.find(e =>
+      (req.targetId && e.id === req.targetId) ||
+      (req.targetName && e.name === req.targetName) ||
+      (req.targetName && e.name.toLowerCase().includes(req.targetName.toLowerCase()))
+    );
+    if (!match) {
+      // Target not visible here anymore — mark handled to avoid re-polling forever.
+      handled.add(key);
+      continue;
+    }
+
+    const valid = req.creature
+      ? isCreatureTarget(match, true)
+      : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
+    if (!valid) {
+      handled.add(key);
+      continue;
+    }
+
+    handled.add(key);
+    ctx.log("combat", `🤝 Hunter coordination: ${req.sender} requested assist vs ${req.targetName} — joining battle at ${req.poi}!`);
+    coordResponding = true;
+    try {
+      await hunterEngage(ctx, match, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+    } finally {
+      coordResponding = false;
+    }
+  }
+}
+
 /** Extract the system ID from a [COMBAT WARNING] or [HULL DAMAGE] faction message. */
 function extractAlertSystem(content: string): string | null {
   // Both alert types end with:  ...| sys_xxxx/poi_yyyy
   const match = content.match(/\|\s*(sys_[a-z0-9_]+)\//i);
   return match ? match[1] : null;
 }
+
+
 
 /**
  * Scan recent faction chat for combat alerts from allied bots.
@@ -731,11 +934,55 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
 
+  // Register the bot chat channel listener so allied hunters can pull us into
+  // creature/pirate battles happening in our POI.
+  ensureHunterCoordListener(bot.username);
+
+  // Cloak on start if cloakOnStart is enabled.
+  // Cloaking requires being UNDOCKED, so if we're docked we undock first, activate
+  // the cloak, then immediately re-dock so the start-of-routine resupply (which can
+  // only run while docked) still works. This prevents the ship from getting stuck
+  // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
+  const wasDockedAtStart = bot.docked;
+  if (initialSettings.cloakOnStart && !bot.isCloaked) {
+    // Undock first if currently docked — the cloak command cannot enable while docked.
+    if (bot.docked) {
+      const undockResp = await bot.exec("undock");
+      if (!undockResp.error) {
+        bot.docked = false;
+      } else {
+        ctx.log("warn", `Failed to undock for cloak: ${undockResp.error.message}`);
+      }
+    }
+
+    const cloakResp = await bot.exec("cloak", { enable: true });
+    if (!cloakResp.error) {
+      ctx.log("system", "Cloak enabled on routine start (cloakOnStart)");
+
+      // Re-dock so we remain at the station for the start-of-routine resupply.
+      if (wasDockedAtStart) {
+        const redockResp = await bot.exec("dock");
+        if (!redockResp.error || (redockResp.error?.message || "").toLowerCase().includes("already")) {
+          bot.docked = true;
+        } else {
+          ctx.log("warn", `Failed to re-dock after cloak (continuing undocked): ${redockResp.error.message}`);
+        }
+      }
+    } else {
+      const msg = cloakResp.error.message.toLowerCase();
+      if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+        ctx.log("warn", `Failed to cloak on start: ${cloakResp.error.message}`);
+      }
+    }
+  }
+
   // If we started the routine while docked at home base, refuel, repair, then restock
   if (bot.docked) {
     await repairShip(ctx);
     await tryRefuel(ctx, { skipApprovedCheck: true });
     await ensureHunterResupply(ctx);
+    await ensureUndocked(ctx);
+    await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
   }
 
   // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
@@ -786,6 +1033,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
     const patrolSystem = settings.system || "";
 
@@ -1002,6 +1250,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           const nearbyResp = await bot.exec("get_nearby");
           if (!nearbyResp.error) {
             bot.trackNearbyPlayers(nearbyResp.result);
+            bot.trackWildlife(nearbyResp.result);
             const entities = parseNearby(nearbyResp.result);
             const threats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
             
@@ -1009,7 +1258,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
               // Engage the threats
               for (const threat of threats) {
-                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const won = await hunterEngage(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (!won) {
                   ctx.log("combat", "Retreated from threat — aborting patrol");
                   abortPatrol = true;
@@ -1039,8 +1288,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         continue;
       }
 
-      // Track player names from nearby scan
+      // Track player names and wildlife from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
+      bot.trackWildlife(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
@@ -1055,10 +1305,11 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
+              bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1072,18 +1323,20 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
-      const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
 
-      if (targets.length === 0) {
+      if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      ctx.log("combat", `Found ${targets.length} target(s) at ${poi.name}: ${targets.map(t => t.name).join(", ")}`);
+      const allTargets = [...pirate_targets, ...creature_targets];
+      ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
       // Engage each target
-      for (const target of targets) {
+      for (const target of allTargets) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();
@@ -1126,7 +1379,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1138,6 +1391,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           const safetyCheckResp = await bot.exec("get_nearby");
           if (!safetyCheckResp.error) {
             bot.trackNearbyPlayers(safetyCheckResp.result);
+            bot.trackWildlife(safetyCheckResp.result);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
             const newThreats = nearbyEntities.filter(e => 
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -1151,7 +1405,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
                 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1233,7 +1487,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         } else {
           await ensureDocked(ctx);
         }
-        await collectFromStorage(ctx);
+        await ensureHunterResupply(ctx);
 
         yield "complete_missions";
         await completeActiveMissions(ctx);
@@ -1263,7 +1517,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         await bot.checkSkills();
 
         ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-        await ensureHunterResupply(ctx);
       } else {
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
@@ -1487,8 +1740,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         continue;
       }
 
-      // Track player names from nearby scan
+      // Track player names and wildlife from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
+      bot.trackWildlife(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
@@ -1503,10 +1757,11 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
+              bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1520,18 +1775,20 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
-      const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
 
-      if (targets.length === 0) {
+      if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      ctx.log("combat", `Found ${targets.length} target(s) at ${poi.name}: ${targets.map(t => t.name).join(", ")}`);
+      const allTargets = [...pirate_targets, ...creature_targets];
+      ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
       // Engage each target
-      for (const target of targets) {
+      for (const target of allTargets) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();
@@ -1553,7 +1810,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1565,6 +1822,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           const safetyCheckResp = await bot.exec("get_nearby");
           if (!safetyCheckResp.error) {
             bot.trackNearbyPlayers(safetyCheckResp.result);
+            bot.trackWildlife(safetyCheckResp.result);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
             const newThreats = nearbyEntities.filter(e =>
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -1577,7 +1835,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1660,7 +1918,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         } else {
           await ensureDocked(ctx);
         }
-        await collectFromStorage(ctx);
+        await ensureHunterResupply(ctx);
 
         yield "complete_missions";
         await completeActiveMissions(ctx);
@@ -1690,7 +1948,6 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await bot.checkSkills();
 
         ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-        await ensureHunterResupply(ctx);
       } else {
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
@@ -1844,8 +2101,9 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       continue;
     }
 
-      // Track player names from nearby scan
+      // Track player names and wildlife from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
+      bot.trackWildlife(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
@@ -1860,10 +2118,11 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
+              bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
               // top up shields after immediate scan-target engagements (no per-target post-battle block)
               const ssettings = getHunterSettings(bot.username);
@@ -1908,7 +2167,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+        const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
         if (won) {
           totalKills++;
@@ -1932,7 +2191,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             for (const newThreat of newThreats) {
               if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
                 if (newWon) {
                 totalKills++;
                 ctx.log("combat", `Kill #${totalKills} (additional threat)`);
@@ -2005,6 +2264,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     // Navigate to the target system in the list
@@ -2053,7 +2313,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);
@@ -2214,6 +2474,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
       : possibleAmmo;
     for (const ammoId of ammoOrder) {
+      // Honor a stop request — don't keep issuing withdraws after stop
+      if (bot.state !== "running") return;
       const ammoSize = getItemSize(ammoId);
       const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
       if (actualQty <= 0) {
@@ -2295,6 +2557,25 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
   if (!gotShield) {
     ctx.log("trade", "Shield charges: relying on faction storage");
+  }
+
+  const desiredWarp = hs.desiredEmergencyWarpDevices ?? 3;
+  const currentWarp = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const warpToGet = Math.max(0, desiredWarp - currentWarp);
+  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "emergency_warp_device",
+      quantity: warpToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
+    } else {
+      ctx.log("trade", `Emergency warp devices: relying on faction storage (${warpToGet} needed)`);
+    }
   }
 
   // 3. Military fuel cells — fill the rest (prefer faction storage)
@@ -2380,6 +2661,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     for (const targetSystem of profile.patrolSystems) {
@@ -2423,7 +2705,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
+          const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);
@@ -2499,6 +2781,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
     const arrived = await navigateToSystem(ctx, pirateBase, safetyOpts);
     if (!arrived) {
@@ -2528,6 +2811,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       autoCloak: currentSettings.autoCloak,
       skipBlacklist: true,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     const targetSystem = patrolList[systemIndex % patrolList.length];
@@ -2571,7 +2855,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         for (const target of targets) {
           await useRepairKits(ctx);
           await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
-          const won = await engageTarget(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold);
+          const won = await hunterEngage(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);

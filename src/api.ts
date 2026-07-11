@@ -93,7 +93,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-6-17-26-BW-Opt-PUBLIC-Ver";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-7-11-26-SPACEBACONSTATION-Release-Ver";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -108,6 +108,8 @@ const SESSION_CREATE_INTERVAL = 3000;
 let globalSessionQueue: Promise<void> = Promise.resolve();
 
 // Command-to-Tool Mapping for V2 API
+// Note: Direct-path commands (like /command instead of /tool/command) are no longer used
+
 const COMMAND_TOOL_MAP: Record<string, string> = {
   // Auth commands
   'login': 'spacemolt_auth',
@@ -207,6 +209,10 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'create_faction': 'spacemolt_faction',
   'join_faction': 'spacemolt_faction',
   'leave_faction': 'spacemolt_faction',
+  'faction_prepay_tax': 'spacemolt_faction',
+
+  // Tax commands
+  'prepay_tax': 'spacemolt',
   'faction_info': 'spacemolt_faction',
   'faction_list': 'spacemolt_faction',
   'faction_invite': 'spacemolt_faction',
@@ -293,7 +299,7 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'get_insurance_quote': 'spacemolt_salvage',
   'view_insurance': 'spacemolt_salvage',
   'set_home_base': 'spacemolt_salvage',
-
+  
   // Fleet
   'fleet': 'spacemolt_fleet',
 };
@@ -368,9 +374,12 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'tow_wreck': 'tow',
    'sell_wreck': 'sell',
    'scrap_wreck': 'scrap',
-   'release_tow': 'release',
+'release_tow': 'release',
    'buy_insurance': 'insure',
-};
+  'get_insurance_quote': 'quote',
+   'view_insurance': 'policies',
+  'set_home_base': 'set_home',
+ };
 
 // Commands that use payload.action for the action (like facility and battle)
 const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
@@ -429,6 +438,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
+  get_insurance_quote: 10_000,
   get_notifications: 5_000, //throttled to once per tick (10s)
   catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
   get_map: 3600_000, //cached once per session, invalidated on server version change or client restart.
@@ -479,8 +489,11 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   cloak: INV_STATUS,
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
   battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
+  prepay_tax: [...INV_STATUS, ...INV_STORAGE],
+  faction_prepay_tax: [...INV_STATUS, ...INV_STORAGE],
   catalog: [],
   get_map: [],
+  set_home_base: [],
 };
 
 export class SpaceMoltAPI {
@@ -594,7 +607,8 @@ export class SpaceMoltAPI {
     try {
       const resp = await this.doRequest("get_version");
       if (!resp.error && resp.result) {
-        this._serverVersion = String(resp.result);
+        const v = resp.result as Record<string, unknown>;
+        this._serverVersion = (v.version as string) || String(resp.result);
         return this._serverVersion;
       }
     } catch {}
@@ -755,7 +769,8 @@ export class SpaceMoltAPI {
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
       if (command === "get_version" && resp.result) {
-        const newVersion = String(resp.result);
+        const v = resp.result as Record<string, unknown>;
+        const newVersion = (v.version as string) || String(resp.result);
         if (newVersion !== this._serverVersion) {
           this._serverVersion = newVersion;
           this._cache.invalidate(["catalog:", "get_map:"]);
@@ -937,6 +952,18 @@ export class SpaceMoltAPI {
       }
     }
 
+    // Translate amount -> quantity for prepay_tax (API uses 'quantity')
+    if (command === 'prepay_tax' && body.amount !== undefined) {
+      body.quantity = body.amount;
+      delete body.amount;
+    }
+
+    // Translate amount -> quantity for faction_prepay_tax (API uses 'quantity')
+    if (command === 'faction_prepay_tax' && body.amount !== undefined) {
+      body.quantity = body.amount;
+      delete body.amount;
+    }
+
     // Auto-add item_id: 'credits' for send_gift
     if (command === 'send_gift') {
       body.item_id = 'credits';
@@ -984,6 +1011,12 @@ export class SpaceMoltAPI {
     if (command === 'travel' && body.target_poi !== undefined) {
       body.id = body.target_poi;
       delete body.target_poi;
+    }
+
+    // Translate base_id -> id for set_home_base (API uses 'id' parameter)
+    if (command === 'set_home_base' && body.base_id !== undefined) {
+      body.id = body.base_id;
+      delete body.base_id;
     }
 
     if (tool === 'spacemolt_catalog') {

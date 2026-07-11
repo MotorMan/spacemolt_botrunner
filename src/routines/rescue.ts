@@ -2,6 +2,8 @@ import type { Routine, RoutineContext, BotStatus } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
 import * as fs from 'fs';
 import * as path from 'path';
+import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
+import { updateFactionStorageCache, getFactionStorageCache, type FactionStorageEntry } from "../factionStorageCache.js";
 import {
   findStation,
   getSystemInfo,
@@ -14,6 +16,7 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
+  enableCloakingIfPossible,
   logStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -27,8 +30,9 @@ import {
   type PirateDetectionResult,
   type NearbyEntity,
 } from "./common.js";
-import { getNextMayday, markMaydayHandled, clearMaydayQueue, type MaydayRequest } from "../mayday.js";
+import { getNextMayday, markMaydayHandled, clearMaydayQueue, getPendingMaydayCount, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
+import { tryClaimMayday, getMaydayLockHolder, releaseMayday } from "../maydayLock.js";
 import {
   isRescueHandled,
   parseRescueAnnouncement,
@@ -114,9 +118,15 @@ function getRescueSettings(): {
   creditTopOffBot: string;
   fleetRescueBot: string;
   maydayRescueBot: string;
+  creditTopOffEnabled: boolean;
+  fleetRescueEnabled: boolean;
+  maydayRescueEnabled: boolean;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
   ignoreBlacklist: boolean;
+  enableCloak: boolean;
+  dontRejectMaydaysInBlacklistSystems: boolean;
+  disableFactionAnnouncements: boolean;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -142,10 +152,34 @@ function getRescueSettings(): {
     creditTopOffBot: (r.creditTopOffBot as string) || '',
     fleetRescueBot: (r.fleetRescueBot as string) || '',
     maydayRescueBot: (r.maydayRescueBot as string) || '',
+    // Enable/disable flags for each capability. Default to TRUE so existing
+    // configs (which only used the *_RescueBot assignment fields) keep working.
+    // Set any of these to false to completely disable that capability on every bot.
+    creditTopOffEnabled: (r.creditTopOffEnabled as boolean) ?? true,
+    fleetRescueEnabled: (r.fleetRescueEnabled as boolean) ?? true,
+    maydayRescueEnabled: (r.maydayRescueEnabled as boolean) ?? true,
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
     ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
+    enableCloak: (r.enableCloak as boolean) ?? false,
+    dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
+    disableFactionAnnouncements: (r.disableFactionAnnouncements as boolean) ?? false,
   };
+}
+
+/**
+ * Enable cloaking on this bot if the rescue settings request it (enableCloak).
+ * A cloaked rescue ship is immune to pirate ambushes, allowing it to safely
+ * enter blacklisted/pirate systems when the corresponding setting is enabled.
+ */
+async function enableRescueCloak(ctx: RoutineContext, settings: ReturnType<typeof getRescueSettings>): Promise<void> {
+  if (!settings.enableCloak) return;
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("rescue", "🛡️ Cloaking enabled (enableCloak setting) — pirates can't ambush us");
+  } else {
+    ctx.log("rescue", "⚠️ enableCloak is set but no cloaking module is available on this ship");
+  }
 }
 
 /**
@@ -162,30 +196,66 @@ function isPrimaryCreditTopOffBot(botUsername: string): boolean {
 
 /**
  * Check if this bot should ONLY run credit top-off (no rescue operations).
- * Returns true if:
- * - This bot is the primary credit top-off bot, AND
- * - Fleet rescue bot is empty/none/different, AND
- * - MAYDAY rescue bot is empty/none/different
- * This allows a bot to be dedicated to credit top-off without doing actual rescues.
+ * Returns true if credit top-off is enabled for this bot AND neither fleet nor
+ * MAYDAY rescue is enabled for this bot. This lets a bot be dedicated to a
+ * single task. Respects both the explicit enable flags and the per-bot
+ * assignment fields.
  */
 function shouldOnlyCreditTopOff(botUsername: string): boolean {
   const settings = getRescueSettings();
-  
-  // Must be the primary credit top-off bot
-  if (!settings.creditTopOffBot || botUsername !== settings.creditTopOffBot) {
+
+  // Credit top-off must be enabled and this bot must be the assigned primary.
+  if (!isCreditTopOffEnabledFor(botUsername)) {
     return false;
   }
-  
-  // If no fleet rescue bot is assigned (or it's a different bot), we're not doing fleet rescues
-  const fleetBotEmpty: boolean = !settings.fleetRescueBot || settings.fleetRescueBot === 'none' || settings.fleetRescueBot === '';
-  const fleetBotDifferent: boolean = !!(settings.fleetRescueBot && settings.fleetRescueBot !== botUsername);
-  
-  // If no mayday rescue bot is assigned (or it's a different bot), we're not doing mayday rescues
-  const maydayBotEmpty: boolean = !settings.maydayRescueBot || settings.maydayRescueBot === 'none' || settings.maydayRescueBot === '';
-  const maydayBotDifferent: boolean = !!(settings.maydayRescueBot && settings.maydayRescueBot !== botUsername);
-  
-  // We should only do credit top-off if we're NOT the fleet or mayday rescue bot
-  return (fleetBotEmpty || fleetBotDifferent) && (maydayBotEmpty || maydayBotDifferent);
+
+  // A bot is "fleet for this bot" only if it is the assigned fleet primary.
+  // We deliberately do NOT fall back to "the primary is busy" here — otherwise a
+  // pure credit-top-off bot would be pulled into the main rescue loop whenever
+  // the fleet bot was occupied, even though it was configured to do nothing but
+  // credit top-off. The same applies to MAYDAY below.
+  const fleetForThisBot =
+    !!settings.fleetRescueEnabled &&
+    isPrimaryFleetRescueBot(botUsername);
+
+  const maydayForThisBot =
+    !!settings.maydayRescueEnabled &&
+    isPrimaryMaydayRescueBot(botUsername);
+
+  // Only credit top-off when neither fleet nor MAYDAY is owned by this bot.
+  return !fleetForThisBot && !maydayForThisBot;
+}
+
+/**
+ * Whether THIS bot should handle fleet rescues this cycle.
+ *
+ * - The assigned fleet-primary bot always handles fleet rescues.
+ * - A NON-primary bot (e.g. the credit-top-off or MAYDAY bot) must NOT piggyback
+ *   on fleet rescues just because the primary happens to be busy with one. It
+ *   only steps in when there is a genuine surge: 2+ stranded fleet members that
+ *   the single primary cannot service alone.
+ */
+function shouldHandleFleetRescue(botUsername: string, strandedCount: number): boolean {
+  const settings = getRescueSettings();
+  if (!settings.fleetRescueEnabled) return false;
+  if (isPrimaryFleetRescueBot(botUsername)) return true;
+  return strandedCount >= 2;
+}
+
+/**
+ * Whether THIS bot should handle a MAYDAY this cycle.
+ *
+ * - The assigned MAYDAY-primary bot always handles MAYDAYs.
+ * - A NON-primary bot (e.g. the credit-top-off or fleet bot) must NOT respond to
+ *   a MAYDAY just because the MAYDAY-primary is busy with one. It only steps in
+ *   when there is a genuine surge: 2+ pending MAYDAYs, so the two bots can cover
+ *   DIFFERENT calls (the per-MAYDAY claim lock prevents both taking the same one).
+ */
+function shouldHandleMaydayRescue(botUsername: string, pendingMaydayCount: number): boolean {
+  const settings = getRescueSettings();
+  if (!settings.maydayRescueEnabled) return false;
+  if (isPrimaryMaydayRescueBot(botUsername)) return true;
+  return pendingMaydayCount >= 2;
 }
 
 /**
@@ -210,6 +280,29 @@ function isPrimaryMaydayRescueBot(botUsername: string): boolean {
     return true;
   }
   return botUsername === settings.maydayRescueBot;
+}
+
+/**
+ * Whether credit top-off is ENABLED for this bot.
+ * Combines the global enable flag with the primary-credit-bot assignment.
+ */
+function isCreditTopOffEnabledFor(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  return !!settings.creditTopOffEnabled && isPrimaryCreditTopOffBot(botUsername);
+}
+
+/**
+ * Whether FLEET rescue is globally enabled in settings.
+ */
+function isFleetRescueEnabledSetting(): boolean {
+  return !!getRescueSettings().fleetRescueEnabled;
+}
+
+/**
+ * Whether MAYDAY rescue is globally enabled in settings.
+ */
+function isMaydayRescueEnabledSetting(): boolean {
+  return !!getRescueSettings().maydayRescueEnabled;
 }
 
 /**
@@ -1296,7 +1389,22 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     if (member.username === bot.username) continue;
     if (member.state !== "running" && member.state !== "idle") continue;
 
-    const currentCredits = member.credits;
+    // Fetch fresh credits for this bot using get_location if available
+    if (!shouldContinueCreditTopOff()) {
+      return false;
+    }
+    let currentCredits = member.credits;
+    if (ctx.getBotFreshStatus) {
+      const freshStatus = await ctx.getBotFreshStatus(member.username);
+      if (freshStatus) {
+        currentCredits = freshStatus.credits;
+      }
+    }
+
+    // Check again after async operation
+    if (!shouldContinueCreditTopOff()) {
+      return false;
+    }
 
     // Track consecutive 0 credit readings
     if (currentCredits === 0) {
@@ -1313,10 +1421,22 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       const needed = targetAmount - currentCredits;
       ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
+      // Check if routine was stopped before making API calls
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
+
       //const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
       const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
       if (withdrawResp.error) {
         ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        return false;
+      }
+
+      // Check if routine was stopped after withdraw
+      if (!shouldContinueCreditTopOff()) {
+        // Refund the withdrawn credits
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed });
         return false;
       }
 
@@ -1340,10 +1460,20 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       continue;
     }
 
+    // Check before expensive log read operation
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     // Verify actual credits via debug log
     ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
     const actualCredits = await getActualCreditsFromLog(member.username, ctx);
-    
+
+    // Check after log read
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     if (actualCredits === null) {
       ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, but has ${consecutiveCount} consecutive 0 readings - proceeding with top-off as fallback`);
     } else if (actualCredits >= minThreshold) {
@@ -1358,9 +1488,21 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     const needed = targetAmount - verifiedCredits;
     ctx.log("rescue", `💰 ${member.username} verified credits: ${verifiedCredits}, needs ${needed}cr to reach ${targetAmount}cr`);
 
+    // Check if routine was stopped before making API calls
+    if (!shouldContinueCreditTopOff()) {
+      continue;
+    }
+
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+      return false;
+    }
+
+    // Check if routine was stopped after withdraw
+    if (!shouldContinueCreditTopOff()) {
+      // Refund the withdrawn credits
+      await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed });
       return false;
     }
 
@@ -1378,8 +1520,16 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
   }
 
   // Top off self if needed
+  if (!shouldContinueCreditTopOff()) {
+    return false;
+  }
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
   await bot.refreshLocation();
+
+  // Check again after async
+  if (!shouldContinueCreditTopOff()) {
+    return false;
+  }
 
   // Track consecutive 0 credits for self
   if (bot.credits === 0) {
@@ -1410,7 +1560,13 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     let actualSelfCredits = bot.credits;
     if (bot.credits === 0) {
       ctx.log("rescue", `💰 Self has 0 credits, verifying via debug log...`);
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
       const verified = await getActualCreditsFromLog(bot.username, ctx);
+      if (!shouldContinueCreditTopOff()) {
+        return false;
+      }
       if (verified !== null) actualSelfCredits = verified;
       if (actualSelfCredits >= minThreshold) {
         ctx.log("rescue", `💰 Verified self has ${actualSelfCredits}cr, false 0 reading. Resetting count.`);
@@ -1421,6 +1577,10 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
     const needed = targetAmount - actualSelfCredits;
     ctx.log("rescue", `💰 Self has ${actualSelfCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    if (!shouldContinueCreditTopOff()) {
+      return false;
+    }
 
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
@@ -1444,6 +1604,14 @@ const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> cons
 const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
 
 /**
+ * Check if credit top-off background loop should continue running.
+ * Returns false if the routine was stopped.
+ */
+function shouldContinueCreditTopOff(): boolean {
+  return creditTopOffRoutineActive;
+}
+
+/**
  * Background credit top-off loop — runs independently every 60 seconds,
  * only when docked at sol_central. Non-blocking to the main rescue loop.
  */
@@ -1462,7 +1630,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
   creditTopOffRoutineActive = true;
   ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
 
-  const intervalMs = 60 * 1000; // 1 minute
+  const intervalMs = 30 * 1000; // .1 minute
 
   const loop = async () => {
     try {
@@ -1477,6 +1645,11 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
 
       // Refresh bot status to get current docked state, system, AND credits
       await bot.refreshStatus();
+
+      // Check again after async operation - routine may have been stopped
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
 
       ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
 
@@ -1496,8 +1669,19 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
       }
 
       ctx.log("rescue", `💰 At ${expectedSystem}, checking fleet credits...`);
+
+      // Check again before the expensive topOffOneBot operation
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
+
       const minThreshold = settings.creditTopOffMinThreshold;
       const toppedOff = await topOffOneBot(ctx, targetAmount, minThreshold);
+
+      // Check again after async operation
+      if (!creditTopOffRoutineActive) {
+        return;
+      }
 
       if (toppedOff) {
         ctx.log("rescue", `💰 Successfully topped off a bot — will check again in ${intervalMs / 1000}s`);
@@ -1505,7 +1689,9 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
         ctx.log("rescue", `💰 No bots need topping off this cycle`);
       }
     } catch (err) {
-      ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+      if (creditTopOffRoutineActive) {
+        ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+      }
     }
   };
 
@@ -1516,13 +1702,14 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
 
 /**
  * Stop the background credit top-off loop.
+ * Sets the active flag BEFORE clearing interval to prevent new iterations.
  */
 function stopCreditTopOffBackground(): void {
+  creditTopOffRoutineActive = false; // Set flag FIRST to prevent new loop iterations
   if (creditTopOffIntervalId !== null) {
     clearInterval(creditTopOffIntervalId);
     creditTopOffIntervalId = null;
   }
-  creditTopOffRoutineActive = false;
   console.log("[rescue] 💰 Credit top-off background loop stopped");
 }
 
@@ -1544,6 +1731,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  await enableRescueCloak(ctx, settings);
 
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
 
@@ -1605,10 +1794,10 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
   // ── Start background credit top-off loop (non-blocking) ──
   // Only the primary credit top-off bot should run this background loop
-  if (isPrimaryCreditTopOffBot(bot.username)) {
+   if (isCreditTopOffEnabledFor(bot.username)) {
     startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
   } else {
-    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+    ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
   }
 
   // ── Register Bot Chat handler for rescue cooperation ──
@@ -1800,37 +1989,58 @@ skipToReturnHome = true;
          continue;
        }
 
-        // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
+        // Check if we're the primary FLEET rescue bot. A non-primary bot only
+        // helps when there are 2+ stranded fleet members (a surge the single
+        // primary can't service alone) — never just because the primary is busy.
         const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-        if (!isFleetRescuePrimary) {
-          ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-        }
-
-        const targets = isFleetRescuePrimary
+        const fleetRescueEnabled = isFleetRescueEnabledSetting();
+        const strandedBots = fleetRescueEnabled
           ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
           : [];
-
-      // Clean up stale queue entries
-      cleanupStaleQueue();
-
-      // ── Check for MAYDAY requests if no fleet targets ──
-      // Check if we're the primary MAYDAY rescue bot
-      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-      if (!isMaydayRescuePrimary) {
-        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-      }
-
-      let maydayTarget: RescueTarget | null = null;
-if (targets.length === 0) {
-        if (!isMaydayRescuePrimary) {
-          const ignoredMayday = getNextMayday();
-          if (ignoredMayday) {
-            markMaydayHandled(ignoredMayday);
-            await ctx.sleep(5000);
-            continue;
+        if (!fleetRescueEnabled) {
+          ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+        } else if (!isFleetRescuePrimary) {
+          if (strandedBots.length >= 2) {
+            ctx.log("rescue", `🤝 ${strandedBots.length} stranded fleet bots pending - covering overflow fleet rescues`);
+          } else {
+            ctx.log("rescue", `📡 Not primary fleet rescue bot - leaving fleet rescues for ${settings.fleetRescueBot || 'primary bot'}`);
           }
-          // No pending MAYDAY — fall through to idle/return-home check below
         }
+
+        const targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
+
+        // Clean up stale queue entries
+        cleanupStaleQueue();
+
+        // ── Check for MAYDAY requests if no fleet targets ──
+        // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
+        // surge) — never just because the MAYDAY-primary is busy with one.
+        const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+        const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+        const pendingMaydays = getPendingMaydayCount();
+        if (!maydayRescueEnabled) {
+          ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+        } else if (!isMaydayRescuePrimary) {
+          if (pendingMaydays >= 2) {
+            ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
+          } else {
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
+          }
+        }
+
+        let maydayTarget: RescueTarget | null = null;
+        if (targets.length === 0) {
+          const shouldProcessMayday = shouldHandleMaydayRescue(bot.username, pendingMaydays);
+
+         if (!shouldProcessMayday) {
+           const ignoredMayday = getNextMayday();
+           if (ignoredMayday) {
+             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+             await ctx.sleep(5000);
+             continue;
+           }
+           // No pending MAYDAY — fall through to idle/return-home check below
+         }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
@@ -1997,10 +2207,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ─-
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+          const runtimeBlacklist = getSystemBlacklist();
+          const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
+          const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -2038,7 +2250,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
-                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
                   if (!blacklistedOnRoute) viableRoute = true;
                 }
@@ -2098,6 +2310,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          // ── CROSS-PROCESS MAYDAY CLAIM LOCK: only ONE bot may launch a given MAYDAY ──
+          // Prevents the dedicated MAYDAY bot and a backup rescue bot from BOTH responding
+          // to the same distress call. Whichever bot wins the atomic claim proceeds; the
+          // other yields immediately so the two bots cooperate instead of both going out.
+          if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+            const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+            ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+            markMaydayHandled(mayday);
+            continue;
+          }
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
@@ -2137,6 +2359,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const decision = shouldProceedOrYield(myClaim, partnerClaim);
               if (decision === "yield") {
                 ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
                 maydayTarget = null; // Cancel this rescue
                 markMaydayHandled(mayday);
                 continue;
@@ -2170,7 +2393,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -2235,7 +2458,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           yield "return_home";
           await ensureUndocked(ctx);
-          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
           const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -2393,16 +2616,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      if (isMaydayTarget) {
+        // Hand off exclusive ownership to the durable rescue session so the
+        // per-MAYDAY lock file is freed for future distress calls.
+        releaseMayday(target.username, target.system, target.poi, bot.username);
+      }
       ctx.log("rescue", `Created rescue session for ${target.username}`);
-    }
-
-    // ── Log the rescue target ──
-    if (isManualRescueTarget) {
-      ctx.log("rescue", `🎯 MANUAL RESCUE: ${target.username} at ${target.system}/${target.poi || "unknown"}`);
-    } else if (isMaydayTarget) {
-      ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
-    } else {
-      ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     }
 
     // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
@@ -2861,58 +3080,50 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
            ctx.log("error", `Travel failed: ${travelResp.error.message}`);
          }
          
-         if (travelSucceeded) {
-           // Success - update bot.poi with the resolved name
-           bot.poi = targetPoiName;
-         } else {
-           // Travel failed - target may be at an unknown/hidden POI
-           ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden or unknown`);
-           ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
-           
-           // Scan for nearby players to find the target
-           const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
-           if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
-             ctx.log("combat", "Battle detected during scan - fleeing!");
-             continue;
-           }
-           
-           if (!nearbyResp.error && nearbyResp.result) {
-             const data = nearbyResp.result as Record<string, unknown>;
-             const players = Array.isArray(data.players) ? data.players :
-                             Array.isArray(data.nearby) ? data.nearby :
-                             Array.isArray(data.ships) ? data.ships : [];
-             
-             let foundTarget = false;
-             for (const p of players as Array<Record<string, unknown>>) {
-               const username = (p.username as string) || (p.name as string);
-               if (username && username.toLowerCase() === target.username.toLowerCase()) {
-                 ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
-                 foundTarget = true;
-                 // Update our position to be at the same POI as target
-                 bot.poi = (p.poi as string) || target.poi;
-                 break;
-               }
-             }
-             
-             if (!foundTarget) {
-               ctx.log("error", `${target.username} not found in nearby scan after failed POI travel`);
-               ctx.log("rescue", `Marking rescue as failed - target unreachable at this location`);
-               if (recoveredSession || getActiveRescueSession(bot.username)) {
-                 await failRescueSession(bot.username, `Target not found at ${target.system}/${target.poi} after POI travel failure`);
-                 const activeSession = getActiveRescueSession(bot.username);
-                 if (activeSession) {
-                   await completeRescueSession(bot.username);
-                 }
-               }
-               await ctx.sleep(settings.scanIntervalSec * 1000);
-               continue;
-             }
-           } else {
-             ctx.log("error", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
-             await ctx.sleep(settings.scanIntervalSec * 1000);
-             continue;
-           }
-         }
+if (travelSucceeded) {
+            // Success - update bot.poi with the resolved name
+            bot.poi = targetPoiName;
+          } else {
+            // Travel failed - target may be at an unknown/hidden POI or cloaked
+            ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden, unknown, or target may be cloaked`);
+            ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
+            
+            // Scan for nearby players to find the target
+            const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
+            if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+              ctx.log("combat", "Battle detected during scan - fleeing!");
+              continue;
+            }
+            
+            if (!nearbyResp.error && nearbyResp.result) {
+              const data = nearbyResp.result as Record<string, unknown>;
+              const players = Array.isArray(data.players) ? data.players :
+                              Array.isArray(data.nearby) ? data.nearby :
+                              Array.isArray(data.ships) ? data.ships : [];
+              
+              let foundTarget = false;
+              for (const p of players as Array<Record<string, unknown>>) {
+                const username = (p.username as string) || (p.name as string);
+                if (username && username.toLowerCase() === target.username.toLowerCase()) {
+                  ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
+                  foundTarget = true;
+                  // Update our position to be at the same POI as target
+                  bot.poi = (p.poi as string) || target.poi;
+                  break;
+                }
+              }
+              
+              if (!foundTarget) {
+                // Target not found in get_nearby - could be cloaked
+                // Proceed with refuel attempt anyway - the refuel command may succeed if target is actually present
+                ctx.log("rescue", `${target.username} not found in get_nearby scan - may be cloaked or at hidden POI`);
+                ctx.log("rescue", `Proceeding with refuel attempt - target may be present but cloaked`);
+              }
+            } else {
+              ctx.log("warn", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
+              ctx.log("rescue", `Proceeding with refuel attempt anyway - target may be present but cloaked`);
+            }
+          }
          
          // Update session state after traveling to POI (or confirming presence via get_nearby)
          if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -2974,10 +3185,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           let fuelDelivered = 0;
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            const fuelDelta = result.fuel as number || 0;
-            const fuelNow = result.fuel_now as number || bot.fuel;
-            const targetFuelNow = result.target_fuel_now as number || 0;
-            const targetName = result.target_player_name as string || target.username;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const fuelNow = result.fuel_now as number || result.fuel as number || bot.fuel;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+            const targetName = result.target_player_name as string || result.targetName as string || target.username;
             fuelDelivered = Math.abs(fuelDelta);
 
             ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${targetName}`);
@@ -3170,7 +3381,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       if (!atHomeSystem) {
         ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -3311,59 +3522,67 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
         // ── Send faction announcement (send immediately, not in setTimeout) ──
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
-            } else {
-              ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
-            }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
-          }
-        }
-      } else {
-        const aiChatSettings = ((globalThis as any).aiChatService)?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
             try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
+              const result = await aiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
               });
               if (!result.ok) {
                 ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              } else {
+                ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
               }
             } catch (e) {
               ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
           }
-        }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
+      } else {
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = ((globalThis as any).aiChatService)?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+              }
+            }
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       }
     }
 
@@ -3453,6 +3672,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
   ctx.log("rescue", `Target: ${targetPlayer} at ${targetSystem} / ${targetPOI}`);
 
   const settings = getRescueSettings();
+
+  await enableRescueCloak(ctx, settings);
 
   // Persistent battle state across cycles
   const battleState: BattleState = {
@@ -3552,7 +3773,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     if (targetSystem && targetSystem !== bot.system) {
       ctx.log("rescue", `Navigating to ${targetSystem}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${targetSystem} — aborting mission`);
@@ -3713,8 +3934,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         } else {
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            const fuelDelta = result.fuel as number || 0;
-            const targetFuelNow = result.target_fuel_now as number || 0;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
             ctx.log("rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${player.username}`);
             ctx.log("rescue", `  Their fuel: ${targetFuelNow}`);
           } else {
@@ -3772,7 +3993,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       if (!atHomeSystem) {
         ctx.log("rescue", `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -3891,6 +4112,19 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  await enableRescueCloak(ctx, settings);
+
+  // ── MAYDAY enable gate ──
+  // If MAYDAY rescue is disabled in settings, this dedicated routine does
+  // nothing (it exists solely to answer distress calls).
+  if (!isMaydayRescueEnabledSetting()) {
+    ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - this routine will idle`);
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    return;
+  }
 
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
@@ -4159,6 +4393,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     
     ctx.log("mayday", `✓ Jump check passed: ${jumpsToTarget} jumps (limit: ${maxJumps})`);
 
+    // ── CROSS-PROCESS MAYDAY CLAIM LOCK: ensure only this bot launches the MAYDAY ──
+    // Defers to any other bot that already claimed this distress call, so the
+    // dedicated MAYDAY bot and a backup rescue bot cannot both fly out to it.
+    if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+      const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+      ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+      markMaydayHandled(mayday);
+      await ctx.sleep(5000);
+      continue;
+    }
+
     // ── Create rescue session if starting new mission ──
     if (!recoveredSession) {
       const session: RescueSession = {
@@ -4175,6 +4420,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
       ctx.log("mayday", `Created MAYDAY rescue session for ${mayday.sender}`);
     }
 
@@ -4212,7 +4458,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
 
     if (mayday.system && mayday.system !== bot.system) {
       ctx.log("mayday", `Jumping to ${mayday.system}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist || settings.dontRejectMaydaysInBlacklistSystems };
       const arrived = await navigateToSystem(ctx, mayday.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
@@ -4354,13 +4600,14 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
           continue;
         }
 
-        if (refuelResp.error) {
+if (refuelResp.error) {
           ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         } else {
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
-            fuelTransferred = Math.abs(result.fuel as number || 0);
-            const targetFuelNow = result.target_fuel_now as number || 0;
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+            fuelTransferred = Math.abs(fuelDelta);
             ctx.log("mayday", `✓ Transferred ${fuelTransferred} fuel to ${mayday.sender}`);
             ctx.log("mayday", `  Their fuel: ${targetFuelNow}`);
           }
@@ -4441,7 +4688,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       if (!atHomeSystem) {
         ctx.log("mayday", `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -4627,7 +4874,13 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
           return playerId;
         }
       }
-    }
+
+      // Fallback: return username when player ID cannot be found via get_nearby
+      // This handles cloaked players who won't appear in nearby scans
+      // The refuel command may accept username as target
+      ctx.log("rescue", `Player ${username} not found in get_nearby scan (possibly cloaked) - using username as fallback target`);
+      return username;
+      }
   } catch (e) {
     ctx.log("warn", `Error getting nearby players: ${e}`);
   }
@@ -4655,6 +4908,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  await enableRescueCloak(ctx, settings);
 
   // Check if this bot should ONLY do credit top-off (no rescue operations)
   if (shouldOnlyCreditTopOff(bot.username)) {
@@ -4712,42 +4967,75 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
 // ── Start background credit top-off loop (non-blocking) ──
     // Only the primary credit top-off bot should run this background loop
-    if (isPrimaryCreditTopOffBot(bot.username)) {
+    if (isCreditTopOffEnabledFor(bot.username)) {
       startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
     } else {
-      ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+      ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
     }
 
-    // ── Start background faction storage update loop (non-blocking) ──
-    // Cycles through approved fuel stations to update faction storage data
-    let currentFuelStationIndex = 0;
-    const general = readSettings().general || {};
-    const approvedFuelStations: string[] = (general as any).approvedFuelStations as string[] || [];
-    
-    if (approvedFuelStations.length > 0) {
-      ctx.log("rescue", `📡 Starting faction storage update cycle for ${approvedFuelStations.length} approved fuel stations`);
-      
-      // Start background update loop
+    // ── Start background remote faction-station fuel monitor (non-blocking) ──
+    // Iterates ALL faction stations one at a time, reading each station's full
+    // faction storage (including the faction fuel facility's current level) via
+    // view_faction_storage. This works REMOTELY — no docking required — so the
+    // rescue bot keeps an accurate, up-to-date picture of every station's faction
+    // fuel reserve/capacity. One station is polled per minute (~stations ≈ full
+    // scan time in minutes). NOTE: this is purely a storage/fuel-level read;
+    // the fuel service's facility job monitoring is a separate, at-station concern.
+    const allFactionStations: string[] = getAllStationsForEmpires(Object.keys(EMPIRE_STATIONS));
+    let remoteStationIndex = 0;
+
+    if (allFactionStations.length > 0) {
+      ctx.log("rescue", `📡 Starting remote faction-station fuel monitor for ${allFactionStations.length} stations (1 per minute via view_faction_storage)`);
+
       (async () => {
         while (bot.state === "running") {
           try {
-            const stationKey = approvedFuelStations[currentFuelStationIndex];
-            const stationId = stationKey.split("|")[1];
-            if (stationId && bot.docked && bot.poi === stationId) {
-              ctx.log("rescue", `📡 Updating faction storage at ${stationId}...`);
-              const storageResp = await bot.exec("view_storage", { target: "faction", station_id: stationId });
-              if (!storageResp.error && storageResp.result) {
-                const result = storageResp.result as Record<string, unknown>;
-                const items = (result.items as any[]) || [];
-                ctx.log("rescue", `📡 Faction storage updated: ${items.length} items`);
-              }
+            const stationRef = allFactionStations[remoteStationIndex];
+            const stationId = stationRef.includes("|") ? stationRef.split("|")[1] : stationRef;
+
+            // Read the REMOTE station's faction storage from anywhere — docking not needed.
+            const storageResp = await bot.exec("view_faction_storage", { station_id: stationId });
+            if (!storageResp.error && storageResp.result) {
+              const result = storageResp.result as Record<string, unknown>;
+              const reserve = (result.faction_fuel_reserve as number) || 0;
+              const capacity = (result.faction_fuel_capacity as number) || 0;
+              // IMPORTANT: view_faction_storage returns the BOT's own faction data, so the
+              // cache must be written under the bot's actual faction (bot.faction). Do NOT
+              // trust result.faction_name / result.faction_id from the response — those
+              // reflect the station's controlling faction and are unreliable, producing
+              // mislabeled cache files (e.g. "solarian--station.json") instead of the
+              // correct "Busy Being Dead--station.json".
+              const factionName = bot.faction || "";
+
+              // Preserve existing cached item entries; only refresh the fuel facility levels
+              // so a partial read never wipes the item list.
+              const existing = getFactionStorageCache(factionName, stationId);
+              const rawItems = (result.items as Array<Record<string, unknown>>) || [];
+              const entries: FactionStorageEntry[] = rawItems.map((i) => ({
+                itemId: (i.item_id as string) || (i.id as string) || "",
+                quantity: (i.quantity as number) || 0,
+                name: (i.name as string) || (i.item_id as string) || (i.id as string) || "",
+              }));
+
+              updateFactionStorageCache(
+                factionName,
+                entries.length > 0 ? entries : (existing?.entries || []),
+                stationId,
+                reserve,
+                capacity,
+              );
+
+              ctx.log("rescue", `📡 Remote ${stationId}: faction fuel facility = ${reserve}/${capacity} (${entries.length} item types)`);
+            } else if (storageResp.error) {
+              ctx.log("warn", `📡 Failed to read faction storage at remote station ${stationId}: ${storageResp.error.message}`);
             }
-            currentFuelStationIndex = (currentFuelStationIndex + 1) % approvedFuelStations.length;
           } catch (e) {
-            ctx.log("warn", `Failed to update faction storage: ${e}`);
+            ctx.log("warn", `📡 Error in remote faction-station fuel monitor: ${e}`);
           }
-          // Wait 1 minute before next station update
-          await new Promise(resolve => setTimeout(resolve, 60000));
+
+          remoteStationIndex = (remoteStationIndex + 1) % allFactionStations.length;
+          // ~1 minute between station reads
+          await new Promise((resolve) => setTimeout(resolve, 60000));
         }
       })();
     }
@@ -4944,47 +5232,68 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
-      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-      if (!isFleetRescuePrimary) {
-        ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
-      }
-
-      let targets = isFleetRescuePrimary
-        ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
-        : [];
-
-      // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
-      const now = Date.now();
-      targets = targets.filter(t => {
-        const expiry = ownBotRescueCooldown.get(t.username);
-        if (expiry && expiry > now) {
-          return false;
-        }
-        return true;
-      });
-
-      // Clean up stale queue entries
-      cleanupStaleQueue();
-
-      // ── Check for MAYDAY requests if no fleet targets ──
-      // Check if we're the primary MAYDAY rescue bot
-      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
-      if (!isMaydayRescuePrimary) {
-        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
-      }
-
-      let maydayTarget: RescueTarget | null = null;
-      if (targets.length === 0) {
-        if (!isMaydayRescuePrimary) {
-          const ignoredMayday = getNextMayday();
-          if (ignoredMayday) {
-            markMaydayHandled(ignoredMayday);
-            await ctx.sleep(5000);
-            continue;
+        // Check if we're the primary FLEET rescue bot. A non-primary bot only
+        // helps when there are 2+ stranded fleet members (a surge the single
+        // primary can't service alone) — never just because the primary is busy.
+        const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+        const fleetRescueEnabled = isFleetRescueEnabledSetting();
+        const strandedBots = fleetRescueEnabled
+          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+          : [];
+        if (!fleetRescueEnabled) {
+          ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
+        } else if (!isFleetRescuePrimary) {
+          if (strandedBots.length >= 2) {
+            ctx.log("rescue", `🤝 ${strandedBots.length} stranded fleet bots pending - covering overflow fleet rescues`);
+          } else {
+            ctx.log("rescue", `📡 Not primary fleet rescue bot - leaving fleet rescues for ${settings.fleetRescueBot || 'primary bot'}`);
           }
-          // No pending MAYDAY — fall through to idle/return-home check below
         }
+
+        let targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
+
+       // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
+       const now = Date.now();
+       targets = targets.filter(t => {
+         const expiry = ownBotRescueCooldown.get(t.username);
+         if (expiry && expiry > now) {
+           return false;
+         }
+         return true;
+       });
+
+       // Clean up stale queue entries
+       cleanupStaleQueue();
+
+        // ── Check for MAYDAY requests if no fleet targets ──
+        // A non-primary bot only handles MAYDAYs when there are 2+ pending (a
+        // surge) — never just because the MAYDAY-primary is busy with one.
+        const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+        const maydayRescueEnabled = isMaydayRescueEnabledSetting();
+        const pendingMaydays = getPendingMaydayCount();
+        if (!maydayRescueEnabled) {
+          ctx.log("mayday", `📴 MAYDAY rescue DISABLED in settings - skipping MAYDAYs`);
+        } else if (!isMaydayRescuePrimary) {
+          if (pendingMaydays >= 2) {
+            ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
+          } else {
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
+          }
+        }
+
+        let maydayTarget: RescueTarget | null = null;
+        const shouldProcessMayday = shouldHandleMaydayRescue(bot.username, pendingMaydays);
+
+       if (targets.length === 0) {
+         if (!shouldProcessMayday) {
+           const ignoredMayday = getNextMayday();
+           if (ignoredMayday) {
+             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+             await ctx.sleep(5000);
+             continue;
+           }
+           // No pending MAYDAY — fall through to idle/return-home check below
+         }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
@@ -5096,10 +5405,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+          const runtimeBlacklist = getSystemBlacklist();
+          const bypassMaydayBlacklist = settings.dontRejectMaydaysInBlacklistSystems && settings.enableCloak && bot.isCloaked;
+          const blacklist = (settings.ignoreBlacklist || bypassMaydayBlacklist) ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -5137,7 +5448,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
-                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
                   if (!blacklistedOnRoute) viableRoute = true;
                 }
@@ -5197,6 +5508,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          // ── CROSS-PROCESS MAYDAY CLAIM LOCK: only ONE bot may launch a given MAYDAY ──
+          // Prevents the dedicated MAYDAY bot and a backup rescue bot from BOTH responding
+          // to the same distress call. Whichever bot wins the atomic claim proceeds; the
+          // other yields immediately so the two bots cooperate instead of both going out.
+          if (!tryClaimMayday(mayday.sender, mayday.system, mayday.poi, bot.username)) {
+            const holder = getMaydayLockHolder(mayday.sender, mayday.system, mayday.poi);
+            ctx.log("mayday", `🤝 MAYDAY from ${mayday.sender} already claimed by ${holder || 'another bot'} — yielding to avoid both bots going out`);
+            markMaydayHandled(mayday);
+            continue;
+          }
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
@@ -5236,6 +5557,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const decision = shouldProceedOrYield(myClaim, partnerClaim);
               if (decision === "yield") {
                 ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
                 maydayTarget = null; // Cancel this rescue
                 markMaydayHandled(mayday);
                 continue;
@@ -5267,7 +5589,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -5332,7 +5654,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           yield "return_home";
           await ensureUndocked(ctx);
-          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
           const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -5585,9 +5907,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         state: "navigating",
       };
       await startRescueSession(session);
+      if (isMaydayTarget) {
+        // Hand off exclusive ownership to the durable rescue session so the
+        // per-MAYDAY lock file is freed for future distress calls.
+        releaseMayday(target.username, target.system, target.poi, bot.username);
+      }
       ctx.log("rescue", `Created rescue session for ${target.username}`);
 
-      // Send faction chat announcement for rescue start
+}
+
+    // Send faction chat announcement for rescue start
+    if (!settings.disableFactionAnnouncements) {
       const aiChatService = (globalThis as any).aiChatService;
       if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
         try {
@@ -6393,7 +6723,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
               ctx.log("rescue", `🏠 Returning home before retry...`);
               await ensureUndocked(ctx);
-              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
               const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
               if (arrived) {
                 ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
@@ -6447,7 +6777,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
             ctx.log("rescue", `🚨 All rescue attempts failed - returning home to safety...`);
             await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (arrived) {
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
@@ -6542,117 +6872,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         });
 
         if (!targetHere) {
-          targetFound = false;
-          ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
-
-          // For our own bots, NEVER record as ghost - they're just in a hidden POI
-          if (isOurBot) {
-            ctx.log("rescue", `👻 Our bot ${target.username} not found - likely in hidden POI, will keep trying`);
-            ctx.log("rescue", `💡 Hidden POI detected: ${target.poi} in ${target.system}`);
-            
-            // Don't fail the session - keep retrying by not marking mayday as handled
-            // and returning to the start of the loop
-            ctx.log("rescue", `🔄 Will retry rescue for ${target.username}...`);
-            
-            // Return home first
-            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
-              ctx.log("rescue", `🏠 Returning home before retry...`);
-              await ensureUndocked(ctx);
-              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-              if (arrived) {
-                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-              }
-            }
-            
-            // Retry by continuing the loop without failing the session
-            await ctx.sleep(5000);
-            continue;
-          }
-
-          // Record ghost incident in BlackBook (skipped for our own bots)
-          recordGhost(target.username);
-          const currentGhosts = getPlayerRecord(target.username).ghostCount;
-          if (currentGhosts < 0) {
-            ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
-          } else {
-             ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-             if (currentGhosts >= 5) {
-               ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
-             }
-           }
-
-          // Send grumpy faction chat message about being ghosted
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await aiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_no_show",
-                targetName: target.username,
-                isMayday: isMaydayTarget,
-                isBot: !isMaydayTarget,
-                currentSystem: bot.system,
-                targetSystem: target.system,
-                targetPoi: target.poi || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
-              }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
-            }
-          }
-
-          // Fail the session and return home
-          if (recoveredSession || getActiveRescueSession(bot.username)) {
-            await failRescueSession(bot.username, "Target not found at location");
-          }
-          markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
-
-          // Return home after failed rescue (potential ambush)
-          if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
-            ctx.log("rescue", `🚨 Target not found - returning home to safety...`);
-            await ensureUndocked(ctx);
-            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-            if (arrived) {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-
-              // If home station is configured, travel there and dock
-              if (settings.homeStation) {
-                const [expectedSystem, stationId] = settings.homeStation.split('|');
-                if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station...`);
-                  const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  // CRITICAL: Check for battle interrupt error
-                  if (travelResp.error) {
-                    const errMsg = travelResp.error.message.toLowerCase();
-                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                      await fleeFromBattle(ctx);
-                      await ctx.sleep(5000);
-                      continue;
-                    }
-                  }
-                  if (!travelResp.error) {
-                    ctx.log("rescue", `⚓ Docking at home station...`);
-                    const dockResp = await bot.exec("dock");
-                    if (!dockResp.error) {
-                      ctx.log("rescue", `✓ Docked at home station`);
-                      // Refuel after docking
-                      ctx.log("rescue", `⛽ Refueling at home station...`);
-                      const refuelResp = await bot.exec("refuel");
-                      if (!refuelResp.error) {
-                        await bot.refreshShip();
-                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          continue;
+          // Target not found in get_nearby - may be cloaked
+          ctx.log("rescue", `${target.username} not found in get_nearby scan - may be cloaked or at hidden POI`);
+          ctx.log("rescue", `Proceeding with refuel attempt - target may be present but cloaked`);
         }
       }
     }
@@ -6683,8 +6905,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const result = refuelResp.result as Record<string, unknown> | undefined;
         let fuelDelivered = 0;
         if (result) {
-          const fuelDelta = result.fuel as number || 0;
-          const targetFuelNow = result.target_fuel_now as number || 0;
+          const fuelDelta = result.fuel as number || result.quantity as number || 0;
+          const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
           fuelDelivered = Math.abs(fuelDelta);
           ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${target.username}`);
           ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);
@@ -6851,70 +7073,78 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         // ── Send faction announcement in background (non-blocking) ──
         // This allows immediate return home instead of waiting for cooldown
-        const aiChatSettings = aiChatService?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = aiChatService?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          }
-        }, cooldownSec * 1000);
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       } else {
         // No bill to send, but still send faction announcement in background
-        const aiChatSettings = aiChatService?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        const botSystemAtRescue = bot.system;
-        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
-        const isMaydayForAnnounce = activeSessionForBill.isMayday;
-        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
-        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
-        
-        setTimeout(async () => {
-          const freshAiChatService = (globalThis as any).aiChatService;
-          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await freshAiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_complete",
-                targetName: targetUsernameForAnnounce,
-                isMayday: isMaydayForAnnounce,
-                isBot: !isMaydayForAnnounce,
-                currentSystem: botSystemAtRescue,
-                targetSystem: targetSystemForAnnounce,
-                targetPoi: targetPoiForAnnounce || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        if (!settings.disableFactionAnnouncements) {
+          const aiChatSettings = aiChatService?.getSettings?.();
+          const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+          ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+          
+          const botSystemAtRescue = bot.system;
+          const targetUsernameForAnnounce = activeSessionForBill?.targetUsername;
+          const isMaydayForAnnounce = activeSessionForBill?.isMayday;
+          const targetSystemForAnnounce = activeSessionForBill?.targetSystem;
+          const targetPoiForAnnounce = activeSessionForBill?.targetPoi;
+          
+          setTimeout(async () => {
+            const freshAiChatService = (globalThis as any).aiChatService;
+            if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await freshAiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: targetUsernameForAnnounce,
+                  isMayday: isMaydayForAnnounce,
+                  isBot: !isMaydayForAnnounce,
+                  currentSystem: botSystemAtRescue,
+                  targetSystem: targetSystemForAnnounce,
+                  targetPoi: targetPoiForAnnounce || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          }
-        }, cooldownSec * 1000);
+          }, cooldownSec * 1000);
+        } else {
+          ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
       }
     }
 
@@ -6923,7 +7153,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       yield "return_home";
       ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
       const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
@@ -7014,7 +7244,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Refuel self ──
     yield "self_refuel";
-await bot.refreshShip();
+    await bot.refreshShip();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
     if (fuelAfterRescue < settings.refuelThreshold) {

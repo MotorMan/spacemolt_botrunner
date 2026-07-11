@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { getCrafterSettings } from "./routines/crafter.js";
+import { getCrafterSettings, resolveFinalVenue } from "./routines/crafter.js";
 import { readSettings } from "./routines/common.js";
 import {
   calculateCraftingPlan,
@@ -338,6 +338,10 @@ describe("Crafter Profile Workflow", () => {
 });
 
 describe("Craft Goals Recipe Selection", () => {
+  beforeEach(() => {
+    vi.mocked(readSettings).mockReturnValue({});
+  });
+
   const mockRecipes = [
     {
       recipe_id: "forge_hull_plating",
@@ -486,6 +490,82 @@ describe("Craft Goals Recipe Selection", () => {
       const result = findRecipeForItem("hull_plating", recipes, countFn);
       expect(result?.recipe_id).toBe("forge_hull_plating"); // should pick forge since materials available
     });
+
+    it("should fall back to a craftable alternate when both candidate recipes are own-facility recipes", () => {
+      // Mirrors the plasma-flux vs regular titanium alloy deadlock: the preferred
+      // recipe is missing one sub-material, while an alternate recipe for the SAME
+      // output item is ALSO available at an owned facility and is fully craftable.
+      // The planner must use the craftable alternate instead of holding forever.
+      const preferred = {
+        recipe_id: "plasma_flux_titanium_alloy",
+        name: "Plasma-Flux Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+          { item_id: "plasma_residue", name: "Plasma Residue", quantity: 1 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const alternate = {
+        recipe_id: "titanium_alloy",
+        name: "Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const facilityAvailableRecipes = new Set(["plasma_flux_titanium_alloy", "titanium_alloy"]);
+      const countFn = (id: string) => {
+        if (id === "titanium_plate") return 10;
+        if (id === "plasma_residue") return 0; // preferred is missing this
+        return 0;
+      };
+      const result = findRecipeForItem("titanium_alloy", [preferred, alternate], countFn, facilityAvailableRecipes);
+      expect(result?.recipe_id).toBe("titanium_alloy"); // fall back to the craftable alternate
+    });
+
+    it("should keep using the own-facility recipe rather than rent when the only alternate has no owned facility", () => {
+      // forceOwnFacility regression: the preferred recipe has an owned facility
+      // but is missing a sub-material; the alternate is craftable but has NO owned
+      // facility (offline). The bot must keep using the own-facility recipe and
+      // wait for sub-materials rather than auto-routing to an external rental.
+      const preferred = {
+        recipe_id: "plasma_flux_titanium_alloy",
+        name: "Plasma-Flux Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+          { item_id: "plasma_residue", name: "Plasma Residue", quantity: 1 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const alternate = {
+        recipe_id: "titanium_alloy",
+        name: "Titanium Alloy",
+        components: [
+          { item_id: "titanium_plate", name: "Titanium Plate", quantity: 10 },
+        ],
+        output_item_id: "titanium_alloy",
+        output_name: "Titanium Alloy",
+        output_quantity: 1,
+        category: "Components",
+      };
+      const facilityAvailableRecipes = new Set(["plasma_flux_titanium_alloy"]); // alternate has no facility
+      const countFn = (id: string) => {
+        if (id === "titanium_plate") return 10;
+        if (id === "plasma_residue") return 0; // preferred is missing this
+        return 0;
+      };
+      const result = findRecipeForItem("titanium_alloy", [preferred, alternate], countFn, facilityAvailableRecipes);
+      expect(result?.recipe_id).toBe("plasma_flux_titanium_alloy"); // keep using own facility, avoid rental
+    });
   });
 
   describe("findAllRecipesForItem", () => {
@@ -526,5 +606,75 @@ describe("Craft Goals Recipe Selection", () => {
       expect(plan?.flatOrder).toHaveLength(1); // Just the forge, since reforge not better
       expect(plan?.flatOrder[0].recipe.recipe_id).toBe("forge_hull_plating");
     });
+  });
+});
+
+describe("resolveFinalVenue rental gating", () => {
+  const baseSettings = (overrides: Partial<any> = {}) => ({
+    craftingPreset: "prefer_own",
+    allowRentalPurchase: false,
+    allowExternalFacilities: false,
+    rentalSpendingLimit: 0,
+    ...overrides,
+  }) as any;
+
+  const externalQuote = {
+    external: true,
+    cost: { fee: 43200 },
+    venue: "Alloy Foundry",
+    venue_type: "external",
+    recipe: "forge_titanium_alloy",
+  };
+  const workshopQuote = {
+    external: false,
+    cost: { fee: 0 },
+    venue: "Station Workshop",
+    venue_type: "workshop",
+    recipe: "forge_titanium_alloy",
+  };
+
+  const makeBot = (onExec?: (payload: any) => void) => ({
+    exec: async (_cmd: string, payload: any) => {
+      onExec?.(payload);
+      if (payload.preset === "workshop") return { result: workshopQuote };
+      return { result: externalQuote };
+    },
+  });
+
+  const ctx = { log: () => {}, sleep: async () => {} } as any;
+
+  it("never rents an external facility when rental is disabled, even under prefer_own", async () => {
+    const v = { preset: "prefer_own", allowRental: false, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 1728,
+      v as any, baseSettings(),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.facilityId).toBeUndefined();
+    expect(result.preset).toBe("workshop");
+    expect(result.rentalFee).toBe(0);
+    expect(result.label).toContain("rental avoided");
+  });
+
+  it("same protection under the default fast preset with rental disabled", async () => {
+    const v = { preset: "fast", allowRental: false, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 10,
+      v as any, baseSettings({ craftingPreset: "fast" }),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.preset).toBe("workshop");
+    expect(result.rentalFee).toBe(0);
+  });
+
+  it("does rent (as last resort) under prefer_own when rental is allowed", async () => {
+    const v = { preset: "prefer_own", allowRental: true, usedOwnFacility: false, missingFacility: true };
+    const result = await resolveFinalVenue(
+      ctx, makeBot(), "forge_titanium_alloy", "Forge Titanium Alloy", 1728,
+      v as any, baseSettings({ allowRentalPurchase: true }),
+    );
+    expect(result.blocked).toBe(false);
+    expect(result.rentalFee).toBe(43200);
+    expect(result.preset).toBe("prefer_own");
   });
 });

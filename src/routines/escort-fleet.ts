@@ -305,7 +305,8 @@ async function handleFleetCoordination(
     const arrived = await navigateToSystem(ctx, homeSystem, {
       fuelThresholdPct: 50,
       hullThresholdPct: 40,
-      skipBlacklist: true
+      skipBlacklist: true,
+      joinBattles: true
     });
     if (!arrived) {
       return { success: false, message: `Could not reach home system ${homeSystem}` };
@@ -319,7 +320,8 @@ async function handleFleetCoordination(
     const arrived = await navigateToSystem(ctx, minerSystem, {
       fuelThresholdPct: 50,
       hullThresholdPct: 40,
-      skipBlacklist: true
+      skipBlacklist: true,
+      joinBattles: true
     });
     if (!arrived) {
       return { success: false, message: `Could not reach miner at ${minerSystem}` };
@@ -799,6 +801,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
       skipBlacklist: settings.ignoreBlacklist,
       isCombatBot: true,
+      joinBattles: true,
     };
 
     if (!minerName) {
@@ -871,6 +874,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       const nearbyResp = await bot.exec("get_nearby");
       if (!nearbyResp.error && nearbyResp.result) {
         bot.trackNearbyPlayers(nearbyResp.result);
+        bot.trackWildlife(nearbyResp.result);
         const entities = parseNearby(nearbyResp.result);
         const targets = entities.filter(e => isPirateTarget(e, false, "boss"));
 

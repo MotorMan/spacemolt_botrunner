@@ -44,11 +44,20 @@ export interface MiningSession {
   notes?: string;
 }
 
+export interface FailedTargetRecord {
+  oreId: string;
+  systemId: string;
+  poiId: string;
+  failedAt: string;
+  reason: string;
+}
+
 export interface MinerActivityData {
   [botUsername: string]: {
     activeSession?: MiningSession;
     lastCompletedSession?: MiningSession;
     sessionHistory?: MiningSession[];
+    failedTargets: FailedTargetRecord[];
   };
 }
 
@@ -144,13 +153,13 @@ export async function flushMinerActivity(): Promise<boolean> {
 
 function getBotActivity(botUsername: string) {
   if (!cachedData[botUsername]) {
-    cachedData[botUsername] = { activeSession: undefined, lastCompletedSession: undefined, sessionHistory: [] };
+    cachedData[botUsername] = { activeSession: undefined, lastCompletedSession: undefined, sessionHistory: [], failedTargets: [] };
   }
   return cachedData[botUsername]!;
 }
 
-async function saveBotActivity(botUsername: string, activity: { activeSession?: MiningSession; lastCompletedSession?: MiningSession; sessionHistory?: MiningSession[] }): Promise<void> {
-  cachedData[botUsername] = activity;
+async function saveBotActivity(botUsername: string, activity: { activeSession?: MiningSession; lastCompletedSession?: MiningSession; sessionHistory?: MiningSession[]; failedTargets?: FailedTargetRecord[] }): Promise<void> {
+  cachedData[botUsername] = activity as MinerActivityData[string];
   await saveMinerActivity(cachedData);
 }
 
@@ -246,4 +255,37 @@ export function createMiningSession(params: {
     resourcesMined: {},
     notes: params.isQuotaDriven ? `Quota-driven: ${params.quotaTarget} units target` : "Configured target",
   };
+}
+
+export function recordFailedTarget(botUsername: string, oreId: string, systemId: string, poiId: string, reason: string): void {
+  const activity = getBotActivity(botUsername);
+  if (!activity.failedTargets) activity.failedTargets = [];
+  
+  activity.failedTargets.push({
+    oreId,
+    systemId,
+    poiId,
+    failedAt: new Date().toISOString(),
+    reason,
+  });
+  
+  // Keep only last 50 failed targets
+  if (activity.failedTargets.length > 50) {
+    activity.failedTargets = activity.failedTargets.slice(-50);
+  }
+  
+  saveMinerActivity(cachedData);
+}
+
+export function isTargetFailedInSystem(botUsername: string, oreId: string, systemId: string, poiId: string, timeoutMs: number = 3 * 60 * 60 * 1000): boolean {
+  const activity = getBotActivity(botUsername);
+  if (!activity.failedTargets) return false;
+  
+  const cutoffTime = Date.now() - timeoutMs;
+  return activity.failedTargets.some(f => 
+    f.oreId === oreId && 
+    f.systemId === systemId && 
+    f.poiId === poiId &&
+    new Date(f.failedAt).getTime() > cutoffTime
+  );
 }

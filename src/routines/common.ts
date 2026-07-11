@@ -5,6 +5,7 @@
  * ore parsing, and safety checks.
  */
 import type { RoutineContext } from "../bot.js";
+import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
@@ -95,24 +96,40 @@ export function isMinablePoi(type: string): boolean {
     || t.includes("belt") || t.includes("resource");
 }
 
-/** Check if a POI is an ore belt (asteroid belt/field/ring/nebula — NOT gas clouds or ice fields). */
+/** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds, ice fields, or hidden POIs). */
 export function isOreBeltPoi(type: string): boolean {
   const t = type.toLowerCase();
-  if (t.includes("gas") || t.includes("cloud") || t.includes("ice")) return false;
+  if (t.includes("gas") || t.includes("cloud") || t.includes("ice") || t.includes("residue") || t.includes("shimmer") || t.includes("nexus")) return false;
   return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
-    || t.includes("field") ||  t.includes("nebula") || t.includes("resource");
+    || t.includes("field") || t.includes("resource");
 }
 
 /** Check if a POI is a gas cloud. */
 export function isGasCloudPoi(type: string): boolean {
   const t = type.toLowerCase();
-  return t.includes("gas") || t.includes("cloud") || t.includes("nebula");
+  return t.includes("gas") || t.includes("cloud") || t.includes("nebula") ||
+         t.includes("residue") || t.includes("shimmer") || t.includes("nexus") ||
+         t.includes("hydrogen") || t.includes("helium") || t.includes("argon") ||
+         t.includes("neon") || t.includes("chlorine") || t.includes("nitrogen") ||
+         t.includes("oxygen") || t.includes("compressed");
+}
+
+/** Check if a POI is a gas cloud by name (fallback when type is not recognized). */
+export function isGasCloudByName(name: string): boolean {
+  const n = name.toLowerCase();
+  return n.includes("cloud") || n.includes("gas") || n.includes("residue") ||
+         n.includes("shimmer") || n.includes("nexus") || n.includes("nebula");
+}
+
+/** Check if a POI is a gas cloud (by type or name). */
+export function isGasCloudPoiOrName(typeOrName: string): boolean {
+  return isGasCloudPoi(typeOrName) || isGasCloudByName(typeOrName);
 }
 
 /** Check if a POI is an ice field. */
 export function isIceFieldPoi(type: string): boolean {
   const t = type.toLowerCase();
-  return t.includes("ice");
+  return t.includes("ice") || t.includes("frost") || t.includes("cryo") || t.includes("water_ice");
 }
 
 /** Check if a POI type is purely scenic (only needs one visit). */
@@ -318,14 +335,30 @@ export function parseSystemData(resp: Record<string, unknown>): SystemInfo {
   const connections: Connection[] = [];
   if (Array.isArray(rawConns)) {
     for (const c of rawConns) {
-      const id = (c.system_id as string) || (c.id as string)
-        || (c.target_system as string) || (c.target as string)
-        || (c.destination as string) || "";
+      // Handle both string format (just system ID) and object format ({system_id: "...", ...})
+      let id: string;
+      let name: string;
+      let jumpCost: number | null = null;
+      
+      if (typeof c === "string") {
+        id = c;
+        name = c;
+      } else if (typeof c === "object" && c !== null) {
+        const connObj = c as Record<string, unknown>;
+        id = (connObj.system_id as string) || (connObj.id as string)
+          || (connObj.target_system as string) || (connObj.target as string)
+          || (connObj.destination as string) || "";
+        name = (connObj.system_name as string) || (connObj.name as string) || id;
+        jumpCost = (connObj.jump_cost as number) ?? null;
+      } else {
+        continue;
+      }
+      
       if (!id) continue;
       connections.push({
         id,
-        name: (c.system_name as string) || (c.name as string) || id,
-        jump_cost: (c.jump_cost as number) ?? null,
+        name,
+        jump_cost: jumpCost,
       });
     }
   }
@@ -1180,14 +1213,27 @@ export async function ensureFueled(
 
   ctx.log("system", `Fuel low (${fuelPct}%) — need to refuel (threshold: ${thresholdPct}%)...`);
 
-  // ── STEP 1: Convert all cargo fuel cells to fuel ────────────────────────
-  // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
-  // via the refuel command even while docked at a station.
+  // ── STEP 1: Check if already docked at a station with fuel service ───────
   await bot.refreshShip();
   const wasDocked = bot.docked;
   const { pois } = await getSystemInfo(ctx);
   const dockingStation = wasDocked ? pois.find(p => isStationPoi(p) && p.id === bot.poi) : undefined;
 
+  // If docked at a station with fuel service, refuel there first (don't undock)
+  if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
+    ctx.log("system", `Already docked at ${dockingStation.name} with fuel service — refueling in place...`);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
+    await bot.refreshShip();
+    const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (newFuelPct >= thresholdPct) {
+      ctx.log("system", `Refueled at station — fuel now ${newFuelPct}%`);
+      return true;
+    }
+  }
+
+  // ── STEP 2: Convert all cargo fuel cells to fuel ────────────────────────
+  // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
+  // via the refuel command even while docked at a station.
   // Undock first so cargo fuel cells are used one at a time (refuel undocked = use cargo)
   if (wasDocked) {
     ctx.log("system", "Undocking to use cargo fuel cells before reaching for station fuel...");
@@ -1243,13 +1289,8 @@ export async function ensureFueled(
     // If we couldn't reach home or refuel there, continue to other options
   }
 
-  // Check for approved fuel stations FIRST
+  // Check for approved fuel stations - if empty/undefined, allow all stations (handled by isApprovedFuelStation)
   const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
-
-  if (!approvedFuelStations || approvedFuelStations.length === 0) {
-    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
-    return false;
-  }
 
   // If we undocked and were previously docked, only return there if it's APPROVED
   if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
@@ -1275,8 +1316,9 @@ export async function ensureFueled(
     if (homeSystem && typeof homeSystem === "string") {
       try {
         const routeResp = await bot.exec("find_route", { target_system: homeSystem });
-        const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
-        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined) {
+        const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
+        const hasWormhole = routeHasWormhole(routeData?.route);
+        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined && !hasWormhole) {
           const canMakeItHome = routeData.fuel_available >= routeData.estimated_fuel;
           ctx.log("system", `Route to home: ${routeData.total_jumps} jumps, need ${routeData.estimated_fuel} fuel, have ${routeData.fuel_available}`);
           if (canMakeItHome) {
@@ -1302,6 +1344,9 @@ export async function ensureFueled(
             ctx.log("system", `Cannot reach home (${routeData.fuel_available} fuel < ${routeData.estimated_fuel} needed) — stranded`);
             return false;
           }
+        } else if (hasWormhole) {
+          ctx.log("system", `Route to home uses wormhole — cannot navigate (bot has not unlocked wormhole POI)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access`);
         }
       } catch (e) {
         ctx.log("system", `Could not check route home: ${e}`);
@@ -1330,10 +1375,12 @@ if (looted > 0) {
   ctx.log("system", "No station in current system — searching known map for nearest station...");
   const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
   const approvedSet = new Set<string>();
-  for (const entry of approvedFuelStations) {
-    approvedSet.add(entry);
-    const parts = entry.split("|");
-    if (parts.length === 2) approvedSet.add(parts[1]);
+  if (approvedFuelStations) {
+    for (const entry of approvedFuelStations) {
+      approvedSet.add(entry);
+      const parts = entry.split("|");
+      if (parts.length === 2) approvedSet.add(parts[1]);
+    }
   }
 
   let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
@@ -1603,17 +1650,33 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 
 // ── Navigation ───────────────────────────────────────────────
 
+/** Route segment from find_route API response */
+export interface RouteSegment {
+  system_id: string;
+  name: string;
+  jumps?: number;
+  via_wormhole?: boolean;
+  entrance_poi?: string;
+}
+
+/** Check if a route contains wormhole segments that the bot cannot traverse. */
+export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
+  if (!route) return false;
+  return route.some(seg => seg.via_wormhole === true);
+}
+
 /** Navigate to a target system via jump chain. Returns true if arrived. */
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
-  // Fleet hunters BYPASS blacklist — they MUST enter pirate systems
-  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
+  // Fleet hunters BYPASS blacklist — they MUST enter pirate systems.
+  // A cloaked ship also bypasses the blacklist (cloaking alone is enough).
+  const blacklist = (opts.skipBlacklist || bot.isCloaked) ? [] : getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -1636,7 +1699,7 @@ export async function navigateToSystem(
     } else {
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
 
       // Check if server says we're already at target (message field or 0 jumps)
       const alreadyAtTarget = routeData?.found && (
@@ -1651,18 +1714,28 @@ export async function navigateToSystem(
       }
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        // Validate server route against blacklist — reject if it passes through blacklisted systems
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        const blacklistedOnRoute = serverRouteSystemIds.find(
+        // Exclude the first system (current position) from blacklist check - we're already there
+        const systemsToCheck = serverRouteSystemIds.slice(1);
+        const blacklistedOnRoute = systemsToCheck.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
-        // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        if (blacklistedOnRoute) {
+        const hasWormhole = routeHasWormhole(routeData.route);
+        
+        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
+        
+        if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else if (blacklistedOnRoute && bypassBlacklist) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route`);
+          nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
+        } else if (hasWormhole) {
+          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access`);
         } else {
           nextSystem = routeData.route[1].system_id;
           const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
@@ -1715,9 +1788,9 @@ export async function navigateToSystem(
       }
     }
 
-    // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist }); //changed to 1.
-    if (!fueled) {
+// Fuel check — MUST have adequate fuel before jumping
+     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || bot.isCloaked });
+     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }
@@ -1735,7 +1808,7 @@ export async function navigateToSystem(
       // No mapped route — query server
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
 
       // Check if server says we're already at target
       const alreadyAtTarget = routeData?.found && (
@@ -1750,18 +1823,28 @@ export async function navigateToSystem(
       }
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        // Validate server route against blacklist — reject if it passes through blacklisted systems
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        const blacklistedOnRoute = serverRouteSystemIds.find(
+        // Exclude the first system (current position) from blacklist check - we're already there
+        const systemsToCheck = serverRouteSystemIds.slice(1);
+        const blacklistedOnRoute = systemsToCheck.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
-        // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        if (blacklistedOnRoute) {
+        const hasWormhole = routeHasWormhole(routeData.route);
+        
+        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
+        
+        if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else if (blacklistedOnRoute && bypassBlacklist) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked/skipBlacklist, using route (post-fuel)`);
+          nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
+        } else if (hasWormhole) {
+          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI) (post-fuel)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access (post-fuel)`);
         } else {
           nextSystem = routeData.route[1].system_id;
           const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
@@ -1777,6 +1860,21 @@ export async function navigateToSystem(
     }
 
     await ensureUndocked(ctx);
+
+    // Pre-jump cloak check: cloak before jumping to dangerous systems if autoCloak enabled
+    if (opts.autoCloak && !bot.isCloaked) {
+      const nextSys = mapStore.getSystem(nextSystem);
+      if (nextSys && isDangerousSystem(nextSys.security_level)) {
+        ctx.log("system", `Cloaking before jump to dangerous system ${nextSystem}...`);
+        const cloakResp = await bot.exec("cloak", { enable: true });
+        if (cloakResp.error) {
+          const msg = cloakResp.error.message.toLowerCase();
+          if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+            ctx.log("warn", `Failed to cloak before jump: ${cloakResp.error.message}`);
+          }
+        }
+      }
+    }
 
     // Jump with retry logic for transient errors
     let jumpSuccess = false;
@@ -1799,10 +1897,10 @@ export async function navigateToSystem(
         const battleNotifs = parseBattleNotifications(jumpResp.notifications);
         const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
         if (hasBattle) {
-          // For hunters (skipBlacklist=true), they intentionally enter pirate systems - don't flee
+          // For combat bots that want to join battles (joinBattles=true), continue navigation
           // For other bots, flee on battle detection
-          if (opts.skipBlacklist) {
-            ctx.log("combat", "Battle detected during jump - hunter intentionally enters - continuing navigation");
+          if (opts.joinBattles) {
+            ctx.log("combat", "Battle detected during jump - combat bot joins battle - continuing navigation");
             inBattleDuringJump = true;
             battleInterruptHandled = true;
           } else {
@@ -1831,13 +1929,13 @@ export async function navigateToSystem(
       // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
       if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
         ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message}`);
-        // For hunters (skipBlacklist=true), they intentionally enter pirate systems - join battle instead of flee
+        // For combat bots that want to join battles (joinBattles=true), join battle instead of flee
         // For other bots, flee on battle interrupt
-        if (opts.skipBlacklist) {
-          ctx.log("combat", "Hunter detected battle interrupt - joining battle instead of fleeing");
+        if (opts.joinBattles) {
+          ctx.log("combat", "Combat bot detected battle interrupt - joining battle instead of fleeing");
           inBattleDuringJump = true;
           battleInterruptHandled = true;
-          // Don't flee - let the escort routine handle battle engagement
+          // Don't flee - let the combat routine handle battle engagement
           // Return false to signal navigation was interrupted by battle
           return false;
         } else {
@@ -1910,12 +2008,35 @@ export async function navigateToSystem(
         errorMsg.includes("pending") ||
         errorMsg.includes("busy") ||
         errorMsg.includes("systems are not connected") || // Sometimes a temporary state
-        errorMsg.includes("you are already in"); // Already at destination - treat as success
+        errorMsg.includes("you are already in") || // Already at destination - treat as success
+        errorMsg.includes("mid-jump") || // Already in a jump - wait for it to complete
+        errorMsg.includes("mid-travel") || // Already traveling - wait for it to complete
+        errorMsg.includes("already in transit"); // Generic in-transit error
 
       if (!isTransient) {
         // Permanent error - don't retry
         ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
         return false;
+      }
+
+      // Handle "mid-jump" or "mid-travel" errors - wait for transit to complete
+      if (errorMsg.includes("mid-jump") || errorMsg.includes("mid-travel") || errorMsg.includes("already in transit")) {
+        ctx.log("travel", "Bot is already in transit - waiting for jump/travel to complete...");
+        const transitCompleted = await waitForTransitCompletion(ctx, 180);
+        if (!transitCompleted) {
+          ctx.log("error", "Transit did not complete within timeout - cannot continue navigation");
+          return false;
+        }
+        // Refresh location after transit completes
+        await bot.refreshLocation();
+        // Check if we're now at the target system
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Arrived at ${targetSystemId} after transit completed`);
+          return true;
+        }
+        // Transit completed but we're not at target - recalculate route from current position
+        ctx.log("travel", `Transit completed at ${bot.system}, recalculating route to ${targetSystemId}...`);
+        continue; // Continue the jump loop with updated position
       }
 
       // Special case: "already in" means we're already at the target system
@@ -1998,6 +2119,7 @@ export async function navigateToSystem(
     if (!opts.skipBlacklist) {
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        bot.trackWildlife(nearbyResp.result);
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
         if (fled) {
           // We fled - navigation is aborted, caller will need to handle new position
@@ -2360,7 +2482,7 @@ export async function fullSalvageWrecks(
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
 
   const enableTow = opts?.enableTow ?? false;
-  const minTowValue = opts?.minTowValue ?? 500;
+  const minTowValue = opts?.minTowValue ?? 0;
   const fuelOnly = opts?.fuelOnly ?? false;
   const battleState = opts?.battleState;
   const coop = opts?.salvageCoop;
@@ -2545,14 +2667,12 @@ export async function fullSalvageWrecks(
     ctx.log("scavenge", `Looted ${lootedItems.join(", ")} from ${wrecks.length} wreck(s)`);
   }
 
-  if (towedWrecks.length > 0) {
-    ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
-  }
+if (towedWrecks.length > 0) {
+     ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
+   }
 
-  // Refresh location to get latest towing state
-  await bot.refreshLocation();
-  ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
-  return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+   ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
+   return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
 
 /**
@@ -2717,18 +2837,19 @@ export async function processTowedWrecks(
   // Try to scrap if preferred and skill allows, with retries
   if (preferScrap && canScrap) {
     let scrapSuccess = false;
-    
+
     for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
       ctx.log("scavenge", `🔄 Scrap attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
       const scrapResp = await bot.exec("scrap_wreck");
-      
-      if (!scrapResp.error && scrapResp.result) {
-        const sr = scrapResp.result as Record<string, unknown>;
+
+      // V2 API returns command result in 'details' field, not 'result'
+      const scrapDetails = (scrapResp.details as Record<string, unknown>) || (scrapResp.result as Record<string, unknown>);
+      if (!scrapResp.error && scrapDetails) {
         // Scrap response uses 'materials' field
-        const materials = (sr.materials as Array<Record<string, unknown>>) || [];
-        const totalValue = (sr.total_value as number) || 0;
-        const message = (sr.message as string) || "";
-        
+        const materials = (scrapDetails.materials as Array<Record<string, unknown>>) || [];
+        const totalValue = (scrapDetails.total_value as number) || 0;
+        const message = (scrapDetails.message as string) || "";
+
         if (materials.length > 0) {
           const names = materials.map(m => `${(m.quantity as number) || 1}x ${(m.name as string) || "material"}`).join(", ");
           ctx.log("scavenge", `✅ Scrapped wreck for: ${names} (total value: ${totalValue}cr)`);
@@ -2756,13 +2877,13 @@ export async function processTowedWrecks(
           ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
         }
       }
-      
+
       // Wait briefly before retry (give server time to process)
       if (attempt < MAX_SALVAGE_RETRIES) {
         await sleep(2000);
       }
     }
-    
+
     if (!scrapSuccess && bot.towingWreck) {
       ctx.log("warn", `All ${MAX_SALVAGE_RETRIES} scrap attempts failed — falling back to sell`);
     }
@@ -2771,25 +2892,27 @@ export async function processTowedWrecks(
   // If scrap failed or not preferred, sell the wreck (also with retries)
   if (processed === 0 && bot.towingWreck) {
     let sellSuccess = false;
-    
+
     for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
       ctx.log("scavenge", `💰 Sell attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
       const sellResp = await bot.exec("sell_wreck");
-      
-      if (!sellResp.error && sellResp.result) {
-        const sr = sellResp.result as Record<string, unknown>;
-        const credits = (sr.credits as number) || (sr.earned as number) || 0;
-        const xp = (sr.xp as number) || (sr.experience as number) || 0;
-        const items = (sr.items as Array<Record<string, unknown>>) || [];
 
-        if (credits > 0 || xp > 0 || items.length > 0) {
-          const itemDetails = items.length > 0 ? ` + ${items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ")}` : "";
-          ctx.log("scavenge", `✅ Sold wreck for ${credits}cr + ${xp} XP${itemDetails}`);
+      // V2 API returns command result in 'details' field, not 'result'
+      const sellDetails = (sellResp.details as Record<string, unknown>) || (sellResp.result as Record<string, unknown>);
+      if (!sellResp.error && sellDetails) {
+        // SellWreckResponse uses total_payout, cargo_value, salvage_value
+        const totalPayout = (sellDetails.total_payout as number) || 0;
+        const cargoValue = (sellDetails.cargo_value as number) || 0;
+        const salvageValue = (sellDetails.salvage_value as number) || 0;
+        const message = (sellDetails.message as string) || "";
+
+        if (totalPayout > 0) {
+          ctx.log("scavenge", `✅ Sold wreck for ${totalPayout}cr (cargo: ${cargoValue}, salvage: ${salvageValue})${message ? ` — ${message}` : ""}`);
           processed++;
           sellSuccess = true;
           break; // Success - exit retry loop
         } else {
-          ctx.log("warn", `Sell attempt ${attempt} returned no credits, XP, or items — retrying...`);
+          ctx.log("warn", `Sell attempt ${attempt} returned no payout (${totalPayout}) — retrying...`);
         }
       } else if (sellResp.error) {
         const errMsg = sellResp.error.message.toLowerCase();
@@ -2808,13 +2931,13 @@ export async function processTowedWrecks(
           ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
         }
       }
-      
+
       // Wait briefly before retry (give server time to process)
       if (attempt < MAX_SALVAGE_RETRIES) {
         await sleep(2000);
       }
     }
-    
+
     if (!sellSuccess && bot.towingWreck) {
       ctx.log("error", `All ${MAX_SALVAGE_RETRIES} sell attempts failed — wreck may be lost`);
     }
@@ -2936,6 +3059,76 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
   return false;
 }
 
+/**
+ * Unconditionally attempt to enable cloaking (e.g. when a routine's settings
+ * request permanent cloaking). Returns true if the bot ends up cloaked.
+ * Skips gracefully when already cloaked or when no cloak module is available.
+ */
+export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.isCloaked) return true;
+  try {
+    const resp = await bot.exec("cloak", { enable: true });
+    if (!resp.error) {
+      bot.isCloaked = true;
+      ctx.log("system", `Cloaking enabled in ${bot.system}`);
+      return true;
+    }
+    const msg = String(resp.error.message || "").toLowerCase();
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+      return true;
+    }
+    ctx.log("warn", `Could not enable cloaking: ${resp.error.message}`);
+    return false;
+  } catch (e) {
+    ctx.log("warn", `Could not enable cloaking: ${e}`);
+    return false;
+  }
+}
+
+// ── Transit Detection ───────────────────────────────────────────
+
+/**
+ * Wait for the bot to finish any ongoing transit (jump/travel).
+ * Returns true if bot was in transit and completed it, false if not in transit.
+ * Waits up to maxWaitSeconds (default 120s) before giving up.
+ */
+export async function waitForTransitCompletion(
+  ctx: RoutineContext,
+  maxWaitSeconds: number = 120,
+): Promise<boolean> {
+  const { bot } = ctx;
+  
+  await bot.refreshPOI();
+  
+  if (!bot.inTransit) {
+    return false;
+  }
+  
+  const transitType = bot.transitType || "unknown";
+  const ticksRemaining = bot.ticksRemaining;
+  ctx.log("travel", `Bot is in transit (${transitType}) with ${ticksRemaining} ticks remaining - waiting...`);
+  
+  const startTime = Date.now();
+  const maxWaitMs = maxWaitSeconds * 1000;
+  
+  while (bot.state === "running" && Date.now() - startTime < maxWaitMs) {
+    await bot.refreshPOI();
+    
+    if (!bot.inTransit) {
+      ctx.log("travel", `Transit complete - ${transitType} finished`);
+      return true;
+    }
+    
+    ctx.log("travel", `Still in transit (${bot.transitType}) - ${bot.ticksRemaining} ticks remaining`);
+    await ctx.sleep(10000);
+  }
+  
+  ctx.log("warn", `Transit wait timeout after ${maxWaitSeconds}s - bot still in transit`);
+  return false;
+}
+
 // ── Insurance ────────────────────────────────────────────────
 
 /** Minimum credits to keep when buying insurance. */
@@ -2948,42 +3141,48 @@ const INSURANCE_CREDIT_FLOOR = 500;
  */
 export async function ensureInsured(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
-  if (!bot.docked) return;
+  if (!bot.docked) {
+    ctx.log("insurance", "Skipping insurance check - not docked");
+    return;
+  }
 
   const all = readSettings();
-  if ((all.general?.autoInsure as boolean) === false) return;
+  if ((all.general?.autoInsure as boolean) === false) {
+    ctx.log("insurance", "Skipping insurance check - autoInsure disabled in settings");
+    return;
+  }
 
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && !stationHasService(currentStation, "insurance")) return;
+  if (currentStation && !stationHasService(currentStation, "insurance")) {
+    ctx.log("insurance", `Skipping insurance check - station ${currentStation.name} does not have insurance service`);
+    return;
+  }
 
   const quoteResp = await bot.exec("get_insurance_quote");
-  if (quoteResp.error || !quoteResp.result) return;
+  if (quoteResp.error || !quoteResp.result) {
+    ctx.log("insurance", `Skipping insurance check - quote failed: ${quoteResp.error?.message || "no result"}`);
+    return;
+  }
 
   const q = quoteResp.result as Record<string, unknown>;
   const quoteObj = (q.quote as Record<string, unknown>) ?? q;
 
   // Already insured?
   const insured = (quoteObj.insured as boolean) ?? (q.insured as boolean) ?? false;
-  if (insured) return;
-
-  const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
-  if (cost <= 0) return;
-
-  if (bot.credits < cost + INSURANCE_CREDIT_FLOOR) {
-    ctx.log("info", `Insurance: can't afford ${cost}cr (need ${INSURANCE_CREDIT_FLOOR}cr floor) — skipping`);
+  if (insured) {
+    ctx.log("insurance", "Already insured - skipping purchase");
     return;
   }
 
-  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
-  if (!insureResp.error) {
-    const r = insureResp.result as Record<string, unknown> | undefined;
-    const msg = (r?.message as string) || `Insurance purchased for ${cost}cr`;
-    ctx.log("info", msg);
-    await bot.refreshLocation();
-  } else if (insureResp.error.message.toLowerCase().includes("already")) {
-    // silently skip
+  const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
+  if (cost <= 0) {
+    ctx.log("insurance", "Skipping insurance check - no valid quote cost");
+    return;
   }
+
+  // We are not insured and have a valid quote — buy insurance automatically.
+  await buyInsurance(ctx);
 }
 
 export async function buyInsurance(ctx: RoutineContext): Promise<void> {
@@ -2999,6 +3198,22 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
     const msg = (r?.message as string) || `Insurance purchased for 7 days`;
     ctx.log("insurance", msg);
     logFactionActivity(ctx, "insurance", `Bought insurance: ${msg}`);
+    
+    const quoteResp = await bot.exec("get_insurance_quote");
+    let coverage = 7;
+    let cost = 0;
+    let analysis: Record<string, unknown> | undefined;
+    if (!quoteResp.error && quoteResp.result) {
+      const q = quoteResp.result as Record<string, unknown>;
+      const quoteObj = (q.quote as Record<string, unknown>) ?? q;
+      cost = (quoteObj.cost as number) || (quoteObj.premium as number) || 0;
+      coverage = (quoteObj.coverage as number) || 7;
+      analysis = q as Record<string, unknown>;
+    }
+    
+    recordInsurancePurchase(bot.username, bot.shipId, bot.shipName, cost, coverage, analysis);
+    ctx.log("insurance", `Recorded insurance: shipId=${bot.shipId}, coverage=${coverage} days`);
+    
     await bot.refreshLocation();
   } else {
     const errMsg = insureResp.error?.message || "Unknown error";
@@ -3137,27 +3352,25 @@ export function logStatus(ctx: RoutineContext): void {
   ctx.log("info", `Credits: ${bot.credits} | Fuel: ${fuelPct}% | Hull: ${hullPct}% | Cargo: ${bot.cargo}/${bot.cargoMax} | System: ${bot.system} | Docked: ${bot.docked}`);
 }
 
-/** Minimum credits a bot must keep before donating to faction. */
-const FACTION_DONATE_FLOOR = 1000;
-
 /**
  * Donate a configurable % of profit to the faction treasury.
  * Reads `general.factionDonatePct` from settings (default 10).
- * Bot retains at least 1000 credits after donation.
+ * Bot retains at least `creditsToHold` credits after donation (default 10000).
  */
-export async function factionDonateProfit(ctx: RoutineContext, profit: number): Promise<void> {
+export async function factionDonateProfit(ctx: RoutineContext, profit: number, creditsToHold?: number): Promise<void> {
   if (profit <= 0) return;
   const all = readSettings();
   const pct = (all.general?.factionDonatePct as number) ?? 10;
   if (pct <= 0) return;
   const { bot } = ctx;
+  const hold = creditsToHold ?? (all.general?.factionDonateFloor as number) ?? 10000;
   const donation = Math.floor(profit * (pct / 100));
   if (donation <= 0) return;
-  if (bot.credits - donation < FACTION_DONATE_FLOOR) return;
+  if (bot.credits - donation < hold) return;
   const resp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: donation }); // NEVER CHANGE THIS - deposit credits to faction storage
   if (!resp.error) {
     ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
-    logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
+    logFactionActivity(ctx, "deposit", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
 }
 
@@ -3834,6 +4047,7 @@ export async function handleBattleNotifications(
         ctx.log("combat", "No pirates detected - checking for attacking players...");
         const nearbyResp = await ctx.bot.exec("get_nearby");
         if (!nearbyResp.error && nearbyResp.result) {
+          ctx.bot.trackWildlife(nearbyResp.result);
           const nearbyResult = parseNearbyEntities(nearbyResp.result);
           ctx.log("combat", `Nearby entities: ${nearbyResult.playerCount} players, ${nearbyResult.pirateCount} pirates`);
 

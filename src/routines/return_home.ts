@@ -2,9 +2,7 @@ import type { Routine, RoutineContext } from "../bot.js";
 import {
   getSystemInfo,
   ensureDocked,
-  ensureUndocked,
   navigateToSystem,
-  refuelAtStation,
   findStation,
   isStationPoi,
   isApprovedFuelStation,
@@ -12,10 +10,63 @@ import {
   readSettings,
   checkAndFleeFromBattle,
   repairShip,
-  type BattleState,
-  getBattleStatus,
-  fleeFromBattle,
+  waitForTransitCompletion,
 } from "./common.js";
+
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("travel", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("travel", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("travel", "Enabling cloaking module for return journey...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to enable cloak: ${resp.error.message}`);
+    }
+    return false;
+  }
+
+  ctx.log("travel", "Cloaking enabled successfully");
+  return true;
+}
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -27,6 +78,7 @@ function getReturnHomeSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
   refuelThreshold: number;
+  enableCloak: boolean;
 } {
   const all = readSettings();
   const globalDefaults = all.return_home || {};
@@ -36,6 +88,7 @@ function getReturnHomeSettings(username?: string): {
     homeSystem: (botOverrides.homeSystem as string) || (globalDefaults.homeSystem as string) || "sol",
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
     refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
+    enableCloak: (botOverrides.enableCloak as boolean) ?? (globalDefaults.enableCloak as boolean) ?? true,
   };
 }
 
@@ -80,11 +133,26 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
+  // Check for ongoing transit (jump/travel) before starting
+  yield "check_transit";
+  await bot.refreshPOI();
+  if (bot.inTransit) {
+    ctx.log("travel", `Bot is already in transit (${bot.transitType}) - waiting for completion before return home`);
+    const transitCompleted = await waitForTransitCompletion(ctx, 180);
+    if (!transitCompleted) {
+      ctx.log("error", "Transit did not complete within timeout - cannot start return home");
+      return; // Cancel routine
+    }
+    // Refresh location after transit completes
+    await bot.refreshLocation();
+  }
+
   // Read settings
   const settings = getReturnHomeSettings(bot.username);
   const homeSystem = settings.homeSystem;
   const homeStation = settings.homeStation;
   const refuelThreshold = settings.refuelThreshold;
+  const enableCloak = settings.enableCloak;
 
   if (!homeSystem) {
     ctx.log("error", "No home system configured — cannot return home");
@@ -92,6 +160,11 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
+
+  // Enable cloaking if configured and module is available
+  if (enableCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
 
   // Battle check before starting return home
   if (await checkAndFleeFromBattle(ctx, "return_home")) {
@@ -103,7 +176,17 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   await bot.refreshLocation();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
-      ctx.log("travel", "Already at home station — checking repair status...");
+      ctx.log("travel", "Already at home station — checking dock/repair status...");
+      // The bot can be at the station POI but not docked (idle in orbit).
+      // If so, dock it before treating the routine as complete.
+      if (!bot.docked) {
+        ctx.log("travel", "At home station but not docked — docking now...");
+        const docked = await ensureDocked(ctx, true);
+        if (!docked) {
+          ctx.log("error", "Failed to dock at home station — routine cancelled");
+          return; // Cancel routine
+        }
+      }
       // Check and repair if needed before leaving
       const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (hullPct < 95) {
@@ -351,9 +434,50 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
+  // Double-check: verify the bot is actually docked before ending the routine.
+  // If not docked (e.g. dock call silently failed or bot got undocked), actually dock.
+  await bot.refreshLocation();
+  if (!bot.docked) {
+    ctx.log("warn", "Double-check: bot is not docked after routine — re-attempting dock...");
+    const MAX_DOCK_CHECK_ATTEMPTS = 3;
+    let docked = false;
+    for (let dockAttempt = 1; dockAttempt <= MAX_DOCK_CHECK_ATTEMPTS && !docked; dockAttempt++) {
+      ctx.log("system", `Dock double-check attempt ${dockAttempt}/${MAX_DOCK_CHECK_ATTEMPTS}...`);
+      docked = await ensureDocked(ctx, true);
+      if (!docked) {
+        await bot.refreshLocation();
+        if (bot.docked) {
+          docked = true;
+          break;
+        }
+        if (dockAttempt < MAX_DOCK_CHECK_ATTEMPTS) {
+          await ctx.sleep(3000);
+        }
+      }
+    }
+    if (!docked) {
+      ctx.log("error", "Double-check failed: bot could not be docked at home station — routine cancelled");
+      return; // Cancel routine
+    }
+
+    // After successful re-dock, ensure repair/refuel completed
+    await bot.refreshShip();
+    const reDockedHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (reDockedHullPct < 95) {
+      ctx.log("system", `Hull at ${reDockedHullPct}% — repairing after re-dock...`);
+      await repairShip(ctx);
+    }
+    const reDockedFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (reDockedFuelPct < refuelThreshold) {
+      ctx.log("system", `Fuel at ${reDockedFuelPct}% — refueling after re-dock...`);
+      await ensureFueled(ctx, refuelThreshold);
+      await ensureDocked(ctx, true);
+    }
+  }
+
   // Final status
   await bot.refreshLocation();
-  ctx.log("travel", `Return Home complete — docked at ${targetStation.name} in ${homeSystem}`);
+  ctx.log("travel", `Return Home complete — docked at ${bot.poi} in ${homeSystem}`);
   ctx.log("info", `Bot status: ${bot.credits} credits, ${bot.fuel}/${bot.maxFuel} fuel, ${bot.hull}/${bot.maxHull} hull`);
 
   // Routine complete — return to cancel it (no loop)

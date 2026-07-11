@@ -58,3 +58,7 @@ export async function onCoordinationUpdate(file: string, data: unknown): Promise
 export async function onRescueUpdate(type: "queue" | "blackbook", data: unknown): Promise<void> {
   await _fire("rescue", { type, data: JSON.parse(JSON.stringify(data)) });
 }
+
+export async function onWildlifeUpdate(data: unknown): Promise<void> {
+  await _fire("wildlife", { data: JSON.parse(JSON.stringify(data)) });
+}

@@ -11,7 +11,7 @@
     .fa-header h3 { margin: 0 0 4px 0; font-size: 16px; }
     .fa-header p { margin: 0; color: var(--text-dim); font-size: 12px; }
     .fa-controls { flex-shrink: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .fa-controls select { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-size: 13px; min-width: 180px; }
+    .fa-controls select { background: #000; color: #fff; border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-size: 13px; min-width: 180px; }
     .fa-controls button { background: var(--accent); color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
     .fa-controls button:hover { opacity: 0.9; }
     .fa-controls button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -25,6 +25,26 @@
     .fa-stat-value.credits-out { color: #f97316; }
     .fa-stat-value.net { color: var(--accent); }
     .fa-stat-value.count { color: var(--text); }
+    .fa-breakdown { flex-shrink: 0; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; max-height: 230px; overflow-y: auto; }
+    .fa-breakdown h4 { margin: 0 0 6px 0; font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-breakdown table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .fa-breakdown th, .fa-breakdown td { padding: 3px 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .fa-breakdown th { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-breakdown tr.total td { border-top: 1px solid var(--border); border-bottom: none; font-weight: 600; }
+    .fa-breakdown .amt { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .fa-breakdown .amt.in { color: #4ade80; }
+    .fa-breakdown .amt.out { color: #f97316; }
+    .fa-breakdown .amt.net { color: var(--accent); }
+    .fa-breakdown .src { color: var(--text); }
+    .fa-breakdown .empty { color: var(--text-dim); padding: 4px 0; }
+    .fa-bot-summary { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 12px; }
+    .fa-bot-summary table { width: 100%; border-collapse: collapse; }
+    .fa-bot-summary th, .fa-bot-summary td { padding: 4px 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .fa-bot-summary th { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-bot-summary .amt { min-width: 80px; text-align: right; }
+    .fa-bot-summary .amt.in { color: #4ade80; }
+    .fa-bot-summary .amt.out { color: #f97316; }
+    .fa-bot-summary .amt.net { color: var(--accent); }
     .fa-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     .fa-log-header { display: flex; justify-content: space-between; align-items: center; padding: 0 4px; }
     .fa-log-header span { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
@@ -44,6 +64,13 @@
     .fa-row .cat.salvage { color: #ff7b72; }
     .fa-row .cat.storage { color: #79c0ff; }
     .fa-row .cat.skill { color: #a78bfa; }
+    .fa-row .cat.mining { color: #f97316; }
+    .fa-row .cat.navigation { color: #58a6ff; }
+    .fa-row .cat.exploration { color: #39d2c0; }
+    .fa-row .cat.reputation { color: #bc8cff; }
+    .fa-row .cat.drone { color: #ff7b72; }
+    .fa-row .cat.session { color: #8b949e; }
+    .fa-row .cat.achievement { color: #a78bfa; }
     .fa-row .cat.other { color: #8b949e; }
     .fa-row .amt { min-width: 90px; text-align: right; font-weight: 600; }
     .fa-row .amt.in { color: #4ade80; }
@@ -75,12 +102,31 @@
       <button class="fa-cat-btn" data-cat="salvage" style="background:#1a1a2e;color:#555;border-color:#333;">salvage</button>
       <button class="fa-cat-btn" data-cat="storage" style="background:#1a1a2e;color:#555;border-color:#333;">storage</button>
       <button class="fa-cat-btn" data-cat="skill" style="background:#1a1a2e;color:#555;border-color:#333;">skill</button>
+      <button class="fa-cat-btn" data-cat="mining" style="background:#1a1a2e;color:#555;border-color:#333;">mining</button>
+      <button class="fa-cat-btn" data-cat="navigation" style="background:#1a1a2e;color:#555;border-color:#333;">navigation</button>
+      <button class="fa-cat-btn" data-cat="exploration" style="background:#1a1a2e;color:#555;border-color:#333;">exploration</button>
+      <button class="fa-cat-btn" data-cat="reputation" style="background:#1a1a2e;color:#555;border-color:#333;">reputation</button>
+      <button class="fa-cat-btn" data-cat="drone" style="background:#1a1a2e;color:#555;border-color:#333;">drone</button>
+      <button class="fa-cat-btn" data-cat="session" style="background:#1a1a2e;color:#555;border-color:#333;">session</button>
+      <button class="fa-cat-btn" data-cat="achievement" style="background:#1a1a2e;color:#555;border-color:#333;">achievement</button>
       <button class="fa-cat-btn" data-cat="other" style="background:#1a1a2e;color:#555;border-color:#333;">other</button>
     </div>
-    <input type="number" id="faPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Page number">
+    <select id="faEventTypeSelect" style="display:none;background:#000;color:#fff;border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:13px;min-width:140px;" title="Filter by event type">
+      <option value="">event type</option>
+    </select>
+    <input type="number" id="faStartPageInput" value="1" min="1" style="width:50px;background:#000;color:#fff;border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Start page">
+    <input type="number" id="faPageCountInput" value="1" min="1" max="10" style="width:50px;background:#000;color:#fff;border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Number of pages">
     <button id="faLoadBtn" onclick="loadActionLog()">Load Log</button>
+    <button id="faLoadPagesBtn" onclick="loadMultiplePages()">Load Pages</button>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faLoadAllBots" style="width:14px;height:14px;">Load all bots</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faShowBotSummary" style="width:14px;height:14px;">Bot summary</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
     <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
+    <button onclick="clearFaResults()" style="background:#21262d;border:1px solid var(--border);color:var(--text);">Clear Log</button>
     <span id="faCooldown" style="font-size:11px;color:var(--text-dim);display:none;">Wait 1s...</span>
   </div>
 
@@ -92,19 +138,24 @@
     <div class="fa-stat-card"><div class="fa-stat-label">Filtered</div><div class="fa-stat-value count" id="faFilteredCount">0</div></div>
   </div>
 
+  <div class="fa-breakdown" id="faBreakdown">
+    <h4>Credit Breakdown by Source</h4>
+    <div id="faBreakdownBody"><div class="empty">Load a log to see where credits came in from and went out to.</div></div>
+  </div>
+
   <div class="fa-body">
     <div id="faStatus" class="fa-status">Initializing connection...</div>
     <div class="fa-log-header">
       <span>Action Log Entries</span>
-      <button onclick="clearFaResults()">Clear</button>
     </div>
     <div class="fa-log" id="faLog">
       <div class="fa-empty">Select a bot, choose categories, then click <b>Load Log</b>.<br>Use <b>Paste JSON</b> for bulk data from get_action_log.</div>
     </div>
   </div>
+  <div id="faBotSummary" class="fa-bot-summary" style="display:none;"></div>
 </div>
 
-<div id="faPasteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;display:none;align-items:center;justify-content:center;">
+<div id="faPasteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center;">
   <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px;width:90%;max-width:700px;max-height:85vh;display:flex;flex-direction:column;gap:10px;">
     <div style="display:flex;justify-content:space-between;align-items:center;">
       <strong style="font-size:14px;">Paste get_action_log JSON Result</strong>
@@ -128,7 +179,21 @@
   let creditsOut = 0;
   let pendingLoad = false;
   let activeCat = '';
+  let activeEventType = '';
   let seenIds = new Set();
+  let lastLoadedPage = 1;
+
+  const EVENT_TYPES = {
+    mining: ['yield'],
+    navigation: ['jumped'],
+    exploration: ['discovered'],
+    reputation: ['changed'],
+    drone: ['deploy', 'recall', 'loss'],
+    session: ['login'],
+    trading: ['buy', 'sell'],
+    combat: ['damage', 'kill', 'outcome'],
+    mission: ['abandon', 'expire', 'complete']
+  };
 
   // ── Helpers ─────────────────────────────────────────────
   function esc(s) {
@@ -242,37 +307,181 @@
     }
   }
 
+  function sendExecWithRetry(bot, command, params, callback, retryCount = 0) {
+    const seq = Date.now();
+    execCallbacks.set(seq, (result) => {
+      if (result.error && (result.error.includes('pending') || result.error.includes('busy') || result.error.includes('timeout'))) {
+        if (retryCount < 10) {
+          setTimeout(() => sendExecWithRetry(bot, command, params, callback, retryCount + 1), 1000);
+          return;
+        }
+      }
+      callback(result);
+    });
+    ws.send(JSON.stringify({ type: 'exec', bot, command, params, _seq: seq }));
+  }
+
   // ── Load Action Log ─────────────────────────────────────
   function loadActionLog() {
     if (pendingLoad) {
       setFaStatus('Cooldown: wait 1 second before loading again.', false, true);
       return;
     }
+    pendingLoad = true;
+    document.getElementById('faLoadBtn').disabled = true;
+    document.getElementById('faCooldown').style.display = 'inline';
+    const cooldownEl = document.getElementById('faCooldown');
+    let countdown = 1;
+    cooldownEl.textContent = 'Wait ' + countdown + 's...';
+    const timer = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        clearInterval(timer);
+        pendingLoad = false;
+        document.getElementById('faLoadBtn').disabled = false;
+        cooldownEl.style.display = 'none';
+      } else {
+        cooldownEl.textContent = 'Wait ' + countdown + 's...';
+      }
+    }, 1000);
     const bot = document.getElementById('faBotSelect').value;
-    if (!bot) { alert('Select a bot first'); return; }
-    if (ws && ws.readyState !== WebSocket.OPEN) { alert('Not connected to server'); return; }
+    if (!bot) {
+      pendingLoad = false;
+      document.getElementById('faLoadBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+    if (ws && ws.readyState !== WebSocket.OPEN) {
+      pendingLoad = false;
+      document.getElementById('faLoadBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
 
-    const page = Math.max(1, parseInt(document.getElementById('faPageInput').value) || 1);
-    const params = activeCat ? { category: activeCat, page } : { page };
+    const page = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
+    const params = {};
+    if (activeCat) params.category = activeCat;
+    if (activeEventType) params.event_type = activeEventType;
+    params.page = page;
     const label = activeCat || 'all';
     setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
 
-    sendExec(bot, 'get_action_log', params, (result) => {
-      document.getElementById('faLoadBtn').disabled = false;
+    sendExecWithRetry(bot, 'get_action_log', params, (result) => {
       if (result.error) {
         setFaStatus('Error: ' + esc(result.error), true);
         return;
       }
       const data = result.data || {};
-      const entries = parseEntries(data);
+      const entries = parseEntries(data, bot);
+      lastLoadedPage = page;
+      document.getElementById('faStartPageInput').value = page + 1;
       setFaStatus('Loaded ' + entries.length + ' entries for ' + esc(bot) + ' (page ' + page + ')', false, false);
       ingestEntries(entries);
       renderResults();
     });
   }
 
+  function loadMultiplePages() {
+    if (pendingLoad) {
+      setFaStatus('Cooldown: wait 1 second before loading again.', false, true);
+      return;
+    }
+    pendingLoad = true;
+    document.getElementById('faLoadPagesBtn').disabled = true;
+    document.getElementById('faCooldown').style.display = 'inline';
+    const cooldownEl = document.getElementById('faCooldown');
+    let countdown = 1;
+    cooldownEl.textContent = 'Wait ' + countdown + 's...';
+    const timer = setInterval(() => {
+      countdown--;
+      if (countdown <= 0) {
+        clearInterval(timer);
+        pendingLoad = false;
+        document.getElementById('faLoadPagesBtn').disabled = false;
+        cooldownEl.style.display = 'none';
+      } else {
+        cooldownEl.textContent = 'Wait ' + countdown + 's...';
+      }
+    }, 1000);
+
+    const loadAllBots = document.getElementById('faLoadAllBots').checked;
+    const singleBot = document.getElementById('faBotSelect').value;
+    if (!loadAllBots && !singleBot) {
+      pendingLoad = false;
+      document.getElementById('faLoadPagesBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+    if (ws && ws.readyState !== WebSocket.OPEN) {
+      pendingLoad = false;
+      document.getElementById('faLoadPagesBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      return;
+    }
+
+    const startPage = Math.max(1, parseInt(document.getElementById('faStartPageInput').value) || 1);
+    const pageCount = Math.max(1, Math.min(10, parseInt(document.getElementById('faPageCountInput').value) || 1));
+    const params = {};
+    if (activeCat) params.category = activeCat;
+    if (activeEventType) params.event_type = activeEventType;
+    const label = activeCat || 'all';
+
+    const targetBots = loadAllBots ? bots.map(b => b.username) : [singleBot];
+    const botTotal = targetBots.length;
+    if (botTotal === 0) {
+      pendingLoad = false;
+      document.getElementById('faLoadPagesBtn').disabled = false;
+      document.getElementById('faCooldown').style.display = 'none';
+      setFaStatus('No bots available. Connect to bots first.', true);
+      return;
+    }
+    let botIndex = 0;
+    let totalEntries = 0;
+    let currentPageOffset = 0;
+
+    const loadBotPage = (bot, page) => {
+      params.page = page;
+      sendExecWithRetry(bot, 'get_action_log', params, (result) => {
+        if (result.error) {
+          setFaStatus('Error for ' + esc(bot) + ' page ' + page + ': ' + esc(result.error), true);
+        } else {
+          const data = result.data || {};
+          const entries = parseEntries(data, bot);
+          totalEntries += entries.length;
+          ingestEntries(entries, true);
+          setFaStatus('Loaded ' + entries.length + ' entries for ' + esc(bot) + ' (page ' + page + ')', false, false);
+        }
+
+        botIndex++;
+        if (botIndex < botTotal) {
+          setTimeout(() => loadBotPage(targetBots[botIndex], page), 100);
+        } else {
+          currentPageOffset++;
+          if (currentPageOffset < pageCount) {
+            botIndex = 0;
+            loadPageBatch(currentPageOffset);
+          } else {
+            lastLoadedPage = startPage + pageCount - 1;
+            document.getElementById('faStartPageInput').value = startPage + pageCount;
+            renderResults();
+            setFaStatus('Completed: ' + totalEntries + ' total entries from ' + botTotal + ' bot(s)', false, false);
+          }
+        }
+      });
+    };
+
+    const loadPageBatch = (pageOffset) => {
+      setFaStatus('Loading page ' + (pageOffset + 1) + ' for ' + botTotal + ' bot(s)...', false, true);
+      botIndex = 0;
+      loadBotPage(targetBots[0], startPage + pageOffset);
+    };
+
+    setFaStatus('Loading page ' + startPage + ' for ' + botTotal + ' bot(s)...', false, true);
+    loadPageBatch(0);
+  }
+
   // ── Parse ───────────────────────────────────────────────
-  function parseEntries(data) {
+  function parseEntries(data, bot = 'unknown') {
     const arr = Array.isArray(data) ? data : (data.entries || data.results || data.log || []);
     return arr.map((e, i) => {
       const category = e.category || e.cat || e.type || 'unknown';
@@ -280,16 +489,39 @@
       const eventType = e.event_type || e.action || e.subtype || e.event || '';
       const summary = e.summary || e.message || e.msg || e.description || '';
       const d = e.data || {};
-      const credits = typeof d.credits === 'number' ? d.credits
-        : typeof d.total_cost === 'number' ? -d.total_cost
-        : typeof d.cost === 'number' ? -d.cost : 0;
+      const credits = extractCredits(e, d, summary, eventType);
       const itemId = d.item_id || d.itemId || d.item || '';
       const id = e.id ?? e._i ?? i;
-      return { id, category, timestamp, eventType, summary, credits, itemId, raw: e };
+      return { id, bot, category, timestamp, eventType, summary, credits, itemId, raw: e };
     });
   }
 
-  function ingestEntries(entries) {
+  // Pull credits from structured fields first; fall back to parsing the
+  // summary text (e.g. "Sold 12x Power Cell @ 2671 each (32052 credits)").
+  function extractCredits(e, d, summary, eventType) {
+    if (typeof d.credits === 'number') return d.credits;
+    if (typeof d.total_cost === 'number') return -d.total_cost;
+    if (typeof d.cost === 'number') return -d.cost;
+
+    const ev = String(eventType || '').toLowerCase();
+    const text = String(summary || '');
+    const m = text.match(/\(([\d,]+)\s*credits?\)/i) || text.match(/([\d,]+)\s*credits?/i);
+    if (m) {
+      const amt = parseInt(m[1].replace(/,/g, ''), 10);
+      if (!isNaN(amt)) {
+        let sign = 1;
+        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || ev === 'buy') {
+          sign = -1;
+        } else if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || ev === 'sell') {
+          sign = 1;
+        }
+        return sign * amt;
+      }
+    }
+    return 0;
+  }
+
+  function ingestEntries(entries, skipRender = false) {
     for (const e of entries) {
       if (!seenIds.has(e.id)) {
         seenIds.add(e.id);
@@ -297,11 +529,23 @@
       }
     }
     applyFilter();
-    renderResults();
+    if (!skipRender) renderResults();
   }
 
   function applyFilter() {
-    filteredEntries = activeCat ? rawEntries.filter(e => e.category === activeCat) : rawEntries;
+    const excludeGifts = document.getElementById('faExcludeGifts').checked;
+    const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
+    const excludeExchangeFill = document.getElementById('faExcludeExchangeFill').checked;
+    const excludePassengerFare = document.getElementById('faExcludePassengerFare').checked;
+    filteredEntries = rawEntries.filter(e => {
+      if (activeCat && e.category !== activeCat) return false;
+      if (activeEventType && e.eventType !== activeEventType) return false;
+      if (excludeGifts && e.category === 'trading' && (e.eventType.includes('gift_sent') || e.eventType.includes('gift_received'))) return false;
+      if (excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) return false;
+      if (excludeExchangeFill && e.eventType.includes('exchange_fill')) return false;
+      if (excludePassengerFare && e.eventType.includes('passenger_fare')) return false;
+      return true;
+    });
     creditsIn = 0;
     creditsOut = 0;
     for (const e of filteredEntries) {
@@ -313,6 +557,57 @@
     document.getElementById('faNet').textContent = fmt(creditsIn - creditsOut);
     document.getElementById('faEntryCount').textContent = rawEntries.length;
     document.getElementById('faFilteredCount').textContent = filteredEntries.length;
+    renderBreakdown(filteredEntries);
+  }
+
+  function renderBreakdown(entries) {
+    const body = document.getElementById('faBreakdownBody');
+    if (!body) return;
+    if (entries.length === 0) {
+      body.innerHTML = '<div class="empty">No entries match the current filter.</div>';
+      return;
+    }
+    const map = {};
+    for (const e of entries) {
+      const key = e.category + '.' + (e.eventType || '—');
+      if (!map[key]) map[key] = { in: 0, out: 0 };
+      if (e.credits > 0) map[key].in += e.credits;
+      else if (e.credits < 0) map[key].out += Math.abs(e.credits);
+    }
+    const rows = Object.entries(map)
+      .map(([key, v]) => ({ key, in: v.in, out: v.out, net: v.in - v.out, vol: v.in + v.out }))
+      .filter(r => r.vol > 0)
+      .sort((a, b) => b.vol - a.vol);
+    if (rows.length === 0) {
+      body.innerHTML = '<div class="empty">No credited activity to break down.</div>';
+      return;
+    }
+    const tIn = rows.reduce((s, r) => s + r.in, 0);
+    const tOut = rows.reduce((s, r) => s + r.out, 0);
+    const rowHtml = rows.map(r => {
+      return `<tr><td class="src">${esc(r.key)}</td>` +
+        `<td class="amt in">${r.in ? fmt(r.in) : '-'}</td>` +
+        `<td class="amt out">${r.out ? fmt(r.out) : '-'}</td>` +
+        `<td class="amt net">${fmt(r.net)}</td></tr>`;
+    }).join('');
+    const totalHtml = `<tr class="total"><td class="src">TOTAL</td>` +
+      `<td class="amt in">${fmt(tIn)}</td>` +
+      `<td class="amt out">${fmt(tOut)}</td>` +
+      `<td class="amt net">${fmt(tIn - tOut)}</td></tr>`;
+    body.innerHTML = `<table><thead><tr><th>Source</th><th class="amt">In</th><th class="amt">Out</th><th class="amt">Net</th></tr></thead>` +
+      `<tbody>${rowHtml}${totalHtml}</tbody></table>`;
+  }
+
+  function updateEventTypeOptions() {
+    const select = document.getElementById('faEventTypeSelect');
+    const events = EVENT_TYPES[activeCat] || [];
+    select.innerHTML = '<option value="">event type</option>' + events.map(e => `<option value="${e}">${e}</option>`).join('');
+    select.style.display = activeCat ? 'inline-block' : 'none';
+    if (!events.length || select.value === '') {
+      select.value = '';
+      applyFilter();
+      renderResults();
+    }
   }
 
   // ── Render ──────────────────────────────────────────────
@@ -339,13 +634,50 @@
     seenIds = new Set();
     creditsIn = 0;
     creditsOut = 0;
+    activeEventType = '';
+    lastLoadedPage = 1;
+    document.getElementById('faStartPageInput').value = 1;
     document.getElementById('faCreditsIn').textContent = '0';
     document.getElementById('faCreditsOut').textContent = '0';
     document.getElementById('faNet').textContent = '0';
     document.getElementById('faEntryCount').textContent = '0';
     document.getElementById('faFilteredCount').textContent = '0';
+    const breakdownBody = document.getElementById('faBreakdownBody');
+    if (breakdownBody) breakdownBody.innerHTML = '<div class="empty">Load a log to see where credits came in from and went out to.</div>';
     document.getElementById('faLog').innerHTML = '<div class="fa-empty">Cleared. Load new data.</div>';
+    document.getElementById('faBotSummary').innerHTML = '';
+    document.getElementById('faBotSummary').style.display = 'none';
     setFaStatus('', false, false);
+  }
+
+  function renderBotSummary() {
+    const summaryEl = document.getElementById('faBotSummary');
+    const logEl = document.getElementById('faLog');
+    const showSummary = document.getElementById('faShowBotSummary').checked;
+    if (showSummary) {
+      logEl.style.display = 'none';
+      summaryEl.style.display = 'block';
+      const excludeGifts = document.getElementById('faExcludeGifts').checked;
+      const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
+      const botStats = {};
+      for (const e of rawEntries) {
+        const bot = e.bot || 'unknown';
+        if (!botStats[bot]) botStats[bot] = { in: 0, out: 0 };
+        const include = !(excludeGifts && e.category === 'trading' && (e.eventType.includes('gift_sent') || e.eventType.includes('gift_received'))) &&
+                        !(excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw'));
+        if (include) {
+          if (e.credits > 0) botStats[bot].in += e.credits;
+          else if (e.credits < 0) botStats[bot].out += Math.abs(e.credits);
+        }
+      }
+      const rows = Object.entries(botStats).map(([bot, stats]) => {
+        return `<tr><td>${esc(bot)}</td><td class="amt in">${fmt(stats.in)}</td><td class="amt out">${fmt(stats.out)}</td><td class="amt net">${fmt(stats.in - stats.out)}</td></tr>`;
+      }).join('');
+      summaryEl.innerHTML = `<table><thead><tr><th>Bot</th><th>Credits In</th><th>Credits Out</th><th>Net</th></tr></thead><tbody>${rows}</tbody></table>`;
+    } else {
+      logEl.style.display = 'block';
+      summaryEl.style.display = 'none';
+    }
   }
 
   function setFaStatus(text, isErr, isLoading) {
@@ -375,12 +707,53 @@
     if (!btn) return;
     const cat = btn.dataset.cat;
     activeCat = cat;
+    activeEventType = '';
     document.querySelectorAll('#faCatGroup .fa-cat-btn').forEach(b => styleCatBtn(b, false));
     if (activeCat === '') {
       styleCatBtn(document.querySelector('#faCatGroup .fa-cat-btn[data-cat=""]'), true);
     } else {
       styleCatBtn(btn, true);
     }
+    updateEventTypeOptions();
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faEventTypeSelect').addEventListener('change', () => {
+    activeEventType = document.getElementById('faEventTypeSelect').value;
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faStartPageInput').addEventListener('input', () => {
+    lastLoadedPage = 0;
+  });
+
+  document.getElementById('faPageCountInput').addEventListener('input', () => {
+    const val = parseInt(document.getElementById('faPageCountInput').value) || 1;
+    document.getElementById('faPageCountInput').value = Math.max(1, Math.min(10, val));
+  });
+
+  document.getElementById('faShowBotSummary').addEventListener('change', () => {
+    renderBotSummary();
+  });
+
+  document.getElementById('faExcludeGifts').addEventListener('change', () => {
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faExcludeFactionWithdraw').addEventListener('change', () => {
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faExcludeExchangeFill').addEventListener('change', () => {
+    applyFilter();
+    renderResults();
+  });
+
+  document.getElementById('faExcludePassengerFare').addEventListener('change', () => {
     applyFilter();
     renderResults();
   });
@@ -414,7 +787,7 @@
       alert('Invalid JSON: ' + e.message);
       return;
     }
-    const entries = parseEntries(data);
+    const entries = parseEntries(data, 'unknown');
     closePasteModal();
     setFaStatus('Parsed ' + entries.length + ' entries from pasted JSON', false, false);
     ingestEntries(entries);
@@ -454,6 +827,7 @@
   initCatStyles();
   fetchInitialData();
   connect();
+  document.getElementById('faStartPageInput').value = 1;
 </script>
 </body>
 </html>

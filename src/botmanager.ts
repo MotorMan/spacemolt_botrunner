@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
@@ -11,6 +11,7 @@ import { traderRoutine } from "./routines/trader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
+import { craftTradeRoutine } from "./routines/craft_trade.js";
 import { tradeBuyerRoutine } from "./routines/trade_buyer.js";
 import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
@@ -23,9 +24,11 @@ import { escortRoutine } from "./routines/escort-fleet.js";
 import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
-import { civilianTransportRoutine } from "./routines/civilianTransport.js";
+import { civilianTransportRoutine, unloadPassengersToLounge } from "./routines/civilianTransport.js";
 import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
+import { fuelServiceRoutine } from "./routines/fuelService.js";
+import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -43,7 +46,9 @@ import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
-import { buyInsurance } from "./routines/common.js";
+import { ensureInsured } from "./routines/common.js";
+import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
+import { logSkills, refreshSkillNames } from "./skillTracker.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -117,6 +122,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },
   fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
+  craft_trade: { name: "CraftTrade", fn: craftTradeRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
   fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },
@@ -130,6 +136,8 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
   civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
+  fuel_service: { name: "FuelService", fn: fuelServiceRoutine },
+  stealth_skill_grind: { name: "StealthSkillGrind", fn: stealthSkillGrindRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────
@@ -265,6 +273,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
       syncCoordination: ((s.syncCoordination as boolean) ?? true),
       syncCivilianTransport: ((s.syncCivilianTransport as boolean) ?? true),
       syncRescue: ((s.syncRescue as boolean) ?? true),
+      syncWildlife: ((s.syncWildlife as boolean) ?? true),
       allowRemoteBotsInDropdowns: ((s.allowRemoteBotsInDropdowns as boolean) ?? true),
       remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
       pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
@@ -428,6 +437,22 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   const routine = ROUTINES[routineKey];
   if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
 
+  // Check insurance status using persistent log before starting routine
+  // This avoids the 10sec delay of calling get_insurance_quote on every start
+  const insuranceRecord = getInsuranceRecord(botName);
+  if (insuranceRecord && bot.shipId) {
+    const status = getInsuranceStatus(botName, bot.shipId);
+    const timestamp = new Date(insuranceRecord.timestamp).toLocaleString("en-US", { hour12: false });
+    
+    if (!status.needsRepurchase && status.isInsured) {
+      server.logSystem(`${botName}: Ship ${bot.shipId} has valid insurance (${status.timeRemaining} remaining, purchased: ${timestamp})`);
+    } else if (bot.shipId !== insuranceRecord.shipId) {
+      server.logSystem(`${botName}: Ship changed from ${insuranceRecord.shipId} to ${bot.shipId} - needs insurance check`);
+    } else {
+      server.logSystem(`${botName}: Insurance expiring soon (${status.timeRemaining}) - will check on dock`);
+    }
+  }
+
   saveLastUsedRoutine(botName, routineKey);
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
 
@@ -449,6 +474,12 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     getAllBotNames: () => [...bots.keys()],
     getBotAssignments: () => server.getBotAssignments(),
     log: (category: string, message: string) => server.logBot(botName, `[${category}] ${message}`),
+    getBotFreshStatus: async (targetBotName: string): Promise<import("./bot.js").BotStatus | null> => {
+      const targetBot = bots.get(targetBotName);
+      if (!targetBot || !targetBot.api.getSession()) return null;
+      await targetBot.refreshLocation();
+      return targetBot.status();
+    },
   };
 
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
@@ -723,18 +754,37 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   }
 
   debugLogForBot(botName, "exec:handler", `${botName} > ${command}`, params);
+
+  // Manual connecting-flight handoff: unload_passenger target=lounge
+  // navigates the bot to the faction home base and checks all (or the named)
+  // aboard passengers into the faction Transit Lounge for another bot to pick up.
+  if (command === "unload_passenger") {
+    const target = (params as Record<string, unknown> | undefined)?.target as string | undefined;
+    if (target && target.toLowerCase() === "lounge") {
+      const result = await unloadPassengersToLounge(bot, {
+        id: (params as Record<string, unknown> | undefined)?.id as string | undefined,
+      });
+      if (!result.ok) {
+        return { ok: false, error: result.error };
+      }
+      refreshStatusTable();
+      return { ok: true, message: result.message };
+    }
+  }
+
   let resp = await bot.exec(command, params);
 
   // Track player names from get_nearby responses
   if (!resp.error && resp.result && command === "get_nearby") {
     bot.trackNearbyPlayers(resp.result);
+    bot.trackWildlife(resp.result);
   }
 
 // Broadcast skills update for get_skills command
   if (!resp.error && resp.result && command === "get_skills") {
     // The API returns skills directly in resp.result (normalized from structuredContent)
     const r = resp.result as Record<string, unknown>;
-    const skillsObj: Record<string, unknown> | null = 
+const skillsObj: Record<string, unknown> | null = 
       (r.skills && typeof r.skills === "object") 
         ? r.skills as Record<string, unknown>
         : r;
@@ -742,7 +792,6 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     if (skillsObj) {
       const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
       for (const [skillId, s] of Object.entries(skillsObj)) {
-        // Skip non-skill keys
         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
         
         if (s && typeof s === "object") {
@@ -759,23 +808,25 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
       }
       server.broadcastSkillsUpdate(botName, skillData);
     }
+    logSkills(bot);
   }
 
-// Refresh cached state after mutating commands
+  // Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
     "refuel", "repair", "deposit_items", "withdraw_items", "jettison",
     "attack", "loot_wreck", "salvage_wreck", "send_gift", "craft",
     "accept_mission", "complete_mission", "abandon_mission",
     "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
+    "set_home_base",
   ]);
   const stateRefreshCommands = new Set(["get_cargo", "get_ship", "get_location", "view_storage", "view_faction_storage"]);
   
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
 
-    if (command === "switch_ship") {
-      await buyInsurance({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
+    if (command === "switch_ship" && !resp.error) {
+      await ensureInsured({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
     }
 
     // Also refresh the recipient bot after gift/trade
@@ -859,7 +910,7 @@ async function main(): Promise<void> {
   const settings = loadSettings();
   const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
   server = new WebServer(port);
-  server.routines = Object.keys(ROUTINES);
+  server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
   server.onShutdown = async () => {
     (globalThis as any).shutdownServer("web-ui");
@@ -893,6 +944,7 @@ async function main(): Promise<void> {
       syncCoordination: (csSettings.syncCoordination as boolean) ?? true,
       syncCivilianTransport: (csSettings.syncCivilianTransport as boolean) ?? true,
       syncRescue: (csSettings.syncRescue as boolean) ?? true,
+      syncWildlife: (csSettings.syncWildlife as boolean) ?? true,
       allowRemoteBotsInDropdowns: (csSettings.allowRemoteBotsInDropdowns as boolean) ?? true,
       remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
       pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,
@@ -975,7 +1027,10 @@ async function main(): Promise<void> {
     } else {
       server.logSystem(`Galaxy map seeded: ${seeded} new system(s), ${known} already known`);
     }
-  }).catch(() => {
+    console.log(`[MAP_SEED] Completed: seeded=${seeded}, known=${known}, failed=${failed}`);
+    console.log(`[MAP_SEED] Total systems in map: ${Object.keys(mapStore.getAllSystems()).length}`);
+  }).catch((err) => {
+    console.log(`[MAP_SEED] Failed: ${err}`);
     server.logSystem("Galaxy map seed failed — will rely on exploration data");
   });
 
@@ -1013,6 +1068,7 @@ async function main(): Promise<void> {
             server.logSystem(`${name} session resumed (no login delay)`);
             try {
               await bot.updateTaxEstimate();
+              await bot.updateFactionTaxEstimate();
             } catch (err) {
               server.logSystem(`Tax collection failed for ${name}: ${err}`);
             }
@@ -1054,6 +1110,7 @@ async function main(): Promise<void> {
               }
               try {
                 await bot.updateTaxEstimate();
+                await bot.updateFactionTaxEstimate();
               } catch (err) {
                 server.logSystem(`Tax collection failed for ${name}: ${err}`);
               }
@@ -1061,6 +1118,7 @@ async function main(): Promise<void> {
                 try {
                   await catalogStore.fetchAll(bot.api);
                   server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  refreshSkillNames();
                 } catch (err) {
                   server.logSystem(`Catalog fetch failed: ${err}`);
                 }
@@ -1094,6 +1152,7 @@ async function main(): Promise<void> {
                 }
                 try {
                   await bot.updateTaxEstimate();
+                  await bot.updateFactionTaxEstimate();
                 } catch (err) {
                   server.logSystem(`Tax collection failed for ${name}: ${err}`);
                 }
@@ -1101,6 +1160,7 @@ async function main(): Promise<void> {
                   try {
                     await catalogStore.fetchAll(bot.api);
                     server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                    refreshSkillNames();
                   } catch (err) {
                     server.logSystem(`Catalog fetch failed: ${err}`);
                   }
@@ -1208,6 +1268,15 @@ async function main(): Promise<void> {
     }
   }, 120 * 1000));
 
+  // Periodic skill logging for all bots with active sessions - every 60 seconds
+  intervals.push(setInterval(() => {
+    for (const bot of bots.values()) {
+      if (bot.api.getSession()) {
+        logSkills(bot);
+      }
+    }
+  }, 60 * 1000));
+
   // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
   // This keeps sessions alive and fetches notifications without heavy API calls
   intervals.push(setInterval(async () => {
@@ -1263,6 +1332,7 @@ async function main(): Promise<void> {
         try {
           await catalogStore.fetchAll(bot.api);
           server.logSystem(`Catalog refreshed (${catalogStore.getSummary()})`);
+          refreshSkillNames();
         } catch (err) {
           server.logSystem(`Catalog refresh failed: ${err}`);
         }

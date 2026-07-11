@@ -93,7 +93,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-7-11-26-SPACEBACONSTATION-Release-Ver";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-7-11-26-SM-Lib-Active-Dev-Ver";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;

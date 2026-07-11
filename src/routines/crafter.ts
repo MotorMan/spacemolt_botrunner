@@ -1066,26 +1066,28 @@ async function executeCraftingPlan(
      return r ? r.recipe_id : "";
    };
 
-   // Account for materials already committed to in-flight jobs so we don't
-   // re-spend them, while crediting outputs those jobs will produce so we can
-   // keep building higher-tier items as soon as their sub-materials appear.
-   const accountPending = (): { consumed: Map<string, number>; produced: Map<string, number> } => {
-     const consumed = new Map<string, number>();
-     const produced = new Map<string, number>();
-     for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
-       const pending = prog.queued - prog.completed;
-       if (pending <= 0) continue;
-       const r = recipeIndex.get(recipeId);
-       if (!r) continue;
-       for (const c of r.components) {
-         const id = c.item_id.toLowerCase();
-         consumed.set(id, (consumed.get(id) || 0) + c.quantity * pending);
-       }
-       const outId = r.output_item_id.toLowerCase();
-       produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
-     }
-     return { consumed, produced };
-   };
+    // Credit outputs that in-flight jobs will produce so we can keep building
+    // higher-tier items as soon as their sub-materials appear. We must NOT also
+    // subtract the materials those jobs consume: the server deducts a job's
+    // inputs up-front when it is queued, so the live faction-storage count we
+    // read each pass ALREADY excludes them. Subtracting them again here would
+    // double-count and could zero out a material we genuinely have (e.g. a
+    // shared base material reserved by an unrelated in-flight job), which
+    // blocked perfectly valid partial crafts of leaf recipes.
+    const accountPending = (): { hasPending: boolean; produced: Map<string, number> } => {
+      let hasPending = false;
+      const produced = new Map<string, number>();
+      for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
+        const pending = prog.queued - prog.completed;
+        if (pending <= 0) continue;
+        hasPending = true;
+        const r = recipeIndex.get(recipeId);
+        if (!r) continue;
+        const outId = r.output_item_id.toLowerCase();
+        produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
+      }
+      return { hasPending, produced };
+    };
 
     let lastStatusReport = Date.now();
     let stagnationIterations = 0;
@@ -1124,13 +1126,13 @@ async function executeCraftingPlan(
        break;
      }
 
-     // Whether anything is still in production (including sub-materials we're waiting on).
-     const { consumed, produced } = accountPending();
-     const anyPending = consumed.size > 0;
-     const availableFn = (itemId: string): number => {
-       const id = itemId.toLowerCase();
-       return Math.max(0, countItemFn!(id) - (consumed.get(id) || 0) + (produced.get(id) || 0));
-     };
+      // Whether anything is still in production (including sub-materials we're waiting on).
+      const { hasPending, produced } = accountPending();
+      const anyPending = hasPending;
+      const availableFn = (itemId: string): number => {
+        const id = itemId.toLowerCase();
+        return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
+      };
 
      const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes);
      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];

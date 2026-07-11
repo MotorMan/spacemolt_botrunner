@@ -131,6 +131,39 @@ export function hasRecipeMaterials(
  * Prefers recipes with materials already available in storage.
  * Optionally prioritizes recipes that can be crafted at available facilities.
  */
+// Comparator that ranks recipes producing the same item.
+//
+// KEY INVARIANT: a recipe that can actually be crafted RIGHT NOW (all of its
+// materials are on hand) always beats one that is missing a material — even if
+// the missing-material recipe scores higher on partial availability. This is
+// what makes the planner fall back to an alternate recipe (e.g. regular
+// titanium alloy) when the preferred one (e.g. plasma-flux titanium alloy) is
+// out of a sub-material, instead of holding forever on the un-craftable recipe.
+// Only when NO candidate is craftable do we fall back to scoring, which is the
+// legitimate "awaiting sub-materials, will retry next pass" case.
+function compareRecipeCandidates(
+  a: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
+  b: { recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean },
+): number {
+  if (a.canCraft !== b.canCraft) return a.canCraft ? -1 : 1;
+  if (a.isFacilityRecipe !== b.isFacilityRecipe) return a.isFacilityRecipe ? -1 : 1;
+  if (a.score !== b.score) return b.score - a.score;
+  return 0;
+}
+
+function scoreCandidates(
+  candidates: Recipe[],
+  countItemFn: (itemId: string) => number,
+  facilityAvailableRecipes?: Set<string>,
+): Array<{ recipe: Recipe; canCraft: boolean; score: number; isFacilityRecipe: boolean }> {
+  return candidates.map(recipe => ({
+    recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
+    score: scoreRecipeAvailability(recipe, countItemFn),
+    isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
+  }));
+}
+
 export function findRecipeForItem(
   itemId: string,
   recipes: Recipe[],
@@ -146,45 +179,19 @@ export function findRecipeForItem(
   const unwrapCandidates = candidates.filter(isUnwrapRecipe);
   const nonUnwrapCandidates = candidates.filter(r => !isUnwrapRecipe(r));
 
+  // When both an unwrap recipe and a direct recipe exist for the same item,
+  // prefer the direct recipe (the unwrap is a convenience fallback).
   if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
     const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
     if (hasDirect) {
-      const scored = nonUnwrapCandidates.map(recipe => ({
-        recipe,
-        canCraft: hasRecipeMaterials(recipe, countItemFn),
-        score: scoreRecipeAvailability(recipe, countItemFn),
-        isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
-      }));
-
-      scored.sort((a, b) => {
-        if (a.isFacilityRecipe && !b.isFacilityRecipe) return -1;
-        if (!a.isFacilityRecipe && b.isFacilityRecipe) return 1;
-        if (a.score !== b.score) {
-          return b.score - a.score;
-        }
-        return a.canCraft ? -1 : 1;
-      });
-
+      const scored = scoreCandidates(nonUnwrapCandidates, countItemFn, facilityAvailableRecipes);
+      scored.sort(compareRecipeCandidates);
       return scored[0].recipe;
     }
   }
 
-  const scored = candidates.map(recipe => ({
-    recipe,
-    canCraft: hasRecipeMaterials(recipe, countItemFn),
-    score: scoreRecipeAvailability(recipe, countItemFn),
-    isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
-  }));
-
-  scored.sort((a, b) => {
-    if (a.isFacilityRecipe && !b.isFacilityRecipe) return -1;
-    if (!a.isFacilityRecipe && b.isFacilityRecipe) return 1;
-    if (a.score !== b.score) {
-      return b.score - a.score;
-    }
-    return a.canCraft ? -1 : 1;
-  });
-
+  const scored = scoreCandidates(candidates, countItemFn, facilityAvailableRecipes);
+  scored.sort(compareRecipeCandidates);
   return scored[0].recipe;
 }
 
@@ -367,42 +374,14 @@ export function findAllRecipesForItem(
   if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
     const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
     if (hasDirect) {
-      const scored = nonUnwrapCandidates.map(recipe => ({
-        recipe,
-        canCraft: hasRecipeMaterials(recipe, countItemFn),
-        score: scoreRecipeAvailability(recipe, countItemFn),
-        isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
-      }));
-
-      scored.sort((a, b) => {
-        if (a.isFacilityRecipe && !b.isFacilityRecipe) return -1;
-        if (!a.isFacilityRecipe && b.isFacilityRecipe) return 1;
-        if (a.score !== b.score) {
-          return b.score - a.score;
-        }
-        return a.canCraft ? -1 : 1;
-      });
-
+      const scored = scoreCandidates(nonUnwrapCandidates, countItemFn, facilityAvailableRecipes);
+      scored.sort(compareRecipeCandidates);
       return scored.map(s => s.recipe);
     }
   }
 
-  const scored = candidates.map(recipe => ({
-    recipe,
-    canCraft: hasRecipeMaterials(recipe, countItemFn),
-    score: scoreRecipeAvailability(recipe, countItemFn),
-    isFacilityRecipe: facilityAvailableRecipes?.has(recipe.recipe_id) ?? false,
-  }));
-
-  scored.sort((a, b) => {
-    if (a.isFacilityRecipe && !b.isFacilityRecipe) return -1;
-    if (!a.isFacilityRecipe && b.isFacilityRecipe) return 1;
-    if (a.score !== b.score) {
-      return b.score - a.score;
-    }
-    return a.canCraft ? -1 : 1;
-  });
-
+  const scored = scoreCandidates(candidates, countItemFn, facilityAvailableRecipes);
+  scored.sort(compareRecipeCandidates);
   return scored.map(s => s.recipe);
 }
 

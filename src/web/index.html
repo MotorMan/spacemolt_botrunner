@@ -19992,6 +19992,12 @@ When responding:
             name: f.name || f.facility_type || f.type || fid,
             level: f.level ?? f.tier ?? "",
             public: !!(lp.public ?? cp.public),
+            pricePerRun:
+              typeof lp.rental_fee_per_run === "number"
+                ? lp.rental_fee_per_run
+                : typeof cp.rental_fee_per_run === "number"
+                  ? cp.rental_fee_per_run
+                  : 0,
             queuedRuns,
             queuedItems,
             ourRuns: 0,
@@ -20067,6 +20073,8 @@ When responding:
             fac.queuedRuns > 0 ? fac.queuedItems / fac.queuedRuns : 1;
           const externalItems =
             externalRuns == null ? null : externalRuns * outputPerRun;
+          const externalProfit =
+            externalRuns == null ? null : externalRuns * fac.pricePerRun;
           const onlyUs = externalRuns != null && externalRuns <= 0;
           const unknown = externalRuns == null;
           const statusColor = unknown
@@ -20087,6 +20095,7 @@ When responding:
             ourRuns,
             externalRuns,
             externalItems,
+            externalProfit,
             statusColor,
             statusText,
             orderers: [...fac.externalOrderers],
@@ -20133,9 +20142,14 @@ When responding:
           (fac) => fac.queuedRuns > 0 && fac.externalRuns == null,
         ).length;
 
+        const totalExternalProfit = factionQueueUsageData
+          .filter((fac) => fac.externalProfit != null)
+          .reduce((sum, fac) => sum + Math.max(0, fac.externalProfit), 0);
+
         let summary =
           '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">';
         summary += `Total external (other players') queued runs: <span style="color:var(--orange);font-weight:600">${totalExternalRuns.toLocaleString()}</span> across <span style="color:var(--orange);font-weight:600">${externalFacilityCount}</span> facility${externalFacilityCount === 1 ? "" : "ies"}`;
+        summary += ` — projected profit: <span style="color:var(--green);font-weight:600">${totalExternalProfit.toLocaleString()} cr</span>`;
         if (unknownCount > 0) {
           summary += ` <span style="color:var(--red)">(${unknownCount} facility with jobs could not be checked)</span>`;
         }
@@ -20160,6 +20174,7 @@ When responding:
             <td style="text-align:right;padding:4px 8px">${fmt(fac.ourRuns)}</td>
             <td style="text-align:right;padding:4px 8px;color:${fac.statusColor};font-weight:600">${fmt(fac.externalRuns)}</td>
             <td style="text-align:right;padding:4px 8px;color:${fac.statusColor}">${fmt(fac.externalItems)}</td>
+            <td style="text-align:right;padding:4px 8px;color:var(--green)">${fac.externalProfit == null ? "—" : Math.round(fac.externalProfit).toLocaleString() + " cr"}</td>
             <td style="text-align:center;padding:4px 8px;color:${fac.statusColor}">${fac.statusText}${orderers}</td>
           </tr>`;
           })
@@ -20183,6 +20198,7 @@ When responding:
                 <th style="text-align:right;padding:4px 8px">Our Runs</th>
                 <th style="text-align:right;padding:4px 8px">External Runs</th>
                 <th style="text-align:right;padding:4px 8px">External Items</th>
+                <th style="text-align:right;padding:4px 8px">External Profit</th>
                 <th style="text-align:center;padding:4px 8px">Usage</th>
               </tr>
             </thead>

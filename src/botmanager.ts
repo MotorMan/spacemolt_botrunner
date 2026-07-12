@@ -574,24 +574,139 @@ async function handleAddClerkBots(action: WebAction): Promise<WebActionResult> {
   }
 }
 
-async function handleAutoRestart(botName: string): Promise<void> {
+/**
+ * Auto-restart bookkeeping, per bot.
+ *
+ * A routine that dies with a *connection* error (e.g. "cannot send on a closed
+ * socket") would otherwise be restarted synchronously and fail instantly again,
+ * producing an unbounded fire-and-forget microtask loop. That flood saturates
+ * the event loop so the web UI locks up and even Ctrl-C can't get a word in.
+ *
+ * To prevent that we:
+ *   - schedule the restart via setTimeout (so the event loop always yields
+ *     between attempts — the client stays responsive and can be interrupted),
+ *   - back the delay off exponentially, and
+ *   - back a connection-loss off exponentially but NEVER give up on it, so a
+ *     bot can't be left permanently disconnected — it keeps retrying with a
+ *     delay until the socket is restored, and
+ *   - give up entirely after a bounded number of consecutive *non-connection*
+ *     failures (a routine that keeps crashing on its own logic shouldn't retry
+ *     forever, and the user can press Start to retry manually).
+ */
+interface RestartState {
+  consecutiveFailures: number;
+  connectionRetries: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+const restartStates = new Map<string, RestartState>();
+
+/** Max consecutive *non-connection* failures before we give up auto-restarting
+ *  (a routine that keeps crashing on its own logic shouldn't retry forever). */
+const MAX_CONSECUTIVE_FAILURES = 6;
+/** Initial backoff (ms); doubles each attempt up to RESTART_MAX_BACKOFF_MS. */
+const RESTART_BASE_BACKOFF_MS = 2000;
+const RESTART_MAX_BACKOFF_MS = 60000;
+
+/** Errors indicating the underlying transport socket is dead. We NEVER give up
+ *  on these — the bot keeps retrying with a delay until the connection comes
+ *  back, so it can never be left permanently disconnected. */
+const CONNECTION_ERROR_PATTERNS =
+  /cannot send on a closed socket|closed socket|socket (is )?closed|not connected|econnreset|econnrefused|disconnected|connection (lost|closed|reset|aborted)/i;
+
+/** Call when a routine finishes successfully so the failure counters reset. */
+function recordSuccessfulRun(botName: string): void {
+  const s = restartStates.get(botName);
+  if (s) {
+    if (s.timer) { clearTimeout(s.timer); s.timer = null; }
+    s.consecutiveFailures = 0;
+    s.connectionRetries = 0;
+  }
+}
+
+/**
+ * (Re)launch the bot's last-used routine. Shared by every retry timer so the
+ * actual start logic lives in exactly one place.
+ */
+function fireRestart(botName: string): void {
+  const b = bots.get(botName);
+  if (!b) return;
+  if (getStoppedState(botName)) return;
+  if (b.state !== "error") return;
+  const lastRoutine = getLastUsedRoutine(botName);
+  const routineKey = (lastRoutine && ROUTINES[lastRoutine]) ? lastRoutine : "miner";
+  if (!lastRoutine) {
+    server.logSystem(`Bot ${botName} in ERROR state but no last-used routine found, defaulting to miner`);
+  } else {
+    server.logSystem(`Bot ${botName} in ERROR state, auto-restarting with last-used routine: ${lastRoutine}`);
+  }
+  handleStart({ type: "start", bot: botName, routine: routineKey });
+}
+
+function scheduleAutoRestart(botName: string, errorMsg: string): void {
+  const bot = bots.get(botName);
+  if (!bot) return;
+
   const stoppedState = getStoppedState(botName);
   if (stoppedState) {
     server.logSystem(`Bot ${botName} was stopped intentionally (${stoppedState}), skipping auto-restart`);
     return;
   }
 
-  const bot = bots.get(botName);
-  if (!bot || bot.state !== "error") return;
-  
-  const lastRoutine = getLastUsedRoutine(botName);
-  if (!lastRoutine || !ROUTINES[lastRoutine]) {
-    server.logSystem(`Bot ${botName} in ERROR state but no last-used routine found, defaulting to miner`);
-    await handleStart({ type: "start", bot: botName, routine: "miner" });
+  if (bot.state !== "error") return;
+
+  // If a retry is already pending for this bot, leave it (avoids the periodic
+  // checker and the .catch double-scheduling and resetting the backoff).
+  let s = restartStates.get(botName);
+  if (s?.timer) return;
+  if (!s) { s = { consecutiveFailures: 0, connectionRetries: 0, timer: null }; restartStates.set(botName, s); }
+
+  const isConnectionError = CONNECTION_ERROR_PATTERNS.test(errorMsg);
+
+  if (isConnectionError) {
+    // Lost connection: keep retrying forever (with a delay) so the bot comes
+    // back automatically when the socket is restored — never permanently stuck.
+    s.connectionRetries++;
+    const delay = Math.min(
+      RESTART_BASE_BACKOFF_MS * 2 ** (s.connectionRetries - 1),
+      RESTART_MAX_BACKOFF_MS,
+    );
+    server.logSystem(
+      `Bot ${botName} lost connection (${errorMsg}) — will auto-retry in ${Math.round(delay / 1000)}s ` +
+      `(attempt ${s.connectionRetries}). It will keep retrying until reconnected.`,
+    );
+    s.timer = setTimeout(() => {
+      s!.timer = null;
+      fireRestart(botName);
+    }, delay);
     return;
   }
-  server.logSystem(`Bot ${botName} in ERROR state, auto-restarting with last-used routine: ${lastRoutine}`);
-  await handleStart({ type: "start", bot: botName, routine: lastRoutine });
+
+  s.consecutiveFailures++;
+  if (s.consecutiveFailures > MAX_CONSECUTIVE_FAILURES) {
+    server.logSystem(
+      `Bot ${botName} failed ${MAX_CONSECUTIVE_FAILURES} times in a row — giving up auto-restart. ` +
+      `Press Start to retry manually.`,
+    );
+    if (s.timer) clearTimeout(s.timer);
+    s.consecutiveFailures = 0;
+    s.timer = null;
+    bot.clearError();
+    return;
+  }
+
+  const backoff = Math.min(
+    RESTART_BASE_BACKOFF_MS * 2 ** (s.consecutiveFailures - 1),
+    RESTART_MAX_BACKOFF_MS,
+  );
+  server.logSystem(
+    `Bot ${botName} in ERROR state — auto-restart scheduled in ${Math.round(backoff / 1000)}s ` +
+    `(attempt ${s.consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}).`,
+  );
+
+  s.timer = setTimeout(() => {
+    s!.timer = null;
+    fireRestart(botName);
+  }, backoff);
 }
 
 async function handleStart(action: WebAction): Promise<WebActionResult> {
@@ -663,14 +778,17 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     clearStoppedState(botName);
     // Clear params after routine completes
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
+    // A successful run resets the auto-restart failure counter.
+    recordSuccessfulRun(botName);
   }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
     server.clearBotAssignment(botName);
     // Clear params after error
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
-    // Auto-restart on ERROR state
-    handleAutoRestart(botName);
+    // Auto-restart on ERROR state (backed off + capped so a dead connection
+    // can't flood the log and lock up the client).
+    scheduleAutoRestart(botName, msg);
   });
 
   server.saveBotAssignment(botName, routineKey);
@@ -1359,12 +1477,15 @@ async function main(): Promise<void> {
     }
   }, 24 * 60 * 60 * 1000));
 
-  // Periodic ERROR state check - auto-restart bots that crashed
+  // Periodic ERROR state check - auto-restart bots that crashed. This is a
+  // safety net; the routine's own .catch already schedules a backed-off
+  // restart. scheduleAutoRestart() is idempotent while a retry timer is pending,
+  // so this won't pile on extra restarts or reset the backoff.
   intervals.push(setInterval(() => {
     for (const [name, bot] of bots) {
       if (bot.state === "error") {
-        server.logSystem(`Detected ${name} in ERROR state, attempting auto-restart...`);
-        handleAutoRestart(name);
+        server.logSystem(`Detected ${name} in ERROR state, ensuring auto-restart is scheduled...`);
+        scheduleAutoRestart(name, (bot as unknown as Record<string, unknown>)._error as string || "error state");
       }
     }
   }, 30000));

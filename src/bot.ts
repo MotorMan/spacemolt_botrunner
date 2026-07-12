@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
-import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch } from "./commandBridge.js";
+import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch, extractLibResult } from "./commandBridge.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
@@ -667,13 +667,7 @@ docked = false;
 
     try {
       const res = await account.send(tool, action, body);
-      const anyRes = res as unknown as { delta?: { details?: unknown }; structuredContent?: unknown; result?: unknown };
-      let result: unknown;
-      if (anyRes.delta) {
-        result = anyRes.delta.details ?? anyRes.delta;
-      } else {
-        result = anyRes.structuredContent ?? anyRes.result;
-      }
+      const result = extractLibResult(res);
       return { result, error: undefined, notifications: [] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -687,6 +681,12 @@ docked = false;
       if (command === "get_insurance_quote" && /starter ships cannot be insured/i.test(message)) {
         this.log("info", `libExec ${command} failed: ${message}`);
         return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+      }
+      // Not being in a battle is an expected, benign state for library-backed bots
+      // (battle presence is tracked via push events). Don't log it as a red error
+      // or it spams every routine that polls get_battle_status while idle.
+      if (command === "get_battle_status" && /no active battle|not_in_battle|not in (a )?battle/i.test(message)) {
+        return { error: { code: "not_in_battle", message }, result: undefined, notifications: [] };
       }
       this.log("error", `libExec ${command} failed: ${message}`);
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };

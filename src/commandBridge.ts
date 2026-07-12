@@ -306,6 +306,52 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
 export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
 
 /**
+ * Normalize a library command result into the bare `{ result }` envelope the
+ * rest of the runner consumes.
+ *
+ * The library returns a few different envelopes depending on the command kind:
+ *   - Query:    `{ structuredContent: T }`
+ *   - Mutation: `{ delta: StateDelta & { details?: TDetails } }`  (the
+ *               action result, e.g. MineResponse, lives under `delta.details`)
+ *   - Raw:      the result object itself (e.g. a MineResponse) with no
+ *               `delta`/`structuredContent`/`result` wrapper at all.
+ *
+ * Previously only `delta.details` was honored, so when the facade resolved a
+ * mutation to its raw result body (no `delta` wrapper) the value collapsed to
+ * `undefined` — callers like `mine` then saw no resource id/quantity and
+ * logged "Mined 1x unknown". We now also fall back to a top-level `details`
+ * and finally to the raw body so the action result is never lost.
+ */
+export function extractLibResult(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object") return raw;
+  const r = raw as Record<string, unknown>;
+
+  if ("delta" in r) {
+    const d = r.delta;
+    if (
+      d &&
+      typeof d === "object" &&
+      "details" in d &&
+      (d as Record<string, unknown>).details
+    ) {
+      return (d as Record<string, unknown>).details;
+    }
+    return d;
+  }
+  if ("structuredContent" in r) {
+    return r.structuredContent;
+  }
+  if ("details" in r && r.details) {
+    return r.details;
+  }
+  if ("result" in r) {
+    return r.result;
+  }
+  // No recognized wrapper — the body is the result itself.
+  return raw;
+}
+
+/**
  * Pure translation of a legacy `exec(command, params)` call into the typed
  * `account.send(tool, action, params)` facade. Both `bot.ts` `libExec` (the
  * path every runtime `bot.exec` call site uses) and `commandBridge.ts`
@@ -400,13 +446,7 @@ export async function libExecute(
 
   try {
     const res = await account.send(tool, action, body);
-    const anyRes = res as unknown as { delta?: { details?: unknown }; structuredContent?: unknown; result?: unknown };
-    let result: unknown;
-    if (anyRes.delta) {
-      result = anyRes.delta.details ?? anyRes.delta;
-    } else {
-      result = anyRes.structuredContent ?? anyRes.result;
-    }
+    const result = extractLibResult(res);
     return { result, error: undefined, notifications: [] };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

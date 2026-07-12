@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
+import { extractLibResult } from "../commandBridge.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
@@ -16,6 +17,7 @@ import {
   isIceFieldPoi,
   findStation,
   parseOreFromMineResult,
+  parseOreFromCargoDelta,
   collectFromStorage,
   ensureDocked,
   ensureUndocked,
@@ -1124,11 +1126,8 @@ interface LibCallResult {
 
 async function runLibCommand<T>(call: Promise<T>): Promise<LibCallResult> {
   try {
-    const res = (await call) as unknown as { delta?: { details?: unknown }; structuredContent?: unknown; result?: unknown };
-    const result =
-      res && typeof res === "object" && "delta" in res
-        ? res.delta?.details ?? res.delta
-        : (res?.structuredContent ?? res?.result);
+    const res = (await call) as unknown;
+    const result = extractLibResult(res);
     return { result, error: undefined, notifications: [] };
   } catch (err) {
     const e = err as Error & { code?: string };
@@ -7133,8 +7132,31 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       miningErrorCount = 0;
       harvestCycles++;
 
-      const { oreId, oreName } = parseOreFromMineResult(mineResp.result);
-      
+      let { oreId, oreName } = parseOreFromMineResult(mineResp.result);
+
+      // Self-diagnosing guard: if we still can't identify the mined resource
+      // despite a successful mine, dump the raw result so the shape mismatch
+      // is visible instead of silently logging "unknown".
+      if (!oreId && mineResp.result && typeof mineResp.result === "object") {
+        const raw = mineResp.result as Record<string, unknown>;
+        const keys = Object.keys(raw);
+        const nested = raw.details && typeof raw.details === "object"
+          ? Object.keys(raw.details as Record<string, unknown>)
+          : null;
+        ctx.log("debug", `parseOreFromMineResult found no ore: topKeys=${keys.join(",")}${nested ? ` detailsKeys=${nested.join(",")}` : ""}`);
+
+        // FALLBACK: the mine response can be a full game-state delta
+        // (top-level ship,cargo,queue,skills) with no details/item block.
+        // Identify the mined ore by diffing the post-mine cargo against the
+        // known pre-mine inventory. Falls back to the quota target resource.
+        const delta = parseOreFromCargoDelta(mineResp.result, bot.inventory, targetResource || resourceLabel);
+        if (delta.oreId) {
+          ctx.log("debug", `parseOreFromCargoDelta recovered ore: ${delta.oreId}`);
+          oreId = delta.oreId;
+          oreName = delta.oreName || delta.oreId;
+        }
+      }
+
       // MINING RESULT SUMMARY: Log exactly what was mined for visibility
       // The mine response may be nested under 'details' field per OpenAPI spec
       if (mineResp.result && typeof mineResp.result === "object") {

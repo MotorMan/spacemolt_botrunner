@@ -421,6 +421,57 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
   return { oreId, oreName };
 }
 
+/**
+ * Fallback ore detection for mine responses that return the full game-state
+ * delta (top-level `ship,cargo,queue,skills`) instead of a `details`/`item`
+ * block. The mined ore is identified by diffing the post-mine `cargo` array
+ * against the previously known inventory and returning the item whose quantity
+ * increased. If no diff is found, falls back to `fallbackResourceId`.
+ */
+export function parseOreFromCargoDelta(
+  result: unknown,
+  prevInventory: Array<{ itemId: string; name: string; quantity: number }>,
+  fallbackResourceId?: string,
+): { oreId: string; oreName: string } {
+  if (!result || typeof result !== "object") return { oreId: "", oreName: "" };
+  const mr = result as Record<string, unknown>;
+
+  // The cargo array lives either at top-level `cargo` or nested under `details`.
+  const cargoSrc = (Array.isArray(mr.cargo) ? mr.cargo : (mr.details as Record<string, unknown>)?.cargo) as
+    | Array<Record<string, unknown>>
+    | undefined;
+  if (!Array.isArray(cargoSrc) || cargoSrc.length === 0) {
+    const id = fallbackResourceId || "";
+    return { oreId: id, oreName: id };
+  }
+
+  const norm = (s: unknown) =>
+    String(s ?? "").replace(/ /g, "_").toLowerCase();
+
+  const prev = new Map<string, number>();
+  for (const it of prevInventory) prev.set(it.itemId, it.quantity);
+
+  let bestId = "";
+  let bestName = "";
+  let bestDelta = 0;
+  for (const raw of cargoSrc) {
+    const id = norm(raw.item_id ?? raw.resource_id ?? raw.id);
+    if (!id) continue;
+    const qty = (raw.quantity as number) ?? (raw.count as number) ?? (raw.amount as number) ?? 0;
+    const before = prev.get(id) ?? 0;
+    const delta = qty - before;
+    if (delta > bestDelta) {
+      bestDelta = delta;
+      bestId = id;
+      bestName = (raw.name as string) || (raw.item_name as string) || (raw.resource_name as string) || id;
+    }
+  }
+
+  if (bestId && bestDelta > 0) return { oreId: bestId, oreName: bestName || bestId };
+  const id = fallbackResourceId || "";
+  return { oreId: id, oreName: id };
+}
+
 // ── Docking ──────────────────────────────────────────────────
 
 /** Ensure the bot is docked at a station. Finds one in current system,
@@ -3892,8 +3943,18 @@ export function parseNearbyEntities(result: unknown): NearbyEntitiesResult {
  */
 export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
   const { bot } = ctx;
-  
-  // Always check API first to get fresh data
+
+  // Library-backed bots receive battle state as push events (Bot.subscribeEvents:
+  // battle_update / battle_started / battle_ended / battle_damage / battle_alert).
+  // When those indicate we are NOT in a battle, polling get_battle_status is
+  // redundant and would only produce a benign "No active battle" error. Skip the
+  // poll and report "not in battle" directly. We still poll whenever push state
+  // says we're in a battle, to get live zone/stance/target data for combat loops.
+  if (bot.account && !bot.isInBattle()) {
+    return null;
+  }
+
+  // Otherwise check API for fresh data
   const resp = await bot.exec("get_battle_status");
   if (resp.error || !resp.result) {
     // On 502/524 errors, return null but don't log - rely on WebSocket state

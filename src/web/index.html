@@ -10243,7 +10243,10 @@
             }
           }
 
-          const skills = Object.entries(skillsData).map(([id, data]) => {
+          const META_KEYS = new Set(["message", "status", "error"]);
+          const skills = Object.entries(skillsData)
+            .filter(([id]) => !META_KEYS.has(id))
+            .map(([id, data]) => {
             const s = data && typeof data === "object" ? data : {};
             return {
               name: id,
@@ -11832,6 +11835,37 @@
         return false;
       }
 
+      // Generic guard: true when the open settings tab has unsaved edits in the
+      // DOM. This generalizes the miner-quotas-specific minerQuotaTabDirty()
+      // guard so every settings page is protected against background refreshes
+      // (mapData / mapUpdate / catalogue pushes) clobbering unsaved input.
+      let _settingsPanelSnapshot = null;
+
+      function serializeSettingsPanel(panel) {
+        const els = panel.querySelectorAll("input, select, textarea");
+        const parts = [];
+        for (const el of els) {
+          const key = el.id || el.name || "";
+          if (el.type === "checkbox" || el.type === "radio") {
+            parts.push(`${key}|${el.type}|${el.checked ? 1 : 0}`);
+          } else {
+            parts.push(`${key}|${el.value}`);
+          }
+        }
+        return parts.join("\n");
+      }
+
+      function captureSettingsPanelSnapshot() {
+        const panel = document.getElementById("settingsContent");
+        _settingsPanelSnapshot = panel ? serializeSettingsPanel(panel) : null;
+      }
+
+      function settingsPanelDirty() {
+        const panel = document.getElementById("settingsContent");
+        if (!panel || _settingsPanelSnapshot === null) return false;
+        return serializeSettingsPanel(panel) !== _settingsPanelSnapshot;
+      }
+
       function scheduleSettingsPanelRefresh() {
         if (_settingsRefreshTimer) return;
         _settingsRefreshTimer = setTimeout(() => {
@@ -11850,7 +11884,7 @@
           }
           // Never clobber unsaved quota edits on a background refresh (e.g.
           // mapData / mapUpdate / catalogue pushes). The user must Save first.
-          if (minerQuotaTabDirty()) return;
+          if (settingsPanelDirty()) return;
           try {
             renderSettingsPanel();
           } catch (e) {
@@ -11903,7 +11937,11 @@
         try {
           // fn may be async; catch both synchronous throws and rejected promises
           // so a broken tab shows an error instead of freezing on the prior tab.
-          Promise.resolve(fn(panel)).catch(showRenderError);
+          // After the panel renders (incl. async work) capture a baseline of the
+          // form controls so background refreshes can detect unsaved edits.
+          Promise.resolve(fn(panel))
+            .then(captureSettingsPanelSnapshot)
+            .catch(showRenderError);
         } catch (e) {
           showRenderError(e);
         }
@@ -17653,6 +17691,12 @@ When responding:
       function send(data) {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(data));
+        }
+        // After a settings save, the DOM still holds the edited (now saved)
+        // values. Re-baseline the dirty snapshot so a subsequent background
+        // refresh isn't permanently blocked on a "dirty" panel.
+        if (data && data.type === "saveSettings") {
+          captureSettingsPanelSnapshot();
         }
       }
 

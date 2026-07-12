@@ -359,6 +359,19 @@ class MapStore {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
+    // First-time bootstrap: if map.json doesn't exist yet, copy the seed map
+    // so miners have ore locations available from the very first start.
+    if (!existsSync(MAP_FILE)) {
+      const seedFile = join(DATA_DIR, "seed_map.json");
+      if (existsSync(seedFile)) {
+        try {
+          copyFileSync(seedFile, MAP_FILE);
+          log("info", "Initialized data/map.json from seed_map.json (first start)");
+        } catch (e) {
+          log("error", `Failed to bootstrap map from seed: ${e}`);
+        }
+      }
+    }
     if (existsSync(MAP_FILE)) {
       try {
         const raw = readFileSync(MAP_FILE, "utf-8");

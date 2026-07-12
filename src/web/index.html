@@ -12229,6 +12229,8 @@
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button onclick="listClerkPlayers()">List Players</button>
           <button class="primary" onclick="addSelectedClerkBots()">Add Selected</button>
+          <button onclick="invertClerkSelection()">Invert Selection</button>
+          <button onclick="addAllClerkBots()">Add All</button>
           <span id="clerkStatus" style="color:var(--text-secondary);font-size:12px"></span>
         </div>
         <input type="text" id="clerkSearch" placeholder="Filter players by name / empire..." oninput="renderClerkPlayers()" style="width:380px" />
@@ -17778,6 +17780,28 @@ When responding:
         const statusEl = document.getElementById("clerkStatus");
         if (statusEl) statusEl.textContent = `Adding ${checked.length} player(s)...`;
         send({ type: "addClerkBots", ids: checked });
+      }
+
+      function invertClerkSelection() {
+        const boxes = document.querySelectorAll(
+          "#clerkPlayersList input[type='checkbox']",
+        );
+        if (!boxes.length) {
+          appendLine("system", "No players loaded to invert.");
+          return;
+        }
+        boxes.forEach((cb) => (cb.checked = !cb.checked));
+      }
+
+      function addAllClerkBots() {
+        if (!clerkPlayersData.length) {
+          appendLine("system", "No players loaded. Click 'List Players' first.");
+          return;
+        }
+        const ids = clerkPlayersData.map((p) => p.id);
+        const statusEl = document.getElementById("clerkStatus");
+        if (statusEl) statusEl.textContent = `Adding all ${ids.length} player(s)...`;
+        send({ type: "addClerkBots", ids });
       }
 
       function renderClerkPlayers() {

@@ -41,7 +41,7 @@ export async function refreshNotifications(ctx: RoutineContext): Promise<unknown
   // Library-backed bots receive notifications as push events (Bot.subscribeEvents),
   // so the HTTP poll is skipped entirely.
   if (ctx.bot.account) return { notifications: [] };
-  const resp = await ctx.bot.api.execute("get_notifications", { limit: 1, clear: false });
+  const resp = await ctx.bot.exec("get_notifications", { limit: 1, clear: false });
   if (resp.error) {
     ctx.log("system", `Notification refresh failed: ${resp.error.message}`);
     return { notifications: [] };

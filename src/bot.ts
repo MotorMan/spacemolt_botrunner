@@ -1,7 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
-import { SpaceMoltAPI, type ApiResponse, COMMAND_TOOL_MAP, COMMAND_ACTION_MAP, COMMANDS_WITH_PAYLOAD_ACTION } from "./api.js";
-import { SessionManager, type Credentials } from "./session.js";
+import { type ApiResponse, COMMAND_TOOL_MAP, COMMAND_ACTION_MAP, COMMANDS_WITH_PAYLOAD_ACTION } from "./commandBridge.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
@@ -72,7 +71,6 @@ export interface BotStatus {
 }
 
 export interface RoutineContext {
-  api: SpaceMoltAPI;
   bot: Bot;
   log: (category: string, message: string) => void;
   /** Interruptible sleep - checks for stop signal periodically. */
@@ -111,9 +109,7 @@ let colorIndex = 0;
 
 export class Bot {
   readonly username: string;
-  readonly api: SpaceMoltAPI;
-  readonly session: SessionManager;
-  /** Live library-backed connection, set when the bot runner is driven through @spacemolt/lib. Null while the legacy HTTP `api` is still in use. */
+  /** Live library-backed connection, set when the bot runner is driven through @spacemolt/lib. */
   account: Account | null = null;
   /** Unsubscribe functions for the event subscriptions registered in `subscribeEvents`. */
   private eventUnsubscribers: Array<() => void> = [];
@@ -325,12 +321,7 @@ docked = false;
   constructor(username: string, baseDir: string, account?: Account | null) {
     this.username = username;
     this.baseDir = baseDir;
-    this.api = new SpaceMoltAPI();
-    this.api.setBotName(username);
-    this.session = new SessionManager(username, baseDir);
     this.account = account ?? null;
-    // Connect API to session manager for persistence
-    this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
 
@@ -387,10 +378,9 @@ docked = false;
     this._error = null;
   }
 
-  /** Get the bot's empire affiliation from session credentials. */
+  /** Get the bot's empire affiliation from the library account state. */
   getEmpire(): string {
-    const creds = this.session.loadCredentials();
-    return creds?.empire || "";
+    return this.account?.state.player?.empire ?? "";
   }
 
   /**
@@ -405,7 +395,7 @@ docked = false;
     abortSignal?: AbortSignal,
   ): Promise<ApiResponse> {
     // Race the API call against a timeout and abort
-    const apiPromise = this.api.execute(command, payload, abortSignal);
+    const apiPromise = this.libExec(command, payload);
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
     });
@@ -841,190 +831,18 @@ docked = false;
       }
     }
 
-      // Library-backed bots dispatch through @spacemolt/lib (P3 migrates the
-      // ~1000 call sites to the typed accessor; until then the legacy command
-      // string is translated here).
-      if (this.account) {
-        return this.libExec(command, payload);
-      }
-
-      this._lastAction = command;
-      debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
-
-      // Capture skill snapshot before command to measure gains later
-      this.captureSkillSnapshot();
-
-      // Create AbortController for this command
-      const controller = new AbortController();
-      const key = command + (payload ? JSON.stringify(payload) : "");
-      this.pendingCommands.set(key, controller);
-
+      // All bots are library-backed (P4.1): dispatch every command through
+      // @spacemolt/lib. The HTTP/SpaceMoltAPI transport (and its 502/524 retry
+      // loops, which the library handles internally) was removed; the business
+      // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
+      resp = await this.libExec(command, payload);
       try {
-        let timeoutMs = 60000;
-        let targetId = "";
-        if (command === "jump") {
-          const t = (payload as Record<string, unknown>)?.target_system;
-          const id = (payload as Record<string, unknown>)?.id;
-          if (typeof t === "number" || typeof id === "number") {
-            timeoutMs = 30000;
-            const bearingValue = typeof t === "number" ? t : (typeof id === "number" ? id : 0);
-            targetId = `bearing:${bearingValue.toFixed(4)}`;
-            this.log("travel", `Pathfinder jump to bearing ${bearingValue.toFixed(4)}° (immediate return, poll get_location for progress)`);
-          } else {
-            timeoutMs = this.calculateJumpTimeout();
-            targetId = (typeof t === "string" ? t : "") || "";
-            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-          }
-        } else if (command === "mine" || command === "jettison") {
-          timeoutMs = 15000;
-        } else if (command === "travel") {
-          timeoutMs = this.calculateTravelTimeout();
-          targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
-          this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-        }
-        resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
-        // Handle HTTP 502 Bad Gateway — server-side issue, but could be battle interrupt
-        // The server may return 502 when a battle starts during the request
-        // Retry and check for battle state via WebSocket
-        if (resp.error && resp.error.message && resp.error.message.includes("502")) {
-          let battleDetectedDuring502 = false;
-          const MAX_502_RETRIES = 15; // Max ~4 minutes of retries before giving up
-          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
-            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
-            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
-          this.log("warn", `HTTP 502 on command "${command}" with payload: ${JSON.stringify(payload)}`);
-          
-          for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
-            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-            // Return a battle interrupt error instead of the misleading 502
-            if (this.currentBattle.inBattle) {
-              this.log("combat", `Battle detected during 502 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-              battleDetectedDuring502 = true;
-              resp = {
-                error: { code: "battle_interrupt", message: `Jump interrupted by battle ${this.currentBattle.battleId}` },
-                result: undefined,
-                notifications: [],
-              };
-              break;
-            }
-
-            // Honor a stop request immediately instead of retrying for minutes
-            if (this._state !== "running") {
-              this.log("system", `Stop requested — aborting 502 retry for "${command}"`);
-              break;
-            }
-
-            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
-            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
-              await this.refreshStatus();
-              this.log("system", `Detected persistent 502 on mutation command "${command}" - checking bot state`);
-              resp = { result: {}, notifications: [] };
-              break;
-            }
-
-            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
-            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
-            await sleep(waitTime);
-            resp = await this.api.execute(command, payload);
-            if (!resp.error || !resp.error.message?.includes("502")) break;
-          }
-          // Only log error if battle was NOT detected (battle detection means we're handling it)
-          if (resp.error && resp.error.message?.includes("502") && !battleDetectedDuring502) {
-            this.log("error", `HTTP 502: Bad Gateway (retried ${MAX_502_RETRIES} times, giving up)`);
-          }
-        }
-
-        // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-        // The server may return 524 when a battle starts during the request
-        // Retry and check for battle state via WebSocket
-        // Also handles "false 524" where server returns 524 but command succeeded
-        if (resp.error && resp.error.message && resp.error.message.includes("524")) {
-          let battleDetectedDuring524 = false;
-          const MAX_524_RETRIES = 15; // Max ~4 minutes of retries before giving up
-          const READ_ONLY_COMMANDS = new Set(["get_status", "get_player", "get_nearby", "get_cargo", "get_ship", 
-            "view_storage", "view_faction_storage", "catalog", "get_commands", "get_version", "get_base", 
-            "get_poi", "get_system", "get_system_agents", "get_map", "survey_system", "find_route", 
-            "search_systems", "get_missions", "get_active_missions", "completed_missions", "view_market",
-            "view_orders", "get_queue", "get_chat_history", "forum_list", "get_notifications"]);
-          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
-            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
-            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
-          
-          this.log("warn", `HTTP 524 on command "${command}" with payload: ${JSON.stringify(payload)}`);
-          
-          for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
-            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-            // Return a battle interrupt error instead of the misleading 524
-            if (this.currentBattle.inBattle) {
-              this.log("combat", `Battle detected during 524 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-              battleDetectedDuring524 = true;
-              resp = {
-                error: { code: "battle_interrupt", message: `Travel interrupted by battle ${this.currentBattle.battleId}` },
-                result: undefined,
-                notifications: [],
-              };
-              break;
-            }
-
-            // Honor a stop request immediately instead of retrying for minutes
-            if (this._state !== "running") {
-              this.log("system", `Stop requested — aborting 524 retry for "${command}"`);
-              break;
-            }
-
-            // For read-only commands, if we keep getting 524, the server is likely having issues
-            // but the data should still be valid from cache. Return cached data if available.
-            if (READ_ONLY_COMMANDS.has(command) && retry >= 3) {
-              const cacheKey = command + (payload ? ":" + JSON.stringify(payload) : "");
-              const cached = this.api.getCachedResponse(cacheKey);
-              if (cached) {
-                this.log("system", `Detected persistent 524 on read-only command "${command}" - using cached data`);
-                resp = cached;
-                break;
-              }
-              // No cached data available, return success with empty result
-              // This allows the routine to continue with default/fallback behavior
-              this.log("system", `Detected persistent 524 on read-only command "${command}" - returning success`);
-              resp = { result: {}, notifications: [] };
-              break;
-            }
-
-            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
-            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
-              await this.refreshStatus();
-              // If bot was docked and is still docked (or in same system), the command likely succeeded
-              // but the server returned a false 524
-              this.log("system", `Detected persistent 524 on mutation command "${command}" - checking bot state`);
-              // Return success - the command may have actually worked
-              resp = { result: {}, notifications: [] };
-              break;
-            }
-
-            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
-            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
-            await sleep(waitTime);
-            resp = await this.api.execute(command, payload);
-            if (!resp.error || !resp.error.message?.includes("524")) break;
-          }
-          // Only log error if battle was NOT detected (battle detection means we're handling it)
-          if (resp.error && resp.error.message?.includes("524") && !battleDetectedDuring524) {
-            this.log("error", `HTTP 524: Timeout (retried ${MAX_524_RETRIES} times, giving up)`);
-          }
-        }
-
-        // Handle full login required (after too many session recovery failures)
-        if (resp.error && resp.error.code === "full_login_required") {
-          this.log("system", "Full login required due to session recovery failures, performing login...");
-          const loggedIn = await this.login();
-          if (loggedIn) {
-            this.log("system", "Full login successful, retrying command...");
-            resp = await this.api.execute(command, payload);
-          } else {
-            this.log("error", "Full login failed");
-          }
-        }
+        // (HTTP 502/524/full_login_required retry blocks were transport-level and
+        // are handled internally by @spacemolt/lib; removed with the SpaceMoltAPI
+        // transport. The library surfaces battle interrupts as thrown errors that
+        // libExec normalizes, so no manual 502/524 battle-retry loop is needed.)
 
         // After jump/travel commands in empire space, wait for customs messages
         // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
@@ -1053,7 +871,7 @@ docked = false;
               if (this._state !== "running") {
                 this.log("system", "Stop requested — aborting pending action retry");
               } else {
-                resp = await this.api.execute(command, payload);
+                resp = await this.libExec(command, payload);
 
                 // If still pending, wait a bit longer and try one more time
                 if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
@@ -1065,7 +883,7 @@ docked = false;
                     await sleep(5_000);
                     // Re-check stop before issuing the final retry
                     if (this._state === "running") {
-                      resp = await this.api.execute(command, payload);
+                      resp = await this.libExec(command, payload);
                     }
                   }
                 }
@@ -1237,8 +1055,6 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           };
         }
         throw err;
-      } finally {
-        this.pendingCommands.delete(key);
       }
   }
 
@@ -1258,9 +1074,9 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     return this._loginPromise;
   }
 
-  /** True when this bot has a live connection — either an HTTP session or a library Account. */
+  /** True when this bot has a live library Account connection. */
   isConnected(): boolean {
-    return !!this.account?.authenticated || !!this.api.getSession();
+    return !!this.account?.authenticated;
   }
 
   /** Internal login implementation */
@@ -1274,36 +1090,11 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       return true;
     }
 
-    const creds = this.session.loadCredentials();
-    if (!creds) {
-      this._error = "No credentials found";
-      this._state = "error";
-      return false;
-    }
-
-    this.api.setCredentials(creds.username, creds.password);
-    this.log("system", `Logging in as ${creds.username}...`);
-    const resp = await this.exec("login", {
-      username: creds.username,
-      password: creds.password,
-    });
-
-    if (resp.error) {
-      this._error = `Login failed: ${resp.error.message}`;
-      this._state = "error";
-      return false;
-    }
-
-     this.log("system", "Login successful");
-     this.api.resetFullLoginFlag();
-     await this.refreshStatus();
-     // Populate initial skill snapshot
-     try {
-       await this.checkSkills();
-     } catch {
-       // ignore skill fetch errors
-     }
-     return true;
+    // No library Account and no credentials: nothing to authenticate with.
+    this._error = "No account/session available";
+    this._state = "error";
+    this.log("error", "Cannot log in: bot has no @spacemolt/lib Account and no credentials.");
+    return false;
   }
 
   /** Resume session from disk without full login. Returns true if session was restored and is valid. */
@@ -1316,35 +1107,16 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       return true;
     }
 
-    const restored = this.api.restoreSessionToken();
-    if (!restored) {
-      this.log("system", "No saved session token found, will require full login");
-      return false;
-    }
-
-    // Test the session with a lightweight API call
-    this.log("system", "Testing restored session...");
-    const resp = await this.exec("get_status");
-    if (resp.error) {
-      this.log("system", `Restored session invalid: ${resp.error.message}, will require full login`);
-      return false;
-    }
-
-     this.log("system", "Session resumed successfully");
-     await this.refreshStatus();
-     try {
-       await this.checkSkills();
-     } catch {
-       // ignore
-     }
-     return true;
+    // No library Account and no saved session token: nothing to resume.
+    this.log("system", "No @spacemolt/lib Account and no saved session token; cannot resume.");
+    return false;
   }
 
   /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
   async refreshStatus(): Promise<ApiResponse> {
     const resp: ApiResponse = this.account
       ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
-      : await this.api.execute("get_status", undefined, { bypassCache: true });
+      : await this.libExec("get_status");
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
     if (!resp.error && resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
@@ -1459,7 +1231,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   async refreshLocation(): Promise<ApiResponse> {
     const resp: ApiResponse = this.account
       ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
-      : await this.api.execute("get_location");
+      : await this.libExec("get_location");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const location = r.location as Record<string, unknown> | undefined;
@@ -1504,7 +1276,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   async refreshShip(): Promise<ApiResponse> {
     const resp = this.account
       ? await this.libExec("get_ship", {})
-      : await this.api.execute("get_ship");
+      : await this.libExec("get_ship");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const ship = (r.ship as Record<string, unknown>) || r;
@@ -1539,7 +1311,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   async refreshCargoAndStorage(): Promise<ApiResponse> {
     const cargoResp: ApiResponse = this.account
       ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
-      : await this.api.execute("get_cargo");
+      : await this.libExec("get_cargo");
     if (!cargoResp.error && cargoResp.result) {
       this.inventory = this.parseItemList(cargoResp.result, 'cargo');
       const r = cargoResp.result as Record<string, unknown>;
@@ -1556,7 +1328,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   async refreshPOI(): Promise<ApiResponse> {
     const resp = this.account
       ? await this.libExec("get_poi", {})
-      : await this.api.execute("get_poi");
+      : await this.libExec("get_poi");
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const poi = (r.poi as Record<string, unknown>) || {};
@@ -1573,17 +1345,17 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
 
   async refreshMissions(): Promise<ApiResponse> {
     if (this.account) return this.libExec("get_missions", {});
-    return this.api.execute("get_missions");
+    return this.libExec("get_missions");
   }
 
   async refreshQueue(): Promise<ApiResponse> {
     if (this.account) return this.libExec("get_queue", {});
-    return this.api.execute("get_queue");
+    return this.libExec("get_queue");
   }
 
   async refreshNearby(): Promise<ApiResponse> {
     if (this.account) return this.libExec("get_nearby", {});
-    return this.api.execute("get_nearby");
+    return this.libExec("get_nearby");
   }
 
   /**
@@ -1598,7 +1370,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     try {
       const resp = this.account
         ? await this.libExec("get_nearby", {})
-        : await this.api.execute("get_nearby");
+        : await this.libExec("get_nearby");
       if (!resp.error && resp.result) {
         this.trackNearbyPlayers(resp.result);
         this.trackWildlife(resp.result);
@@ -1612,7 +1384,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   async refreshSkills(): Promise<ApiResponse> {
      const resp = this.account
        ? await this.libExec("get_skills", {})
-       : await this.api.execute("get_skills");
+       : await this.libExec("get_skills");
      if (!resp.error && resp.result) {
        const r = resp.result as Record<string, unknown>;
        let skillsData: Record<string, unknown> | null = null;
@@ -1838,10 +1610,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     // stale or wildly incorrect). We call api.execute directly (as get_status
     // does) so we can pass bypassCache without going through the command
     // bookkeeping in exec().
-    const resp = await this.api.execute(
+    const resp = await this.libExec(
       "view_faction_storage",
       { station_id: homeStationId },
-      { bypassCache: true },
     );
     if (resp.error) {
       this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
@@ -1975,45 +1746,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     this._error = null;
     this._abortController = new AbortController();
 
-    const settings = loadSettings();
-    const generalSettings = (settings.general as Record<string, unknown>) || {};
-    if (generalSettings.disableRateLimiting === true) {
-      this.api.setRateLimitingDisabled(true);
-      this.log("system", "Rate limiting disabled via settings");
-    }
-
-    const creds = this.session.loadCredentials();
-    if (!creds) {
-      this._error = "No credentials found";
-      this._state = "error";
-      throw new Error(this._error);
-    }
-
-    // Try to resume session from disk first (fast, no login delay)
-    // If resume fails, fall back to full login
-    if (this.api.needsFullLogin()) {
-      // Full login required due to too many session recovery failures
-      this.log("system", "Full login required (session recovery failed too many times)...");
-      const loggedIn = await this.login();
-      if (!loggedIn) {
-        this._state = "error";
-        throw new Error(this._error || "Login failed");
-      }
-      this.api.resetFullLoginFlag();
-    } else if (this.api.getSession()) {
-      this.log("system", "Using existing in-memory session");
-    } else if (await this.resumeSession()) {
-      // Session resumed successfully from disk
-    } else {
-      // No valid session, need full login
-      this.log("system", "No valid session, performing full login...");
-      const loggedIn = await this.login();
-      if (!loggedIn) {
-        this._state = "error";
-        throw new Error(this._error || "Login failed");
-      }
-    }
-
+    // Library-backed bots are already authenticated via connectOwned(); the
+    // legacy per-bot rate-limiting toggle and credential/session resume flow
+    // were part of the retired HTTP transport.
     this.log("system", `Starting routine: ${routineName}`);
 
     // Open the optional WebSocket v2 market stream (static/market-watcher bots).
@@ -2021,7 +1756,6 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     this.ensureMarketSubscription();
 
     const ctx: RoutineContext = {
-      api: this.api,
       bot: this,
       log: (cat, msg) => this.log(cat, msg),
       // Interruptible sleep that checks for stop signal every 100ms
@@ -2246,7 +1980,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     }
 
     await new Promise(r => setTimeout(r, 500));
-    const poiResp = await this.api.execute("get_poi");
+    const poiResp = await this.libExec("get_poi");
     if (!poiResp.result || typeof poiResp.result !== "object") {
       this.log("error", "Pathfinder jump: failed to get initial transit status");
       clearPathfinderTravel(this.username);
@@ -2273,7 +2007,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       await new Promise(r => setTimeout(r, 5000));
       poll++;
 
-      const poiResp2 = await this.api.execute("get_poi");
+      const poiResp2 = await this.libExec("get_poi");
       if (poiResp2.result && typeof poiResp2.result === "object") {
         const poi2 = poiResp2.result as Record<string, unknown>;
         inTransit = (poi2.in_transit as boolean) ?? false;
@@ -2307,7 +2041,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       }
 
       if (!inTransit) {
-        const locResp = await this.api.execute("get_location");
+        const locResp = await this.libExec("get_location");
         if (locResp.result && typeof locResp.result === "object") {
           const loc = locResp.result as Record<string, unknown>;
           const newSystem = (loc.system_id as string) || (loc.system_name as string) || null;
@@ -2433,7 +2167,7 @@ getSkillLevel(skillId: string): number {
      /** Fetch all skills as a Map (calls get_skills API). */
      private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
        const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
-       const resp = await this.api.execute("get_skills");
+       const resp = await this.libExec("get_skills");
        if (resp.error || !resp.result) return map;
        
        const r = resp.result as Record<string, unknown>;
@@ -2653,7 +2387,7 @@ getSkillLevel(skillId: string): number {
 
   /**
    * Route notifications to the bot's own activity log and detect hull damage.
-   * Uses this.api.execute() directly (not this.exec()) to avoid recursion.
+   * Uses this.libExec() directly (not this.exec()) to avoid recursion.
    */
   private async handleNotifications(notifications: unknown[]): Promise<void> {
     // Get AI Chat service from global scope (initialized by botmanager)
@@ -3053,7 +2787,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
   ): Promise<void> {
     try {
       let nearbyInfo = "";
-      const nearbyResp = await this.api.execute("get_nearby");
+      const nearbyResp = await this.libExec("get_nearby");
       
       // Track players from nearby response
       if (nearbyResp.result) {
@@ -3088,7 +2822,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       const shieldStr = yourShield !== undefined ? ` Shield: ${yourShield}` : "";
       const content = `[HULL DAMAGE] ${this.username} hit by ${pirateName}${pirateT ? ` (${pirateT})` : ""} — ${damage} ${damageType} dmg | Hull: ${yourHull}/${maxHull} (${hullPct}%)${shieldStr} | ${this.system}/${this.poi}${nearbyInfo}`;
 
-      await this.api.execute("chat", { channel: "faction", content });
+      await this.libExec("chat", { channel: "faction", content });
       this.log("combat", `Faction alert sent: ${pirateName} at ${this.system}`);
     } catch (err) {
       this.log("error", `Combat alert failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3099,7 +2833,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
    private async sendWarningFactionAlert(message: string): Promise<void> {
      try {
        const content = `[COMBAT WARNING] ${this.username} — ${message} | ${this.system}/${this.poi}`;
-       await this.api.execute("chat", { channel: "faction", content });
+       await this.libExec("chat", { channel: "faction", content });
        this.log("combat", `Faction warning sent`);
      } catch (err) {
        this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3132,7 +2866,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
        }
 
        // Get nearby entities to provide context
-       const nearbyResp = await this.api.execute("get_nearby");
+       const nearbyResp = await this.libExec("get_nearby");
        let nearbyInfo = "";
        if (nearbyResp.result && typeof nearbyResp.result === "object") {
          const nearby = nearbyResp.result as Record<string, unknown>;
@@ -3152,7 +2886,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
        }
 
         // Get battle status for more details
-        const battleStatusResp = await this.api.execute("get_battle_status");
+        const battleStatusResp = await this.libExec("get_battle_status");
         let battleInfo = "";
         let isAttackerFriendly = false;
         let ourSideId: number | undefined;
@@ -3172,7 +2906,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
             const ourParticipant = participants.find((p: any) => p.side_id === ourSideId);
             
             // Get ship info for context
-            const shipResp = await this.api.execute("get_ship");
+            const shipResp = await this.libExec("get_ship");
             let shipInfo = "";
             if (shipResp.result && typeof shipResp.result === "object") {
               const ship = shipResp.result as Record<string, unknown>;

@@ -827,7 +827,6 @@ export async function unloadPassengersToLounge(
   opts: { id?: string } = {},
 ): Promise<{ ok: boolean; message?: string; error?: string }> {
   const ctx: RoutineContext = {
-    api: bot.api,
     bot,
     log: (cat, msg) => bot.log(cat, msg),
     sleep: (ms: number) => new Promise((r) => setTimeout(r, ms)),

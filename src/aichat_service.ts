@@ -1190,7 +1190,7 @@ private async runLoop(): Promise<void> {
     if (!bots || bots.length === 0) return null;
 
     const target = bots.find(b => b.username === botName);
-    if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
+    if (target && (target.state === "running" || target.state === "idle") && target.isConnected()) {
       return target;
     }
     return null;
@@ -1211,7 +1211,7 @@ private async runLoop(): Promise<void> {
 
     // Log all bots and their states
     for (const b of bots) {
-      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}, system=${b.system}, poi=${b.poi}`);
+      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.isConnected()}, system=${b.system}, poi=${b.poi}`);
     }
 
     const candidates: Bot[] = [];
@@ -1221,8 +1221,8 @@ private async runLoop(): Promise<void> {
     // BUT: For faction chat, only add receiving bot to the pool (don't prioritize it) to encourage randomness
     if (receivingBot) {
       const target = bots.find(b => b.username === receivingBot);
-      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
-      if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
+      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.isConnected()}`);
+      if (target && (target.state === "running" || target.state === "idle") && target.isConnected()) {
         // For local chat, prioritize receiving bot (must be at correct location)
         // For faction/system chat, just add to pool without prioritizing
         if (msg.channel === "local") {
@@ -1238,7 +1238,7 @@ private async runLoop(): Promise<void> {
     if (msg.channel === "local" && msg.botSystem && msg.botPoi) {
       for (const bot of bots) {
         if (addedBots.has(bot.username)) continue;
-        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
         if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
           this.logFn("ai_chat_debug", `Adding location-matched bot: ${bot.username}`);
           candidates.push(bot);
@@ -1251,7 +1251,7 @@ private async runLoop(): Promise<void> {
     if (msg.channel === "system" && msg.botSystem) {
       for (const bot of bots) {
         if (addedBots.has(bot.username)) continue;
-        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
         if (bot.system === msg.botSystem) {
           this.logFn("ai_chat_debug", `Adding system-matched bot: ${bot.username}`);
           candidates.push(bot);
@@ -1265,7 +1265,7 @@ private async runLoop(): Promise<void> {
     // For other channels, add to candidates
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
-      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+      if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
       if (msg.channel === "faction") {
         addedBots.add(bot.username);
       } else {
@@ -1277,7 +1277,7 @@ private async runLoop(): Promise<void> {
     // Fallback: Any bot with session (even if state is unusual)
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
-      if (bot.api.getSession()) {
+      if (bot.isConnected()) {
         if (msg.channel === "faction") {
           addedBots.add(bot.username);
         } else {
@@ -2571,7 +2571,7 @@ async sendRescueEnRouteNotification(
     // Check if bot is available
     const bots = AiChatService.getBots();
     const botRef = bots.find(b => b.username === bot.username);
-    if (!botRef || botRef.state !== "running" || !botRef.api.getSession()) {
+    if (!botRef || botRef.state !== "running" || !botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} not in running state (state: ${botRef?.state}), skipping captain's log`);
       return false;
     }
@@ -2686,7 +2686,7 @@ Write a captain's log entry (personal journal) describing what you did during th
       return false;
     }
 
-    if (!botRef.api.getSession()) {
+    if (!botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping status update`);
       return false;
     }
@@ -2792,7 +2792,7 @@ Be creative but concise. Think like you're setting a social status that other pl
       return false;
     }
 
-    if (!botRef.api.getSession()) {
+    if (!botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping color update`);
       return false;
     }
@@ -2876,7 +2876,7 @@ No other text, formatting, or explanation.`;
 
         // Update each bot's status
         for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          if (bot.state !== "running" || !bot.isConnected()) continue;
           await this.generateAndSetBotStatus(bot);
           await sleep(2000); // Small delay between updates to avoid rate limiting
         }
@@ -2895,7 +2895,7 @@ No other text, formatting, or explanation.`;
 
         // Update each bot's colors
         for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          if (bot.state !== "running" || !bot.isConnected()) continue;
           await this.generateAndSetBotColors(bot);
           await sleep(2000); // Small delay between updates to avoid rate limiting
         }
@@ -2912,7 +2912,7 @@ No other text, formatting, or explanation.`;
         this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
 
         for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
+          if (bot.state !== "running" || !bot.isConnected()) continue;
           await this.generateAndSetCaptainLog(bot);
           await sleep(2000); // Small delay between updates to avoid rate limiting
         }

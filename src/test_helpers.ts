@@ -8,7 +8,7 @@
 import { vi } from "vitest";
 
 import type { Bot, RoutineContext } from "./bot.js";
-import type { ApiResponse } from "./api.js";
+import type { ApiResponse } from "./commandBridge.js";
 
 // Mock Bot Factory
 export function createMockBot(options: {
@@ -80,7 +80,6 @@ export function createMockBot(options: {
 // Mock Context Factory
 export function createMockContext(bot: Bot): RoutineContext {
   return {
-    api: bot.api as any,
     bot,
     log: vi.fn(),
     sleep: vi.fn(),

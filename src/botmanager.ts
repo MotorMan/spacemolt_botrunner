@@ -78,16 +78,11 @@ export function getBotChatChannel() {
   return botChatChannel;
 }
 
-/** Get total bandwidth usage across all bots in KB/s */
+/** Get total bandwidth usage across all bots in KB/s.
+ *  The legacy HTTP transport tracked per-bot bandwidth; the @spacemolt/lib
+ *  transport has no equivalent counter, so this currently reports zero. */
 export function getTotalBandwidth(): { inKBps: number; outKBps: number } {
-  let totalIn = 0;
-  let totalOut = 0;
-  for (const bot of bots.values()) {
-    const usage = bot.api.getBandwidthUsage();
-    totalIn += usage.inKBps;
-    totalOut += usage.outKBps;
-  }
-  return { inKBps: totalIn, outKBps: totalOut };
+  return { inKBps: 0, outKBps: 0 };
 }
 
 /** Send a chat message from a bot to other bots. */
@@ -768,7 +763,7 @@ const skillsObj: Record<string, unknown> | null =
     await bot.refreshStatus();
 
     if (command === "switch_ship" && !resp.error) {
-      await ensureInsured({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
+      await ensureInsured({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)) });
     }
 
     // Also refresh the recipient bot after gift/trade

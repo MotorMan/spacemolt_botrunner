@@ -1,7 +1,7 @@
 import { Type, StringEnum } from "@mariozechner/pi-ai";
 import type { Tool } from "@mariozechner/pi-ai";
-import type { SpaceMoltAPI } from "./api.js";
-import type { SessionManager } from "./session.js";
+import type { Account } from "@spacemolt/lib";
+import { libExecute } from "./commandBridge.js";
 import { log, logTool, logDebug, formatToolResult, logNotifications } from "./ui.js";
 
 // ─── Tool Definitions ────────────────────────────────────────
@@ -53,19 +53,27 @@ export const allTools: Tool[] = [
 
 const LOCAL_TOOLS = new Set(["save_credentials", "update_todo", "read_todo", "status_log"]);
 
+// ─── CLI session store ──────────────────────────────────────
+
+/** Minimal file-backed store the CLI agent uses for its TODO list. */
+export interface CliStore {
+  loadTodo(): string;
+  saveTodo(content: string): void;
+}
+
 // ─── Tool Executor ───────────────────────────────────────────
 
 export async function executeTool(
   name: string,
   args: Record<string, unknown>,
-  api: SpaceMoltAPI,
-  session: SessionManager,
+  account: Account,
+  store: CliStore,
   reason?: string,
 ): Promise<string> {
   // Handle local tools
   if (LOCAL_TOOLS.has(name)) {
     logTool(name, args, reason);
-    return executeLocalTool(name, args, session);
+    return executeLocalTool(name, args, store);
   }
 
   // Handle the `game` wrapper tool — extract command + args
@@ -85,7 +93,7 @@ export async function executeTool(
 
   // Execute API command
   try {
-    const resp = await api.execute(command, commandArgs && Object.keys(commandArgs).length > 0 ? commandArgs : undefined);
+    const resp = await libExecute(account, command, commandArgs && Object.keys(commandArgs).length > 0 ? commandArgs : undefined);
 
     // Log chat/system notifications to stdout for the human watching
     if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
@@ -114,27 +122,21 @@ function truncateResult(text: string): string {
 function executeLocalTool(
   name: string,
   args: Record<string, unknown>,
-  session: SessionManager,
+  store: CliStore,
 ): string {
   switch (name) {
     case "save_credentials": {
-      const creds = {
-        username: String(args.username),
-        password: String(args.password),
-        empire: String(args.empire),
-        playerId: String(args.player_id),
-      };
-      session.saveCredentials(creds);
-      log("setup", `Credentials saved for ${creds.username}`);
-      return `Credentials saved successfully for ${creds.username}.`;
+      // Credentials are managed by the CLI's clerk-backed connection; there is
+      // nothing to persist locally.
+      return "Credentials are managed by the CLI connection (clerk) — nothing to save locally.";
     }
     case "update_todo": {
-      session.saveTodo(String(args.content));
+      store.saveTodo(String(args.content));
       log("info", "TODO list updated");
       return "TODO list updated.";
     }
     case "read_todo": {
-      const todo = session.loadTodo();
+      const todo = store.loadTodo();
       return todo || "(empty TODO list)";
     }
     case "status_log": {

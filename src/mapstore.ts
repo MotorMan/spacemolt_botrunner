@@ -23,6 +23,8 @@ export interface OreRecord {
   last_seen: string;
   depleted?: boolean;
   depleted_at?: string;
+  /** True for ore entries seeded from seed_map.json (static hints, not real scan data). */
+  seed?: boolean;
 }
 
 /** Resource data from get_poi scan */
@@ -127,7 +129,8 @@ export interface StoredPOI {
   base_type: string | null;
   services: string[];
   ores_found: OreRecord[];
-  resources: ResourceRecord[];
+  /** Undefined when a POI has never been scan-scanned (or is a seed hint). An empty [] means a real scan found nothing. */
+  resources?: ResourceRecord[];
   market: MarketRecord[];
   orders: OrderRecord[];
   missions: MissionRecord[];
@@ -259,11 +262,55 @@ class MapStore {
 
   constructor() {
     this.data = this.load();
+    // Only seed when the live map is empty (fresh bootstrap). A populated
+    // data/map.json is never modified here, so the running client is safe.
+    if (Object.keys(this.data.systems).length === 0) {
+      this.mergeSeedMap();
+    }
     this.loadPrecalcRoutes();
     if (!existsSync(BACKUP_DIR)) {
       mkdirSync(BACKUP_DIR, { recursive: true });
     }
     this.backupTimer = setInterval(() => this.performBackup(), 30 * 60 * 1000);
+  }
+
+  /**
+   * Merge the static seed map (seed_map.json in the project root) into the
+   * in-memory store. Seed POIs carry ores_found entries flagged `seed: true`
+   * and omit `resources`, so findOreLocations treats them as ore hints that a
+   * real get_poi scan later overrides. No save is scheduled here — persistence
+   * happens via the client's own normal update/save flow, so data/map.json is
+   * never written by this method.
+   */
+  private mergeSeedMap(): void {
+    const seedFile = join(process.cwd(), "seed_map.json");
+    if (!existsSync(seedFile)) return;
+    try {
+      const raw = readFileSync(seedFile, "utf-8");
+      const seed = JSON.parse(raw) as MapData;
+      for (const [sid, seedSys] of Object.entries(seed.systems)) {
+        const existing = this.data.systems[sid];
+        if (!existing) {
+          this.data.systems[sid] = seedSys;
+          continue;
+        }
+        const existingPois = new Map(existing.pois.map((p) => [p.id, p]));
+        for (const seedPoi of seedSys.pois) {
+          const ep = existingPois.get(seedPoi.id);
+          if (!ep) {
+            existing.pois.push(seedPoi);
+            continue;
+          }
+          const have = new Set((ep.ores_found || []).map((o) => o.item_id));
+          for (const so of seedPoi.ores_found || []) {
+            if (!have.has(so.item_id)) ep.ores_found.push(so);
+          }
+        }
+      }
+      log("info", `Merged seed map (${Object.keys(seed.systems).length} systems) into empty store`);
+    } catch (e) {
+      log("error", `Failed to merge seed map: ${e}`);
+    }
   }
 
   private loadPrecalcRoutes(): void {
@@ -487,7 +534,11 @@ class MapStore {
           base_type: (p.base_type as string) ?? prev?.base_type ?? null,
           services: (p.services as string[]) ?? prev?.services ?? [],
           ores_found: prev?.ores_found ?? [],
-          resources: prev?.resources ?? [],
+          // Preserve undefined (not default to []) so seeded POIs that omit
+          // `resources` remain authoritative via ores_found until a real get_poi
+          // scan populates `resources`. A genuinely scanned-empty POI gets []
+          // from updatePoiResources, preserving the "ore not present" guard.
+          resources: prev?.resources,
           market: prev?.market ?? [],
           orders: prev?.orders ?? [],
           missions: prev?.missions ?? [],
@@ -808,6 +859,7 @@ class MapStore {
       existing.times_seen++;
       existing.last_seen = now();
       existing.depleted = false; // Reset depleted flag on successful mining
+      existing.seed = false; // Real mining converts a seed hint into real data
     } else {
       poi.ores_found.push({
         item_id: oreItem.item_id,

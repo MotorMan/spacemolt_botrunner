@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
-import { type ApiResponse, COMMAND_TOOL_MAP, COMMAND_ACTION_MAP, COMMANDS_WITH_PAYLOAD_ACTION } from "./commandBridge.js";
+import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch } from "./commandBridge.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
@@ -663,46 +663,7 @@ docked = false;
     debugLogForBot(this.username, "bot:libExec", `${account.id ?? this.username} > ${command}`, payload);
     this.captureSkillSnapshot();
 
-    const tool = COMMAND_TOOL_MAP[command] || "spacemolt";
-    let action = COMMAND_ACTION_MAP[command] || command;
-    const body: Record<string, unknown> = payload ? { ...payload } : {};
-
-    // Wrapper commands carry the real action in payload.action (battle/storage/facility/fleet).
-    if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
-      action = String(payload.action);
-      delete body.action;
-    }
-
-    // Param translations (mirror api.ts makeHttpRequest so call sites stay unchanged).
-    if (command === "faction_deposit_items" && !body.target) body.target = "faction";
-    if (command === "faction_withdraw_items" && !body.source) body.source = "faction";
-    if (command === "view_faction_storage" && !body.target) body.target = "faction";
-    if (command === "faction_deposit_credits") {
-      body.item_id = "credits";
-      if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-      if (!body.target) body.target = "faction";
-    }
-    if (command === "faction_withdraw_credits") {
-      body.item_id = "credits";
-      if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-      if (!body.source) body.source = "faction";
-    }
-    if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-    if (command === "faction_prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-    if (command === "send_gift") {
-      body.item_id = "credits";
-      if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }
-      if (body.recipient !== undefined) { body.target = body.recipient; delete body.recipient; }
-    }
-    if (command === "find_route") {
-      delete body.target_poi;
-      if (body.target !== undefined && body.target_system === undefined) { body.target_system = body.target; delete body.target; }
-    }
-    if (command === "jump" && typeof body.target_system === "string") { body.id = body.target_system; delete body.target_system; }
-    if (command === "jump" && body.target !== undefined && body.id === undefined) { body.id = body.target; delete body.target; }
-    if (command === "jump" && body.target_poi !== undefined && body.id === undefined) { body.id = body.target_poi; delete body.target_poi; }
-    if (command === "travel" && body.target_poi !== undefined) { body.id = body.target_poi; delete body.target_poi; }
-    if (command === "set_home_base" && body.base_id !== undefined) { body.id = body.base_id; delete body.base_id; }
+    const { tool, action, body } = buildLibDispatch(command, payload);
 
     try {
       const res = await account.send(tool, action, body);
@@ -716,6 +677,17 @@ docked = false;
       return { result, error: undefined, notifications: [] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // Some failures are expected and not actionable, so avoid spamming the
+      // log with red errors:
+      //  - players who are not in a faction (view_faction_storage)
+      //  - starter ships that simply cannot be insured (get_insurance_quote)
+      if (command === "view_faction_storage" && /you must be in a faction/i.test(message)) {
+        return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+      }
+      if (command === "get_insurance_quote" && /starter ships cannot be insured/i.test(message)) {
+        this.log("info", `libExec ${command} failed: ${message}`);
+        return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+      }
       this.log("error", `libExec ${command} failed: ${message}`);
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
     }
@@ -1615,7 +1587,12 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       { station_id: homeStationId },
     );
     if (resp.error) {
-      this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
+      const errMsg = resp.error.message || "";
+      // Not being in a faction is expected for many players and not
+      // actionable, so don't flood the log with a red error every refresh.
+      if (!/you must be in a faction/i.test(errMsg)) {
+        this.log("error", `Error refreshing faction storage from ${homeStationId}: ${errMsg}`);
+      }
       // Do NOT silently fall back to the on-disk cache file — those are known to
       // be stale/misleading. Keep whatever the last successful live read gave us
       // so counts stay consistent instead of jumping to a wrong cached value.

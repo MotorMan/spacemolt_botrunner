@@ -32,7 +32,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots";
   bot?: string;
   routine?: string;
   username?: string;
@@ -44,6 +44,10 @@ export interface WebAction {
   settings?: Record<string, unknown>;
   command?: string;
   params?: Record<string, unknown>;
+  /** Clerk API key supplied from Settings → General (replaces env SPACEMOLT_CLERK_API_KEY). */
+  clerkApiKey?: string;
+  /** Player ids selected to add as bots. */
+  ids?: string[];
 }
 
 export interface WebActionResult {
@@ -106,6 +110,47 @@ function loadSettings(): RoutineSettings {
 }
 
 export { loadSettings };
+
+// ── Clerk (headless client) config persistence ─────────────
+// Stored separately from `general` so the per-routine settings save (which
+// replaces the whole `general` object) can't clobber the selected-bot list.
+
+export interface ClerkConfig {
+  /** Clerk API key — headless-client credential that owns the player accounts. */
+  apiKey: string;
+  /** Player ids the user has chosen to run as bots (a Clerk account can own hundreds). */
+  bots: string[];
+}
+
+export function getClerkConfig(): ClerkConfig {
+  const s = loadSettings();
+  const c = (s.clerk as Record<string, unknown>) || {};
+  return {
+    apiKey: typeof c.apiKey === "string" ? c.apiKey : "",
+    bots: Array.isArray(c.bots) ? (c.bots as string[]) : [],
+  };
+}
+
+/**
+ * Resolve the Clerk API key: the env var takes precedence (kept for the CLI /
+ * headless deployments), then the dashboard-supplied key in settings.
+ */
+export function getClerkApiKey(): string | undefined {
+  if (process.env.SPACEMOLT_CLERK_API_KEY) return process.env.SPACEMOLT_CLERK_API_KEY;
+  const key = getClerkConfig().apiKey;
+  return key || undefined;
+}
+
+/** Merge a partial Clerk config into settings and persist it. */
+export function setClerkConfig(partial: Partial<ClerkConfig>): ClerkConfig {
+  const s = loadSettings();
+  const c = (s.clerk as Record<string, unknown>) || {};
+  if (typeof partial.apiKey === "string") c.apiKey = partial.apiKey;
+  if (Array.isArray(partial.bots)) c.bots = partial.bots;
+  s.clerk = c;
+  saveSettings(s);
+  return c as unknown as ClerkConfig;
+}
 
 export interface LastUsedRoutineData {
   [botUsername: string]: string;
@@ -2145,7 +2190,7 @@ if (url.pathname === "/data/shipsForSale.json") {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
               // Include bot, command, and params fields in execResult for processing in frontend
-              const responseData = { type: resType, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
+              const responseData = { type: resType, action: data.type, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
               ws.send(JSON.stringify(responseData));
             }
           } catch (err) {

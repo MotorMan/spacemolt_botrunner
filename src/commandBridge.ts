@@ -45,11 +45,16 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'get_base': 'spacemolt',
   'get_poi': 'spacemolt',
   'get_system': 'spacemolt',
-  'get_system_agents': 'spacemolt',
-  'get_nearby': 'spacemolt',
-  'get_location': 'spacemolt',
-  'get_map': 'spacemolt',
-  'find_route': 'spacemolt',
+   'get_system_agents': 'spacemolt',
+   'get_nearby': 'spacemolt',
+   'get_location': 'spacemolt',
+   'get_map': 'spacemolt',
+   'get_tax_estimate': 'spacemolt',
+   'list_passengers': 'spacemolt',
+   'list_station_passengers': 'spacemolt',
+   'load_passenger': 'spacemolt',
+   'unload_passenger': 'spacemolt',
+   'find_route': 'spacemolt',
   'search_systems': 'spacemolt',
   'survey_system': 'spacemolt',
   'jump': 'spacemolt',
@@ -84,9 +89,8 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'list_ships': 'spacemolt_ship',
   'switch_ship': 'spacemolt_ship',
   'sell_ship': 'spacemolt_ship',
-  'commission_ship': 'spacemolt_ship',
-  'claim_commission': 'spacemolt_ship',
-  'commission_status': 'spacemolt_ship',
+   'commission_ship': 'spacemolt_ship',
+   'commission_status': 'spacemolt_ship',
   'cancel_commission': 'spacemolt_ship',
   'list_ship_for_sale': 'spacemolt_ship',
   'cancel_ship_listing': 'spacemolt_ship',
@@ -105,6 +109,7 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
    'faction_withdraw_items': 'spacemolt_storage', // auto-add source: 'faction'
    'faction_deposit_credits': 'spacemolt_storage', // auto-add item_id: 'credits', target: 'faction'
    'faction_withdraw_credits': 'spacemolt_storage', // auto-add item_id: 'credits', source: 'faction'
+   'withdraw_credits': 'spacemolt_storage', // auto-add item_id: 'credits' (self withdrawal)
    'storage': 'spacemolt_storage',
 
   // Market commands
@@ -117,15 +122,16 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'estimate_purchase': 'spacemolt_market',
   'analyze_market': 'spacemolt_market',
 
-  // Faction commands
+   // Faction commands
   'create_faction': 'spacemolt_faction',
   'join_faction': 'spacemolt_faction',
   'leave_faction': 'spacemolt_faction',
-  'faction_prepay_tax': 'spacemolt_faction',
+  'faction_prepay_tax': 'spacemolt_faction', // action 'prepay_tax' (spacemolt_faction/prepay_tax)
 
-  // Tax commands
-  'prepay_tax': 'spacemolt',
-  'faction_info': 'spacemolt_faction',
+   // Tax commands
+   'prepay_tax': 'spacemolt',
+   'get_faction_tax_estimate': 'spacemolt_faction',
+   'faction_info': 'spacemolt_faction',
   'faction_list': 'spacemolt_faction',
   'faction_invite': 'spacemolt_faction',
   'faction_kick': 'spacemolt_faction',
@@ -150,12 +156,14 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'faction_edit': 'spacemolt_faction_admin',
   'faction_create_role': 'spacemolt_faction_admin',
   'faction_edit_role': 'spacemolt_faction_admin',
-  'faction_delete_role': 'spacemolt_faction_admin',
-  'faction_post_mission': 'spacemolt_faction_admin',
-  'faction_cancel_mission': 'spacemolt_faction_admin',
+  'faction_post_mission': 'spacemolt_faction_admin', // spacemolt_faction_admin/post_mission
   'faction_promote': 'spacemolt_faction_admin',
   'faction_write_room': 'spacemolt_faction_admin',
-  'faction_delete_room': 'spacemolt_faction_admin',
+
+  // Faction admin actions that actually live under spacemolt_faction
+  'faction_delete_role': 'spacemolt_faction',    // spacemolt_faction/delete_role
+  'faction_cancel_mission': 'spacemolt_faction', // spacemolt_faction/cancel_mission
+  'faction_delete_room': 'spacemolt_faction',    // spacemolt_faction/delete_room
 
   // Social commands
   'chat': 'spacemolt_social',
@@ -199,7 +207,6 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Salvage
   'get_wrecks': 'spacemolt_salvage',
   'loot_wreck': 'spacemolt_salvage',
-  'salvage_wreck': 'spacemolt_salvage',
   'scrap_wreck': 'spacemolt_salvage',
   'tow_wreck': 'spacemolt_salvage',
   'sell_wreck': 'spacemolt_salvage',
@@ -227,13 +234,16 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
    'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
    'faction_deposit_credits': 'deposit',   // auto-add item_id: 'credits', target: 'faction'
    'faction_withdraw_credits': 'withdraw', // auto-add item_id: 'credits', source: 'faction'
-   'send_gift': 'withdraw',               // auto-add item_id: 'credits'
+    'send_gift': 'withdraw',               // auto-add item_id: 'credits'
+    'withdraw_credits': 'withdraw',        // auto-add item_id: 'credits' (self withdrawal)
+    'get_faction_tax_estimate': 'tax_estimate',
 
   // Faction storage
   'view_faction_storage': 'view',  // auto-add source: 'faction'
   'create_faction': 'create',
   'join_faction': 'join',
   'leave_faction': 'leave',
+  'faction_prepay_tax': 'prepay_tax', // spacemolt_faction/prepay_tax
   'faction_info': 'info',
   'faction_list': 'list',
   'faction_invite': 'invite',
@@ -242,7 +252,7 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
   'faction_declare_war': 'declare_war',
   'faction_decline_invite': 'decline_invite',
   'faction_get_invites': 'get_invites',
-  'faction_set_ally': 'set_ally',
+  'faction_set_ally': 'propose_ally',
   'faction_set_enemy': 'set_enemy',
   'faction_propose_peace': 'propose_peace',
   'faction_remove_ally': 'remove_ally',
@@ -286,13 +296,79 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
    'scrap_wreck': 'scrap',
  'release_tow': 'release',
    'buy_insurance': 'insure',
-  'get_insurance_quote': 'quote',
-   'view_insurance': 'policies',
+   'claim_insurance': 'policies', // spacemolt_salvage/policies returns ClaimInsuranceResponse
+   'get_insurance_quote': 'quote',
+    'view_insurance': 'policies',
   'set_home_base': 'set_home',
  };
 
 // Commands that use payload.action for the action (like facility and battle)
 export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
+
+/**
+ * Pure translation of a legacy `exec(command, params)` call into the typed
+ * `account.send(tool, action, params)` facade. Both `bot.ts` `libExec` (the
+ * path every runtime `bot.exec` call site uses) and `commandBridge.ts`
+ * `libExecute` (the CLI/drone path) must route through this single function so
+ * the param renames below can never drift between the two dispatch surfaces.
+ */
+export interface LibDispatch {
+  tool: string;
+  action: string;
+  body: Record<string, unknown>;
+}
+
+export function buildLibDispatch(
+  command: string,
+  payload?: Record<string, unknown>,
+): LibDispatch {
+  const tool = COMMAND_TOOL_MAP[command] || "spacemolt";
+  let action = COMMAND_ACTION_MAP[command] || command;
+  const body: Record<string, unknown> = payload ? { ...payload } : {};
+
+  // Wrapper commands carry the real action in payload.action (battle/storage/facility/fleet).
+  if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
+    action = String(payload.action);
+    delete body.action;
+  }
+
+  // Param translations (mirror api.ts makeHttpRequest so call sites stay unchanged).
+  if (command === "faction_deposit_items" && !body.target) body.target = "faction";
+  if (command === "faction_withdraw_items" && !body.source) body.source = "faction";
+  if (command === "view_faction_storage" && !body.target) body.target = "faction";
+  if (command === "faction_deposit_credits") {
+    body.item_id = "credits";
+    if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+    if (!body.target) body.target = "faction";
+  }
+  if (command === "faction_withdraw_credits") {
+    body.item_id = "credits";
+    if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+    if (!body.source) body.source = "faction";
+  }
+  if (command === "withdraw_credits") {
+    body.item_id = "credits";
+    if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+  }
+  if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+  if (command === "faction_prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+  if (command === "send_gift") {
+    body.item_id = "credits";
+    if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }
+    if (body.recipient !== undefined) { body.target = body.recipient; delete body.recipient; }
+  }
+  if (command === "find_route") {
+    delete body.target_poi;
+    if (body.target !== undefined && body.target_system === undefined) { body.target_system = body.target; delete body.target; }
+  }
+  if (command === "jump" && typeof body.target_system === "string") { body.id = body.target_system; delete body.target_system; }
+  if (command === "jump" && body.target !== undefined && body.id === undefined) { body.id = body.target; delete body.target; }
+  if (command === "jump" && body.target_poi !== undefined && body.id === undefined) { body.id = body.target_poi; delete body.target_poi; }
+  if (command === "travel" && body.target_poi !== undefined) { body.id = body.target_poi; delete body.target_poi; }
+  if (command === "set_home_base" && body.base_id !== undefined) { body.id = body.base_id; delete body.base_id; }
+
+  return { tool, action, body };
+}
 
 /**
  * Dispatch a legacy command name through a connected library `Account`,
@@ -320,46 +396,7 @@ export async function libExecute(
     return { result: { notifications: [] }, error: undefined, notifications: [] };
   }
 
-  const tool = COMMAND_TOOL_MAP[command] || "spacemolt";
-  let action = COMMAND_ACTION_MAP[command] || command;
-  const body: Record<string, unknown> = payload ? { ...payload } : {};
-
-  // Wrapper commands carry the real action in payload.action (battle/storage/facility/fleet).
-  if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
-    action = String(payload.action);
-    delete body.action;
-  }
-
-  // Param translations (mirror bot.ts libExec so call sites stay unchanged).
-  if (command === "faction_deposit_items" && !body.target) body.target = "faction";
-  if (command === "faction_withdraw_items" && !body.source) body.source = "faction";
-  if (command === "view_faction_storage" && !body.target) body.target = "faction";
-  if (command === "faction_deposit_credits") {
-    body.item_id = "credits";
-    if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-    if (!body.target) body.target = "faction";
-  }
-  if (command === "faction_withdraw_credits") {
-    body.item_id = "credits";
-    if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-    if (!body.source) body.source = "faction";
-  }
-  if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-  if (command === "faction_prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-  if (command === "send_gift") {
-    body.item_id = "credits";
-    if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }
-    if (body.recipient !== undefined) { body.target = body.recipient; delete body.recipient; }
-  }
-  if (command === "find_route") {
-    delete body.target_poi;
-    if (body.target !== undefined && body.target_system === undefined) { body.target_system = body.target; delete body.target; }
-  }
-  if (command === "jump" && typeof body.target_system === "string") { body.id = body.target_system; delete body.target_system; }
-  if (command === "jump" && body.target !== undefined && body.id === undefined) { body.id = body.target; delete body.target; }
-  if (command === "jump" && body.target_poi !== undefined && body.id === undefined) { body.id = body.target_poi; delete body.target_poi; }
-  if (command === "travel" && body.target_poi !== undefined) { body.id = body.target_poi; delete body.target_poi; }
-  if (command === "set_home_base" && body.base_id !== undefined) { body.id = body.base_id; delete body.base_id; }
+  const { tool, action, body } = buildLibDispatch(command, payload);
 
   try {
     const res = await account.send(tool, action, body);

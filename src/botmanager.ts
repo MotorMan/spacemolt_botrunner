@@ -32,15 +32,14 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKey, getClerkConfig, setClerkConfig } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
-import { reconnectQueue } from "./reconnectqueue.js";
-import { connectOwnedAccounts } from "./libClient.js";
+import { connectOwnedAccounts, initSpacemoltClient, listOwnedPlayers, getConnectedAccounts } from "./libClient.js";
+import type { Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
-import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 import { flushMinerActivity } from "./routines/minerActivity.js";
@@ -162,28 +161,128 @@ function refreshStatusTable(): void {
 }
 
 /**
- * Connect every account the Clerk user owns through `@spacemolt/lib` and back
- * each with a `Bot`. This is now the ONLY source of bots — if
- * `SPACEMOLT_CLERK_API_KEY` is unset, no bots start.
+ * Wire a freshly connected library `Account` into a `Bot` and register it.
+ * Shared by the startup connect and the dashboard "Add Selected" flow so both
+ * paths behave identically.
+ */
+function addOwnedAccountAsBot(account: Account): void {
+  const id = account.id || "";
+  if (!id || bots.has(id)) return;
+  const bot = new Bot(id, BASE_DIR, account);
+  setupBotLogging(bot);
+  bot.subscribeEvents();
+  bots.set(id, bot);
+  server.logSystem(`Connected owned account: ${id}`);
+
+  // Populate the cached game state once so the dashboard shows real data
+  // immediately instead of looking "broken" (all zeroed/unknown) until the bot
+  // is opened or started. Idle bots aren't touched by the periodic refresh
+  // (which only refreshes running bots), so without this they'd stay empty.
+  // refreshStatus() reads the library's seeded account.state; refreshShip()
+  // fetches get_ship for the ship name, hull/shield, modules, and ammo, which
+  // the seeded state alone doesn't always carry. account.refresh() forces a
+  // fresh canonical seed in case seeding hasn't settled by the onConnect call.
+  void (async () => {
+    try {
+      await account.refresh();
+    } catch { /* fall back to whatever the library already seeded */ }
+    await bot.refreshStatus().catch(() => {});
+    await bot.refreshShip().catch(() => {});
+    const addedStation = await registerBotStation(bot).catch(() => false);
+    refreshStatusTable();
+    // Broadcast the now-updated map so the dashboard's station pickers
+    // (faction storage, approved fuel stations, …) show the new options.
+    if (addedStation) server.updateMapData();
+  })();
+}
+
+/**
+ * Register the bot's current docked station into the shared map store.
+ *
+ * The galaxy map seeded from the public /api/map has systems + connections but
+ * no POIs, and POIs are otherwise only discovered during gameplay exploration.
+ * That left the web UI's station selectors (faction storage, approved fuel
+ * stations, rescue systems, …) empty ("(not set)") until a routine happened to
+ * explore. Bots are normally docked when they connect, so recording their
+ * current station gives the pickers real options immediately.
+ *
+ * Returns true if a new station POI was added to the map.
+ */
+async function registerBotStation(bot: Bot): Promise<boolean> {
+  const systemId = bot.system;
+  const poiId = bot.poi;
+  if (!systemId || !poiId || !bot.docked) return false;
+
+  // Don't re-add a station we already know about.
+  const known = mapStore.getSystem(systemId)?.pois.find((p) => p.id === poiId);
+  if (known?.has_base || known?.base_id) return false;
+
+  let name = poiId;
+  let baseId = poiId;
+  let baseName: string | null = null;
+  let baseType: string | null = null;
+  let services: string[] = [];
+  try {
+    const resp = await bot.exec("get_poi", {});
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const poi = (r.poi as Record<string, unknown>) || r;
+      name = (poi.name as string) || name;
+      baseId = (poi.base_id as string) || (poi.id as string) || baseId;
+      baseName = (poi.base_name as string) || (poi.name as string) || null;
+      baseType = (poi.base_type as string) || null;
+      services = (poi.services as string[]) || [];
+    }
+  } catch { /* best-effort; fall back to ids */ }
+
+  mapStore.updateSystem({
+    id: systemId,
+    pois: [{
+      id: poiId,
+      name,
+      type: "station",
+      has_base: true,
+      base_id: baseId,
+      base_name: baseName,
+      base_type: baseType,
+      services,
+    }],
+  });
+  return true;
+}
+
+/**
+ * Connect the `Bot`s selected in Settings → General → Add Bots from Account
+ * through `@spacemolt/lib`. A Clerk account can own hundreds of players, so we
+ * connect ONLY the ids the user has explicitly chosen (persisted in
+ * `settings.clerk.bots`) rather than every owned account.
+ *
+ * If no Clerk API key is configured, or no players have been selected yet, no
+ * bots start — the dashboard is where selection happens.
  */
 async function connectLibraryAccounts(): Promise<void> {
-  if (!process.env.SPACEMOLT_CLERK_API_KEY) {
-    server.logSystem("No SPACEMOLT_CLERK_API_KEY set — skipping @spacemolt/lib owned-account connect.");
+  const key = getClerkApiKey();
+  if (!key) {
+    server.logSystem(
+      "No Clerk API key configured — set SPACEMOLT_CLERK_API_KEY or add it in Settings → General → Clerk API Key, then choose players to add.",
+    );
     return;
   }
-  server.logSystem("Connecting owned accounts via @spacemolt/lib...");
+  initSpacemoltClient(key);
+
+  const selected = getClerkConfig().bots;
+  if (!selected.length) {
+    server.logSystem(
+      "Clerk API key set but no players selected. Open Settings → General → Add Bots from Account to choose which players to run.",
+    );
+    return;
+  }
+
+  server.logSystem(`Connecting ${selected.length} selected owned account(s) via @spacemolt/lib...`);
   try {
     const accounts = await connectOwnedAccounts(
-      undefined,
-      (account) => {
-        const id = account.id || "";
-        if (!id || bots.has(id)) return;
-        const bot = new Bot(id, BASE_DIR, account);
-        setupBotLogging(bot);
-        bot.subscribeEvents();
-        bots.set(id, bot);
-        server.logSystem(`Connected owned account: ${id}`);
-      },
+      (player) => selected.includes(player.id),
+      (account) => addOwnedAccountAsBot(account),
     );
     server.logSystem(`Connected ${accounts.length} owned account(s) via @spacemolt/lib`);
   } catch (err) {
@@ -217,6 +316,12 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleManualRescueRequest(action);
     case "pathfinder_calc":
       return handlePathfinderCalc(action);
+    case "setClerkKey":
+      return handleSetClerkKey(action);
+    case "listClerkPlayers":
+      return handleListClerkPlayers();
+    case "addClerkBots":
+      return handleAddClerkBots(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -397,6 +502,76 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
   }
 
   return { ok: false, error: "Provide from+to for bearing calc, or originSystem+bearing to simulate, or just bearing for reverse" };
+}
+
+async function handleSetClerkKey(action: WebAction): Promise<WebActionResult> {
+  const key = (action as any).clerkApiKey as string | undefined;
+  if (!key) return { ok: false, error: "No Clerk API key provided" };
+  setClerkConfig({ apiKey: key });
+  try {
+    initSpacemoltClient(key);
+  } catch (err) {
+    return { ok: false, error: `Failed to initialize client: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  server.logSystem("Clerk API key saved. Use 'List Players' to choose accounts to add.");
+  return { ok: true, message: "Clerk API key saved. Use 'List Players' to choose accounts to add." };
+}
+
+async function handleListClerkPlayers(): Promise<WebActionResult> {
+  if (!getClerkApiKey()) {
+    return { ok: false, error: "No Clerk API key set. Add it in Settings → General → Clerk API Key first." };
+  }
+  try {
+    initSpacemoltClient(getClerkApiKey()!);
+  } catch {
+    // already initialized is fine
+  }
+  try {
+    const players = await listOwnedPlayers();
+    const selected = new Set(getClerkConfig().bots);
+    const connected = new Set(getConnectedAccounts().map((a) => a.id));
+    const data = players.map((p) => ({
+      id: p.id,
+      username: p.username,
+      empire: p.empire,
+      hidden: p.hidden,
+      selected: selected.has(p.id),
+      connected: connected.has(p.id),
+    }));
+    return { ok: true, data: { players: data, count: data.length } };
+  } catch (err) {
+    return { ok: false, error: `Failed to list owned players: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+async function handleAddClerkBots(action: WebAction): Promise<WebActionResult> {
+  const ids = (action as any).ids as string[] | undefined;
+  if (!ids || !ids.length) return { ok: false, error: "No players selected" };
+  if (!getClerkApiKey()) {
+    return { ok: false, error: "No Clerk API key set. Add it in Settings → General → Clerk API Key first." };
+  }
+  try {
+    initSpacemoltClient(getClerkApiKey()!);
+  } catch {
+    // already initialized is fine
+  }
+
+  // Persist the selection so these bots reconnect on next restart.
+  const prev = getClerkConfig().bots;
+  const merged = Array.from(new Set([...prev, ...ids]));
+  setClerkConfig({ bots: merged });
+
+  try {
+    const accounts = await connectOwnedAccounts(
+      (player) => ids.includes(player.id),
+      (account) => addOwnedAccountAsBot(account),
+    );
+    refreshStatusTable();
+    server.logSystem(`Added ${accounts.length} bot(s) from Clerk account.`);
+    return { ok: true, message: `Added ${accounts.length} bot(s).`, data: { added: accounts.length } };
+  } catch (err) {
+    return { ok: false, error: `Failed to add bots: ${err instanceof Error ? err.message : String(err)}` };
+  }
 }
 
 async function handleAutoRestart(botName: string): Promise<void> {
@@ -622,6 +797,11 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
   clearStoppedState(botName);
+
+  // Keep the selected-bot list (settings.clerk.bots) in sync so a removed bot
+  // isn't re-added on the next restart.
+  const clerkBots = getClerkConfig().bots.filter((id) => id !== botName);
+  setClerkConfig({ bots: clerkBots });
 
   // Delete session directory
   const sessionDir = join(SESSIONS_DIR, botName);
@@ -853,6 +1033,12 @@ async function main(): Promise<void> {
     (globalThis as any).shutdownServer("web-ui");
   };
 
+  // Start the web server BEFORE anything else so the UI can connect and
+  // render immediately (showing bots as idle while they load). Previously
+  // this ran last, after every account was connected and every routine
+  // auto-resumed — which blocked the UI until all players finished loading.
+  server.start();
+
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Connecting owned accounts via @spacemolt/lib...");
   await connectLibraryAccounts();
@@ -946,15 +1132,6 @@ async function main(): Promise<void> {
     server.logSystem(line);
   });
   server.logSystem("Bot-to-bot chat channel initialized");
-
-  // Set up mass disconnect detector callback
-  massDisconnectDetector.setTriggerCallback((affectedBots) => {
-    server.logSystem(`⚠️ MASS SESSION INVALIDATION DETECTED: ${affectedBots.length} unique bots lost sessions within 5s`);
-    server.logSystem(`Affected bots: ${affectedBots.join(", ")}`);
-    server.logSystem(`Initiating graceful shutdown for restart...`);
-    (globalThis as any).shutdownServer("mass_session_loss", true);
-  });
-  server.logSystem("Mass disconnect detector initialized");
 
   // Seed galaxy map from public API so pathfinding works from first run
   server.logSystem("Seeding galaxy map from /api/map...");
@@ -1192,9 +1369,6 @@ async function main(): Promise<void> {
     }
   }, 30000));
 
-  // Start HTTP + WebSocket server
-  server.start();
-
   // Graceful shutdown handler
   function gracefulShutdown(signal: string, restart: boolean = false): void {
     console.log(`\nShutting down (${signal})...`);
@@ -1213,8 +1387,6 @@ async function main(): Promise<void> {
       aiChatService.stop();
       aiChatService = null;
     }
-    // Clear reconnection queue to release any pending reconnection attempts
-    reconnectQueue.clear();
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();

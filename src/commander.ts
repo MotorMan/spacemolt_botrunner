@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import type { Context } from "@mariozechner/pi-ai";
 import { resolveModel } from "./model.js";
-import { getSpacemoltClient, getConnectedAccount } from "./libClient.js";
+import { initSpacemoltClient, getConnectedAccount } from "./libClient.js";
 import type { Account } from "@spacemolt/lib";
 import { libExecute } from "./commandBridge.js";
 import { allTools, type CliStore } from "./tools.js";
@@ -270,7 +270,12 @@ async function main(): Promise<void> {
 
   // Connect every account owned by the Clerk user (no per-account passwords).
   log("setup", "Connecting owned SpaceMolt accounts via library client...");
-  const client = getSpacemoltClient();
+  const clerkKey = process.env.SPACEMOLT_CLERK_API_KEY;
+  if (!clerkKey) {
+    logError("No connected accounts — is SPACEMOLT_CLERK_API_KEY set and valid?");
+    process.exit(1);
+  }
+  const client = initSpacemoltClient(clerkKey);
   const connected = await client.connectOwned();
   if (connected.length === 0) {
     logError("No connected accounts — is SPACEMOLT_CLERK_API_KEY set and valid?");

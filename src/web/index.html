@@ -276,7 +276,6 @@
               <button class="sm danger" onclick="emergencyReturnHome()">
                 ⚠ Emergency Return Home
               </button>
-              <button class="sm" onclick="showAddModal()">+ Add Bot</button>
               <button
                 class="sm"
                 onclick="toggleRoutineGroupsLayout()"
@@ -1363,46 +1362,6 @@
       </div>
     </main>
 
-    <!-- Add / Register Modal -->
-    <div class="modal-overlay" id="addModal">
-      <div class="modal">
-        <h2 id="modalTitle">Add Existing Bot</h2>
-        <div id="modalAddFields">
-          <label>Username</label>
-          <input type="text" id="addUsername" placeholder="Bot username" />
-          <label>Password</label>
-          <input type="password" id="addPassword" placeholder="Bot password" />
-        </div>
-        <div id="modalRegFields" style="display: none">
-          <label>Registration Code</label>
-          <input
-            type="text"
-            id="regCode"
-            placeholder="From spacemolt.com/dashboard"
-          />
-          <label>Username (3-24 chars)</label>
-          <input type="text" id="regUsername" placeholder="New username" />
-          <label>Empire</label>
-          <select id="regEmpire">
-            <option value="crimson">Crimson Fleet (combat)</option>
-            <option value="nebula">Nebula Collective (exploration)</option>
-            <option value="outerrim">Outer Rim (crafting/cargo)</option>
-            <option value="solarian">Solarian Empire (mining/trade)</option>
-            <option value="voidborn">Voidborn (stealth/shields)</option>
-          </select>
-        </div>
-        <div class="modal-actions">
-          <button onclick="toggleModalMode()" id="modalToggle">
-            Register New
-          </button>
-          <button onclick="closeAddModal()">Cancel</button>
-          <button class="primary" onclick="submitAddModal()" id="modalSubmit">
-            Add
-          </button>
-        </div>
-      </div>
-    </div>
-
     <!-- Shutdown Confirmation Modal -->
     <div class="modal-overlay" id="shutdownModal">
       <div class="modal">
@@ -1451,10 +1410,10 @@
       let flockSettings = { flockGroups: [], assignments: {} };
       let knownSystems = [];
       let knownOres = [];
+      let allMiningOres = [];
       let mobileCapitol = null;
       let reconnectDelay = 1000;
       let mapData = {};
-      let modalMode = "add";
       let activeSettingsTab = "general";
       let mapLoading = false;
       let profileBot = null;
@@ -2327,9 +2286,28 @@
             case "mapData":
               mapData = msg.data.systems || msg.data || {};
               renderMapStats();
+              // Refresh the open settings tab so newly-registered stations
+              // (e.g. from a just-connected bot) show up in the pickers.
+              if (document.getElementById("page-settings")?.classList.contains("active")) {
+                scheduleSettingsPanelRefresh();
+              }
               break;
             case "catalog":
               catalog = msg.data;
+              // Ore/gas/ice quota pickers are sourced from the catalogue. Only
+              // refresh the settings panel to populate them the first time the
+              // catalogue arrives while the tab is already open. Later periodic
+              // resyncs must not clobber unsaved quota edits (deep core and
+              // radioactive use fixed lists and are unaffected).
+              if (
+                document
+                  .getElementById("page-settings")
+                  ?.classList.contains("active")
+              ) {
+                const sel = document.getElementById("ore-quota-add-ore");
+                const needsPopulate = !sel || sel.options.length <= 1;
+                if (needsPopulate) scheduleSettingsPanelRefresh();
+              }
               break;
             case "statsDaily":
               statsDaily = msg.data;
@@ -2554,6 +2532,22 @@
                 window.currentSettings = settings; // Sync for use in render functions
                 updateAiChatToggleButton();
               }
+              if (msg.action === "listClerkPlayers" && msg.data && msg.data.players) {
+                clerkPlayersData = msg.data.players;
+                renderClerkPlayers();
+                const statusEl = document.getElementById("clerkStatus");
+                if (statusEl) {
+                  statusEl.textContent = `${msg.data.players.length} player(s) found. Select the ones to add.`;
+                }
+              } else if (msg.action === "addClerkBots" && msg.data && typeof msg.data.added === "number") {
+                const statusEl = document.getElementById("clerkStatus");
+                if (statusEl) statusEl.textContent = `Added ${msg.data.added} bot(s).`;
+                // Refresh the player list so connected state is accurate.
+                listClerkPlayers();
+              } else if (msg.action === "setClerkKey") {
+                const statusEl = document.getElementById("clerkStatus");
+                if (statusEl) statusEl.textContent = "Key saved. Click 'List Players'.";
+              }
               break;
             case "settings_updated":
               // Settings were updated on disk by a bot routine (e.g., cargo mover delivery tracking)
@@ -2633,8 +2627,13 @@
               ) {
                 renderMissionsFromMap();
               }
-              // NOTE: Do NOT re-render settings panel on mapUpdate - it clears unsaved changes
-              // The settings panel will be updated with new ore/system data when user next switches tabs
+              // Re-render the open settings tab when map data changes so
+              // newly-registered stations show up in the pickers. The debounced
+              // refresh skips re-rendering while the user is actively editing a
+              // field, so unsaved changes aren't clobbered.
+              if (document.getElementById("page-settings")?.classList.contains("active")) {
+                scheduleSettingsPanelRefresh();
+              }
               break;
             case "statsUpdate":
               statsDaily = msg.statsDaily || {};
@@ -4543,7 +4542,7 @@
                       ? `deepcore:${botDeepCore}`
                       : "";
 
-          const oreOres = knownOres.filter((o) => {
+          const oreOres = allMiningOres.filter((o) => {
             const n = o.name.toLowerCase();
             return (
               !n.includes("gas") &&
@@ -4560,7 +4559,7 @@
               !n.includes("thorium")
             );
           });
-          const gasOres = knownOres.filter((o) => {
+        const gasOres = allMiningOres.filter((o) => {
             const n = o.name.toLowerCase();
             return (
               n.includes("gas") ||
@@ -4569,7 +4568,7 @@
               n.includes("helium")
             );
           });
-          const iceOres = knownOres.filter((o) => {
+        const iceOres = allMiningOres.filter((o) => {
             const n = o.name.toLowerCase();
             return (
               n.includes("ice") ||
@@ -4578,7 +4577,7 @@
               n.includes("water")
             );
           });
-          const radioactiveOres = knownOres.filter((o) => {
+          const radioactiveOres = allMiningOres.filter((o) => {
             const n = o.name.toLowerCase();
             return (
               n.includes("polonium") ||
@@ -11793,66 +11792,120 @@
         renderSettingsPanel();
       }
 
+      // Debounced re-render of the open settings tab when the shared map data
+      // changes (e.g. a connected bot registers its docked station, or a routine
+      // discovers new POIs). Skipped while the user is actively editing a field
+      // so unsaved input isn't clobbered by a refresh.
+      let _settingsRefreshTimer = null;
+      // Returns true when the open miner-quotas tab has edits in the DOM that
+      // are not yet reflected in `settings` (added/removed rows or changed
+      // quantities). Background refreshes rebuild the panel from `settings`, so
+      // refreshing while dirty would silently discard unsaved work.
+      function minerQuotaTabDirty() {
+        if (activeSettingsTab !== "miner_quotas") return false;
+        const saved = settings.miner || {};
+        const tables = [
+          ["ore-quota-table", "oreQuotas"],
+          ["gas-quota-table", "gasQuotas"],
+          ["ice-quota-table", "iceQuotas"],
+          ["deepcore-quota-table", "deepCoreQuotas"],
+          ["radioactive-quota-table", "radioactiveQuotas"],
+        ];
+        for (const [tableId, key] of tables) {
+          const tbody = document.querySelector(`#${tableId} tbody`);
+          if (!tbody) continue;
+          const savedMap = saved[key] || {};
+          const domIds = new Set();
+          for (const tr of tbody.querySelectorAll("tr[data-ore-id]")) {
+            const id = tr.dataset.oreId;
+            domIds.add(id);
+            const qty = parseInt(tr.querySelector(".quota-qty")?.value) || 0;
+            if (qty !== (savedMap[id] || 0)) return true;
+          }
+          const savedIds = new Set(
+            Object.keys(savedMap).filter((k) => savedMap[k] > 0),
+          );
+          for (const id of savedIds) {
+            if (!domIds.has(id)) return true;
+          }
+        }
+        return false;
+      }
+
+      function scheduleSettingsPanelRefresh() {
+        if (_settingsRefreshTimer) return;
+        _settingsRefreshTimer = setTimeout(() => {
+          _settingsRefreshTimer = null;
+          const panel = document.getElementById("settingsContent");
+          if (!panel) return;
+          const ae = document.activeElement;
+          if (
+            ae &&
+            (ae.tagName === "INPUT" ||
+              ae.tagName === "SELECT" ||
+              ae.tagName === "TEXTAREA") &&
+            panel.contains(ae)
+          ) {
+            return;
+          }
+          // Never clobber unsaved quota edits on a background refresh (e.g.
+          // mapData / mapUpdate / catalogue pushes). The user must Save first.
+          if (minerQuotaTabDirty()) return;
+          try {
+            renderSettingsPanel();
+          } catch (e) {
+            console.error("settings panel refresh failed", e);
+          }
+        }, 800);
+      }
+
       function renderSettingsPanel() {
         const panel = document.getElementById("settingsContent");
-        if (activeSettingsTab === "general") {
-          renderGeneralSettings(panel);
-        } else if (activeSettingsTab === "system_blacklist") {
-          renderSystemBlacklistSettings(panel);
-        } else if (activeSettingsTab === "miner") {
-          renderMinerSettings(panel);
-        } else if (activeSettingsTab === "miner_quotas") {
-          renderMinerQuotasSettings(panel);
-        } else if (activeSettingsTab === "flock_grouping") {
-          renderFlockGroupingSettings(panel);
-        } else if (activeSettingsTab === "crafter") {
-          renderCrafterSettings(panel);
-        } else if (activeSettingsTab === "rescue") {
-          renderRescueSettings(panel);
-        } else if (activeSettingsTab === "explorer") {
-          renderExplorerSettings(panel);
-        } else if (activeSettingsTab === "coordinator") {
-          renderCoordinatorSettings(panel);
-        } else if (activeSettingsTab === "trader") {
-          renderTraderSettings(panel);
-        } else if (activeSettingsTab === "faction_trader") {
-          renderFactionTraderSettings(panel);
-        } else if (activeSettingsTab === "craft_trade") {
-          renderCraftTradeSettings(panel);
-        } else if (activeSettingsTab === "trade_buyer") {
-          renderTradeBuyerSettings(panel);
-        } else if (activeSettingsTab === "fuel_cell_seller") {
-          renderFuelCellSellerSettings(panel);
-        } else if (activeSettingsTab === "salvager") {
-          renderSalvagerSettings(panel);
-        } else if (activeSettingsTab === "cleanup") {
-          renderCleanupSettings(panel);
-        } else if (activeSettingsTab === "return_home") {
-          renderReturnHomeSettings(panel);
-        } else if (activeSettingsTab === "ai") {
-          renderAiSettings(panel);
-        } else if (activeSettingsTab === "ai_chat") {
-          renderAiChatSettings(panel);
-        } else if (activeSettingsTab === "hunter") {
-          renderHunterSettings(panel);
-        } else if (activeSettingsTab === "escort") {
-          renderEscortSettings(panel);
-        } else if (activeSettingsTab === "pathfinder_test") {
-          renderPathfinderTestSettings(panel);
-        } else if (activeSettingsTab === "fleet_hunter") {
-          renderFleetHunterSettings(panel);
-        } else if (activeSettingsTab === "cargo_mover") {
-          renderCargoMoverSettings(panel);
-        } else if (activeSettingsTab === "fuel_transport") {
-          renderFuelTransportSettings(panel);
-        } else if (activeSettingsTab === "civilian_transport") {
-          renderCivilianTransportSettings(panel);
-        } else if (activeSettingsTab === "module_seller") {
-          renderModuleSellerSettings(panel);
-        } else if (activeSettingsTab === "client_sync") {
-          renderClientSyncSettings(panel);
-        } else if (activeSettingsTab === "fuel_service") {
-          renderFuelServiceSettings(panel);
+        if (!panel) return;
+        const dispatch = {
+          general: renderGeneralSettings,
+          system_blacklist: renderSystemBlacklistSettings,
+          miner: renderMinerSettings,
+          miner_quotas: renderMinerQuotasSettings,
+          flock_grouping: renderFlockGroupingSettings,
+          crafter: renderCrafterSettings,
+          rescue: renderRescueSettings,
+          explorer: renderExplorerSettings,
+          coordinator: renderCoordinatorSettings,
+          trader: renderTraderSettings,
+          faction_trader: renderFactionTraderSettings,
+          craft_trade: renderCraftTradeSettings,
+          trade_buyer: renderTradeBuyerSettings,
+          fuel_cell_seller: renderFuelCellSellerSettings,
+          salvager: renderSalvagerSettings,
+          cleanup: renderCleanupSettings,
+          return_home: renderReturnHomeSettings,
+          ai: renderAiSettings,
+          ai_chat: renderAiChatSettings,
+          hunter: renderHunterSettings,
+          escort: renderEscortSettings,
+          pathfinder_test: renderPathfinderTestSettings,
+          fleet_hunter: renderFleetHunterSettings,
+          cargo_mover: renderCargoMoverSettings,
+          fuel_transport: renderFuelTransportSettings,
+          civilian_transport: renderCivilianTransportSettings,
+          module_seller: renderModuleSellerSettings,
+          client_sync: renderClientSyncSettings,
+          fuel_service: renderFuelServiceSettings,
+        };
+        const fn = dispatch[activeSettingsTab];
+        if (!fn) return;
+        const showRenderError = (e) => {
+          // Isolate a single broken tab so it can't blank the whole panel.
+          console.error(`Failed to render settings tab '${activeSettingsTab}':`, e);
+          panel.innerHTML = `<h3>${esc(activeSettingsTab)} Settings</h3><div class="settings-desc" style="color:#d32f2f">This tab failed to render: ${esc(String((e && e.message) || e))}</div>`;
+        };
+        try {
+          // fn may be async; catch both synchronous throws and rejected promises
+          // so a broken tab shows an error instead of freezing on the prior tab.
+          Promise.resolve(fn(panel)).catch(showRenderError);
+        } catch (e) {
+          showRenderError(e);
         }
       }
 
@@ -12117,6 +12170,31 @@
         <div style="display:flex;flex-direction:column;gap:4px" id="wsv2-bot-list">
           ${wsV2BotsRows}
         </div>
+      </div>
+
+      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
+        <div>
+          <div class="setting-label">Clerk API Key</div>
+          <div class="setting-hint">Headless-client credential from the website. Connects the players you own without per-account passwords. Also readable from the SPACEMOLT_CLERK_API_KEY env var (env takes precedence).</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input type="password" id="set-clerk-apikey" placeholder="Clerk API key" value="${settings.clerk?.apiKey || ""}" style="width:380px" />
+          <button class="primary" onclick="saveClerkKey()">Save Key</button>
+        </div>
+      </div>
+
+      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
+        <div>
+          <div class="setting-label">Add Bots from Account</div>
+          <div class="setting-hint">A Clerk account can own hundreds of players. List the players you own and add only the ones you want to run — you do not have to add them all. Added players reconnect automatically on restart.</div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button onclick="listClerkPlayers()">List Players</button>
+          <button class="primary" onclick="addSelectedClerkBots()">Add Selected</button>
+          <span id="clerkStatus" style="color:var(--text-secondary);font-size:12px"></span>
+        </div>
+        <input type="text" id="clerkSearch" placeholder="Filter players by name / empire..." oninput="renderClerkPlayers()" style="width:380px" />
+        <div id="clerkPlayersList" style="width:100%;max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px"></div>
       </div>
 
       <div class="settings-save-bar">
@@ -12673,7 +12751,7 @@
       }
 
       async function renderCrafterSettings(panel) {
-        const crafter = settings.crafter || {};
+        const crafter = (settings.crafter = settings.crafter || {});
         const crafters = crafter.crafters || [];
         const botCrafterAssignments = crafter.botCrafterAssignments || {};
 
@@ -17578,22 +17656,6 @@ When responding:
         }
       }
 
-      // ── Add / Register Modal ───────────────────────────────────
-      function showAddModal() {
-        modalMode = "add";
-        updateModalView();
-        document.getElementById("addModal").classList.add("active");
-        document.getElementById("addUsername").focus();
-      }
-
-      function closeAddModal() {
-        document.getElementById("addModal").classList.remove("active");
-        document.getElementById("addUsername").value = "";
-        document.getElementById("addPassword").value = "";
-        document.getElementById("regCode").value = "";
-        document.getElementById("regUsername").value = "";
-      }
-
       function showShutdownModal() {
         document.getElementById("shutdownModal").classList.add("active");
       }
@@ -17643,44 +17705,76 @@ When responding:
         send({ type: "emergencyReturn" });
       }
 
-      function toggleModalMode() {
-        modalMode = modalMode === "add" ? "register" : "add";
-        updateModalView();
-      }
+      // ── Clerk (headless client) account management ────────────
+      let clerkPlayersData = [];
 
-      function updateModalView() {
-        const isAdd = modalMode === "add";
-        document.getElementById("modalTitle").textContent = isAdd
-          ? "Add Existing Bot"
-          : "Register New Bot";
-        document.getElementById("modalAddFields").style.display = isAdd
-          ? ""
-          : "none";
-        document.getElementById("modalRegFields").style.display = isAdd
-          ? "none"
-          : "";
-        document.getElementById("modalToggle").textContent = isAdd
-          ? "Register New"
-          : "Add Existing";
-        document.getElementById("modalSubmit").textContent = isAdd
-          ? "Add"
-          : "Register";
-      }
-
-      function submitAddModal() {
-        if (modalMode === "add") {
-          const username = document.getElementById("addUsername").value.trim();
-          const password = document.getElementById("addPassword").value.trim();
-          if (!username || !password) return;
-          send({ type: "add", username, password });
-        } else {
-          const code = document.getElementById("regCode").value.trim();
-          const username = document.getElementById("regUsername").value.trim();
-          const empire = document.getElementById("regEmpire").value;
-          if (!code || !username) return;
-          send({ type: "register", username, empire, registration_code: code });
+      function saveClerkKey() {
+        const key = document.getElementById("set-clerk-apikey").value.trim();
+        if (!key) {
+          appendLine("system", "Clerk API key is empty — not saved.");
+          return;
         }
-        closeAddModal();
+        send({ type: "setClerkKey", clerkApiKey: key });
+      }
+
+      function listClerkPlayers() {
+        const statusEl = document.getElementById("clerkStatus");
+        if (statusEl) statusEl.textContent = "Loading players...";
+        send({ type: "listClerkPlayers" });
+      }
+
+      function addSelectedClerkBots() {
+        const checked = Array.from(
+          document.querySelectorAll("#clerkPlayersList input[type='checkbox']:checked"),
+        ).map((cb) => cb.value);
+        if (!checked.length) {
+          appendLine("system", "No players selected to add.");
+          return;
+        }
+        const statusEl = document.getElementById("clerkStatus");
+        if (statusEl) statusEl.textContent = `Adding ${checked.length} player(s)...`;
+        send({ type: "addClerkBots", ids: checked });
+      }
+
+      function renderClerkPlayers() {
+        const listEl = document.getElementById("clerkPlayersList");
+        if (!listEl) return;
+        const filter = (document.getElementById("clerkSearch")?.value || "")
+          .trim()
+          .toLowerCase();
+        const players = clerkPlayersData.filter((p) => {
+          if (!filter) return true;
+          return (
+            (p.username || "").toLowerCase().includes(filter) ||
+            (p.empire || "").toLowerCase().includes(filter) ||
+            (p.id || "").toLowerCase().includes(filter)
+          );
+        });
+        if (!clerkPlayersData.length) {
+          listEl.innerHTML =
+            '<div class="setting-hint" style="padding:8px">No players loaded. Click "List Players" to fetch the accounts owned by this Clerk key.</div>';
+          return;
+        }
+        if (!players.length) {
+          listEl.innerHTML =
+            '<div class="setting-hint" style="padding:8px">No players match the filter.</div>';
+          return;
+        }
+        listEl.innerHTML = players
+          .map((p) => {
+            const id = "clerk-player-" + p.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const checked = p.selected ? " checked" : "";
+            const tag = p.connected
+              ? '<span style="color:var(--green);font-size:11px"> ● connected</span>'
+              : p.selected
+                ? '<span style="color:var(--text-secondary);font-size:11px"> ○ selected (not connected)</span>'
+                : "";
+            return `<label class="checkbox-row" for="${id}" style="display:flex;gap:8px;align-items:center;padding:3px 4px">
+              <input type="checkbox" id="${id}" value="${esc(p.id)}"${checked} />
+              <span><strong>${esc(p.username)}</strong> <span style="color:var(--text-secondary);font-size:11px">(${esc(p.empire)}${p.hidden ? ", hidden" : ""})</span> ${tag}</span>
+            </label>`;
+          })
+          .join("");
       }
 
       // ── Utilities ──────────────────────────────────────────────
@@ -23688,6 +23782,20 @@ async function fetchPersonalFacilityTypes(username) {
         const oreSecondary = depositFallback;
         const desiredEmergencyWarpDevices = m.desiredEmergencyWarpDevices ?? 3;
 
+        // Complete mineable-resource list from the catalogue, unioned with any
+        // ores discovered from map scans. knownOres is only populated once POIs
+        // have been scanned, so the ore/gas/ice pickers would otherwise be empty.
+        const catalogMiningOres = Object.values(catalog.items || {})
+          .filter((it) => it.category === "ore")
+          .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
+        allMiningOres = catalogMiningOres.slice();
+        for (const o of knownOres) {
+          if (!allMiningOres.find((mm) => mm.item_id === o.item_id)) {
+            allMiningOres.push(o);
+          }
+        }
+        allMiningOres.sort((a, b) => a.name.localeCompare(b.name));
+
         const systemOpts = ['<option value="">(current system)</option>'];
         for (const sys of [...knownSystems].sort((a, b) =>
           (a.name || a.id || "").localeCompare(b.name || b.id || ""),
@@ -23830,7 +23938,7 @@ async function fetchPersonalFacilityTypes(username) {
           "dark_matter_residue",
           "adamantite_ore",
         ]);
-        const oreOres = knownOres.filter((o) => {
+        const oreOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             !n.includes("gas") &&
@@ -23847,7 +23955,7 @@ async function fetchPersonalFacilityTypes(username) {
             !deepCoreOreIds.has(o.item_id)
           );
         });
-        const gasOres = knownOres.filter((o) => {
+        const gasOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             n.includes("gas") ||
@@ -23856,7 +23964,7 @@ async function fetchPersonalFacilityTypes(username) {
             n.includes("helium")
           );
         });
-        const iceOres = knownOres.filter((o) => {
+        const iceOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             n.includes("ice") ||
@@ -24431,15 +24539,15 @@ async function fetchPersonalFacilityTypes(username) {
         ];
         const allOres =
           type === "ore"
-            ? knownOres.filter(
+            ? allMiningOres.filter(
                 (o) =>
                   !o.name.toLowerCase().includes("gas") &&
                   !o.name.toLowerCase().includes("ice"),
               )
             : type === "gas"
-              ? knownOres.filter((o) => o.name.toLowerCase().includes("gas"))
+              ? allMiningOres.filter((o) => o.name.toLowerCase().includes("gas"))
               : type === "ice"
-                ? knownOres.filter((o) => o.name.toLowerCase().includes("ice"))
+                ? allMiningOres.filter((o) => o.name.toLowerCase().includes("ice"))
                 : type === "deepcore"
                   ? deepCoreOresList
                   : radioactiveOresList;
@@ -24467,7 +24575,7 @@ async function fetchPersonalFacilityTypes(username) {
         );
         if (existing) return;
 
-        const oreOresList = knownOres.filter((o) => {
+        const oreOresList = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             !n.includes("gas") &&
@@ -24503,7 +24611,7 @@ async function fetchPersonalFacilityTypes(username) {
         );
         if (existing) return;
 
-        const oreOresList = knownOres.filter((o) => {
+        const oreOresList = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             !n.includes("gas") &&
@@ -24764,6 +24872,22 @@ async function fetchPersonalFacilityTypes(username) {
         const deepCoreQuotas = m.deepCoreQuotas || {};
         const radioactiveQuotas = m.radioactiveQuotas || {};
 
+        // Build a complete list of mineable resources from the full item
+        // catalogue and union it with any ores discovered from map scans.
+        // knownOres is only populated once POIs have been scanned, so relying on
+        // it alone leaves the ore/gas/ice pickers empty for users who haven't
+        // explored yet (deep core + radioactive already use fixed lists below).
+        const catalogMiningOres = Object.values(catalog.items || {})
+          .filter((it) => it.category === "ore")
+          .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
+        allMiningOres = catalogMiningOres.slice();
+        for (const o of knownOres) {
+          if (!allMiningOres.find((m) => m.item_id === o.item_id)) {
+            allMiningOres.push(o);
+          }
+        }
+        allMiningOres.sort((a, b) => a.name.localeCompare(b.name));
+
         // Deep core ore IDs (for filtering basic ores)
         const deepCoreOreIds = new Set([
           "void_essence",
@@ -24776,7 +24900,7 @@ async function fetchPersonalFacilityTypes(username) {
         ]);
 
         // Build ore filter lists
-        const oreOres = knownOres.filter((o) => {
+        const oreOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             !n.includes("gas") &&
@@ -24793,7 +24917,7 @@ async function fetchPersonalFacilityTypes(username) {
             !deepCoreOreIds.has(o.item_id)
           );
         });
-        const gasOres = knownOres.filter((o) => {
+        const gasOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             n.includes("gas") ||
@@ -24802,7 +24926,7 @@ async function fetchPersonalFacilityTypes(username) {
             n.includes("helium")
           );
         });
-        const iceOres = knownOres.filter((o) => {
+        const iceOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
           return (
             n.includes("ice") ||

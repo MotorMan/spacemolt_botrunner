@@ -32,7 +32,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
   bot?: string;
   routine?: string;
   username?: string;

@@ -5,7 +5,7 @@ import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
-import { WebSocketV2Client, type MarketUpdatePayload, type WsV2Status } from "./wsv2.js";
+import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
@@ -201,10 +201,10 @@ docked = false;
   settings?: Record<string, unknown>;
 
   /** Optional WebSocket v2 client for realtime market subscriptions (opt-in static bots). */
-  wsV2: WebSocketV2Client | null = null;
+
 
   /** Maps a subscribed base_id to the {systemId, poiId} it was subscribed from (for dashboard mirror). */
-  private wsV2BaseMapping: Record<string, { systemId: string; poiId: string }> = {};
+
 
   // Action log (last N entries)
   readonly actionLog: string[] = [];
@@ -372,14 +372,13 @@ docked = false;
   }
 
   /**
-   * Typed command facade from `@spacemolt/lib`, available once this bot is
-   * backed by a live `Account` (set via the constructor). Returns `null` while
-   * the legacy HTTP `api` is still in use, so call sites can branch:
-   * `const cmds = bot.commands; if (cmds) { ... } else { await bot.exec(...) }`.
-   * Use `account.commands.<tool>.<action>(params)` per the library's API.
+   * Typed command facade from `@spacemolt/lib`. Every bot is backed by a live
+   * `Account` (the legacy HTTP/credential path was retired in P4.1), so this is
+   * always available. Call sites use it directly:
+   * `bot.commands.<tool>.<action>(params)` per the library's API.
    */
-  get commands(): Commands | null {
-    return this.account ? this.account.commands : null;
+  get commands(): Commands {
+    return this.account!.commands;
   }
 
   clearError(): void {
@@ -765,7 +764,6 @@ docked = false;
       "battle_alert",
       "crafting_update",
       "mining_yield",
-      "market_update",
       "skill_level_up",
       "achievement_unlocked",
       "trade_offer_received",
@@ -788,6 +786,10 @@ docked = false;
       "base_destroyed",
       "base_raid_update",
     );
+
+    // Realtime market order-book updates feed the stream store + dashboard cache.
+    const offMarket = account.on("market_update", (payload) => this.handleMarketUpdate(payload));
+    this.eventUnsubscribers.push(offMarket);
 
     // Untyped pushes (legacy "system"/"combat" pirate-attack messages) arrive as
     // RawFrame via onAny. Forward those too, skipping anything already covered
@@ -1220,7 +1222,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.lastSystem = this.system;
           this.lastPoi = this.poi;
           // Re-evaluate WS v2 subscription for the (possibly new) docked station.
-          this.ensureWebSocketV2();
+          this.ensureMarketSubscription();
         }
 
         return resp;
@@ -1883,7 +1885,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   // ── WebSocket v2 (realtime market) lifecycle ──────────────
 
   /** Whether WS v2 market streaming is enabled for this bot. */
-  isWebSocketV2Enabled(): boolean {
+  isMarketStreamEnabled(): boolean {
     try {
       const settings = loadSettings();
       const general = (settings.general as Record<string, unknown>) || {};
@@ -1905,78 +1907,51 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     return base || null;
   }
 
-  /** Ensure the WS v2 client is running and subscribed to the current station. */
-  private ensureWebSocketV2(): void {
-    if (!this.isWebSocketV2Enabled()) return;
+  /** Subscribe to the library's realtime market stream for the current dock. */
+  private ensureMarketSubscription(): void {
+    if (!this.isMarketStreamEnabled()) return;
+    const account = this.account;
+    if (!account) return;
     const baseId = this.getCurrentBaseId();
     if (!baseId) {
-      this.log("system", "WS v2: enabled but not docked at a known station yet.");
+      this.log("system", "Market stream: enabled but not docked at a known station yet.");
       return;
     }
-    if (!this.wsV2) {
-      this.startWebSocketV2();
-      return;
-    }
-    if (this.wsV2.subscribedBaseId !== baseId && this.wsV2.isConnected) {
-      this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
-      this.wsV2.subscribeMarket(baseId).catch((err) =>
-        this.log("error", `WS v2 resubscribe failed: ${err instanceof Error ? err.message : err}`),
+    account.subscribeMarket()
+      .then((snap) => {
+        marketStreamStore.update(snap.base_id, 0, snap.items);
+        try {
+          const normalized = snap.items.map((it) => ({
+            item_id: it.item_id,
+            item_name: it.item_name,
+            sell_orders: it.sell_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
+            buy_orders: it.buy_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
+          }));
+          mapStore.updateMarket(this.system, this.poi, { items: normalized });
+        } catch { /* ignore dashboard mirror errors */ }
+      })
+      .catch((err) =>
+        this.log("error", `Market subscription failed: ${err instanceof Error ? err.message : err}`),
       );
-    }
   }
 
-  /** Open the WS v2 client (non-blocking). Subscription happens via onStatus "connected". */
-  private startWebSocketV2(): void {
-    const creds = this.session.loadCredentials();
-    if (!creds) return;
-    this.wsV2 = new WebSocketV2Client({
-      username: creds.username,
-      password: creds.password,
-      baseUrl: this.api.baseUrl,
-      onMarketUpdate: (payload) => this.handleWebSocketV2MarketUpdate(payload),
-      onStatus: (status: WsV2Status) => this.onWebSocketV2Status(status),
-    });
-    this.wsV2.start().catch((err) =>
-      this.log("error", `WS v2 connection error: ${err instanceof Error ? err.message : err}`),
-    );
-  }
-
-  private onWebSocketV2Status(status: WsV2Status): void {
-    this.log("system", `WS v2 status: ${status}`);
-    if (status === "connected") {
-      const baseId = this.getCurrentBaseId();
-      if (baseId && this.wsV2 && this.wsV2.subscribedBaseId !== baseId) {
-        this.wsV2BaseMapping[baseId] = { systemId: this.system, poiId: this.poi };
-        this.wsV2.subscribeMarket(baseId).catch((err) =>
-          this.log("error", `WS v2 subscribe failed: ${err instanceof Error ? err.message : err}`),
-        );
-      }
-    }
-  }
-
-  private handleWebSocketV2MarketUpdate(payload: MarketUpdatePayload): void {
+  /** Feed a market snapshot/update into the stream store and dashboard cache. */
+  private handleMarketUpdate(payload: NotificationMarketUpdate): void {
     const baseId = payload.base_id;
     if (!baseId || !Array.isArray(payload.items)) return;
     marketStreamStore.update(baseId, payload.tick, payload.items);
 
     // Optional mirror into the dashboard's HTTP market cache, normalizing
     // the WS order-book shape (price_each) into what mapStore expects (price).
-    const mapping = this.wsV2BaseMapping[baseId];
-    if (mapping) {
-      try {
-        const normalized = payload.items.map((it) => ({
-          item_id: it.item_id,
-          item_name: it.item_name,
-          sell_orders: Array.isArray(it.sell_orders)
-            ? it.sell_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
-            : it.sell_orders,
-          buy_orders: Array.isArray(it.buy_orders)
-            ? it.buy_orders.map((o) => ({ price: o.price_each ?? o.price, quantity: o.quantity, source: o.source }))
-            : it.buy_orders,
-        }));
-        mapStore.updateMarket(mapping.systemId, mapping.poiId, { items: normalized });
-      } catch { /* ignore dashboard mirror errors */ }
-    }
+    try {
+      const normalized = payload.items.map((it) => ({
+        item_id: it.item_id,
+        item_name: it.item_name,
+        sell_orders: it.sell_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
+        buy_orders: it.buy_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
+      }));
+      mapStore.updateMarket(this.system, this.poi, { items: normalized });
+    } catch { /* ignore dashboard mirror errors */ }
   }
 
   /** Start running a routine. */
@@ -2043,7 +2018,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
 
     // Open the optional WebSocket v2 market stream (static/market-watcher bots).
     // Non-blocking: failures are logged but never delay or crash the routine.
-    this.ensureWebSocketV2();
+    this.ensureMarketSubscription();
 
     const ctx: RoutineContext = {
       api: this.api,
@@ -2096,9 +2071,6 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       // assignment is cleared and "crashed" is logged rather than "finished".
       throw err;
     } finally {
-      // Tear down the WS v2 stream so it isn't left reconnecting while idle.
-      this.wsV2?.close();
-      this.wsV2 = null;
       await generator.return(undefined);
     }
 

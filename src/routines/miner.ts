@@ -88,9 +88,9 @@ async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[])
   if (cachedModules && cachedModules.length > 0) {
     modules = cachedModules;
   } else {
-    const shipResp = await bot.exec("get_ship");
-    if (shipResp.error || !shipResp.result) return false;
-    const shipData = shipResp.result as Record<string, unknown>;
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipData) return false;
     modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   }
 
@@ -131,9 +131,10 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
 
   // Enable cloaking
   ctx.log("mining", "Enabling cloaking module...");
-  const resp = await bot.exec("cloak", { enable: true });
-  if (resp.error) {
-    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+  try {
+    await bot.commands.spacemolt.cloak({ enable: true });
+  } catch (e) {
+    ctx.log("error", `Failed to enable cloak: ${e}`);
     return false;
   }
 
@@ -190,10 +191,10 @@ export function isDeepCoreOre(resourceId: string): boolean {
  */
 export async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error || !shipResp.result) return false;
+  const shipResp = await bot.commands.spacemolt.get_ship();
+  const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+  if (!shipData) return false;
 
-  const shipData = shipResp.result as Record<string, unknown>;
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
 
   for (const mod of modules) {
@@ -218,10 +219,10 @@ export async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boo
  */
 export async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error || !shipResp.result) return false;
+  const shipResp = await bot.commands.spacemolt.get_ship();
+  const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+  if (!shipData) return false;
 
-  const shipData = shipResp.result as Record<string, unknown>;
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
 
   for (const mod of modules) {
@@ -280,12 +281,12 @@ export async function getDeepCoreCapability(ctx: RoutineContext, fieldTestActive
  */
 async function hasFieldTestMission(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  const activeResp = await bot.exec("get_active_missions");
-  if (activeResp.error || !activeResp.result) return false;
+  const activeResp = await bot.commands.spacemolt.get_active_missions();
+  const result = activeResp.structuredContent as Record<string, unknown> | undefined;
+  if (!result) return false;
 
-  const result = activeResp.result as Record<string, unknown>;
-  const missions = Array.isArray(activeResp.result)
-    ? activeResp.result
+  const missions = Array.isArray(activeResp.structuredContent)
+    ? activeResp.structuredContent
     : Array.isArray(result.missions)
     ? result.missions
     : [];
@@ -319,18 +320,20 @@ async function checkAndAcceptMinerMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
-  const activeResp = await bot.exec("get_active_missions");
+  const activeResp = await bot.commands.spacemolt.get_active_missions();
   let activeCount = 0;
-  if (activeResp.result && typeof activeResp.result === "object") {
-    const r = activeResp.result as Record<string, unknown>;
+  const activeContent = activeResp.structuredContent;
+  if (activeContent && typeof activeContent === "object") {
+    const r = activeContent as Record<string, unknown>;
     const list = Array.isArray(r) ? r : Array.isArray(r.missions) ? r.missions : [];
     activeCount = (list as unknown[]).length;
   }
   if (activeCount >= 5) return;
 
-  const availResp = await bot.exec("get_missions");
-  if (!availResp.result || typeof availResp.result !== "object") return;
-  const r = availResp.result as Record<string, unknown>;
+  const availResp = await bot.commands.spacemolt.get_missions();
+  const availContent = availResp.structuredContent;
+  if (!availContent || typeof availContent !== "object") return;
+  const r = availContent as Record<string, unknown>;
   const available = (
     Array.isArray(r) ? r :
     Array.isArray(r.missions) ? r.missions : []
@@ -347,11 +350,11 @@ async function checkAndAcceptMinerMissions(ctx: RoutineContext): Promise<void> {
       name.includes(kw) || desc.includes(kw) || type.includes(kw)
     );
     if (!isMinerMission) continue;
-    const acceptResp = await bot.exec("accept_mission", { mission_id: missionId });
-    if (!acceptResp.error) {
+    try {
+      await bot.commands.spacemolt.accept_mission({ id: missionId });
       activeCount++;
       ctx.log("trade", `Mission accepted: ${(mission.name as string) || missionId} (${activeCount}/5 active)`);
-    }
+    } catch { /* mission not accepted */ }
   }
 }
 
@@ -360,9 +363,10 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
-  const activeResp = await bot.exec("get_active_missions");
-  if (!activeResp.result || typeof activeResp.result !== "object") return;
-  const r = activeResp.result as Record<string, unknown>;
+  const activeResp = await bot.commands.spacemolt.get_active_missions();
+  const activeContent = activeResp.structuredContent;
+  if (!activeContent || typeof activeContent !== "object") return;
+  const r = activeContent as Record<string, unknown>;
   const missions = (
     Array.isArray(r) ? r :
     Array.isArray(r.missions) ? r.missions : []
@@ -371,12 +375,12 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
   for (const mission of missions) {
     const missionId = (mission.id as string) || (mission.mission_id as string) || "";
     if (!missionId) continue;
-    const completeResp = await bot.exec("complete_mission", { mission_id: missionId });
-    if (!completeResp.error) {
+    try {
+      await bot.commands.spacemolt.complete_mission({ id: missionId });
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
       await bot.refreshLocation();
-    }
+    } catch { /* mission not completed */ }
   }
 }
 
@@ -571,12 +575,13 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     shipData = { modules: cachedModules };
     usingCachedModules = true;
   } else {
-    const shipResp = await bot.exec("get_ship");
-    if (shipResp.error) {
-      ctx.log("error", `Failed to get ship info: ${shipResp.error.message}`);
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipDataResult = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipDataResult) {
+      ctx.log("error", `Failed to get ship info`);
       return null;
     }
-    shipData = shipResp.result as Record<string, unknown>;
+    shipData = shipDataResult;
   }
 
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
@@ -675,9 +680,9 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   // This prevents failures when cached modules are incomplete after client restart/timeout
   if (usingCachedModules && !hasMiningLaser && !hasStripMiner && !hasGasHarvester && !hasIceHarvester && !hasRadioactiveEquipment && !deepCoreCap.canMineHidden) {
     ctx.log("warn", "Cached modules incomplete — retrying with fresh ship data");
-    const freshResp = await bot.exec("get_ship");
-    if (!freshResp.error && freshResp.result) {
-      const freshShipData = freshResp.result as Record<string, unknown>;
+    const freshResp = await bot.commands.spacemolt.get_ship();
+    const freshShipData = freshResp.structuredContent as Record<string, unknown> | undefined;
+    if (freshShipData) {
       const freshModules = Array.isArray(freshShipData.modules) ? freshShipData.modules : [];
 
       // Reset detection flags
@@ -771,9 +776,9 @@ export async function hasEquipmentForMiningType(ctx: RoutineContext, miningType:
   if (cachedModules && cachedModules.length > 0) {
     modules = cachedModules;
   } else {
-    const shipResp = await bot.exec("get_ship");
-    if (shipResp.error) return false;
-    const shipData = shipResp.result as Record<string, unknown>;
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipData) return false;
     modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   }
 
@@ -828,9 +833,9 @@ async function hasStripMiner(ctx: RoutineContext, cachedModules?: unknown[]): Pr
   if (cachedModules) {
     modules = cachedModules;
   } else {
-    const shipResp = await bot.exec("get_ship");
-    if (shipResp.error) return false;
-    const shipData = shipResp.result as Record<string, unknown>;
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipData) return false;
     modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   }
 
@@ -1111,6 +1116,32 @@ async function reportNoViableTargetsAndDeepSleep(
   await ctx.sleep(sleepMs);
 }
 
+interface LibCallResult {
+  result?: unknown;
+  error?: { code: string; message: string };
+  notifications: unknown[];
+}
+
+async function runLibCommand<T>(call: Promise<T>): Promise<LibCallResult> {
+  try {
+    const res = (await call) as unknown as { delta?: { details?: unknown }; structuredContent?: unknown; result?: unknown };
+    const result =
+      res && typeof res === "object" && "delta" in res
+        ? res.delta?.details ?? res.delta
+        : (res?.structuredContent ?? res?.result);
+    return { result, error: undefined, notifications: [] };
+  } catch (err) {
+    const e = err as Error & { code?: string };
+    const message = e?.message ?? String(err);
+    const msg = message.toLowerCase();
+    let code = e?.code ?? "lib_error";
+    if (msg.includes("battle_interrupt") || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+      code = "battle_interrupt";
+    }
+    return { error: { code, message }, result: undefined, notifications: [] };
+  }
+}
+
 /**
  * Survey the current system to reveal hidden POIs.
  * This is required before a bot can travel to a hidden POI it hasn't discovered yet.
@@ -1120,7 +1151,7 @@ async function surveySystemForHiddenPois(ctx: RoutineContext): Promise<boolean> 
   const { bot } = ctx;
   
   ctx.log("mining", "Surveying system to reveal hidden POIs...");
-  const surveyResp = await bot.exec("survey_system");
+  const surveyResp = await runLibCommand(bot.commands.spacemolt.survey_system());
   
   // Check for battle notifications after survey
   if (surveyResp.notifications && Array.isArray(surveyResp.notifications)) {
@@ -1199,7 +1230,7 @@ async function travelToPoiWithSurvey(
   const { bot } = ctx;
   
   // First attempt to travel
-  const travelResp = await bot.exec("travel", { target_poi: poiId });
+  const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: poiId }));
 
   // Check for battle notifications
   if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
@@ -1250,7 +1281,7 @@ async function travelToPoiWithSurvey(
     
     // Retry travel after survey
     ctx.log("mining", `Retrying travel to hidden POI ${poiName} after survey...`);
-    const retryResp = await bot.exec("travel", { target_poi: poiId });
+    const retryResp = await runLibCommand(bot.commands.spacemolt.travel({ id: poiId }));
 
     // Check for battle notifications on retry
     if (retryResp.notifications && Array.isArray(retryResp.notifications)) {
@@ -1727,7 +1758,7 @@ async function signalEscort(
   const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
 
   if (channel === "faction") {
-    await bot.exec("chat", { channel: "faction", content: message });
+    await bot.commands.spacemolt_social.chat({ target: "faction", content: message });
   } else if (channel === "local") {
     ctx.log("escort", `Signal: ${message}`);
   } else if (channel === "chat") {
@@ -1763,14 +1794,15 @@ async function dumpCargo(ctx: RoutineContext, settings: Awaited<ReturnType<typeo
   let hadFallback = false;
   for (const item of cargoItems) {
     if (settings.depositMode === "faction") {
-      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-      if (fResp.error) {
-        ctx.log("warn", `Faction deposit failed for ${item.name}: ${fResp.error.message} — falling back to personal storage`);
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      try {
+        await bot.commands.spacemolt_storage.deposit({ item_id: item.itemId, quantity: item.quantity, target: "faction" });
+      } catch (err) {
+        ctx.log("warn", `Faction deposit failed for ${item.name}: ${err instanceof Error ? err.message : String(err)} — falling back to personal storage`);
+        await bot.commands.spacemolt_storage.deposit({ item_id: item.itemId, quantity: item.quantity });
         hadFallback = true;
       }
     } else {
-      await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      await bot.commands.spacemolt_storage.deposit({ item_id: item.itemId, quantity: item.quantity });
     }
   }
   const names = cargoItems.map(i => `${i.quantity}x ${i.name}`).join(", ");
@@ -1786,12 +1818,8 @@ async function dumpCargo(ctx: RoutineContext, settings: Awaited<ReturnType<typeo
  */
 async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> {
   const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error) {
-    ctx.log("warn", `Failed to cache ship modules: ${shipResp.error.message}`);
-    return null;
-  }
-  const shipData = (shipResp.result || {}) as Record<string, unknown>;
+  const shipResp = await bot.commands.spacemolt.get_ship();
+  const shipData = (shipResp.structuredContent as Record<string, unknown> | undefined) ?? {};
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
   if (modules.length === 0) {
     ctx.log("warn", "Ship modules not returned from get_ship — server may still be processing");
@@ -1899,18 +1927,13 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
         continue;
       }
 
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: ammoId,
-        quantity: actualQty
-      });
-      if (!wResp.error) {
+      try {
+        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: ammoId, quantity: actualQty });
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
         break;
-      } else {
-        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${wResp.error.message}`);
+      } catch (e) {
+        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${e}`);
       }
     }
   }
@@ -1920,15 +1943,12 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
   if (repairToGet > 0) {
     const kitQty = Math.min(repairToGet, Math.floor(freeSpace / getItemSize("repair_kit")));
     if (kitQty > 0) {
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: "advanced_repair_kit",
-        quantity: kitQty
-      });
-      if (!wResp.error) {
+      try {
+        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "advanced_repair_kit", quantity: kitQty });
         ctx.log("trade", `Withdrew ${kitQty} advanced_repair_kit from faction storage`);
         freeSpace -= kitQty * getItemSize("advanced_repair_kit");
+      } catch (e) {
+        ctx.log("trade", `Failed to withdraw advanced_repair_kit: ${e}`);
       }
     }
   }
@@ -1938,14 +1958,11 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
   if (shieldToGet > 0 && freeSpace >= getItemSize("shield_charge")) {
     const shQty = Math.min(shieldToGet, Math.floor(freeSpace / getItemSize("shield_charge")));
     if (shQty > 0) {
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: "shield_charge",
-        quantity: shQty
-      });
-      if (!wResp.error) {
+      try {
+        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "shield_charge", quantity: shQty });
         ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
+      } catch (e) {
+        ctx.log("trade", `Failed to withdraw shield_charge: ${e}`);
       }
     }
   }
@@ -1957,15 +1974,12 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   const warpToGet = Math.max(0, desiredWarp - currentWarp);
   if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: "emergency_warp_device",
-      quantity: warpToGet
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
-    }
+      try {
+        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "emergency_warp_device", quantity: warpToGet });
+        ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
+      } catch (e) {
+        ctx.log("trade", `Failed to withdraw emergency_warp_device: ${e}`);
+      }
   }
 }
 
@@ -2234,7 +2248,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let wasCloakingAttempted = false;
     if (settings0.enableCloak && bot.docked && !bot.isCloaked) {
       ctx.log("mining", "Manually undocking before cloaking to control state...");
-      const undockResp = await bot.exec("undock");
+      await bot.commands.spacemolt.undock();
       await ctx.sleep(500);
       await bot.refreshShip();
     }
@@ -2260,11 +2274,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // When docked at home system, also withdraw ammo from faction storage
     if (wasCloakingAttempted && homeSystem && bot.system === homeSystem && !bot.docked) {
       ctx.log("mining", "Re-docking at home station for resupply after cloaking");
-      const dockResp = await bot.exec("dock");
-      if (!dockResp.error) {
+      try {
+        await bot.commands.spacemolt.dock();
         bot.docked = true;
         ctx.log("mining", "Re-docked at home station");
-      }
+      } catch { /* dock failed */ }
     }
 
     if (bot.docked) {
@@ -2397,14 +2411,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       const minFuel = settings.minimumFuelCells;
       if (fuelInCargo < minFuel) {
-        const mil = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: minFuel });
-        if (!mil.error) ctx.log("mining", `Withdrew ${minFuel} military fuel cells from storage`);
-        else {
-          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: minFuel });
-          if (!prem.error) ctx.log("mining", `Withdrew ${minFuel} premium fuel cells from storage`);
-          else {
-            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: minFuel * 2 });
-            if (!reg.error) ctx.log("mining", `Withdrew fuel cells from storage`);
+        try {
+          await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: minFuel });
+          ctx.log("mining", `Withdrew ${minFuel} military fuel cells from storage`);
+        } catch {
+          try {
+            await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: minFuel });
+            ctx.log("mining", `Withdrew ${minFuel} premium fuel cells from storage`);
+          } catch {
+            try {
+              await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: minFuel * 2 });
+              ctx.log("mining", `Withdrew fuel cells from storage`);
+            } catch { /* no fuel cells available */ }
           }
         }
       }
@@ -2917,7 +2935,7 @@ if (shouldAbandon) {
       const homeStation = findStation(homePois);
       if (homeStation) {
         yield "travel_to_station";
-        await bot.exec("travel", { target_poi: homeStation.id });
+        await bot.commands.spacemolt.travel({ id: homeStation.id });
       }
       yield "deposit_cargo";
       await ensureDocked(ctx);
@@ -4009,7 +4027,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const homeStationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
         if (homeStationPoi) {
           yield "travel_to_station";
-          await bot.exec("travel", { target_poi: homeStationPoi.id });
+          await bot.commands.spacemolt.travel({ id: homeStationPoi.id });
         }
         yield "deposit_cargo";
         await ensureDocked(ctx);
@@ -4393,7 +4411,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
               if (stationPoi) {
                 yield "travel_to_station";
-                await bot.exec("travel", { target_poi: stationPoi.id });
+                await bot.commands.spacemolt.travel({ id: stationPoi.id });
               }
               yield "deposit_cargo";
               await ensureDocked(ctx);
@@ -4539,7 +4557,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
       if (stationPoi) {
         yield "travel_to_station";
-        await bot.exec("travel", { target_poi: stationPoi.id });
+        await bot.commands.spacemolt.travel({ id: stationPoi.id });
       }
       yield "deposit_cargo";
       await ensureDocked(ctx);
@@ -4594,7 +4612,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (surveySuccess) {
             // After survey, verify we can now travel to the POI
             ctx.log("mining", `Retrying travel to ${miningPoi.name} after survey...`);
-            const retryResp = await bot.exec("travel", { target_poi: miningPoi.id });
+            const retryResp = await runLibCommand(bot.commands.spacemolt.travel({ id: miningPoi.id }));
             if (!retryResp.error || retryResp.error.message.includes("already")) {
               bot.poi = miningPoi.id;
               ctx.log("mining", `Successfully traveled to hidden POI ${miningPoi.name} after verification survey`);
@@ -4615,12 +4633,12 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             const firstConn = connections[0];
             const targetSysName = firstConn.system_name || firstConn.system_id || "unknown";
             ctx.log("mining", `Jumping to connected system ${targetSysName} then back...`);
-            const outResp = await bot.exec("jump", { target_system: firstConn.system_id });
-            if (!outResp.error) {
+            try {
+              await bot.commands.spacemolt.jump({ id: firstConn.system_id });
               ctx.log("mining", `Jumped to ${targetSysName} — returning to ${homeSys}`);
               await ctx.sleep(3000);
-              const backResp = await bot.exec("jump", { target_system: homeSys });
-              if (!backResp.error) {
+              try {
+                await bot.commands.spacemolt.jump({ id: homeSys });
                 await bot.refreshLocation();
                 ctx.log("mining", `Returned to ${homeSys} — retrying POI discovery`);
                 await ctx.sleep(3000);
@@ -4632,13 +4650,13 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 } else {
                   ctx.log("error", `Still cannot access hidden POI after directional approach: ${retryDiscover.error?.message || "unknown"}`);
                 }
-              } else {
-                ctx.log("error", `Failed to return to ${homeSys}: ${backResp.error.message}`);
+              } catch (e) {
+                ctx.log("error", `Failed to return to ${homeSys}: ${e}`);
                 // Navigate back using normal navigation
                 await navigateToSystem(ctx, homeSys, safetyOpts);
               }
-            } else {
-              ctx.log("error", `Failed to travel to ${targetSysName}: ${outResp.error.message}`);
+            } catch (e) {
+              ctx.log("error", `Failed to travel to ${targetSysName}: ${e}`);
             }
           } else {
             ctx.log("warn", `No connected systems known for ${homeSys} — cannot attempt directional approach`);
@@ -4653,24 +4671,17 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
     }
 
     // Check for pirates at mining location
-    const nearbyResp = await bot.exec("get_nearby");
+    const nearbyResp = await bot.commands.spacemolt.get_nearby();
 
-    // Check for battle notifications in get_nearby response
-    if (nearbyResp.notifications && Array.isArray(nearbyResp.notifications)) {
-      const battleDetected = await handleBattleNotifications(ctx, nearbyResp.notifications, battleState);
-      if (battleDetected) {
-        ctx.log("error", "Battle detected at mining location - fleeing!");
-        await ctx.sleep(30000);
-        continue;
-      }
-    }
+    // Battle detection is now event-driven via bot.isInBattle() (set by subscribeEvents);
+    // the inline notification check here is redundant and QueryResult carries no .notifications.
 
     // Check for pirates in nearby response (skip if cloaked with cloakIgnoreBlacklist)
     const isCloakedIgnoringBlacklist = bot.isCloaked && settings.cloakIgnoreBlacklist;
-    if (!isCloakedIgnoringBlacklist && nearbyResp.result && typeof nearbyResp.result === "object") {
-      bot.trackWildlife(nearbyResp.result);
+    if (!isCloakedIgnoringBlacklist && nearbyResp.structuredContent && typeof nearbyResp.structuredContent === "object") {
+      bot.trackWildlife(nearbyResp.structuredContent);
       const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.structuredContent);
       if (fled) {
         ctx.log("error", "Pirates detected - fled mining location, will retry");
         await ctx.sleep(30000);
@@ -4684,11 +4695,11 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - checking engagement...`);
 
       // Check for nearby players to decide if we should engage
-      const nearbyResp = await bot.exec("get_nearby");
-      if (nearbyResp.result && typeof nearbyResp.result === "object") {
-        bot.trackWildlife(nearbyResp.result);
+      const nearbyResp = await bot.commands.spacemolt.get_nearby();
+      if (nearbyResp.structuredContent && typeof nearbyResp.structuredContent === "object") {
+        bot.trackWildlife(nearbyResp.structuredContent);
         const { parseNearbyEntities } = await import("./common.js");
-        const nearbyResult = parseNearbyEntities(nearbyResp.result);
+        const nearbyResult = parseNearbyEntities(nearbyResp.structuredContent);
 
         if (nearbyResult.hasPlayers) {
           // Check emergency fighting setting first
@@ -4726,11 +4737,11 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
       ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - checking engagement...`);
 
       // Check for nearby players to decide if we should engage
-      const nearbyResp2 = await bot.exec("get_nearby");
-      if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
-        bot.trackWildlife(nearbyResp2.result);
+      const nearbyResp2 = await bot.commands.spacemolt.get_nearby();
+      if (nearbyResp2.structuredContent && typeof nearbyResp2.structuredContent === "object") {
+        bot.trackWildlife(nearbyResp2.structuredContent);
         const { parseNearbyEntities } = await import("./common.js");
-        const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
+        const nearbyResult2 = parseNearbyEntities(nearbyResp2.structuredContent);
 
         if (nearbyResult2.hasPlayers) {
           // Check emergency fighting setting first
@@ -4790,7 +4801,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           ctx.log("error", `Travel claimed success but location wrong: at ${afterTravelPoi}, expected ${intendedPoi}`);
           
           // Try one more travel as last resort
-          const lastTravel = await bot.exec("travel", { target_poi: intendedPoi });
+          const lastTravel = await runLibCommand(bot.commands.spacemolt.travel({ id: intendedPoi }));
           await bot.refreshLocation();
           const finalPoi = bot.poi || "";
           
@@ -5055,7 +5066,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
 
           // Issue flee stance and return immediately - DON'T wait for disengage!
           // The harvest loop below will re-issue flee every cycle
-          await bot.exec("battle", { action: "stance", stance: "flee" });
+          await bot.commands.spacemolt_battle.stance({ id: "flee" });
           battleState.lastFleeTime = now;
           ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
           // Continue to the battle handling code below (lines 3290-3309)
@@ -5078,7 +5089,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             battleState.isFleeing = false;
 
             // Issue flee stance and return immediately - DON'T wait for disengage!
-            await bot.exec("battle", { action: "stance", stance: "flee" });
+            await bot.commands.spacemolt_battle.stance({ id: "flee" });
             battleState.lastFleeTime = now;
             ctx.log("combat", "Flee stance issued via API check - will re-issue every cycle until disengaged!");
           }
@@ -5091,12 +5102,12 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
         if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
           ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
-          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-          if (fleeResp.error) {
-            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
-          } else {
-            battleState.lastFleeTime = now;
-          }
+           try {
+             await bot.commands.spacemolt_battle.stance({ id: "flee" });
+             battleState.lastFleeTime = now;
+           } catch (e) {
+             ctx.log("error", `Flee re-issue failed: ${e}`);
+           }
         }
         // Check if we've successfully disengaged
         const currentBattleStatus = await getBattleStatus(ctx);
@@ -5270,7 +5281,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                     stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
                     if (stationPoi) {
                       yield "travel_to_station";
-                      await bot.exec("travel", { target_poi: stationPoi.id });
+                      await bot.commands.spacemolt.travel({ id: stationPoi.id });
                     }
                     yield "deposit_cargo";
                     await ensureDocked(ctx);
@@ -5504,7 +5515,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                           stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
                           if (stationPoi) {
                             yield "travel_to_station";
-                            await bot.exec("travel", { target_poi: stationPoi.id });
+                            await bot.commands.spacemolt.travel({ id: stationPoi.id });
                           }
                           yield "deposit_cargo";
                           await ensureDocked(ctx);
@@ -5549,7 +5560,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                         }
                         
                         // Travel to new POI
-                        const travelResp = await bot.exec("travel", { target_poi: chosen.poiId });
+                        const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: chosen.poiId }));
                         
                         // Check for battle notifications
                         if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
@@ -5595,7 +5606,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
         for (const jettisonOreId of activeJettisonList) {
           const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
           if (cargoItem && cargoItem.quantity > 0) {
-            const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+            const jettisonResp = await runLibCommand(bot.commands.spacemolt.jettison({ id: jettisonOreId, quantity: cargoItem.quantity }));
 
             // CRITICAL: Check for battle interrupt after jettison (the bot was hit here!)
             if (jettisonResp.error && (
@@ -5634,7 +5645,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
         ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! - initiating flee and BREAKING!`);
         battleState.inBattle = true;
         battleState.isFleeing = false;
-        await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+        await bot.commands.spacemolt_battle.stance({ id: "flee" }); // Issue flee immediately
         battleState.lastFleeTime = Date.now();
         break; // BREAK out of harvest loop - don't try to mine!
       } else {
@@ -5644,7 +5655,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           battleState.inBattle = true;
           battleState.battleId = preMineBattleCheck.battle_id;
           battleState.isFleeing = false;
-          await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+          await bot.commands.spacemolt_battle.stance({ id: "flee" }); // Issue flee immediately
           battleState.lastFleeTime = Date.now();
           break; // BREAK out of harvest loop - don't try to mine!
         }
@@ -5678,12 +5689,10 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
       
       // Get total mining power from ship modules
       let totalMiningPower = 0;
-      const shipResp = await bot.exec("get_ship");
-      if (!shipResp.error && shipResp.result) {
-  const shipData = (shipResp.result || {}) as Record<string, unknown>;
-        const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
-        totalMiningPower = getTotalMiningPower(modules);
-      }
+      const shipResp = await bot.commands.spacemolt.get_ship();
+      const shipData = (shipResp.structuredContent as Record<string, unknown> | undefined) ?? {};
+      const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+      totalMiningPower = getTotalMiningPower(modules);
       
       const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower);
       if (!powerCheck.canMine) {
@@ -5824,7 +5833,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           }
           
           if (newPoiId !== bot.poi) {
-            const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+            const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: newPoiId }));
             if (travelResp.error && !travelResp.error.message.includes("already")) {
               ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
               stopReason = "deposit too sparse for equipment";
@@ -5851,7 +5860,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
         break;
       }
 
-      const mineResp = await bot.exec("mine");
+      const mineResp = await runLibCommand(bot.commands.spacemolt.mine());
 
       // Check for battle notifications after mining
       if (mineResp.notifications && Array.isArray(mineResp.notifications)) {
@@ -5871,7 +5880,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
           battleState.inBattle = true;
           battleState.isFleeing = false;
           // Issue flee and DON'T wait for disengage - let the loop re-issue
-          await bot.exec("battle", { action: "stance", stance: "flee" });
+          await bot.commands.spacemolt_battle.stance({ id: "flee" });
           stopReason = "battle detected (mine interrupted)";
           break;
         }
@@ -6012,7 +6021,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             }
             
             if (newPoiId !== bot.poi) {
-              const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: newPoiId }));
               if (travelResp.error && !travelResp.error.message.includes("already")) {
                 ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
                 stopReason = "deposit too sparse for equipment";
@@ -6161,7 +6170,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
             }
             
             if (newPoiId !== bot.poi) {
-              const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: newPoiId }));
               if (travelResp.error && !travelResp.error.message.includes("already")) {
                 ctx.log("error", `Failed to travel to new POI: ${travelResp.error.message}`);
                 stopReason = "deposit too sparse for equipment";
@@ -6897,7 +6906,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
 
             if (newPoiId !== bot.poi) {
               ctx.log("mining", `Traveling to new target: ${newTarget} @ ${newPoiName}`);
-              const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: newPoiId }));
 
               // Check for battle notifications
               if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
@@ -7065,7 +7074,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
             
             if (altPoi) {
               ctx.log("mining", `Found correct POI type: ${altPoi.name}`);
-              const travelResp = await bot.exec("travel", { target_poi: altPoi.id });
+              const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: altPoi.id }));
               
               // Check for battle notifications
               if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
@@ -7167,12 +7176,12 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
 
         // JETTISON: If the mined ore is in the jettison list, dump it immediately
         if (activeJettisonList.includes(oreId)) {
-          const jettisonResp = await bot.exec("jettison", { item_id: oreId, quantity: 9999 });
-          if (!jettisonResp.error) {
+          try {
+            await bot.commands.spacemolt.jettison({ id: oreId, quantity: 9999 });
             const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
             ctx.log("mining", `Jettisoned ${oreName} (low-value item configured for jettison${dcTag})`);
             await bot.refreshCargo();
-          }
+          } catch { /* jettison failed */ }
         }
 
         // JETTISON: Also clear any other jettison-listed items that may have accumulated in cargo
@@ -7180,13 +7189,13 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
           if (jettisonItemId === oreId) continue; // Already jettisoned above
           const cargoItem = bot.inventory.find(i => i.itemId === jettisonItemId);
           if (cargoItem && cargoItem.quantity > 0) {
-            const jettisonResp = await bot.exec("jettison", { item_id: jettisonItemId, quantity: cargoItem.quantity });
-            if (!jettisonResp.error) {
+            try {
+              await bot.commands.spacemolt.jettison({ id: jettisonItemId, quantity: cargoItem.quantity });
               const jettisonName = cargoItem.name || jettisonItemId;
               const dcTag = isDeepCoreMining ? " [deep core]" : (isGasMining ? " [gas]" : "");
               ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${jettisonName} (configured for jettison${dcTag})`);
               await bot.refreshCargo();
-            }
+            } catch { /* jettison failed */ }
           }
         }
 
@@ -7268,13 +7277,23 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       const currentStation = findStation(currentPois);
       if (currentStation) {
         // Dock and refuel but do NOT unload cargo
-        const dockResp = await bot.exec("dock");
-        if (!dockResp.error || dockResp.error.message.includes("already")) {
+        let docked = false;
+        try {
+          await bot.commands.spacemolt.dock();
+          docked = true;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("already")) docked = true;
+          else ctx.log("error", `Dock failed: ${e}`);
+        }
+        if (docked) {
           bot.docked = true;
           ctx.log("system", `Refueling at ${currentStation.name} (cargo: ${bot.cargo}/${bot.cargoMax}, will deposit at home)`);
-          const refuelResp = await bot.exec("refuel");
-          if (!refuelResp.error) {
+          try {
+            await bot.commands.spacemolt.refuel();
             ctx.log("system", "Refueled — continuing mining (cargo kept onboard)");
+          } catch (e) {
+            ctx.log("error", `Refuel failed: ${e}`);
           }
         }
       } else {
@@ -7320,7 +7339,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     // ── Travel to station ──
     yield "travel_to_station";
     if (stationPoi) {
-      const travelStationResp = await bot.exec("travel", { target_poi: stationPoi.id });
+      const travelStationResp = await runLibCommand(bot.commands.spacemolt.travel({ id: stationPoi.id }));
       
       // Check for battle notifications
       if (travelStationResp.notifications && Array.isArray(travelStationResp.notifications)) {
@@ -7381,9 +7400,17 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       await updateFlockPhase(settings.flockName, "docked", isFlockLeader);
     }
 
-    const dockResp = await bot.exec("dock");
-    if (dockResp.error && !dockResp.error.message.includes("already")) {
-      ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+    let dockFailed = false;
+    try {
+      await bot.commands.spacemolt.dock();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!msg.includes("already")) {
+        ctx.log("error", `Dock failed: ${e}`);
+        dockFailed = true;
+      }
+    }
+    if (dockFailed) {
       const docked = await ensureDocked(ctx);
       if (!docked) {
         ctx.log("error", "Failed to find station — waiting before retry");
@@ -7417,14 +7444,13 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     const creditsBefore = bot.credits;
 
     yield "unload_cargo";
-    const cargoResp = await bot.exec("get_cargo");
-    if (cargoResp.result && typeof cargoResp.result === "object") {
-      const result = cargoResp.result as Record<string, unknown>;
-      const cargoItems = (
-        Array.isArray(result) ? result :
-        Array.isArray(result.items) ? result.items :
-        Array.isArray(result.cargo) ? result.cargo : []
-      ) as Array<Record<string, unknown>>;
+    const cargoResp = await bot.commands.spacemolt.get_cargo();
+    const result = (cargoResp.structuredContent ?? {}) as Record<string, unknown>;
+    const cargoItems = (
+      Array.isArray(result) ? result :
+      Array.isArray(result.items) ? result.items :
+      Array.isArray(result.cargo) ? result.cargo : []
+    ) as Array<Record<string, unknown>>;
 
       const modeLabel: Record<string, string> = {
         storage: "station storage", faction: "faction storage", sell: "market",
@@ -7442,28 +7468,31 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
         const displayName = (item.name as string) || itemId;
 
         if (settings.depositMode === "sell") {
-          const sellResp = await bot.exec("sell", { item_id: itemId, quantity });
-          if (sellResp.error) {
+          try {
+            await bot.commands.spacemolt.sell({ id: itemId, quantity });
+          } catch (err) {
             ctx.log("warn", `Market sell failed for ${displayName} — falling back to personal storage`);
-            await bot.exec("deposit_items", { item_id: itemId, quantity });
+            await bot.commands.spacemolt_storage.deposit({ item_id: itemId, quantity });
             hadFallback = true;
           }
         } else if (settings.depositMode === "faction") {
-          const fResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity });
-          if (fResp.error) {
-            ctx.log("warn", `Faction deposit failed for ${displayName}: ${fResp.error.message} — falling back to personal storage`);
-            await bot.exec("deposit_items", { item_id: itemId, quantity });
+          try {
+            await bot.commands.spacemolt_storage.deposit({ item_id: itemId, quantity, target: "faction" });
+          } catch (err) {
+            ctx.log("warn", `Faction deposit failed for ${displayName}: ${err instanceof Error ? err.message : String(err)} — falling back to personal storage`);
+            await bot.commands.spacemolt_storage.deposit({ item_id: itemId, quantity });
             hadFallback = true;
           }
         } else if (settings.depositBot) {
-          const gResp = await bot.exec("send_gift", { recipient: settings.depositBot, item_id: itemId, quantity });
-          if (gResp.error) {
-            ctx.log("warn", `Gift to ${settings.depositBot} failed for ${displayName}: ${gResp.error.message} — falling back to personal storage`);
-            await bot.exec("deposit_items", { item_id: itemId, quantity });
+          try {
+            await bot.commands.spacemolt_storage.withdraw({ item_id: itemId, quantity, target: settings.depositBot });
+          } catch (err) {
+            ctx.log("warn", `Gift to ${settings.depositBot} failed for ${displayName}: ${err instanceof Error ? err.message : String(err)} — falling back to personal storage`);
+            await bot.commands.spacemolt_storage.deposit({ item_id: itemId, quantity });
             hadFallback = true;
           }
         } else {
-          await bot.exec("deposit_items", { item_id: itemId, quantity });
+          await bot.commands.spacemolt_storage.deposit({ item_id: itemId, quantity });
         }
         unloadedItems.push(`${quantity}x ${displayName}`);
         yield "unloading";
@@ -7478,7 +7507,6 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       if (recoveredSession) {
         await updateMiningSession(bot.username, { state: "depositing" });
       }
-    }
 
     // Exact fuel cells reserve for return home — prefer withdraw from faction storage at home base
     // CRITICAL: Only withdraw from faction storage when DOCKED at home system
@@ -7489,7 +7517,8 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
     }
     try {
-      const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
+      const routeResult = (await bot.commands.spacemolt.find_route({ id: homeSystem })).structuredContent;
+      const r = routeResult as any;
       if (r?.estimated_fuel && r?.fuel_available != null) {
         const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
         const needed = Math.ceil(deficit / 20);
@@ -7500,15 +7529,21 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
           let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
           if (isAtHome) {
             // Prefer military_fuel_cell (100 fuel, 3 space)
-            const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
-            if (!milResp.error) stillNeeded = Math.max(0, stillNeeded - 100);
+            try {
+              await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
+              stillNeeded = Math.max(0, stillNeeded - 100);
+            } catch { /* withdraw failed */ }
             if (stillNeeded > 0) {
-              const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-              if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+              try {
+                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+                stillNeeded = Math.max(0, stillNeeded - 50);
+              } catch { /* withdraw failed */ }
             }
             if (stillNeeded > 0) {
-              const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
-              if (!regResp.error) stillNeeded = 0;
+              try {
+                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
+                stillNeeded = 0;
+              } catch { /* withdraw failed */ }
             }
             if (stillNeeded <= 0) ctx.log("mining", `Withdrew fuel cells from faction storage`);
           }
@@ -7517,7 +7552,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
             const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
             if (buyQty > 0) {
               ctx.log("mining", `Buying ${buyQty} military fuel cells for return (last resort)`);
-              await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
+              await bot.commands.spacemolt.buy({ id: "military_fuel_cell", quantity: buyQty });
             }
           }
         }

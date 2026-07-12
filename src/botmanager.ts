@@ -1,7 +1,6 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
-import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
@@ -63,9 +62,6 @@ const bots: Map<string, Bot> = new Map();
 let server: WebServer;
 let chatServer: ChatWebServer;
 let aiChatService: AiChatService | null = null;
-
-// Track failed session restore attempts per bot (timestamps in ms)
-const sessionRestoreFailures: Map<string, number[]> = new Map();
 
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
@@ -141,24 +137,6 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   stealth_skill_grind: { name: "StealthSkillGrind", fn: stealthSkillGrindRoutine },
 };
 
-// ── Auto-discover existing sessions ─────────────────────────
-
-function discoverBots(): void {
-  if (!existsSync(SESSIONS_DIR)) return;
-  const dirs = readdirSync(SESSIONS_DIR, { withFileTypes: true });
-  for (const d of dirs) {
-    if (!d.isDirectory()) continue;
-    const name = d.name;
-    if (bots.has(name)) continue;
-    const credPath = join(SESSIONS_DIR, name, "credentials.json");
-    if (existsSync(credPath)) {
-      const bot = new Bot(name, BASE_DIR);
-      setupBotLogging(bot);
-      bots.set(name, bot);
-    }
-  }
-}
-
 /** Categories that go to the broadcast panel instead of bot log. */
 const BROADCAST_CATEGORIES = new Set(["broadcast", "chat", "dm"]);
 
@@ -190,8 +168,8 @@ function refreshStatusTable(): void {
 
 /**
  * Connect every account the Clerk user owns through `@spacemolt/lib` and back
- * each with a `Bot`. Skipped unless `SPACEMOLT_CLERK_API_KEY` is set (legacy
- * credential/session discovery still runs via `discoverBots`).
+ * each with a `Bot`. This is now the ONLY source of bots — if
+ * `SPACEMOLT_CLERK_API_KEY` is unset, no bots start.
  */
 async function connectLibraryAccounts(): Promise<void> {
   if (!process.env.SPACEMOLT_CLERK_API_KEY) {
@@ -228,10 +206,6 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleStop(action);
     case "stop_after_cycle":
       return handleStopAfterCycle(action);
-    case "add":
-      return handleAdd(action);
-    case "register":
-      return handleRegister(action);
     case "chat":
       return handleChat(action);
     case "saveSettings":
@@ -665,69 +639,6 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   return { ok: true, message: `Removed ${botName}` };
 }
 
-async function handleAdd(action: WebAction): Promise<WebActionResult> {
-  const { username, password } = action;
-  if (!username || !password) return { ok: false, error: "Username and password required" };
-
-  if (bots.has(username)) return { ok: false, error: `Bot already exists: ${username}` };
-
-  const session = new SessionManager(username, BASE_DIR);
-  session.saveCredentials({ username, password, empire: "", playerId: "" });
-
-  const bot = new Bot(username, BASE_DIR);
-  setupBotLogging(bot);
-  bots.set(username, bot);
-
-  server.logSystem(`Verifying credentials for ${username}...`);
-  const ok = await bot.login();
-  if (ok) {
-    const s = bot.status();
-    server.logSystem(`Added ${username}! Location: ${s.location}, Credits: ${s.credits}`);
-  } else {
-    server.logSystem(`Login failed for ${username} -- credentials saved, retry later.`);
-  }
-  refreshStatusTable();
-  return { ok: true, message: `Bot added: ${username}` };
-}
-
-async function handleRegister(action: WebAction): Promise<WebActionResult> {
-  const { username, empire, registration_code } = action;
-  if (!username) return { ok: false, error: "Username required" };
-  if (!registration_code) return { ok: false, error: "Registration code required (get one from spacemolt.com/dashboard)" };
-
-  const selectedEmpire = empire || "solarian";
-  server.logSystem(`Registering ${username} in ${selectedEmpire}...`);
-
-  const tempBot = new Bot(username, BASE_DIR);
-  const resp = await tempBot.exec("register", { username, empire: selectedEmpire, registration_code });
-
-  if (resp.error) {
-    server.logSystem(`Registration failed: ${resp.error.message}`);
-    return { ok: false, error: `Registration failed: ${resp.error.message}` };
-  }
-
-  const result = resp.result as Record<string, unknown> | undefined;
-  const password = (result?.password as string) || "";
-  const playerId = (result?.player_id as string) || "";
-
-  if (!password) {
-    server.logSystem("Registration succeeded but no password returned.");
-    return { ok: false, error: "No password returned" };
-  }
-
-  server.logSystem(`Registration successful for ${username} — password returned to dashboard only.`);
-
-  const session = new SessionManager(username, BASE_DIR);
-  session.saveCredentials({ username, password, empire: selectedEmpire, playerId });
-
-  const bot = new Bot(username, BASE_DIR);
-  setupBotLogging(bot);
-  bots.set(username, bot);
-  server.logSystem(`Bot added: ${username}`);
-  refreshStatusTable();
-
-  return { ok: true, message: `Registered ${username}`, password };
-}
 
 async function handleChat(action: WebAction): Promise<WebActionResult> {
   const { bot: botName, message, channel } = action;
@@ -948,8 +859,7 @@ async function main(): Promise<void> {
   };
 
   server.logSystem("SpaceMolt Bot Manager v0.2");
-  server.logSystem("Loading saved sessions...");
-  discoverBots();
+  server.logSystem("Connecting owned accounts via @spacemolt/lib...");
   await connectLibraryAccounts();
 
   const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
@@ -1083,143 +993,38 @@ async function main(): Promise<void> {
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
-    // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
-    const SESSION_RESUME_DELAY_MS = 7000;
-    const FULL_LOGIN_DELAY_MS = 13000;
-    let botIndex = 0;
+    // Library-owned accounts are already connected & authenticated by
+    // connectLibraryAccounts() — no HTTP login/resume is needed. Fetch the
+    // catalog once, then auto-resume each bot's last-used routine (unless it
+    // was stopped intentionally).
+    try {
+      if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
+        await catalogStore.fetchFromLib();
+        server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+      }
+    } catch (err) {
+      server.logSystem(`Catalog fetch failed: ${err}`);
+    }
 
- for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-      const delay = botIndex * SESSION_RESUME_DELAY_MS;
-      const loginIndex = botIndex;
-      botIndex++;
-      setTimeout(() => {
-        bot.resumeSession().then(async (ok) => {
-          refreshStatusTable();
-          if (ok) {
-            sessionRestoreFailures.delete(name);
-            server.logSystem(`${name} session resumed (no login delay)`);
-            try {
-              await bot.updateTaxEstimate();
-              await bot.updateFactionTaxEstimate();
-            } catch (err) {
-              server.logSystem(`Tax collection failed for ${name}: ${err}`);
-            }
-            if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
-              try {
-                await catalogStore.fetchFromLib();
-                server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-              } catch (err) {
-                server.logSystem(`Catalog fetch failed: ${err}`);
-              }
-            }
-            const routineKey = getLastUsedRoutine(name) || assignments[name];
-            if (routineKey && ROUTINES[routineKey]) {
-              const stoppedState = getStoppedState(name);
-              if (stoppedState) {
-                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
-              } else {
-                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-                await handleStart({ type: "start", bot: name, routine: routineKey });
-              }
-            }
-            return;
-          }
-
-          const now = Date.now();
-          const failures = sessionRestoreFailures.get(name) || [];
-          failures.push(now);
-          const recentFailures = failures.filter(ts => now - ts < 60000);
-          sessionRestoreFailures.set(name, recentFailures);
-
-          if (recentFailures.length >= 3) {
-            server.logSystem(`${name} session restore failed 3+ times in past minute, forcing immediate full login...`);
-            bot.login().then(async (loginOk) => {
-              sessionRestoreFailures.delete(name);
-              refreshStatusTable();
-              if (!loginOk) {
-                server.logSystem(`${name} forced login failed`);
-                return;
-              }
-              try {
-                await bot.updateTaxEstimate();
-                await bot.updateFactionTaxEstimate();
-              } catch (err) {
-                server.logSystem(`Tax collection failed for ${name}: ${err}`);
-              }
-              if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
-                try {
-                  await catalogStore.fetchFromLib();
-                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                  refreshSkillNames();
-                } catch (err) {
-                  server.logSystem(`Catalog fetch failed: ${err}`);
-                }
-              }
-              const routineKey = getLastUsedRoutine(name) || assignments[name];
-              if (!routineKey || !ROUTINES[routineKey]) {
-                server.logSystem(`${name} logged in but no routine assigned`);
-                return;
-              }
-              const stoppedState = getStoppedState(name);
-              if (stoppedState) {
-                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
-              } else {
-                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-                await handleStart({ type: "start", bot: name, routine: routineKey });
-              }
-            }).catch((err) => {
-              server.logSystem(`Forced login failed for ${name}: ${err}`);
-              refreshStatusTable();
-            });
-          } else {
-            const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
-            server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
-            setTimeout(() => {
-              bot.login().then(async (loginOk) => {
-                sessionRestoreFailures.delete(name);
-                refreshStatusTable();
-                if (!loginOk) {
-                  server.logSystem(`${name} login failed`);
-                  return;
-                }
-                try {
-                  await bot.updateTaxEstimate();
-                  await bot.updateFactionTaxEstimate();
-                } catch (err) {
-                  server.logSystem(`Tax collection failed for ${name}: ${err}`);
-                }
-                if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
-                  try {
-                    await catalogStore.fetchFromLib();
-                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                    refreshSkillNames();
-                  } catch (err) {
-                    server.logSystem(`Catalog fetch failed: ${err}`);
-                  }
-                }
-                const routineKey = getLastUsedRoutine(name) || assignments[name];
-                if (!routineKey || !ROUTINES[routineKey]) {
-                  server.logSystem(`${name} logged in but no routine assigned`);
-                  return;
-                }
-                const stoppedState = getStoppedState(name);
-                if (stoppedState) {
-                  server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
-                } else {
-                  server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-                  await handleStart({ type: "start", bot: name, routine: routineKey });
-                }
-              }).catch((err) => {
-                server.logSystem(`Login failed for ${name}: ${err}`);
-                refreshStatusTable();
-              });
-            }, loginDelay);
-          }
-        }).catch((err) => {
-          server.logSystem(`Session resume failed for ${name}: ${err}`);
-          refreshStatusTable();
-        });
-      }, delay);
+    for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+      try {
+        await bot.updateTaxEstimate();
+        await bot.updateFactionTaxEstimate();
+      } catch (err) {
+        server.logSystem(`Tax collection failed for ${name}: ${err}`);
+      }
+      const routineKey = getLastUsedRoutine(name) || assignments[name];
+      if (!routineKey || !ROUTINES[routineKey]) {
+        server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
+        continue;
+      }
+      const stoppedState = getStoppedState(name);
+      if (stoppedState) {
+        server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+      } else {
+        server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+        await handleStart({ type: "start", bot: name, routine: routineKey });
+      }
     }
   }
 

@@ -1,6 +1,7 @@
 import { SpacemoltClient, type Account, type ClerkPlayer } from "@spacemolt/lib";
 
 let clientSingleton: SpacemoltClient | null = null;
+let clientKey: string | null = null;
 
 /**
  * (Re)create the single multi-account `SpacemoltClient` for the whole runner,
@@ -10,9 +11,24 @@ let clientSingleton: SpacemoltClient | null = null;
  *
  * Migration anchor (see plans/1783739200000-spacemolt-lib-api-migration.md):
  * this replaces the hand-rolled HTTP layer in `api.ts` / `session.ts`.
+ *
+ * IMPORTANT: this is idempotent with respect to the Clerk key. If a client
+ * already exists for the same key, the existing instance is returned and NOT
+ * recreated. Recreating the client tears down its underlying transport socket,
+ * which would instantly disconnect every already-live bot (their `Account`
+ * objects belong to the old client) — surfacing as "cannot send on a closed
+ * socket" for all running bots and `mutation_timeout` for the newly-issued
+ * commands. The dashboard's "Add Bots" / "List Players" flows call this while
+ * other bots are already connected, so recreating here was the root cause of
+ * those mass-disconnect and timeout storms. A new client is only built when
+ * the key actually changes.
  */
 export function initSpacemoltClient(clerkApiKey: string): SpacemoltClient {
+  if (clientSingleton && clientKey === clerkApiKey) {
+    return clientSingleton;
+  }
   clientSingleton = new SpacemoltClient({ clerkApiKey });
+  clientKey = clerkApiKey;
   return clientSingleton;
 }
 
@@ -27,6 +43,7 @@ export function getSpacemoltClient(): SpacemoltClient {
     const envKey = process.env.SPACEMOLT_CLERK_API_KEY;
     if (envKey) {
       clientSingleton = new SpacemoltClient({ clerkApiKey: envKey });
+      clientKey = envKey;
     } else {
       throw new Error(
         "SpacemoltClient not initialized — set SPACEMOLT_CLERK_API_KEY or supply a Clerk API key via Settings → General.",

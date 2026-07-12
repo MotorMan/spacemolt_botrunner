@@ -290,6 +290,35 @@ async function connectLibraryAccounts(): Promise<void> {
   }
 }
 
+/**
+ * Reconnect any selected (saved) bot that isn't currently connected.
+ *
+ * `connectLibraryAccounts` only runs once at startup. If an account failed to
+ * connect then — e.g. a transient @spacemolt/lib timeout while many bots were
+ * being added — it would otherwise stay missing forever. This periodically
+ * retries just the missing ids so a bot can never be left permanently
+ * disconnected. `addOwnedAccountAsBot` de-dupes, so already-connected bots are
+ * untouched.
+ */
+async function ensureSelectedBotsConnected(): Promise<void> {
+  const selected = getClerkConfig().bots;
+  if (!selected.length) return;
+  const missing = selected.filter((id) => !bots.has(id));
+  if (!missing.length) return;
+
+  server.logSystem(`Reconnecting ${missing.length} selected bot(s) not currently connected: ${missing.join(", ")}`);
+  try {
+    await connectOwnedAccounts(
+      (player) => missing.includes(player.id),
+      (account) => addOwnedAccountAsBot(account),
+    );
+    refreshStatusTable();
+  } catch (err) {
+    // Transient failure — the next interval pass will try again.
+    server.logSystem(`Reconnect of missing bots failed (will retry): ${err}`);
+  }
+}
+
 // ── Action handlers ──────────────────────────────────────────
 
 async function handleAction(action: WebAction): Promise<WebActionResult> {
@@ -1141,6 +1170,25 @@ const skillsObj: Record<string, unknown> | null =
 // ── Main ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  // ── Process-level safety net ──────────────────────────────────────────
+  // @spacemolt/lib can surface a late rejection from its internal mutation
+  // timeout (e.g. when our execWithTimeout abandons an in-flight account.send,
+  // or a response arrives after the request was already cancelled). That
+  // rejection otherwise bubbles up as an unhandledRejection and kills the
+  // whole process (exit code 1) — taking down every bot and the web UI.
+  // Never let a single stray library error take the whole client down; log it
+  // and keep running so bots can self-heal / auto-reconnect.
+  process.on("uncaughtException", (err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[FATAL] Uncaught exception — keeping process alive:", err);
+    try { server?.logSystem?.(`Uncaught exception (ignored to stay alive): ${msg}`); } catch { /* ignore */ }
+  });
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    console.error("[WARN] Unhandled promise rejection — ignored to keep process alive:", reason);
+    try { server?.logSystem?.(`Unhandled rejection ignored (staying alive): ${msg}`); } catch { /* ignore */ }
+  });
+
   // Load port from settings.json (general.port), env var, or default to 3000
   const settings = loadSettings();
   const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
@@ -1489,6 +1537,14 @@ async function main(): Promise<void> {
       }
     }
   }, 30000));
+
+  // Periodic reconnect of selected bots that aren't currently connected.
+  // Guarantees a bot can never be left permanently disconnected just because
+  // its initial connection attempt failed (e.g. a lib timeout while adding
+  // many bots at once). Retries the missing ids every 2 minutes.
+  intervals.push(setInterval(() => {
+    ensureSelectedBotsConnected().catch(() => {});
+  }, 2 * 60 * 1000));
 
   // Graceful shutdown handler
   function gracefulShutdown(signal: string, restart: boolean = false): void {

@@ -396,6 +396,11 @@ docked = false;
   ): Promise<ApiResponse> {
     // Race the API call against a timeout and abort
     const apiPromise = this.libExec(command, payload);
+    // If OUR timeout/abort wins the race, `apiPromise` is left pending. The
+    // underlying library call may later reject (e.g. its own mutation-timeout
+    // timer fires) — attach a no-op catch so that late rejection can never
+    // become an unhandledRejection that crashes the whole process.
+    apiPromise.catch(() => {});
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
     });

@@ -25,9 +25,9 @@ export interface MarketStreamEntry {
 type MarketStreamSubscriber = (entry: MarketStreamEntry | null) => void;
 
 /**
- * In-memory realtime market sink fed by the WebSocket v2 `market_update`
- * frames. Kept fully separate from the HTTP `mapStore` cache; the future
- * static market watcher routine will read from here.
+ * In-memory realtime market sink fed by the library's `market_update` push
+ * frames. Kept fully separate from the HTTP `mapStore` cache; the dashboard
+ * market view reads from here.
  */
 class MarketStreamStore {
   private markets = new Map<string, MarketStreamEntry>();

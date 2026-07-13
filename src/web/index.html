@@ -2142,6 +2142,7 @@
               .catch(() => ({})),
           ]);
           settings = settingsRes || {};
+          applyWindowTitle();
           flockSettings = flockRes || { flockGroups: [], assignments: {} };
           lastUsedRoutines = lastUsedRoutinesRes || {};
           // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
@@ -2229,6 +2230,7 @@
               bots = msg.bots || [];
               routines = msg.routines || [];
               settings = msg.settings || {};
+              applyWindowTitle();
               window.currentSettings = settings; // Sync for use in render functions
               knownSystems = msg.knownSystems || [];
               knownOres = msg.knownOres || [];
@@ -2529,19 +2531,37 @@
               }
               if (msg.settings) {
                 settings = msg.settings;
+                applyWindowTitle();
                 window.currentSettings = settings; // Sync for use in render functions
                 updateAiChatToggleButton();
               }
-              if (msg.action === "listClerkPlayers" && msg.data && msg.data.players) {
-                clerkPlayersData = msg.data.players;
+              if (msg.action === "listClerkPlayers" && msg.data && msg.data.groups) {
+                clerkGroupsData = msg.data.groups;
+                clerkPlayersData = clerkGroupsData.flatMap((g) => g.players);
+                // Re-base the persistent selection from the server's selected
+                // set (the persisted settings.clerk.bots), so a fresh fetch
+                // reflects what's actually saved without losing unsaved state
+                // scopes — an explicit "List Players" is treated as a refresh.
+                clerkSelection = new Set(
+                  clerkPlayersData.filter((p) => p.selected).map((p) => p.username),
+                );
                 renderClerkPlayers();
                 const statusEl = document.getElementById("clerkStatus");
                 if (statusEl) {
-                  statusEl.textContent = `${msg.data.players.length} player(s) found. Select the ones to add.`;
+                  const acctCount = clerkGroupsData.length;
+                  statusEl.textContent = `${msg.data.count} player(s) across ${acctCount} account(s). Select the ones to add.`;
                 }
               } else if (msg.action === "addClerkBots" && msg.data && typeof msg.data.added === "number") {
                 const statusEl = document.getElementById("clerkStatus");
                 if (statusEl) statusEl.textContent = `Added ${msg.data.added} bot(s).`;
+                // Mark the just-added bots as ticked IMMEDIATELY (synchronously)
+                // so a quick "Save Settings" can't snapshot them as unticked and
+                // drop them from the persisted list. The async listClerkPlayers
+                // below then refreshes connected-state accuracy.
+                if (Array.isArray(msg.data.ids)) {
+                  for (const id of msg.data.ids) clerkSelection.add(id);
+                  renderClerkPlayers();
+                }
                 // Refresh the player list so connected state is accurate.
                 listClerkPlayers();
               } else if (msg.action === "setClerkKey") {
@@ -2552,6 +2572,7 @@
             case "settings_updated":
               // Settings were updated on disk by a bot routine (e.g., cargo mover delivery tracking)
               settings = msg.settings;
+              applyWindowTitle();
               window.currentSettings = settings;
               // Only re-render if settings tab is active (user is watching)
               if (
@@ -3435,7 +3456,7 @@
       };
 
       // ── Bulk Start Idle Bots ────────────────────────────────────
-      const BULK_START_DELAY_MS = 200; // 1 second delay between bots
+      const BULK_START_DELAY_MS = 200; // small gap between bot starts to keep the UI responsive during bulk start/stop
 
       /** Populate the bulk start routine dropdown */
       function updateBulkStartDropdown() {
@@ -11961,27 +11982,6 @@
           ? general.approvedFuelStations
           : [];
 
-        // Build the WebSocket v2 bot checkbox list
-        const websocketV2Bots = Array.isArray(general.websocketV2Bots)
-          ? general.websocketV2Bots
-          : [];
-        const wsV2BotList = Array.from(
-          new Set([
-            ...Object.keys(settings.botAssignments || {}),
-            ...(window.discoveredBots || []),
-          ]),
-        ).filter((b) => b && b.trim());
-        let wsV2BotsRows = '<div class="setting-hint">No known bots — start a routine or discover bots first.</div>';
-        if (wsV2BotList.length > 0) {
-          wsV2BotsRows = wsV2BotList
-            .map((b) => {
-              const checked = websocketV2Bots.includes(b) ? " checked" : "";
-              const id = "set-general-wsv2-" + b.replace(/[^a-zA-Z0-9_-]/g, "_");
-              return `<label class="checkbox-row" for="${id}"><input type="checkbox" id="${id}" value="${esc(b)}"${checked} /> ${esc(b)}</label>`;
-            })
-            .join("");
-        }
-
         // Build station options from mapData
         let stationOpts = '<option value="">(not set)</option>';
         for (const [sysId, sys] of Object.entries(mapData)) {
@@ -12012,6 +12012,17 @@
         <div class="setting-hint">Port number the web server listens on. Requires server restart to take effect.</div>
       </div>
       <input type="number" id="set-general-port" min="1" max="65535" value="${port}" style="width:100px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Browser Window Title</div>
+        <div class="setting-hint">Custom title shown in the browser tab. Leave blank to use the default "SpaceMolt Commander". Useful for telling multiple client tabs apart.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="text" id="set-general-windowTitle" maxlength="60" value="${esc(general.windowTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" />
+        <button class="sm" onclick="document.getElementById('set-general-windowTitle').value='';saveGeneralSettings();applyWindowTitle()">Reset</button>
+      </div>
     </div>
 
     <div class="setting-row">
@@ -12202,39 +12213,31 @@
 
       <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
         <div>
-          <div class="setting-label">WebSocket V2 (Realtime Market)</div>
-          <div class="setting-hint">Enable realtime market streaming over the WebSocket v2 API for static bots that stay docked at one station. The socket opens only while the bot's routine is running. All gameplay commands still go over the HTTP API.</div>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:4px" id="wsv2-bot-list">
-          ${wsV2BotsRows}
-        </div>
-      </div>
-
-      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
-        <div>
           <div class="setting-label">Clerk API Key</div>
           <div class="setting-hint">Headless-client credential from the website. Connects the players you own without per-account passwords. Also readable from the SPACEMOLT_CLERK_API_KEY env var (env takes precedence).</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <input type="password" id="set-clerk-apikey" placeholder="Clerk API key" value="${settings.clerk?.apiKey || ""}" style="width:380px" />
+          <input type="password" id="set-clerk-apikey2" placeholder="Clerk API key 2 (other account)" value="${settings.clerk?.apiKey2 || ""}" style="width:380px" />
           <button class="primary" onclick="saveClerkKey()">Save Key</button>
         </div>
+        <div class="setting-hint">Optional second key lets you add bots owned by a different Clerk account. Env vars SPACEMOLT_CLERK_API_KEY and SPACEMOLT_CLERK_API_KEY_2 also work.</div>
       </div>
 
       <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
         <div>
           <div class="setting-label">Add Bots from Account</div>
-          <div class="setting-hint">A Clerk account can own hundreds of players. List the players you own and add only the ones you want to run — you do not have to add them all. Added players reconnect automatically on restart.</div>
+          <div class="setting-hint">A Clerk account can own hundreds of players. Each configured Clerk key is listed as its own section below, so you can work one account's players without scrolling past another's. Add only the ones you want to run — added players reconnect automatically on restart.</div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button onclick="listClerkPlayers()">List Players</button>
-          <button class="primary" onclick="addSelectedClerkBots()">Add Selected</button>
-          <button onclick="invertClerkSelection()">Invert Selection</button>
-          <button onclick="addAllClerkBots()">Add All</button>
+          <button class="primary" onclick="addSelectedClerkBots()">Add Selected (all)</button>
+          <button onclick="invertClerkSelection()">Invert (all)</button>
+          <button onclick="addAllClerkBots()">Add All (all)</button>
           <span id="clerkStatus" style="color:var(--text-secondary);font-size:12px"></span>
         </div>
-        <input type="text" id="clerkSearch" placeholder="Filter players by name / empire..." oninput="renderClerkPlayers()" style="width:380px" />
-        <div id="clerkPlayersList" style="width:100%;max-height:340px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px"></div>
+        <input type="text" id="clerkSearch" placeholder="Filter players across all accounts by name / empire..." value="${esc(clerkSearchValue)}" oninput="clerkSearchValue=this.value; renderClerkPlayers()" style="width:380px" />
+        <div id="clerkPlayersList" style="width:100%;max-height:440px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px"></div>
       </div>
 
       <div class="settings-save-bar">
@@ -12251,6 +12254,12 @@
             if (isSelected) opt.selected = true;
           }
         }
+        // Repopulate the player list on every (re)render. The panel template
+        // ships an EMPTY #clerkPlayersList, so without this a background refresh
+        // (mapData / catalogue push) would wipe the list and any in-progress
+        // selection. Selection state comes from the persistent `clerkSelection`
+        // set, which survives the re-render.
+        renderClerkPlayers();
       }
 
       function saveGeneralSettings() {
@@ -12326,13 +12335,32 @@
             parseInt(
               document.getElementById("set-general-periodicRefreshSec").value,
             ) || 30,
-          websocketV2Bots: Array.from(
-            document.querySelectorAll("#wsv2-bot-list input[type='checkbox']"),
-          )
-            .filter((cb) => cb.checked)
-            .map((cb) => cb.value),
+          windowTitle:
+            (document.getElementById("set-general-windowTitle").value || "")
+              .trim() || "",
         };
-        send({ type: "saveSettings", routine: "general", settings: s });
+        // Persist the "Add Bots from Account" checkbox selection too, so
+        // unchecking a bot and pressing Save removes it from the selected-bot
+        // list (and it won't reconnect on the next restart).
+        const clerkBoxes = Array.from(
+          document.querySelectorAll("#clerkPlayersList input[type='checkbox']"),
+        );
+        const clerkDisplayed = clerkBoxes.map((cb) => cb.value);
+        const clerkChecked = clerkBoxes
+          .filter((cb) => cb.checked)
+          .map((cb) => cb.value);
+        send({
+          type: "saveSettings",
+          routine: "general",
+          settings: s,
+          clerkSelection: { displayed: clerkDisplayed, checked: clerkChecked },
+        });
+        applyWindowTitle();
+      }
+
+      function applyWindowTitle() {
+        const custom = (settings.general && settings.general.windowTitle) || "";
+        document.title = custom.trim() ? custom.trim() : "SpaceMolt Commander";
       }
 
       // ── System Blacklist Settings ───────────────────────────────
@@ -17752,15 +17780,28 @@ When responding:
       }
 
       // ── Clerk (headless client) account management ────────────
+      // Flat list of every owned player (used by "Add All" / "no players" checks).
       let clerkPlayersData = [];
+      // Players grouped per Clerk API key (account), so each account's list is
+      // shown in its own separate, scrollable + independently-filterable section.
+      let clerkGroupsData = [];
+      // Persistent in-progress checkbox selection, keyed by username. Survives
+      // background panel re-renders (mapData / catalogue pushes) that previously
+      // wiped the DOM-only checkbox state. Re-based from the server's selected
+      // set whenever the player list is (re)fetched.
+      let clerkSelection = new Set();
+      // Last global search text, restored across background re-renders so the
+      // list doesn't snap back to unfiltered on a refresh.
+      let clerkSearchValue = "";
 
       function saveClerkKey() {
         const key = document.getElementById("set-clerk-apikey").value.trim();
-        if (!key) {
-          appendLine("system", "Clerk API key is empty — not saved.");
+        const key2 = document.getElementById("set-clerk-apikey2").value.trim();
+        if (!key && !key2) {
+          appendLine("system", "Both Clerk API keys are empty — not saved.");
           return;
         }
-        send({ type: "setClerkKey", clerkApiKey: key });
+        send({ type: "setClerkKey", clerkApiKey: key, clerkApiKey2: key2 });
       }
 
       function listClerkPlayers() {
@@ -17791,6 +17832,28 @@ When responding:
           return;
         }
         boxes.forEach((cb) => (cb.checked = !cb.checked));
+        syncClerkSelectionFromDom();
+      }
+
+      // Track a single checkbox toggle into the persistent selection set so it
+      // survives background panel re-renders.
+      function updateClerkSelection(cb) {
+        const username = cb.value;
+        if (cb.checked) clerkSelection.add(username);
+        else clerkSelection.delete(username);
+      }
+
+      // Rebuild the persistent selection set from the current DOM checkboxes.
+      // Used after bulk operations (invert, add) that toggle many boxes at once.
+      function syncClerkSelectionFromDom() {
+        const boxes = document.querySelectorAll(
+          "#clerkPlayersList input[type='checkbox']",
+        );
+        clerkSelection = new Set(
+          Array.from(boxes)
+            .filter((cb) => cb.checked)
+            .map((cb) => cb.value),
+        );
       }
 
       function addAllClerkBots() {
@@ -17798,49 +17861,131 @@ When responding:
           appendLine("system", "No players loaded. Click 'List Players' first.");
           return;
         }
-        const ids = clerkPlayersData.map((p) => p.id);
+        const ids = clerkPlayersData.map((p) => p.username);
         const statusEl = document.getElementById("clerkStatus");
         if (statusEl) statusEl.textContent = `Adding all ${ids.length} player(s)...`;
         send({ type: "addClerkBots", ids });
       }
 
+      // Add the checked players from a single Clerk account group.
+      function addSelectedClerkGroup(gi) {
+        const groupEl = document.querySelector(
+          `#clerkPlayersList .clerk-group[data-gi="${gi}"]`,
+        );
+        const checked = groupEl
+          ? Array.from(
+              groupEl.querySelectorAll("input[type='checkbox']:checked"),
+            ).map((cb) => cb.value)
+          : [];
+        if (!checked.length) {
+          appendLine("system", "No players selected in that account.");
+          return;
+        }
+        const statusEl = document.getElementById("clerkStatus");
+        if (statusEl) statusEl.textContent = `Adding ${checked.length} player(s)...`;
+        send({ type: "addClerkBots", ids: checked });
+      }
+
+      // Add every player owned by a single Clerk account group.
+      function addAllClerkGroup(gi) {
+        const group = clerkGroupsData[gi];
+        if (!group || !group.players.length) {
+          appendLine("system", "No players in that account to add.");
+          return;
+        }
+        const ids = group.players.map((p) => p.username);
+        const statusEl = document.getElementById("clerkStatus");
+        if (statusEl) statusEl.textContent = `Adding all ${ids.length} player(s) from this account...`;
+        send({ type: "addClerkBots", ids });
+      }
+
+      // Invert the selection within a single Clerk account group.
+      function invertClerkGroup(gi) {
+        const groupEl = document.querySelector(
+          `#clerkPlayersList .clerk-group[data-gi="${gi}"]`,
+        );
+        if (!groupEl) return;
+        groupEl
+          .querySelectorAll("input[type='checkbox']")
+          .forEach((cb) => (cb.checked = !cb.checked));
+        syncClerkSelectionFromDom();
+      }
+
+      // Filter the player rows of one Clerk account group in place (preserves
+      // input focus, unlike a full re-render).
+      function filterClerkGroup(input) {
+        const gi = input.dataset.gi;
+        const groupEl = input.closest(".clerk-group");
+        if (!groupEl) return;
+        const q = (input.value || "").trim().toLowerCase();
+        const rows = groupEl.querySelectorAll(".clerk-player-row");
+        let shown = 0;
+        rows.forEach((r) => {
+          const match = !q || (r.dataset.search || "").includes(q);
+          r.style.display = match ? "" : "none";
+          if (match) shown++;
+        });
+        const countEl = groupEl.querySelector(".clerk-group-count");
+        if (countEl) countEl.textContent = `${shown}/${rows.length}`;
+      }
+
       function renderClerkPlayers() {
         const listEl = document.getElementById("clerkPlayersList");
         if (!listEl) return;
-        const filter = (document.getElementById("clerkSearch")?.value || "")
+        // Global filter applies across every account group.
+        const globalFilter = (document.getElementById("clerkSearch")?.value || "")
           .trim()
           .toLowerCase();
-        const players = clerkPlayersData.filter((p) => {
-          if (!filter) return true;
-          return (
-            (p.username || "").toLowerCase().includes(filter) ||
-            (p.empire || "").toLowerCase().includes(filter) ||
-            (p.id || "").toLowerCase().includes(filter)
-          );
-        });
-        if (!clerkPlayersData.length) {
+
+        if (!clerkGroupsData.length) {
           listEl.innerHTML =
-            '<div class="setting-hint" style="padding:8px">No players loaded. Click "List Players" to fetch the accounts owned by this Clerk key.</div>';
+            '<div class="setting-hint" style="padding:8px">No players loaded. Click "List Players" to fetch the accounts owned by your Clerk key(s).</div>';
           return;
         }
-        if (!players.length) {
-          listEl.innerHTML =
-            '<div class="setting-hint" style="padding:8px">No players match the filter.</div>';
-          return;
-        }
-        listEl.innerHTML = players
-          .map((p) => {
-            const id = "clerk-player-" + p.id.replace(/[^a-zA-Z0-9_-]/g, "_");
-            const checked = p.selected ? " checked" : "";
-            const tag = p.connected
-              ? '<span style="color:var(--green);font-size:11px"> ● connected</span>'
-              : p.selected
-                ? '<span style="color:var(--text-secondary);font-size:11px"> ○ selected (not connected)</span>'
-                : "";
-            return `<label class="checkbox-row" for="${id}" style="display:flex;gap:8px;align-items:center;padding:3px 4px">
-              <input type="checkbox" id="${id}" value="${esc(p.id)}"${checked} />
-              <span><strong>${esc(p.username)}</strong> <span style="color:var(--text-secondary);font-size:11px">(${esc(p.empire)}${p.hidden ? ", hidden" : ""})</span> ${tag}</span>
-            </label>`;
+
+        listEl.innerHTML = clerkGroupsData
+          .map((g, gi) => {
+            const players = g.players.filter((p) => {
+              if (!globalFilter) return true;
+              return (
+                (p.username || "").toLowerCase().includes(globalFilter) ||
+                (p.empire || "").toLowerCase().includes(globalFilter) ||
+                (p.id || "").toLowerCase().includes(globalFilter)
+              );
+            });
+            // Skip an account entirely when the global filter hides all its rows.
+            if (globalFilter && !players.length) return "";
+
+            const rows = players
+              .map((p) => {
+                const id =
+                  "clerk-player-" + gi + "-" + p.id.replace(/[^a-zA-Z0-9_-]/g, "_");
+                const checked = clerkSelection.has(p.username) ? " checked" : "";
+                const tag = p.connected
+                  ? '<span style="color:var(--green);font-size:11px"> ● connected</span>'
+                  : clerkSelection.has(p.username)
+                    ? '<span style="color:var(--text-secondary);font-size:11px"> ○ selected (not connected)</span>'
+                    : "";
+                const search = `${p.username} ${p.empire} ${p.id}`.toLowerCase();
+                return `<label class="checkbox-row clerk-player-row" for="${id}" data-search="${esc(search)}" style="display:flex;gap:8px;align-items:center;padding:3px 4px">
+                  <input type="checkbox" id="${id}" value="${esc(p.username)}"${checked} onchange="updateClerkSelection(this)" />
+                  <span><strong>${esc(p.username)}</strong> <span style="color:var(--text-secondary);font-size:11px">(${esc(p.empire)}${p.hidden ? ", hidden" : ""})</span> ${tag}</span>
+                </label>`;
+              })
+              .join("");
+
+            return `<div class="clerk-group" data-gi="${gi}" style="border:1px solid var(--border);border-radius:6px;margin-bottom:8px;padding:6px">
+              <div class="clerk-group-head" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
+                <strong style="font-size:13px">Clerk Key ${gi + 1}</strong>
+                <span style="color:var(--text-secondary);font-size:11px">${esc(g.keyLabel)}</span>
+                <span class="clerk-group-count" style="color:var(--text-secondary);font-size:11px">${players.length}/${g.players.length}</span>
+                <input type="text" class="clerk-group-search" data-gi="${gi}" placeholder="Filter this account..." oninput="filterClerkGroup(this)" style="width:200px" />
+                <button class="sm primary" onclick="addSelectedClerkGroup(${gi})">Add Selected</button>
+                <button class="sm" onclick="addAllClerkGroup(${gi})">Add All</button>
+                <button class="sm" onclick="invertClerkGroup(${gi})">Invert</button>
+              </div>
+              <div class="clerk-group-players" style="max-height:260px;overflow:auto">${rows}</div>
+            </div>`;
           })
           .join("");
       }
@@ -20036,12 +20181,12 @@ When responding:
               <span style="font-size:10px">${status}</span>
               ${canManage ? `
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                <span style="font-size:11px;color:var(--text-dim)">Public access:</span>
+                <span style="font-size:11px;color:var(--text-dim)"></span>
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
                 <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                <span style="font-size:11px;color:var(--text-dim)">Output price / unit:</span>
+                <span style="font-size:11px;color:var(--text-dim)">PPR:</span>
                 <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
                 <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
               </div>` : ``}

@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { minerRoutine } from "./routines/miner.js";
@@ -32,12 +32,12 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKey, getClerkConfig, setClerkConfig } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
-import { connectOwnedAccounts, initSpacemoltClient, listOwnedPlayers, getConnectedAccounts } from "./libClient.js";
+import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients } from "./libClient.js";
 import type { Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
@@ -45,6 +45,7 @@ import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
+import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
 import { ensureInsured } from "./routines/common.js";
 import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
 import { logSkills, refreshSkillNames } from "./skillTracker.js";
@@ -160,14 +161,94 @@ function refreshStatusTable(): void {
   server.updateBotStatus(statuses);
 }
 
+type ClerkPlayerLike = { id: string; username: string };
+
+/**
+ * The selected-bot list (`settings.clerk.bots`) and the `bots` map must agree
+ * on identity. The map (and the dashboard) are keyed by `account.id` — the
+ * library's *managed id* (the username). Historically clerk.bots was seeded
+ * with `ClerkPlayer.id`, which is the account's separate `player_id`. Those two
+ * ids are NOT the same string, so a value stored as a `player_id` never matched
+ * a `bots`-map lookup keyed by `account.id`. That mismatch made "remove" fail to
+ * actually drop the bot from the persisted list, and made the periodic
+ * reconnect treat every connected bot as "missing" (reconnect storms / bots
+ * reappearing on their own).
+ *
+ * This rewrites any legacy `player_id` entries in clerk.bots to the
+ * corresponding username, using the id→username map from a `listOwnedPlayers`
+ * result. Idempotent; returns true if a change was persisted.
+ */
+function normalizeClerkBotsToUsernames(players: ClerkPlayerLike[]): boolean {
+  const idToName = new Map<string, string>();
+  for (const p of players) idToName.set(p.id, p.username);
+  const cfg = getClerkConfig();
+  if (!cfg.bots.length) return false;
+  let changed = false;
+  const next = cfg.bots.map((id) => {
+    const name = idToName.get(id);
+    if (name && name !== id) {
+      changed = true;
+      return name;
+    }
+    return id;
+  });
+  if (changed) setClerkConfig({ bots: next });
+  return changed;
+}
+
 /**
  * Wire a freshly connected library `Account` into a `Bot` and register it.
  * Shared by the startup connect and the dashboard "Add Selected" flow so both
  * paths behave identically.
  */
+/**
+ * Wire a freshly connected (or reconnected) library `Account` into a `Bot`.
+ *
+ * On a *reconnect* — the library dropped the bot's old socket for good
+ * (`onAccountDisconnected`) or a watchdog detected a dead socket — the `Bot`
+ * already exists in the `bots` map, so instead of creating a duplicate we swap
+ * the fresh `Account` into the existing `Bot` and re-wire its event
+ * subscriptions. The `Bot` instance (and any routine currently holding it)
+ * keeps working transparently against the new socket.
+ *
+ * On a *first* connect there is no `Bot` yet, so we create one as before.
+ */
+/**
+ * Post-connect initialization for a bot: pull a fresh canonical seed and
+ * populate the cached game state so the dashboard shows real data immediately
+ * (idle bots aren't touched by the periodic refresh). Fire-and-forget so a
+ * fleet-wide connect kicks every bot off at once without blocking.
+ */
+function initBot(bot: Bot, account: Account): void {
+  void (async () => {
+    try {
+      await account.refresh();
+    } catch { /* fall back to whatever the library already seeded */ }
+    await bot.refreshStatus().catch(() => {});
+    await bot.refreshShip().catch(() => {});
+    const addedStation = await registerBotStation(bot).catch(() => false);
+    refreshStatusTable();
+    // Broadcast the now-updated map so the dashboard's station pickers
+    // (faction storage, approved fuel stations, …) show the new options.
+    if (addedStation) server.updateMapData();
+  })();
+}
+
 function addOwnedAccountAsBot(account: Account): void {
   const id = account.id || "";
-  if (!id || bots.has(id)) return;
+  if (!id) return;
+
+  const existing = bots.get(id);
+  if (existing) {
+    existing.account = account;
+    existing.instrumentSend();
+    existing.unsubscribeEvents();
+    existing.subscribeEvents();
+    server.logSystem(`Reconnected owned account: ${id}`);
+    initBot(existing, account);
+    return;
+  }
+
   const bot = new Bot(id, BASE_DIR, account);
   setupBotLogging(bot);
   bot.subscribeEvents();
@@ -182,18 +263,7 @@ function addOwnedAccountAsBot(account: Account): void {
   // fetches get_ship for the ship name, hull/shield, modules, and ammo, which
   // the seeded state alone doesn't always carry. account.refresh() forces a
   // fresh canonical seed in case seeding hasn't settled by the onConnect call.
-  void (async () => {
-    try {
-      await account.refresh();
-    } catch { /* fall back to whatever the library already seeded */ }
-    await bot.refreshStatus().catch(() => {});
-    await bot.refreshShip().catch(() => {});
-    const addedStation = await registerBotStation(bot).catch(() => false);
-    refreshStatusTable();
-    // Broadcast the now-updated map so the dashboard's station pickers
-    // (faction storage, approved fuel stations, …) show the new options.
-    if (addedStation) server.updateMapData();
-  })();
+  initBot(bot, account);
 }
 
 /**
@@ -257,18 +327,21 @@ async function registerBotStation(bot: Bot): Promise<boolean> {
  * connect ONLY the ids the user has explicitly chosen (persisted in
  * `settings.clerk.bots`) rather than every owned account.
  *
- * If no Clerk API key is configured, or no players have been selected yet, no
- * bots start — the dashboard is where selection happens.
+ * If no Clerk API key is configured (neither env var nor dashboard key), or no
+ * players have been selected yet, no bots start — the dashboard is where
+ * selection happens. A second key (Settings → General → Clerk API Key 2) is
+ * initialized too, so players owned by a different Clerk account can be added
+ * alongside the primary account's players.
  */
 async function connectLibraryAccounts(): Promise<void> {
-  const key = getClerkApiKey();
-  if (!key) {
+  const keys = getClerkApiKeys();
+  if (!keys.length) {
     server.logSystem(
-      "No Clerk API key configured — set SPACEMOLT_CLERK_API_KEY or add it in Settings → General → Clerk API Key, then choose players to add.",
+      "No Clerk API key configured — set SPACEMOLT_CLERK_API_KEY (or SPACEMOLT_CLERK_API_KEY_2) or add it in Settings → General → Clerk API Key, then choose players to add.",
     );
     return;
   }
-  initSpacemoltClient(key);
+  initSpacemoltClients(keys);
 
   const selected = getClerkConfig().bots;
   if (!selected.length) {
@@ -278,15 +351,105 @@ async function connectLibraryAccounts(): Promise<void> {
     return;
   }
 
-  server.logSystem(`Connecting ${selected.length} selected owned account(s) via @spacemolt/lib...`);
+  // Normalize the persisted selected-bot list (settings.clerk.bots) so it
+  // stores usernames (the account id / `bots`-map key) rather than the legacy
+  // player_id form. Without this, removal/uncheck never matched and bots kept
+  // reconnecting on their own.
+  try {
+    const players = await listOwnedPlayers();
+    normalizeClerkBotsToUsernames(players);
+  } catch { /* best-effort; the connect filter below also accepts player_id */ }
+
+  const selectedNow = getClerkConfig().bots;
+  server.logSystem(`Connecting ${selectedNow.length} selected owned account(s) across ${keys.length} Clerk key(s) via @spacemolt/lib...`);
+  registerClientDisconnectHandlers();
   try {
     const accounts = await connectOwnedAccounts(
-      (player) => selected.includes(player.id),
+      (player) => selectedNow.includes(player.username) || selectedNow.includes(player.id),
       (account) => addOwnedAccountAsBot(account),
     );
     server.logSystem(`Connected ${accounts.length} owned account(s) via @spacemolt/lib`);
   } catch (err) {
     server.logSystem(`Library-owned-account connect failed: ${err}`);
+  }
+}
+
+/**
+ * Clients whose `onAccountDisconnected` listener we've already wired, so we
+ * register each client exactly once no matter how many times init/re-init runs.
+ */
+const registeredClients = new Set<ReturnType<typeof getSpacemoltClients>[number]>();
+
+/**
+ * Wire a one-time listener on every initialized client that fires when the
+ * library gives up on a bot's socket for good (terminal close, or its
+ * in-place reconnect retries exhausted). We log it and let the periodic
+ * watchdog batch-reconnect the dead bot(s) on its next tick — re-requesting a
+ * fresh socket rather than leaving the `Bot` welded to a dead one.
+ */
+function registerClientDisconnectHandlers(): void {
+  for (const client of getSpacemoltClients()) {
+    if (registeredClients.has(client)) continue;
+    registeredClients.add(client);
+    client.onAccountDisconnected((id, err) => {
+      const detail = (err && (err as { code?: number; message?: string }).code)
+        ?? (err && (err as { message?: string }).message)
+        ?? "closed";
+      server.logSystem(`Connection to "${id}" lost for good (${detail}). Will re-request a new socket.`);
+    });
+  }
+}
+
+/**
+ * Reconnect any selected bot whose library socket is dead (closed and not
+ * coming back).
+ *
+ * The @spacemolt/lib client auto-reconnects in place for a while, but gives up
+ * after its retries are exhausted (e.g. a long server outage) and then deletes
+ * the account — leaving the `Bot` wired to a permanently-dead socket. This
+ * re-requests a fresh socket by reconnecting the bot's account through the
+ * library; `addOwnedAccountAsBot` swaps the new `Account` into the existing
+ * `Bot`, so any routine holding it keeps working.
+ *
+ * `ids`, when given, limits the reconnect to those bots (used by the
+ * `onAccountDisconnected` listener); when omitted, every selected bot with a
+ * dead socket is reconnected in a single batched call (used by the watchdog).
+ * Intentionally-stopped bots are skipped — their socket should stay down.
+ */
+async function reconnectDeadBots(ids?: string[]): Promise<void> {
+  const selected = getClerkConfig().bots;
+  if (!selected.length) return;
+
+  // Lazily (re)initialize clients from the configured keys so a bot added via a
+  // second Clerk key after startup can still reconnect even if the dashboard
+  // "Save Key" flow didn't run.
+  if (!hasSpacemoltClient()) {
+    const keys = getClerkApiKeys();
+    if (!keys.length) return;
+    initSpacemoltClients(keys);
+    registerClientDisconnectHandlers();
+  }
+
+  const targets = (ids ?? selected).filter((id) => {
+    if (getStoppedState(id)) return false;
+    const bot = bots.get(id);
+    if (!bot) return false;
+    return !bot.isConnected();
+  });
+  if (!targets.length) return;
+
+  server.logSystem(`Reconnecting ${targets.length} bot(s) with a dead socket: ${targets.join(", ")}`);
+  try {
+    const accounts = await connectOwnedAccounts(
+      (player) => targets.includes(player.username) || targets.includes(player.id),
+      (account) => addOwnedAccountAsBot(account),
+    );
+    refreshStatusTable();
+    server.logSystem(`Reconnected ${accounts.length} bot(s) via @spacemolt/lib`);
+  } catch (err) {
+    // Transient failure — the next watchdog pass (or the next
+    // onAccountDisconnected) will try again.
+    server.logSystem(`Reconnect of dead bot(s) failed (will retry): ${err}`);
   }
 }
 
@@ -303,13 +466,27 @@ async function connectLibraryAccounts(): Promise<void> {
 async function ensureSelectedBotsConnected(): Promise<void> {
   const selected = getClerkConfig().bots;
   if (!selected.length) return;
+
+  // First, breathe life back into any bot whose socket died but whose Bot
+  // object is still around (the library gave up on it / it was dropped).
+  await reconnectDeadBots();
+
   const missing = selected.filter((id) => !bots.has(id));
   if (!missing.length) return;
+
+  // Lazily (re)initialize clients from the configured keys so a bot added via a
+  // second Clerk key after startup can still reconnect even if the dashboard
+  // "Save Key" flow didn't run.
+  if (!hasSpacemoltClient()) {
+    const keys = getClerkApiKeys();
+    if (!keys.length) return;
+    initSpacemoltClients(keys);
+  }
 
   server.logSystem(`Reconnecting ${missing.length} selected bot(s) not currently connected: ${missing.join(", ")}`);
   try {
     await connectOwnedAccounts(
-      (player) => missing.includes(player.id),
+      (player) => missing.includes(player.username) || missing.includes(player.id),
       (account) => addOwnedAccountAsBot(account),
     );
     refreshStatusTable();
@@ -370,6 +547,35 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   const routine = (action as any).routine as string;
   const s = action.settings;
   if (!routine || !s) return { ok: false, error: "Routine and settings required" };
+
+  // Persist the Clerk "Add Bots" selection when the General settings are saved.
+  // Unchecking a bot in that list and pressing Save must remove it from the
+  // persisted selected-bot list so it doesn't reconnect on the next restart.
+  const sel = action.clerkSelection;
+  if (sel && Array.isArray(sel.displayed) && Array.isArray(sel.checked)) {
+    // Normalize any legacy player_id entries to usernames first (best-effort),
+    // so an unchecked-but-legacy entry can actually be matched against the
+    // displayed usernames and dropped below.
+    try {
+      const players = await listOwnedPlayers();
+      normalizeClerkBotsToUsernames(players);
+    } catch { /* best-effort */ }
+    const displayed = new Set(sel.displayed);
+    const checked = new Set(sel.checked);
+    // Keep everything already persisted EXCEPT a bot the user explicitly showed
+    // in the list AND left unticked (that's the "uncheck + Save = remove"
+    // gesture). Always re-add the ticked bots too — this way a freshly-added bot
+    // whose checkbox state hasn't settled in the DOM can never be silently
+    // dropped from the persisted list (which would make it vanish on restart).
+    // Bots that were never shown in this list (e.g. owned by a Clerk key the
+    // user hasn't listed right now) are left untouched.
+    const nextBots = [...new Set([
+      ...getClerkConfig().bots.filter((id) => !displayed.has(id) || checked.has(id)),
+      ...checked,
+    ])];
+    setClerkConfig({ bots: nextBots });
+    server.logSystem(`Updated selected-bot list (${nextBots.length} kept) from General settings save.`);
+  }
 
   if (routine === "flock") {
     const { writeFileSync, existsSync, mkdirSync } = await import("fs");
@@ -535,39 +741,58 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
 
 async function handleSetClerkKey(action: WebAction): Promise<WebActionResult> {
   const key = (action as any).clerkApiKey as string | undefined;
-  if (!key) return { ok: false, error: "No Clerk API key provided" };
-  setClerkConfig({ apiKey: key });
+  const key2 = (action as any).clerkApiKey2 as string | undefined;
+  if (!key && !key2) return { ok: false, error: "No Clerk API key provided" };
+
+  // Only overwrite the fields the dashboard actually sent (so saving the second
+  // key alone doesn't blank out the first, and vice versa).
+  const partial: { apiKey?: string; apiKey2?: string } = {};
+  if (key !== undefined) partial.apiKey = key;
+  if (key2 !== undefined) partial.apiKey2 = key2;
+  setClerkConfig(partial);
+
+  const keys = getClerkApiKeys();
   try {
-    initSpacemoltClient(key);
+    initSpacemoltClients(keys);
   } catch (err) {
     return { ok: false, error: `Failed to initialize client: ${err instanceof Error ? err.message : String(err)}` };
   }
-  server.logSystem("Clerk API key saved. Use 'List Players' to choose accounts to add.");
-  return { ok: true, message: "Clerk API key saved. Use 'List Players' to choose accounts to add." };
+  server.logSystem("Clerk API key(s) saved. Use 'List Players' to choose accounts to add.");
+  return { ok: true, message: "Clerk API key(s) saved. Use 'List Players' to choose accounts to add." };
 }
 
 async function handleListClerkPlayers(): Promise<WebActionResult> {
-  if (!getClerkApiKey()) {
+  const keys = getClerkApiKeys();
+  if (!keys.length) {
     return { ok: false, error: "No Clerk API key set. Add it in Settings → General → Clerk API Key first." };
   }
   try {
-    initSpacemoltClient(getClerkApiKey()!);
+    initSpacemoltClients(keys);
   } catch {
     // already initialized is fine
   }
   try {
-    const players = await listOwnedPlayers();
+    const groups = await listOwnedPlayersByKey();
+    const allPlayers = groups.flatMap((g) => g.players);
+    normalizeClerkBotsToUsernames(allPlayers);
     const selected = new Set(getClerkConfig().bots);
     const connected = new Set(getConnectedAccounts().map((a) => a.id));
-    const data = players.map((p) => ({
-      id: p.id,
-      username: p.username,
-      empire: p.empire,
-      hidden: p.hidden,
-      selected: selected.has(p.id),
-      connected: connected.has(p.id),
+    const data = groups.map((g) => ({
+      keyIndex: g.keyIndex,
+      keyLabel: g.keyLabel,
+      players: g.players.map((p) => ({
+        id: p.id,
+        username: p.username,
+        empire: p.empire,
+        hidden: p.hidden,
+        // The selected list may hold either the username (account id) or the
+        // legacy player_id form, so accept both.
+        selected: selected.has(p.id) || selected.has(p.username),
+        connected: connected.has(p.id) || connected.has(p.username),
+      })),
     }));
-    return { ok: true, data: { players: data, count: data.length } };
+    const count = data.reduce((n, g) => n + g.players.length, 0);
+    return { ok: true, data: { groups: data, count } };
   } catch (err) {
     return { ok: false, error: `Failed to list owned players: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -576,28 +801,40 @@ async function handleListClerkPlayers(): Promise<WebActionResult> {
 async function handleAddClerkBots(action: WebAction): Promise<WebActionResult> {
   const ids = (action as any).ids as string[] | undefined;
   if (!ids || !ids.length) return { ok: false, error: "No players selected" };
-  if (!getClerkApiKey()) {
+  const keys = getClerkApiKeys();
+  if (!keys.length) {
     return { ok: false, error: "No Clerk API key set. Add it in Settings → General → Clerk API Key first." };
   }
   try {
-    initSpacemoltClient(getClerkApiKey()!);
+    initSpacemoltClients(keys);
   } catch {
     // already initialized is fine
   }
 
   // Persist the selection so these bots reconnect on next restart.
+  // ids arrive as usernames (account ids) from the dashboard. Normalize any
+  // legacy player_id entries already in the list to usernames too.
   const prev = getClerkConfig().bots;
-  const merged = Array.from(new Set([...prev, ...ids]));
+  const idsAsUsernames = Array.from(new Set(ids));
+  let merged = Array.from(new Set([...prev, ...idsAsUsernames]));
+  try {
+    const players = await listOwnedPlayers();
+    const idToName = new Map(players.map((p) => [p.id, p.username]));
+    merged = merged.map((id) => idToName.get(id) ?? id);
+    const mergedSet = new Set(merged);
+    merged = [...mergedSet];
+  } catch { /* best-effort */ }
   setClerkConfig({ bots: merged });
 
   try {
+    registerClientDisconnectHandlers();
     const accounts = await connectOwnedAccounts(
-      (player) => ids.includes(player.id),
+      (player) => merged.includes(player.username) || merged.includes(player.id),
       (account) => addOwnedAccountAsBot(account),
     );
     refreshStatusTable();
     server.logSystem(`Added ${accounts.length} bot(s) from Clerk account.`);
-    return { ok: true, message: `Added ${accounts.length} bot(s).`, data: { added: accounts.length } };
+    return { ok: true, message: `Added ${accounts.length} bot(s).`, data: { added: accounts.length, ids: merged } };
   } catch (err) {
     return { ok: false, error: `Failed to add bots: ${err instanceof Error ? err.message : String(err)}` };
   }
@@ -934,11 +1171,17 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
 
-  // Stop if running
+  // Stop the routine (aborts the running loop if any) and tear down the library
+  // connection so the bot stops "playing" in the background. Without closing the
+  // Account, @spacemolt/lib keeps the WebSocket open and keeps pushing
+  // notifications (crafting_update, etc.) that re-route through the bot's onLog
+  // into the activity log even though the bot is no longer in the dashboard.
   if (bot.state === "running") {
     bot.stop();
     await new Promise((r) => setTimeout(r, 3000));
   }
+  bot.unsubscribeEvents();
+  bot.account?.close();
 
   bots.delete(botName);
   server.clearBotAssignment(botName);
@@ -946,8 +1189,25 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   clearStoppedState(botName);
 
   // Keep the selected-bot list (settings.clerk.bots) in sync so a removed bot
-  // isn't re-added on the next restart.
-  const clerkBots = getClerkConfig().bots.filter((id) => id !== botName);
+  // isn't re-added on the next restart. clerk.bots may hold either the username
+  // (account id / map key) OR a legacy `player_id`, so drop every entry matching
+  // either identity for this bot — otherwise the watchdog reconnects it.
+  let pid: string | undefined;
+  const acct = bot?.account as
+    | { state?: { player?: { player_id?: string } }; player?: { id?: string; player_id?: string } }
+    | undefined;
+  if (acct) {
+    pid = acct?.state?.player?.player_id ?? acct?.player?.player_id ?? acct?.player?.id;
+  }
+  // Normalize any legacy player_id entries to usernames (best-effort) so the
+  // filter below can match the stored form even if this bot is stored as a
+  // player_id rather than a username.
+  try {
+    const players = await listOwnedPlayers();
+    normalizeClerkBotsToUsernames(players);
+  } catch { /* best-effort; the player_id fallback below still covers it */ }
+  const removeIds = new Set<string>([botName, ...(pid ? [pid] : [])]);
+  const clerkBots = getClerkConfig().bots.filter((id) => !removeIds.has(id));
   setClerkConfig({ bots: clerkBots });
 
   // Delete session directory
@@ -1387,6 +1647,39 @@ async function main(): Promise<void> {
     }
   }, 2000));
 
+  // Outbound send metrics sampler (read-only; no throttling). Every 10s tag the
+  // window with the current active-player count, log a terse summary, and append
+  // the row to data/send_metrics.jsonl so we can find the per-client player
+  // ceiling by plotting latency/error onset against active players.
+  {
+    const metricsPath = join(BASE_DIR, "data", "send_metrics.jsonl");
+    intervals.push(setInterval(() => {
+      try {
+        const activePlayers = [...bots.values()].filter(
+          (b) => b.state === "running" && b.isConnected(),
+        ).length;
+        setActivePlayers(activePlayers);
+        const snap = snapshotAndReset();
+        if (!snap) return;
+        const errs = snap.errClosedSocket + snap.errTimeout + snap.errRateLimited + snap.errOther;
+        if (errs > 0 || snap.latP95Ms >= 3000) {
+          server.logSystem(
+            `Send metrics: ${snap.activePlayers} players, ${snap.sends} sends, ` +
+            `p50 ${snap.latP50Ms}ms / p95 ${snap.latP95Ms}ms / max ${snap.latMaxMs}ms, ` +
+            `maxInFlight ${snap.maxInFlight}, errors ${errs} ` +
+            `(closed ${snap.errClosedSocket}, timeout ${snap.errTimeout}, rate ${snap.errRateLimited}, other ${snap.errOther}).`,
+          );
+        }
+        try {
+          mkdirSync(join(BASE_DIR, "data"), { recursive: true });
+          appendFileSync(metricsPath, JSON.stringify(snap) + "\n");
+        } catch { /* metrics file is best-effort; never break the runner */ }
+      } catch (err) {
+        console.error('Error sampling send metrics:', err);
+      }
+    }, 10000));
+  }
+
   // Periodic live refresh (hit API for bots that are running routines only)
   // Set periodicRefreshSec to 0 to disable
   const periodicRefreshSec = (settings.general as Record<string, unknown>)?.periodicRefreshSec as number || 30;
@@ -1537,6 +1830,14 @@ async function main(): Promise<void> {
       }
     }
   }, 30000));
+
+  // Fast watchdog: re-request a fresh socket for any selected bot whose
+  // connection died and the library has given up on (or that was dropped).
+  // Batches every dead bot into one reconnect call every 15s, so a bot can
+  // never be left welded to a dead "cannot send on a closed socket" socket.
+  intervals.push(setInterval(() => {
+    reconnectDeadBots().catch(() => {});
+  }, 15 * 1000));
 
   // Periodic reconnect of selected bots that aren't currently connected.
   // Guarantees a bot can never be left permanently disconnected just because

@@ -1481,6 +1481,10 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
+  // Respect the enableMissions setting (default true). When disabled, never
+  // touch active missions — neither completing nor accepting them.
+  if (getTraderSettings(bot.username).enableMissions === false) return;
+
   // Try to complete active missions
   const activeResp = await bot.exec("get_active_missions");
   let activeMissionCount = 0;

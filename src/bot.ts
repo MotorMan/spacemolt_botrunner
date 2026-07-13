@@ -3,6 +3,7 @@ import { join } from "path";
 import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch, extractLibResult } from "./commandBridge.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
+import { measureSend } from "./sendMetrics.js";
 import { mapStore } from "./mapstore.js";
 import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
@@ -113,6 +114,8 @@ export class Bot {
   account: Account | null = null;
   /** Unsubscribe functions for the event subscriptions registered in `subscribeEvents`. */
   private eventUnsubscribers: Array<() => void> = [];
+  /** Unsubscribe function for the realtime market push stream (only used by trade routines). */
+  private marketUnsubscriber: (() => void) | null = null;
   private baseDir: string;
   private color: string;
   private _state: BotState = "idle";
@@ -195,9 +198,6 @@ docked = false;
 
   /** Bot-specific settings loaded from disk. */
   settings?: Record<string, unknown>;
-
-  /** Optional WebSocket v2 client for realtime market subscriptions (opt-in static bots). */
-
 
   /** Maps a subscribed base_id to the {systemId, poiId} it was subscribed from (for dashboard mirror). */
 
@@ -322,11 +322,39 @@ docked = false;
     this.username = username;
     this.baseDir = baseDir;
     this.account = account ?? null;
+    this.instrumentSend();
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
 
     // Initialize player name tracking
     playerNameStore.setBotName(username);
+  }
+
+  /**
+   * Install a measurement-only shim over this bot's library `Account.send` so
+   * every outbound command is timed by the metrics module. This adds NO delay
+   * or throttling — it wraps the call, records latency / in-flight concurrency /
+   * error category, and returns the result (or rethrows) untouched.
+   *
+   * The library builds its whole `commands` facade on top of `account.send`
+   * (`buildCommands((t,a,p) => this.send(t,a,p))`), so wrapping `send` is the one
+   * chokepoint that catches both `Bot.libExec` and the direct
+   * `bot.commands.spacemolt.*()` calls the routines make. Idempotent (tagged
+   * with `_instrumented`) so a reconnect that swaps in a fresh `Account` and the
+   * constructor never double-wrap.
+   */
+  instrumentSend(): void {
+    const account = this.account;
+    if (!account) return;
+    const tagged = account as unknown as {
+      _instrumented?: boolean;
+      send: (t: string, a: string, p?: Record<string, unknown>) => Promise<unknown>;
+    };
+    if (tagged._instrumented) return;
+    const originalSend = account.send.bind(account);
+    tagged.send = (tool: string, action: string, payload?: Record<string, unknown>) =>
+      measureSend(() => originalSend(tool, action, payload));
+    tagged._instrumented = true;
   }
 
   async initCraftQueueTracker(): Promise<void> {
@@ -755,8 +783,9 @@ docked = false;
     );
 
     // Realtime market order-book updates feed the stream store + dashboard cache.
-    const offMarket = account.on("market_update", (payload) => this.handleMarketUpdate(payload));
-    this.eventUnsubscribers.push(offMarket);
+    // Only subscribed for routines that actually deal with trade (explorer/trader)
+    // — every other routine drops it to avoid wasting game-server bandwidth.
+    this.syncMarketSubscription();
 
     // Untyped pushes (legacy "system"/"combat" pirate-attack messages) arrive as
     // RawFrame via onAny. Forward those too, skipping anything already covered
@@ -774,7 +803,42 @@ docked = false;
     });
     this.eventUnsubscribers.push(offAny);
 
-    this.log("system", "Subscribed to @spacemolt/lib push events (chat/battle/market/notifications).");
+    const channels = ["chat", "battle", "notifications"];
+    if (this.marketUnsubscriber) channels.push("market");
+    this.log("system", `Subscribed to @spacemolt/lib push events (${channels.join("/")}).`);
+  }
+
+  /**
+   * True when this bot's current routine is one that deals in trade data and
+   * therefore needs the high-bandwidth realtime market push stream. Only
+   * explorers and traders subscribe; every other routine drops it to save
+   * game-server bandwidth.
+   */
+  private isTradeRoutine(): boolean {
+    return this._routine === "explorer" || this._routine === "trader";
+  }
+
+  /**
+   * Subscribe to (or unsubscribe from) the realtime `market_update` push stream
+   * based on the bot's current routine. Idempotent: calling repeatedly with the
+   * same routine state is a no-op. Routines that don't deal with trade never
+   * open the market stream, so they generate no market bandwidth against the
+   * game server.
+   */
+  private syncMarketSubscription(): void {
+    const account = this.account;
+    if (!account) return;
+
+    if (this.isTradeRoutine()) {
+      if (!this.marketUnsubscriber) {
+        this.marketUnsubscriber = account.on("market_update", (payload) =>
+          this.handleMarketUpdate(payload),
+        );
+      }
+    } else if (this.marketUnsubscriber) {
+      try { this.marketUnsubscriber(); } catch { /* ignore */ }
+      this.marketUnsubscriber = null;
+    }
   }
 
   /** Remove all event subscriptions registered by `subscribeEvents`. */
@@ -783,6 +847,10 @@ docked = false;
       try { off(); } catch { /* ignore */ }
     }
     this.eventUnsubscribers = [];
+    if (this.marketUnsubscriber) {
+      try { this.marketUnsubscriber(); } catch { /* ignore */ }
+      this.marketUnsubscriber = null;
+    }
   }
 
   /** Execute an API command, log the result, handle notifications. */
@@ -983,14 +1051,28 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             if (location.docked_at) this.poi = (location.docked_at as string);
           } else if (command === "undock") {
             this.docked = false;
-          } else if (command === "sell" || command === "create_sell_order") {
-            const creditsEarned = (r.credits_earned as number) || (r.credits as number) || 0;
-            if (creditsEarned) this.credits += creditsEarned;
+            } else if (command === "sell" || command === "create_sell_order") {
+            // Prefer the authoritative absolute balance when the API returns
+            // it; otherwise apply the relative earned amount. This avoids
+            // double-counting (adding an absolute balance to the current one)
+            // which produced bouncing/wrong credit values.
+            const newCredits = (r.credits as number);
+            if (typeof newCredits === "number") {
+              this.credits = newCredits;
+            } else {
+              const creditsEarned = (r.credits_earned as number) || 0;
+              if (creditsEarned) this.credits += creditsEarned;
+            }
             const qty = (r.quantity as number) || 0;
             if (qty) this.cargo = Math.max(0, this.cargo - qty);
           } else if (command === "buy" || command === "create_buy_order") {
-            const creditsSpent = (r.credits_spent as number) || (r.credits as number) || 0;
-            if (creditsSpent) this.credits = Math.max(0, this.credits - creditsSpent);
+            const newCredits = (r.credits as number);
+            if (typeof newCredits === "number") {
+              this.credits = newCredits;
+            } else {
+              const creditsSpent = (r.credits_spent as number) || 0;
+              if (creditsSpent) this.credits = Math.max(0, this.credits - creditsSpent);
+            }
             const qty = (r.quantity as number) || 0;
             if (qty) this.cargo += qty;
           } else if (command === "refuel") {
@@ -1016,8 +1098,6 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.logPosition();
           this.lastSystem = this.system;
           this.lastPoi = this.poi;
-          // Re-evaluate WS v2 subscription for the (possibly new) docked station.
-          this.ensureMarketSubscription();
         }
 
         return resp;
@@ -1089,111 +1169,153 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     return false;
   }
 
-  /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
+  /**
+   * Throttle for real `get_status` network fetches. `refreshStatus()` is called
+   * extremely often — every routine loop iteration, after every web-UI command,
+   * and on every periodic tick across the whole fleet — so issuing a network
+   * `get_status` on each call would hammer the game server. We fetch at most
+   * once per window and otherwise return the last authoritative result.
+   *
+   * This also fixes a stale-data bounce: previously library-backed bots read
+   * `account.state` directly, which the library only refreshes from push
+   * events and does NOT keep current for credits/fuel/etc. Each broadcast then
+   * clobbered freshly-fetched values with that stale cache, making the UI
+   * flicker between old and new data (and prefer the old). Now the cached
+   * `credits`/`fuel`/`hull`/`shield`/`cargo` come from a real `get_status`.
+   */
+  private _lastStatusResult: Record<string, unknown> | null = null;
+  private _lastStatusFetchAt = 0;
+  private static readonly STATUS_FETCH_THROTTLE_MS = 5000;
+
   async refreshStatus(): Promise<ApiResponse> {
-    const resp: ApiResponse = this.account
-      ? { result: this.account.state as unknown as Record<string, unknown>, error: undefined, notifications: [] }
-      : await this.libExec("get_status");
-    debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
-    if (!resp.error && resp.result && typeof resp.result === "object") {
-      const r = resp.result as Record<string, unknown>;
-      debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
-
-      const location = r.location as Record<string, unknown> | undefined;
-      const player = r.player as Record<string, unknown> | undefined;
-      const p = location || player || r;
-
-      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
-      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
-      this.docked = location?.docked_at != null
-        ? !!(location.docked_at)
-        : (p.docked_at_base != null
-          ? !!(p.docked_at_base)
-          : (p.docked as boolean) ?? (p.status === "docked"));
-      this.location =
-        (location?.system_name as string) ||
-        (location?.system_id as string) ||
-        (p.current_system as string) ||
-        (p.location as string) ||
-        this.location;
-
-      this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
-      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
-      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
-        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
-      }
-
-      const ship = r.ship as Record<string, unknown> | undefined;
-      debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
-      if (ship) {
-        const rawName = (ship.name as string) || "";
-        const shipType = (ship.ship_type as string) || (ship.type as string) || "";
-        this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
-        this.shipClass = shipType;
-        this.tier = (ship.tier as number) ?? null;
-        this.fuel = (ship.fuel as number) ?? this.fuel;
-        this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
-        this.cargo = (ship.cargo_used as number) ?? this.cargo;
-        this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
-        this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
-        this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
-        this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-        this.shipSpeed = (ship.speed as number) || 1;
-        this.shipId = (ship.id as string) || "";
-
-        const modulesArray = (
-          Array.isArray(r.modules) ? r.modules :
-          Array.isArray(ship.modules) ? ship.modules :
-          []
-        ) as Array<Record<string, unknown>>;
-
-        let totalAmmo = 0;
-        for (const mod of modulesArray) {
-          if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
-            totalAmmo += mod.current_ammo as number;
-          }
+    if (this.account) {
+      const now = Date.now();
+      if (now - this._lastStatusFetchAt >= Bot.STATUS_FETCH_THROTTLE_MS) {
+        const resp = await this.libExec("get_status");
+        this._lastStatusFetchAt = now;
+        if (!resp.error && resp.result && typeof resp.result === "object") {
+          this._lastStatusResult = resp.result as Record<string, unknown>;
+          this.applyStatusResult(this._lastStatusResult);
+          return { result: this._lastStatusResult, error: undefined, notifications: [] };
         }
-        if (totalAmmo > 0) {
-          this.ammo = totalAmmo;
-        } else if (ship.ammo != null) {
-          this.ammo = ship.ammo as number;
+        // The fetch failed but we have a previous good result — keep using it
+        // instead of falling back to the possibly-stale account.state.
+        if (this._lastStatusResult == null) {
+          this._lastStatusResult = this.account.state as unknown as Record<string, unknown>;
         }
-        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+        this.applyStatusResult(this._lastStatusResult);
+        return { result: this._lastStatusResult, error: undefined, notifications: [] };
       }
-
-      // Towing state handling - moved outside ship block since it's on player/location
-      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
-        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
-      }
-
-      const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-      // Only update towing state if the field is present in the response
-      if (towingWreckId !== undefined && towingWreckId !== null) {
-        if (towingWreckId !== "") {
-          this.towingWreck = true;
-          this.towingWreckId = towingWreckId;
-        } else {
-          this.towingWreck = false;
-          this.towingWreckId = null;
-        }
-      }
-      // If field is not present, preserve existing towing state
-
-      playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
-
-      if (p.towing_wreck_id !== undefined || (ship && ship.towing_wreck_id !== undefined) || r.towing_wreck_id !== undefined) {
-        this.log("debug", `Tow fields in status: p.towing_wreck_id=${p.towing_wreck_id}, this.towingWreck=${this.towingWreck}`);
-      }
-
-      if (this.hull <= 0 && this.maxHull > 0) {
-        this.isDead = true;
-      } else if (this.hull > 0 && this.isDead) {
-        this.isDead = false;
-      }
-
-      if (typeof r.fuel === "number") this.fuel = r.fuel;
+      // Throttled: reuse the last authoritative result so callers (and the
+      // status broadcast) use real data instead of stale account.state.
+      return {
+        result: this._lastStatusResult ?? (this.account.state as unknown as Record<string, unknown>),
+        error: undefined,
+        notifications: [],
+      };
     }
+    return this.libExec("get_status");
+  }
+
+  /** Parse a `get_status` result into the bot's cached game state. */
+  private applyStatusResult(r: Record<string, unknown>): void {
+    debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, r);
+    debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
+
+    const location = r.location as Record<string, unknown> | undefined;
+    const player = r.player as Record<string, unknown> | undefined;
+    const p = location || player || r;
+
+    this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+    this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+    this.docked = location?.docked_at != null
+      ? !!(location.docked_at)
+      : (p.docked_at_base != null
+        ? !!(p.docked_at_base)
+        : (p.docked as boolean) ?? (p.status === "docked"));
+    this.location =
+      (location?.system_name as string) ||
+      (location?.system_id as string) ||
+      (p.current_system as string) ||
+      (p.location as string) ||
+      this.location;
+
+    this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+    this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+    if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+      this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+    }
+
+    const ship = r.ship as Record<string, unknown> | undefined;
+    debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
+    if (ship) {
+      const rawName = (ship.name as string) || "";
+      const shipType = (ship.ship_type as string) || (ship.type as string) || "";
+      this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
+      this.shipClass = shipType;
+      this.tier = (ship.tier as number) ?? null;
+      this.fuel = (ship.fuel as number) ?? this.fuel;
+      this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+      this.cargo = (ship.cargo_used as number) ?? this.cargo;
+      this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+      this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+      this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+      this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+      this.shipSpeed = (ship.speed as number) || 1;
+      this.shipId = (ship.id as string) || "";
+
+      const modulesArray = (
+        Array.isArray(r.modules) ? r.modules :
+        Array.isArray(ship.modules) ? ship.modules :
+        []
+      ) as Array<Record<string, unknown>>;
+
+      let totalAmmo = 0;
+      for (const mod of modulesArray) {
+        if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
+          totalAmmo += mod.current_ammo as number;
+        }
+      }
+      if (totalAmmo > 0) {
+        this.ammo = totalAmmo;
+      } else if (ship.ammo != null) {
+        this.ammo = ship.ammo as number;
+      }
+      this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+    }
+
+    // Towing state handling - moved outside ship block since it's on player/location
+    if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+      this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+    }
+
+    const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+    // Only update towing state if the field is present in the response
+    if (towingWreckId !== undefined && towingWreckId !== null) {
+      if (towingWreckId !== "") {
+        this.towingWreck = true;
+        this.towingWreckId = towingWreckId;
+      } else {
+        this.towingWreck = false;
+        this.towingWreckId = null;
+      }
+    }
+    // If field is not present, preserve existing towing state
+
+    playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
+
+    if (p.towing_wreck_id !== undefined || (ship && ship.towing_wreck_id !== undefined) || r.towing_wreck_id !== undefined) {
+      this.log("debug", `Tow fields in status: p.towing_wreck_id=${p.towing_wreck_id}, this.towingWreck=${this.towingWreck}`);
+    }
+
+    if (this.hull <= 0 && this.maxHull > 0) {
+      this.isDead = true;
+    } else if (this.hull > 0 && this.isDead) {
+      this.isDead = false;
+    }
+
+    if (typeof r.fuel === "number") this.fuel = r.fuel;
 
     if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
       this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
@@ -1201,8 +1323,6 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.lastSystem = this.system;
       this.lastPoi = this.poi;
     }
-
-    return resp;
   }
 
   async refreshLocation(): Promise<ApiResponse> {
@@ -1635,58 +1755,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     }
   }
 
-  // ── WebSocket v2 (realtime market) lifecycle ──────────────
-
-  /** Whether WS v2 market streaming is enabled for this bot. */
-  isMarketStreamEnabled(): boolean {
-    try {
-      const settings = loadSettings();
-      const general = (settings.general as Record<string, unknown>) || {};
-      const bots = Array.isArray(general.websocketV2Bots)
-        ? (general.websocketV2Bots as string[])
-        : [];
-      return bots.includes(this.username);
-    } catch {
-      return false;
-    }
-  }
-
-  /** The base_id of the bot's current docked station, or null if not docked/unknown. */
-  getCurrentBaseId(): string | null {
-    if (!this.docked) return null;
-    const sys = mapStore.getSystem(this.system);
-    const poi = sys?.pois?.find((p) => p.id === this.poi);
-    const base = poi?.base_id || poi?.id;
-    return base || null;
-  }
-
-  /** Subscribe to the library's realtime market stream for the current dock. */
-  private ensureMarketSubscription(): void {
-    if (!this.isMarketStreamEnabled()) return;
-    const account = this.account;
-    if (!account) return;
-    const baseId = this.getCurrentBaseId();
-    if (!baseId) {
-      this.log("system", "Market stream: enabled but not docked at a known station yet.");
-      return;
-    }
-    account.subscribeMarket()
-      .then((snap) => {
-        marketStreamStore.update(snap.base_id, 0, snap.items);
-        try {
-          const normalized = snap.items.map((it) => ({
-            item_id: it.item_id,
-            item_name: it.item_name,
-            sell_orders: it.sell_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
-            buy_orders: it.buy_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
-          }));
-          mapStore.updateMarket(this.system, this.poi, { items: normalized });
-        } catch { /* ignore dashboard mirror errors */ }
-      })
-      .catch((err) =>
-        this.log("error", `Market subscription failed: ${err instanceof Error ? err.message : err}`),
-      );
-  }
+  // ── Realtime market push handling ─────────────────────────
 
   /** Feed a market snapshot/update into the stream store and dashboard cache. */
   private handleMarketUpdate(payload: NotificationMarketUpdate): void {
@@ -1728,14 +1797,19 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     this._error = null;
     this._abortController = new AbortController();
 
+    // (Re)subscribe to the realtime market push stream if this routine deals
+    // with trade (explorer/trader); otherwise ensure it's dropped to save
+    // game-server bandwidth.
+    this.syncMarketSubscription();
+
+    // (Re)subscribe to the realtime market push stream if this routine deals
+    // with trade (explorer/trader); otherwise ensure it's dropped to save
+    // game-server bandwidth.
+
     // Library-backed bots are already authenticated via connectOwned(); the
     // legacy per-bot rate-limiting toggle and credential/session resume flow
     // were part of the retired HTTP transport.
     this.log("system", `Starting routine: ${routineName}`);
-
-    // Open the optional WebSocket v2 market stream (static/market-watcher bots).
-    // Non-blocking: failures are logged but never delay or crash the routine.
-    this.ensureMarketSubscription();
 
     const ctx: RoutineContext = {
       bot: this,
@@ -1792,6 +1866,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
 
     this._state = "idle";
     this._routine = null;
+    // Routine ended — drop the market push stream (it was only for trade
+    // routines) so an idle bot generates no market bandwidth.
+    this.syncMarketSubscription();
     this.log("system", "Routine finished");
   }
 

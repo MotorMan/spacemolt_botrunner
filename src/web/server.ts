@@ -46,8 +46,20 @@ export interface WebAction {
   params?: Record<string, unknown>;
   /** Clerk API key supplied from Settings → General (replaces env SPACEMOLT_CLERK_API_KEY). */
   clerkApiKey?: string;
+  /** Optional second Clerk API key, for adding bots owned by a different Clerk account. */
+  clerkApiKey2?: string;
   /** Player ids selected to add as bots. */
   ids?: string[];
+  /**
+   * Clerk player selection state to persist alongside a General-settings save.
+   * `displayed` is the set of player ids currently shown in the Add-Bots list;
+   * `checked` is the subset the user left ticked. Any id in `displayed` that is
+   * NOT in `checked` is removed from the persisted `clerk.bots` list (so
+   * unchecking a bot and saving really removes it), while ids not in
+   * `displayed` are left untouched (so bots added from an account the user
+   * hasn't listed aren't accidentally wiped).
+   */
+  clerkSelection?: { checked?: string[]; displayed?: string[] };
 }
 
 export interface WebActionResult {
@@ -111,13 +123,24 @@ function loadSettings(): RoutineSettings {
 
 export { loadSettings };
 
+// The WebServer keeps an in-memory copy of settings (`this.settings`) that most
+// save paths write back to disk wholesale via `saveSettings(this.settings)`.
+// `setClerkConfig` writes `clerk.bots` to disk directly, so we must keep this
+// in-memory copy pointed at the same object and keep its `clerk` section in
+// sync — otherwise the next routine/settings save silently clobbers the
+// selected-bot list (added bots vanish on restart). `activeSettings` tracks the
+// live in-memory object even when `this.settings` is reassigned on reload.
+let activeSettings: RoutineSettings | null = null;
+
 // ── Clerk (headless client) config persistence ─────────────
 // Stored separately from `general` so the per-routine settings save (which
 // replaces the whole `general` object) can't clobber the selected-bot list.
 
 export interface ClerkConfig {
-  /** Clerk API key — headless-client credential that owns the player accounts. */
+  /** Primary Clerk API key — headless-client credential that owns the player accounts. */
   apiKey: string;
+  /** Optional second Clerk API key — lets you add bots owned by a different Clerk account. */
+  apiKey2: string;
   /** Player ids the user has chosen to run as bots (a Clerk account can own hundreds). */
   bots: string[];
 }
@@ -127,18 +150,34 @@ export function getClerkConfig(): ClerkConfig {
   const c = (s.clerk as Record<string, unknown>) || {};
   return {
     apiKey: typeof c.apiKey === "string" ? c.apiKey : "",
+    apiKey2: typeof c.apiKey2 === "string" ? c.apiKey2 : "",
     bots: Array.isArray(c.bots) ? (c.bots as string[]) : [],
   };
 }
 
 /**
- * Resolve the Clerk API key: the env var takes precedence (kept for the CLI /
- * headless deployments), then the dashboard-supplied key in settings.
+ * Resolve every configured Clerk API key: env vars take precedence (kept for
+ * the CLI / headless deployments), then the dashboard-supplied keys in
+ * settings. Returns a de-duplicated, order-preserving list (env first).
+ */
+export function getClerkApiKeys(): string[] {
+  const keys: string[] = [];
+  if (process.env.SPACEMOLT_CLERK_API_KEY) keys.push(process.env.SPACEMOLT_CLERK_API_KEY);
+  if (process.env.SPACEMOLT_CLERK_API_KEY_2) keys.push(process.env.SPACEMOLT_CLERK_API_KEY_2);
+  const cfg = getClerkConfig();
+  if (cfg.apiKey) keys.push(cfg.apiKey);
+  if (cfg.apiKey2) keys.push(cfg.apiKey2);
+  return [...new Set(keys)];
+}
+
+/**
+ * Resolve the primary Clerk API key (env var takes precedence, kept for the
+ * CLI / headless deployments, then the dashboard-supplied keys). Backward
+ * compatible with callers that expect a single key.
  */
 export function getClerkApiKey(): string | undefined {
-  if (process.env.SPACEMOLT_CLERK_API_KEY) return process.env.SPACEMOLT_CLERK_API_KEY;
-  const key = getClerkConfig().apiKey;
-  return key || undefined;
+  const keys = getClerkApiKeys();
+  return keys[0] || undefined;
 }
 
 /** Merge a partial Clerk config into settings and persist it. */
@@ -146,8 +185,13 @@ export function setClerkConfig(partial: Partial<ClerkConfig>): ClerkConfig {
   const s = loadSettings();
   const c = (s.clerk as Record<string, unknown>) || {};
   if (typeof partial.apiKey === "string") c.apiKey = partial.apiKey;
+  if (typeof partial.apiKey2 === "string") c.apiKey2 = partial.apiKey2;
   if (Array.isArray(partial.bots)) c.bots = partial.bots;
   s.clerk = c;
+  // Keep the in-memory settings copy (used by every other save path) in sync so
+  // a later `saveSettings(this.settings)` doesn't overwrite clerk.bots with a
+  // stale version and drop freshly-added/removed bots.
+  if (activeSettings) activeSettings.clerk = c;
   saveSettings(s);
   return c as unknown as ClerkConfig;
 }
@@ -367,6 +411,7 @@ export class WebServer {
 constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
+    activeSettings = this.settings;
     delete (this.settings as Record<string, unknown>).flock;
     if (!this.settings.module_seller) {
       this.settings.module_seller = {
@@ -499,6 +544,7 @@ if (!this.settings.fuel_service) {
     const memJson = JSON.stringify(this.settings);
     if (diskJson !== memJson) {
       this.settings = diskSettings;
+      activeSettings = this.settings;
       for (const ws of this.clients) {
         try {
           ws.send(JSON.stringify({

@@ -32033,7 +32033,7 @@ ignoreBlacklist: document.getElementById(
             <div class="setting-label">API Key</div>
             <div class="setting-hint">Use this key when connecting from slave clients.</div>
           </div>
-          <input type="text" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Auto-generated" style="width:200px">
+          <input type="text" id="set-client_sync-master-apiKey" value="${esc(apiKey)}" placeholder="Auto-generated" style="width:200px">
           <button class="sm" onclick="generateNewApiKey()">Generate New</button>
         </div>
 
@@ -32042,7 +32042,7 @@ ignoreBlacklist: document.getElementById(
             <div class="setting-label">Password</div>
             <div class="setting-hint">Optional password for slave authentication.</div>
           </div>
-          <input type="password" id="set-client_sync-password" value="${esc(password)}" placeholder="Optional" style="width:200px">
+          <input type="password" id="set-client_sync-master-password" value="${esc(password)}" placeholder="Optional" style="width:200px">
         </div>
 
         <div class="setting-row">
@@ -32079,7 +32079,7 @@ ignoreBlacklist: document.getElementById(
             <div class="setting-label">API Key</div>
             <div class="setting-hint">API key from the master client.</div>
           </div>
-          <input type="password" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Enter API key" style="width:150px">
+          <input type="password" id="set-client_sync-slave-apiKey" value="${esc(apiKey)}" placeholder="Enter API key" style="width:150px">
         </div>
 
         <div class="setting-row">
@@ -32087,7 +32087,7 @@ ignoreBlacklist: document.getElementById(
             <div class="setting-label">Password</div>
             <div class="setting-hint">Optional password for master (if set).</div>
           </div>
-          <input type="password" id="set-client_sync-password" value="${esc(password)}" placeholder="Optional" style="width:150px">
+          <input type="password" id="set-client_sync-slave-password" value="${esc(password)}" placeholder="Optional" style="width:150px">
         </div>
 
         <div class="setting-row">
@@ -32189,7 +32189,7 @@ ignoreBlacklist: document.getElementById(
           Date.now().toString(36) +
           "_" +
           Math.random().toString(36).slice(2, 10);
-        document.getElementById("set-client_sync-apiKey").value = newKey;
+        document.getElementById("set-client_sync-master-apiKey").value = newKey;
         saveClientSyncSettings();
       }
 
@@ -32256,9 +32256,9 @@ ignoreBlacklist: document.getElementById(
         const masterUrl = document.getElementById(
           "set-client_sync-masterUrl",
         ).value;
-        const apiKey = document.getElementById("set-client_sync-apiKey").value;
+        const apiKey = document.getElementById("set-client_sync-slave-apiKey").value;
         const password = document.getElementById(
-          "set-client_sync-password",
+          "set-client_sync-slave-password",
         ).value;
         const label = document.getElementById("set-client_sync-label").value;
         const statusEl = document.getElementById("clientSyncStatus");
@@ -32309,10 +32309,16 @@ ignoreBlacklist: document.getElementById(
 
       function saveClientSyncSettings() {
         const mode = document.getElementById("set-client_sync-mode").value;
-        const apiKey = document.getElementById("set-client_sync-apiKey").value;
-        const password = document.getElementById(
-          "set-client_sync-password",
-        ).value;
+        const apiKeyId =
+          mode === "master"
+            ? "set-client_sync-master-apiKey"
+            : "set-client_sync-slave-apiKey";
+        const passwordId =
+          mode === "master"
+            ? "set-client_sync-master-password"
+            : "set-client_sync-slave-password";
+        const apiKey = document.getElementById(apiKeyId).value;
+        const password = document.getElementById(passwordId).value;
 
         const newSettings = {
           clientSync: {

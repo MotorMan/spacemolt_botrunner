@@ -32331,7 +32331,8 @@ ignoreBlacklist: document.getElementById(
                 document.getElementById("set-client_sync-pollIntervalSec")
                   .value,
               ) || 15,
-            syncMap: cs.syncMap !== false,
+            syncMap:
+              !settings.clientSync || settings.clientSync.syncMap !== false,
             syncMarket: document.getElementById("set-client_sync-syncMarket")
               .checked,
             syncCatalog: document.getElementById("set-client_sync-syncCatalog")

@@ -558,7 +558,10 @@ if (!this.settings.fuel_service) {
       saveSettings(this.settings);
     }
     // Initialize periodic refresh setting in general
-    if ((this.settings.general as Record<string, unknown>)?.periodicRefreshSec === undefined) {
+    if (!this.settings.general || typeof this.settings.general !== "object") {
+      this.settings.general = {};
+    }
+    if ((this.settings.general as Record<string, unknown>).periodicRefreshSec === undefined) {
       (this.settings.general as Record<string, unknown>).periodicRefreshSec = 30;
       saveSettings(this.settings);
     }

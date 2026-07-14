@@ -37,7 +37,7 @@ import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
-import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients } from "./libClient.js";
+import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, removeConnectedAccount, reconnectConnectedAccount } from "./libClient.js";
 import type { Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
@@ -467,12 +467,40 @@ async function reconnectDeadBots(ids?: string[]): Promise<void> {
 
   server.logSystem(`Reconnecting ${targets.length} bot(s) with a dead socket: ${targets.join(", ")}`);
   try {
-    const accounts = await connectOwnedAccounts(
-      (player) => targets.includes(player.username) || targets.includes(player.id),
-      (account) => addOwnedAccountAsBot(account),
-    );
+    let reconnected = 0;
+    const stillMissing: string[] = [];
+    // Revive any *cached* (but dead) Account in place by minting a fresh socket
+    // via `reconnectConnectedAccount` (which calls `Account.reconnectOnce()`).
+    // This is the key fix: `connect()`/`connectOwned()` return the cached
+    // Account for an id REGARDLESS of socket state, so reusing it would re-weld
+    // the same permanently-closed socket and every command would fail with
+    // "cannot send on a closed socket" forever. `reconnectConnectedAccount`
+    // returns null when the id isn't currently cached, so those fall through to
+    // the fresh connectOwned below.
+    for (const id of targets) {
+      try {
+        const revived = await reconnectConnectedAccount(id);
+        if (revived) {
+          reconnected++;
+          continue;
+        }
+      } catch {
+        // reconnectOnce failed (e.g. transient) — fall back to a brand-new
+        // Account built by connectOwned below.
+      }
+      stillMissing.push(id);
+    }
+    // Whatever isn't currently cached (or couldn't be revived in place) gets a
+    // fresh Account through connectOwned.
+    if (stillMissing.length) {
+      const accounts = await connectOwnedAccounts(
+        (player) => stillMissing.includes(player.username) || stillMissing.includes(player.id),
+        (account) => addOwnedAccountAsBot(account),
+      );
+      reconnected += accounts.length;
+    }
     refreshStatusTable();
-    server.logSystem(`Reconnected ${accounts.length} bot(s) via @spacemolt/lib`);
+    server.logSystem(`Reconnected ${reconnected} bot(s) via @spacemolt/lib`);
   } catch (err) {
     // Transient failure — the next watchdog pass (or the next
     // onAccountDisconnected) will try again.
@@ -1239,16 +1267,25 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   }
 
   // Stop the routine (aborts the running loop if any) and tear down the library
-  // connection so the bot stops "playing" in the background. Without closing the
-  // Account, @spacemolt/lib keeps the WebSocket open and keeps pushing
-  // notifications (crafting_update, etc.) that re-route through the bot's onLog
-  // into the activity log even though the bot is no longer in the dashboard.
+  // connection so the bot stops "playing" in the background.
   if (bot.state === "running") {
     bot.stop();
     await new Promise((r) => setTimeout(r, 3000));
   }
   bot.unsubscribeEvents();
-  bot.account?.close();
+
+  // IMPORTANT: evict the Account from the library's in-memory `connected` map
+  // (close + drop cached instance), NOT just `account.close()`. `close()` only
+  // sets the socket's permanent `closed` flag + `userClosing` guard and leaves
+  // the dead Account cached under this id. Because `SpacemoltClient.connect()`
+  // returns any cached Account for an id regardless of socket state, a later
+  // re-add/reconnect would hand back that same permanently-dead socket and every
+  // command would fail with "cannot send on a closed socket" — forever, and
+  // across a browser/dashboard restart (the node process + its cache survive).
+  // Evicting guarantees the next connect builds a fresh Account with a live
+  // socket. (`client.remove` also drops stored creds, which `connectOwned`
+  // re-stores on re-add, so this is safe for Clerk-managed bots.)
+  removeConnectedAccount(botName);
 
   bots.delete(botName);
   server.clearBotAssignment(botName);

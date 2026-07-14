@@ -188,3 +188,44 @@ export function getConnectedAccount(id: string): Account | undefined {
   }
   return undefined;
 }
+
+/**
+ * Evict a bot's `Account` from every initialized client's in-memory `connected`
+ * map, closing its socket and dropping its stored credentials.
+ *
+ * This is the *correct* counterpart to `account.close()`: calling
+ * `bot.account.close()` only sets the socket's permanent `closed` flag and the
+ * `userClosing` guard — it does NOT remove the dead `Account` from the client's
+ * `connected` map. The library's `connect()` short-circuits on any cached
+ * `Account` for an id (`if (existing) return existing`) *regardless of socket
+ * state*, so a subsequently re-added/reconnected bot gets handed back the exact
+ * same permanently-dead socket and every command fails with
+ * "cannot send on a closed socket" — forever, and across a browser/dashboard
+ * restart (the node process and its `connected` map keep running). Evicting here
+ * guarantees `connectOwned()`/`connect()` builds a brand-new `Account` with a
+ * fresh socket. Clerk credentials are re-stored by `connectOwned`, so dropping
+ * them here is safe.
+ */
+export function removeConnectedAccount(id: string): void {
+  for (const c of getSpacemoltClients()) {
+    if (c.account(id)) c.remove(id);
+  }
+}
+
+/**
+ * Revive a cached (possibly permanently-closed) `Account` in place by minting a
+ * fresh socket and re-authenticating — the library's `Account.reconnectOnce()`.
+ *
+ * Unlike `connect()`/`connectOwned()`, which would return the cached dead
+ * instance, `reconnectOnce()` rebuilds the socket (`makeSocket`) so `Socket.closed`
+ * resets to false and the account comes back to life while keeping the same
+ * instance (so anything holding a direct reference — e.g. a running `Bot` — keeps
+ * working). Returns the account on success, or `null` if the id isn't currently
+ * cached (caller should fall back to `connectOwned` to build a fresh one).
+ */
+export async function reconnectConnectedAccount(id: string): Promise<Account | null> {
+  const acc = getConnectedAccount(id);
+  if (!acc) return null;
+  await acc.reconnectOnce();
+  return acc;
+}

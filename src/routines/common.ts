@@ -3246,7 +3246,7 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
     return;
   }
   ctx.log("insurance", "Buying insurance for 7 days...");
-  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
+  const insureResp = await bot.exec("buy_insurance", { ticks: 60480 });
   if (!insureResp.error && insureResp.result) {
     const r = insureResp.result as Record<string, unknown>;
     const msg = (r?.message as string) || `Insurance purchased for 7 days`;

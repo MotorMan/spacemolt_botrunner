@@ -1474,6 +1474,18 @@
         );
       }
 
+      /**
+       * Returns true if the catalog item is a "quest" item that cannot be stored
+       * in faction storage (e.g. all "deep core" items, flagged `quest_item`).
+       * These can only ever live in station storage (or cargo), so any attempt to
+       * deposit/withdraw them via faction storage errors and must be routed to
+       * station storage instead.
+       */
+      function isQuestItem(itemId) {
+        if (!itemId) return false;
+        return catalog.items?.[itemId]?.quest_item === true;
+      }
+
       function getCatalogFacilitiesByCategory(category) {
         const facilities = catalog.facilities || {};
         return Object.values(facilities).filter((f) => f.category === category);
@@ -3096,17 +3108,18 @@
           ? resolveLocation(bot.system, bot.poi)
           : resolveLocation(bot.system) || bot.location;
         const stateLabel =
-          bot.state === "running" && bot.routine
+          bot.offline ? "Reconnecting…"
+          : bot.state === "running" && bot.routine
             ? bot.routine
             : bot.state === "error"
               ? lastUsedRoutines[bot.username] || "miner"
               : bot.state;
 
         return `
-    <div class="grid-bot-card" onclick="openProfile('${esc(bot.username)}')">
+    <div class="grid-bot-card ${bot.offline ? 'ghost' : ''}" onclick="openProfile('${esc(bot.username)}')">
       <div class="grid-bot-header">
         <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}</span>
-        <span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>
+        <span class="state-badge ${bot.offline ? 'state-offline' : 'state-' + bot.state}">${esc(stateLabel)}</span>
       </div>
       <div class="grid-bot-ship">${esc(bot.shipName || "-")}</div>
       <div class="grid-bot-bars">
@@ -3128,9 +3141,9 @@
       <div class="grid-bot-location" title="${esc(loc)}">📍 ${esc(loc)}</div>
       <div class="grid-bot-actions" onclick="event.stopPropagation()">
         ${
-          bot.state !== "running" && bot.state !== "stopping"
+          bot.offline || (bot.state !== "running" && bot.state !== "stopping")
             ? `
-          <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
+          <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">${bot.offline ? 'Early Login' : 'Start'}</button>
           <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" style="padding:2px 6px">✕</button>
         `
             : bot.state === "running"
@@ -3345,9 +3358,10 @@
           bot.state === "error"
             ? lastUsedRoutines[bot.username] || bot.routine || "unknown"
             : bot.routine;
+        const statusLabel = bot.offline ? "Reconnecting…" : (bot.state === "error" ? lastUsedRoutines[bot.username] || "miner" : bot.state);
 
         return `
-    <div class="bot-card routine-${displayRoutine} ${isExpanded ? "expanded" : ""}"
+    <div class="bot-card routine-${displayRoutine} ${bot.offline ? 'ghost' : ''} ${isExpanded ? "expanded" : ""}"
          data-bot="${esc(bot.username)}"
          onclick="handleBotCardClick(event, '${esc(bot.username)}')">
       <div class="bot-card-header">
@@ -3357,8 +3371,8 @@
           <span class="bot-card-ship" title="${esc(bot.shipName || "")}">${esc(bot.shipName || "-")}</span>
         </div>
         <div class="bot-card-status">
-          <span class="status-dot ${bot.state}"></span>
-          <span class="status-label">${bot.state === "error" ? lastUsedRoutines[bot.username] || "miner" : bot.state}</span>
+          <span class="status-dot ${bot.offline ? 'offline' : bot.state}"></span>
+          <span class="status-label">${statusLabel}</span>
         </div>
       </div>
       <div class="bot-card-bars">
@@ -3401,8 +3415,8 @@
       }
       <div class="bot-card-actions">
         ${
-          bot.state !== "running"
-            ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`
+          bot.offline || bot.state !== "running"
+            ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">${bot.offline ? 'Early Login' : 'Start'}</button>`
             : bot.routine === "civilian_transport"
               ? `<button class="sm warning" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
               : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
@@ -4168,7 +4182,7 @@
             systems += b.stats.totalSystems;
           }
           credits += b.credits || 0;
-          if (b.state === "running") active++;
+          if (b.state === "running" && !b.offline) active++;
         }
         document.getElementById("statMined").textContent = num(mined);
         document.getElementById("statCrafted").textContent = num(crafted);
@@ -8504,6 +8518,20 @@
 
         const item = items[index];
         const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+
+        // Quest items (e.g. deep core) can't be stored in faction storage and are
+        // only ever available via station storage, so there's nothing to withdraw
+        // from faction — skip it and continue with the rest of the queue.
+        if (isQuestItem(item.item_id)) {
+          logResponse(
+            `<span class="resp-cmd">${ts} > Skipping ${item.quantity}x ${item.item_id} (${index + 1}/${items.length}): quest item already in station storage</span>`,
+          );
+          loadoutWithdrawalQueue.index++;
+          mcUpdateLoadoutWithdrawalStatus();
+          setTimeout(mcProcessLoadoutWithdrawal, 200);
+          return;
+        }
+
         logResponse(
           `<span class="resp-cmd">${ts} > Withdrawing ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`,
         );
@@ -14495,13 +14523,23 @@
           let depositFailed = false;
           for (const mod of removedModules) {
             const modName = catalog.items?.[mod.catalogId]?.name || mod.catalogId;
+            const quest = isQuestItem(mod.catalogId);
+            // Quest items (e.g. deep core) can't be stored in faction storage,
+            // so deposit them to station storage instead — depositing to faction
+            // would error and abort the whole loadout change.
+            const depositTarget = quest ? "self" : "faction";
+            if (quest) {
+              logResponse(
+                `<span class="resp-cmd">Depositing removed quest module ${esc(modName)} to station storage (not faction)</span>`,
+              );
+            }
             await new Promise((resolve) => {
               sendExec(
                 bot.username,
                 "storage",
                 {
                   action: "deposit",
-                  target: "faction",
+                  target: depositTarget,
                   item_id: mod.catalogId,
                   quantity: 1,
                 },
@@ -14522,12 +14560,12 @@
             statusEl.textContent = "Deposit failed!";
             statusEl.style.color = "var(--red)";
             logResponse(
-              `<span class="resp-err">Failed to deposit some modules to faction storage. Aborting loadout change.</span>`,
+              `<span class="resp-err">Failed to deposit some modules. Aborting loadout change.</span>`,
             );
             return;
           }
           logResponse(
-            `<span class="resp-ok">Deposited removed modules to faction</span>`,
+            `<span class="resp-ok">Deposited removed modules to storage</span>`,
           );
         }
 
@@ -14540,6 +14578,17 @@
         const missingModules = [];
         for (const modId of neededModules) {
           const modName = catalog.items?.[modId]?.name || modId;
+          if (isQuestItem(modId)) {
+            // Quest items (e.g. deep core) can't be stored in faction storage and
+            // are only ever available via station storage (or cargo), so there's
+            // nothing to withdraw from faction — skip it and let the cargo/install
+            // loop pull it from station storage directly.
+            logResponse(
+              `<span class="resp-cmd">Skipping faction withdraw for quest item ${esc(modName)} (only available in station storage)</span>`,
+            );
+            await new Promise((r) => setTimeout(r, 200));
+            continue;
+          }
           await new Promise((resolve) => {
             sendExec(
               bot.username,
@@ -17655,7 +17704,7 @@ When responding:
       // ── Actions ────────────────────────────────────────────────
       function startBot(username) {
         const sel = document.getElementById(`routine-${username}`);
-        const routine = sel ? sel.value : "miner";
+        const routine = sel ? sel.value : (lastUsedRoutines[username] || "miner");
         const params = {};
         if (routine === "return_home") {
           const cb = document.getElementById(

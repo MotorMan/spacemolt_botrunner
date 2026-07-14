@@ -69,6 +69,15 @@ export interface BotStatus {
   factionFuelCapacity?: number;
   faction: string | null;
   isCloaked: boolean;
+  /**
+   * Transient flag set only for bot cards that have been rehydrated from the
+   * persisted active-bot snapshot at client startup — i.e. bots that were
+   * active last run but have not yet reconnected this session. The dashboard
+   * renders these with a "Reconnecting…" badge so the fleet list is stable
+   * across restarts instead of popping in one card at a time. Cleared as soon
+   * as a live status update arrives for the bot.
+   */
+  offline?: boolean;
 }
 
 export interface RoutineContext {

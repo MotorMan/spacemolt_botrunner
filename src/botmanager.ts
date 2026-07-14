@@ -63,6 +63,15 @@ let server: WebServer;
 let chatServer: ChatWebServer;
 let aiChatService: AiChatService | null = null;
 
+/**
+ * Early-login queue: routine keys to start the moment a not-yet-connected bot
+ * logs in. A bot rehydrated from the persisted snapshot at startup has no live
+ * `Bot`/`Account` yet, so a Start action can't run immediately — instead it's
+ * queued here and flushed by `addOwnedAccountAsBot` the instant that bot's
+ * account connects (initial connect or watchdog reconnect).
+ */
+const pendingEarlyLogin = new Map<string, string>();
+
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()].sort((a, b) => a.localeCompare(b));
@@ -234,6 +243,21 @@ function initBot(bot: Bot, account: Account): void {
   })();
 }
 
+/**
+ * Start any routine that was queued via the early-login flow (see
+ * `pendingEarlyLogin`) now that `id`'s account has connected. Skipped if the
+ * bot was intentionally stopped, so a queued routine can't override a Stop.
+ */
+function flushEarlyLogin(id: string): void {
+  const routineKey = pendingEarlyLogin.get(id);
+  if (!routineKey) return;
+  pendingEarlyLogin.delete(id);
+  const bot = bots.get(id);
+  if (!bot || !bot.isConnected() || getStoppedState(id)) return;
+  server.logSystem(`Early-login: starting queued ${routineKey} routine for ${id}.`);
+  handleStart({ type: "start", bot: id, routine: routineKey }).catch(() => {});
+}
+
 function addOwnedAccountAsBot(account: Account): void {
   const id = account.id || "";
   if (!id) return;
@@ -246,6 +270,7 @@ function addOwnedAccountAsBot(account: Account): void {
     existing.subscribeEvents();
     server.logSystem(`Reconnected owned account: ${id}`);
     initBot(existing, account);
+    flushEarlyLogin(id);
     return;
   }
 
@@ -264,6 +289,7 @@ function addOwnedAccountAsBot(account: Account): void {
   // the seeded state alone doesn't always carry. account.refresh() forces a
   // fresh canonical seed in case seeding hasn't settled by the onConnect call.
   initBot(bot, account);
+  flushEarlyLogin(id);
 }
 
 /**
@@ -979,8 +1005,25 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   const botName = action.bot;
   if (!botName) return { ok: false, error: "No bot specified" };
 
+  const routineKey = action.routine || "miner";
+  const routine = ROUTINES[routineKey];
+  if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
+
   const bot = bots.get(botName);
-  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+  if (!bot) {
+    // The bot isn't connected yet (e.g. it's a rehydrated bot from the
+    // persisted snapshot that hasn't logged in this session). If it's in the
+    // selected-bot list it WILL reconnect, so queue the routine to start the
+    // moment it logs in ("early login") instead of erroring out.
+    if (getClerkConfig().bots.includes(botName)) {
+      pendingEarlyLogin.set(botName, routineKey);
+      server.saveBotAssignment(botName, routineKey);
+      saveLastUsedRoutine(botName, routineKey);
+      server.logSystem(`Queued early-login for ${botName} with ${routineKey} — starts on login.`);
+      return { ok: true, message: `Queued ${routineKey} for ${botName} — starts automatically on login.` };
+    }
+    return { ok: false, error: `Bot not found: ${botName}` };
+  }
   if (bot.state === "running") return { ok: false, error: `${botName} is already running` };
   if (bot.state === "error") {
     bot.clearError();
@@ -988,10 +1031,6 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
 
   // Clear any stopped state when manually starting the bot
   clearStoppedState(botName);
-
-  const routineKey = action.routine || "miner";
-  const routine = ROUTINES[routineKey];
-  if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
 
   // Check insurance status using persistent log before starting routine
   // This avoids the 10sec delay of calling get_insurance_quote on every start
@@ -1169,7 +1208,24 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   if (!botName) return { ok: false, error: "No bot specified" };
 
   const bot = bots.get(botName);
-  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+  if (!bot) {
+    // Not connected yet (e.g. a rehydrated bot from the persisted snapshot
+    // that hasn't logged in this session). Just drop it from the displayed
+    // fleet, the selected-bot list, and any queued early-login so it doesn't
+    // reappear on the next restart.
+    if (getClerkConfig().bots.includes(botName)) {
+      server.clearSeededOffline(botName);
+      pendingEarlyLogin.delete(botName);
+      clearStoppedState(botName);
+      const removeIds = new Set<string>([botName]);
+      const clerkBots = getClerkConfig().bots.filter((id) => !removeIds.has(id));
+      setClerkConfig({ bots: clerkBots });
+      server.logSystem(`Removed (not yet connected) bot: ${botName}`);
+      refreshStatusTable();
+      return { ok: true, message: `Removed ${botName}` };
+    }
+    return { ok: false, error: `Bot not found: ${botName}` };
+  }
 
   // Stop the routine (aborts the running loop if any) and tear down the library
   // connection so the bot stops "playing" in the background. Without closing the
@@ -1186,6 +1242,8 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   bots.delete(botName);
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
+  server.clearSeededOffline(botName);
+  pendingEarlyLogin.delete(botName);
   clearStoppedState(botName);
 
   // Keep the selected-bot list (settings.clerk.bots) in sync so a removed bot
@@ -1856,6 +1914,8 @@ async function main(): Promise<void> {
     // Flush stats before stopping bots
     const statuses = [...bots.values()].map(b => b.status());
     server.flushBotStats(statuses);
+    // Flush the active-bots dashboard snapshot (long debounce may have pending write)
+    server.flushActiveBots();
     // Stop all running bots
     for (const [, bot] of bots) {
       if (bot.state === "running") bot.stop();

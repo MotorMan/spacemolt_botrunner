@@ -295,6 +295,17 @@ table.bot-table tbody td:nth-child(8) {
 .state-running { background: #0d2818; color: var(--green); }
 .state-stopping { background: #2d1b00; color: var(--yellow); }
 .state-error { background: #2d0000; color: var(--red); }
+.state-offline { background: #1a2330; color: var(--blue, #4a9eff); }
+/* Rehydrated (not-yet-reconnected) bot cards — last-active from prior run */
+.grid-bot-card.ghost,
+.bot-card.ghost {
+  opacity: 0.55;
+  border-style: dashed;
+}
+.grid-bot-card.ghost:hover,
+.bot-card.ghost:hover {
+  opacity: 0.8;
+}
 
 .row-actions {
   display: flex;
@@ -2817,6 +2828,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .status-dot.idle { background: var(--text-dim); }
 .status-dot.error { background: var(--red); }
 .status-dot.stopping { background: var(--yellow); }
+.status-dot.offline { background: var(--blue, #4a9eff); animation: pulse 1s infinite; }
 
 .status-label {
   font-size: 9px;

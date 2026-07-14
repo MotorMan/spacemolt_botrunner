@@ -86,6 +86,7 @@ const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
 const FLOCK_FILE = join(DATA_DIR, "flock.json");
 const LAST_USED_ROUTINE_FILE = join(DATA_DIR, "lastUsedRoutine.json");
+const ACTIVE_BOTS_FILE = join(DATA_DIR, "activeBots.json");
 
 interface MainLogs {
   activity: string[];
@@ -228,6 +229,82 @@ function getAllLastUsedRoutines(): LastUsedRoutineData {
 }
 
 export { loadLastUsedRoutines, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines };
+
+// ── Active bots snapshot (survives client restarts) ──────────
+// The dashboard's bot list is driven by `latestStatuses`, which is empty until
+// the library reconnects the selected bots. That made the fleet "pop in" one
+// card at a time after every restart (and the window resize with each). We
+// persist a snapshot of the last-known statuses to disk and rehydrate
+// `latestStatuses` from it at startup, so the last-active bots appear
+// immediately — flagged `offline` (Reconnecting…) until a live status arrives.
+// Only bots that are still in the selected-bot list (`clerk.bots`) are seeded,
+// so a bot that was removed never lingers as a ghost card.
+
+interface ActiveBotsFile {
+  bots: BotStatus[];
+}
+
+function loadActiveBots(): BotStatus[] {
+  if (!existsSync(ACTIVE_BOTS_FILE)) return [];
+  try {
+    const data = JSON.parse(readFileSync(ACTIVE_BOTS_FILE, "utf-8")) as ActiveBotsFile;
+    const list = Array.isArray(data.bots) ? data.bots : [];
+    const selected = new Set(getClerkConfig().bots);
+    // Keep only bots we still intend to reconnect, and flag them offline.
+    const seeded = list
+      .filter((b) => b && typeof b.username === "string" && selected.has(b.username))
+      .map((b) => ({ ...b, offline: true }));
+    return seeded;
+  } catch (err) {
+    console.warn(`Warning: corrupt activeBots.json, starting fresh —`, err);
+    return [];
+  }
+}
+
+let activeBotsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let activeBotsDirty = false;
+let latestActiveStatuses: BotStatus[] = [];
+
+// Snapshot is only used to rehydrate the dashboard on restart, so a long
+// debounce is fine and greatly reduces SSD wear (was 5s).
+const ACTIVE_BOTS_SAVE_DEBOUNCE_MS = 120_000;
+
+function scheduleActiveBotsSave(statuses: BotStatus[]): void {
+  // Persist a clean (non-offline) snapshot of the live fleet so the next
+  // restart rehydrates from real last-known data rather than stale ghosts.
+  latestActiveStatuses = statuses;
+  activeBotsDirty = true;
+  if (activeBotsSaveTimer) return;
+  activeBotsSaveTimer = setTimeout(() => {
+    activeBotsSaveTimer = null;
+    if (!activeBotsDirty) return;
+    activeBotsDirty = false;
+    try {
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
+      writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+    } catch (err) {
+      console.warn(`Warning: failed to save activeBots.json —`, err);
+    }
+  }, ACTIVE_BOTS_SAVE_DEBOUNCE_MS);
+}
+
+/** Write any pending activeBots snapshot to disk immediately (call on shutdown). */
+function flushActiveBotsSave(): void {
+  if (activeBotsSaveTimer) {
+    clearTimeout(activeBotsSaveTimer);
+    activeBotsSaveTimer = null;
+  }
+  if (!activeBotsDirty) return;
+  activeBotsDirty = false;
+  try {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
+    writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.warn(`Warning: failed to flush activeBots.json —`, err);
+  }
+}
 
 const STOPPED_STATE_FILE = join(DATA_DIR, "stoppedState.json");
 
@@ -387,6 +464,12 @@ export class WebServer {
   // Latest bot statuses for initial page load
   private latestStatuses: BotStatus[] = [];
 
+  // Bots rehydrated from the persisted snapshot at startup (offline /
+  // "Reconnecting…"). Kept separate so live statuses can replace them
+  // one-by-one as each bot reconnects, instead of the whole list being wiped
+  // by a `refreshStatusTable` tick while the fleet is still connecting.
+  private seededOffline = new Map<string, BotStatus>();
+
   // Persisted routine settings
   settings: RoutineSettings;
 
@@ -482,6 +565,11 @@ if (!this.settings.fuel_service) {
     this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
     this.systemLog = mainLogs.system.slice(-MAX_LOG_BUFFER);
     this.factionLog = mainLogs.faction.slice(-MAX_LOG_BUFFER);
+    // Rehydrate the last-active bot list so the dashboard shows the fleet
+    // immediately on restart instead of starting blank and popping in cards.
+    const seeded = loadActiveBots();
+    this.seededOffline = new Map(seeded.map((b) => [b.username, b]));
+    this.latestStatuses = seeded;
     this.applyInitialLogSettings();
   }
 
@@ -2276,8 +2364,37 @@ if (url.pathname === "/data/shipsForSale.json") {
   // ── Interface matching TUI ─────────────────────────────────
 
   updateBotStatus(bots: BotStatus[]): void {
-    this.latestStatuses = bots;
-    this.broadcast({ type: "status", bots });
+    // Merge live statuses with any rehydrated (offline) bots that haven't
+    // produced a live status yet, so the dashboard list stays stable across
+    // restarts instead of being wiped while the fleet is still reconnecting.
+    const liveByUser = new Map(bots.map((b) => [b.username, b]));
+    const merged: BotStatus[] = bots.slice();
+    for (const [name, offlineStatus] of [...this.seededOffline]) {
+      if (liveByUser.has(name)) {
+        // This bot has now (re)connected — drop its offline placeholder.
+        this.seededOffline.delete(name);
+        continue;
+      }
+      merged.push(offlineStatus);
+    }
+    this.latestStatuses = merged;
+    // Persist a snapshot (live only) so a future restart rehydrates from real
+    // last-known data rather than stale ghosts.
+    scheduleActiveBotsSave(bots);
+    this.broadcast({ type: "status", bots: merged });
+  }
+
+  /** Flush pending activeBots snapshot to disk immediately (call on shutdown). */
+  flushActiveBots(): void {
+    flushActiveBotsSave();
+  }
+
+  /** Drop a rehydrated offline placeholder (e.g. when its bot is removed). */
+  clearSeededOffline(username: string): void {
+    if (this.seededOffline.delete(username)) {
+      this.latestStatuses = this.latestStatuses.filter((b) => b.username !== username);
+      this.broadcast({ type: "status", bots: this.latestStatuses });
+    }
   }
 
   logActivity(line: string): void {

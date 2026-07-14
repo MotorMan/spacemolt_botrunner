@@ -1692,6 +1692,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+      ignoreBlacklistWhenCloaked: settings.autoCloak,
     };
     let extraRevenue = 0;
     let recoveredSessionHandled = false; // Track if we've handled a recovered session
@@ -1965,6 +1967,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               fuelThresholdPct: settings.refuelThreshold,
               hullThresholdPct: settings.repairThreshold,
               autoCloak: settings.autoCloak,
+              ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+              ignoreBlacklistWhenCloaked: settings.autoCloak,
             });
             if (arrived) {
               // Find station at home

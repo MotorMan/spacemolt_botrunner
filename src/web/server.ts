@@ -2405,6 +2405,13 @@ if (url.pathname === "/data/shipsForSale.json") {
           let isExec = false;
           try {
             const raw = JSON.parse(typeof msg === "string" ? msg : msg.toString());
+            // Heartbeat: the client pings to prove the socket is alive (and to
+            // keep it from being reaped); reply with a pong so the client's
+            // data watchdog sees activity.
+            if (raw && raw.type === "ping") {
+              try { ws.send(JSON.stringify({ type: "pong" })); } catch {}
+              return;
+            }
             seq = raw._seq;
             isExec = raw.type === "exec";
             const data = raw as WebAction;

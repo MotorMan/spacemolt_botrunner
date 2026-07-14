@@ -30,6 +30,9 @@ echo.
     echo.
     
     cd /d "%SCRIPT_DIR%"
+    echo [%date% %time%] Running bun install...
+    timeout /t 120 bun install || echo Warning: bun install failed or timed out
+    echo.
     bun run src\botmanager.ts
     set EXIT_CODE=%ERRORLEVEL%
     

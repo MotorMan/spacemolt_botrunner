@@ -1,6 +1,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { perf } from "../perf.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
@@ -745,6 +746,7 @@ export function findTradeOpportunities(
   marketInsights: Array<Record<string, unknown>> = [],
   debugLog?: (msg: string) => void,
 ): TradeRoute[] {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.findTradeOpportunities") : null;
   // Extract oversupply items to filter out bad sell destinations
   const oversupplyItems = new Set<string>();
   for (const insight of marketInsights) {
@@ -853,11 +855,13 @@ export function findTradeOpportunities(
 
   // Sort by total profit descending
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  stop?.end();
   return routes;
 }
 
 /** Find the cheapest known market sell price for an item (replacement/acquisition cost). */
 export function getItemMarketCost(itemId: string): number {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.getItemMarketCost") : null;
   let cheapest = Infinity;
   const systems = mapStore.getAllSystems();
   for (const sys of Object.values(systems)) {
@@ -871,6 +875,7 @@ export function getItemMarketCost(itemId: string): number {
       }
     }
   }
+  stop?.end();
   return cheapest === Infinity ? 0 : cheapest;
 }
 
@@ -886,6 +891,7 @@ export function processMarketInsights(
   cargoCapacity: number = 999,
   debugLog?: (msg: string) => void,
 ): TradeRoute[] {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.processMarketInsights") : null;
   const routes: TradeRoute[] = [];
 
   debugLog?.(`processMarketInsights: ${insights.length} insights, priority threshold 100000`);
@@ -1152,6 +1158,7 @@ export function processMarketInsights(
 
   // Sort by total profit descending
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  stop?.end();
   return routes;
 }
 

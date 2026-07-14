@@ -4,6 +4,7 @@ import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -1810,7 +1811,7 @@ const locations = this.findOreLocations(oreId, blacklist);
   findRoute(fromSystemId: string, toSystemId: string, blacklist?: string[]): string[] | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const useNoPirate = blacklistArr.length > 0;
-    return this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate);
+    return perf.timeSync("mapStore.findRoute", () => this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate));
   }
 
   /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes. */
@@ -2089,6 +2090,7 @@ const locations = this.findOreLocations(oreId, blacklist);
 
   /** Find the best buy price (highest buyer) for an item across all known markets (excluding pirate systems). */
   findBestBuyPrice(itemId: string): { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.findBestBuyPrice") : null;
     let best: { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null = null;
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2104,11 +2106,13 @@ const locations = this.findOreLocations(oreId, blacklist);
       }
     }
 
+    stop?.end();
     return best;
   }
 
   /** Find all items with buy orders across all known stations (excluding pirate systems). */
   getAllBuyDemand(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.getAllBuyDemand") : null;
     const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2133,10 +2137,12 @@ const locations = this.findOreLocations(oreId, blacklist);
       }
     }
 
+    stop?.end();
     return results;
   }
 
   getAllSellSupply(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.getAllSellSupply") : null;
     const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2161,6 +2167,7 @@ const locations = this.findOreLocations(oreId, blacklist);
       }
     }
 
+    stop?.end();
     return results;
   }
 
@@ -2172,6 +2179,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     destSystem: string; destPoi: string; destPoiName: string; sellAt: number; sellQty: number;
     spread: number;
   }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.findPriceSpreads") : null;
     // Collect all sell listings (where we can buy from NPC market)
     const sellListings: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
     // Collect all buy listings (where we can sell to NPC market / fill buy orders)
@@ -2229,6 +2237,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     }
 
     results.sort((a, b) => b.spread - a.spread);
+    stop?.end();
     return results;
   }
 

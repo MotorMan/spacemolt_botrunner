@@ -46,6 +46,7 @@ import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
 import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
+import { perf, snapshotAndReset as perfSnapshotAndReset, setActivePlayers as perfSetActivePlayers } from "./perf.js";
 import { ensureInsured } from "./routines/common.js";
 import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
 import { logSkills, refreshSkillNames } from "./skillTracker.js";
@@ -554,6 +555,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleListClerkPlayers();
     case "addClerkBots":
       return handleAddClerkBots(action);
+    case "setPerformanceMonitoring":
+      return handleSetPerformanceMonitoring(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -664,6 +667,14 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   }
   
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };
+}
+
+/** Live toggle for CPU performance monitoring (no full settings save round-trip). */
+async function handleSetPerformanceMonitoring(action: WebAction): Promise<WebActionResult> {
+  const enabled = !!(action as any).enabled;
+  perf.setEnabled(enabled);
+  server.logSystem(`Performance monitoring ${enabled ? "enabled" : "disabled"}`);
+  return { ok: true, message: `performance monitoring ${enabled ? "enabled" : "disabled"}` };
 }
 
 async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {
@@ -1736,6 +1747,50 @@ async function main(): Promise<void> {
         console.error('Error sampling send metrics:', err);
       }
     }, 10000));
+  }
+
+  // CPU/perf metrics sampler (read-only; no throttling). Mirrors the send-metrics
+  // sampler: every 10s tag the window with the current active-player count, log a
+  // terse summary, and append the row to data/perf_metrics.jsonl so a fleet
+  // operator can find which functions/routines burn the most CPU. Disabled by
+  // default — only runs when performance monitoring is turned on.
+  {
+    const perfMetricsPath = join(BASE_DIR, "data", "perf_metrics.jsonl");
+    intervals.push(setInterval(() => {
+      try {
+        if (!perf.isEnabled()) return;
+        const activePlayers = [...bots.values()].filter(
+          (b) => b.state === "running" && b.isConnected(),
+        ).length;
+        perfSetActivePlayers(activePlayers);
+        const snap = perfSnapshotAndReset();
+        if (!snap) return;
+        const topHot = snap.hotFunctions.slice(0, 5)
+          .map((h) => `${h.name} ${h.wallMs}ms/${h.calls}x`)
+          .join(", ");
+        const topRoutines = [...snap.routines]
+          .sort((a, b) => b.cpuMs - a.cpuMs)
+          .slice(0, 5)
+          .map((r) => `${r.bot}/${r.routine} ${r.cpuMs}ms/${r.ticks}t`)
+          .join(", ");
+        server.logSystem(
+          `Perf: ${snap.activePlayers} players, EL p95 ${snap.eventLoop.p95Ms}ms / max ${snap.eventLoop.maxMs}ms | ` +
+          `hot: ${topHot || "none"} | routines: ${topRoutines || "none"}`,
+        );
+        try {
+          mkdirSync(join(BASE_DIR, "data"), { recursive: true });
+          appendFileSync(perfMetricsPath, JSON.stringify(snap) + "\n");
+        } catch { /* metrics file is best-effort; never break the runner */ }
+      } catch (err) {
+        console.error('Error sampling perf metrics:', err);
+      }
+    }, 10000));
+  }
+
+  // Start performance monitoring if it was persisted as enabled in General settings.
+  if ((settings.general as Record<string, unknown>)?.performanceMonitoring === true) {
+    perf.setEnabled(true);
+    server.logSystem("Performance monitoring restored from settings (enabled)");
   }
 
   // Periodic live refresh (hit API for bots that are running routines only)

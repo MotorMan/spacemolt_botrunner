@@ -4,6 +4,7 @@ import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch, extractLibResult 
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLogForBot } from "./debug.js";
 import { measureSend } from "./sendMetrics.js";
+import { perf } from "./perf.js";
 import { mapStore } from "./mapstore.js";
 import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
@@ -1781,7 +1782,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         sell_orders: it.sell_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
         buy_orders: it.buy_orders.map((o) => ({ price: o.price_each, quantity: o.quantity, source: o.source })),
       }));
-      mapStore.updateMarket(this.system, this.poi, { items: normalized });
+      perf.timeSync("mapStore.updateMarket", () => mapStore.updateMarket(this.system, this.poi, { items: normalized }));
     } catch { /* ignore dashboard mirror errors */ }
   }
 
@@ -1852,7 +1853,18 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     const generator = routine(ctx);
     try {
       while (true) {
-        const { value: stateName, done } = await generator.next();
+        let stateName!: string | void;
+        let done!: boolean | undefined;
+        if (perf.isEnabled()) {
+          const cpuStart = process.cpuUsage();
+          const wallStart = performance.now();
+          ({ value: stateName, done } = await generator.next());
+          const wallMs = performance.now() - wallStart;
+          const cpuDelta = process.cpuUsage(cpuStart);
+          perf.markRoutineTick(this.username, routineName, (cpuDelta.user + cpuDelta.system) / 1000, wallMs);
+        } else {
+          ({ value: stateName, done } = await generator.next());
+        }
         if (done) break;
         if ((this._state as BotState) === "stopping") {
           this.log("system", `Stopped during state: ${stateName}`);

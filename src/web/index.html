@@ -12212,6 +12212,14 @@
         <input type="checkbox" id="set-general-disableActivityLog" ${general.disableActivityLog ? "checked" : ""} />
       </div>
 
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Performance Monitoring</div>
+          <div class="setting-hint">Record per-function CPU/wall time and event-loop lag (default OFF, zero overhead when disabled). Samples every 10s to data/perf_metrics.jsonl and the System Messages log. Use to find CPU hotspots before optimizing. Leave OFF in production.</div>
+        </div>
+        <input type="checkbox" id="set-general-performanceMonitoring" ${general.performanceMonitoring ? "checked" : ""} />
+      </div>
+
 <div class="setting-row">
         <div>
           <div class="setting-label">Clear Session on Restart</div>
@@ -12352,6 +12360,9 @@
           ).checked,
           disableActivityLog: document.getElementById(
             "set-general-disableActivityLog",
+          ).checked,
+          performanceMonitoring: document.getElementById(
+            "set-general-performanceMonitoring",
           ).checked,
           clearSessionOnRestart: document.getElementById(
             "set-general-clearSessionOnRestart",

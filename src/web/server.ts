@@ -14,6 +14,7 @@ import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
+import { setEnabled as setPerfEnabled } from "../perf.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -32,7 +33,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring";
   bot?: string;
   routine?: string;
   username?: string;
@@ -44,6 +45,8 @@ export interface WebAction {
   settings?: Record<string, unknown>;
   command?: string;
   params?: Record<string, unknown>;
+  /** Toggled value for the `setPerformanceMonitoring` action (live, no full save). */
+  enabled?: boolean;
   /** Clerk API key supplied from Settings → General (replaces env SPACEMOLT_CLERK_API_KEY). */
   clerkApiKey?: string;
   /** Optional second Clerk API key, for adding bots owned by a different Clerk account. */
@@ -619,6 +622,10 @@ if (!this.settings.fuel_service) {
       }
       if (s.disableActivityLog !== undefined) {
         setActivityLog(!s.disableActivityLog);
+      }
+      // Performance monitoring is default-OFF; only enable when explicitly true.
+      if (s.performanceMonitoring !== undefined) {
+        setPerfEnabled(!!s.performanceMonitoring);
       }
     }
   }

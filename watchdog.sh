@@ -33,10 +33,10 @@ while true; do
     set +e
     cd "$SCRIPT_DIR"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running bun install..."
-    timeout 120 bun install || echo "Warning: bun install failed or timed out"
+    bun install || echo "Warning: bun install failed"
     echo ""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running git pull..."
-    timeout 30 git pull || echo "Warning: git pull failed, timed out, or not a git repository"
+    git pull || echo "Warning: git pull failed or not a git repository"
     echo ""
     bun run src/botmanager.ts
     EXIT_CODE=$?

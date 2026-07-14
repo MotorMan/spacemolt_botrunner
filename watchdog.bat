@@ -15,6 +15,7 @@ echo.
 echo Configuration:
 echo   - Restart delay: %RESTART_DELAY% seconds
 echo   - Working directory: %SCRIPT_DIR%
+echo   - Git pull on start: enabled
 echo.
 echo Exit codes:
 echo   - 0: Normal shutdown (no restart)
@@ -32,6 +33,9 @@ echo.
     cd /d "%SCRIPT_DIR%"
     echo [%date% %time%] Running bun install...
     timeout /t 120 bun install || echo Warning: bun install failed or timed out
+    echo.
+    echo [%date% %time%] Running git pull...
+    timeout /t 30 git pull || echo Warning: git pull failed, timed out, or not a git repository
     echo.
     bun run src\botmanager.ts
     set EXIT_CODE=%ERRORLEVEL%

@@ -1,3 +1,12 @@
+import { join } from "path";
+import {
+  mergeIntoFile,
+  seedIntoFile,
+  readSyncedFile,
+  peerRequest,
+  peerRequestText,
+  type FileEntry,
+} from "./client_sync_files.js";
 import type {
   RegisteredClient,
   PoiPayload,
@@ -85,7 +94,7 @@ export class ClientSyncMaster {
     return { ok: true, version: this.version, clientId, connectedClients: clients };
   }
 
-  public register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
+  public register(payload: { label: string; apiKey: string; password?: string; url?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
     if (this.mode !== "master") {
       return Promise.resolve({ clientId: "", ok: false, error: "Master not in master mode" });
     }
@@ -104,8 +113,65 @@ export class ClientSyncMaster {
       password: payload.password,
       connectedAt: now,
       lastSeen: now,
+      selfUrl: payload.url || undefined,
     });
     return Promise.resolve({ clientId: id, ok: true });
+  }
+
+  /**
+   * Pull a slave's synced files into this master's combined repository.
+   * Missing files are seeded; existing files are deep-merged by key. Returns a
+   * count of how many files were touched.
+   */
+  public async pullFromSlave(clientId: string): Promise<number> {
+    const client = this.clients.get(clientId);
+    if (!client || !client.selfUrl) return 0;
+    const dataDir = join(process.cwd(), "data");
+    let listed: { files: FileEntry[] };
+    try {
+      listed = await peerRequest(client.selfUrl, "/api/client-sync/local-files", this.apiKey, this.password || "");
+    } catch {
+      return 0;
+    }
+    let touched = 0;
+    for (const f of listed.files) {
+      const content = readSyncedFile(dataDir, f.path);
+      // Fetch the slave's raw file body regardless; seed if missing, merge if present.
+      const remote = await peerRequestText(client.selfUrl, `/api/client-sync/local-file?path=${encodeURIComponent(f.path)}`, this.apiKey, this.password || "");
+      if (typeof remote !== "string" || !remote) continue;
+      const hash = content === null
+        ? seedIntoFile(dataDir, f.path, remote)
+        : mergeIntoFile(dataDir, f.path, remote);
+      if (hash) touched++;
+    }
+    return touched;
+  }
+
+  /** Pull every registered slave that advertised a reachable URL. */
+  public async pullAllSlaves(): Promise<number> {
+    let total = 0;
+    for (const id of this.clients.keys()) {
+      total += await this.pullFromSlave(id);
+    }
+    return total;
+  }
+
+  private fileSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+  /** Periodically re-poll slaves so files changed without a push still converge. */
+  public startFileSync(intervalSec: number): void {
+    if (this.fileSyncTimer) return;
+    const ms = Math.max(5000, intervalSec * 1000);
+    this.fileSyncTimer = setInterval(() => {
+      this.pullAllSlaves().catch(() => {});
+    }, ms);
+  }
+
+  public stopFileSync(): void {
+    if (this.fileSyncTimer) {
+      clearInterval(this.fileSyncTimer);
+      this.fileSyncTimer = null;
+    }
   }
 
   public disconnect(clientId: string): boolean {

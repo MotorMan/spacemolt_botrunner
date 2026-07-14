@@ -37,8 +37,8 @@ import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
-import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, removeConnectedAccount, reconnectConnectedAccount } from "./libClient.js";
-import type { Account } from "@spacemolt/lib";
+import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, getConnectedAccount, removeConnectedAccount } from "./libClient.js";
+import { CLOSE_CODE, type Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
@@ -72,6 +72,22 @@ let aiChatService: AiChatService | null = null;
  * account connects (initial connect or watchdog reconnect).
  */
 const pendingEarlyLogin = new Map<string, string>();
+
+/**
+ * Bots whose connection was closed by the server with a *terminal* close code
+ * (`session_replaced` 4001 / `auth_timeout` 4002). These mean the player is
+ * already connected somewhere ELSE (another botrunner instance, or you logged in
+ * as that player on the website) — the server will keep killing any new session
+ * we open for it. The @spacemolt/lib client correctly refuses to reconnect on
+ * these codes, but our reconnect watchdog must also honor that: blindly
+ * `connectOwned`-ing a terminal-closed bot just opens a socket the server
+ * immediately replaces, producing an endless "cannot send on a closed socket"
+ * fight that survives restarts (the bot is persisted in `clerk.bots`) and
+ * remove/re-add. While a bot is in this set we do NOT auto-reconnect it. The set
+ * is cleared when the bot genuinely reconnects, when the user explicitly Starts
+ * it, or when it's re-added.
+ */
+const terminalClosedBots = new Set<string>();
 
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
@@ -263,6 +279,11 @@ function addOwnedAccountAsBot(account: Account): void {
   const id = account.id || "";
   if (!id) return;
 
+  // This account successfully connected/reconnected, so clear any terminal-close
+  // guard we may have set (a previous session_replaced/auth_timeout). If it gets
+  // terminal-closed again, the disconnect handler will re-add it.
+  terminalClosedBots.delete(id);
+
   const existing = bots.get(id);
   if (existing) {
     existing.account = account;
@@ -419,10 +440,29 @@ function registerClientDisconnectHandlers(): void {
     if (registeredClients.has(client)) continue;
     registeredClients.add(client);
     client.onAccountDisconnected((id, err) => {
-      const detail = (err && (err as { code?: number; message?: string }).code)
-        ?? (err && (err as { message?: string }).message)
-        ?? "closed";
-      server.logSystem(`Connection to "${id}" lost for good (${detail}). Will re-request a new socket.`);
+      const code = (err && (err as { code?: number }).code) ?? undefined;
+      const detail = code ?? (err && (err as { message?: string }).message) ?? "closed";
+
+      // Terminal close codes mean the player is connected ELSEWHERE (another
+      // botrunner / the website): the server will keep replacing any new session
+      // we open, so the library refuses to reconnect — and so must we. Stop the
+      // watchdog from fighting it forever (and spamming "cannot send on a closed
+      // socket"). The user has to disconnect the other session first.
+      if (code === CLOSE_CODE.SESSION_REPLACED || code === CLOSE_CODE.AUTH_TIMEOUT) {
+        terminalClosedBots.add(id);
+        server.logSystem(
+          `Connection to "${id}" closed permanently (${detail}). The player is connected elsewhere ` +
+          `— another botrunner instance or you are logged in as ${id} on the website. Stopping auto-reconnect ` +
+          `for ${id}. To use it here, disconnect it there first, then click Start (or remove + re-add).`,
+        );
+        return;
+      }
+
+      // Any other close is non-terminal: the library already auto-reconnects the
+      // SAME account in place (client-managed `reconnectOnce`), so the watchdog
+      // must NOT also open a competing connection — that would just fight the
+      // library's own reconnect and can wedge the socket. We only log.
+      server.logSystem(`Connection to "${id}" dropped (${detail}). @spacemolt/lib will auto-reconnect it in place.`);
     });
   }
 }
@@ -431,17 +471,25 @@ function registerClientDisconnectHandlers(): void {
  * Reconnect any selected bot whose library socket is dead (closed and not
  * coming back).
  *
- * The @spacemolt/lib client auto-reconnects in place for a while, but gives up
- * after its retries are exhausted (e.g. a long server outage) and then deletes
- * the account — leaving the `Bot` wired to a permanently-dead socket. This
- * re-requests a fresh socket by reconnecting the bot's account through the
- * library; `addOwnedAccountAsBot` swaps the new `Account` into the existing
- * `Bot`, so any routine holding it keeps working.
+ * This ONLY opens a fresh socket for bots that are *genuinely missing* from the
+ * library's `connected` map and were NOT terminal-closed. The @spacemolt/lib
+ * client already auto-reconnects in place for ordinary drops (client-managed
+ * `reconnectOnce`), so if a bot is still cached there we leave it alone — the
+ * library owns its reconnect and we must not open a competing second connection
+ * (that would just fight the library's own reconnect and can wedge the socket).
  *
- * `ids`, when given, limits the reconnect to those bots (used by the
- * `onAccountDisconnected` listener); when omitted, every selected bot with a
- * dead socket is reconnected in a single batched call (used by the watchdog).
- * Intentionally-stopped bots are skipped — their socket should stay down.
+ * We also do NOT retry bots in `terminalClosedBots`: those were closed by the
+ * server with `session_replaced` (4001) / `auth_timeout` (4002), meaning the
+ * player is connected ELSEWHERE. The server will keep killing any new session
+ * we open, so retrying only produces an endless "cannot send on a closed socket"
+ * loop. The user must disconnect the other session first (then click Start, or
+ * remove + re-add). This is what makes a terminal close survive restarts and
+ * remove/re-add: the bot is persisted in `clerk.bots` and the watchdog would
+ * otherwise re-fight it forever.
+ *
+ * `ids`, when given, limits the reconnect to those bots; when omitted, every
+ * selected bot that is genuinely missing + not terminal is connected in one
+ * batched call (used by the watchdog). Intentionally-stopped bots are skipped.
  */
 async function reconnectDeadBots(ids?: string[]): Promise<void> {
   const selected = getClerkConfig().bots;
@@ -459,52 +507,27 @@ async function reconnectDeadBots(ids?: string[]): Promise<void> {
 
   const targets = (ids ?? selected).filter((id) => {
     if (getStoppedState(id)) return false;
-    const bot = bots.get(id);
-    if (!bot) return false;
-    return !bot.isConnected();
+    if (!bots.has(id)) return false;
+    // Library is already managing this account (cached, possibly mid-reconnect).
+    // Let it do its in-place reconnect; do NOT open a competing connection.
+    if (getConnectedAccount(id)) return false;
+    // Terminal close (connected elsewhere) — do not fight it.
+    if (terminalClosedBots.has(id)) return false;
+    return true;
   });
   if (!targets.length) return;
 
-  server.logSystem(`Reconnecting ${targets.length} bot(s) with a dead socket: ${targets.join(", ")}`);
+  server.logSystem(`Reconnecting ${targets.length} bot(s) with a missing socket: ${targets.join(", ")}`);
   try {
-    let reconnected = 0;
-    const stillMissing: string[] = [];
-    // Revive any *cached* (but dead) Account in place by minting a fresh socket
-    // via `reconnectConnectedAccount` (which calls `Account.reconnectOnce()`).
-    // This is the key fix: `connect()`/`connectOwned()` return the cached
-    // Account for an id REGARDLESS of socket state, so reusing it would re-weld
-    // the same permanently-closed socket and every command would fail with
-    // "cannot send on a closed socket" forever. `reconnectConnectedAccount`
-    // returns null when the id isn't currently cached, so those fall through to
-    // the fresh connectOwned below.
-    for (const id of targets) {
-      try {
-        const revived = await reconnectConnectedAccount(id);
-        if (revived) {
-          reconnected++;
-          continue;
-        }
-      } catch {
-        // reconnectOnce failed (e.g. transient) — fall back to a brand-new
-        // Account built by connectOwned below.
-      }
-      stillMissing.push(id);
-    }
-    // Whatever isn't currently cached (or couldn't be revived in place) gets a
-    // fresh Account through connectOwned.
-    if (stillMissing.length) {
-      const accounts = await connectOwnedAccounts(
-        (player) => stillMissing.includes(player.username) || stillMissing.includes(player.id),
-        (account) => addOwnedAccountAsBot(account),
-      );
-      reconnected += accounts.length;
-    }
+    const accounts = await connectOwnedAccounts(
+      (player) => targets.includes(player.username) || targets.includes(player.id),
+      (account) => addOwnedAccountAsBot(account),
+    );
     refreshStatusTable();
-    server.logSystem(`Reconnected ${reconnected} bot(s) via @spacemolt/lib`);
+    server.logSystem(`Reconnected ${accounts.length} bot(s) via @spacemolt/lib`);
   } catch (err) {
-    // Transient failure — the next watchdog pass (or the next
-    // onAccountDisconnected) will try again.
-    server.logSystem(`Reconnect of dead bot(s) failed (will retry): ${err}`);
+    // Transient failure — the next watchdog pass will try again.
+    server.logSystem(`Reconnect of missing bot(s) failed (will retry): ${err}`);
   }
 }
 
@@ -674,6 +697,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
       allowRemoteBotsInDropdowns: ((s.allowRemoteBotsInDropdowns as boolean) ?? true),
       remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
       pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
+      selfUrl: ((s.selfUrl as string) || ""),
     };
     const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
     if (newSettings.enabled && newSettings.mode === "slave" && newSettings.masterUrl) {
@@ -890,6 +914,9 @@ async function handleAddClerkBots(action: WebAction): Promise<WebActionResult> {
     merged = [...mergedSet];
   } catch { /* best-effort */ }
   setClerkConfig({ bots: merged });
+  // Re-adding is an explicit attempt to bring these bots online, so clear any
+  // terminal-close guard and let them try once.
+  for (const id of idsAsUsernames) terminalClosedBots.delete(id);
 
   try {
     registerClientDisconnectHandlers();
@@ -963,6 +990,19 @@ function fireRestart(botName: string): void {
   if (!b) return;
   if (getStoppedState(botName)) return;
   if (b.state !== "error") return;
+  // Terminal-close guard: if this bot was closed by the server because it's
+  // connected elsewhere (session_replaced/auth_timeout), do NOT auto-restart it.
+  // An auto-restart would just open a socket the server immediately kills,
+  // re-triggering the endless "cannot send on a closed socket" loop. The user
+  // must disconnect the other session first, then click Start (which clears the
+  // guard). Note: handleStart clears the guard, so we must bail BEFORE calling it.
+  if (terminalClosedBots.has(botName)) {
+    server.logSystem(
+      `Bot ${botName} was terminal-closed (connected elsewhere) — skipping auto-restart. ` +
+      `Disconnect ${botName} on the other session, then click Start to retry.`,
+    );
+    return;
+  }
   const lastRoutine = getLastUsedRoutine(botName);
   const routineKey = (lastRoutine && ROUTINES[lastRoutine]) ? lastRoutine : "miner";
   if (!lastRoutine) {
@@ -980,6 +1020,18 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
   const stoppedState = getStoppedState(botName);
   if (stoppedState) {
     server.logSystem(`Bot ${botName} was stopped intentionally (${stoppedState}), skipping auto-restart`);
+    return;
+  }
+
+  // Terminal-close guard: if this bot was closed by the server because it's
+  // connected elsewhere (session_replaced/auth_timeout), do NOT keep
+  // auto-restarting it — that just re-opens a socket the server immediately
+  // kills, reproducing the endless "cannot send on a closed socket" loop. The
+  // user must disconnect the other session first, then click Start (which
+  // clears the guard). Any pending retry timer is cancelled.
+  if (terminalClosedBots.has(botName)) {
+    const s = restartStates.get(botName);
+    if (s?.timer) { clearTimeout(s.timer); s.timer = null; }
     return;
   }
 
@@ -1070,6 +1122,9 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
 
   // Clear any stopped state when manually starting the bot
   clearStoppedState(botName);
+  // A manual Start is an explicit attempt to bring the bot online, so clear any
+  // terminal-close guard (session_replaced/auth_timeout) and let this one try.
+  terminalClosedBots.delete(botName);
 
   // Check insurance status using persistent log before starting routine
   // This avoids the 10sec delay of calling get_insurance_quote on every start
@@ -1273,6 +1328,8 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
     await new Promise((r) => setTimeout(r, 3000));
   }
   bot.unsubscribeEvents();
+  // Clear any terminal-close guard so a future re-add starts clean.
+  terminalClosedBots.delete(botName);
 
   // IMPORTANT: evict the Account from the library's in-memory `connected` map
   // (close + drop cached instance), NOT just `account.close()`. `close()` only
@@ -1603,6 +1660,7 @@ async function main(): Promise<void> {
       allowRemoteBotsInDropdowns: (csSettings.allowRemoteBotsInDropdowns as boolean) ?? true,
       remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
       pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,
+      selfUrl: (csSettings.selfUrl as string) || "",
     };
     if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
       const syncSlave = new ClientSyncSlave(clientSyncSettings);

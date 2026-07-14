@@ -12,6 +12,7 @@ import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilit
 import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
+import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
@@ -556,6 +557,7 @@ if (!this.settings.fuel_service) {
         allowRemoteBotsInDropdowns: true,
         remoteBotNameStyle: "prefix",
         pushLocalDiscoveries: true,
+        selfUrl: "",
       };
       saveSettings(this.settings);
     }
@@ -1390,8 +1392,12 @@ if (url.pathname === "/data/shipsForSale.json") {
             const csSettings = this.settings.clientSync || {};
             this.syncMaster = new ClientSyncMaster(csSettings);
             this.syncMaster.saveSettings();
+            if (this.syncMaster.getMode() === "master") {
+              this.syncMaster.startFileSync((csSettings.pollIntervalSec as number) || 15);
+            }
           }
           const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+          const syncCfg = (this.settings.clientSync || {}) as Record<string, unknown>;
 
           if (url.pathname === "/api/client-sync/hello" && req.method === "GET") {
             const clientId = req.headers.get("x-client-id") || "unknown";
@@ -1468,11 +1474,21 @@ if (url.pathname === "/data/shipsForSale.json") {
             }
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
-            const body = await req.json() as { apiKey: string; label: string; password?: string };
+            const body = await req.json() as { apiKey: string; label: string; password?: string; url?: string };
             if (!this.syncMaster) {
               return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: cors });
             }
             const result = await this.syncMaster.register(body);
+            if (result.ok && this.syncMaster.getMode() === "master") {
+              // Start (idempotent) the periodic re-poll of slaves, then pull
+              // this freshly-connected slave immediately so its files are
+              // seeded into the combined repository right away.
+              this.syncMaster.startFileSync((syncCfg.pollIntervalSec as number) || 15);
+              const cid = result.clientId;
+              if (body.url) {
+                this.syncMaster.pullFromSlave(cid).catch(() => {});
+              }
+            }
             return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/test-register" && req.method === "POST") {
@@ -1542,6 +1558,57 @@ if (url.pathname === "/data/shipsForSale.json") {
             const ok = this.syncMaster?.disconnect(id);
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+
+          // ── File sync (shared by master + slave; the master's local data dir
+          //    IS the combined repository) ──────────────────────────────────
+          const cfgApiKey = (syncCfg.apiKey as string) || "";
+          const cfgPassword = (syncCfg.password as string) || "";
+          const apiKeyMatch = !cfgApiKey
+            || req.headers.get("x-api-key") === cfgApiKey
+            || (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") === cfgApiKey;
+          const passwordMatch = !cfgPassword || req.headers.get("x-password") === cfgPassword;
+          const fileAuthOk = apiKeyMatch && passwordMatch;
+
+          if (url.pathname === "/api/client-sync/local-files" && req.method === "GET") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const files: FileEntry[] = listSyncedFiles(dataDir);
+            return Response.json({ files }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/local-file" && req.method === "GET") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const relPath = url.searchParams.get("path") || "";
+            if (!isPathSynced(relPath)) return new Response("not allowed", { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const content = readSyncedFile(dataDir, relPath);
+            if (content === null) return new Response("not found", { status: 404, headers: cors });
+            return new Response(content, { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+          }
+          if (url.pathname === "/api/client-sync/file-update" && req.method === "POST") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const body = await req.json() as { path?: string; content?: string };
+            if (!body.path || body.content === undefined) {
+              return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
+            }
+            if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const hash = mergeIntoFile(dataDir, body.path, body.content);
+            if (hash === null) return Response.json({ ok: false, error: "merge failed" }, { status: 500, headers: cors });
+            return Response.json({ ok: true, hash }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/file-seed" && req.method === "POST") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const body = await req.json() as { path?: string; content?: string };
+            if (!body.path || body.content === undefined) {
+              return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
+            }
+            if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const hash = seedIntoFile(dataDir, body.path, body.content);
+            if (hash === null) return Response.json({ ok: false, error: "seed failed" }, { status: 500, headers: cors });
+            return Response.json({ ok: true, hash, seeded: true }, { headers: cors });
+          }
+
           return new Response("not found", { status: 404, headers: cors });
         }
 

@@ -19,6 +19,7 @@ export interface SyncSettings {
   allowRemoteBotsInDropdowns: boolean;
   remoteBotNameStyle: "prefix" | "suffix";
   pushLocalDiscoveries: boolean;
+  selfUrl?: string;
 }
 
 export interface RegisteredClient {
@@ -29,6 +30,7 @@ export interface RegisteredClient {
   connectedAt: number;
   lastSeen: number;
   ip?: string;
+  selfUrl?: string;
 }
 
 export interface PoiPayload {

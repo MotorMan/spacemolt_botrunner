@@ -1,9 +1,17 @@
+import { join } from "path";
 import { type SyncSettings, type CoordinationPayload } from "./client_sync_types.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 import { onCoordinationUpdate } from "./client_sync_hooks.js";
 import { wildlifeStore } from "./wildlivestore.js";
+import {
+  listSyncedFiles,
+  readSyncedFile,
+  mergeIntoFile,
+  seedIntoFile,
+  type FileEntry,
+} from "./client_sync_files.js";
 
 export class ClientSyncSlave {
   private settings: SyncSettings;
@@ -14,6 +22,10 @@ export class ClientSyncSlave {
   private lastError: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private lastConnectAttempt = 0;
+  /** Hash of the last content we pushed to master for each file (loop guard). */
+  private lastPushed = new Map<string, string>();
+  /** Hash of the last content we pulled from master for each file (loop guard). */
+  private lastPulled = new Map<string, string>();
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -83,6 +95,30 @@ export class ClientSyncSlave {
     }
   }
 
+  /** Like `request` but returns the raw response text (for file bodies). */
+  private async requestText(path: string): Promise<string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    };
+    if (this.settings.apiKey) headers["X-API-Key"] = this.settings.apiKey;
+    if (this.settings.password) headers["X-Password"] = this.settings.password;
+    if (this.clientId) headers["X-Client-Id"] = this.clientId;
+
+    const url = `${this.settings.masterUrl}${path}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+      return await res.text();
+    } catch (err) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  }
+
   private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<void> {
     await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload);
   }
@@ -93,7 +129,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     this.lastConnectAttempt = Date.now();
     
     try {
-      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password, url: this.settings.selfUrl || "" }) });
       let payload: { ok: boolean; clientId?: string; error?: string };
       try { 
         payload = await res.json(); 
@@ -183,6 +219,63 @@ private async pushStatuses(): Promise<void> {
     await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
   }
 
+  /**
+   * Two-way file sync against the master.
+   *
+   * PULL: fetch the master's combined repository listing and merge any file
+   * that differs from what we last pulled. Missing files (incl. at first
+   * connect) are seeded locally so this client gains the master's existing
+   * data. After merging a master file we record its hash as both "pulled" and
+   * "pushed" so we never echo it straight back.
+   *
+   * PUSH: diff our local synced files against the last content we sent to the
+   * master and POST any that changed. The master deep-merges them into the
+   * combined repo, so every other client converges on our writes.
+   */
+  private async syncFiles(): Promise<void> {
+    if (!this.clientId) return;
+    const dataDir = join(process.cwd(), "data");
+
+    // ── PULL from master ──
+    const masterList = await this.request<{ files: FileEntry[] }>("/api/client-sync/local-files");
+    if (masterList && Array.isArray(masterList.files)) {
+      for (const f of masterList.files) {
+        const last = this.lastPulled.get(f.path);
+        if (last === f.hash) continue;
+        const content = await this.requestText(`/api/client-sync/local-file?path=${encodeURIComponent(f.path)}`);
+        if (typeof content !== "string" || !content) continue;
+        const localContent = readSyncedFile(dataDir, f.path);
+        // Missing locally → seed with master's content; present → merge master
+        // into our local copy so we gain every other client's data too.
+        const hash = localContent === null
+          ? seedIntoFile(dataDir, f.path, content)
+          : mergeIntoFile(dataDir, f.path, content);
+        if (hash) {
+          this.lastPulled.set(f.path, f.hash);
+          // If the merge produced exactly what master already has, mark it
+          // pushed so we don't echo master's own data back. Otherwise leave it
+          // unset so the push phase uploads our (superset) version once.
+          if (hash === f.hash) this.lastPushed.set(f.path, f.hash);
+        }
+      }
+    }
+
+    // ── PUSH to master ──
+    const localList = listSyncedFiles(dataDir);
+    for (const f of localList) {
+      const last = this.lastPushed.get(f.path);
+      if (last === f.hash) continue;
+      const content = readSyncedFile(dataDir, f.path);
+      if (content === null) continue;
+      try {
+        await this.request<{ ok: boolean }>("/api/client-sync/file-update", { method: "POST" }, { path: f.path, content, mtime: f.mtime });
+        this.lastPushed.set(f.path, f.hash);
+      } catch {
+        // leave lastPushed unchanged so we retry next cycle
+      }
+    }
+  }
+
   private async pollCycle(): Promise<void> {
     if (!this.running) return;
     try {
@@ -204,6 +297,7 @@ private async pushStatuses(): Promise<void> {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });
         await this.pushLocal("market-update", { station: "", orders: [] });
       }
+      await this.syncFiles();
       this.lastSync = Date.now();
       this.lastError = null;
     } catch (err) {

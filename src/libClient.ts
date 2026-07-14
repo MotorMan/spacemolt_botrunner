@@ -211,21 +211,3 @@ export function removeConnectedAccount(id: string): void {
     if (c.account(id)) c.remove(id);
   }
 }
-
-/**
- * Revive a cached (possibly permanently-closed) `Account` in place by minting a
- * fresh socket and re-authenticating — the library's `Account.reconnectOnce()`.
- *
- * Unlike `connect()`/`connectOwned()`, which would return the cached dead
- * instance, `reconnectOnce()` rebuilds the socket (`makeSocket`) so `Socket.closed`
- * resets to false and the account comes back to life while keeping the same
- * instance (so anything holding a direct reference — e.g. a running `Bot` — keeps
- * working). Returns the account on success, or `null` if the id isn't currently
- * cached (caller should fall back to `connectOwned` to build a fresh one).
- */
-export async function reconnectConnectedAccount(id: string): Promise<Account | null> {
-  const acc = getConnectedAccount(id);
-  if (!acc) return null;
-  await acc.reconnectOnce();
-  return acc;
-}

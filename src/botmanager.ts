@@ -1646,7 +1646,7 @@ async function main(): Promise<void> {
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
-  server.onShutdown = async () => {
+  server.onShutdown = async (restart: boolean = false) => {
     // gracefulShutdown is a hoisted function declaration in main(), so it is
     // safe to call directly here. Previously this went through
     // globalThis.shutdownServer, which is only assigned later in main() (after
@@ -1662,7 +1662,10 @@ async function main(): Promise<void> {
       server.logSystem("Shutdown ignored: server still starting up (stale request from a previous session?)");
       throw new Error("Server still starting up — shutdown ignored");
     }
-    gracefulShutdown("web-ui");
+    // restart=true means the user asked to restart (re-pull updates / fresh
+    // state) rather than fully shut down. gracefulShutdown exits with code 101
+    // in that case so the watchdog knows to bring the client back up.
+    gracefulShutdown("web-ui", restart);
   };
 
   // Start the web server BEFORE anything else so the UI can connect and
@@ -2191,9 +2194,16 @@ async function main(): Promise<void> {
       }
     }
 
-    // Exit with special code to signal watchdog to restart
-    // Code 100 = restart requested, code 0 = normal shutdown
-    process.exit(restart ? 100 : 0);
+    // Exit with a special code so the watchdog knows what to do on exit:
+    //   Code 0   = normal shutdown (no restart — user fully stopped the client)
+    //   Code 100 = restart requested (mass disconnect / session loss)
+    //   Code 101 = restart requested (user-initiated, e.g. to apply updates)
+    // The watchdog treats 100 and 101 identically (both restart, after a git
+    // pull), but the distinct codes let it log *why* the restart happened so we
+    // can tell a deliberate user restart apart from a mass disconnect or a full
+    // exit in the watchdog log.
+    const exitCode = restart ? (signal === "mass_session_loss" ? 100 : 101) : 0;
+    process.exit(exitCode);
   }
 
   // Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (Windows/taskkill)

@@ -490,8 +490,9 @@ export class WebServer {
   // Action callback — set by botmanager
   onAction: ((action: WebAction) => Promise<WebActionResult>) | null = null;
 
-  // Shutdown callback — set by botmanager
-  onShutdown: (() => Promise<void>) | null = null;
+  // Shutdown callback — set by botmanager. `restart` is true when the user
+  // asked to restart the client (re-pull updates) rather than fully shut down.
+  onShutdown: ((restart?: boolean) => Promise<void>) | null = null;
 
   // Empire official alert callback — set by botmanager
   onEmpireAlert: ((sender: string, content: string) => void) | null = null;
@@ -1294,11 +1295,14 @@ if (url.pathname === "/data/shipsForSale.json") {
           return Response.json({ stations: stationsData });
         }
 
-        // Shutdown endpoint
+        // Shutdown endpoint. `?restart=true` means the user asked to restart
+        // the client (re-pull updates) rather than fully shut it down — the
+        // watchdog will bring it back up after a git pull.
         if (url.pathname === "/api/shutdown" && req.method === "POST") {
           if (this.onShutdown) {
-            await this.onShutdown();
-            return Response.json({ ok: true, message: "Shutting down..." });
+            const restart = url.searchParams.get("restart") === "true";
+            await this.onShutdown(restart);
+            return Response.json({ ok: true, message: "Shutting down...", restart });
           }
           return Response.json({ ok: false, error: "No shutdown handler" });
         }

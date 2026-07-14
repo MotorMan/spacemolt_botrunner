@@ -1375,6 +1375,9 @@
         </p>
         <div class="modal-actions">
           <button onclick="hideShutdownModal()">Cancel</button>
+          <button class="primary" onclick="confirmRestart()">
+            Restart Client (Updates)
+          </button>
           <button class="danger" onclick="confirmShutdown()">
             Shutdown Client
           </button>
@@ -17885,6 +17888,38 @@ When responding:
           })
           .catch((err) => {
             appendLine("error", `Shutdown error: ${err.message}`);
+          });
+      }
+
+      function confirmRestart() {
+        fetch("/api/shutdown?restart=true", { method: "POST" })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.ok) {
+              appendLine(
+                "system",
+                "Client restart requested — applying updates and restarting...",
+              );
+              hideShutdownModal();
+              // Close WebSocket connection
+              if (ws) {
+                wsManualClose = true;
+                ws.close();
+                ws = null;
+              }
+              // Update connection status
+              document.getElementById("connDot").classList.remove("connected");
+              document.getElementById("connText").textContent =
+                "Restarting...";
+            } else {
+              appendLine(
+                "error",
+                `Restart failed: ${data.error || "unknown"}`,
+              );
+            }
+          })
+          .catch((err) => {
+            appendLine("error", `Restart error: ${err.message}`);
           });
       }
 

@@ -1627,7 +1627,13 @@ async function main(): Promise<void> {
   server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
   server.onShutdown = async () => {
-    (globalThis as any).shutdownServer("web-ui");
+    // gracefulShutdown is a hoisted function declaration in main(), so it is
+    // safe to call directly here. Previously this went through
+    // globalThis.shutdownServer, which is only assigned later in main() (after
+    // the full startup sequence); if a shutdown was requested before that
+    // assignment ran, it threw "globalThis.shutdownServer is not a function"
+    // and the request failed.
+    gracefulShutdown("web-ui");
   };
 
   // Start the web server BEFORE anything else so the UI can connect and
@@ -1635,6 +1641,13 @@ async function main(): Promise<void> {
   // this ran last, after every account was connected and every routine
   // auto-resumed — which blocked the UI until all players finished loading.
   server.start();
+
+  // Expose the shutdown function on globalThis early (gracefulShutdown is a
+  // hoisted function declaration, so it is already defined here). This must be
+  // set before any request can reach it, not at the end of main() after the
+  // long startup sequence, otherwise web-triggered shutdowns fail with
+  // "globalThis.shutdownServer is not a function".
+  (globalThis as any).shutdownServer = gracefulShutdown;
 
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Connecting owned accounts via @spacemolt/lib...");
@@ -2145,9 +2158,6 @@ async function main(): Promise<void> {
   // Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (Windows/taskkill)
   process.on("SIGINT", () => gracefulShutdown("SIGINT"));
   process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-
-  // Expose shutdown function for web UI
-  (globalThis as any).shutdownServer = gracefulShutdown;
 }
 
 main().catch((err) => {

@@ -1109,6 +1109,32 @@
     }
 
     /** Log to the Command All log panel */
+    const CA_LOG_KEY = 'spacemolt_commandall_log';
+    const CA_LOG_MAX = 300;
+
+    /** Restore the persisted Fleet Command Log (survives iframe reloads). */
+    function restoreCommandAllLog() {
+      try {
+        const raw = localStorage.getItem(CA_LOG_KEY);
+        if (!raw) return;
+        const log = document.getElementById('commandAllLog');
+        if (!log) return;
+        log.innerHTML = raw;
+        // Enforce the cap on restore too.
+        while (log.children.length > CA_LOG_MAX) log.removeChild(log.lastChild);
+        log.scrollTop = 0;
+      } catch { /* localStorage unavailable — ignore */ }
+    }
+
+    /** Persist the current Fleet Command Log to localStorage. */
+    function persistCommandAllLog() {
+      try {
+        const log = document.getElementById('commandAllLog');
+        if (log) localStorage.setItem(CA_LOG_KEY, log.innerHTML);
+      } catch { /* localStorage unavailable — ignore */ }
+    }
+
+    /** Log to the Command All log panel */
     function caLog(html) {
       const log = document.getElementById('commandAllLog');
       if (!log) return;
@@ -1117,14 +1143,16 @@
       div.innerHTML = html;
       log.prepend(div);
       // Cap DOM entries
-      while (log.children.length > 300) log.removeChild(log.lastChild);
+      while (log.children.length > CA_LOG_MAX) log.removeChild(log.lastChild);
       log.scrollTop = 0;
+      persistCommandAllLog();
     }
 
     /** Clear the command all log */
     function clearCommandAllLog() {
       const log = document.getElementById('commandAllLog');
       if (log) log.innerHTML = '';
+      persistCommandAllLog();
     }
 
     // Helper functions
@@ -1187,6 +1215,7 @@
     }
 
     // Initialize
+    restoreCommandAllLog();
     connect();
   </script>
 </body>

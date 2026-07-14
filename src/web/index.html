@@ -1603,10 +1603,10 @@
           loadTaxesDataAndRender();
           switchStatsView("main");
         }
-        if (name === "commandall") {
-          const frame = document.getElementById("commandallFrame");
-          if (frame) frame.src = frame.src;
-        }
+        // The Command All tab is a persistent iframe that keeps its own live
+        // WebSocket connection (it re-renders controls on `init`/`status` pushes),
+        // so it must NOT be reloaded here — re-navigating it destroys the
+        // Fleet Command Log and any in-flight commands.
         if (name === "fleetcombat") {
           renderFleetCombatControls(true);
           updateBattleUI();

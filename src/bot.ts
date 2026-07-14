@@ -1358,7 +1358,14 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         (p.location as string) ||
         this.location;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
-      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+      // For library-backed bots `r` is `account.state`, which the library only
+      // updates from push events and does NOT keep current for is_cloaked /
+      // credits (see refreshStatus's throttle note). Re-deriving these here from
+      // that stale cache clobbers freshly-fetched values on every periodic tick,
+      // reverting the dashboard to the client-start snapshot ~30s after a
+      // "command all status". These fields are owned by refreshStatus() (a real
+      // get_status), so only apply them from a genuine get_location (HTTP bots).
+      if (!this.account && (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined)) {
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
       const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
@@ -1374,7 +1381,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       }
       // If field is not present, preserve existing towing state
       const creditsValue = r.credits ?? player?.credits;
-      if (typeof creditsValue === "number") this.credits = creditsValue;
+      if (!this.account && typeof creditsValue === "number") this.credits = creditsValue;
     }
 
     return resp;

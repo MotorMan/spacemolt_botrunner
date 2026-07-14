@@ -19118,7 +19118,11 @@ When responding:
 
         return `
     <div class="faction-section">
-      <div class="faction-section-title">Members <span class="count-badge">${members.length}</span></div>
+      <div class="faction-section-title" style="display:flex;align-items:center;gap:8px">
+        Members <span class="count-badge">${members.length}</span>
+        <button id="factionSetOfficerBtn" class="sm primary" style="margin-left:auto;font-size:11px;padding:3px 8px" onclick="factionSetMembersToOfficer('${esc(username)}')">Set Members to Officer</button>
+        <button class="sm" style="font-size:11px;padding:3px 8px" onclick="factionStopMemberPromoteQueue()">Stop Promotion</button>
+      </div>
       <div class="faction-card" style="padding:0">${rows}</div>
     </div>
     <div class="faction-section" style="margin-top:12px">
@@ -19762,6 +19766,117 @@ When responding:
             }
           },
         );
+      }
+
+      // ── Set Members to Officer (queued, one mutation per tick) ──
+      let memberPromoteQueue = null; // { username, targets: string[], index: number }
+      const MEMBER_PROMOTE_COOLDOWN_MS = TICK_COOLDOWN_MS + 500;
+
+      function factionSetMembersToOfficer(username) {
+        if (!factionData || !Array.isArray(factionData.members)) {
+          appendLine("system", "No faction member data loaded yet.");
+          return;
+        }
+        const targets = factionData.members.filter((m) => {
+          const role = (m.role || m.rank || "").toLowerCase();
+          const pid = m.player_id || m.id;
+          return pid && role === "member";
+        });
+        if (targets.length === 0) {
+          appendLine("system", "No members at the Member rank to promote.");
+          return;
+        }
+        if (memberPromoteQueue) {
+          appendLine(
+            "system",
+            `A promotion queue is already running (${memberPromoteQueue.index}/${memberPromoteQueue.targets.length}). Use "Stop Promotion" to cancel.`,
+          );
+          return;
+        }
+        if (
+          !confirm(
+            `Promote ${targets.length} player(s) at the Member rank to Officer? This only affects members at the "Member" rank and runs ONE at a time (each is a tick-aligned mutation), so it may take a while.`,
+          )
+        )
+          return;
+
+        memberPromoteQueue = {
+          username,
+          targets: targets.map((m) => m.player_id || m.id),
+          index: 0,
+        };
+        updateMemberPromoteButton();
+        appendLine(
+          "system",
+          `Starting promotion of ${targets.length} member(s) to Officer — processing one per tick...`,
+        );
+        factionProcessMemberPromoteQueue();
+      }
+
+      function factionProcessMemberPromoteQueue() {
+        if (!memberPromoteQueue) return;
+        const { targets, index, username } = memberPromoteQueue;
+        if (index >= targets.length) {
+          appendLine(
+            "system",
+            `Finished promoting ${targets.length} member(s) to Officer.`,
+          );
+          memberPromoteQueue = null;
+          updateMemberPromoteButton();
+          fetchFactionInfo(username);
+          return;
+        }
+        const pid = targets[index];
+        sendExec(
+          username,
+          "faction_promote",
+          { player_id: pid, role_id: "officer" },
+          (result) => {
+            if (!memberPromoteQueue) return; // stopped/cancelled
+            if (result.ok) {
+              appendLine(
+                "system",
+                `Set ${pid} to officer (${memberPromoteQueue.index + 1}/${memberPromoteQueue.targets.length})`,
+              );
+            } else {
+              appendLine(
+                "system",
+                `Promotion failed for ${pid}: ${result.error || "unknown"}`,
+              );
+            }
+            memberPromoteQueue.index++;
+            updateMemberPromoteButton();
+            setTimeout(
+              factionProcessMemberPromoteQueue,
+              MEMBER_PROMOTE_COOLDOWN_MS,
+            );
+          },
+        );
+      }
+
+      function factionStopMemberPromoteQueue() {
+        if (!memberPromoteQueue) {
+          appendLine("system", "No promotion queue is currently running.");
+          return;
+        }
+        appendLine(
+          "system",
+          `Stopped promotion queue after ${memberPromoteQueue.index}/${memberPromoteQueue.targets.length} processed.`,
+        );
+        memberPromoteQueue = null;
+        updateMemberPromoteButton();
+      }
+
+      function updateMemberPromoteButton() {
+        const btn = document.getElementById("factionSetOfficerBtn");
+        if (!btn) return;
+        if (memberPromoteQueue) {
+          btn.textContent = `Promoting… ${memberPromoteQueue.index}/${memberPromoteQueue.targets.length}`;
+          btn.disabled = true;
+        } else {
+          btn.textContent = "Set Members to Officer";
+          btn.disabled = false;
+        }
       }
 
       function factionDepositCredits(username) {

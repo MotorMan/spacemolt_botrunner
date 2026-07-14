@@ -1620,6 +1620,19 @@ async function main(): Promise<void> {
     try { server?.logSystem?.(`Unhandled rejection ignored (staying alive): ${msg}`); } catch { /* ignore */ }
   });
 
+  // Periodic timers (store IDs for cleanup). Declared up front — BEFORE
+  // server.start()/onShutdown — so gracefulShutdown can safely clear them even
+  // if a shutdown is requested during the startup sequence. Previously this was
+  // declared much later in main(), so an early shutdown threw
+  // "Cannot access 'intervals' before initialization" (temporal dead zone).
+  const intervals: ReturnType<typeof setInterval>[] = [];
+
+  // Set true once main() has finished wiring everything up. Used to ignore
+  // stray /api/shutdown POSTs that arrive from a previous session's open tab
+  // during the first moments after a restart (which would otherwise tear the
+  // freshly-started server down). Legitimate shutdowns work normally afterwards.
+  let startupComplete = false;
+
   // Load port from settings.json (general.port), env var, or default to 3000
   const settings = loadSettings();
   const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
@@ -1633,6 +1646,15 @@ async function main(): Promise<void> {
     // the full startup sequence); if a shutdown was requested before that
     // assignment ran, it threw "globalThis.shutdownServer is not a function"
     // and the request failed.
+    // Ignore shutdown requests that arrive before startup has finished — these
+    // are almost always a stale POST from a tab left open across a restart, and
+    // honoring them would kill the freshly-started server. Throw so the client
+    // sees a failed shutdown (not a false "Server Stopped") and the server, and
+    // its bots, stay alive.
+    if (!startupComplete) {
+      server.logSystem("Shutdown ignored: server still starting up (stale request from a previous session?)");
+      throw new Error("Server still starting up — shutdown ignored");
+    }
     gracefulShutdown("web-ui");
   };
 
@@ -1787,37 +1809,46 @@ async function main(): Promise<void> {
 
     // Library-owned accounts are already connected & authenticated by
     // connectLibraryAccounts() — no HTTP login/resume is needed. Fetch the
-    // catalog once, then auto-resume each bot's last-used routine (unless it
-    // was stopped intentionally).
-    try {
-      if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
-        await catalogStore.fetchFromLib();
-        server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-      }
-    } catch (err) {
-      server.logSystem(`Catalog fetch failed: ${err}`);
-    }
-
-    for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    // catalog, then auto-resume each bot's last-used routine (unless it was
+    // stopped intentionally). Run this in the BACKGROUND: for a large fleet it
+    // can take minutes, and awaiting it here would (a) block the event loop so
+    // WebSocket handshakes / UI updates stall, (b) delay registration of the
+    // periodic intervals (status push + reconnect watchdog) — which is exactly
+    // why bots looked "not connected" for many minutes after a restart — and
+    // (c) leave `intervals` uninitialized so a shutdown during this window
+    // threw a TDZ error. Running it fire-and-forget keeps startup instant and
+    // lets the 2s status push + watchdog start immediately.
+    void (async () => {
       try {
-        await bot.updateTaxEstimate();
-        await bot.updateFactionTaxEstimate();
+        if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
+          await catalogStore.fetchFromLib();
+          server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+        }
       } catch (err) {
-        server.logSystem(`Tax collection failed for ${name}: ${err}`);
+        server.logSystem(`Catalog fetch failed: ${err}`);
       }
-      const routineKey = getLastUsedRoutine(name) || assignments[name];
-      if (!routineKey || !ROUTINES[routineKey]) {
-        server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
-        continue;
+
+      for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+        try {
+          await bot.updateTaxEstimate();
+          await bot.updateFactionTaxEstimate();
+        } catch (err) {
+          server.logSystem(`Tax collection failed for ${name}: ${err}`);
+        }
+        const routineKey = getLastUsedRoutine(name) || assignments[name];
+        if (!routineKey || !ROUTINES[routineKey]) {
+          server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
+          continue;
+        }
+        const stoppedState = getStoppedState(name);
+        if (stoppedState) {
+          server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+        } else {
+          server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+          await handleStart({ type: "start", bot: name, routine: routineKey });
+        }
       }
-      const stoppedState = getStoppedState(name);
-      if (stoppedState) {
-        server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
-      } else {
-        server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-        await handleStart({ type: "start", bot: name, routine: routineKey });
-      }
-    }
+    })();
   }
 
   refreshStatusTable();
@@ -1829,9 +1860,8 @@ async function main(): Promise<void> {
     server.logSystem("Catalog data is stale, will fetch after first bot login...");
   }
 
-  // Periodic timers (store IDs for cleanup)
-  const intervals: ReturnType<typeof setInterval>[] = [];
-
+  // Periodic timers (store IDs for cleanup). `intervals` is declared at the top
+  // of main() so gracefulShutdown can clear them even during startup.
   // Periodic UI push (cached data → websocket clients)
   intervals.push(setInterval(() => {
     try {
@@ -2085,6 +2115,10 @@ async function main(): Promise<void> {
     ensureSelectedBotsConnected().catch(() => {});
   }, 2 * 60 * 1000));
 
+  // All periodic timers are registered and the server is fully wired up. From
+  // here on, a /api/shutdown POST will be honored (see server.onShutdown).
+  startupComplete = true;
+
   // Graceful shutdown handler
   function gracefulShutdown(signal: string, restart: boolean = false): void {
     console.log(`\nShutting down (${signal})...`);
@@ -2120,7 +2154,7 @@ async function main(): Promise<void> {
       server.logSystem(`ERROR flushing miner activity data: ${err}`);
     });
     server.stop();
-    chatServer.stop();
+    chatServer?.stop();
     
     // If restarting due to mass session loss, clear all session files
     // This forces fresh logins on restart, avoiding the invalid session loop

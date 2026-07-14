@@ -508,6 +508,7 @@ function getTraderSettings(username?: string): {
   autoInsure: boolean;
   stationPriority: boolean;
   autoCloak: boolean;
+  ignorePiratesWhenCloaked: boolean;
   maxFactionCreditsToUse: number;
   enableMissions: boolean;
   debugLogging: boolean;
@@ -530,6 +531,7 @@ function getTraderSettings(username?: string): {
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
+    ignorePiratesWhenCloaked: (t.ignorePiratesWhenCloaked as boolean) ?? true,
     maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0,
     enableMissions: (t.enableMissions as boolean) !== false,
     debugLogging: (t.debugLogging as boolean) ?? false,
@@ -3148,13 +3150,16 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
           bot.trackWildlife(nearbyResp.result);
-          const { checkAndFleeFromPirates } = await import("./common.js");
-          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-          if (fled) {
-            ctx.log("error", "Pirates detected at destination - fled, aborting trade");
-            await ensureDocked(ctx);
-            await ctx.sleep(30000);
-            continue;
+          // Cloaked ships cannot be ambushed — skip the pirate flee when enabled.
+          if (!(settings.ignorePiratesWhenCloaked !== false && bot.isCloaked)) {
+            const { checkAndFleeFromPirates } = await import("./common.js");
+            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+            if (fled) {
+              ctx.log("error", "Pirates detected at destination - fled, aborting trade");
+              await ensureDocked(ctx);
+              await ctx.sleep(30000);
+              continue;
+            }
           }
         }
       }

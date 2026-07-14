@@ -124,6 +124,7 @@ function getRescueSettings(): {
   premiumFuelReserve: number;
   maxFuelDelivery: number;
   ignoreBlacklist: boolean;
+  ignorePirateFleeWhenCloaked: boolean;
   enableCloak: boolean;
   dontRejectMaydaysInBlacklistSystems: boolean;
   disableFactionAnnouncements: boolean;
@@ -161,6 +162,9 @@ function getRescueSettings(): {
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
     ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
+    // When cloaked a ship cannot be ambushed, so (default ON) it may ignore
+    // detected pirates and not flee.
+    ignorePirateFleeWhenCloaked: (r.ignorePirateFleeWhenCloaked as boolean) ?? true,
     enableCloak: (r.enableCloak as boolean) ?? false,
     dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
     disableFactionAnnouncements: (r.disableFactionAnnouncements as boolean) ?? false,
@@ -3855,12 +3859,14 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
 
-      // Check for pirates and flee if detected
-      const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - had to flee, rescue aborted");
-        return;
+      // Check for pirates and flee if detected (cloaked ships ignore pirates)
+      if (!(getRescueSettings().ignorePirateFleeWhenCloaked !== false && bot.isCloaked)) {
+        const { checkAndFleeFromPirates } = await import("./common.js");
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - had to flee, rescue aborted");
+          return;
+        }
       }
 
       const data = nearbyResp.result as Record<string, unknown>;
@@ -4576,12 +4582,14 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
 
-      // Check for pirates and flee if detected
-      const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - had to flee, rescue aborted");
-        return;
+      // Check for pirates and flee if detected (cloaked ships ignore pirates)
+      if (!(getRescueSettings().ignorePirateFleeWhenCloaked !== false && bot.isCloaked)) {
+        const { checkAndFleeFromPirates } = await import("./common.js");
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - had to flee, rescue aborted");
+          return;
+        }
       }
 
       const data = nearbyResp.result as Record<string, unknown>;
@@ -4861,12 +4869,14 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
       return null;
     }
     if (!resp.error && resp.result) {
-      // Check for pirates and flee if detected
-      const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, resp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - had to flee");
-        return null;
+      // Check for pirates and flee if detected (cloaked ships ignore pirates)
+      if (!(getRescueSettings().ignorePirateFleeWhenCloaked !== false && bot.isCloaked)) {
+        const { checkAndFleeFromPirates } = await import("./common.js");
+        const fled = await checkAndFleeFromPirates(ctx, resp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - had to flee");
+          return null;
+        }
       }
 
       const data = resp.result as Record<string, unknown>;
@@ -6875,13 +6885,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         return;
       }
       if (!nearbyResp.error && nearbyResp.result) {
-        // Check for pirates and flee if detected
+      // Check for pirates and flee if detected (cloaked ships ignore pirates)
+      if (!(getRescueSettings().ignorePirateFleeWhenCloaked !== false && bot.isCloaked)) {
         const { checkAndFleeFromPirates } = await import("./common.js");
         const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
         if (fled) {
           ctx.log("error", "Pirates detected - had to flee, rescue aborted");
           return;
         }
+      }
 
         const data = nearbyResp.result as Record<string, unknown>;
         const players = Array.isArray(data.players) ? data.players :

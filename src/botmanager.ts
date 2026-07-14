@@ -37,6 +37,7 @@ import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
+import { isConnectionError } from "./connection.js";
 import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, getConnectedAccount, removeConnectedAccount } from "./libClient.js";
 import { CLOSE_CODE, type Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
@@ -975,9 +976,9 @@ const RESTART_MAX_BACKOFF_MS = 60000;
 
 /** Errors indicating the underlying transport socket is dead. We NEVER give up
  *  on these — the bot keeps retrying with a delay until the connection comes
- *  back, so it can never be left permanently disconnected. */
-const CONNECTION_ERROR_PATTERNS =
-  /cannot send on a closed socket|closed socket|socket (is )?closed|not connected|econnreset|econnrefused|disconnected|connection (lost|closed|reset|aborted)/i;
+ *  back, so it can never be left permanently disconnected. The matcher is
+ *  shared with the command dispatch layer via ./connection.js (isConnectionError)
+ *  so the two stay in lockstep. */
 
 /** Call when a routine finishes successfully so the failure counters reset. */
 function recordSuccessfulRun(botName: string): void {
@@ -1051,9 +1052,9 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
   if (s?.timer) return;
   if (!s) { s = { consecutiveFailures: 0, connectionRetries: 0, timer: null }; restartStates.set(botName, s); }
 
-  const isConnectionError = CONNECTION_ERROR_PATTERNS.test(errorMsg);
+  const lostConnection = isConnectionError(errorMsg);
 
-  if (isConnectionError) {
+  if (lostConnection) {
     // Lost connection: keep retrying forever (with a delay) so the bot comes
     // back automatically when the socket is restored — never permanently stuck.
     s.connectionRetries++;

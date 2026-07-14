@@ -115,6 +115,8 @@ interface CargoMoverSettings {
   refuelThreshold: number;
   repairThreshold: number;
   militaryFuelCells: number;
+  ignorePiratesWhenCloaked: boolean;
+  ignoreBlacklistWhenCloaked: boolean;
 }
 
 function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -156,29 +158,39 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     militaryFuelCells: (t.militaryFuelCells as number) || 10,
+    // When cloaked a ship cannot be ambushed, so (default ON) it may ignore
+    // pirates and blacklisted systems while cloaked.
+    ignorePiratesWhenCloaked: (botOverrides.ignorePiratesWhenCloaked as boolean) ?? (t.ignorePiratesWhenCloaked as boolean) ?? true,
+    ignoreBlacklistWhenCloaked: (botOverrides.ignoreBlacklistWhenCloaked as boolean) ?? (t.ignoreBlacklistWhenCloaked as boolean) ?? true,
   };
 }
 
-/** Resolve station ID to system ID using mapStore. */
+/** Resolve station ID to system ID using mapStore.
+ *  Matches on the POI hex id OR the friendly POI/base name (and on the system
+ *  part when present) so an unresolved hex id and a friendly name for the same
+ *  station both resolve to the same system. */
 export function resolveStationSystem(stationId: string): string | null {
   if (!stationId) return null;
 
-  // Handle system|station format
-  let stationPart = stationId;
-  let systemPart: string | null = null;
+  // system|station format: trust the system part when present and resolvable.
   if (stationId.includes('|')) {
-    const parts = stationId.split('|');
-    systemPart = parts[0];
-    stationPart = parts[1];
+    const systemPart = stationId.split('|')[0];
+    const sys = mapStore.getSystem(systemPart);
+    if (sys) return sys.id;
   }
 
+  const resolved = mapStore.resolveStationIdentity(stationId);
+  if (resolved.systemId) return resolved.systemId;
+
+  // Fallback: brute-force scan (handles any representation not yet resolved).
   const allSystems = mapStore.getAllSystems();
   for (const [sysId, sys] of Object.entries(allSystems)) {
-    // If we have a system part, only check that system
-    if (systemPart && sysId !== systemPart) continue;
-
     for (const poi of sys.pois) {
-      if (poi.id === stationPart || poi.base_id === stationPart) {
+      const token = stationId.toLowerCase();
+      if (poi.id.toLowerCase() === token ||
+          (poi.base_id && poi.base_id.toLowerCase() === token) ||
+          (poi.name && poi.name.toLowerCase() === token) ||
+          (poi.base_name && poi.base_name.toLowerCase() === token)) {
         return sysId;
       }
     }
@@ -186,12 +198,23 @@ export function resolveStationSystem(stationId: string): string | null {
   return null;
 }
 
-/** Extract station ID from system|station format for travel commands. */
-function extractStationId(stationValue: string): string {
-  if (stationValue.includes('|')) {
-    return stationValue.split('|')[1];
+/** True when the bot's current POI matches the configured station reference,
+ *  comparing on BOTH the hex POI id and the friendly POI name via mapStore so
+ *  an unresolved hex id and a friendly name are never treated as different
+ *  stations (which would otherwise make us misroute or lose cargo). */
+function botIsAtStation(bot: Bot, stationRef: string): boolean {
+  if (!bot.poi) return false;
+  if (mapStore.sameStation(bot.poi, stationRef)) return true;
+  // Also accept the legacy system|token form where bot.poi is the token half.
+  if (stationRef.includes('|') && mapStore.sameStation(bot.poi, stationRef.split('|')[1])) {
+    return true;
   }
-  return stationValue;
+  return false;
+}
+
+/** Resolve a station reference to the POI token to hand to travel/dock. */
+function stationTravelTarget(stationRef: string): string {
+  return mapStore.resolveStationTarget(stationRef);
 }
 
 /** Get current system for mobile stations like mobile_capital or frontier_station. */
@@ -772,7 +795,7 @@ function findMoveJobs(
     ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
-      const blacklist = getSystemBlacklist();
+      const blacklist = (settings.ignoreBlacklistWhenCloaked && ctx.bot.isCloaked) ? [] : getSystemBlacklist();
       const route = mapStore.findRoute(sourceSystem, effectiveDestSystem, blacklist);
       const jumps = route ? route.length - 1 : 999;
 
@@ -998,6 +1021,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+      ignoreBlacklistWhenCloaked: settings.ignoreBlacklistWhenCloaked,
     };
 
     ctx.log("cargo", `═══════════════════════════════════════════════════════`);
@@ -1159,9 +1184,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         ctx.log("system", "⛔ Stopping — emergency detected");
         return;
       }
-      if (bot.poi !== extractStationId(settings.destinationStation)) {
+      if (!botIsAtStation(bot, settings.destinationStation)) {
         ctx.log("travel", `Traveling to destination station ${settings.destinationStation}...`);
-        const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+        const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
         if (bot.state !== "running") {
           ctx.log("system", "⛔ Stopping — emergency detected");
           return;
@@ -1210,7 +1235,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                   ctx.log("cargo", `✅ Arrived at updated mobile capital system ${currentSystem} for recovery`);
                 }
                 // Retry travel to the station
-                const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+                const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
                 if (retryResp.error) {
                   const retryErrMsg = retryResp.error.message.toLowerCase();
                   if (!retryErrMsg.includes("already")) {
@@ -1219,7 +1244,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                     continue;
                   }
                 } else {
-        bot.poi = extractStationId(settings.destinationStation);
+        bot.poi = stationTravelTarget(settings.destinationStation);
                 }
               } else {
                 ctx.log("error", "Could not determine current location of mobile capital during recovery");
@@ -1233,7 +1258,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             }
           }
         } else {
-        bot.poi = extractStationId(settings.destinationStation);
+        bot.poi = stationTravelTarget(settings.destinationStation);
         }
       }
 
@@ -1364,7 +1389,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     // Only travel to and dock at source station if not already there
-    if (!bot.docked || bot.poi !== settings.sourceStation) {
+    if (!bot.docked || !botIsAtStation(bot, settings.sourceStation)) {
       ctx.log("cargo", `🚢 Not docked at source station — docking/traveling...`);
       
       saveLastSession(bot.username, settings.sourceStation, settings.destinationStation,
@@ -1379,12 +1404,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         return;
       }
-    if (bot.poi !== extractStationId(settings.sourceStation)) {
+    if (!botIsAtStation(bot, settings.sourceStation)) {
         ctx.log("travel", `Traveling to source station ${settings.sourceStation}...`);
         logCargoActivity(bot.username, "navigation", `Traveling to source station ${settings.sourceStation}`, {
           location: `${bot.system}: ${bot.poi} → ${settings.sourceStation}`,
         });
-        const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.sourceStation) });
+        const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.sourceStation) });
         if (bot.state !== "running") {
           ctx.log("system", "⛔ Stopping — emergency detected");
           logCargoActivity(bot.username, "interruption", "Emergency detected during travel to source station", {
@@ -1422,7 +1447,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
         }
-        bot.poi = extractStationId(settings.sourceStation);
+        bot.poi = stationTravelTarget(settings.sourceStation);
       }
 
       yield "dock_source";
@@ -1787,12 +1812,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
       return;
     }
-    if (bot.poi !== extractStationId(settings.destinationStation)) {
+    if (!botIsAtStation(bot, settings.destinationStation)) {
       ctx.log("travel", `Traveling to ${settings.destinationStation}...`);
       logCargoActivity(bot.username, "navigation", `Traveling to destination station ${settings.destinationStation}`, {
         location: `${bot.system}: ${bot.poi} → ${settings.destinationStation}`,
       });
-      const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+      const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during travel to destination", {
@@ -1861,7 +1886,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                 }
 
                 // Retry travel to the mobile capital
-                const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+                const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
                 if (retryResp.error) {
                   const retryErrMsg = retryResp.error.message.toLowerCase();
                   if (!retryErrMsg.includes("already")) {
@@ -1873,7 +1898,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                     break;
                   }
                 } else {
-                  bot.poi = extractStationId(settings.destinationStation);
+                  bot.poi = stationTravelTarget(settings.destinationStation);
                 }
               } else {
                 ctx.log("error", "Could not determine mobile capital's new location from error message");
@@ -1919,7 +1944,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                 ctx.log("cargo", `✅ Arrived at updated mobile capital system ${currentSystem}`);
               }
               // Retry travel to the station
-              const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+              const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
               if (retryResp.error) {
                 const retryErrMsg = retryResp.error.message.toLowerCase();
                 if (!retryErrMsg.includes("already")) {
@@ -1931,7 +1956,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
                   break;
                 }
               } else {
-          bot.poi = extractStationId(settings.destinationStation);
+          bot.poi = stationTravelTarget(settings.destinationStation);
               }
             } else {
               ctx.log("error", "Could not determine current location of mobile capital");
@@ -1951,7 +1976,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           }
         }
       } else {
-        bot.poi = extractStationId(settings.destinationStation);
+        bot.poi = stationTravelTarget(settings.destinationStation);
       }
     }
 
@@ -2194,12 +2219,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
       return;
     }
-    if (bot.poi !== extractStationId(settings.sourceStation)) {
+    if (!botIsAtStation(bot, settings.sourceStation)) {
       ctx.log("travel", `Traveling back to ${settings.sourceStation}...`);
       logCargoActivity(bot.username, "navigation", `Returning to source station ${settings.sourceStation}`, {
         location: `${bot.system}: ${bot.poi} → ${settings.sourceStation}`,
       });
-      const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.sourceStation) });
+      const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.sourceStation) });
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during return travel", {
@@ -2237,7 +2262,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           continue;
         }
       }
-      bot.poi = extractStationId(settings.sourceStation);
+      bot.poi = stationTravelTarget(settings.sourceStation);
     }
 
     if (!await dockAtStation(ctx)) {

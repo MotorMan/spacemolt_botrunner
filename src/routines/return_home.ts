@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import { isConnectionError } from "../connection.js";
 import {
   getSystemInfo,
   ensureDocked,
@@ -338,11 +339,15 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         const isTimeout = msg.includes("524") || msg.includes("timeout") || msg.includes("Timeout");
+        // A dropped socket (server restart / network blip) is never fatal — the
+        // dispatch layer pauses and resends, but if a connection error still
+        // surfaces here we retry the same as a timeout instead of cancelling.
+        const isConnectionLoss = isConnectionError(msg);
 
         ctx.log("error", `Navigation error (attempt ${navAttempts}/${MAX_NAV_ATTEMPTS}): ${msg}`);
 
-        if (!isTimeout) {
-          // Non-timeout error - don't retry
+        if (!isTimeout && !isConnectionLoss) {
+          // Non-timeout, non-connection error - don't retry
           ctx.log("error", `Failed to reach ${homeSystem} — routine cancelled`);
           return;
         }

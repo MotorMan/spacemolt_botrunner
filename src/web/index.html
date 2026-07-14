@@ -15399,6 +15399,7 @@
         const maydayRescueBot = r.maydayRescueBot || "";
         const ignoreBlacklist = r.ignoreBlacklist === true;
         const enableCloak = r.enableCloak === true;
+        const ignorePirateFleeWhenCloaked = r.ignorePirateFleeWhenCloaked ?? true;
         const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
         const disableFactionAnnouncements = r.disableFactionAnnouncements === true;
 
@@ -15609,6 +15610,11 @@
     </div>
 
     <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-ignorePirateFleeWhenCloaked" ${ignorePirateFleeWhenCloaked ? "checked" : ""}> Ignore pirate flee when cloaked</label>
+      <small style="color:var(--dim)">When cloaking is enabled AND active, do not flee from detected pirates (cloaked ships cannot be ambushed). Default: enabled.</small>
+    </div>
+
+    <div class="settings-group">
       <label><input type="checkbox" id="set-rescue-disableFactionAnnouncements" ${disableFactionAnnouncements ? "checked" : ""}> Disable faction announcements</label>
       <small style="color:var(--dim)">Don't send rescue start/complete messages to faction chat (quieter operation)</small>
     </div>
@@ -15682,6 +15688,9 @@
             "set-rescue-ignoreBlacklist",
           ).checked,
           enableCloak: document.getElementById("set-rescue-enableCloak").checked,
+          ignorePirateFleeWhenCloaked: document.getElementById(
+            "set-rescue-ignorePirateFleeWhenCloaked",
+          ).checked,
           dontRejectMaydaysInBlacklistSystems: document.getElementById(
             "set-rescue-dontRejectMaydaysInBlacklistSystems",
           ).checked,
@@ -15792,6 +15801,7 @@
         const homeSystem = t.homeSystem ?? "";
         const maxFactionCreditsToUse = t.maxFactionCreditsToUse ?? 0;
         const autoCloak = t.autoCloak ?? false;
+        const ignorePiratesWhenCloaked = t.ignorePiratesWhenCloaked ?? true;
         const depositProfitsToFaction = t.depositProfitsToFaction ?? true;
 
         panel.innerHTML = `
@@ -15817,6 +15827,17 @@
       <select id="set-trader-autoCloak">
         <option value="false" ${autoCloak === true ? "" : "selected"}>Disabled</option>
         <option value="true" ${autoCloak === true ? "selected" : ""}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Pirates When Cloaked</div>
+        <div class="setting-hint">When cloaked, ignore detected pirates and do not flee (cloaked ships cannot be ambushed). Default: enabled.</div>
+      </div>
+      <select id="set-trader-ignorePiratesWhenCloaked">
+        <option value="false" ${ignorePiratesWhenCloaked === false ? "selected" : ""}>Disabled</option>
+        <option value="true" ${ignorePiratesWhenCloaked !== false ? "selected" : ""}>Enabled</option>
       </select>
     </div>
 
@@ -15939,6 +15960,8 @@
             "true",
           autoCloak:
             document.getElementById("set-trader-autoCloak").value === "true",
+          ignorePiratesWhenCloaked:
+            document.getElementById("set-trader-ignorePiratesWhenCloaked").value === "true",
           debugLogging:
             document.getElementById("set-trader-debugLogging").value === "true",
           depositProfitsToFaction:
@@ -27591,6 +27614,8 @@ ignoreBlacklist: document.getElementById(
         const militaryFuelCells = cm.militaryFuelCells ?? 10;
         const personalStorageBot = cm.personalStorageBot || "";
         const factionStorageBot = cm.factionStorageBot || "";
+        const ignorePiratesWhenCloaked = cm.ignorePiratesWhenCloaked ?? true;
+        const ignoreBlacklistWhenCloaked = cm.ignoreBlacklistWhenCloaked ?? true;
 
         // Build station options from mapData
         let sourceStationOpts = '<option value="">(not set)</option>';
@@ -27892,6 +27917,22 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-cm-militaryFuelCells" min="0" max="200" value="${militaryFuelCells}" onchange="saveCargoMoverSettings()">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Pirates When Cloaked</div>
+        <div class="setting-hint">When cloaked, ignore detected pirates and do not flee (cloaked ships cannot be ambushed).</div>
+      </div>
+      <label><input type="checkbox" id="set-cm-ignorePiratesWhenCloaked" ${ignorePiratesWhenCloaked ? "checked" : ""}> Ignore pirates</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Blacklist When Cloaked</div>
+        <div class="setting-hint">When cloaked, travel through blacklisted systems (cloaked ships cannot be attacked).</div>
+      </div>
+      <label><input type="checkbox" id="set-cm-ignoreBlacklistWhenCloaked" ${ignoreBlacklistWhenCloaked ? "checked" : ""}> Ignore blacklist</label>
+    </div>
+
     <div class="settings-save-bar">
       <button class="sm" onclick="renderCargoMoverSettings(document.getElementById('settingsContent'))">Refresh</button>
       <button class="primary" onclick="saveCargoMoverSettings()">Save Settings</button>
@@ -28149,6 +28190,10 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-cm-militaryFuelCells")?.value,
             ) || 10,
+          ignorePiratesWhenCloaked:
+            document.getElementById("set-cm-ignorePiratesWhenCloaked")?.checked ?? true,
+          ignoreBlacklistWhenCloaked:
+            document.getElementById("set-cm-ignoreBlacklistWhenCloaked")?.checked ?? true,
         };
 
         send({ type: "saveSettings", routine: "cargo_mover", settings: s });

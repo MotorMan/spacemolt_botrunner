@@ -5,6 +5,7 @@
  * ore parsing, and safety checks.
  */
 import type { RoutineContext } from "../bot.js";
+import { isConnectionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
@@ -1704,6 +1705,24 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 
 // ── Navigation ───────────────────────────────────────────────
 
+/**
+ * Explicitly pause the routine until the bot's socket is reconnected. The
+ * dispatch layer (bot.ts libExec) already survives a dropped socket by blocking
+ * and resending, but calling this at the top of a travel loop makes the routine
+ * *visibly* aware it can't act while disconnected, and avoids burning jump
+ * retries/route re-queries against a dead socket. Fast no-op when already
+ * connected. Returns true if connected (or reconnected), false if the routine
+ * should give up (stopped or the connection is terminal).
+ */
+export async function waitForReconnect(ctx: RoutineContext): Promise<boolean> {
+  if (ctx.bot.isConnected()) return true;
+  ctx.log("warn", "Socket not connected — waiting for reconnection before issuing commands...");
+  const ok = await ctx.bot.waitForSocket();
+  if (ok) ctx.log("system", "Socket reconnected — resuming routine.");
+  else ctx.log("error", "Socket could not be restored — ending routine.");
+  return ok;
+}
+
 /** Route segment from find_route API response */
 export interface RouteSegment {
   system_id: string;
@@ -1723,19 +1742,32 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
+  // A cloaked ship cannot be ambushed, so (by default) it may ignore both
+  // pirates and blacklisted systems while cloaked. Both behaviors are
+  // toggleable: a routine can pass either option as `false` to disable.
+  const ignorePiratesWhenCloaked = opts.ignorePiratesWhenCloaked !== false;
+  const ignoreBlacklistWhenCloaked = opts.ignoreBlacklistWhenCloaked !== false;
   // Fleet hunters BYPASS blacklist — they MUST enter pirate systems.
-  // A cloaked ship also bypasses the blacklist (cloaking alone is enough).
-  const blacklist = (opts.skipBlacklist || bot.isCloaked) ? [] : getSystemBlacklist();
+  // A cloaked ship also bypassses the blacklist (cloaking alone is enough)
+  // unless the routine explicitly opted out via ignoreBlacklistWhenCloaked.
+  const blacklist = (opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked)) ? [] : getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
+    // If the socket dropped (server restart / blip), pause here until it's back
+    // rather than hammering route queries / jumps against a dead connection.
+    // The dispatch layer also blocks per-command, so this is defense-in-depth.
+    if (!bot.isConnected()) {
+      const reconnected = await waitForReconnect(ctx);
+      if (!reconnected) return false;
+    }
     await bot.refreshLocation();
     // Case-insensitive comparison for system names (handle underscore vs space)
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
@@ -1777,9 +1809,9 @@ export async function navigateToSystem(
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
-        
-        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
-        
+
+        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
+
         if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
         } else if (blacklistedOnRoute && bypassBlacklist) {
@@ -1843,7 +1875,7 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || bot.isCloaked });
+     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked) });
      if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
@@ -1886,8 +1918,8 @@ export async function navigateToSystem(
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
-        
-        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
+
+        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
         
         if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
@@ -2065,7 +2097,8 @@ export async function navigateToSystem(
         errorMsg.includes("you are already in") || // Already at destination - treat as success
         errorMsg.includes("mid-jump") || // Already in a jump - wait for it to complete
         errorMsg.includes("mid-travel") || // Already traveling - wait for it to complete
-        errorMsg.includes("already in transit"); // Generic in-transit error
+        errorMsg.includes("already in transit") || // Generic in-transit error
+        isConnectionError(errorMsg); // Socket dropped (server restart / blip) - wait + retry, never permanent-fail
 
       if (!isTransient) {
         // Permanent error - don't retry
@@ -2168,9 +2201,11 @@ export async function navigateToSystem(
       return false; // Aborted navigation due to battle
     }
 
-    // Check for pirates in the new system and flee if detected
-    // Hunters (skipBlacklist) intentionally enter pirate systems — do NOT flee
-    if (!opts.skipBlacklist) {
+    // Check for pirates in the new system and flee if detected.
+    // Cloaked ships cannot be ambushed, so (by default) a cloaked bot with
+    // ignorePiratesWhenCloaked ignores pirates. Hunters (skipBlacklist)
+    // intentionally enter pirate systems — do NOT flee.
+    if (!opts.skipBlacklist && !(ignorePiratesWhenCloaked && bot.isCloaked)) {
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         bot.trackWildlife(nearbyResp.result);

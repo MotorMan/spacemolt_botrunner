@@ -21,6 +21,7 @@ import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
+import { isConnectionError } from "./connection.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -183,6 +184,17 @@ docked = false;
   /** Whether the bot's ship is dead (hull <= 0). */
   isDead = false;
 
+  /**
+   * Set when the library reports this account's socket is gone for good
+   * (terminal close: `session_replaced` 4001 / `auth_timeout` 4002, or reconnect
+   * retries exhausted). Unlike a routine server-restart blip — which the library
+   * auto-reconnects in place and flips `authenticated` back to true — a terminal
+   * close means this bot is connected ELSEWHERE and can never send commands here.
+   * The dispatch layer uses this to stop waiting for a reconnect that will never
+   * come, so the running routine ends cleanly instead of blocking forever.
+   */
+  private _terminalClosed = false;
+
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -341,16 +353,20 @@ docked = false;
   }
 
   /**
-   * Install a measurement-only shim over this bot's library `Account.send` so
-   * every outbound command is timed by the metrics module. This adds NO delay
-   * or throttling — it wraps the call, records latency / in-flight concurrency /
-   * error category, and returns the result (or rethrows) untouched.
+   * Install a measurement + connection-loss wrapper over this bot's library
+   * `Account.send`. This is the ONE chokepoint every outbound command funnels
+   * through — both `Bot.libExec` AND the direct `bot.commands.spacemolt.*()`
+   * calls the routines make (hundreds of sites) call `account.send` underneath.
    *
-   * The library builds its whole `commands` facade on top of `account.send`
-   * (`buildCommands((t,a,p) => this.send(t,a,p))`), so wrapping `send` is the one
-   * chokepoint that catches both `Bot.libExec` and the direct
-   * `bot.commands.spacemolt.*()` calls the routines make. Idempotent (tagged
-   * with `_instrumented`) so a reconnect that swaps in a fresh `Account` and the
+   * The wrapper times each attempt (measureSend) and, crucially, makes the
+   * socket drop transparent to callers: if `send` throws a connection error
+   * ("cannot send on a closed socket" / "WebSocket connection closed") the
+   * command was NEVER delivered to the server, so it is always safe to resend
+   * it once the socket is back. We block and retry the exact same call until
+   * the library reconnects (account.authenticated flips true again) — so a
+   * routine survives a server patch restart / network blip instead of
+   * permanently failing and leaving the bot idle (== death). Idempotent
+   * (`_instrumented`) so a reconnect that swaps in a fresh `Account` and the
    * constructor never double-wrap.
    */
   instrumentSend(): void {
@@ -362,9 +378,48 @@ docked = false;
     };
     if (tagged._instrumented) return;
     const originalSend = account.send.bind(account);
-    tagged.send = (tool: string, action: string, payload?: Record<string, unknown>) =>
-      measureSend(() => originalSend(tool, action, payload));
+    const self = this;
+    tagged.send = (tool, action, payload) =>
+      self.sendResilient(tool, action, payload, originalSend);
     tagged._instrumented = true;
+  }
+
+  /**
+   * Resilient `account.send`: on a transport/connection error, pause until the
+   * library reconnects, then resend the same command. Used by the `instrumentSend`
+   * wrapper so it covers EVERY command path (libExec and direct bot.commands.*).
+   * Returns the result, or throws (the original error) only when the wait is
+   * aborted (bot stopped) or the connection is terminal (player connected
+   * elsewhere) — in which case the caller should end the routine cleanly.
+   */
+  private async sendResilient(
+    tool: string,
+    action: string,
+    payload: Record<string, unknown> | undefined,
+    rawSend: (t: string, a: string, p?: Record<string, unknown>) => Promise<unknown>,
+  ): Promise<unknown> {
+    let connectionWaitCount = 0;
+    for (;;) {
+      try {
+        return await measureSend(() => rawSend(tool, action, payload));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (!isConnectionError(message)) throw err;
+        if (this.state === "stopping" || this._abortController?.signal.aborted) {
+          throw err;
+        }
+        connectionWaitCount++;
+        this.log("warn", `Disconnected (${message}) — pausing ${tool}/${action} until the socket reconnects (wait #${connectionWaitCount})`);
+        const reconnected = await this.waitForReconnect();
+        if (!reconnected) {
+          // Stopped, or the connection is gone for good (player connected
+          // elsewhere). Stop retrying; surface the error so the routine ends.
+          // The botmanager's terminal-close guard then prevents an auto-restart.
+          throw err;
+        }
+        this.log("system", `Reconnected — resending ${tool}/${action}`);
+      }
+    }
   }
 
   async initCraftQueueTracker(): Promise<void> {
@@ -708,8 +763,17 @@ docked = false;
 
     const { tool, action, body } = buildLibDispatch(command, payload);
 
+    const acct = this.account;
+    if (!acct) {
+      return { error: { code: "no_account", message: "Library account not connected" }, result: undefined, notifications: [] };
+    }
+
+    // account.send is instrumented (see instrumentSend) with connection-loss
+    // resilience: if the socket drops mid-command it blocks and resends once
+    // the library reconnects, so a routine never sees a transient disconnect
+    // as a failure. We only handle genuine, non-connection errors here.
     try {
-      const res = await account.send(tool, action, body);
+      const res = await acct.send(tool, action, body);
       const result = extractLibResult(res);
       return { result, error: undefined, notifications: [] };
     } catch (err) {
@@ -734,6 +798,56 @@ docked = false;
       this.log("error", `libExec ${command} failed: ${message}`);
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
     }
+  }
+
+  /**
+   * Poll until this bot's library socket is authenticated again, the bot is
+   * stopped, or the connection is terminal (player connected elsewhere).
+   * Returns true if reconnected (so the caller should resend), false if the
+   * caller should stop waiting and end the routine.
+   *
+   * We key off `account.authenticated` rather than a fixed delay: the library
+   * auto-reconnects in place for ordinary drops (its `reconnectOnce` flips
+   * `authenticated` true again), and only a terminal close leaves it false for
+   * good — which we detect via `_terminalClosed` (set by the account's
+   * `onDisconnected` listener in subscribeEvents).
+   */
+  private waitForReconnect(): Promise<boolean> {
+    const self = this;
+    let lastThrottle = 0;
+    return new Promise<boolean>((resolve) => {
+      const check = () => {
+        if (self.state === "stopping" || self._abortController?.signal.aborted) {
+          clearInterval(poll);
+          resolve(false);
+          return;
+        }
+        if (self._terminalClosed) {
+          clearInterval(poll);
+          self.log("error", "Connection closed permanently (account connected elsewhere) — ending routine.");
+          resolve(false);
+          return;
+        }
+        const acct = self.account;
+        if (acct && acct.authenticated) {
+          clearInterval(poll);
+          resolve(true);
+          return;
+        }
+        const now = Date.now();
+        if (now - lastThrottle > 30000) {
+          lastThrottle = now;
+          self.log("warn", "Still disconnected — waiting for the socket to reconnect before issuing more commands...");
+        }
+      };
+      const poll = setInterval(check, 1000);
+      check();
+    });
+  }
+
+  /** Public alias routines can call to explicitly pause until reconnected. */
+  async waitForSocket(): Promise<boolean> {
+    return this.waitForReconnect();
   }
 
   /**
@@ -791,6 +905,24 @@ docked = false;
       "base_destroyed",
       "base_raid_update",
     );
+
+    // Track terminal closes (the player is connected elsewhere / reconnect gave
+    // up). A routine server-restart blip is NOT terminal — the library
+    // auto-reconnects in place and flips `authenticated` back to true, so the
+    // dispatch layer just waits for that. A terminal close never reconnects, so
+    // `waitForReconnect` checks this flag and stops blocking so the routine can
+    // end gracefully. This single-slot listener is otherwise unused (the
+    // botrunner keys off the client-level `onAccountDisconnected`), so setting
+    // it here is safe.
+    this._terminalClosed = false;
+    try {
+      (account as unknown as { onDisconnected?: (cb: (err: unknown) => void) => void }).onDisconnected?.(() => {
+        this._terminalClosed = true;
+      });
+      (account as unknown as { onReconnected?: (cb: () => void) => void }).onReconnected?.(() => {
+        this._terminalClosed = false;
+      });
+    } catch { /* listener registration is best-effort */ }
 
     // Realtime market order-book updates feed the stream store + dashboard cache.
     // Only subscribed for routines that actually deal with trade (explorer/trader)

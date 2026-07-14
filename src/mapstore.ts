@@ -230,6 +230,30 @@ export interface MapData {
   };
 }
 
+// ── Station identity cross-referencing ─────────────────────
+//
+// A station can be referenced several ways: by its POI hex id (e.g.
+// "d1c54e3a473f4d3ce9c7603c5e0c6b38"), by its friendly POI name (e.g.
+// "crosshaven_station"), by its base id/name, or as a "system|poi" pair. The
+// game occasionally reports a station only as an unresolved hex id, while the
+// user's config may use a friendly name (or vice versa). Comparing those
+// references with a raw string equality check makes the bot think it is NOT at
+// the destination and can misroute or lose cargo. These helpers resolve any
+// station reference into a single canonical identity (carrying BOTH the hex id
+// and the friendly name) and compare two references so that a hex id and a name
+// that point at the same station are treated as equal.
+
+export interface ResolvedStation {
+  /** Resolved system id, or null if unknown. */
+  systemId: string | null;
+  /** Resolved POI hex id, or the raw token if unresolved. */
+  poiId: string | null;
+  /** Resolved friendly POI name, or null if not known. */
+  poiName: string | null;
+  /** True if the reference matched a POI in the map. */
+  matched: boolean;
+}
+
 // ── MapStore singleton ──────────────────────────────────────
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -2355,6 +2379,129 @@ const locations = this.findOreLocations(oreId, blacklist);
   /** Return the full systems map for the web dashboard. */
   getAllSystems(): Record<string, StoredSystem> {
     return this.data.systems;
+  }
+
+  // ── Station identity cross-referencing ───────────────────
+
+  /**
+   * Resolve a station reference into a canonical identity carrying BOTH the POI
+   * hex id and the friendly POI name (when known). The reference may be:
+   *   - "system|poi"        (e.g. "crosshaven|d1c54e3a...")
+   *   - "system|name"       (e.g. "crosshaven|crosshaven_station")
+   *   - "poi" (hex or name) e.g. "d1c54e3a..." or "crosshaven_station"
+   *   - a bare system id     (no POI)
+   * If nothing in the map matches (e.g. an unresolved hex id the server hasn't
+   * fully described yet), the raw token is preserved in `poiId` so callers can
+   * still compare/travel. This is what lets a hex id and a friendly name for the
+   * same station be treated as equal.
+   */
+  resolveStationIdentity(stationRef: string): ResolvedStation {
+    if (!stationRef) return { systemId: null, poiId: null, poiName: null, matched: false };
+
+    let systemPart: string | null = null;
+    let token = stationRef;
+    if (stationRef.includes("|")) {
+      const parts = stationRef.split("|");
+      systemPart = (parts[0] || "").trim() || null;
+      token = (parts[1] || parts[0] || "").trim();
+    }
+    if (!token) return { systemId: systemPart, poiId: null, poiName: null, matched: false };
+
+    const tokenLower = token.toLowerCase();
+
+    const poiMatches = (poi: StoredPOI): boolean =>
+      poi.id.toLowerCase() === tokenLower ||
+      (poi.base_id !== null && poi.base_id.toLowerCase() === tokenLower) ||
+      (poi.name !== null && poi.name.toLowerCase() === tokenLower) ||
+      (poi.base_name !== null && poi.base_name.toLowerCase() === tokenLower);
+
+    // 1) Preferred: search within the named system first.
+    if (systemPart) {
+      const sys = this.getSystem(systemPart);
+      const poi = sys?.pois.find(poiMatches);
+      if (poi) {
+        return { systemId: sys!.id, poiId: poi.id, poiName: poi.name, matched: true };
+      }
+    }
+
+    // 2) Global search by poi id / base id / name (handles a stale or missing
+    //    system part, and resolves an unresolved hex id to its friendly name).
+    for (const sys of this.getSystems()) {
+      const poi = sys.pois.find(poiMatches);
+      if (poi) {
+        return { systemId: sys.id, poiId: poi.id, poiName: poi.name, matched: true };
+      }
+    }
+
+    // 3) A bare token that is itself a known system (no POI specified).
+    if (!systemPart) {
+      const asSystem = this.getSystem(token);
+      if (asSystem) {
+        return { systemId: asSystem.id, poiId: null, poiName: null, matched: true };
+      }
+    }
+
+    // 4) Unresolved — preserve the raw token so the caller can still travel to
+    //    / compare against it.
+    return { systemId: systemPart, poiId: token, poiName: null, matched: false };
+  }
+
+  /**
+   * Return the best POI token to hand to commands like `travel`/`dock` for the
+   * given station reference. Prefers the resolved POI hex id (what the server
+   * expects), falling back to the friendly name, then to the raw token.
+   */
+  resolveStationTarget(stationRef: string): string {
+    const resolved = this.resolveStationIdentity(stationRef);
+    if (resolved.matched && resolved.poiId) return resolved.poiId;
+    if (stationRef.includes("|")) {
+      const parts = stationRef.split("|");
+      return (parts[1] || parts[0] || "").trim();
+    }
+    return stationRef;
+  }
+
+  /**
+   * Compare two station references and return true if they point at the SAME
+   * station, matching on either the hex POI id OR the friendly POI name (and
+   * respecting system when both sides know their system). This is safe against
+   * the game intermittently reporting a station as an unresolved hex id while
+   * the config uses its friendly name.
+   */
+  sameStation(a: string, b: string): boolean {
+    if (!a || !b) return false;
+    if (a.toLowerCase() === b.toLowerCase()) return true;
+
+    const ra = this.resolveStationIdentity(a);
+    const rb = this.resolveStationIdentity(b);
+
+    // If neither resolved to the map, fall back to a raw token compare.
+    if (!ra.matched && !rb.matched) {
+      return a.toLowerCase() === b.toLowerCase();
+    }
+
+    // System compatibility: if both sides know their system and they differ,
+    // they are not the same station.
+    if (ra.systemId && rb.systemId &&
+        ra.systemId.toLowerCase() !== rb.systemId.toLowerCase()) {
+      return false;
+    }
+
+    const na = (ra.poiName || "").toLowerCase();
+    const nb = (rb.poiName || "").toLowerCase();
+
+    // Strongest signal: POI hex id match (works even when names are blank).
+    if (ra.poiId && rb.poiId &&
+        ra.poiId.toLowerCase() === rb.poiId.toLowerCase()) return true;
+
+    // Friendly name match.
+    if (na && nb && na === nb) return true;
+
+    // Cross check: one side resolved to an id, the other to a name that equals it.
+    if (ra.poiId && nb && ra.poiId.toLowerCase() === nb) return true;
+    if (rb.poiId && na && rb.poiId.toLowerCase() === na) return true;
+
+    return false;
   }
 
   // ── Mobile Capitol Tracking ───────────────────────────────

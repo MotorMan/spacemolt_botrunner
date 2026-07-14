@@ -31988,6 +31988,9 @@ ignoreBlacklist: document.getElementById(
         const syncRescue = cs.syncRescue !== false;
         const allowRemoteBots = cs.allowRemoteBotsInDropdowns !== false;
         const pushLocalDiscoveries = cs.pushLocalDiscoveries !== false;
+        const remoteBotNameStyle = cs.remoteBotNameStyle || "prefix";
+        const selfUrl = cs.selfUrl || "";
+        const syncWildlife = cs.syncWildlife !== false;
 
         if (mode === "master" && !apiKey) {
           // No key present yet (e.g. first-time master). Generate one locally
@@ -32097,6 +32100,14 @@ ignoreBlacklist: document.getElementById(
 
         <div class="setting-row">
           <div>
+            <div class="setting-label">Self URL</div>
+            <div class="setting-hint">Optional public URL of this client so the master can reach back (e.g., http://192.168.1.101:3000).</div>
+          </div>
+          <input type="text" id="set-client_sync-selfUrl" value="${esc(selfUrl)}" placeholder="http://host:port" style="width:200px">
+        </div>
+
+        <div class="setting-row">
+          <div>
             <div class="setting-label">Connection Status</div>
             <div class="setting-hint">Current sync status. Auto-refreshes every 5s.</div>
           </div>
@@ -32108,8 +32119,12 @@ ignoreBlacklist: document.getElementById(
         </div>
       </div>
 
-      <div id="clientSyncOptionsPanel" style="${mode === "slave" ? "" : "display:none"}">
+      <div id="clientSyncOptionsPanel" style="${mode !== "disabled" ? "" : "display:none"}">
         <div style="margin-top:8px;margin-bottom:4px;font-size:13px;font-weight:500;color:var(--text-bright)">Sync Options</div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Map</div></div>
+          <input type="checkbox" id="set-client_sync-syncMap" ${syncMap ? "checked" : ""}>
+        </div>
         <div class="setting-row">
           <div><div class="setting-label">Sync Market</div></div>
           <input type="checkbox" id="set-client_sync-syncMarket" ${syncMarket ? "checked" : ""}>
@@ -32146,6 +32161,20 @@ ignoreBlacklist: document.getElementById(
           <div><div class="setting-label">Push Local Discoveries</div></div>
           <input type="checkbox" id="set-client_sync-pushLocalDiscoveries" ${pushLocalDiscoveries ? "checked" : ""}>
         </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Wildlife</div></div>
+          <input type="checkbox" id="set-client_sync-syncWildlife" ${syncWildlife ? "checked" : ""}>
+        </div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Remote Bot Name Style</div>
+            <div class="setting-hint">How remote bots are labeled (prefix/suffix with their client label).</div>
+          </div>
+          <select id="set-client_sync-remoteBotNameStyle">
+            <option value="prefix" ${remoteBotNameStyle === "prefix" ? "selected" : ""}>Prefix</option>
+            <option value="suffix" ${remoteBotNameStyle === "suffix" ? "selected" : ""}>Suffix</option>
+          </select>
+        </div>
       </div>
 
       <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
@@ -32176,7 +32205,7 @@ ignoreBlacklist: document.getElementById(
         document.getElementById("clientSyncSlavePanel").style.display =
           mode === "slave" ? "" : "none";
         document.getElementById("clientSyncOptionsPanel").style.display =
-          mode === "slave" ? "" : "none";
+          mode === "disabled" ? "none" : "";
         if (mode === "master") refreshClientSyncConnectedClients();
       }
 
@@ -32331,8 +32360,7 @@ ignoreBlacklist: document.getElementById(
                 document.getElementById("set-client_sync-pollIntervalSec")
                   .value,
               ) || 15,
-            syncMap:
-              !settings.clientSync || settings.clientSync.syncMap !== false,
+            syncMap: document.getElementById("set-client_sync-syncMap").checked,
             syncMarket: document.getElementById("set-client_sync-syncMarket")
               .checked,
             syncCatalog: document.getElementById("set-client_sync-syncCatalog")
@@ -32352,12 +32380,18 @@ ignoreBlacklist: document.getElementById(
             ).checked,
             syncRescue: document.getElementById("set-client_sync-syncRescue")
               .checked,
+            syncWildlife: document.getElementById("set-client_sync-syncWildlife")
+              .checked,
             allowRemoteBotsInDropdowns: document.getElementById(
               "set-client_sync-allowRemoteBotsInDropdowns",
             ).checked,
+            remoteBotNameStyle:
+              document.getElementById("set-client_sync-remoteBotNameStyle")
+                ?.value || "prefix",
             pushLocalDiscoveries: document.getElementById(
               "set-client_sync-pushLocalDiscoveries",
             ).checked,
+            selfUrl: document.getElementById("set-client_sync-selfUrl").value,
           },
         };
         settings = Object.assign({}, settings, newSettings);

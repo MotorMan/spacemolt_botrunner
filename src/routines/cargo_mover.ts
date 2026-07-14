@@ -43,6 +43,7 @@ import {
   getLastSession,
   startItemProgress,
   updateItemProgress,
+  getItemProgress,
   createMovement,
   updateMovement,
   completeMovement,
@@ -64,6 +65,7 @@ import {
   addInTransitItems,
   removeInTransitItems,
   getInTransitQuantity,
+  getInTransitSummary,
   cleanupStaleInTransit,
 } from "./cargoMoverInTransit.js";
 
@@ -712,9 +714,15 @@ function findMoveJobs(
   ctx.log("cargo", `findMoveJobs: bot.storage has ${bot.storage.length} items, bot.factionStorage has ${bot.factionStorage.length} items`);
 
   for (const configItem of settings.items) {
-    // Skip if item has reached its delivery target (totalDelivered >= totalToDeliver)
+    // Delivered progress = max of persisted settings count and activity-log
+    // progress (robust across restarts / manual edits).
+    const delivered = Math.max(
+      configItem.totalDelivered || 0,
+      getItemProgress(bot.username, configItem.itemId)?.totalDelivered || 0,
+    );
+
+    // Skip if this item's delivery target (if configured) is already met.
     if (configItem.totalToDeliver !== undefined && configItem.totalToDeliver > 0) {
-      const delivered = configItem.totalDelivered || 0;
       if (delivered >= configItem.totalToDeliver) {
         ctx.log("cargo", `  ${configItem.itemName}: delivery target reached (${delivered}/${configItem.totalToDeliver}) — skipping`);
         continue;
@@ -750,11 +758,18 @@ function findMoveJobs(
     
     const alreadyClaimed = getBotClaimedQuantity(bot.username, configItem.itemId);
 
-    // Calculate effective target considering items already in transit
-    const baseTargetQty = configItem.quantity > 0 ? configItem.quantity : availableQty;
-    const effectiveTargetQty = Math.max(0, baseTargetQty - inTransitQty);
+    // Target = configured quantity (or totalToDeliver if set), minus what's
+    // already delivered and what's already in transit. This way we never assume
+    // every configured item is still at the source — in-transit items are already
+    // loaded (possibly in another mover's hold) and must not be re-moved.
+    const deliveryTarget =
+      (configItem.totalToDeliver && configItem.totalToDeliver > 0)
+        ? configItem.totalToDeliver
+        : (configItem.quantity > 0 ? configItem.quantity : 0);
+    const baseTargetQty = deliveryTarget > 0 ? deliveryTarget : availableQty;
+    const effectiveTargetQty = Math.max(0, baseTargetQty - delivered - inTransitQty);
 
-    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
+    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
       const blacklist = getSystemBlacklist();
@@ -989,12 +1004,50 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     ctx.log("cargo", `📦 Cargo Mover Cycle Starting`);
     ctx.log("cargo", `   Source: ${settings.sourceStation}`);
     ctx.log("cargo", `   Destination: ${settings.destinationStation} (${settings.destinationStorageType})`);
-    ctx.log("cargo", `   Items to move: ${settings.items.length}`);
+    ctx.log("cargo", `   Items configured: ${settings.items.length}`);
+
+    // Robust plan accounting: consult the activity log (delivered) and the shared
+    // in-transit tracking ("who has what" across all movers) so the routine never
+    // assumes every configured item is still sitting at the source. Items already
+    // in transit have been withdrawn and are en route / in another bot's hold.
+    const inTransitSummary = getInTransitSummary();
+    let planInTransit = 0;
+    let planDelivered = 0;
+    let planRemaining = 0;
     for (const item of settings.items) {
-      const delivered = item.totalDelivered || 0;
-      const target = item.totalToDeliver || '∞';
-      ctx.log("cargo", `     - ${item.itemName}: ${item.quantity || 'all'} from ${item.storageType || 'faction'} [${delivered}/${target} delivered]`);
+      const effectiveDest = item.shipLoadoutDestination || settings.destinationStation;
+      const configured = item.quantity || 0;
+      // Delivered = max of persisted settings count and activity-log progress
+      // (robust across restarts / manual edits / multiple movers).
+      const delivered = Math.max(
+        item.totalDelivered || 0,
+        getItemProgress(bot.username, item.itemId)?.totalDelivered || 0,
+      );
+      const inTransitAll = getInTransitQuantity(item.itemId, effectiveDest);
+      const inTransitSelf = getInTransitQuantity(item.itemId, effectiveDest, bot.username);
+      const inTransitOthers = Math.max(0, inTransitAll - inTransitSelf);
+
+      // "Who has what" breakdown for multi-mover visibility.
+      const destEntries = inTransitSummary.itemsByDestination[effectiveDest] || [];
+      const byBot = destEntries
+        .filter((e) => e.itemId === item.itemId)
+        .map((e) => `${e.botUsername}=${e.quantity}`);
+
+      const remaining = configured > 0
+        ? Math.max(0, configured - inTransitAll - delivered)
+        : null;
+
+      planInTransit += inTransitAll;
+      planDelivered += delivered;
+      if (remaining !== null) planRemaining += remaining;
+
+      const whoPart = byBot.length > 0
+        ? `inTransit: ${byBot.join(", ")}`
+        : `inTransit: 0 (you ${inTransitSelf})`;
+      const remainPart = remaining === null ? "all (storage-based)" : `${remaining} remaining`;
+      ctx.log("cargo", `     - ${item.itemName}: target=${configured || "all"} | delivered=${delivered} | ${whoPart} | ${remainPart}`);
     }
+    ctx.log("cargo", `   Plan → inTransit(all movers)=${planInTransit}, delivered=${planDelivered}, remaining-to-move=${planRemaining}`);
     ctx.log("cargo", `═══════════════════════════════════════════════════════`);
 
     if (settings.items.length === 0) {

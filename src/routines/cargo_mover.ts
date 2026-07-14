@@ -33,6 +33,7 @@ import {
   fleeFromBattle,
   getItemSize,
   maxItemsForCargo,
+  enableCloakingIfPossible,
   type BattleState,
 } from "./common.js";
 import {
@@ -111,6 +112,7 @@ interface CargoMoverSettings {
   factionStorageBot?: string;
   refuelThreshold: number;
   repairThreshold: number;
+  militaryFuelCells: number;
 }
 
 function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -151,6 +153,7 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
     factionStorageBot: (t.factionStorageBot as string) || '',
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
+    militaryFuelCells: (t.militaryFuelCells as number) || 10,
   };
 }
 
@@ -232,6 +235,121 @@ interface MoveJob {
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
   return Math.max(0, bot.cargoMax - bot.cargo);
+}
+
+/** Re-cloak the ship whenever it is undocked and has a cloak module.
+ * Returns true if the bot ended up cloaked. The `warnedNoCloak` ref is used to
+ * emit the "no module" warning only once per session so the log stays clean. */
+async function ensureCloaked(
+  ctx: RoutineContext,
+  warnedNoCloak: { warned: boolean },
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Cannot cloak while docked — nothing to do right now.
+  if (bot.docked) return bot.isCloaked;
+
+  if (bot.isCloaked) {
+    logCargoActivity(bot.username, "cloak", "Cloak already active", {
+      location: `${bot.system}/${bot.poi}`,
+    });
+    return true;
+  }
+
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    logCargoActivity(bot.username, "cloak", "Cloaking enabled (ship has cloak module)", {
+      location: `${bot.system}/${bot.poi}`,
+    });
+  } else if (!warnedNoCloak.warned) {
+    warnedNoCloak.warned = true;
+    logCargoActivity(bot.username, "cloak", "No cloaking module available — could not cloak", {
+      location: `${bot.system}/${bot.poi}`,
+    });
+  }
+  return cloaked;
+}
+
+/** Undock and re-cloak (if undocked). Use before any jump/travel so the ship is
+ * always cloaked while in transit whenever a cloak module is present. */
+async function undockForTravel(
+  ctx: RoutineContext,
+  warnedNoCloak: { warned: boolean },
+): Promise<void> {
+  await ensureUndocked(ctx);
+  await ensureCloaked(ctx, warnedNoCloak);
+}
+
+/** Ensure the bot carries the user-configured number of military fuel cells
+ * (default 10). These power in-transit refueling and are NEVER delivered to the
+ * destination (fuel cells are excluded from deposits). Loads from faction
+ * storage first, then falls back to buying from the market. */
+async function ensureMilitaryFuelCells(
+  ctx: RoutineContext,
+  targetCount: number,
+): Promise<number> {
+  const { bot } = ctx;
+  if (targetCount <= 0) return 0;
+
+  await bot.refreshCargo();
+  const have = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
+  if (have >= targetCount) {
+    ctx.log("cargo", `✅ Already carrying ${have}x military_fuel_cell (target ${targetCount})`);
+    return have;
+  }
+
+  const needed = targetCount - have;
+  ctx.log("cargo", `🔋 Loading ${needed}x military_fuel_cell (have ${have}/${targetCount})...`);
+  logCargoActivity(bot.username, "fuel_cells", `Loading ${needed}x military_fuel_cell for trip (have ${have}/${targetCount})`, {
+    location: `${bot.system}/${bot.poi}`,
+    quantity: needed,
+  });
+
+  // Try faction storage first (move faction → station → cargo).
+  const inFaction = bot.factionStorage.find((i) => i.itemId === "military_fuel_cell");
+  if (inFaction && inFaction.quantity > 0) {
+    const qty = Math.min(needed, inFaction.quantity);
+    const fResp = await bot.exec("storage", {
+      action: "deposit",
+      target: "self",
+      item_id: "military_fuel_cell",
+      quantity: qty,
+      source: "faction",
+    });
+    if (!fResp.error) {
+      await bot.refreshStorage();
+      const wResp = await bot.exec("withdraw_items", { item_id: "military_fuel_cell", quantity: qty });
+      if (!wResp.error) {
+        await bot.refreshCargo();
+      }
+    }
+  }
+
+  // Fallback: buy from the market.
+  const haveAfterFaction = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
+  if (haveAfterFaction < targetCount) {
+    const stillNeed = targetCount - haveAfterFaction;
+    const buyResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: stillNeed });
+    if (!buyResp.error) {
+      await bot.refreshCargo();
+    } else {
+      ctx.log("warn", `Could not buy military_fuel_cell from market: ${buyResp.error.message}`);
+    }
+  }
+
+  const finalHave = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
+  if (finalHave >= targetCount) {
+    logCargoActivity(bot.username, "fuel_cells", `Military fuel cells loaded to target ${finalHave}/${targetCount}`, {
+      location: `${bot.system}/${bot.poi}`,
+      quantity: finalHave,
+    });
+  } else {
+    logCargoActivity(bot.username, "fuel_cells", `Only loaded ${finalHave}/${targetCount} military_fuel_cell (source low)`, {
+      location: `${bot.system}/${bot.poi}`,
+      quantity: finalHave,
+    });
+  }
+  return finalHave;
 }
 
 /** Withdraw items from specified storage type into cargo. */
@@ -783,6 +901,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     lastFleeTime: undefined,
   };
 
+  // Session-scoped flag so the "no cloak module" warning is only emitted once.
+  const warnedNoCloak: { warned: boolean } = { warned: false };
+
+  // Startup: attempt to cloak immediately if we're already undocked (a cloak
+  // module, if present, is always enabled). If docked, we'll cloak as soon as
+  // we undock to travel.
+  if (!bot.docked) {
+    await ensureCloaked(ctx, warnedNoCloak);
+  }
+
   while (bot.state === "running") {
 
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -934,7 +1062,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       yield "recover_cargo_delivery";
 
       // Ensure we're undocked and fueled
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx, warnedNoCloak);
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         return;
@@ -973,7 +1101,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       }
 
       // Travel to destination station
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx, warnedNoCloak);
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         return;
@@ -1064,6 +1192,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         continue;
       }
       ctx.log("cargo", `✅ Docked at destination station ${settings.destinationStation}`);
+      logCargoActivity(bot.username, "arrived_destination", `Cargo (recovered) arrived at destination ${settings.destinationStation} — preparing to unload`, {
+        location: `${bot.system}/${settings.destinationStation}`,
+      });
 
       // Deliver all cargo
       yield "deposit_items";
@@ -1138,7 +1269,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         settings.items.map(i => ({ itemId: i.itemId, itemName: i.itemName, quantity: i.quantity, storageType: i.storageType || 'faction' })),
         0, "navigating_to_source", bot.system, bot.poi || "", bot.docked);
       
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx, warnedNoCloak);
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during navigation to source", {
@@ -1187,7 +1318,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         settings.items.map(i => ({ itemId: i.itemId, itemName: i.itemName, quantity: i.quantity, storageType: i.storageType || 'faction' })),
         0, "docking_at_source", bot.system, bot.poi || "", bot.docked);
       
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx, warnedNoCloak);
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during source station approach", {
@@ -1263,6 +1394,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       ctx.log("cargo", `🔧 Performing maintenance at source station...`);
       await tryRefuel(ctx);
       await repairShip(ctx);
+      // Load the user-configured number of military fuel cells for the trip.
+      // These are never delivered and power in-transit refueling.
+      await bot.refreshFactionStorage();
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
     }
 
     // Clear unrelated cargo items to FACTION storage (not personal) so other bots can access them
@@ -1376,8 +1511,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     let consecutiveFailures = 0;
     const maxConsecutiveFailures = jobs.length; // One full pass through all jobs
     
-    // Track cargo manually to avoid stale bot.cargo issues
-    let cargoUsed = 0;
+    // Track cargo manually to avoid stale bot.cargo issues.
+    // Seed with current cargo so pre-loaded items (e.g. military fuel cells)
+    // are accounted for and we never overfill the hold.
+    let cargoUsed = bot.cargo;
     const cargoMax = bot.cargoMax;
     
     while (bot.state === "running") {
@@ -1464,6 +1601,13 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         jobRemaining.set(job.itemId, newRemaining);
         totalMoved += withdrawResult.withdrawnQty;
         ctx.log("cargo", `✅ Loaded ${withdrawResult.withdrawnQty}x ${job.itemName} (${newRemaining} remaining, cargo: ${cargoUsed}/${cargoMax})`);
+        // Robust milestone log: item is now physically in the cargo hold.
+        logCargoActivity(bot.username, "cargo_loaded", `Loaded ${withdrawResult.withdrawnQty}x ${job.itemName} into cargo (${newRemaining} remaining to load)`, {
+          itemId: job.itemId,
+          itemName: job.itemName,
+          quantity: withdrawResult.withdrawnQty,
+          location: `${bot.system}/${bot.poi}`,
+        });
         loadedThisIteration = true;
 
         // Update item progress tracking
@@ -1519,7 +1663,13 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (loadedItems.length > 0) {
       addInTransitItems(bot.username, settings.destinationStation, loadedItems);
-      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${loadedItems.reduce((sum, i) => sum + i.quantity, 0)} total items)`);
+      const totalInTransit = loadedItems.reduce((sum, i) => sum + i.quantity, 0);
+      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${totalInTransit} total items) → ${settings.destinationStation}`);
+      // Robust milestone log: cargo has left the source and is now in transit.
+      logCargoActivity(bot.username, "in_transit", `Cargo in transit: ${totalInTransit} items heading to ${settings.destinationStation}`, {
+        location: `${bot.system}/${bot.poi}`,
+        quantity: totalInTransit,
+      });
     }
 
     // Now travel to destination and deliver what we loaded
@@ -1534,7 +1684,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       location: `${bot.system} → ${destSystem}`,
     });
     
-    await ensureUndocked(ctx);
+    await undockForTravel(ctx, warnedNoCloak);
     if (bot.state !== "running") {
       ctx.log("system", "⛔ Stopping — emergency detected");
       logCargoActivity(bot.username, "interruption", "Emergency detected before delivery travel", {
@@ -1576,7 +1726,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
     }
 
-    await ensureUndocked(ctx);
+    await undockForTravel(ctx, warnedNoCloak);
     if (bot.state !== "running") {
       ctx.log("system", "⛔ Stopping — emergency detected");
       logCargoActivity(bot.username, "interruption", "Emergency detected during destination approach", {
@@ -1765,6 +1915,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     logCargoActivity(bot.username, "dock", `Docked at destination station ${settings.destinationStation}`, {
       location: `${bot.system}/${settings.destinationStation}`,
     });
+    // Robust milestone log: cargo has physically arrived at the destination.
+    logCargoActivity(bot.username, "arrived_destination", `Cargo arrived at destination ${settings.destinationStation} — preparing to unload`, {
+      location: `${bot.system}/${settings.destinationStation}`,
+    });
 
     yield "deposit_items";
 
@@ -1938,7 +2092,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel back to source system if needed
     if (bot.system !== sourceSystem) {
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx, warnedNoCloak);
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during return to source", {
@@ -1979,7 +2133,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     // Travel to source station and dock
-    await ensureUndocked(ctx);
+    await undockForTravel(ctx, warnedNoCloak);
     if (bot.state !== "running") {
       ctx.log("system", "⛔ Stopping — emergency detected");
       logCargoActivity(bot.username, "interruption", "Emergency detected during return to source station", {

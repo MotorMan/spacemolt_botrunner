@@ -27588,6 +27588,7 @@ ignoreBlacklist: document.getElementById(
         const items = cm.items || [];
         const refuelThreshold = cm.refuelThreshold ?? 50;
         const repairThreshold = cm.repairThreshold ?? 40;
+        const militaryFuelCells = cm.militaryFuelCells ?? 10;
         const personalStorageBot = cm.personalStorageBot || "";
         const factionStorageBot = cm.factionStorageBot || "";
 
@@ -27883,6 +27884,14 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-cm-repairThreshold" min="20" max="80" value="${repairThreshold}" onchange="saveCargoMoverSettings()">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Military Fuel Cells</div>
+        <div class="setting-hint">Load this many military fuel cells from source for in-transit refueling (never delivered)</div>
+      </div>
+      <input type="number" id="set-cm-militaryFuelCells" min="0" max="200" value="${militaryFuelCells}" onchange="saveCargoMoverSettings()">
+    </div>
+
     <div class="settings-save-bar">
       <button class="sm" onclick="renderCargoMoverSettings(document.getElementById('settingsContent'))">Refresh</button>
       <button class="primary" onclick="saveCargoMoverSettings()">Save Settings</button>
@@ -28136,6 +28145,10 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-cm-repairThreshold")?.value,
             ) || 40,
+          militaryFuelCells:
+            parseInt(
+              document.getElementById("set-cm-militaryFuelCells")?.value,
+            ) || 10,
         };
 
         send({ type: "saveSettings", routine: "cargo_mover", settings: s });

@@ -214,8 +214,14 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     await this.request<{ ok: boolean }>("/api/client-sync/wildlife-update", { method: "POST" }, data);
   }
 
-private async pushStatuses(): Promise<void> {
-    const statuses: Record<string, unknown>[] = [];
+  private async pushStatuses(): Promise<void> {
+    let statuses: Record<string, unknown>[] = [];
+    try {
+      const { getBotStatuses } = await import("./botmanager.js");
+      statuses = (getBotStatuses() as unknown[]) as Record<string, unknown>[];
+    } catch {
+      // best-effort: ignore if bot manager is unavailable
+    }
     await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
   }
 

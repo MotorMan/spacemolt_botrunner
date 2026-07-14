@@ -36,6 +36,7 @@ function generateApiKey(): string {
 export class ClientSyncMaster {
   private settings: Record<string, unknown>;
   private clients = new Map<string, RegisteredClient>();
+  private botStatuses = new Map<string, unknown[]>();
   private readonly version = "1.0.0";
   private apiKey: string;
   private password: string;
@@ -175,6 +176,7 @@ export class ClientSyncMaster {
   }
 
   public disconnect(clientId: string): boolean {
+    this.botStatuses.delete(clientId);
     return this.clients.delete(clientId);
   }
 
@@ -187,10 +189,11 @@ export class ClientSyncMaster {
     return { ok: true };
   }
 
-  public botStatusPush(clientId: string, _statuses: BotStatusPush[]): boolean {
+  public botStatusPush(clientId: string, statuses: BotStatusPush[]): boolean {
     const c = this.clients.get(clientId);
     if (!c) return false;
     c.lastSeen = Date.now();
+    this.botStatuses.set(clientId, statuses as unknown[]);
     return true;
   }
 
@@ -218,7 +221,17 @@ export class ClientSyncMaster {
     return true;
   }
 
-  public getBots(): unknown[] {
-    return [];
+  public getBots(): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (const [clientId, c] of this.clients) {
+      const statuses = this.botStatuses.get(clientId) || [];
+      for (const s of statuses) {
+        const entry = { ...(s as Record<string, unknown>) } as Record<string, unknown>;
+        entry._clientId = clientId;
+        entry._clientLabel = c.label;
+        out.push(entry);
+      }
+    }
+    return out;
   }
 }

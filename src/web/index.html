@@ -1407,6 +1407,7 @@
       let bots = [];
       let routines = [];
       let settings = {};
+      let remoteBots = [];
       let flockSettings = { flockGroups: [], assignments: {} };
       let knownSystems = [];
       let knownOres = [];
@@ -2201,6 +2202,11 @@
       }
 
       function connect() {
+        // Periodically refresh remote (client-sync) bots for the dropdowns.
+        if (!window.__remoteBotsTimer) {
+          window.__remoteBotsTimer = setInterval(fetchRemoteBots, 15000);
+          fetchRemoteBots();
+        }
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
         ws = new WebSocket(`${proto}//${location.host}/ws`);
 
@@ -6338,17 +6344,16 @@
                 .join("")
             : '<option value="">No market data — dock first</option>';
 
-        // Build other bots list for trade/gift
-        const otherBotOpts =
-          bots
-            .filter((b) => b.username !== bot.username)
-            .map(
-              (b) =>
-                `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
-            )
-            .join("") || '<option value="">No other bots</option>';
-        const hasOtherBots =
-          otherBotOpts !== '<option value="">No other bots</option>';
+        // Build other bots list for trade/gift (local + remote via client sync)
+        const localOtherOpts = bots
+          .filter((b) => b.username !== bot.username)
+          .map(
+            (b) =>
+              `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
+          )
+          .join("");
+        const otherBotOpts = localOtherOpts + getRemoteBotOptions(bot.username);
+        const hasOtherBots = otherBotOpts.length > 0;
         const giftBotOpts = hasOtherBots
           ? otherBotOpts + '<option value="__custom__">Enter name...</option>'
           : '<option value="__custom__">Enter name...</option>';
@@ -27424,6 +27429,8 @@ ignoreBlacklist: document.getElementById(
           personalBotOpts += `<option value="${esc(bot.username)}"${personalSel}>${esc(bot.username)}</option>`;
           giftBotOpts += `<option value="${esc(bot.username)}"${giftSel}>${esc(bot.username)}</option>`;
         }
+        // Append remote bots (client sync) so cross-client delivery targets appear.
+        giftBotOpts += getRemoteBotOptions("", destinationBotName);
 
         // Separate items by storage type
         const factionItems = items.filter(
@@ -31968,6 +31975,67 @@ ignoreBlacklist: document.getElementById(
           });
       }
 
+      // ── Remote bots (client sync): fetch & merge into dropdowns ──
+      let lastRemoteBotsFetch = 0;
+      function fetchRemoteBots() {
+        const now = Date.now();
+        if (now - lastRemoteBotsFetch < 8000) return Promise.resolve();
+        lastRemoteBotsFetch = now;
+        const cs = (settings && settings.clientSync) || {};
+        if (!cs.allowRemoteBotsInDropdowns) {
+          remoteBots = [];
+          return Promise.resolve();
+        }
+        let url;
+        if (cs.mode === "slave" && cs.masterUrl) {
+          url = cs.masterUrl.replace(/\/+$/, "") + "/api/client-sync/bots";
+        } else if (cs.mode === "master") {
+          url = "/api/client-sync/bots";
+        } else {
+          remoteBots = [];
+          return Promise.resolve();
+        }
+        // Plain GET (no custom headers / Content-Type) so it stays a "simple"
+        // cross-origin request and never triggers a CORS preflight the server
+        // wouldn't answer. The master endpoint requires no auth.
+        return fetch(url)
+          .then((r) => (r.ok ? r.json() : []))
+          .then((list) => {
+            remoteBots = Array.isArray(list) ? list : [];
+          })
+          .catch(() => {
+            remoteBots = [];
+          });
+      }
+
+      function remoteBotDisplayName(username, label, style) {
+        if (!label) return username;
+        if (style === "suffix") return `${username} [${label}]`;
+        return `[${label}] ${username}`;
+      }
+
+      // Returns <option> HTML for remote bots. Excludes the given username and
+      // any bot already present in the local `bots` list (so a slave doesn't see
+      // its own bots echoed back from the master), and (optionally) marks one as
+      // selected. Requires allowRemoteBotsInDropdowns.
+      function getRemoteBotOptions(excludeUsername, selectedUsername) {
+        const cs = (settings && settings.clientSync) || {};
+        if (!cs.allowRemoteBotsInDropdowns) return "";
+        const style = cs.remoteBotNameStyle || "prefix";
+        const localUsernames = new Set((bots || []).map((b) => b.username));
+        const seen = new Set();
+        let html = "";
+        for (const b of remoteBots) {
+          const u = b.username;
+          if (!u || u === excludeUsername || seen.has(u)) continue;
+          seen.add(u);
+          if (localUsernames.has(u)) continue;
+          const sel = selectedUsername && u === selectedUsername ? " selected" : "";
+          html += `<option value="${esc(u)}"${sel}>${esc(remoteBotDisplayName(u, b._clientLabel, style))}</option>`;
+        }
+        return html;
+      }
+
       function renderClientSyncSettings(panel) {
         const cs = settings.clientSync || {};
         const enabled = cs.enabled !== false;
@@ -32413,6 +32481,8 @@ ignoreBlacklist: document.getElementById(
             body: JSON.stringify({ password }),
           });
         }
+        // Refresh the remote bot list now that settings may have changed.
+        fetchRemoteBots();
       }
 
       function renderFuelServiceSettings(panel) {

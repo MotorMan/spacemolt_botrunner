@@ -1,6 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
-import { Bot, type Routine } from "./bot.js";
+import { Bot, type Routine, type BotStatus } from "./bot.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
@@ -49,6 +49,7 @@ import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
 import { perf, snapshotAndReset as perfSnapshotAndReset, setActivePlayers as perfSetActivePlayers } from "./perf.js";
 import { ensureInsured } from "./routines/common.js";
 import { getInsuranceRecord, getInsuranceStatus } from "./insuranceTracker.js";
+import { refreshOpenApiV2Spec } from "./openapi.js";
 import { logSkills, refreshSkillNames } from "./skillTracker.js";
 
 interface BotState {
@@ -97,6 +98,13 @@ export function getDiscoveredBots(): string[] {
 /** Get a bot by name (for API use). */
 export function getBot(name: string): Bot | undefined {
   return bots.get(name);
+}
+
+/** Get the current local bot statuses (used by client-sync bot-status pushes). */
+export function getBotStatuses(): BotStatus[] {
+  return [...bots.values()]
+    .sort((a, b) => a.username.localeCompare(b.username))
+    .map((b) => b.status());
 }
 
 /** Get the bot-to-bot chat channel service (for routines to use). */
@@ -1736,6 +1744,15 @@ async function main(): Promise<void> {
   }).catch((err) => {
     console.log(`[MAP_SEED] Failed: ${err}`);
     server.logSystem("Galaxy map seed failed — will rely on exploration data");
+  });
+
+  // Download and persist the V2 OpenAPI spec under a versioned filename
+  // (e.g. openapi-V2-V0.501.0.json) for offline websocket / spacemolt-lib / CLI use.
+  refreshOpenApiV2Spec().then(({ meta, path, saved, changed, throttled }) => {
+    const changeNote = changed ? "changed" : throttled ? "throttled — reused cached" : "unchanged (304)";
+    console.log(`[OPENAPI] V2 spec ${meta.gameServerVersion} ${changeNote} ${saved ? "saved" : "already present"} -> ${path}`);
+  }).catch((err) => {
+    console.log(`[OPENAPI] Refresh failed: ${err}`);
   });
 
   if (bots.size > 0) {

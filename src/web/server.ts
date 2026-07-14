@@ -1426,6 +1426,9 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
             return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
+            return Response.json(this.syncMaster?.getBots() ?? [], { headers: cors });
+          }
           if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
             return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });
           }

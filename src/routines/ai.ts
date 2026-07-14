@@ -17,6 +17,7 @@ import { catalogStore } from "../catalogstore.js";
 import { readSettings } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { refreshOpenApiV2Spec, deriveOpenApiMeta } from "../openapi.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -146,11 +147,10 @@ let cachedCommandList: string | null = null;
 async function fetchCommandList(): Promise<string> {
   if (cachedCommandList) return cachedCommandList;
   try {
-    const resp = await fetch("https://game.spacemolt.com/api/v2/openapi.json", {
-      signal: AbortSignal.timeout(15_000),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const spec = await resp.json() as { paths?: Record<string, Record<string, { operationId?: string; summary?: string; "x-is-mutation"?: boolean }>> };
+    const { spec: rawSpec, changed, throttled } = await refreshOpenApiV2Spec();
+    const spec = rawSpec as { paths?: Record<string, Record<string, { operationId?: string; summary?: string; "x-is-mutation"?: boolean }>> };
+    const changeNote = changed ? "changed" : throttled ? "throttled — reused cached" : "unchanged (304)";
+    console.log(`[OPENAPI] V2 spec ${deriveOpenApiMeta(rawSpec).gameServerVersion} ${changeNote}`);
     const queries: string[] = [];
     const mutations: string[] = [];
     for (const methods of Object.values(spec.paths ?? {})) {

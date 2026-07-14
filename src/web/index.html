@@ -31990,16 +31990,13 @@ ignoreBlacklist: document.getElementById(
         const pushLocalDiscoveries = cs.pushLocalDiscoveries !== false;
 
         if (mode === "master" && !apiKey) {
-          fetch("/api/client-sync/api-key")
-            .then((r) => r.json())
-            .then((data) => {
-              if (data.apiKey) {
-                apiKey = data.apiKey;
-                settings.clientSync.apiKey = apiKey;
-                renderClientSyncSettings(panel);
-              }
-            })
-            .catch(() => {});
+          // No key present yet (e.g. first-time master). Generate one locally
+          // and persist it so the visible field always matches settings.json.
+          // We deliberately do NOT re-fetch from the server and re-render the
+          // whole panel: the server's in-memory ClientSyncMaster regenerates a
+          // *different* key when it lazily initializes, and a re-render would
+          // clobber the key the user just typed/generated.
+          setTimeout(() => generateNewApiKey(), 0);
         }
 
         panel.innerHTML = `

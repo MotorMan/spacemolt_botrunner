@@ -1392,6 +1392,8 @@ if (url.pathname === "/data/shipsForSale.json") {
             const csSettings = this.settings.clientSync || {};
             this.syncMaster = new ClientSyncMaster(csSettings);
             this.syncMaster.saveSettings();
+            // Persist any key the master lazily generated so disk matches memory.
+            saveSettings(this.settings);
             if (this.syncMaster.getMode() === "master") {
               this.syncMaster.startFileSync((csSettings.pollIntervalSec as number) || 15);
             }
@@ -1431,12 +1433,14 @@ if (url.pathname === "/data/shipsForSale.json") {
             const body = await req.json() as { password: string };
             this.syncMaster?.setPassword(body.password);
             this.syncMaster?.saveSettings();
+            saveSettings(this.settings);
             return Response.json({ ok: true }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/set-api-key" && req.method === "POST") {
             const body = await req.json() as { apiKey: string };
             this.syncMaster?.setApiKey(body.apiKey);
             this.syncMaster?.saveSettings();
+            saveSettings(this.settings);
             return Response.json({ ok: true }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/slave-state" && req.method === "GET") {

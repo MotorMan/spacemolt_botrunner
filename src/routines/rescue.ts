@@ -1360,6 +1360,26 @@ async function getActualCreditsFromLog(botUsername: string, ctx: RoutineContext)
 }
 
 /**
+ * Force a fresh status update on a bot that just received a credit top-off.
+ *
+ * Idle/docked bots never call get_status on their own, so their cached credit
+ * balance stays stale (usually 0). Without refreshing right after we deposit
+ * credits, the next cycle's fleet-status read would still show the old balance
+ * and the rescue routine would keep topping the SAME bot off every 30s —
+ * dumping the whole faction treasury into one ship. A real get_status updates
+ * the cached credits so the next cycle sees the real balance and skips the bot.
+ */
+async function refreshBotCreditsAfterTopOff(ctx: RoutineContext, username: string): Promise<void> {
+  if (!ctx.getBotFreshStatus) return;
+  try {
+    await ctx.getBotFreshStatus(username);
+    ctx.log("rescue", `💰 Forced status refresh for ${username} after credit top-off`);
+  } catch (e) {
+    ctx.log("rescue", `💰 Failed to refresh status for ${username} after top-off: ${e}`);
+  }
+}
+
+/**
  * Credit top-off function — redistributes credits from faction treasury
  * to ONE bot that is running low, including self.
  * This is designed to be called repeatedly in a background loop,
@@ -1449,6 +1469,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
         return false;
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
+        await refreshBotCreditsAfterTopOff(ctx, member.username);
         return true;
       }
     }
@@ -1515,6 +1536,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     } else {
       ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
       consecutiveZeroCredits.delete(member.username);
+      await refreshBotCreditsAfterTopOff(ctx, member.username);
       return true;
     }
   }

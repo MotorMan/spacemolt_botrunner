@@ -1174,7 +1174,14 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     getBotFreshStatus: async (targetBotName: string): Promise<import("./bot.js").BotStatus | null> => {
       const targetBot = bots.get(targetBotName);
       if (!targetBot || !targetBot.isConnected()) return null;
-      await targetBot.refreshLocation();
+      // NOTE: must use refreshStatus() (a real get_status), NOT refreshLocation().
+      // refreshLocation() reads account.state, which the library only keeps
+      // current from push events and does NOT update credits (see bot.ts). Idle
+      // bots never fetch get_status on their own, so their cached credit balance
+      // would stay stale (usually 0) — which is exactly what made the rescue
+      // routine keep topping the same bot off every cycle. A real get_status
+      // updates the cached credits so the next read sees the true balance.
+      await targetBot.refreshStatus();
       return targetBot.status();
     },
   };

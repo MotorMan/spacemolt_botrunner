@@ -2204,14 +2204,17 @@
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
         ws = new WebSocket(`${proto}//${location.host}/ws`);
 
-        // Fallback: if WebSocket doesn't connect quickly, fetch data via REST
+        // Fallback: if WebSocket doesn't connect quickly, fetch data via REST.
+        // Use a generous threshold so a briefly-contended connection (e.g. another
+        // open dashboard tab doing work) doesn't spur a redundant ~1MB REST fetch
+        // that competes with the WebSocket handshake.
         clearTimeout(wsInitTimer);
         wsInitTimer = setTimeout(() => {
           if (!ws || ws.readyState !== WebSocket.OPEN) {
             console.warn("WebSocket slow, fetching initial data via REST...");
             fetchInitialData();
           }
-        }, 500);
+        }, 1500);
 
         ws.onopen = () => {
           clearTimeout(wsInitTimer);

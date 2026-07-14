@@ -453,6 +453,13 @@ export class WebServer {
   private clients = new Set<ServerWebSocket<WSData>>();
   private nextClientId = 1;
 
+  // Cached serialized payloads so we don't re-stringify the ~1.1MB map on
+  // every connection (reconnect storms / multiple tabs would otherwise
+  // multiply the cost and stall the single-threaded event loop).
+  private mapDataCache: string | null = null;
+  private catalogCache: string | null = null;
+  private statsCache: string | null = null;
+
   // Log buffers for scrollback on reconnect (persisted to disk)
   private activityLog: string[];
   private broadcastLog: string[];
@@ -2292,20 +2299,20 @@ if (url.pathname === "/data/shipsForSale.json") {
                 lastUsedRoutines: getAllLastUsedRoutines(),
               }));
 
-              // Send large data separately to avoid blocking with JSON serialization
+              // Send large data separately to avoid blocking with JSON serialization.
+              // These payloads are cached (built once, reused for every connection)
+              // so reconnect storms / multiple tabs don't re-serialize ~1.1MB each time.
               setImmediate(() => {
                 try {
-                  const mapData = mapStore.getAllSystems();
-                  const mapJson = JSON.stringify({ type: "mapData", data: mapData });
+                  const mapJson = this.getMapDataMessage();
                   console.log(`Sending mapData, size: ${mapJson.length} chars`);
                   ws.send(mapJson);
 
-                  const catalogData = catalogStore.getAll();
-                  const catalogJson = JSON.stringify({ type: "catalog", data: catalogData });
+                  const catalogJson = this.getCatalogMessage();
                   console.log(`Sending catalog, size: ${catalogJson.length} chars`);
                   ws.send(catalogJson);
 
-                  const statsJson = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+                  const statsJson = this.getStatsMessage();
                   console.log(`Sending statsDaily, size: ${statsJson.length} chars`);
                   ws.send(statsJson);
                 } catch (err) {
@@ -2440,7 +2447,33 @@ if (url.pathname === "/data/shipsForSale.json") {
     this.broadcast({ type: "botLog", username, line });
   }
 
+  // ── Cached, pre-serialized large payloads ──────────────────
+  // Built once and reused for every connection; invalidated when the
+  // underlying data changes. Avoids re-stringifying ~1.1MB maps per connect.
+
+  private getMapDataMessage(): string {
+    if (this.mapDataCache === null) {
+      this.mapDataCache = JSON.stringify({ type: "mapData", data: mapStore.getAllSystems() });
+    }
+    return this.mapDataCache;
+  }
+
+  private getCatalogMessage(): string {
+    if (this.catalogCache === null) {
+      this.catalogCache = JSON.stringify({ type: "catalog", data: catalogStore.getAll() });
+    }
+    return this.catalogCache;
+  }
+
+  private getStatsMessage(): string {
+    if (this.statsCache === null) {
+      this.statsCache = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+    }
+    return this.statsCache;
+  }
+
   updateMapData(): void {
+    this.mapDataCache = null;
     this.broadcast({
       type: "mapUpdate",
       mapData: mapStore.getAllSystems(),
@@ -2506,6 +2539,7 @@ if (url.pathname === "/data/shipsForSale.json") {
     if (changed) {
       pruneOldDates(this.statsData.daily);
       saveStats(this.statsData);
+      this.statsCache = null;
       this.broadcast({ type: "statsUpdate", statsDaily: this.statsData.daily });
     }
   }

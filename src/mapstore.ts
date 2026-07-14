@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, writeFile, copyFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
@@ -258,6 +258,9 @@ class MapStore {
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
+  // Guard so two async disk writes never overlap (which would race on the file).
+  private writeInFlight = false;
+  private writeQueued = false;
   private precalcRoutes: Record<string, Record<string, string[] | null>> = {};
   private precalcNoPirateRoutes: Record<string, Record<string, string[] | null>> = {};
 
@@ -395,12 +398,33 @@ class MapStore {
 
   private writeToDisk(): void {
     if (!this.dirty) return;
+    if (this.writeInFlight) {
+      // A write is already in progress; mark that we still have pending
+      // changes so another write runs once the current one finishes.
+      this.writeQueued = true;
+      return;
+    }
+    this.writeInFlight = true;
+    this.dirty = false;
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     this.data.last_saved = now();
-    writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
-    this.dirty = false;
+    const payload = JSON.stringify(this.data, null, 2) + "\n";
+    // Write asynchronously so the (single-threaded) event loop is never blocked
+    // by a multi-MB map write — otherwise active bots exploring+save map would
+    // stall the web server and delay every other client's connection.
+    writeFile(MAP_FILE, payload, "utf-8", (err) => {
+      this.writeInFlight = false;
+      if (err) {
+        this.dirty = true;
+        log("error", `Failed to write map.json: ${err}`);
+      }
+      if (this.writeQueued) {
+        this.writeQueued = false;
+        this.writeToDisk();
+      }
+    });
   }
 
   /** Flush pending writes to disk immediately. Call on shutdown. */
@@ -413,7 +437,13 @@ class MapStore {
       clearInterval(this.backupTimer);
       this.backupTimer = null;
     }
-    this.writeToDisk();
+    // Synchronous flush on shutdown so pending changes are guaranteed on disk.
+    if (this.dirty) {
+      this.dirty = false;
+      this.data.last_saved = now();
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+    }
   }
 
   private getTimestamp(): string {

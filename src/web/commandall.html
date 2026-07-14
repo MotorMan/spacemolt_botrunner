@@ -168,7 +168,7 @@
             console.warn('WebSocket slow, fetching initial data via REST...');
             fetchInitialData();
           }
-        }, 500);
+        }, 1500);
 
         ws.onopen = () => {
           clearTimeout(wsInitTimer);

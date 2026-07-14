@@ -32,10 +32,10 @@ echo.
     
     cd /d "%SCRIPT_DIR%"
     echo [%date% %time%] Running bun install...
-    timeout /t 120 bun install || echo Warning: bun install failed or timed out
+    bun install || echo Warning: bun install failed
     echo.
     echo [%date% %time%] Running git pull...
-    timeout /t 30 git pull || echo Warning: git pull failed, timed out, or not a git repository
+    git pull || echo Warning: git pull failed or not a git repository
     echo.
     bun run src\botmanager.ts
     set EXIT_CODE=%ERRORLEVEL%

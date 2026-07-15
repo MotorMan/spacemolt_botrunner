@@ -102,6 +102,37 @@ const terminalClosedBots = new Set<string>();
  */
 const reconnectingBots = new Set<string>();
 
+/**
+ * Per-bot reconnection backoff. Every forced reconnect for a bot that KEEPS
+ * dying (a socket that connects and then is immediately closed, a server that
+ * rate-limits new sessions, …) is spaced out EXPONENTIALLY so we never
+ * hammer the server with a reconnect storm. A storm is actively harmful: it
+ * makes the server see what looks like duplicate sessions for the same account
+ * and answer with a `session_replaced` (4001) / `auth_timeout` (4002)
+ * close — which the code then (wrongly) reads as "connected elsewhere"
+ * and can wedge the bot for good. Backing off gives the server/library
+ * room to breathe and lets a real socket actually stick.
+ *
+ * Keyed by bot id; `attempts` counts consecutive failures and resets to 0
+ * the moment a fresh socket is observed live (see `forceReconnectBot`
+ * success path and `addOwnedAccountAsBot`).
+ */
+const RECONNECT_BASE_MS = 5000;
+const RECONNECT_MAX_MS = 120_000; // cap at 2 minutes between attempts
+const reconnectBackoff = new Map<string, { lastAttempt: number; attempts: number }>();
+
+/** Milliseconds to wait before the NEXT forced reconnect for `id`. */
+function nextReconnectDelay(id: string): number {
+  const b = reconnectBackoff.get(id);
+  if (!b) return 0; // first attempt is immediate (instant detection)
+  return Math.min(RECONNECT_BASE_MS * 2 ** b.attempts, RECONNECT_MAX_MS);
+}
+
+/** Record a (re)connect success: clear any backoff so the next drop starts fresh. */
+function resetReconnectBackoff(id: string): void {
+  reconnectBackoff.delete(id);
+}
+
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()].sort((a, b) => a.localeCompare(b));
@@ -303,6 +334,10 @@ function addOwnedAccountAsBot(account: Account): void {
   // guard we may have set (a previous session_replaced/auth_timeout). If it gets
   // terminal-closed again, the disconnect handler will re-add it.
   terminalClosedBots.delete(id);
+  // …and reset the reconnect backoff: a live socket means we're healthy
+  // again, so the next drop should start with an immediate (not backed-off)
+  // reconnect instead of inheriting a long cooldown from the previous outage.
+  resetReconnectBackoff(id);
 
   const existing = bots.get(id);
   if (existing) {
@@ -584,12 +619,27 @@ async function reconnectDeadBots(ids?: string[]): Promise<void> {
  * is a correct, bounded retry rather than a silent permanent give-up.
  */
 export async function forceReconnectBot(id: string): Promise<void> {
-  // De-dup: multiple callers (disconnect handler, health monitor, per-command
-  // sendResilient) can request a fresh socket for the same bot at once. The
-  // first caller wins; the rest see the bot is already in-flight and skip,
-  // so we never race `connectOwnedAccounts` against itself and wedge the socket.
+  const now = Date.now();
+
+  // De-dup in-flight: if a reconnect is currently running for this bot,
+  // don't start a second concurrent one (we'd race connectOwnedAccounts).
   if (reconnectingBots.has(id)) return;
+
+  // Shared exponential backoff: if the last attempt was too recent, skip.
+  // First drop → immediate (instant detection, as wanted). Repeated drops
+  // → 5s, 10s, 20s, 40s, 80s, capped at 120s. This is
+  // what stops the reconnect STORM: a socket that keeps dying is retried
+  // gently instead of hammered every few seconds (which itself provokes
+  // the server's "duplicate session" close and wedges the bot for good).
+  const b = reconnectBackoff.get(id);
+  const delay = b ? Math.min(RECONNECT_BASE_MS * 2 ** b.attempts, RECONNECT_MAX_MS) : 0;
+  if (b && now - b.lastAttempt < delay) return;
+
   reconnectingBots.add(id);
+  // Record/advance the backoff tracker up front so a concurrent caller that
+  // slips past the in-flight check still respects the window.
+  if (!b) reconnectBackoff.set(id, { lastAttempt: now, attempts: 0 });
+  else { b.lastAttempt = now; b.attempts++; }
 
   const RECCONNECT_TIMEOUT_MS = 15_000;
   try {
@@ -629,9 +679,16 @@ export async function forceReconnectBot(id: string): Promise<void> {
 
     const rebot = bots.get(id);
     if (rebot?.isConnected()) {
+      // Success — reset the backoff so the next drop starts immediately again.
+      resetReconnectBackoff(id);
       server.logSystem(`Reconnected bot ${id} with a fresh socket.`);
     } else {
-      server.logSystem(`Reconnect of ${id} did not produce a live socket yet — watchdog will retry.`);
+      server.logSystem(
+        `Reconnect of ${id} did not produce a live socket yet ` +
+          `(next attempt in ~${Math.round(
+            Math.min(RECONNECT_BASE_MS * 2 ** reconnectBackoff.get(id)!.attempts, RECONNECT_MAX_MS) / 1000,
+          )}s) — watchdog/backoff will keep retrying.`,
+      );
     }
     refreshStatusTable();
   } finally {

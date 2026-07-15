@@ -844,16 +844,23 @@ docked = false;
    * forced reconnect's new socket never authenticated (server keeps the session
    * zombie-closed after a restart), it waited indefinitely — which wedged
    * `login()`/`refreshStatus()` and produced an endless "Login already in
-   * progress, waiting..." hang. This version is bounded and self-healing: it
-   * keeps forcing fresh sockets every `FORCE_EVERY_MS` until one sticks, and
-   * gives up (false) after `MAX_FORCES` so the caller can end the routine
-   * instead of hanging forever.
+   * progress, waiting..." hang. This version is bounded by WALL CLOCK
+   * (MAX_WAIT_MS) instead of attempt count, and defers the actual reconnect
+   * cadence to botmanager's shared exponential backoff (forceReconnectBot) so
+   * a socket that keeps dying is retried gently rather than hammered into a
+   * storm. It gives up (false) only after a long continuous outage, so the
+   * caller can end the routine instead of hanging forever.
    */
   private waitForFreshSocket(): Promise<boolean> {
     const self = this;
-    const FORCE_EVERY_MS = 4000; // re-force a fresh socket this often while dead
-    const MAX_FORCES = 8;        // bounded so we can NEVER hang forever (~32s)
-    let forces = 0;
+    const FORCE_EVERY_MS = 5000; // wake up this often to re-check the socket
+    // Bounded by WALL CLOCK, not attempt count. The actual reconnect cadence
+    // is governed by botmanager's shared exponential backoff (forceReconnectBot),
+    // so a socket that keeps dying is retried gently (5s→10s→…→120s) rather
+    // than hammered into a storm. We only give up after a long continuous
+    // outage so a routine never hangs the event loop forever.
+    const MAX_WAIT_MS = 20 * 60 * 1000; // 20 min of continuous dead socket
+    const startTime = Date.now();
     let lastThrottle = 0;
     return new Promise<boolean>((resolve) => {
       let settled = false;
@@ -872,31 +879,26 @@ docked = false;
         if (acct && acct.authenticated) {
           return settle(true);
         }
-        // A terminal close (session_replaced / auth_timeout) usually means the
-        // player is connected elsewhere — but it is ALSO what the game server
-        // sends to every bot after its own restart (a "zombie" session whose
-        // socket pre-dates the restart). We used to treat it as a permanent
-        // death sentence and never reconnect, which left the entire fleet dead
-        // after every server restart ("won't reconnect"). Instead, drop the dead
-        // socket and try a fresh one (bounded by MAX_FORCES below): a post-
-        // restart zombie reconnects immediately, and a genuinely-elsewhere
-        // account simply re-dies and falls through to the bounded give-up
-        // rather than hanging the routine forever.
+        // The library reported this account's socket closed (its onDisconnected
+        // fires on ANY drop — server restart, network blip, or a genuine
+        // elsewhere login). We don't assume WHY; we just drop the dead socket
+        // and let the shared backoff build a fresh one. A post-restart zombie
+        // reconnects quickly; a genuinely-elsewhere account re-dies and the
+        // backoff keeps retrying (never hanging forever).
         if (self._terminalClosed) {
-          self.log("warn", "Connection was closed (account connected elsewhere / server restart) — dropping it and trying a fresh socket...");
           self.clearTerminalClosed();
         }
-        forces++;
-        if (forces > MAX_FORCES) {
-          self.log("error", "Could not establish a fresh socket after multiple attempts — ending routine.");
+        const now = Date.now();
+        if (now - startTime > MAX_WAIT_MS) {
+          self.log("error", "Socket stayed dead for 20m — ending routine (auto-restart will retry).");
           return settle(false);
         }
-        const now = Date.now();
         if (now - lastThrottle > 30000) {
           lastThrottle = now;
-          self.log("warn", "Still disconnected — forcing another fresh socket before issuing more commands...");
+          self.log("warn", "Still disconnected — forcing a fresh socket (backed off) before issuing more commands...");
         }
-        // Force a brand-new socket RIGHT NOW (not after a delay).
+        // Ask for a fresh socket. forceReconnectBot enforces the backoff, so
+        // this is cheap when we're already inside a cooldown window.
         void self.forceSocketReconnect();
       };
       const poll = setInterval(check, FORCE_EVERY_MS);

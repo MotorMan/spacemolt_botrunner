@@ -26,7 +26,7 @@ function getCacheKey(factionName: string, station: string): string {
 }
 
 function sanitizeFilename(key: string): string {
-  return key.replace(/::/g, "--");
+  return key.replace(/::/g, "--").replace(/[<>:"/\\|?*]/g, "_");
 }
 
 function checkExistingCacheFiles(): void {

@@ -27744,6 +27744,7 @@ ignoreBlacklist: document.getElementById(
         let sourceStationOpts = '<option value="">(not set)</option>';
         let destStationOpts = '<option value="">(not set)</option>';
 
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -27754,13 +27755,18 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-
-            const srcSel = val === sourceStation ? " selected" : "";
-            sourceStationOpts += `<option value="${val}"${srcSel}>${label} (${sysName})</option>`;
-
-            const dstSel = val === destinationStation ? " selected" : "";
-            destStationOpts += `<option value="${val}"${dstSel}>${label} (${sysName})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const srcSel = val === sourceStation ? " selected" : "";
+          sourceStationOpts += `<option value="${val}"${srcSel}>${label} (${sysName})</option>`;
+
+          const dstSel = val === destinationStation ? " selected" : "";
+          destStationOpts += `<option value="${val}"${dstSel}>${label} (${sysName})</option>`;
         }
 
         // Build bot options for faction and personal storage selectors

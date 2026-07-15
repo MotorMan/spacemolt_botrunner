@@ -19168,6 +19168,7 @@ When responding:
           "storage",
           "facilities",
           "queueusage",
+          "station",
           "personal",
           "rooms",
           "missions",
@@ -19202,6 +19203,9 @@ When responding:
             break;
           case "queueusage":
             panelHtml = renderFactionQueueUsage(f, username);
+            break;
+          case "station":
+            panelHtml = renderStationFacilities(f, username);
             break;
           case "personal":
             panelHtml = renderPersonalFacilities(f, username);
@@ -19262,6 +19266,13 @@ When responding:
         if (factionSelectedBot) renderFactionContent(factionSelectedBot);
         if (panel === "queueusage" && factionSelectedBot) {
           startFactionQueueUsageAutoRefresh(factionSelectedBot);
+        }
+        if (panel === "station" && factionSelectedBot) {
+          // Auto-calculate maintenance if we already have facility data.
+          const sum = document.getElementById("stationMaintenanceSummary");
+          if (sum && stationFacilitiesData && stationFacilitiesData.length > 0) {
+            fetchStationMaintenance(factionSelectedBot);
+          }
         }
       }
 
@@ -20478,6 +20489,473 @@ When responding:
   `;
       }
 
+      // ── Station Facilities (player-built at stations) ─────────────
+
+      function renderStationFacilities(f, username) {
+        const bot = bots.find((b) => b.username === username);
+        const docked = bot ? bot.docked : false;
+        const dockWarning = !docked
+          ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage station facilities.</div>'
+          : "";
+
+        stationFacilityTypes = Object.values(catalog.facilities || {}).filter(
+          (t) => t.player_station_buildable,
+        );
+        const buildableCount = stationFacilityTypes.length;
+
+        const catBtns = stationFacilityCategories
+          .map((c) => {
+            const active = c === stationFacilityCategory;
+            const cnt = Object.values(catalog.facilities || {}).filter(
+              (t) => t.player_station_buildable && t.category === c,
+            ).length;
+            return `<button class="sm" id="sf-cat-${c}" style="${active ? "background:var(--accent);color:#fff" : ""}" onclick="switchStationFacilityCategory('${c}','${esc(username)}')">${c.charAt(0).toUpperCase() + c.slice(1)} (${cnt})</button>`;
+          })
+          .join(" ");
+
+        return `
+    ${dockWarning}
+    <div class="faction-section">
+      <div class="faction-section-title">Station Maintenance Requirements</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <button class="sm" onclick="fetchStationMaintenance('${esc(username)}')" ${!docked ? "disabled" : ""}>Calculate Requirements</button>
+        <span style="font-size:11px;color:var(--text-dim)">Aggregates the per-round maintenance inputs of every built &amp; active station facility, then compares against your cargo + personal station storage.</span>
+      </div>
+      <div id="stationMaintenanceSummary"><div class="faction-no-data" style="font-size:11px">Load facilities to calculate maintenance.</div></div>
+    </div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Station Facilities at Current Station</div>
+      <div id="stationFacilitiesList">
+        <button class="sm" onclick="fetchStationFacilities('${esc(username)}')" ${!docked ? "disabled" : ""}>Load Facilities</button>
+      </div>
+    </div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Build New Station Facility</div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center;flex-wrap:wrap">
+        ${catBtns}
+        <span id="sf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${buildableCount} buildable</span>
+      </div>
+      <div id="stationBuildableTypes">
+        ${stationFacilityTypes.length > 0 ? renderStationBuildableTypesListHtml(stationFacilityTypes, username) : `<button class="sm" onclick="fetchStationBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`}
+      </div>
+    </div>
+  `;
+      }
+
+      function switchStationFacilityCategory(category, username) {
+        stationFacilityCategory = category;
+        stationFacilityTypes = Object.values(catalog.facilities || {}).filter(
+          (t) => t.player_station_buildable && t.category === category,
+        );
+        stationFacilityCategories.forEach((c) => {
+          const btn = document.getElementById(`sf-cat-${c}`);
+          if (btn) {
+            if (c === category) {
+              btn.style.background = "var(--accent)";
+              btn.style.color = "#fff";
+            } else {
+              btn.style.background = "";
+              btn.style.color = "";
+            }
+          }
+        });
+        const infoEl = document.getElementById("sf-category-info");
+        if (infoEl) infoEl.textContent = `${stationFacilityTypes.length} ${category} buildable`;
+        renderStationBuildableTypesList(username);
+      }
+
+      function fetchStationBuildableTypes(username) {
+        renderStationBuildableTypesList(username);
+      }
+
+      function renderStationBuildableTypesList(username) {
+        const container = document.getElementById("stationBuildableTypes");
+        if (!container) return;
+        const types = stationFacilityTypes;
+        if (types.length === 0) {
+          container.innerHTML =
+            '<div class="faction-no-data">No station facility types in this category.</div>';
+          return;
+        }
+        container.innerHTML = renderStationBuildableTypesListHtml(types, username);
+      }
+
+      function renderStationBuildableTypesListHtml(types, username) {
+        return types
+          .map((t) => {
+            const typeId = t.facility_type || t.type || t.id || "";
+            const cost = t.build_cost ?? t.cost ?? t.credits ?? t.price ?? 0;
+            const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
+            const mats = t.build_materials || [];
+            let matsHtml = "";
+            if (Array.isArray(mats) && mats.length > 0) {
+              matsHtml =
+                '<div style="margin-top:4px;font-size:11px"><span style="color:var(--text-dim)">Build mats:</span> ' +
+                mats
+                  .map((m) => {
+                    const mName = m.name || m.item_id || "?";
+                    const mQty = m.quantity || 1;
+                    return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
+                  })
+                  .join(", ") +
+                "</div>";
+            }
+            const maint = t.maintenance_inputs || [];
+            let maintHtml = "";
+            if (Array.isArray(maint) && maint.length > 0) {
+              maintHtml =
+                '<div style="margin-top:2px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Upkeep/round:</span> ' +
+                maint
+                  .map((m) => {
+                    const mName = m.name || m.item_id || "?";
+                    const mQty = m.quantity || 1;
+                    return `<span style="color:var(--cyan)">${mQty}x ${esc(mName)}</span>`;
+                  })
+                  .join(", ") +
+                "</div>";
+            }
+            return `<div id="sf-type-${esc(typeId)}" class="faction-card" style="opacity:1">
+      <div class="fc-name">${esc(t.name || typeId)}</div>
+      <div class="fc-detail">${esc(t.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
+      ${matsHtml}
+      ${maintHtml}
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;font-size:11px">
+        <button class="sm" onclick="showStationBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
+        <button class="primary sm" onclick="stationBuildFacility('${esc(username)}','${esc(typeId)}')">Build</button>
+      </div>
+    </div>`;
+          })
+          .join("");
+      }
+
+      function showStationBuildableTypeDetails(username, typeId) {
+        const container = document.getElementById("stationBuildableTypes");
+        if (!container) return;
+        const detail = getCatalogFacility(typeId);
+        if (!detail) {
+          container.innerHTML =
+            '<div class="faction-no-data">No catalog details for this type.</div>';
+          return;
+        }
+        const cost = detail.build_cost ?? detail.cost ?? detail.credits ?? 0;
+        const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
+        const mats = detail.build_materials || [];
+        const matsHtml = Array.isArray(mats) && mats.length
+          ? '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+            mats
+              .map((m) => `<span style="color:var(--text)">${(m.quantity || 1)}x ${esc(m.name || m.item_id || "?")}</span>`)
+              .join(", ") +
+            "</div>"
+          : "";
+        const maint = detail.maintenance_inputs || [];
+        const maintHtml = Array.isArray(maint) && maint.length
+          ? '<div style="margin-top:6px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Maintenance (per round):</span> ' +
+            maint
+              .map((m) => `<span style="color:var(--cyan)">${(m.quantity || 1)}x ${esc(m.name || m.item_id || "?")}</span>`)
+              .join(", ") +
+            "</div>"
+          : "";
+        container.innerHTML = `
+      <div class="faction-card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+          <div>
+            <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(detail.name || typeId)}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${esc(detail.category || "")} Station Facility</div>
+          </div>
+          <button class="sm" onclick="switchStationFacilityCategory('${esc(stationFacilityCategory)}','${esc(username)}')">Back to List</button>
+        </div>
+        <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(detail.description || "")}</div>
+        ${costStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(costStr)}</div>` : ""}
+        ${detail.labor_cost ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${detail.labor_cost} labor</div>` : ""}
+        ${detail.build_time ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${detail.build_time}s</div>` : ""}
+        ${matsHtml}
+        ${maintHtml}
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+          <button class="primary sm" style="width:100%" onclick="stationBuildFacility('${esc(username)}','${esc(typeId)}')">Build Facility</button>
+        </div>
+      </div>
+    `;
+      }
+
+      // Build a station facility. Player-built station facilities use the same
+      // `facility faction_build` command the user verified.
+      function stationBuildFacility(username, facilityType) {
+        if (!facilityType) {
+          appendLine("system", "No station facility type ID");
+          return;
+        }
+        appendLine(
+          "system",
+          `${username}: Building station facility ${facilityType}...`,
+        );
+        sendExec(
+          username,
+          "facility",
+          { action: "faction_build", facility_type: facilityType },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: ${facilityType} built!`);
+              fetchStationFacilities(username);
+            } else {
+              appendLine("system", `Build failed: ${result.error || "unknown"}`);
+              if (result.data)
+                appendLine("system", `Raw: ${JSON.stringify(result.data)}`);
+            }
+          },
+        );
+      }
+
+      async function fetchStationFacilities(username) {
+        const container = document.getElementById("stationFacilitiesList");
+        if (!container) return;
+        container.innerHTML = '<div class="faction-no-data">Loading...</div>';
+        sendExec(
+          username,
+          "facility",
+          { action: "list" },
+          (result) => {
+            if (!result.ok || !result.data) {
+              container.innerHTML = `<div class="faction-no-data">${esc(result.error || "No facilities found")}</div>`;
+              return;
+            }
+            const d = result.data;
+            const all = Array.isArray(d)
+              ? d
+              : Array.isArray(d.player_facilities)
+                ? d.player_facilities
+                : Array.isArray(d.facilities)
+                  ? d.facilities
+                  : [];
+            const psbIds = getPlayerStationBuildableIds();
+            // Keep only player_station_buildable facilities (service/infrastructure/defense).
+            const facilities = all.filter((fac) => {
+              const id = fac.facility_type || fac.type || fac.id;
+              return id && psbIds.has(id);
+            });
+            stationFacilitiesData = facilities;
+            if (facilities.length === 0) {
+              container.innerHTML =
+                '<div class="faction-no-data">No station facilities at this station.</div>';
+              return;
+            }
+            facilities.sort((a, b) =>
+              (a.name || a.facility_type || a.type || "?")
+                .toLowerCase()
+                .localeCompare(
+                  (b.name || b.facility_type || b.type || "?").toLowerCase(),
+                ),
+            );
+            container.innerHTML = facilities
+              .map((fac) => {
+                const name = fac.name || fac.facility_type || fac.type || "?";
+                const facId = fac.facility_id || fac.id || "";
+                const active = fac.status === "active" || fac.active === true;
+                const status = active
+                  ? '<span style="color:var(--green)">Active</span>'
+                  : '<span style="color:var(--red)">Inactive</span>';
+                const cat = fac.category || "";
+                const desc = active
+                  ? getCatalogFacility(fac.facility_type || fac.type || fac.id)?.satisfied_description || fac.description || ""
+                  : getCatalogFacility(fac.facility_type || fac.type || fac.id)?.degraded_description || fac.description || "";
+                const maint = getCatalogFacility(fac.facility_type || fac.type || fac.id)?.maintenance_inputs || [];
+                const maintHtml = Array.isArray(maint) && maint.length
+                  ? '<div style="margin-top:4px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Needs/round:</span> ' +
+                    maint
+                      .map((m) => `<span style="color:var(--cyan)">${(m.quantity || 1)}x ${esc(m.name || m.item_id || "?")}</span>`)
+                      .join(", ") +
+                    "</div>"
+                  : "";
+                return `<div class="faction-card" id="sf-card-${esc(facId)}">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
+            <div>
+              <span class="fc-name">${esc(name)}</span>
+              <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
+              <span style="margin-left:8px;font-size:10px">${status}</span>
+              ${cat ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(cat)}</span>` : ""}
+            </div>
+            <div style="display:flex;gap:4px">
+              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="stationToggleFacility('${esc(username)}','${esc(facId)}')">${active ? "Disable" : "Enable"}</button>
+            </div>
+          </div>
+          ${desc ? `<div class="fc-detail" style="margin-top:4px;font-size:11px;color:var(--text-dim)">${esc(desc)}</div>` : ""}
+          ${maintHtml}
+        </div>`;
+              })
+              .join("");
+          },
+        );
+      }
+
+      function stationToggleFacility(username, facilityId) {
+        sendExec(
+          username,
+          "facility",
+          { action: "toggle", facility_id: facilityId },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: Station facility toggled`);
+              fetchStationFacilities(username);
+            } else {
+              appendLine("system", `Toggle failed: ${result.error || "unknown"}`);
+            }
+          },
+        );
+      }
+
+      // ── Station maintenance requirement calculator ───────────────
+      // Sums maintenance_inputs of every built & active station facility,
+      // then compares against the bot's cargo + personal station storage.
+      async function fetchStationMaintenance(username) {
+        const container = document.getElementById("stationMaintenanceSummary");
+        if (!container) return;
+        container.innerHTML =
+          '<div class="faction-no-data">Calculating...</div>';
+
+        // 1) Ensure we have the current station facility list.
+        if (!stationFacilitiesData || stationFacilitiesData.length === 0) {
+          await new Promise((resolve) => {
+            sendExec(
+              username,
+              "facility",
+              { action: "list" },
+              (result) => {
+                if (result.ok && result.data) {
+                  const d = result.data;
+                  const all = Array.isArray(d)
+                    ? d
+                    : Array.isArray(d.player_facilities)
+                      ? d.player_facilities
+                      : Array.isArray(d.facilities)
+                        ? d.facilities
+                        : [];
+                  const psbIds = getPlayerStationBuildableIds();
+                  stationFacilitiesData = all.filter((fac) => {
+                    const id = fac.facility_type || fac.type || fac.id;
+                    return id && psbIds.has(id);
+                  });
+                } else {
+                  stationFacilitiesData = [];
+                }
+                resolve();
+              },
+            );
+          });
+        }
+
+        // 2) Gather the bot's inventory: cargo + personal station storage.
+        const inv = await collectStationInventory(username);
+
+        // 3) Sum maintenance inputs across built & active facilities.
+        const totals = {};
+        const contributing = [];
+        (stationFacilitiesData || []).forEach((fac) => {
+          const active = fac.status === "active" || fac.active === true;
+          if (!active) return;
+          const id = fac.facility_type || fac.type || fac.id;
+          const cat = getCatalogFacility(id);
+          const maint = (cat && cat.maintenance_inputs) || [];
+          if (!maint.length) return;
+          contributing.push({
+            name: fac.name || id || "?",
+            items: maint.map((m) => ({
+              item_id: m.item_id,
+              quantity: m.quantity || 1,
+            })),
+          });
+          maint.forEach((m) => {
+            const key = m.item_id;
+            totals[key] = (totals[key] || 0) + (m.quantity || 1);
+          });
+        });
+
+        if (Object.keys(totals).length === 0) {
+          container.innerHTML =
+            '<div class="faction-no-data">No active station facilities with maintenance requirements.</div>';
+          return;
+        }
+
+        let allGood = true;
+        const rows = Object.entries(totals)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([itemId, need]) => {
+            const have =
+              (inv.items[itemId] || 0) + (inv.storage[itemId] || 0);
+            const ok = have >= need;
+            if (!ok) allGood = false;
+            const haveStr = num(have);
+            const color = ok ? "var(--green)" : "var(--red)";
+            return `<tr>
+          <td style="padding:4px 8px">${esc(catalogName(itemId))}</td>
+          <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim)">${esc(itemId)}</td>
+          <td style="padding:4px 8px;text-align:right;font-weight:600">${num(need)}</td>
+          <td style="padding:4px 8px;text-align:right;color:${color}">${haveStr}</td>
+          <td style="padding:4px 8px;text-align:right;color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+        </tr>`;
+          })
+          .join("");
+
+        const summary = allGood
+          ? '<div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ All maintenance inputs satisfied for this round.</div>'
+          : '<div style="color:var(--red);font-weight:600;margin-bottom:8px">✗ Some maintenance inputs are short — facilities will not run this round without them.</div>';
+
+        const contribHtml = contributing.length
+          ? `<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Contributing facilities: ${contributing
+              .map((c) => esc(c.name))
+              .join(", ")}</div>`
+          : "";
+
+        container.innerHTML = `
+      ${summary}
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);color:var(--text-dim)">
+            <th style="padding:4px 8px;text-align:left">Item</th>
+            <th style="padding:4px 8px;text-align:left">ID</th>
+            <th style="padding:4px 8px;text-align:right">Need/round</th>
+            <th style="padding:4px 8px;text-align:right">You have</th>
+            <th style="padding:4px 8px;text-align:right">Status</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage on this bot. Refresh after delivering items.</div>
+      ${contribHtml}
+    `;
+      }
+
+      // Collect cargo + personal station storage for the given bot.
+      async function collectStationInventory(username) {
+        const items = {};
+        const storage = {};
+        // Cargo items via get_cargo.
+        const cargoRes = await new Promise((resolve) => {
+          sendExec(username, "get_cargo", {}, resolve);
+        });
+        if (cargoRes && cargoRes.ok && cargoRes.data) {
+          const arr =
+            cargoRes.data.cargo || cargoRes.data.items || cargoRes.data || [];
+          const list = Array.isArray(arr) ? arr : Object.values(arr);
+          list.forEach((c) => {
+            const id = c.item_id || c.id;
+            if (id) items[id] = (items[id] || 0) + (c.quantity || c.count || 0);
+          });
+        }
+        // Personal station storage.
+        const storeRes = await new Promise((resolve) => {
+          sendExec(username, "view_storage", { target: "self" }, resolve);
+        });
+        if (storeRes && storeRes.ok && storeRes.data) {
+          const arr =
+            storeRes.data.items || storeRes.data.storage || storeRes.data || [];
+          const list = Array.isArray(arr) ? arr : Object.values(arr);
+          list.forEach((c) => {
+            const id = c.item_id || c.id;
+            if (id) storage[id] = (storage[id] || 0) + (c.quantity || c.count || 0);
+          });
+        }
+        return { items, storage };
+      }
+
       function renderFactionQueueUsage(f, username) {
         const bot = bots.find((b) => b.username === username);
         const docked = bot ? bot.docked : false;
@@ -21257,6 +21735,24 @@ When responding:
       let personalFacilityLoadComplete = false;
       let personalFacilityDismantling = {};
       let personalFacilityDismantleTimers = {};
+
+      // ── Station Facilities (player_station_buildable) state ──
+      let stationFacilityTypes = [];
+      let stationFacilityCategory = "service";
+      const stationFacilityCategories = ["service", "infrastructure", "defense"];
+      let stationFacilitiesData = [];
+      let stationMaintenanceTimer = null;
+      let stationMaintenanceCache = { cargo: [], storage: [] };
+
+      // Catalog ids of all player_station_buildable facilities (44 total).
+      function getPlayerStationBuildableIds() {
+        const facilities = catalog.facilities || {};
+        return new Set(
+          Object.values(facilities)
+            .filter((f) => f.player_station_buildable)
+            .map((f) => f.id),
+        );
+      }
 
       function fetchFactionBuildableTypes(username) {
         const container = document.getElementById("factionBuildableTypes");
@@ -22153,6 +22649,7 @@ When responding:
     <button class="faction-nav-btn ${activePanel === "storage" ? "active" : ""}" onclick="switchFactionPanel('storage')">Storage</button>
     <button class="faction-nav-btn ${activePanel === "facilities" ? "active" : ""}" onclick="switchFactionPanel('facilities')">Facilities</button>
     <button class="faction-nav-btn ${activePanel === "queueusage" ? "active" : ""}" onclick="switchFactionPanel('queueusage')">Queue Usage</button>
+    <button class="faction-nav-btn ${activePanel === "station" ? "active" : ""}" onclick="switchFactionPanel('station')">Station</button>
     <button class="faction-nav-btn ${activePanel === "personal" ? "active" : ""}" onclick="switchFactionPanel('personal')">Personal Facilities</button>
     <button class="faction-nav-btn ${activePanel === "rooms" ? "active" : ""}" onclick="switchFactionPanel('rooms')">Rooms</button>
     <button class="faction-nav-btn ${activePanel === "missions" ? "active" : ""}" onclick="switchFactionPanel('missions')">Missions</button>

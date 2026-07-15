@@ -20708,7 +20708,7 @@ When responding:
         sendExec(
           username,
           "facility",
-          { action: "list" },
+          { action: "faction_list" },
           (result) => {
             if (!result.ok || !result.data) {
               container.innerHTML = `<div class="faction-no-data">${esc(result.error || "No facilities found")}</div>`;
@@ -20811,7 +20811,7 @@ When responding:
             sendExec(
               username,
               "facility",
-              { action: "list" },
+              { action: "faction_list" },
               (result) => {
                 if (result.ok && result.data) {
                   const d = result.data;
@@ -21754,6 +21754,9 @@ When responding:
         if (stationFacilityCategories.includes(cat)) return true;
         const id = fac.facility_type || fac.type || fac.id;
         if (id && getPlayerStationBuildableIds().has(id)) return true;
+        // Last resort: resolve via catalog (any id form) and check the flag.
+        const catDef = resolveStationCatalog(fac);
+        if (catDef && catDef.player_station_buildable) return true;
         return false;
       }
 

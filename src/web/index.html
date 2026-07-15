@@ -20684,25 +20684,21 @@ When responding:
           appendLine("system", "No station facility type ID");
           return;
         }
-        appendLine(
-          "system",
-          `${username}: Building station facility ${facilityType}...`,
-        );
-        sendExec(
-          username,
-          "facility",
-          { action: "faction_build", facility_type: facilityType },
-          (result) => {
-            if (result.ok) {
-              appendLine("system", `${username}: ${facilityType} built!`);
-              fetchStationFacilities(username);
-            } else {
-              appendLine("system", `Build failed: ${result.error || "unknown"}`);
-              if (result.data)
-                appendLine("system", `Raw: ${JSON.stringify(result.data)}`);
-            }
-          },
-        );
+        // Reuse the faction build flow (checks + progress UI) but render the
+        // progress into the station build container and refresh station lists.
+        factionBuildFacility(username, facilityType, {
+          containerId: "stationBuildableTypes",
+          onErrorHtml:
+            '<button class="sm" onclick="switchStationFacilityCategory(\'' +
+            esc(stationFacilityCategory) +
+            "','" +
+            esc(username) +
+            "')\">Back to List</button>",
+          onSuccessHtml:
+            '<button class="primary sm" onclick="fetchStationFacilities(\'' +
+            esc(username) +
+            "')\">View Station Facilities</button>",
+        });
       }
 
       async function fetchStationFacilities(username) {
@@ -20726,12 +20722,9 @@ When responding:
                 : Array.isArray(d.facilities)
                   ? d.facilities
                   : [];
-            const psbIds = getPlayerStationBuildableIds();
-            // Keep only player_station_buildable facilities (service/infrastructure/defense).
-            const facilities = all.filter((fac) => {
-              const id = fac.facility_type || fac.type || fac.id;
-              return id && psbIds.has(id);
-            });
+            // Keep only player-station facilities (service/infrastructure/defense),
+            // which are the same entries returned by `facility faction_list`.
+            const facilities = all.filter((fac) => isStationFacility(fac));
             stationFacilitiesData = facilities;
             if (facilities.length === 0) {
               container.innerHTML =
@@ -20754,10 +20747,11 @@ When responding:
                   ? '<span style="color:var(--green)">Active</span>'
                   : '<span style="color:var(--red)">Inactive</span>';
                 const cat = fac.category || "";
+                const catDef = resolveStationCatalog(fac);
                 const desc = active
-                  ? getCatalogFacility(fac.facility_type || fac.type || fac.id)?.satisfied_description || fac.description || ""
-                  : getCatalogFacility(fac.facility_type || fac.type || fac.id)?.degraded_description || fac.description || "";
-                const maint = getCatalogFacility(fac.facility_type || fac.type || fac.id)?.maintenance_inputs || [];
+                  ? catDef?.satisfied_description || fac.description || ""
+                  : catDef?.degraded_description || fac.description || "";
+                const maint = catDef?.maintenance_inputs || [];
                 const maintHtml = Array.isArray(maint) && maint.length
                   ? '<div style="margin-top:4px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Needs/round:</span> ' +
                     maint
@@ -20828,11 +20822,7 @@ When responding:
                       : Array.isArray(d.facilities)
                         ? d.facilities
                         : [];
-                  const psbIds = getPlayerStationBuildableIds();
-                  stationFacilitiesData = all.filter((fac) => {
-                    const id = fac.facility_type || fac.type || fac.id;
-                    return id && psbIds.has(id);
-                  });
+                  stationFacilitiesData = all.filter((fac) => isStationFacility(fac));
                 } else {
                   stationFacilitiesData = [];
                 }
@@ -20852,7 +20842,7 @@ When responding:
           const active = fac.status === "active" || fac.active === true;
           if (!active) return;
           const id = fac.facility_type || fac.type || fac.id;
-          const cat = getCatalogFacility(id);
+          const cat = resolveStationCatalog(fac);
           const maint = (cat && cat.maintenance_inputs) || [];
           if (!maint.length) return;
           contributing.push({
@@ -21754,6 +21744,32 @@ When responding:
         );
       }
 
+      // A live facility counts as a "station" facility if its category is one of
+      // the player-station categories (service/infrastructure/defense) — these
+      // are exactly the categories returned by `facility faction_list` — OR if
+      // its catalog id is flagged player_station_buildable.
+      function isStationFacility(fac) {
+        if (!fac) return false;
+        const cat = (fac.category || "").toLowerCase();
+        if (stationFacilityCategories.includes(cat)) return true;
+        const id = fac.facility_type || fac.type || fac.id;
+        if (id && getPlayerStationBuildableIds().has(id)) return true;
+        return false;
+      }
+
+      // Resolve a live facility's catalog definition (for maintenance_inputs,
+      // descriptions, etc.). Tries several id forms since live `faction_list`
+      // entries may key by facility_type/id/type differently than catalog.
+      function resolveStationCatalog(fac) {
+        if (!fac) return null;
+        const ids = [fac.facility_type, fac.id, fac.type].filter(Boolean);
+        for (const id of ids) {
+          const c = getCatalogFacility(id);
+          if (c) return c;
+        }
+        return null;
+      }
+
       function fetchFactionBuildableTypes(username) {
         const container = document.getElementById("factionBuildableTypes");
         if (!container) return;
@@ -22261,8 +22277,14 @@ When responding:
         container.innerHTML = detailHtml;
       }
 
-      async function factionBuildFacility(username, facilityType) {
-        const container = document.getElementById("factionBuildableTypes");
+      async function factionBuildFacility(
+        username,
+        facilityType,
+        opts,
+      ) {
+        opts = opts || {};
+        const containerId = opts.containerId || "factionBuildableTypes";
+        const container = document.getElementById(containerId);
         if (!container) return;
 
         // Show progress UI (same style as personal)
@@ -22300,17 +22322,19 @@ When responding:
         const showError = (msg) => {
           setStatus("ERROR: " + msg, "var(--red)");
           document.getElementById("bp-actions").innerHTML =
-            '<button class="sm" onclick="fetchFactionBuildableTypes(\'' +
-            esc(username) +
-            "')\">Back to List</button>";
+            opts.onErrorHtml ||
+            ('<button class="sm" onclick="fetchFactionBuildableTypes(\'' +
+              esc(username) +
+              "')\">Back to List</button>");
         };
 
         const showSuccess = () => {
           setStatus("Facility built successfully!", "var(--green)");
           document.getElementById("bp-actions").innerHTML =
-            '<button class="primary sm" onclick="fetchFactionFacilities(\'' +
-            esc(username) +
-            "')\">View Faction Facilities</button>";
+            opts.onSuccessHtml ||
+            ('<button class="primary sm" onclick="fetchFactionFacilities(\'' +
+              esc(username) +
+              "')\">View Faction Facilities</button>");
         };
 
         // Step 1: Get facility type details

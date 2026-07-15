@@ -41,6 +41,11 @@
     let knownOres = [];
     let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
     let reconnectDelay = 1000;
+    let wsManualClose = false;
+    let wsConnectTimer = null;
+    let wsHeartbeatTimer = null;
+    let wsWatchdogTimer = null;
+    let wsLastMsg = Date.now();
     let mapData = {};
     let modalMode = 'add';
     let activeSettingsTab = 'general';
@@ -158,36 +163,68 @@
     }
 
       function connect() {
-        clearTimeout(wsInitTimer);
+        if (wsManualClose) return;
+        clearTimeout(wsConnectTimer);
 
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        let host = location.host;
+        if (!host) host = (location.hostname || 'localhost') + (location.port ? ':' + location.port : '');
+        let url;
+        try {
+          url = `${proto}//${host}/ws`;
+          ws = new WebSocket(url);
+        } catch (err) {
+          console.warn('WebSocket constructor failed, retrying in 1s:', err);
+          wsConnectTimer = setTimeout(connect, 1000);
+          return;
+        }
 
+        wsLastMsg = Date.now();
+
+        clearTimeout(wsInitTimer);
         wsInitTimer = setTimeout(() => {
           if (!ws || ws.readyState !== WebSocket.OPEN) {
-            console.warn('WebSocket slow, fetching initial data via REST...');
-            fetchInitialData();
+            console.warn('WebSocket not open after 4s — REST fallback + reconnect');
+            try { fetchInitialData(); } catch (e) {}
+            try { ws && ws.close(); } catch {}
           }
-        }, 1500);
+        }, 4000);
 
         ws.onopen = () => {
           clearTimeout(wsInitTimer);
           reconnectDelay = 1000;
           flushWsSendQueue();
+          clearInterval(wsHeartbeatTimer);
+          wsHeartbeatTimer = setInterval(() => {
+            try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+          }, 15000);
+          clearInterval(wsWatchdogTimer);
+          wsWatchdogTimer = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+              console.warn('WebSocket silent for 30s, forcing reconnect');
+              try { ws.close(); } catch {}
+            }
+          }, 5000);
         };
 
         ws.onclose = () => {
           clearTimeout(wsInitTimer);
+          clearInterval(wsHeartbeatTimer);
+          clearInterval(wsWatchdogTimer);
           ws = null;
-          setTimeout(connect, reconnectDelay);
-          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+          if (wsManualClose) return;
+          wsConnectTimer = setTimeout(connect, 1000);
         };
 
-        ws.onerror = () => {};
+        ws.onerror = () => {
+          try { ws && ws.close(); } catch {}
+        };
 
         ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'pong') return;
+          wsLastMsg = Date.now();
           switch (msg.type) {
             case 'init':
               clearTimeout(wsInitTimer);

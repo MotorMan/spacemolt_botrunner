@@ -9,7 +9,7 @@
   <body>
     <header>
       <div style="display: flex; align-items: center">
-        <h1>SpaceMolt Commander</h1>
+        <h1 id="appTitle">SpaceMolt Commander</h1>
         <div class="top-tabs" id="topTabs">
           <div
             class="top-tab active"
@@ -12109,11 +12109,18 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Browser Window Title</div>
-        <div class="setting-hint">Custom title shown in the browser tab. Leave blank to use the default "SpaceMolt Commander". Useful for telling multiple client tabs apart.</div>
+        <div class="setting-hint">Custom title shown in the browser tab and app header. Leave blank to use the default "SpaceMolt Commander". Useful for telling multiple client tabs apart.</div>
+        <div class="setting-hint" style="margin-top:4px">
+          Color codes are supported in the in-app header:
+          <code>[c:red]text[/c]</code> (names: red, green, blue, yellow, cyan, magenta, orange, purple, pink, lime, teal, gold, white, gray) or hex <code>[c:#ff8800]text[/c]</code>. Nested colors work too.
+        </div>
       </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <input type="text" id="set-general-windowTitle" maxlength="60" value="${esc(general.windowTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" />
-        <button class="sm" onclick="document.getElementById('set-general-windowTitle').value='';saveGeneralSettings();applyWindowTitle()">Reset</button>
+      <div style="display:flex;flex-direction:column;align-items:flex-start;gap:8px">
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="text" id="set-general-windowTitle" maxlength="120" value="${esc(general.windowTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" oninput="updateWindowTitlePreview()" />
+          <button class="sm" onclick="document.getElementById('set-general-windowTitle').value='';saveGeneralSettings();applyWindowTitle();updateWindowTitlePreview()">Reset</button>
+        </div>
+        <div style="font-size:13px;font-weight:600" id="windowTitlePreview"></div>
       </div>
     </div>
 
@@ -12360,6 +12367,7 @@
         // selection. Selection state comes from the persistent `clerkSelection`
         // set, which survives the re-render.
         renderClerkPlayers();
+        updateWindowTitlePreview();
       }
 
       function saveGeneralSettings() {
@@ -12461,9 +12469,101 @@
         applyWindowTitle();
       }
 
+      // ── Color-code mini-language for the app title ──────────────
+      // Supports [c:name]...[/c] and [c:#rrggbb]...[/c] for multi-color
+      // titles. Named colors map to the palette below; hex values are allowed
+      // too. The browser tab (document.title) stays plain text, but the in-app
+      // header <h1 id="appTitle"> renders the colors.
+      const TITLE_COLORS = {
+        red: "#ff6b6b",
+        green: "#4ade80",
+        blue: "#60a5fa",
+        yellow: "#facc15",
+        cyan: "#22d3ee",
+        magenta: "#e879f9",
+        orange: "#fb923c",
+        purple: "#a78bfa",
+        pink: "#f472b6",
+        lime: "#a3e635",
+        teal: "#2dd4bf",
+        gold: "#fcd34d",
+        white: "#f0f6fc",
+        gray: "#8b949e",
+        grey: "#8b949e",
+        black: "#1b1f24",
+      };
+
+      function titleColorToCss(c) {
+        if (!c) return null;
+        c = String(c).trim().toLowerCase();
+        if (TITLE_COLORS[c]) return TITLE_COLORS[c];
+        if (/^#([0-9a-f]{3}|[0-9a-f]{6})$/.test(c)) return c;
+        return null;
+      }
+
+      function escHtml(s) {
+        return String(s).replace(/[&<>"']/g, (m) => ({
+          "&": "&amp;",
+          "<": "&lt;",
+          ">": "&gt;",
+          '"': "&quot;",
+          "'": "&#39;",
+        }[m]));
+      }
+
+      // Convert a title string (with optional [c:...] codes) to safe HTML.
+      // Unknown codes / unbalanced [/c] are rendered literally.
+      function parseColorCodes(text) {
+        if (!text) return "";
+        const re = /\[c:([^\]]+)\]|\[\/c\]/g;
+        let last = 0;
+        let m;
+        let html = "";
+        let open = 0;
+        while ((m = re.exec(text)) !== null) {
+          html += escHtml(text.slice(last, m.index));
+          if (m[1] !== undefined) {
+            const css = titleColorToCss(m[1]);
+            if (css) {
+              html += `<span style="color:${css}">`;
+              open++;
+            } else {
+              html += escHtml(m[0]);
+            }
+          } else {
+            if (open > 0) {
+              html += "</span>";
+              open--;
+            } else {
+              html += escHtml(m[0]);
+            }
+          }
+          last = re.lastIndex;
+        }
+        html += escHtml(text.slice(last));
+        while (open-- > 0) html += "</span>";
+        return html;
+      }
+
+      function stripColorCodes(text) {
+        return String(text || "").replace(/\[c:[^\]]+\]/g, "").replace(/\[\/c\]/g, "");
+      }
+
       function applyWindowTitle() {
         const custom = (settings.general && settings.general.windowTitle) || "";
-        document.title = custom.trim() ? custom.trim() : "SpaceMolt Commander";
+        const title = custom.trim() ? custom.trim() : "SpaceMolt Commander";
+        // Browser tab title is plain text only.
+        document.title = stripColorCodes(title);
+        // In-app header renders the colors.
+        const h1 = document.getElementById("appTitle");
+        if (h1) h1.innerHTML = parseColorCodes(title);
+      }
+
+      function updateWindowTitlePreview() {
+        const el = document.getElementById("windowTitlePreview");
+        if (!el) return;
+        const val = document.getElementById("set-general-windowTitle").value || "";
+        el.innerHTML = parseColorCodes(val.trim() ? val.trim() : "SpaceMolt Commander");
       }
 
       // ── System Blacklist Settings ───────────────────────────────

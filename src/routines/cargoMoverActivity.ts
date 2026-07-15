@@ -142,7 +142,8 @@ export type CargoActivityType =
   | "lock_released"
   | "lock_conflict"
   | "interruption"
-  | "resume";
+  | "resume"
+  | "graceful_stop";
 
 export interface CargoMoverActivityData {
   /** Active movements keyed by movementId. */

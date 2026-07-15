@@ -770,6 +770,55 @@ async function depositToDestination(
   return { success: false, depositedQty: 0 };
 }
 
+/** Deliver every deliverable item currently in the hold to the destination.
+ *  Used by the graceful-shutdown path so cargo is never abandoned when the
+ *  routine is asked to stop. Fuel cells are never deposited (see
+ *  isNeverDepositFuelItem / fuelDepositQty). Returns the delivered items. */
+async function deliverCargoAboard(
+  ctx: RoutineContext,
+  settings: CargoMoverSettings,
+): Promise<{ itemId: string; quantity: number }[]> {
+  const { bot } = ctx;
+
+  await bot.refreshCargo();
+  const items = [...bot.inventory];
+  const delivered: { itemId: string; quantity: number }[] = [];
+
+  for (const item of items) {
+    if (item.quantity <= 0) continue;
+    // Premium/energy cells never leave the ship; military cells keep the
+    // required reserve aboard and deposit only the excess.
+    if (isNeverDepositFuelItem(item.itemId)) continue;
+    const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+    if (depositQty <= 0) {
+      ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
+      continue;
+    }
+    const result = await depositToDestination(
+      ctx,
+      item.itemId,
+      depositQty,
+      settings.destinationStorageType,
+      settings.destinationBotName,
+    );
+    if (result.success) {
+      ctx.log("cargo", `✅ Delivered ${result.depositedQty}x ${item.name}`);
+      delivered.push({ itemId: item.itemId, quantity: result.depositedQty });
+    }
+  }
+
+  if (delivered.length > 0) {
+    const itemIds = delivered.map((d) => d.itemId);
+    const quantities = delivered.map((d) => d.quantity);
+    updateDeliveryTracking(ctx, itemIds, quantities, settings);
+    // Remove delivered items from in-transit tracking.
+    removeInTransitItems(bot.username, settings.destinationStation, delivered);
+    ctx.log("cargo", `📦 Removed ${delivered.length} item type(s) from in-transit tracking after graceful delivery`);
+  }
+
+  return delivered;
+}
+
 function findMoveJobs(
   ctx: RoutineContext,
   settings: CargoMoverSettings,
@@ -1062,6 +1111,174 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // Still in battle - continue to next cycle
       await ctx.sleep(2000); // Brief pause before next check
       continue;
+    }
+
+    // ── GRACEFUL SHUTDOWN (return to home / source station) ─────────────
+    // Mirrors civilian transport's stopAfterCycle, but the cargo mover must
+    // always end parked back at the source ("home") station when it stops.
+    // When a stop is requested we finish the current in-flight delivery, then
+    // navigate home, dock, and stop. We never abandon cargo and never start a
+    // brand-new loading round.
+    if (bot.shouldStopAfterCycle()) {
+      const gSettings = getCargoMoverSettings(bot.username);
+      ctx.log("cargo", "🛑 Graceful shutdown requested — finishing round and returning to source station (home)...");
+      logCargoActivity(bot.username, "graceful_stop", "Graceful shutdown requested", {
+        location: `${bot.system}/${bot.poi}`,
+      });
+
+      // Already docked at home — nothing left to do, stop immediately.
+      if (bot.docked && botIsAtStation(bot, gSettings.sourceStation)) {
+        bot.clearStopAfterCycle();
+        for (const item of gSettings.items) {
+          releaseQuantityLock(bot.username, item.itemId, "stopped");
+        }
+        logCargoActivity(bot.username, "graceful_stop", "Routine stopped at home (source station)", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        ctx.log("cargo", "🛑 Graceful shutdown — stopped at home (source station)");
+        bot.initiateStop();
+        return;
+      }
+
+      const gSourceSystem = resolveStationSystem(gSettings.sourceStation);
+      const gDestSystem = resolveStationSystem(gSettings.destinationStation);
+
+      // Deliver any cargo aboard first (so it is never stranded). Skip this if
+      // we're already at the destination — the cargo is (or was) dropped there.
+      await bot.refreshCargo();
+      const hasCargo = bot.inventory.some((item) => {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+        return gSettings.items.some((ci) => ci.itemId === item.itemId);
+      });
+
+      if (hasCargo && gDestSystem && !botIsAtStation(bot, gSettings.destinationStation)) {
+        ctx.log("cargo", "🛑 Graceful shutdown — delivering cargo aboard to destination before returning home...");
+        const gSafetyOpts = {
+          fuelThresholdPct: gSettings.refuelThreshold,
+          hullThresholdPct: gSettings.repairThreshold,
+          ignorePiratesWhenCloaked: gSettings.ignorePiratesWhenCloaked,
+          ignoreBlacklistWhenCloaked: gSettings.ignoreBlacklistWhenCloaked,
+        };
+        await undockForTravel(ctx, warnedNoCloak);
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
+        const fueled = await ensureFueled(ctx, gSafetyOpts.fuelThresholdPct);
+        if (!fueled) {
+          ctx.log("error", "Cannot refuel for graceful-shutdown delivery");
+          await ctx.sleep(30000);
+          continue;
+        }
+        if (bot.system !== gDestSystem) {
+          const arrived = await navigateToSystem(ctx, gDestSystem, gSafetyOpts);
+          if (!arrived || bot.state !== "running") {
+            if (bot.state !== "running") {
+              ctx.log("system", "⛔ Stopping — emergency detected");
+              return;
+            }
+            ctx.log("error", `Failed to reach ${gDestSystem} for graceful-shutdown delivery`);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+        await undockForTravel(ctx, warnedNoCloak);
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
+        if (!botIsAtStation(bot, gSettings.destinationStation)) {
+          const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(gSettings.destinationStation) });
+          if (bot.state !== "running") {
+            ctx.log("system", "⛔ Stopping — emergency detected");
+            return;
+          }
+          if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+            ctx.log("error", `Travel to destination failed during graceful shutdown: ${tResp.error.message}`);
+            await ctx.sleep(30000);
+            continue;
+          }
+          if (!tResp.error) bot.poi = stationTravelTarget(gSettings.destinationStation);
+        }
+        if (!await dockAtStation(ctx)) {
+          ctx.log("error", "Could not dock at destination for graceful-shutdown delivery");
+          await ctx.sleep(30000);
+          continue;
+        }
+        await deliverCargoAboard(ctx, gSettings);
+        await tryRefuel(ctx);
+      }
+
+      // Return home (source station) and dock.
+      if (gSourceSystem) {
+        ctx.log("cargo", "🛑 Graceful shutdown — returning to source station (home)...");
+        await undockForTravel(ctx, warnedNoCloak);
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
+        const gSafetyOpts = {
+          fuelThresholdPct: gSettings.refuelThreshold,
+          hullThresholdPct: gSettings.repairThreshold,
+          ignorePiratesWhenCloaked: gSettings.ignorePiratesWhenCloaked,
+          ignoreBlacklistWhenCloaked: gSettings.ignoreBlacklistWhenCloaked,
+        };
+        const fueled = await ensureFueled(ctx, gSafetyOpts.fuelThresholdPct);
+        if (!fueled) {
+          ctx.log("error", "Cannot refuel for graceful-shutdown return home");
+          await ctx.sleep(30000);
+          continue;
+        }
+        if (bot.system !== gSourceSystem) {
+          const arrived = await navigateToSystem(ctx, gSourceSystem, gSafetyOpts);
+          if (!arrived || bot.state !== "running") {
+            if (bot.state !== "running") {
+              ctx.log("system", "⛔ Stopping — emergency detected");
+              return;
+            }
+            ctx.log("error", `Failed to reach ${gSourceSystem} for graceful-shutdown return`);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+        await undockForTravel(ctx, warnedNoCloak);
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
+        if (!botIsAtStation(bot, gSettings.sourceStation)) {
+          const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(gSettings.sourceStation) });
+          if (bot.state !== "running") {
+            ctx.log("system", "⛔ Stopping — emergency detected");
+            return;
+          }
+          if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+            ctx.log("error", `Travel to source failed during graceful shutdown: ${tResp.error.message}`);
+            await ctx.sleep(30000);
+            continue;
+          }
+          if (!tResp.error) bot.poi = stationTravelTarget(gSettings.sourceStation);
+        }
+        if (!await dockAtStation(ctx)) {
+          ctx.log("error", "Could not dock at source station for graceful shutdown");
+          await ctx.sleep(30000);
+          continue;
+        }
+        await tryRefuel(ctx);
+        await repairShip(ctx);
+      }
+
+      bot.clearStopAfterCycle();
+      for (const item of gSettings.items) {
+        releaseQuantityLock(bot.username, item.itemId, "stopped");
+      }
+      logCargoActivity(bot.username, "graceful_stop", "Routine stopped at home (source station)", {
+        location: `${bot.system}/${bot.poi}`,
+      });
+      ctx.log("cargo", "🛑 Graceful shutdown — stopped at home (source station)");
+      bot.initiateStop();
+      return;
     }
 
     const settings = getCargoMoverSettings(bot.username);

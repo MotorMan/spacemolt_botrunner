@@ -1353,7 +1353,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // Navigate to source station only if not already there
     yield "navigate_to_source";
 
-    let justDockedAtSource = false;
+    // Always run source-station maintenance (refuel + load fuel cells) when we
+    // are docked at the source and about to start a load cycle — including the
+    // common case where the bot is already sitting docked at "home" when the
+    // routine begins. Without this, the ship would load cargo and depart without
+    // ever refueling, then run dry partway through a multi-jump trip.
+    let justDockedAtSource = bot.docked && botIsAtStation(bot, settings.sourceStation);
 
     if (bot.system !== sourceSystem) {
       ctx.log("cargo", `🚀 Not at source system (${bot.system} ≠ ${sourceSystem}) — navigating...`);
@@ -1780,14 +1785,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       location: `${bot.system} → ${destSystem}`,
     });
     
-    await undockForTravel(ctx, warnedNoCloak);
-    if (bot.state !== "running") {
-      ctx.log("system", "⛔ Stopping — emergency detected");
-      logCargoActivity(bot.username, "interruption", "Emergency detected before delivery travel", {
-        location: `${bot.system}/${bot.poi}`,
-      });
-      return;
-    }
+    // Refuel BEFORE undocking so we top off the tank while still docked at the
+    // source/home station (ensureFueled can refuel in place when docked). If we
+    // undocked first, the only option would be cargo cells and we could leave
+    // home under-fueled.
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
       ctx.log("error", "Cannot refuel for delivery");
@@ -1796,6 +1797,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
       allJobsCompleted = false;
       break;
+    }
+
+    await undockForTravel(ctx, warnedNoCloak);
+    if (bot.state !== "running") {
+      ctx.log("system", "⛔ Stopping — emergency detected");
+      logCargoActivity(bot.username, "interruption", "Emergency detected before delivery travel", {
+        location: `${bot.system}/${bot.poi}`,
+      });
+      return;
     }
 
     if (bot.system !== destSystem) {

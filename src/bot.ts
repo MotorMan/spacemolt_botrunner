@@ -195,6 +195,22 @@ docked = false;
    */
   private _terminalClosed = false;
 
+  /**
+   * Guards the forced-socket-reconnect so it fires at most once per
+   * connection-loss episode. Set the first time `sendResilient` sees a dead
+   * socket (and `forceSocketReconnect` is kicked off); cleared again when the
+   * socket comes back, or when the routine ends (so a later restart can force a
+   * fresh socket too). Prevents a genuinely-dead connection from being force-
+   * reconnected in a tight loop — retries fall back to the routine's back-off
+   * restart instead.
+   */
+  private _forceReconnectPending = false;
+
+  /** Clear the terminal-close guard (e.g. when a forced reconnect is requested). */
+  clearTerminalClosed(): void {
+    this._terminalClosed = false;
+  }
+
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -409,7 +425,17 @@ docked = false;
           throw err;
         }
         connectionWaitCount++;
-        this.log("warn", `Disconnected (${message}) — pausing ${tool}/${action} until the socket reconnects (wait #${connectionWaitCount})`);
+        this.log("warn", `Disconnected (${message}) — forcing @spacemolt/lib to drop the dead socket and open a fresh one (wait #${connectionWaitCount})`);
+        // On the VERY FIRST connection error for this account, stop passively
+        // waiting and INSTANTLY ask the library to drop the dead socket and make
+        // a brand-new one. Pounding a closed door does nothing; a fresh socket
+        // does. We only trigger this once per loss episode (the flag is cleared
+        // when the socket comes back or the routine ends), so a genuinely-dead
+        // connection retries with the established back-off instead of a tight loop.
+        if (!this._forceReconnectPending) {
+          this._forceReconnectPending = true;
+          void this.forceSocketReconnect();
+        }
         const reconnected = await this.waitForReconnect();
         if (!reconnected) {
           // Stopped, or the connection is gone for good (player connected
@@ -818,11 +844,13 @@ docked = false;
     return new Promise<boolean>((resolve) => {
       const check = () => {
         if (self.state === "stopping" || self._abortController?.signal.aborted) {
+          self._forceReconnectPending = false;
           clearInterval(poll);
           resolve(false);
           return;
         }
         if (self._terminalClosed) {
+          self._forceReconnectPending = false;
           clearInterval(poll);
           self.log("error", "Connection closed permanently (account connected elsewhere) — ending routine.");
           resolve(false);
@@ -830,6 +858,7 @@ docked = false;
         }
         const acct = self.account;
         if (acct && acct.authenticated) {
+          self._forceReconnectPending = false;
           clearInterval(poll);
           resolve(true);
           return;
@@ -843,6 +872,31 @@ docked = false;
       const poll = setInterval(check, 1000);
       check();
     });
+  }
+
+  /**
+   * Force @spacemolt/lib to drop this account's dead socket and open a fresh one,
+   * RIGHT NOW. Called from `sendResilient` on the first connection error so we
+   * never sit "pounding our heads against a closed door" — we make the library
+   * replace the socket instantly. Delegates to botmanager's `forceReconnectBot`
+   * (evict the dead `Account` from the client, then reconnect a fresh one) via a
+   * lazy import to avoid a bot.ts ↔ botmanager.ts circular dependency. Fire-and-
+   * forget: `waitForReconnect` keeps polling `account.authenticated`, so when the
+   * new socket authenticates the in-flight command is simply resent.
+   */
+  private async forceSocketReconnect(): Promise<void> {
+    const id = this.account?.id;
+    if (!id) return;
+    if (this.state === "stopping" || this._abortController?.signal.aborted) return;
+    this.log("system", `Forcing a fresh @spacemolt/lib socket for ${id} (dropping the dead one)...`);
+    try {
+      const { forceReconnectBot } = await import("./botmanager.js");
+      await forceReconnectBot(id);
+    } catch {
+      // Transient (e.g. the client isn't initialized yet). The 15s watchdog and
+      // the routine's own back-off restart will still retry; this is a best-effort
+      // parallel kick that must never throw into the caller.
+    }
   }
 
   /** Public alias routines can call to explicitly pause until reconnected. */

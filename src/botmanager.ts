@@ -541,6 +541,43 @@ async function reconnectDeadBots(ids?: string[]): Promise<void> {
 }
 
 /**
+ * Force a brand-new socket for a single bot, RIGHT NOW.
+ *
+ * Called by `Bot.sendResilient` the instant it hits the FIRST "cannot send on a
+ * closed socket" error for an account. The previous behavior was to *passively*
+ * `waitForReconnect` — hoping the library's own auto-reconnect (`reconnectOnce`
+ * / client-managed `reconnectAccountInPlace`) would revive the socket. But after
+ * a server restart the socket can stay dead: the library's reconnect may not fire,
+ * or it re-welds us to the *same* permanently-closed `Account` still cached in the
+ * client's `connected` map — so we'd sit there "pounding our heads against a
+ * closed door" while every command failed. This instead INSTANTLY tells
+ * @spacemolt/lib to drop the dead socket and build a fresh one: evict the dead
+ * `Account` from the client (so `connectOwned` can't hand us the same closed
+ * socket back) and then reconnect it.
+ *
+ * We also clear any terminal-close guard first. A `session_replaced` (4001) /
+ * `auth_timeout` (4002) close is usually a *zombie* session after a server
+ * restart — the server still thinks the pre-restart socket is "the" live session,
+ * not a genuinely-somewhere-else login — so clearing it here lets our fresh socket
+ * win, exactly like the user wants. A truly-elsewhere session will just get
+ * replaced again and re-arm the guard behind the routine's back-off restart, which
+ * is a correct, bounded retry rather than a silent permanent give-up.
+ */
+export async function forceReconnectBot(id: string): Promise<void> {
+  // Clear the terminal-close guard so this fresh attempt isn't skipped by
+  // reconnectDeadBots / waitForReconnect.
+  terminalClosedBots.delete(id);
+  const bot = bots.get(id);
+  if (bot) bot.clearTerminalClosed();
+  // Evict the dead Account so reconnectDeadBots builds a brand-new one with a
+  // fresh socket (otherwise connectOwned short-circuits on the cached dead one).
+  if (getConnectedAccount(id)) {
+    try { removeConnectedAccount(id); } catch { /* best-effort */ }
+  }
+  await reconnectDeadBots([id]);
+}
+
+/**
  * Reconnect any selected (saved) bot that isn't currently connected.
  *
  * `connectLibraryAccounts` only runs once at startup. If an account failed to

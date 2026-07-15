@@ -868,13 +868,23 @@ docked = false;
           self.log("system", "Stop requested — aborting socket recovery.");
           return settle(false);
         }
-        if (self._terminalClosed) {
-          self.log("error", "Connection closed permanently (account connected elsewhere) — ending routine.");
-          return settle(false);
-        }
         const acct = self.account;
         if (acct && acct.authenticated) {
           return settle(true);
+        }
+        // A terminal close (session_replaced / auth_timeout) usually means the
+        // player is connected elsewhere — but it is ALSO what the game server
+        // sends to every bot after its own restart (a "zombie" session whose
+        // socket pre-dates the restart). We used to treat it as a permanent
+        // death sentence and never reconnect, which left the entire fleet dead
+        // after every server restart ("won't reconnect"). Instead, drop the dead
+        // socket and try a fresh one (bounded by MAX_FORCES below): a post-
+        // restart zombie reconnects immediately, and a genuinely-elsewhere
+        // account simply re-dies and falls through to the bounded give-up
+        // rather than hanging the routine forever.
+        if (self._terminalClosed) {
+          self.log("warn", "Connection was closed (account connected elsewhere / server restart) — dropping it and trying a fresh socket...");
+          self.clearTerminalClosed();
         }
         forces++;
         if (forces > MAX_FORCES) {

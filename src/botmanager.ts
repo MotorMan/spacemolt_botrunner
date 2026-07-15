@@ -460,9 +460,9 @@ function registerClientDisconnectHandlers(): void {
       if (code === CLOSE_CODE.SESSION_REPLACED || code === CLOSE_CODE.AUTH_TIMEOUT) {
         terminalClosedBots.add(id);
         server.logSystem(
-          `Connection to "${id}" closed permanently (${detail}). The player is connected elsewhere ` +
-          `— another botrunner instance or you are logged in as ${id} on the website. Stopping auto-reconnect ` +
-          `for ${id}. To use it here, disconnect it there first, then click Start (or remove + re-add).`,
+          `Connection to "${id}" closed (${detail}). Treated as a possible post-restart zombie — ` +
+          `auto-reconnect will keep dropping the dead socket and trying a fresh one on a backoff. ` +
+          `If ${id} is genuinely connected elsewhere, disconnect it there and it will resume automatically.`,
         );
         return;
       }
@@ -1036,18 +1036,15 @@ function fireRestart(botName: string): void {
   if (!b) return;
   if (getStoppedState(botName)) return;
   if (b.state !== "error") return;
-  // Terminal-close guard: if this bot was closed by the server because it's
-  // connected elsewhere (session_replaced/auth_timeout), do NOT auto-restart it.
-  // An auto-restart would just open a socket the server immediately kills,
-  // re-triggering the endless "cannot send on a closed socket" loop. The user
-  // must disconnect the other session first, then click Start (which clears the
-  // guard). Note: handleStart clears the guard, so we must bail BEFORE calling it.
+  // A terminal-closed bot (session_replaced / auth_timeout) may have been killed
+  // by a post-restart zombie session rather than a genuine elsewhere login, so
+  // we DO auto-restart it here (the backoff retry in scheduleAutoRestart already
+  // governs how often). Clearing the guard lets this attempt open a fresh socket;
+  // a genuinely-elsewhere account simply re-dies and re-arms the guard + backoff.
   if (terminalClosedBots.has(botName)) {
-    server.logSystem(
-      `Bot ${botName} was terminal-closed (connected elsewhere) — skipping auto-restart. ` +
-      `Disconnect ${botName} on the other session, then click Start to retry.`,
-    );
-    return;
+    terminalClosedBots.delete(botName);
+    const bot2 = bots.get(botName);
+    if (bot2) bot2.clearTerminalClosed();
   }
   const lastRoutine = getLastUsedRoutine(botName);
   const routineKey = (lastRoutine && ROUTINES[lastRoutine]) ? lastRoutine : "miner";
@@ -1069,15 +1066,31 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
     return;
   }
 
-  // Terminal-close guard: if this bot was closed by the server because it's
-  // connected elsewhere (session_replaced/auth_timeout), do NOT keep
-  // auto-restarting it — that just re-opens a socket the server immediately
-  // kills, reproducing the endless "cannot send on a closed socket" loop. The
-  // user must disconnect the other session first, then click Start (which
-  // clears the guard). Any pending retry timer is cancelled.
+  // Terminal-close guard: the server closed this account with session_replaced /
+  // auth_timeout, meaning it believes the player is connected ELSEWHERE. That is
+  // usually a *zombie* session after a server restart — the old socket is gone
+  // but the server still treats it as "the" live session — and a fresh socket
+  // reconnects immediately. It can also be a genuine elsewhere login. Either way
+  // we keep retrying to drop + reconnect (just on a long, gentle backoff so we
+  // recover automatically without flooding the server or the other session),
+  // rather than permanently giving up and leaving the bot dead.
+  let s = restartStates.get(botName);
   if (terminalClosedBots.has(botName)) {
-    const s = restartStates.get(botName);
     if (s?.timer) { clearTimeout(s.timer); s.timer = null; }
+    if (!s) { s = { consecutiveFailures: 0, connectionRetries: 0, timer: null }; restartStates.set(botName, s); }
+    s.connectionRetries++;
+    const delay = Math.min(
+      RESTART_BASE_BACKOFF_MS * 2 ** (s.connectionRetries - 1),
+      RESTART_MAX_BACKOFF_MS * 5,
+    );
+    server.logSystem(
+      `Bot ${botName} was closed (connected elsewhere) — will keep trying to drop + reconnect in ` +
+      `${Math.round(delay / 1000)}s (attempt ${s.connectionRetries}). Reconnects automatically once the socket sticks.`,
+    );
+    s.timer = setTimeout(() => {
+      s!.timer = null;
+      fireRestart(botName);
+    }, delay);
     return;
   }
 
@@ -1085,7 +1098,6 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
 
   // If a retry is already pending for this bot, leave it (avoids the periodic
   // checker and the .catch double-scheduling and resetting the backoff).
-  let s = restartStates.get(botName);
   if (s?.timer) return;
   if (!s) { s = { consecutiveFailures: 0, connectionRetries: 0, timer: null }; restartStates.set(botName, s); }
 
@@ -2066,8 +2078,14 @@ async function main(): Promise<void> {
     }
   }, 60 * 1000));
 
-  // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
-  // This keeps sessions alive and fetches notifications without heavy API calls
+  // Low-bandwidth session keep-alive for idle bots (every 40s). This is what
+  // keeps the server from timing the socket out while a bot is sitting idle.
+  // For HTTP-backed bots we poll get_notifications (also surfaces any pending
+  // notifications). For library-backed bots the WebSocket would otherwise go
+  // completely silent while idle — and the game server's idle timeout then CLOSES
+  // the socket (the "cannot send on a closed socket" deaths). A lightweight
+  // get_status is outbound traffic that resets the server idle timer AND keeps
+  // the dashboard's cached state current, so idle library bots get pinged too.
   intervals.push(setInterval(async () => {
     try {
       const keepAlivePromises = [];
@@ -2075,15 +2093,17 @@ async function main(): Promise<void> {
       for (const [name, bot] of bots) {
         // Only hit API for idle bots (not already doing heavy refresh)
         if (bot.state === "idle" && bot.isConnected()) {
-          // Library-backed bots keep their connection alive via the WebSocket
-          // and receive notifications as push events, so skip the HTTP poll.
           if (!bot.account) {
-            // Use bot.exec() instead of api.execute() to process notifications properly
+            // HTTP-backed: poll notifications to keep the session alive
             keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
               if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
                 debugLogForBot(name, "keepalive:notifications", `Received ${resp.notifications.length} notification(s) for idle bot`);
               }
             }).catch(() => {}));
+            keepAliveCount++;
+          } else {
+            // Library-backed: lightweight status ping keeps the idle socket alive
+            keepAlivePromises.push(bot.refreshStatus().catch(() => {}));
             keepAliveCount++;
           }
         }

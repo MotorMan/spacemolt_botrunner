@@ -2065,7 +2065,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
           const start = Date.now();
           const self = this; // Capture this for use in setInterval callback
           const timer = setInterval(() => {
-            if (self._state === "stopping") {
+            if (self._state === "stopping" || self._stopAfterCycle) {
               clearInterval(timer);
               resolve();
               return;

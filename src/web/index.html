@@ -2936,7 +2936,7 @@
         <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
             } else if (bot.state === "running") {
               actions =
-                bot.routine === "civilian_transport"
+                (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
                   ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
                   : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
             }
@@ -3214,7 +3214,7 @@
             : bot.state === "running"
               ? `
           ${
-            bot.routine === "civilian_transport"
+            (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
               ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
               : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
           }
@@ -3482,7 +3482,7 @@
         ${
           bot.offline || bot.state !== "running"
             ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">${bot.offline ? 'Early Login' : 'Start'}</button>`
-            : bot.routine === "civilian_transport"
+            : (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
               ? `<button class="sm warning" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
               : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
         }
@@ -4604,7 +4604,7 @@
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
       <button class="danger sm" onclick="removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕ Remove</button>`;
         } else if (bot.state === "running") {
-          const isCivilianTransport = bot.routine === "civilian_transport";
+          const isCivilianTransport = (bot.routine === "civilian_transport" || bot.routine === "cargo_mover");
           actions = isCivilianTransport
             ? `<button class="warning sm" onclick="stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop Now</button>`
             : `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;

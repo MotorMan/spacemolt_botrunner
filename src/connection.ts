@@ -11,7 +11,7 @@
  */
 
 export const CONNECTION_ERROR_PATTERNS =
-  /cannot send on a closed socket|closed socket|socket (is )?closed|not connected|web ?socket connection closed|econnreset|econnrefused|disconnected|connection (lost|closed|reset|aborted)/i;
+  /cannot send on a closed socket|closed socket|socket (is )?closed|not connected|web ?socket connection closed|econnreset|econnrefused|disconnected|connection (lost|closed|reset|aborted)|fresh socket|could not establish|multiple attempts|socket after|reconnect.*(failed|gave up)|transport.*(closed|lost)|no live (socket|connection)/i;
 
 /** True when an error message indicates the transport socket is dead. */
 export function isConnectionError(message?: string | null): boolean {

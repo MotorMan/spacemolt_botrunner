@@ -840,28 +840,32 @@ docked = false;
    * connection is terminal (player connected elsewhere), or we exhausted the
    * bounded force attempts.
    *
-   * The previous version polled `authenticated` FOREVER with no timeout. If the
-   * forced reconnect's new socket never authenticated (server keeps the session
-   * zombie-closed after a restart), it waited indefinitely — which wedged
-   * `login()`/`refreshStatus()` and produced an endless "Login already in
-   * progress, waiting..." hang. This version is bounded by WALL CLOCK
-   * (MAX_WAIT_MS) instead of attempt count, and defers the actual reconnect
-   * cadence to botmanager's shared exponential backoff (forceReconnectBot) so
-   * a socket that keeps dying is retried gently rather than hammered into a
-   * storm. It gives up (false) only after a long continuous outage, so the
-   * caller can end the routine instead of hanging forever.
+   * The previous version polled `authenticated` forever (which could wedge
+   * `login()`/`refreshStatus()`), then a later version bounded it by a 20-minute
+   * wall clock — but that still gave up too early on slow post-restart
+   * reconnects, dropping the bot in hostile territory. This version keeps trying
+   * FOREVER while the bot is running: it defers the actual reconnect cadence to
+   * botmanager's shared exponential backoff (forceReconnectBot) so a socket that
+   * keeps dying is retried gently rather than hammered into a storm, but it
+   * NEVER ends the routine on a plain disconnect. It only resolves false when
+   * the user explicitly stops the bot or the connection is TERMINAL (account
+   * connected elsewhere) — otherwise it waits for recovery no matter how long.
    */
   private waitForFreshSocket(): Promise<boolean> {
     const self = this;
     const FORCE_EVERY_MS = 5000; // wake up this often to re-check the socket
-    // Bounded by WALL CLOCK, not attempt count. The actual reconnect cadence
-    // is governed by botmanager's shared exponential backoff (forceReconnectBot),
+    // NOT bounded by wall clock anymore. The actual reconnect cadence is
+    // governed by botmanager's shared exponential backoff (forceReconnectBot),
     // so a socket that keeps dying is retried gently (5s→10s→…→120s) rather
-    // than hammered into a storm. We only give up after a long continuous
-    // outage so a routine never hangs the event loop forever.
-    const MAX_WAIT_MS = 20 * 60 * 1000; // 20 min of continuous dead socket
-    const startTime = Date.now();
+    // than hammered into a storm. We keep trying FOREVER while the bot is
+    // running — a routine must never give up on a dropped socket just because
+    // the reconnect is taking longer than usual (server restart / slow
+    // reconnect). It only stops when the user explicitly stops it, or the
+    // connection is TERMINAL (the account is connected elsewhere / session
+    // replaced). A normal blip or restart just means we keep forcing fresh
+    // sockets until one authenticates.
     let lastThrottle = 0;
+    let forceCount = 0;
     return new Promise<boolean>((resolve) => {
       let settled = false;
       const settle = (val: boolean) => {
@@ -877,25 +881,25 @@ docked = false;
         }
         const acct = self.account;
         if (acct && acct.authenticated) {
+          self.log("system", "Socket reconnected — resuming routine.");
           return settle(true);
         }
         // The library reported this account's socket closed (its onDisconnected
         // fires on ANY drop — server restart, network blip, or a genuine
-        // elsewhere login). We don't assume WHY; we just drop the dead socket
-        // and let the shared backoff build a fresh one. A post-restart zombie
-        // reconnects quickly; a genuinely-elsewhere account re-dies and the
-        // backoff keeps retrying (never hanging forever).
+        // elsewhere login). We don't assume WHY; we just keep dropping the dead
+        // socket and letting the shared backoff build a fresh one. A
+        // post-restart zombie reconnects eventually; a genuinely-elsewhere
+        // account re-dies and is caught by the terminal-close guard below.
+        // A slow-but-recovering reconnect simply keeps retrying here until it
+        // comes back — we never give up while running.
         if (self._terminalClosed) {
           self.clearTerminalClosed();
         }
         const now = Date.now();
-        if (now - startTime > MAX_WAIT_MS) {
-          self.log("error", "Socket stayed dead for 20m — ending routine (auto-restart will retry).");
-          return settle(false);
-        }
         if (now - lastThrottle > 30000) {
           lastThrottle = now;
-          self.log("warn", "Still disconnected — forcing a fresh socket (backed off) before issuing more commands...");
+          forceCount++;
+          self.log("warn", `Still disconnected — forcing a fresh socket (attempt #${forceCount}, backed off) and waiting for recovery before issuing more commands...`);
         }
         // Ask for a fresh socket. forceReconnectBot enforces the backoff, so
         // this is cheap when we're already inside a cooldown window.

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 RESTART_DELAY=30
+MANUAL_RESTART_DELAY=5
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "========================================"
@@ -13,7 +14,8 @@ echo "SpaceMolt BotRunner Watchdog"
 echo "========================================"
 echo "" 
 echo "Configuration:"
-echo "  - Restart delay: $RESTART_DELAY seconds"
+echo "  - Restart delay: $RESTART_DELAY seconds (mass disconnect)"
+echo "  - Manual restart delay: $MANUAL_RESTART_DELAY seconds (user-initiated)"
 echo "  - Working directory: $SCRIPT_DIR"
 echo "  - Git pull on start: enabled"
 echo ""
@@ -51,16 +53,21 @@ while true; do
         echo "=== Normal shutdown - no restart ==="
         echo ""
         break
-    elif [ "$EXIT_CODE" -eq 100 ] || [ "$EXIT_CODE" -eq 101 ]; then
+    elif [ "$EXIT_CODE" -eq 100 ]; then
         echo ""
-        if [ "$EXIT_CODE" -eq 100 ]; then
-            echo "=== Restart requested (mass disconnect) ==="
-        else
-            echo "=== Restart requested (user-initiated) ==="
-        fi
+        echo "=== Restart requested (mass disconnect) ==="
         echo ""
         echo "Waiting $RESTART_DELAY seconds before restart..."
         sleep "$RESTART_DELAY"
+        echo ""
+        echo "=== Restarting BotRunner ==="
+        echo ""
+    elif [ "$EXIT_CODE" -eq 101 ]; then
+        echo ""
+        echo "=== Restart requested (user-initiated) ==="
+        echo ""
+        echo "Waiting $MANUAL_RESTART_DELAY seconds before restart..."
+        sleep "$MANUAL_RESTART_DELAY"
         echo ""
         echo "=== Restarting BotRunner ==="
         echo ""

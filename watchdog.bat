@@ -7,6 +7,7 @@ REM Normal shutdown (exit code 0) will not trigger restart
 setlocal enabledelayedexpansion
 
 set RESTART_DELAY=30
+set MANUAL_RESTART_DELAY=5
 set SCRIPT_DIR=%~dp0
 
 echo ========================================
@@ -14,7 +15,8 @@ echo SpaceMolt BotRunner Watchdog
 echo ========================================
 echo.
 echo Configuration:
-echo   - Restart delay: %RESTART_DELAY% seconds
+echo   - Restart delay: %RESTART_DELAY% seconds (mass disconnect)
+echo   - Manual restart delay: %MANUAL_RESTART_DELAY% seconds (user-initiated)
 echo   - Working directory: %SCRIPT_DIR%
 echo   - Git pull on start: enabled
 echo.
@@ -57,7 +59,7 @@ echo.
     ) else if %EXIT_CODE% EQU 101 (
         echo.
         echo === Restart requested (user-initiated) ===
-        goto :dorestart
+        goto :dorestart_manual
     ) else (
         echo.
         echo === Unexpected exit code %EXIT_CODE% - no restart ===
@@ -69,6 +71,15 @@ echo.
     echo.
     echo Waiting %RESTART_DELAY% seconds before restart...
     timeout /t %RESTART_DELAY% /nobreak
+    echo.
+    echo === Restarting BotRunner ===
+    echo.
+    goto :loop
+
+    :dorestart_manual
+    echo.
+    echo Waiting %MANUAL_RESTART_DELAY% seconds before restart...
+    timeout /t %MANUAL_RESTART_DELAY% /nobreak
     echo.
     echo === Restarting BotRunner ===
     echo.

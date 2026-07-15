@@ -263,6 +263,26 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
+/** Operational cells that must NEVER be deposited at the destination — they
+ *  power the ship itself (premium cells, energy cells). Regular `fuel_cell` is
+ *  treated as ordinary cargo and delivered normally; `military_fuel_cell` is
+ *  deposited only above the user-configured reserve (see fuelDepositQty). */
+function isNeverDepositFuelItem(itemId: string): boolean {
+  const lower = itemId.toLowerCase();
+  return lower === "premium_fuel_cell" || lower.includes("energy_cell");
+}
+
+/** How many of an item to deposit at the destination, reserving the ship's
+ *  required operational fuel. For military fuel cells we always keep the
+ *  user-configured reserve (default 10) aboard for in-transit refueling and
+ *  deposit only any excess; everything else deposits in full. */
+function fuelDepositQty(itemId: string, quantity: number, reserve: number): number {
+  if (itemId === "military_fuel_cell") {
+    return Math.max(0, quantity - Math.max(0, reserve));
+  }
+  return quantity;
+}
+
 /** Re-cloak the ship whenever it is undocked and has a cloak module.
  * Returns true if the bot ended up cloaked. The `warnedNoCloak` ref is used to
  * emit the "no module" warning only once per session so the log stays clean. */
@@ -1311,13 +1331,22 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         ctx.log("cargo", `📦 Delivering recovered cargo to destination...`);
         for (const item of itemsToDeposit) {
           if (item.quantity <= 0) continue;
-          const lower = item.itemId.toLowerCase();
-          if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
+          // Premium/energy cells never leave the ship; military cells keep the
+          // required reserve aboard and deposit only the excess.
+          if (isNeverDepositFuelItem(item.itemId)) continue;
+          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+          if (depositQty <= 0) {
+            ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
+            continue;
+          }
+          if (item.itemId === "military_fuel_cell") {
+            ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+          }
 
           const depositResult = await depositToDestination(
             ctx,
             item.itemId,
-            item.quantity,
+            depositQty,
             settings.destinationStorageType,
             settings.destinationBotName,
           );
@@ -2062,19 +2091,27 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       let depositErrors = 0;
       for (const item of itemsToDeposit) {
         if (item.quantity <= 0) continue;
-        // Skip specific fuel cells used for operations
-        const lower = item.itemId.toLowerCase();
-        if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
+        // Premium/energy cells never leave the ship; military cells keep the
+        // required reserve aboard and deposit only the excess.
+        if (isNeverDepositFuelItem(item.itemId)) continue;
+        const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+        if (depositQty <= 0) {
+          ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
+          continue;
+        }
+        if (item.itemId === "military_fuel_cell") {
+          ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+        }
 
         const depositResult = await depositToDestination(
           ctx,
           item.itemId,
-          item.quantity,
+          depositQty,
           settings.destinationStorageType,
           settings.destinationBotName,
         );
         if (!depositResult.success) {
-          ctx.log("error", `❌ Failed to deliver ${item.quantity}x ${item.name}`);
+          ctx.log("error", `❌ Failed to deliver ${depositQty}x ${item.name}`);
           depositErrors++;
         }
       }
@@ -2117,13 +2154,19 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         ctx.log("cargo", `📦 Using reported delivery quantities for gift delivery (cannot verify)`);
         for (const item of itemsToDeposit) {
           if (item.quantity <= 0) continue;
-          const lower = item.itemId.toLowerCase();
-          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          // Premium/energy cells never leave the ship; military cells keep the
+          // required reserve aboard and deposit only the excess.
+          if (isNeverDepositFuelItem(item.itemId)) continue;
+          const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+          if (depositQty <= 0) continue;
+          if (item.itemId === "military_fuel_cell") {
+            ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
+          }
 
           const depositResult = await depositToDestination(
             ctx,
             item.itemId,
-            item.quantity,
+            depositQty,
             settings.destinationStorageType,
             settings.destinationBotName,
           );

@@ -1945,13 +1945,22 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     if (readCurrentStation) {
       readStation = undefined;
       cacheKey = `${this.system}|${this.poi}`;
-    } else {
+    } else if (stationId || homeStationId) {
       readStation = stationId || homeStationId;
       cacheKey = readStation;
-    }
-
-    if (!readCurrentStation && !readStation) {
-      this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");
+    } else if (this.docked && this.poi) {
+      // No specific station was passed and no faction hub is configured, but we
+      // ARE docked at a station — read the faction storage of the CURRENT
+      // station. Faction storage is per-station, so when we're docked at (for
+      // example) the cargo mover's source station this is precisely the storage
+      // the caller needs. Bailing out here would leave this.factionStorage empty
+      // and make callers believe the station is empty even when it is full
+      // (the "nothing to move" bug when factionStorageStation is unset).
+      readStation = undefined;
+      readCurrentStation = true;
+      cacheKey = `${this.system}|${this.poi}`;
+    } else {
+      this.log("warn", "No factionStorageStation configured in settings.general and not docked - cannot refresh faction storage");
       return;
     }
 

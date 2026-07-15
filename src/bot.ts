@@ -1894,22 +1894,36 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
    *   holdings (e.g. think it has 714k steel_plate when it really has 1.1M),
    *   which wastes queue slots refining materials it already has enough of.
    */
-  async refreshFactionStorage(forceLive = false, stationId?: string): Promise<void> {
+  async refreshFactionStorage(forceLive = false, stationId?: string, readCurrentStation = false): Promise<void> {
     const settings = loadSettings();
     const generalSettings = (settings.general as Record<string, unknown>) || {};
-    // Allow callers to read a specific station's faction storage. Faction storage
-    // is PER-STATION, so a deposit into station A must be verified by reading
-    // station A — not the default factionStorageStation hub. Without this
-    // override, refreshFactionStorage() always reads factionStorageStation and a
-    // successful deposit into another station looks like a silent failure.
-    const homeStationId = stationId || (generalSettings.factionStorageStation as string) || "";
-    
-    if (!homeStationId) {
+    const homeStationId = (generalSettings.factionStorageStation as string) || "";
+
+    // Two read modes:
+    //  - specific station: read `stationId` if given, else the configured hub
+    //    (factionStorageStation). Faction storage is PER-STATION, so a deposit
+    //    into station A must be verified by reading station A.
+    //  - current station: omit station_id entirely so the server returns the
+    //    faction storage of the station we're currently docked at. Used as a
+    //    workaround while the exact remote station_id format for faction bases is
+    //    unknown (remote lookups currently fail with "Station not found").
+    let readStation: string | undefined;
+    let cacheKey: string;
+    if (readCurrentStation) {
+      readStation = undefined;
+      cacheKey = `${this.system}|${this.poi}`;
+    } else {
+      readStation = stationId || homeStationId;
+      cacheKey = readStation;
+    }
+
+    if (!readCurrentStation && !readStation) {
       this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");
       return;
     }
 
     const factionName = this.faction || "unknown";
+    const label = readStation ? ` from ${readStation}` : " (current station)";
     // Force a live API call. We never want the 120s response cache here, and we
     // do NOT rely on the data/factionStorage/*.json cache files (they are often
     // stale or wildly incorrect). We call api.execute directly (as get_status
@@ -1917,22 +1931,22 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     // bookkeeping in exec().
     const resp = await this.libExec(
       "view_faction_storage",
-      { station_id: homeStationId },
+      readStation ? { station_id: readStation } : {},
     );
     if (resp.error) {
       const errMsg = resp.error.message || "";
       // Not being in a faction is expected for many players and not
       // actionable, so don't flood the log with a red error every refresh.
       if (!/you must be in a faction/i.test(errMsg)) {
-        this.log("error", `Error refreshing faction storage from ${homeStationId}: ${errMsg}`);
+        this.log("error", `Error refreshing faction storage${label}: ${errMsg}`);
       }
       // Do NOT silently fall back to the on-disk cache file — those are known to
       // be stale/misleading. Keep whatever the last successful live read gave us
       // so counts stay consistent instead of jumping to a wrong cached value.
       if (this.factionStorage.length === 0) {
-        const cached = getFactionStorageCache(factionName, homeStationId);
+        const cached = getFactionStorageCache(factionName, cacheKey);
         if (cached?.entries?.length) {
-          this.log("warn", `No live faction storage and bot store empty - falling back to stale cache for ${homeStationId}: ${cached.entries.length} items (may be inaccurate)`);
+          this.log("warn", `No live faction storage and bot store empty - falling back to stale cache${label}: ${cached.entries.length} items (may be inaccurate)`);
           this.factionStorage = cached.entries.map((e) => ({
             itemId: e.itemId,
             name: e.name || e.itemId,
@@ -1958,8 +1972,8 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.factionStorage = entries;
       this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
       this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;
-      updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
-      this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items${forceLive ? " (live)" : ""}`);
+      updateFactionStorageCache(factionName, entries, cacheKey, this.factionFuelReserve, this.factionFuelCapacity);
+      this.log("info", `Refreshed faction storage${label}: ${entries.length} items${forceLive ? " (live)" : ""}`);
     }
   }
 

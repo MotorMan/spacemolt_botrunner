@@ -10,6 +10,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { loadInTransitData } from "./cargoMoverInTransit.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "cargoMoverActivity.json");
@@ -559,4 +560,35 @@ export function getCargoMoverSummary(botUsername?: string): {
     totalItemsLost,
     itemProgress,
   };
+}
+
+/**
+ * Live per-item delivery status aggregated from the authoritative data sources
+ * (activity progress + in-transit tracking). Unlike the `totalDelivered` mirror
+ * kept on the settings object, this always reflects the real current counts.
+ */
+export function getCargoMoverItemStatuses(): Record<
+  string,
+  { itemName: string; delivered: number; inTransit: number }
+> {
+  const activity = loadCargoMoverActivity();
+  const inTransit = loadInTransitData();
+  const result: Record<string, { itemName: string; delivered: number; inTransit: number }> = {};
+
+  for (const p of Object.values(activity.itemProgress)) {
+    const entry = result[p.itemId] || (result[p.itemId] = { itemName: p.itemName, delivered: 0, inTransit: 0 });
+    entry.delivered += p.totalDelivered || 0;
+    entry.itemName = p.itemName || entry.itemName;
+  }
+
+  for (const entries of Object.values(inTransit.inTransitItems)) {
+    for (const e of entries) {
+      if (e.quantity <= 0) continue;
+      const entry = result[e.itemId] || (result[e.itemId] = { itemName: e.itemName, delivered: 0, inTransit: 0 });
+      entry.inTransit += e.quantity;
+      entry.itemName = e.itemName || entry.itemName;
+    }
+  }
+
+  return result;
 }

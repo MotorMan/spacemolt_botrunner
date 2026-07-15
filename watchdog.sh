@@ -20,6 +20,7 @@ echo ""
 echo "Exit codes:"
 echo "  - 0: Normal shutdown (no restart)"
 echo "  - 100: Restart requested (mass disconnect detected)"
+echo "  - 101: Restart requested (user-initiated, e.g. to apply updates)"
 echo "  - Other: Unexpected exit (no restart)"
 echo ""
 echo "Press Ctrl+C to stop the watchdog."
@@ -50,9 +51,13 @@ while true; do
         echo "=== Normal shutdown - no restart ==="
         echo ""
         break
-    elif [ "$EXIT_CODE" -eq 100 ]; then
+    elif [ "$EXIT_CODE" -eq 100 ] || [ "$EXIT_CODE" -eq 101 ]; then
         echo ""
-        echo "=== Restart requested ==="
+        if [ "$EXIT_CODE" -eq 100 ]; then
+            echo "=== Restart requested (mass disconnect) ==="
+        else
+            echo "=== Restart requested (user-initiated) ==="
+        fi
         echo ""
         echo "Waiting $RESTART_DELAY seconds before restart..."
         sleep "$RESTART_DELAY"

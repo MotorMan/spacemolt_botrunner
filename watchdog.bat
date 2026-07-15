@@ -1,6 +1,7 @@
 @echo off
 REM SpaceMolt BotRunner Watchdog
 REM Restarts the client if it exits with code 100 (mass disconnect restart request)
+REM or code 101 (user-requested restart, e.g. to apply updates)
 REM Normal shutdown (exit code 0) will not trigger restart
 
 setlocal enabledelayedexpansion
@@ -20,6 +21,7 @@ echo.
 echo Exit codes:
 echo   - 0: Normal shutdown (no restart)
 echo   - 100: Restart requested (mass disconnect detected)
+echo   - 101: Restart requested (user-initiated, e.g. to apply updates)
 echo   - Other: Unexpected exit (no restart)
 echo.
 echo Press Ctrl+C to stop the watchdog.
@@ -50,20 +52,27 @@ echo.
         goto :end
     ) else if %EXIT_CODE% EQU 100 (
         echo.
-        echo === Restart requested ===
+        echo === Restart requested (mass disconnect) ===
+        goto :dorestart
+    ) else if %EXIT_CODE% EQU 101 (
         echo.
-        echo Waiting %RESTART_DELAY% seconds before restart...
-        timeout /t %RESTART_DELAY% /nobreak
-        echo.
-        echo === Restarting BotRunner ===
-        echo.
-        goto :loop
+        echo === Restart requested (user-initiated) ===
+        goto :dorestart
     ) else (
         echo.
         echo === Unexpected exit code %EXIT_CODE% - no restart ===
         echo.
         goto :end
     )
+
+    :dorestart
+    echo.
+    echo Waiting %RESTART_DELAY% seconds before restart...
+    timeout /t %RESTART_DELAY% /nobreak
+    echo.
+    echo === Restarting BotRunner ===
+    echo.
+    goto :loop
 
 :end
     echo.

@@ -15,6 +15,7 @@ import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPa
 import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
+import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
 
 function getLocalIp(): string | null {
@@ -806,6 +807,9 @@ if (!this.settings.fuel_service) {
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
+        }
+        if (url.pathname === "/api/cargo_mover/status") {
+          return Response.json({ items: getCargoMoverItemStatuses() });
         }
         if (url.pathname === "/api/stationRef") {
           const stationRefPath = join(DATA_DIR, "stationRef.json");

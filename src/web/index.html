@@ -27681,16 +27681,17 @@ ignoreBlacklist: document.getElementById(
                   const cat = item.category ? ` [${esc(item.category)}]` : "";
                   const delivered = item.totalDelivered || 0;
                   const target = item.totalToDeliver || 0;
-                  const progressDisplay =
-                    target > 0
-                      ? `<div class="craft-limit-detail" style="color:var(--green)">Delivered: ${delivered}/${target}</div>`
-                      : `<div class="craft-limit-detail" style="color:var(--dim)">Delivered: ${delivered} (no target set)</div>`;
-                  
+                  const statusId = `cm-status-faction-${idx}`;
+                  const progressDisplay = `
+                    <div class="craft-limit-detail" id="${statusId}" data-itemid="${esc(item.itemId)}" data-target="${target}">
+                      Delivered: ${delivered}${target > 0 ? `/${target}` : " (no target set)"}
+                    </div>`;
+
                   // Show destination info for ship loadout items
                   const destInfo = item.shipLoadoutDestination
                     ? `<div class="craft-limit-detail" style="color:var(--blue)">Destination: ${esc(getStationLabel(item.shipLoadoutDestination))}</div>`
                     : "";
-                  
+
                   return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
@@ -27722,10 +27723,11 @@ ignoreBlacklist: document.getElementById(
                   const cat = item.category ? ` [${esc(item.category)}]` : "";
                   const delivered = item.totalDelivered || 0;
                   const target = item.totalToDeliver || 0;
-                  const progressDisplay =
-                    target > 0
-                      ? `<div class="craft-limit-detail" style="color:var(--green)">Delivered: ${delivered}/${target}</div>`
-                      : `<div class="craft-limit-detail" style="color:var(--dim)">Delivered: ${delivered} (no target set)</div>`;
+                  const statusId = `cm-status-personal-${idx}`;
+                  const progressDisplay = `
+                    <div class="craft-limit-detail" id="${statusId}" data-itemid="${esc(item.itemId)}" data-target="${target}">
+                      Delivered: ${delivered}${target > 0 ? `/${target}` : " (no target set)"}
+                    </div>`;
                   return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
@@ -27959,6 +27961,49 @@ ignoreBlacklist: document.getElementById(
           const botSel = document.getElementById("cm-personal-bot-select");
           if (botSel) botSel.value = personalStorageBot;
         }
+
+        // Live-refresh delivered / in-transit counts from the server so the
+        // panel reflects real progress instead of the stale settings snapshot.
+        refreshCargoMoverLiveStatuses();
+        if (window.__cmStatusTimer) clearInterval(window.__cmStatusTimer);
+        window.__cmStatusTimer = setInterval(() => {
+          if (!document.getElementById("page-settings")?.classList.contains("active")) {
+            clearInterval(window.__cmStatusTimer);
+            window.__cmStatusTimer = null;
+            return;
+          }
+          refreshCargoMoverLiveStatuses();
+        }, 5000);
+      }
+
+      function refreshCargoMoverLiveStatuses() {
+        fetch("/api/cargo_mover/status")
+          .then((r) => (r.ok ? r.json() : null))
+          .then((data) => {
+            if (!data || !data.items) return;
+            const items = data.items;
+            document
+              .querySelectorAll("[id^='cm-status-']")
+              .forEach((el) => {
+                const itemId = el.getAttribute("data-itemid");
+                const target = parseInt(el.getAttribute("data-target") || "0", 10);
+                const s = items[itemId];
+                if (!s) return;
+                const delivered = s.delivered || 0;
+                const inTransit = s.inTransit || 0;
+                let label = `Delivered: ${delivered}`;
+                label += target > 0 ? `/${target}` : " (no target set)";
+                if (inTransit > 0) label += ` | In transit: ${inTransit}`;
+                el.textContent = label;
+                el.style.color =
+                  target > 0 && delivered >= target
+                    ? "var(--green)"
+                    : inTransit > 0
+                      ? "var(--blue)"
+                      : "var(--dim)";
+              });
+          })
+          .catch(() => {});
       }
 
       function toggleCargoMoverGiftField() {

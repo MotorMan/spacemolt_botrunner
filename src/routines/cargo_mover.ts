@@ -22,6 +22,7 @@ import {
   ensureFueled,
   tryRefuel,
   repairShip,
+  sleep,
   navigateToSystem,
   detectAndRecoverFromDeath,
   readSettings,
@@ -646,10 +647,20 @@ async function depositToDestination(
 
     const dResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity });
     if (!dResp.error) {
-      // Refresh faction storage to verify actual deposit
-      await bot.refreshFactionStorage();
-      const factionAfter = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
-      const actuallyDeposited = Math.max(0, factionAfter - factionBefore);
+      // The game server caches faction-storage reads, so a refresh issued
+      // immediately after the deposit can still return the pre-deposit snapshot
+      // and make a successful deposit look like a silent failure. Give the cache
+      // a beat to invalidate, then refresh — retry a few times so transient
+      // staleness isn't reported as a failed delivery.
+      let actuallyDeposited = 0;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        await sleep(1000);
+        await bot.refreshFactionStorage();
+        const factionAfter = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
+        actuallyDeposited = Math.max(0, factionAfter - factionBefore);
+        if (actuallyDeposited > 0) break;
+        ctx.log("warn", `⚠️ Faction storage still unchanged after refresh (attempt ${attempt}/3) for ${itemId} — retrying verification...`);
+      }
 
       if (actuallyDeposited > 0) {
         logFactionActivity(ctx, "deposit", `Deposited ${actuallyDeposited}x ${itemId} (cargo mover)`);
@@ -688,10 +699,17 @@ async function depositToDestination(
 
   const dResp = await bot.exec("deposit_items", { item_id: itemId, quantity });
   if (!dResp.error) {
-    // Refresh personal storage to verify actual deposit
-    await bot.refreshStorage();
-    const personalAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
-    const actuallyDeposited = Math.max(0, personalAfter - personalBefore);
+    // Same server-side read caching as faction storage: pause and refresh a
+    // few times so a just-completed deposit isn't mistaken for a silent failure.
+    let actuallyDeposited = 0;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await sleep(1000);
+      await bot.refreshStorage();
+      const personalAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+      actuallyDeposited = Math.max(0, personalAfter - personalBefore);
+      if (actuallyDeposited > 0) break;
+      ctx.log("warn", `⚠️ Personal storage still unchanged after refresh (attempt ${attempt}/3) for ${itemId} — retrying verification...`);
+    }
 
     if (actuallyDeposited > 0) {
       ctx.log("cargo", `✅ Deposited to personal storage: ${actuallyDeposited}x ${itemId} (verified)`);

@@ -642,7 +642,17 @@ async function depositToDestination(
   }
 
   if (storageType === "faction") {
-    // Check faction storage before deposit for verification
+    // Faction storage is PER-STATION. The deposit below (called without a
+    // station_id) lands in the faction storage of the station the bot is
+    // currently docked at. We must verify against THAT SAME station, not the
+    // default factionStorageStation hub (sol_central) that refreshFactionStorage
+    // reads by default — otherwise a successful deposit into station A is read
+    // back from station B and reported as a silent failure.
+    const depositStation = `${bot.system}|${bot.poi}`;
+
+    // Baseline must come from the SAME station the deposit targets, so the
+    // before/after delta is meaningful.
+    await bot.refreshFactionStorage(false, depositStation);
     const factionBefore = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
 
     const dResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity });
@@ -655,7 +665,7 @@ async function depositToDestination(
       let actuallyDeposited = 0;
       for (let attempt = 1; attempt <= 3; attempt++) {
         await sleep(1000);
-        await bot.refreshFactionStorage();
+        await bot.refreshFactionStorage(false, depositStation);
         const factionAfter = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
         actuallyDeposited = Math.max(0, factionAfter - factionBefore);
         if (actuallyDeposited > 0) break;

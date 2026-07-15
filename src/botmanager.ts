@@ -1554,7 +1554,7 @@ const skillsObj: Record<string, unknown> | null =
   // Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
-    "refuel", "repair", "deposit_items", "withdraw_items", "jettison",
+    "refuel", "repair", "deposit_items", "withdraw_items", "faction_deposit_items", "faction_withdraw_items", "jettison",
     "attack", "loot_wreck", "salvage_wreck", "send_gift", "craft",
     "accept_mission", "complete_mission", "abandon_mission",
     "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",

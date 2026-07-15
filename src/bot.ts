@@ -1894,10 +1894,15 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
    *   holdings (e.g. think it has 714k steel_plate when it really has 1.1M),
    *   which wastes queue slots refining materials it already has enough of.
    */
-  async refreshFactionStorage(forceLive = false): Promise<void> {
+  async refreshFactionStorage(forceLive = false, stationId?: string): Promise<void> {
     const settings = loadSettings();
     const generalSettings = (settings.general as Record<string, unknown>) || {};
-    const homeStationId = (generalSettings.factionStorageStation as string) || "";
+    // Allow callers to read a specific station's faction storage. Faction storage
+    // is PER-STATION, so a deposit into station A must be verified by reading
+    // station A — not the default factionStorageStation hub. Without this
+    // override, refreshFactionStorage() always reads factionStorageStation and a
+    // successful deposit into another station looks like a silent failure.
+    const homeStationId = stationId || (generalSettings.factionStorageStation as string) || "";
     
     if (!homeStationId) {
       this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");

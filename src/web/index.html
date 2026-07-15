@@ -12108,19 +12108,29 @@
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Browser Window Title</div>
-        <div class="setting-hint">Custom title shown in the browser tab and app header. Leave blank to use the default "SpaceMolt Commander". Useful for telling multiple client tabs apart.</div>
+        <div class="setting-label">Browser Tab Title</div>
+        <div class="setting-hint">Plain-text title shown in the browser tab. Browser tabs can't be colored, so no color codes here. Leave blank to use the default "SpaceMolt Commander". Useful for telling multiple client tabs apart.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="text" id="set-general-windowTitle" maxlength="120" value="${esc(general.windowTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" />
+        <button class="sm" onclick="document.getElementById('set-general-windowTitle').value='';saveGeneralSettings();applyWindowTitle()">Reset</button>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">App Header Title</div>
+        <div class="setting-hint">Title shown in the in-app header (the big heading). Supports color codes and can be longer than the tab title. Leave blank to use "SpaceMolt Commander".</div>
         <div class="setting-hint" style="margin-top:4px">
-          Color codes are supported in the in-app header:
-          <code>[c:red]text[/c]</code> (names: red, green, blue, yellow, cyan, magenta, orange, purple, pink, lime, teal, gold, white, gray) or hex <code>[c:#ff8800]text[/c]</code>. Nested colors work too.
+          Color codes: <code>[c:red]text[/c]</code> (names: red, green, blue, yellow, cyan, magenta, orange, purple, pink, lime, teal, gold, white, gray) or hex <code>[c:#ff8800]text[/c]</code>. Nested colors work too.
         </div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-start;gap:8px">
         <div style="display:flex;align-items:center;gap:8px">
-          <input type="text" id="set-general-windowTitle" maxlength="120" value="${esc(general.windowTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" oninput="updateWindowTitlePreview()" />
-          <button class="sm" onclick="document.getElementById('set-general-windowTitle').value='';saveGeneralSettings();applyWindowTitle();updateWindowTitlePreview()">Reset</button>
+          <input type="text" id="set-general-headerTitle" maxlength="200" value="${esc(general.headerTitle || "")}" placeholder="SpaceMolt Commander" style="width:320px" oninput="updateHeaderTitlePreview()" />
+          <button class="sm" onclick="document.getElementById('set-general-headerTitle').value='';saveGeneralSettings();applyWindowTitle();updateHeaderTitlePreview()">Reset</button>
         </div>
-        <div style="font-size:13px;font-weight:600" id="windowTitlePreview"></div>
+        <div style="font-size:13px;font-weight:600" id="headerTitlePreview"></div>
       </div>
     </div>
 
@@ -12367,7 +12377,7 @@
         // selection. Selection state comes from the persistent `clerkSelection`
         // set, which survives the re-render.
         renderClerkPlayers();
-        updateWindowTitlePreview();
+        updateHeaderTitlePreview();
       }
 
       function saveGeneralSettings() {
@@ -12448,6 +12458,9 @@
             ) || 30,
           windowTitle:
             (document.getElementById("set-general-windowTitle").value || "")
+              .trim() || "",
+          headerTitle:
+            (document.getElementById("set-general-headerTitle").value || "")
               .trim() || "",
         };
         // Persist the "Add Bots from Account" checkbox selection too, so
@@ -12550,20 +12563,30 @@
       }
 
       function applyWindowTitle() {
-        const custom = (settings.general && settings.general.windowTitle) || "";
-        const title = custom.trim() ? custom.trim() : "SpaceMolt Commander";
-        // Browser tab title is plain text only.
-        document.title = stripColorCodes(title);
-        // In-app header renders the colors.
+        const tabTitle =
+          (settings.general && settings.general.windowTitle) || "";
+        const headerTitle =
+          (settings.general && settings.general.headerTitle) || "";
+        // Browser tab title is plain text only (no color codes allowed).
+        document.title = stripColorCodes(
+          tabTitle.trim() ? tabTitle.trim() : "SpaceMolt Commander",
+        );
+        // In-app header renders colors and can be a different/longer title.
         const h1 = document.getElementById("appTitle");
-        if (h1) h1.innerHTML = parseColorCodes(title);
+        if (h1)
+          h1.innerHTML = parseColorCodes(
+            headerTitle.trim() ? headerTitle.trim() : "SpaceMolt Commander",
+          );
       }
 
-      function updateWindowTitlePreview() {
-        const el = document.getElementById("windowTitlePreview");
+      function updateHeaderTitlePreview() {
+        const el = document.getElementById("headerTitlePreview");
         if (!el) return;
-        const val = document.getElementById("set-general-windowTitle").value || "";
-        el.innerHTML = parseColorCodes(val.trim() ? val.trim() : "SpaceMolt Commander");
+        const val =
+          document.getElementById("set-general-headerTitle").value || "";
+        el.innerHTML = parseColorCodes(
+          val.trim() ? val.trim() : "SpaceMolt Commander",
+        );
       }
 
       // ── System Blacklist Settings ───────────────────────────────

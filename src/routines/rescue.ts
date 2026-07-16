@@ -5023,7 +5023,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         while (bot.state === "running") {
           try {
             const stationRef = allFactionStations[remoteStationIndex];
-            const stationId = stationRef.includes("|") ? stationRef.split("|")[1] : stationRef;
+            // Resolve to the plain hex POI id the server expects for station_id.
+            // Player faction bases are hex ids, so a "system|poi" reference or
+            // friendly name must be collapsed to the POI id or the remote read
+            // fails with "Station not found".
+            const stationId = mapStore.resolveStationTarget(stationRef);
 
             // Read the REMOTE station's faction storage from anywhere — docking not needed.
             const storageResp = await bot.exec("view_faction_storage", { station_id: stationId });

@@ -196,8 +196,12 @@ function resolveStationSystem(stationId: string): string | null {
 }
 
 function extractStationId(stationValue: string): string {
-  if (stationValue.includes("|")) return stationValue.split("|")[1];
-  return stationValue;
+  // Resolve a station reference (e.g. "system|poi" or a friendly name) to the
+  // plain hex POI id the server expects for faction storage lookups/deposits.
+  // Player faction bases are exposed as hex POI ids, so a remote
+  // view_faction_storage / faction_deposit_items must use that id, not a
+  // "system|poi" reference or a friendly name.
+  return mapStore.resolveStationTarget(stationValue);
 }
 
 async function getRemoteFactionQty(bot: Bot, remoteStationId: string, itemId: string): Promise<number> {

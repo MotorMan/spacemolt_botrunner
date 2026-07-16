@@ -820,6 +820,13 @@ docked = false;
         this.log("info", `libExec ${command} failed: ${message}`);
         return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
       }
+      // Viewing station storage requires being docked or passing a station_id.
+      // Bots undocking (or without a station_id for remote faction storage) hit
+      // this constantly, so don't spam red errors — drop it to info.
+      if (command === "view_storage" && /must be docked or provide a station_id/i.test(message)) {
+        this.log("info", `libExec ${command} failed: ${message}`);
+        return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+      }
       // Not being in a battle is an expected, benign state for library-backed bots
       // (battle presence is tracked via push events). Don't log it as a red error
       // or it spams every routine that polls get_battle_status while idle.
@@ -1943,9 +1950,13 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     //    (factionStorageStation). Faction storage is PER-STATION, so a deposit
     //    into station A must be verified by reading station A.
     //  - current station: omit station_id entirely so the server returns the
-    //    faction storage of the station we're currently docked at. Used as a
-    //    workaround while the exact remote station_id format for faction bases is
-    //    unknown (remote lookups currently fail with "Station not found").
+    //    faction storage of the station we're currently docked at.
+    //
+    // The server's `view_faction_storage` station_id is the station's POI — same
+    // as a regular station's POI. Player faction bases are exposed as hex POI ids
+    // (e.g. a356fc2c1744c0425cf6cf47f48def92), so a station reference must be
+    // resolved to that plain hex id before being sent, otherwise the lookup
+    // fails with "Station not found".
     let readStation: string | undefined;
     let cacheKey: string;
     if (readCurrentStation) {
@@ -1970,8 +1981,22 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       return;
     }
 
+    // Resolve a station reference (e.g. "system|poi" or a friendly name) to the
+    // plain hex POI id the server expects as station_id. Faction bases are hex
+    // ids, and a "system|poi" reference must be collapsed to just the poi token
+    // or the remote lookup is rejected. When the reference is already a bare hex
+    // id / raw token that mapStore can't resolve, this preserves it untouched.
+    let stationIdParam: string | undefined;
+    if (readStation) {
+      const resolved = mapStore.resolveStationIdentity(readStation);
+      stationIdParam = (resolved.matched && resolved.poiId) ? resolved.poiId : mapStore.resolveStationTarget(readStation);
+      // Keep cacheKey aligned with the resolved id so a docked read (keyed on
+      // `${system}|${poi}`) and a remote read of the same base share a cache.
+      cacheKey = stationIdParam;
+    }
+
     const factionName = this.faction || "unknown";
-    const label = readStation ? ` from ${readStation}` : " (current station)";
+    const label = stationIdParam ? ` from ${stationIdParam}` : " (current station)";
     // Force a live API call. We never want the 120s response cache here, and we
     // do NOT rely on the data/factionStorage/*.json cache files (they are often
     // stale or wildly incorrect). We call api.execute directly (as get_status
@@ -1979,7 +2004,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     // bookkeeping in exec().
     const resp = await this.libExec(
       "view_faction_storage",
-      readStation ? { station_id: readStation } : {},
+      stationIdParam ? { station_id: stationIdParam } : {},
     );
     if (resp.error) {
       const errMsg = resp.error.message || "";

@@ -12074,8 +12074,10 @@
           ? general.approvedFuelStations
           : [];
 
-        // Build station options from mapData
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
         let stationOpts = '<option value="">(not set)</option>';
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -12085,13 +12087,19 @@
           )) {
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
-            const sel =
-              sysId === factionStorageSystem && poi.id === factionStorageStation
-                ? " selected"
-                : "";
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel =
+            val === factionStorageSystem + "|" + factionStorageStation
+              ? " selected"
+              : "";
+          stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
         }
 
         panel.innerHTML = `
@@ -12794,6 +12802,9 @@
 
         let stationOpts = `<option value="">(use general: ${esc(generalLabel)})</option>`;
         let focusOpts = `<option value="">(clean all stations)</option>`;
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdowns aren't in random map-discovery order).
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -12803,16 +12814,20 @@
           )) {
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
-            const sel =
-              sysId === cleanupSystem && poi.id === cleanupStation
-                ? " selected"
-                : "";
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
-            const focusVal = poi.base_id || poi.id;
-            const focusSel = focusStationId === focusVal ? " selected" : "";
-            focusOpts += `<option value="${esc(focusVal)}"${focusSel}>${esc(label)} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel =
+            val === cleanupSystem + "|" + cleanupStation ? " selected" : "";
+          stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+          const focusVal = val.split("|")[1];
+          const focusSel = focusStationId === focusVal ? " selected" : "";
+          focusOpts += `<option value="${esc(focusVal)}"${focusSel}>${esc(label)} (${esc(sysName)})</option>`;
         }
 
         panel.innerHTML = `
@@ -12879,8 +12894,10 @@
         const homeStation = returnHome.homeStation || "";
         const refuelThreshold = returnHome.refuelThreshold ?? 50;
 
-        // Build station options from mapData
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
         let stationOpts = '<option value="">(not set)</option>';
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -12890,11 +12907,16 @@
           )) {
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
-            const sel =
-              sysId === homeSystem && poi.id === homeStation ? " selected" : "";
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === homeSystem + "|" + homeStation ? " selected" : "";
+          stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
         }
 
         // Per-bot overrides
@@ -26763,9 +26785,11 @@ ignoreBlacklist: document.getElementById(
           );
         }
 
-        // Build station options from mapData (exact pattern from CargoMover)
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
         let homeStationOpts =
           '<option value="">(use nearest safe station)</option>';
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData || {})) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -26776,9 +26800,15 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-            const sel = val === hunterHomeStation ? " selected" : "";
-            homeStationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === hunterHomeStation ? " selected" : "";
+          homeStationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
         }
 
         panel.innerHTML = `
@@ -29066,7 +29096,8 @@ ignoreBlacklist: document.getElementById(
         const currentValue = destSelect?.value || "";
         
         let options = '<option value="">-- Select Destination Station --</option>';
-        
+
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -29077,9 +29108,15 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-            const sel = val === currentValue ? " selected" : "";
-            options += '<option value="' + esc(val) + '"' + sel + '>' + esc(label) + ' (' + esc(sysName) + ')</option>';
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === currentValue ? " selected" : "";
+          options += '<option value="' + esc(val) + '"' + sel + '>' + esc(label) + ' (' + esc(sysName) + ')</option>';
         }
         return options;
       }
@@ -29231,7 +29268,10 @@ ignoreBlacklist: document.getElementById(
               ")";
         }
 
-        let stationOpts = '<option value="">(not set)</option>';
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
+        let stationOpts = '<option value="">(select station)</option>';
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -29242,8 +29282,14 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
         }
 
         let botOpts = '<option value="">(select bot at home)</option>';
@@ -29917,6 +29963,9 @@ ignoreBlacklist: document.getElementById(
         const homeStation = ct.homeStation || general.homeStation || "";
 
         let homeStationOpts = '<option value="">(none)</option>';
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData)) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -29927,10 +29976,15 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-            const sel =
-              sysId === homeSystem && poi.id === homeStation ? " selected" : "";
-            homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === homeSystem + "|" + homeStation ? " selected" : "";
+          homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
         }
 
         panel.innerHTML = `
@@ -30181,6 +30235,9 @@ ignoreBlacklist: document.getElementById(
 
         let stationOpts =
           '<option value="">(use faction storage station)</option>';
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData || {})) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -30190,11 +30247,16 @@ ignoreBlacklist: document.getElementById(
           )) {
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
-            const sel =
-              sysId === homeSystem && poi.id === homeStation ? " selected" : "";
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === homeSystem + "|" + homeStation ? " selected" : "";
+          stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
         }
 
         let moduleItemsHtml = "";
@@ -33591,6 +33653,9 @@ ignoreBlacklist: document.getElementById(
         }
 
         let stationOpts = '<option value="">(not set)</option>';
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
+        const stationList = [];
         for (const [sysId, sys] of Object.entries(mapData || {})) {
           const sysName = sys.name || sysId;
           for (const poi of [...(sys.pois || [])].sort((a, b) =>
@@ -33601,8 +33666,14 @@ ignoreBlacklist: document.getElementById(
             if (!(poi.has_base || poi.base_id)) continue;
             const val = sysId + "|" + poi.id;
             const label = poi.base_name || poi.name || poi.id;
-            stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
+            stationList.push({ val, label, sysName });
           }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        for (const { val, label, sysName } of stationList) {
+          stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
         }
 
         // Render configured stations list

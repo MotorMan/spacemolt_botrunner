@@ -20751,16 +20751,12 @@ When responding:
         }
 
         const matched = all.filter((fac) => isStationFacility(fac));
-        // TEMP DEBUG: show source counts and a sample so we can see the live
-        // shape. Remove once the filter is confirmed working.
-        const sample = all[0] ? esc(JSON.stringify(all.slice(0, 3), null, 1)) : "none";
-        const debugHtml = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">DEBUG: fromFactionCache=${Array.isArray(factionFacilitiesData) ? factionFacilitiesData.length : 0}, merged=${all.length}, matched=${matched.length}. Keys: ${all.length ? esc(Object.keys(all[0]).join(",")) : "none"}</div>` + (all.length ? `<pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow:auto">${sample}</pre>` : "");
 
         const facilities = matched;
         stationFacilitiesData = facilities;
         if (facilities.length === 0) {
           container.innerHTML =
-            debugHtml + '<div class="faction-no-data">No station facilities at this station.</div>';
+            '<div class="faction-no-data">No station facilities at this station.</div>';
           return;
         }
         facilities.sort((a, b) =>
@@ -20770,7 +20766,7 @@ When responding:
               (b.name || b.facility_type || b.type || "?").toLowerCase(),
             ),
         );
-        container.innerHTML = debugHtml + facilities
+        container.innerHTML = facilities
           .map((fac) => {
             const name = fac.name || fac.facility_type || fac.type || "?";
             const facId = fac.facility_id || fac.id || "";

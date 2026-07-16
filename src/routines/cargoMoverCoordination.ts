@@ -378,6 +378,57 @@ export function cleanupStaleLocks(): number {
 }
 
 /**
+ * Clear all active locks and reset global delivered/withdrawn tracking. Use to
+ * recover from a bug that inflated the in-transit / delivered numbers. This
+ * drops the in-memory fleet coordination so bots recompute from live storage
+ * reads instead of stale phantom quantities.
+ *
+ * @param keepHistory When true, moves cleared locks into lockHistory (for
+ *   audit) instead of discarding them.
+ */
+export function resetCoordinationTracking(keepHistory = true): {
+  clearedLocks: number;
+  clearedTracking: number;
+} {
+  const data = loadCoordinationData();
+  let clearedLocks = 0;
+
+  for (const [key, lock] of Object.entries(data.activeLocks)) {
+    if (!lock.isActive) continue;
+    clearedLocks++;
+    if (keepHistory) {
+      data.lockHistory.unshift({ ...lock, releasedAt: new Date().toISOString(), reason: "manual_reset" });
+    }
+    lock.isActive = false;
+  }
+
+  // Drop any still-inactive entries from the active map.
+  for (const key of Object.keys(data.activeLocks)) {
+    if (!data.activeLocks[key].isActive) {
+      delete data.activeLocks[key];
+    }
+  }
+
+  if (data.lockHistory.length > 200) {
+    data.lockHistory = data.lockHistory.slice(0, 200);
+  }
+
+  const trackingKeys = Object.keys(data.globalItemTracking);
+  for (const k of trackingKeys) {
+    data.globalItemTracking[k] = {
+      ...data.globalItemTracking[k],
+      totalWithdrawn: 0,
+      totalDelivered: 0,
+      totalLost: 0,
+      lastUpdated: new Date().toISOString(),
+    };
+  }
+
+  saveCoordinationData(data);
+  return { clearedLocks, clearedTracking: trackingKeys.length };
+}
+
+/**
  * Get a summary of fleet cargo moving activity.
  */
 export function getFleetCargoMoverSummary(): {

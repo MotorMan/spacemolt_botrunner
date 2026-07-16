@@ -16,6 +16,9 @@ import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSyn
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
+import { reconcileDeliveredWithDestination, getCargoMoverSettings } from "../routines/cargo_mover.js";
+import { resetInTransitData } from "../routines/cargoMoverInTransit.js";
+import { resetCoordinationTracking } from "../routines/cargoMoverCoordination.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
 
 function getLocalIp(): string | null {
@@ -810,6 +813,39 @@ if (!this.settings.fuel_service) {
         }
         if (url.pathname === "/api/cargo_mover/status") {
           return Response.json({ items: getCargoMoverItemStatuses() });
+        }
+        if (url.pathname === "/api/cargo_mover/reconcile" && req.method === "POST") {
+          try {
+            const body = await req.json() as { bot?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot name required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            const settings = getCargoMoverSettings(body.bot);
+            const ctx = { bot: botInstance, log: (cat: string, msg: string) => botInstance.log(cat, msg) } as any;
+            const result = await reconcileDeliveredWithDestination(ctx, settings);
+            return Response.json({ ok: true, ...result });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
+        }
+        if (url.pathname === "/api/cargo_mover/reset-intransit" && req.method === "POST") {
+          try {
+            const inTransit = resetInTransitData();
+            const coord = resetCoordinationTracking(true);
+            return Response.json({ ok: true, inTransit, coordination: coord });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
         }
         if (url.pathname === "/api/stationRef") {
           const stationRefPath = join(DATA_DIR, "stationRef.json");

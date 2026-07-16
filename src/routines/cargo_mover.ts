@@ -133,7 +133,7 @@ interface CargoMoverSettings {
   bulkSeedAmount: number;
 }
 
-function getCargoMoverSettings(username?: string): CargoMoverSettings {
+export function getCargoMoverSettings(username?: string): CargoMoverSettings {
   const all = readSettings();
   const general = all.general || {};
   const t = all.cargo_mover || {};
@@ -1002,6 +1002,87 @@ function updateDeliveryTracking(
   if (updated) {
     writeSettings({ cargo_mover: { items } });
   }
+}
+
+/**
+ * Reconcile delivered counts against the DESTINATION's actual faction storage.
+ *
+ * After a bug corrupted the per-item `totalDelivered` (and in-transit) counts,
+ * the source of truth for "what actually arrived" is the destination station's
+ * faction storage — it physically holds whatever was delivered. This reads the
+ * destination storage (remotely, no travel needed) and sets each configured
+ * item's `totalDelivered` to the quantity currently sitting at the destination
+ * (capped at the item's delivery target when one is set). It updates both the
+ * settings mirror and the activity-progress record so `findMoveJobs` and the
+ * dashboard agree.
+ *
+ * Only meaningful for `faction` destinations (the only ones with a queryable
+ * faction storage). For `personal` / `send_gift` destinations there is no
+ * single reconcilable store, so this is a no-op and reports 0 reconciled.
+ *
+ * @returns A summary of what changed, for logging / the API response.
+ */
+export async function reconcileDeliveredWithDestination(
+  ctx: RoutineContext,
+  settings: CargoMoverSettings,
+): Promise<{ reconciled: number; changed: Array<{ itemId: string; itemName: string; oldDelivered: number; newDelivered: number }> }> {
+  const { bot } = ctx;
+  if (settings.destinationStorageType !== "faction") {
+    ctx.log("cargo", `⚠️ Reconcile skipped: destination storage type is "${settings.destinationStorageType}" (only faction destinations can be reconciled)`);
+    return { reconciled: 0, changed: [] };
+  }
+
+  // Remote read of the destination's faction storage (no need to travel there).
+  await bot.refreshFactionStorage(false, settings.destinationStation);
+  const destQty = new Map<string, number>();
+  for (const i of bot.factionStorage) destQty.set(i.itemId, i.quantity);
+
+  const all = readSettings();
+  const cargoMover = all.cargo_mover || {};
+  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
+  const changed: Array<{ itemId: string; itemName: string; oldDelivered: number; newDelivered: number }> = [];
+
+  for (const configItem of settings.items) {
+    const actual = destQty.get(configItem.itemId) || 0;
+    // The destination can't physically hold more than what's there, so the
+    // real delivered amount is at most the destination's stored quantity. When
+    // a delivery target is configured, delivered should never exceed it either.
+    const cap = (configItem.totalToDeliver && configItem.totalToDeliver > 0)
+      ? configItem.totalToDeliver
+      : Number.MAX_SAFE_INTEGER;
+    const newDelivered = Math.min(actual, cap);
+
+    const oldDelivered = configItem.totalDelivered || 0;
+    if (newDelivered === oldDelivered) continue;
+
+    // Update the settings mirror.
+    const item = items.find((it) => it.itemId === configItem.itemId);
+    if (item) item.totalDelivered = newDelivered;
+
+    // Update the activity-progress record so the dashboard + findMoveJobs agree.
+    const progress = getItemProgress(bot.username, configItem.itemId);
+    if (progress) {
+      progress.totalDelivered = newDelivered;
+      progress.lastUpdatedAt = new Date().toISOString();
+      if (progress.targetQuantity > 0 && newDelivered >= progress.targetQuantity) {
+        progress.isComplete = true;
+      }
+    }
+
+    changed.push({
+      itemId: configItem.itemId,
+      itemName: configItem.itemName,
+      oldDelivered,
+      newDelivered,
+    });
+    ctx.log("cargo", `🔄 Reconciled ${configItem.itemName}: delivered ${oldDelivered} → ${newDelivered} (destination holds ${actual})`);
+  }
+
+  if (items.length > 0) {
+    writeSettings({ cargo_mover: { items } });
+  }
+
+  return { reconciled: changed.length, changed };
 }
 
 /** Build the ordered, filtered list of items to bulk-move from the source

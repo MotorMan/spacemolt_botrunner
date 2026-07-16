@@ -28520,6 +28520,12 @@ ignoreBlacklist: document.getElementById(
     <h3>Cargo Mover Settings</h3>
     <div class="settings-desc">Haul items between stations. Configure source, destination, and items to move.</div>
 
+    <div style="display:flex;gap:8px;margin:8px 0 4px;flex-wrap:wrap">
+      <button class="sm" style="background:#2e7d32;border:none;color:#fff;cursor:pointer;border-radius:4px" onclick="reconcileCargoMoverDelivered()" title="Read destination faction storage and set delivered counts to the actual amounts held there">⟳ Reconcile Delivered from Destination</button>
+      <button class="sm" style="background:#d32f2f;border:none;color:#fff;cursor:pointer;border-radius:4px" onclick="resetCargoMoverInTransit()" title="Clear inflated in-transit + coordination tracking so bots recompute from live storage">🧹 Reset In-Transit Tracking</button>
+      <span id="cm-admin-status" style="font-size:11px;color:var(--text-dim);align-self:center"></span>
+    </div>
+
     <div class="setting-row">
       <div>
         <div class="setting-label">Source Station</div>
@@ -28994,6 +29000,46 @@ ignoreBlacklist: document.getElementById(
         }
 
         renderCargoMoverSettings(document.getElementById("settingsContent"));
+      }
+
+      async function reconcileCargoMoverDelivered() {
+        const bot = getProfileBot();
+        if (!bot) { alert("Select a bot first."); return; }
+        if (!confirm(`Reconcile delivered counts for "${bot.username}" from the destination's actual faction storage? This overwrites the stored delivered numbers with what the destination actually holds.`)) return;
+        const statusEl = document.getElementById("cm-admin-status");
+        if (statusEl) statusEl.textContent = "Reconciling…";
+        try {
+          const resp = await fetch("/api/cargo_mover/reconcile", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bot: bot.username }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "reconcile failed");
+          const detail = (data.changed || []).map(c => `${c.itemName}: ${c.oldDelivered}→${c.newDelivered}`).join(", ");
+          if (statusEl) statusEl.textContent = `Reconciled ${data.reconciled} item(s)${detail ? ": " + detail : ""}`;
+          renderCargoMoverSettings(document.getElementById("settingsContent"));
+          refreshCargoMoverLiveStatuses();
+        } catch (e) {
+          if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+          alert("Reconcile failed: " + e.message);
+        }
+      }
+
+      async function resetCargoMoverInTransit() {
+        if (!confirm("Clear ALL in-transit and coordination tracking? Bots will recompute from live storage. This does NOT touch delivered counts.")) return;
+        const statusEl = document.getElementById("cm-admin-status");
+        if (statusEl) statusEl.textContent = "Resetting…";
+        try {
+          const resp = await fetch("/api/cargo_mover/reset-intransit", { method: "POST" });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "reset failed");
+          if (statusEl) statusEl.textContent = `In-transit cleared: ${data.inTransit.clearedEntries} entries, ${data.coordination.clearedLocks} locks`;
+          refreshCargoMoverLiveStatuses();
+        } catch (e) {
+          if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+          alert("Reset failed: " + e.message);
+        }
       }
 
       function saveCargoMoverSettings() {

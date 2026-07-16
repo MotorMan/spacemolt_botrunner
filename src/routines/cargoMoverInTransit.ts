@@ -203,6 +203,23 @@ export function cleanupStaleInTransit(): number {
   return cleaned;
 }
 
+/**
+ * Wipe all in-transit tracking. Use after a corrupting bug (e.g. inflated
+ * in-transit counts) so bots stop believing phantom cargo is mid-flight.
+ * Does NOT touch delivered counts — those are reconciled separately.
+ */
+export function resetInTransitData(): { clearedKeys: number; clearedEntries: number } {
+  const data = loadInTransitData();
+  let clearedEntries = 0;
+  const keys = Object.keys(data.inTransitItems);
+  for (const key of keys) {
+    clearedEntries += data.inTransitItems[key].length;
+    delete data.inTransitItems[key];
+  }
+  saveInTransitData(data);
+  return { clearedKeys: keys.length, clearedEntries };
+}
+
 /** Get summary of in-transit items. */
 export function getInTransitSummary(): {
   totalItems: number;

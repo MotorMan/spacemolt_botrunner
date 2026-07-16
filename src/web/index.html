@@ -20835,9 +20835,9 @@ When responding:
           container.innerHTML = '<div class="faction-no-data">No station selected.</div>';
           return;
         }
-        container.innerHTML = '<div class="faction-no-data">Loading...</div>';
+        container.innerHTML = '<div class="faction-no-data">Loading (live remote read)...</div>';
         try {
-          const res = await fetch(`/api/faction-storage?station=${encodeURIComponent(stationStorageStation)}`);
+          const res = await fetch(`/api/faction-storage?station=${encodeURIComponent(stationStorageStation)}&live=1&bot=${encodeURIComponent(username)}`);
           const data = await res.json();
           stationStorageData = data;
           renderStationStorageTable(username);

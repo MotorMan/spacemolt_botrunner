@@ -1137,7 +1137,45 @@ if (url.pathname === "/data/shipsForSale.json") {
         if (url.pathname === "/api/faction-storage") {
           const station = url.searchParams.get("station") || "";
           const factionName = url.searchParams.get("faction") || "";
-          
+          const live = url.searchParams.get("live") === "1";
+          const liveBot = url.searchParams.get("bot") || "";
+
+          // Live mode: perform an actual remote read via the selected bot so the
+          // viewer reflects current server inventory instead of the (often stale)
+          // on-disk cache. refreshFactionStorage(true, station) does the live
+          // view_faction_storage call AND rewrites the disk cache, so afterwards
+          // we can fall through to the normal cache read to build the response.
+          if (live && liveBot) {
+            const bot = getBot(liveBot);
+            if (!bot) {
+              return Response.json({ error: { code: "not_found", message: `Bot ${liveBot} not found` }, items: [] });
+            }
+            try {
+              await bot.refreshFactionStorage(true, station || undefined);
+              // Return the freshly-read inventory directly from the bot instance.
+              // The disk cache is keyed on the RESOLVED hex POI id (not the raw
+              // `system|poi` string the viewer sends), so re-reading disk here
+              // could miss the just-written file. bot.factionStorage was populated
+              // by the live read above, so it is authoritative for this response.
+              const items = (bot.factionStorage || []).map((e) => ({
+                itemId: e.itemId,
+                item_id: e.itemId,
+                name: e.name || e.itemId,
+                quantity: e.quantity,
+              }));
+              return Response.json({
+                items,
+                factionFuelReserve: bot.factionFuelReserve || 0,
+                factionFuelCapacity: bot.factionFuelCapacity || 0,
+                factionName: bot.faction || factionName,
+                station,
+                live: true,
+              });
+            } catch (err) {
+              return Response.json({ error: { code: "refresh_failed", message: err instanceof Error ? err.message : String(err) }, items: [] });
+            }
+          }
+
           const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
           
           if (!existsSync(CACHE_DIR)) {

@@ -238,6 +238,37 @@ function stationTravelTarget(stationRef: string): string {
   return mapStore.resolveStationTarget(stationRef);
 }
 
+/** True when an item in this bot's cargo is actually cargo THIS bot is supposed
+ *  to be transporting under the current settings — i.e. it is a configured item
+ *  whose effective destination matches `settings.destinationStation`, OR it is
+ *  recorded in the shared in-transit tracking as this bot's cargo bound for that
+ *  destination. Used by the startup recovery + clear-cargo steps so a bot never
+ *  mistakes another bot's (or a different movement's) cargo for something to
+ *  reroute/misdeliver, and never strands its own transit cargo as "unrelated". */
+function isThisBotsTransitCargo(
+  itemId: string,
+  botUsername: string,
+  settings: CargoMoverSettings,
+): boolean {
+  const lower = itemId.toLowerCase();
+  if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+
+  const effectiveDest = settings.destinationStation;
+  const isConfigured = settings.items.some((ci) => {
+    if (ci.itemId !== itemId) return false;
+    // An item configured with its own per-item destination still counts as
+    // "ours" only when that destination is the one we're currently serving.
+    const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
+    return itemDest === effectiveDest;
+  });
+  if (isConfigured) return true;
+
+  // Not in our item list — but maybe we legitimately loaded it and it's still
+  // tracked as in-transit under our name for this destination.
+  const inTransitSelf = getInTransitQuantity(itemId, effectiveDest, botUsername);
+  return inTransitSelf > 0;
+}
+
 /** Get current system for mobile stations like mobile_capital or frontier_station. */
 export async function getMobileStationSystem(ctx: RoutineContext, stationId: string): Promise<string | null> {
   if (stationId !== "mobile_capital" && stationId !== "frontier_station") return null;
@@ -1795,12 +1826,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // On restart, check if bot has cargo items that need to be delivered.
     // If so, skip directly to delivery instead of going back to source.
     await bot.refreshCargo();
-    const cargoItemsToDeliver = bot.inventory.filter(item => {
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-      // Check if this item is one of our configured items
-      return settings.items.some(ci => ci.itemId === item.itemId);
-    });
+    const cargoItemsToDeliver = bot.inventory.filter(item =>
+      isThisBotsTransitCargo(item.itemId, bot.username, settings)
+    );
 
     if (cargoItemsToDeliver.length > 0) {
       ctx.log("cargo", `🔄 CARGO RECOVERY: Found ${cargoItemsToDeliver.length} item type(s) in cargo that need delivery`);
@@ -1953,7 +1981,11 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // Deliver all cargo
       yield "deposit_items";
       await bot.refreshCargo();
-      const itemsToDeposit = [...bot.inventory];
+      // Only deliver cargo that is actually ours to transport — never reroute
+      // another bot's / another movement's leftovers into our destination.
+      const itemsToDeposit = bot.inventory.filter((item) =>
+        isThisBotsTransitCargo(item.itemId, bot.username, settings)
+      );
       const deliveredItems: { itemId: string; quantity: number }[] = [];
 
       if (itemsToDeposit.length > 0) {
@@ -2169,19 +2201,22 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
     }
 
-    // Clear unrelated cargo items to FACTION storage (not personal) so other bots can access them
+    // Clear UNRELATED cargo items to FACTION storage (not personal) so other
+    // bots can access them. Only items that are NOT this bot's transit cargo are
+    // cleared — cargo we are actually meant to transport (a configured item for
+    // this destination, or an item still tracked in-transit under our name) is
+    // left aboard so the normal load/deliver loop handles it. This prevents us
+    // from stranding legitimately-transporting cargo, or dumping another bot's
+    // / another movement's leftovers to the wrong storage.
     yield "clear_cargo";
     ctx.log("cargo", `🧹 Clearing unrelated cargo items to faction storage...`);
     await bot.refreshCargo();
     if (bot.inventory.length > 0) {
       const itemsToClear = bot.inventory.filter(item => {
-        // Keep fuel/energy cells for operations
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-        // Check if this is one of our configured items to move
-        const isConfiguredItem = settings.items.some(ci => ci.itemId === item.itemId);
-        // Deposit non-configured items to faction storage so other bots can use them
-        return !isConfiguredItem;
+        // Never clear cargo this bot is actually supposed to be transporting.
+        return !isThisBotsTransitCargo(item.itemId, bot.username, settings);
       });
       if (itemsToClear.length > 0) {
         const deposited: string[] = [];

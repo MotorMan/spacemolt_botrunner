@@ -29003,8 +29003,11 @@ ignoreBlacklist: document.getElementById(
       }
 
       async function reconcileCargoMoverDelivered() {
-        const bot = getProfileBot();
-        if (!bot) { alert("Select a bot first."); return; }
+        // Prefer the profile-selected bot, but fall back to any running bot
+        // since these admin buttons live on the Settings page (independent of
+        // the profile) and the user may not have a profile open.
+        const bot = getProfileBot() || bots.find((b) => b.state === "running") || bots[0];
+        if (!bot) { alert("No bots connected — select or connect a bot first."); return; }
         if (!confirm(`Reconcile delivered counts for "${bot.username}" from the destination's actual faction storage? This overwrites the stored delivered numbers with what the destination actually holds.`)) return;
         const statusEl = document.getElementById("cm-admin-status");
         if (statusEl) statusEl.textContent = "Reconciling…";

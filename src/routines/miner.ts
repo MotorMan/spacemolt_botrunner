@@ -7177,6 +7177,10 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       // Self-diagnosing guard: if we still can't identify the mined resource
       // despite a successful mine, dump the raw result so the shape mismatch
       // is visible instead of silently logging "unknown".
+      // Also compute the cargo delta every time — it both identifies the ore
+      // AND yields the true mined quantity for harvest responses (ice/gas),
+      // which return a full game-state delta with no explicit `quantity` field.
+      const cargoDelta = parseOreFromCargoDelta(mineResp.result, bot.inventory, targetResource || resourceLabel);
       if (!oreId && mineResp.result && typeof mineResp.result === "object") {
         const raw = mineResp.result as Record<string, unknown>;
         const keys = Object.keys(raw);
@@ -7189,11 +7193,10 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
         // (top-level ship,cargo,queue,skills) with no details/item block.
         // Identify the mined ore by diffing the post-mine cargo against the
         // known pre-mine inventory. Falls back to the quota target resource.
-        const delta = parseOreFromCargoDelta(mineResp.result, bot.inventory, targetResource || resourceLabel);
-        if (delta.oreId) {
-          ctx.log("debug", `parseOreFromCargoDelta recovered ore: ${delta.oreId}`);
-          oreId = delta.oreId;
-          oreName = delta.oreName || delta.oreId;
+        if (cargoDelta.oreId) {
+          ctx.log("debug", `parseOreFromCargoDelta recovered ore: ${cargoDelta.oreId}`);
+          oreId = cargoDelta.oreId;
+          oreName = cargoDelta.oreName || cargoDelta.oreId;
         }
       }
 
@@ -7202,7 +7205,13 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
       if (mineResp.result && typeof mineResp.result === "object") {
         const result = mineResp.result as Record<string, unknown>;
         const responseData = (result.details as Record<string, unknown>) || result;
-        const quantity = (responseData.quantity as number) ?? (responseData.amount as number) ?? 1;
+        // Prefer the explicit quantity from the response. Harvest responses
+        // (ice/gas) are a full game-state delta with no quantity field, so fall
+        // back to the cargo-delta amount (the real mined count). Default to 1.
+        const explicitQty = (responseData.quantity as number) ?? (responseData.amount as number);
+        const quantity = (explicitQty != null && explicitQty > 0)
+          ? explicitQty
+          : (cargoDelta.oreId && cargoDelta.quantity > 0 ? cargoDelta.quantity : 1);
         const richness = (responseData.richness as number) ?? 0;
         const resourceType = (responseData.resource_type as string) ?? (responseData.type as string) ?? "";
         const poiName = (responseData.poi_name as string) ?? (responseData.location as string) ?? miningPoi?.name ?? "";

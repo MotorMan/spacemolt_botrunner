@@ -433,8 +433,8 @@ export function parseOreFromCargoDelta(
   result: unknown,
   prevInventory: Array<{ itemId: string; name: string; quantity: number }>,
   fallbackResourceId?: string,
-): { oreId: string; oreName: string } {
-  if (!result || typeof result !== "object") return { oreId: "", oreName: "" };
+): { oreId: string; oreName: string; quantity: number } {
+  if (!result || typeof result !== "object") return { oreId: "", oreName: "", quantity: 0 };
   const mr = result as Record<string, unknown>;
 
   // The cargo array lives either at top-level `cargo` or nested under `details`.
@@ -443,7 +443,7 @@ export function parseOreFromCargoDelta(
     | undefined;
   if (!Array.isArray(cargoSrc) || cargoSrc.length === 0) {
     const id = fallbackResourceId || "";
-    return { oreId: id, oreName: id };
+    return { oreId: id, oreName: id, quantity: 0 };
   }
 
   const norm = (s: unknown) =>
@@ -468,9 +468,9 @@ export function parseOreFromCargoDelta(
     }
   }
 
-  if (bestId && bestDelta > 0) return { oreId: bestId, oreName: bestName || bestId };
+  if (bestId && bestDelta > 0) return { oreId: bestId, oreName: bestName || bestId, quantity: bestDelta };
   const id = fallbackResourceId || "";
-  return { oreId: id, oreName: id };
+  return { oreId: id, oreName: id, quantity: 0 };
 }
 
 // ── Docking ──────────────────────────────────────────────────

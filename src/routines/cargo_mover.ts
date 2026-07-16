@@ -118,6 +118,19 @@ interface CargoMoverSettings {
   militaryFuelCells: number;
   ignorePiratesWhenCloaked: boolean;
   ignoreBlacklistWhenCloaked: boolean;
+  /** Bulk-move sub-routine: move EVERYTHING from the source faction storage to
+   *  the destination instead of the hand-picked `items` list. */
+  enableBulkMove: boolean;
+  /** Skip any source item whose stored quantity exceeds this (it will never fit
+   *  at the destination and would just error). Default 500000. */
+  bulkIgnoreOver: number;
+  /** Transfer ordering: alphabetical, reverse alphabetical, or random. */
+  bulkOrder: "alphabetical" | "reverse_alphabetical" | "random";
+  /** Seed-base mode: first move a small amount of every item so the destination
+   *  has a presence of each, then switch to full moving once all items are present. */
+  bulkSeedMode: boolean;
+  /** Amount per item to seed during seed-base mode. */
+  bulkSeedAmount: number;
 }
 
 function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -163,6 +176,11 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
     // pirates and blacklisted systems while cloaked.
     ignorePiratesWhenCloaked: (botOverrides.ignorePiratesWhenCloaked as boolean) ?? (t.ignorePiratesWhenCloaked as boolean) ?? true,
     ignoreBlacklistWhenCloaked: (botOverrides.ignoreBlacklistWhenCloaked as boolean) ?? (t.ignoreBlacklistWhenCloaked as boolean) ?? true,
+    enableBulkMove: (t.enableBulkMove as boolean) ?? false,
+    bulkIgnoreOver: (t.bulkIgnoreOver as number) || 500000,
+    bulkOrder: (t.bulkOrder as "alphabetical" | "reverse_alphabetical" | "random") || "alphabetical",
+    bulkSeedMode: (t.bulkSeedMode as boolean) ?? false,
+    bulkSeedAmount: (t.bulkSeedAmount as number) || 10,
   };
 }
 
@@ -261,6 +279,16 @@ interface MoveJob {
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
   return Math.max(0, bot.cargoMax - bot.cargo);
+}
+
+/** Item ids that should NEVER be bulk-moved (operational fuel/energy cells). */
+function isBulkSkipItem(itemId: string): boolean {
+  const lower = itemId.toLowerCase();
+  return (
+    lower === "premium_fuel_cell" ||
+    lower === "military_fuel_cell" ||
+    lower.includes("energy_cell")
+  );
 }
 
 /** Operational cells that must NEVER be deposited at the destination — they
@@ -976,6 +1004,233 @@ function updateDeliveryTracking(
   }
 }
 
+/** Build the ordered, filtered list of items to bulk-move from the source
+ *  faction storage. Excludes operational fuel/energy cells, and any item whose
+ *  stored quantity exceeds `bulkIgnoreOver` (those can never fit at the
+ *  destination and would just error out). `destHas` lets seed mode skip items
+ *  that already have a presence at the destination. */
+function planBulkItems(
+  ctx: RoutineContext,
+  sourceItems: Array<{ itemId: string; name: string; quantity: number }>,
+  settings: CargoMoverSettings,
+  destHas: Set<string>,
+): Array<{ itemId: string; itemName: string; quantity: number }> {
+  const { bot } = ctx;
+  let candidates = sourceItems.filter((i) => {
+    if (!i.itemId || i.quantity <= 0) return false;
+    if (isBulkSkipItem(i.itemId)) return false;
+    // Items that already have a presence at the destination are skipped while
+    // seeding — we bring every OTHER item in first, then seed them on a later
+    // pass once the rest all have a presence.
+    if (settings.bulkSeedMode && destHas.has(i.itemId)) return false;
+    if (i.quantity > settings.bulkIgnoreOver) {
+      ctx.log("cargo", `  ⏭️ Skipping ${i.name}: ${i.quantity} in storage exceeds ignore-over threshold (${settings.bulkIgnoreOver})`);
+      return false;
+    }
+    return true;
+  });
+
+  // During seed mode, cap each item to the seed amount.
+  let planned = candidates.map((i) => ({
+    itemId: i.itemId,
+    itemName: i.name || i.itemId,
+    quantity: settings.bulkSeedMode ? Math.min(i.quantity, settings.bulkSeedAmount) : i.quantity,
+  }));
+
+  // Apply transfer ordering.
+  const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  if (settings.bulkOrder === "alphabetical") {
+    planned.sort((a, b) => coll.compare(a.itemName, b.itemName));
+  } else if (settings.bulkOrder === "reverse_alphabetical") {
+    planned.sort((a, b) => coll.compare(b.itemName, a.itemName));
+  } else if (settings.bulkOrder === "random") {
+    for (let i = planned.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [planned[i], planned[j]] = [planned[j], planned[i]];
+    }
+  }
+
+  return planned;
+}
+
+/** Bulk-move sub-routine. Moves everything (respecting `bulkIgnoreOver`,
+ *  `bulkOrder`, and `bulkSeedMode`) from the source faction storage to the
+ *  destination. Runs a single round: load as much as fits, deliver, then return
+ *  to source. The main loop calls this repeatedly, so seed mode naturally
+ *  progresses (each pass more items gain a destination presence) until the base
+ *  is seeded and full moving takes over. */
+async function runBulkMovePhase(
+  ctx: RoutineContext,
+  settings: CargoMoverSettings,
+  safetyOpts: {
+    fuelThresholdPct: number;
+    hullThresholdPct: number;
+    ignorePiratesWhenCloaked: boolean;
+    ignoreBlacklistWhenCloaked: boolean;
+  },
+  warnedNoCloak: { warned: boolean },
+): Promise<void> {
+  const { bot } = ctx;
+  const mode = settings.bulkSeedMode ? "SEED-BASE" : "FULL";
+  ctx.log("cargo", `═══════════════════════════════════════════════════════`);
+  ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}`);
+  ctx.log("cargo", `   Source: ${settings.sourceStation}`);
+  ctx.log("cargo", `   Destination: ${settings.destinationStation} (${settings.destinationStorageType})`);
+
+  const sourceSystem = resolveStationSystem(settings.sourceStation);
+  const destSystem = resolveStationSystem(settings.destinationStation);
+  if (!sourceSystem) { ctx.log("error", "Bulk move: unknown source station"); await ctx.sleep(60000); return; }
+  if (!destSystem) { ctx.log("error", "Bulk move: unknown destination station"); await ctx.sleep(60000); return; }
+
+  // ── Navigate to source & dock ──────────────────────────────
+  if (bot.system !== sourceSystem) {
+    await undockForTravel(ctx, warnedNoCloak);
+    if (bot.state !== "running") return;
+    if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
+    if (!await navigateToSystem(ctx, sourceSystem, safetyOpts)) { await ctx.sleep(30000); return; }
+  }
+  if (!bot.docked || !botIsAtStation(bot, settings.sourceStation)) {
+    await undockForTravel(ctx, warnedNoCloak);
+    if (bot.state !== "running") return;
+    if (!botIsAtStation(bot, settings.sourceStation)) {
+      const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.sourceStation) });
+      if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+        ctx.log("error", `Bulk move: travel to source failed: ${tResp.error.message}`);
+        await ctx.sleep(30000); return;
+      }
+      if (!tResp.error) bot.poi = stationTravelTarget(settings.sourceStation);
+    }
+    if (!await dockAtStation(ctx)) { await ctx.sleep(30000); return; }
+  }
+
+  // ── Maintenance at source ─────────────────────────────────
+  await tryRefuel(ctx);
+  await repairShip(ctx);
+  await bot.refreshFactionStorage();
+  await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+
+  // ── Re-check REMOTE destination faction storage ───────────
+  // Read the destination's faction storage so we can see what it already has
+  // (and what it doesn't) before we start hauling. This feeds seed mode and the
+  // user-facing visibility of the target's inventory.
+  const destHas = new Set<string>();
+  try {
+    await bot.refreshFactionStorage(false, settings.destinationStation);
+    const destItems = bot.factionStorage;
+    ctx.log("cargo", `🔎 Destination faction storage (${settings.destinationStation}) has ${destItems.length} item type(s):`);
+    for (const d of destItems.slice().sort((a, b) => (a.name || a.itemId).localeCompare(b.name || b.itemId))) {
+      if (d.quantity > 0) destHas.add(d.itemId);
+      ctx.log("cargo", `     - ${d.name || d.itemId}: ${d.quantity}`);
+    }
+    // Restore the source storage into cache for the load step below.
+    await bot.refreshFactionStorage();
+  } catch (e) {
+    ctx.log("warn", `Could not read remote destination faction storage: ${e instanceof Error ? e.message : e}`);
+    await bot.refreshFactionStorage();
+  }
+
+  // ── Plan what to move ─────────────────────────────────────
+  const planned = planBulkItems(ctx, bot.factionStorage, settings, destHas);
+  if (planned.length === 0) {
+    if (settings.bulkSeedMode) {
+      // Seed pass found nothing new to bring in — that means every sourced item
+      // already has a presence at the destination, so seeding is complete.
+      const allPresent = bot.factionStorage
+        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && i.quantity <= settings.bulkIgnoreOver)
+        .every((i) => destHas.has(i.itemId));
+      if (allPresent) {
+        ctx.log("cargo", `✅ Seed pass complete — every sourced item now has a presence at the destination. Disabling seed mode and switching to FULL moves.`);
+        const all = readSettings();
+        const cm = (all.cargo_mover as Record<string, unknown>) || {};
+        cm.bulkSeedMode = false;
+        writeSettings({ cargo_mover: cm });
+      }
+    }
+    ctx.log("info", "Bulk move: nothing to move right now — waiting 60s");
+    await ctx.sleep(60000);
+    return;
+  }
+
+  ctx.log("cargo", `📋 Bulk move plan: ${planned.length} item type(s)${settings.bulkSeedMode ? ` (seeding ${settings.bulkSeedAmount} each)` : ""}`);
+  for (const p of planned) {
+    ctx.log("cargo", `     - ${p.itemName}: ${p.quantity}`);
+  }
+
+  // ── Load as much as fits into cargo ───────────────────────
+  await bot.refreshCargo();
+  let cargoUsed = bot.cargo;
+  const cargoMax = bot.cargoMax;
+  let loadedAny = false;
+
+  for (const p of planned) {
+    while (bot.state === "running") {
+      const freeSpace = Math.max(0, cargoMax - cargoUsed);
+      if (freeSpace <= 0) break;
+      const itemSize = getItemSize(p.itemId);
+      const maxFit = Math.floor(freeSpace / itemSize);
+      if (maxFit <= 0) break;
+
+      await bot.refreshFactionStorage();
+      const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
+      const stillNeeded = settings.bulkSeedMode
+        ? Math.max(0, p.quantity - (destHas.has(p.itemId) ? 0 : 0))
+        : p.quantity;
+      const loadQty = Math.min(maxFit, inStorage, stillNeeded);
+      if (loadQty <= 0) break;
+
+      const res = await withdrawFromStorage(ctx, p.itemId, loadQty, "faction");
+      if (res.success && res.withdrawnQty > 0) {
+        cargoUsed += res.withdrawnQty * itemSize;
+        loadedAny = true;
+        p.quantity -= res.withdrawnQty;
+        ctx.log("cargo", `✅ Loaded ${res.withdrawnQty}x ${p.itemName} (cargo ${cargoUsed}/${cargoMax})`);
+        if (p.quantity <= 0) break;
+      } else {
+        break;
+      }
+    }
+    if (Math.max(0, cargoMax - cargoUsed) <= 0) break;
+  }
+
+  if (!loadedAny) {
+    ctx.log("info", "Bulk move: could not load anything — waiting 60s");
+    await ctx.sleep(60000);
+    return;
+  }
+
+  // ── Deliver to destination ────────────────────────────────
+  const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+  if (!fueled) { await ctx.sleep(30000); return; }
+  await undockForTravel(ctx, warnedNoCloak);
+  if (bot.state !== "running") return;
+  if (bot.system !== destSystem) {
+    if (!await navigateToSystem(ctx, destSystem, safetyOpts)) { await ctx.sleep(30000); return; }
+  }
+  await undockForTravel(ctx, warnedNoCloak);
+  if (bot.state !== "running") return;
+  if (!botIsAtStation(bot, settings.destinationStation)) {
+    const tResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
+    if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+      ctx.log("error", `Bulk move: travel to destination failed: ${tResp.error.message}`);
+      await ctx.sleep(30000); return;
+    }
+    if (!tResp.error) bot.poi = stationTravelTarget(settings.destinationStation);
+  }
+  if (!await dockAtStation(ctx)) { await ctx.sleep(30000); return; }
+
+  await bot.refreshCargo();
+  for (const item of bot.inventory) {
+    if (item.quantity <= 0) continue;
+    if (isBulkSkipItem(item.itemId)) continue;
+    const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+    if (depositQty <= 0) continue;
+    await depositToDestination(ctx, item.itemId, depositQty, settings.destinationStorageType, settings.destinationBotName);
+  }
+
+  await tryRefuel(ctx);
+  await ctx.sleep(5000);
+}
+
 export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
@@ -1288,6 +1543,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
       ignoreBlacklistWhenCloaked: settings.ignoreBlacklistWhenCloaked,
     };
+
+    // ── BULK MOVE SUB-ROUTINE ─────────────────────────────────
+    // When enabled, move EVERYTHING from the source faction storage to the
+    // destination (respecting the ignore-over / order / seed-mode options)
+    // instead of the hand-picked items list. Runs each cycle and returns here
+    // to loop, so seed mode naturally progresses pass-by-pass.
+    if (settings.enableBulkMove) {
+      yield "bulk_move";
+      await runBulkMovePhase(ctx, settings, safetyOpts, warnedNoCloak);
+      continue;
+    }
 
     ctx.log("cargo", `═══════════════════════════════════════════════════════`);
     ctx.log("cargo", `📦 Cargo Mover Cycle Starting`);

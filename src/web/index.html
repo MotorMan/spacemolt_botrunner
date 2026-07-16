@@ -28303,6 +28303,11 @@ ignoreBlacklist: document.getElementById(
         const factionStorageBot = cm.factionStorageBot || "";
         const ignorePiratesWhenCloaked = cm.ignorePiratesWhenCloaked ?? true;
         const ignoreBlacklistWhenCloaked = cm.ignoreBlacklistWhenCloaked ?? true;
+        const enableBulkMove = cm.enableBulkMove ?? false;
+        const bulkIgnoreOver = cm.bulkIgnoreOver ?? 500000;
+        const bulkOrder = cm.bulkOrder || "alphabetical";
+        const bulkSeedMode = cm.bulkSeedMode ?? false;
+        const bulkSeedAmount = cm.bulkSeedAmount ?? 10;
 
         // Build station options from mapData
         let sourceStationOpts = '<option value="">(not set)</option>';
@@ -28628,11 +28633,72 @@ ignoreBlacklist: document.getElementById(
       <label><input type="checkbox" id="set-cm-ignoreBlacklistWhenCloaked" ${ignoreBlacklistWhenCloaked ? "checked" : ""}> Ignore blacklist</label>
     </div>
 
+    <!-- Bulk Move Sub-Routine Section -->
+    <div style="margin-top:20px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚚 Bulk Move Sub-Routine</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        When enabled, move EVERYTHING from the source faction storage to the destination (ignoring the item list above). Re-checks the remote destination storage each run.
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Bulk Move</div>
+          <div class="setting-hint">Move all items instead of the configured list</div>
+        </div>
+        <label><input type="checkbox" id="set-cm-enableBulkMove" ${enableBulkMove ? "checked" : ""} onchange="toggleBulkMoveFields()"> Enabled</label>
+      </div>
+
+      <div id="cm-bulk-fields" style="display: ${enableBulkMove ? "" : "none"}">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Ignore Items Over</div>
+            <div class="setting-hint">Skip any item with more than this in storage (won't fit, errors)</div>
+          </div>
+          <input type="number" id="set-cm-bulkIgnoreOver" min="0" step="10000" value="${bulkIgnoreOver}" onchange="saveCargoMoverSettings()">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Transfer Order</div>
+            <div class="setting-hint">Order in which items are moved</div>
+          </div>
+          <select id="set-cm-bulkOrder" onchange="saveCargoMoverSettings()">
+            <option value="alphabetical" ${bulkOrder === "alphabetical" ? "selected" : ""}>Alphabetical</option>
+            <option value="reverse_alphabetical" ${bulkOrder === "reverse_alphabetical" ? "selected" : ""}>Reverse Alphabetical</option>
+            <option value="random" ${bulkOrder === "random" ? "selected" : ""}>Random</option>
+          </select>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Seed Base First</div>
+            <div class="setting-hint">Move a small amount of each item first so the destination has a presence of everything, then switch to full moves once all items are present</div>
+          </div>
+          <label><input type="checkbox" id="set-cm-bulkSeedMode" ${bulkSeedMode ? "checked" : ""} onchange="saveCargoMoverSettings()"> Seed mode</label>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Seed Amount</div>
+            <div class="setting-hint">How many of each item to seed during seed mode</div>
+          </div>
+          <input type="number" id="set-cm-bulkSeedAmount" min="1" value="${bulkSeedAmount}" onchange="saveCargoMoverSettings()">
+        </div>
+      </div>
+    </div>
+
     <div class="settings-save-bar">
       <button class="sm" onclick="renderCargoMoverSettings(document.getElementById('settingsContent'))">Refresh</button>
       <button class="primary" onclick="saveCargoMoverSettings()">Save Settings</button>
     </div>
   `;
+
+        function toggleBulkMoveFields() {
+          const en = document.getElementById("set-cm-enableBulkMove")?.checked;
+          const f = document.getElementById("cm-bulk-fields");
+          if (f) f.style.display = en ? "" : "none";
+          saveCargoMoverSettings();
+        }
 
         // Populate ship loadout dropdown
         populateCargoMoverShipLoadouts();
@@ -28932,6 +28998,20 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-cm-ignorePiratesWhenCloaked")?.checked ?? true,
           ignoreBlacklistWhenCloaked:
             document.getElementById("set-cm-ignoreBlacklistWhenCloaked")?.checked ?? true,
+          enableBulkMove:
+            document.getElementById("set-cm-enableBulkMove")?.checked ?? false,
+          bulkIgnoreOver:
+            parseInt(
+              document.getElementById("set-cm-bulkIgnoreOver")?.value,
+            ) || 500000,
+          bulkOrder:
+            document.getElementById("set-cm-bulkOrder")?.value || "alphabetical",
+          bulkSeedMode:
+            document.getElementById("set-cm-bulkSeedMode")?.checked ?? false,
+          bulkSeedAmount:
+            parseInt(
+              document.getElementById("set-cm-bulkSeedAmount")?.value,
+            ) || 10,
         };
 
         send({ type: "saveSettings", routine: "cargo_mover", settings: s });

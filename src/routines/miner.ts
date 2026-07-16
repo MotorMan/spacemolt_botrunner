@@ -322,7 +322,21 @@ async function checkAndAcceptMinerMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
-  const activeResp = await bot.commands.spacemolt.get_active_missions();
+  // Stations that are too small (e.g. Whisperbound Station) do not offer
+  // mission services. The library throws "does not offer mission services" —
+  // treat that as "no missions here" rather than letting it crash the routine.
+  let activeResp: Awaited<ReturnType<typeof bot.commands.spacemolt.get_active_missions>>;
+  try {
+    activeResp = await bot.commands.spacemolt.get_active_missions();
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    if (msg.includes("does not offer mission") || msg.includes("no mission")) {
+      ctx.log("mining", "Station offers no mission services — skipping mission accept");
+      return;
+    }
+    throw err;
+  }
+
   let activeCount = 0;
   const activeContent = activeResp.structuredContent;
   if (activeContent && typeof activeContent === "object") {
@@ -332,7 +346,17 @@ async function checkAndAcceptMinerMissions(ctx: RoutineContext): Promise<void> {
   }
   if (activeCount >= 5) return;
 
-  const availResp = await bot.commands.spacemolt.get_missions();
+  let availResp: Awaited<ReturnType<typeof bot.commands.spacemolt.get_missions>>;
+  try {
+    availResp = await bot.commands.spacemolt.get_missions();
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    if (msg.includes("does not offer mission") || msg.includes("no mission")) {
+      ctx.log("mining", "Station offers no mission services — skipping mission accept");
+      return;
+    }
+    throw err;
+  }
   const availContent = availResp.structuredContent;
   if (!availContent || typeof availContent !== "object") return;
   const r = availContent as Record<string, unknown>;
@@ -365,7 +389,19 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
-  const activeResp = await bot.commands.spacemolt.get_active_missions();
+  // Stations that are too small do not offer mission services. Treat that as
+  // "no active missions here" rather than crashing the routine.
+  let activeResp: Awaited<ReturnType<typeof bot.commands.spacemolt.get_active_missions>>;
+  try {
+    activeResp = await bot.commands.spacemolt.get_active_missions();
+  } catch (err) {
+    const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+    if (msg.includes("does not offer mission") || msg.includes("no mission")) {
+      ctx.log("mining", "Station offers no mission services — skipping mission completion");
+      return;
+    }
+    throw err;
+  }
   const activeContent = activeResp.structuredContent;
   if (!activeContent || typeof activeContent !== "object") return;
   const r = activeContent as Record<string, unknown>;
@@ -445,6 +481,7 @@ async function getMinerSettings(username?: string): Promise<{
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
  enableFighting: boolean;
+ enableMissions: boolean;
 
    // Deep sleep interval (minutes) used when NO viable mining target exists anywhere in the map.
    // Prevents the miner from hammering the server with repeated failed target searches.
@@ -547,6 +584,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
     enableCloak: (m.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
+    enableMissions: (m.enableMissions as boolean) ?? true,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
@@ -2226,8 +2264,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 }
 
     // ── Startup: accept missions ──
-    await completeActiveMissions(ctx);
-    await checkAndAcceptMinerMissions(ctx);
+    if (settings0.enableMissions) {
+      await completeActiveMissions(ctx);
+      await checkAndAcceptMinerMissions(ctx);
+    }
 
     // ── Startup: unload cargo if docked at home with existing cargo ──
     if (bot.docked && bot.system === homeSystem) {
@@ -7606,11 +7646,13 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     // }
 
     // ── Mission handling: complete and accept missions ──
-    yield "complete_missions";
-    await completeActiveMissions(ctx);
+    if (settings0.enableMissions) {
+      yield "complete_missions";
+      await completeActiveMissions(ctx);
 
-    yield "accept_missions";
-    await checkAndAcceptMinerMissions(ctx);
+      yield "accept_missions";
+      await checkAndAcceptMinerMissions(ctx);
+    }
 
     // ── Refuel + Repair ──
     yield "refuel";

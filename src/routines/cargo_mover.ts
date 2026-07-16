@@ -1106,7 +1106,11 @@ async function runBulkMovePhase(
   // ── Maintenance at source ─────────────────────────────────
   await tryRefuel(ctx);
   await repairShip(ctx);
-  await bot.refreshFactionStorage();
+  // Read the SOURCE station's faction storage explicitly — never fall back to
+  // the global general.factionStorageStation (used by cleanup/faction-trader),
+  // which is unrelated to this routine's source and would make us plan against
+  // the wrong inventory.
+  await bot.refreshFactionStorage(false, settings.sourceStation);
   await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
 
   // ── Re-check REMOTE destination faction storage ───────────
@@ -1122,11 +1126,11 @@ async function runBulkMovePhase(
       if (d.quantity > 0) destHas.add(d.itemId);
       ctx.log("cargo", `     - ${d.name || d.itemId}: ${d.quantity}`);
     }
-    // Restore the source storage into cache for the load step below.
-    await bot.refreshFactionStorage();
+    // Restore the SOURCE station storage into cache for the load step below.
+    await bot.refreshFactionStorage(false, settings.sourceStation);
   } catch (e) {
     ctx.log("warn", `Could not read remote destination faction storage: ${e instanceof Error ? e.message : e}`);
-    await bot.refreshFactionStorage();
+    await bot.refreshFactionStorage(false, settings.sourceStation);
   }
 
   // ── Plan what to move ─────────────────────────────────────
@@ -1170,7 +1174,7 @@ async function runBulkMovePhase(
       const maxFit = Math.floor(freeSpace / itemSize);
       if (maxFit <= 0) break;
 
-      await bot.refreshFactionStorage();
+      await bot.refreshFactionStorage(false, settings.sourceStation);
       const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
       const stillNeeded = settings.bulkSeedMode
         ? Math.max(0, p.quantity - (destHas.has(p.itemId) ? 0 : 0))
@@ -2018,7 +2022,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       await repairShip(ctx);
       // Load the user-configured number of military fuel cells for the trip.
       // These are never delivered and power in-transit refueling.
-      await bot.refreshFactionStorage();
+      // Read the SOURCE station's faction storage (not general.factionStorageStation).
+      await bot.refreshFactionStorage(false, settings.sourceStation);
       await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
     }
 
@@ -2055,9 +2060,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     // Refresh storage after clearing cargo to get accurate counts
-    // This prevents race conditions where items just deposited aren't counted
+    // This prevents race conditions where items just deposited aren't counted.
+    // Read the SOURCE station's faction storage (not general.factionStorageStation).
     await bot.refreshStorage();
-    await bot.refreshFactionStorage();
+    await bot.refreshFactionStorage(false, settings.sourceStation);
 
     yield "find_jobs";
     // Clean up any stale locks from other bots before checking availability

@@ -856,20 +856,26 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
   const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (startFuel >= 95) return false;
 
-  // Refresh storage views so we can see what's available here.
+  await bot.refreshShip();
   await bot.refreshFactionStorage(false, undefined, true);
   await bot.refreshStorage();
   await bot.refreshCargo();
+
+  const fuelNeeded = Math.max(0, bot.maxFuel - bot.fuel);
 
   let sourced = 0;
   for (const { id } of FUEL_CELL_RANK) {
     const have = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
     if (have > 0) continue;
 
+    const cellFuel = FUEL_CELL_RANK.find((f) => f.id === id)?.fuel || 20;
+    const cellsNeeded = Math.max(1, Math.ceil(fuelNeeded / cellFuel));
+    const pullLimit = cellsNeeded + 5;
+
     // 1) Faction storage
     const inFaction = bot.factionStorage.find((i) => i.itemId === id);
     if (inFaction && inFaction.quantity > 0) {
-      const qty = Math.min(inFaction.quantity, maxFuelCellsForCargo(ctx, id) || inFaction.quantity);
+      const qty = Math.min(inFaction.quantity, maxFuelCellsForCargo(ctx, id) || inFaction.quantity, pullLimit);
       if (qty > 0) {
         const fResp = await bot.exec("storage", {
           action: "deposit", target: "self", item_id: id, quantity: qty, source: "faction",
@@ -891,7 +897,7 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
     // 2) Station storage
     const inStation = bot.storage.find((i) => i.itemId === id);
     if (inStation && inStation.quantity > 0) {
-      const qty = Math.min(inStation.quantity, maxFuelCellsForCargo(ctx, id) || inStation.quantity);
+      const qty = Math.min(inStation.quantity, maxFuelCellsForCargo(ctx, id) || inStation.quantity, pullLimit);
       if (qty > 0) {
         const wResp = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
         if (!wResp.error) {
@@ -909,7 +915,7 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
       const { pois } = await getSystemInfo(ctx);
       const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
       if (stationHasMarket(station)) {
-        const buyQty = Math.max(1, maxFuelCellsForCargo(ctx, id));
+        const buyQty = Math.max(1, Math.min(maxFuelCellsForCargo(ctx, id), pullLimit));
         if (buyQty > 0) {
           const buyResp = await bot.exec("buy", { item_id: id, quantity: buyQty });
           if (!buyResp.error) {

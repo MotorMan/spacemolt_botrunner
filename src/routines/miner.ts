@@ -7590,40 +7590,36 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     try {
       const routeResult = (await bot.commands.spacemolt.find_route({ id: homeSystem })).structuredContent;
       const r = routeResult as any;
-      if (r?.estimated_fuel && r?.fuel_available != null) {
-        const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
-        const needed = Math.ceil(deficit / 20);
+      if (r?.estimated_fuel != null && r?.fuel_available != null) {
         const minFuel = settings.minimumFuelCells;
-        if (fuelInCargo < Math.max(needed, minFuel)) {
+        if (fuelInCargo < minFuel) {
           // CRITICAL: Only withdraw from faction storage if DOCKED at home system
           const isAtHome = homeSystem && bot.system === homeSystem && bot.docked;
-          let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
+          const cellsNeeded = minFuel - fuelInCargo;
           if (isAtHome) {
             // Prefer military_fuel_cell (100 fuel, 3 space)
             try {
-              await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
-              stillNeeded = Math.max(0, stillNeeded - 100);
-            } catch { /* withdraw failed */ }
-            if (stillNeeded > 0) {
+              const qty = Math.min(cellsNeeded, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 3));
+              if (qty > 0) {
+                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: qty });
+                ctx.log("mining", `Withdrew ${qty} military fuel cells from storage`);
+              }
+            } catch {
               try {
-                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-                stillNeeded = Math.max(0, stillNeeded - 50);
-              } catch { /* withdraw failed */ }
-            }
-            if (stillNeeded > 0) {
-              try {
-                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
-                stillNeeded = 0;
-              } catch { /* withdraw failed */ }
-            }
-            if (stillNeeded <= 0) ctx.log("mining", `Withdrew fuel cells from faction storage`);
-          }
-          if (stillNeeded > 0) {
-            const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
-            const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
-            if (buyQty > 0) {
-              ctx.log("mining", `Buying ${buyQty} military fuel cells for return (last resort)`);
-              await bot.commands.spacemolt.buy({ id: "military_fuel_cell", quantity: buyQty });
+                const qty = Math.min(cellsNeeded, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 2));
+                if (qty > 0) {
+                  await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: qty });
+                  ctx.log("mining", `Withdrew ${qty} premium fuel cells from storage`);
+                }
+              } catch {
+                try {
+                  const qty = Math.min(cellsNeeded * 5, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 1));
+                  if (qty > 0) {
+                    await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: qty });
+                    ctx.log("mining", `Withdrew ${qty} fuel cells from storage`);
+                  }
+                } catch { /* no fuel cells available */ }
+              }
             }
           }
         }

@@ -15548,38 +15548,43 @@
         const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
         const disableFactionAnnouncements = r.disableFactionAnnouncements === true;
 
-        // Build system options from mapData
-        const systems = Object.keys(mapData || {}).sort();
-        const sysOpts = [
-          '<option value="">(none - use starting system)</option>',
-        ];
-        for (const sys of systems) {
-          const sel = sys === homeSystem ? " selected" : "";
-          sysOpts.push(
-            `<option value="${esc(sys)}"${sel}>${esc(sys)}</option>`,
-          );
-        }
-
-        // Build station options from selected system
-        let stationOpts = [
-          '<option value="">(none - dock at any station)</option>',
-        ];
-        if (homeSystem && mapData && mapData[homeSystem]) {
-          const sysData = mapData[homeSystem];
-          const pois = sysData.pois || [];
-          const stations = pois.filter(
-            (p) =>
-              p.type === "station" ||
-              p.type === "outpost" ||
-              (p.services && p.services.refuel),
-          );
-          for (const station of stations) {
-            const stationVal = `${homeSystem}|${station.id}`;
-            const sel = stationVal === homeStation ? " selected" : "";
-            stationOpts.push(
-              `<option value="${esc(stationVal)}"${sel}>${esc(station.name)}</option>`,
-            );
+        // Build a single, full-station dropdown covering every known station
+        // across all systems. Each option value is "system|poiId" so both the
+        // home system and home station are captured from one selector. A leading
+        // "(any station in starting system)" option preserves the old behaviour
+        // of not pinning a specific station.
+        const stationSpecs = [];
+        for (const [sysId, sys] of Object.entries(mapData || {})) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.name || a.base_name || a.id || "").localeCompare(
+              b.name || b.base_name || b.id || "",
+            ),
+          )) {
+            const isStation =
+              poi.type === "station" ||
+              poi.type === "outpost" ||
+              (poi.services && poi.services.refuel) ||
+              poi.has_base ||
+              poi.base_id;
+            if (!isStation) continue;
+            const val = `${sysId}|${poi.id}`;
+            const label = poi.name || poi.base_name || poi.id;
+            stationSpecs.push({ val, label, sysId, sysName });
           }
+        }
+        stationSpecs.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+
+        let stationOpts = [
+          '<option value="">(any station — uses starting/landing system)</option>',
+        ];
+        for (const { val, label, sysName } of stationSpecs) {
+          const sel = val === homeStation ? " selected" : "";
+          stationOpts.push(
+            `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`,
+          );
         }
 
         // Build bot options for rescue assignments
@@ -15615,15 +15620,9 @@
     </p>
 
     <div class="settings-group">
-      <label>Home System</label>
-      <select id="set-rescue-homeSystem" onchange="renderRescueSettings(document.getElementById('settings-content'))" style="width:100%;max-width:300px">${sysOpts.join("")}</select>
-      <small style="color:var(--dim)">Return to this system after completing rescues (defaults to starting system if not set)</small>
-    </div>
-
-    <div class="settings-group">
-      <label>Home Station (optional)</label>
-      <select id="set-rescue-homeStation" style="width:100%;max-width:300px">${stationOpts.join("")}</select>
-      <small style="color:var(--dim)">Dock at this specific station when returning home (for refueling). Select system first.</small>
+      <label>Home Base (system + station)</label>
+      <select id="set-rescue-homeStation" style="width:100%;max-width:400px">${stationOpts.join("")}</select>
+      <small style="color:var(--dim)">Station the rescue bot returns to and docks at after missions. Choose a specific station, or leave as "(any station)" to use the system the bot started in and dock at the nearest station.</small>
     </div>
 
     <div class="settings-group">
@@ -15770,10 +15769,12 @@
 
       function saveRescueSettings() {
         const s = {
-          homeSystem:
-            document.getElementById("set-rescue-homeSystem").value || "",
           homeStation:
             document.getElementById("set-rescue-homeStation").value || "",
+          homeSystem: (() => {
+            const v = document.getElementById("set-rescue-homeStation").value || "";
+            return v ? v.split("|")[0] : "";
+          })(),
           fuelThreshold:
             parseInt(
               document.getElementById("set-rescue-fuelThreshold").value,

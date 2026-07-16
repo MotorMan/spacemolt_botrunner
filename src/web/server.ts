@@ -1257,6 +1257,27 @@ if (url.pathname === "/data/shipsForSale.json") {
           }
         }
 
+        if (url.pathname === "/api/station-facilities") {
+          // Per-station facility list cache (faction + empire facilities).
+          const station = url.searchParams.get("station") || "";
+          try {
+            const { getStationFacilityCache, getAllStationFacilityCacheStations } =
+              await import("../stationFacilityCache.js");
+            if (station) {
+              const data = getStationFacilityCache(station);
+              if (!data) {
+                return Response.json({ station, factionFacilities: [], empireFacilities: [], lastUpdated: 0 });
+              }
+              return Response.json(data);
+            }
+            const stations = getAllStationFacilityCacheStations();
+            const all = stations.map((st) => getStationFacilityCache(st)).filter(Boolean);
+            return Response.json({ stations: all });
+          } catch (e) {
+            return Response.json({ error: String(e) });
+          }
+        }
+
         if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
           const settings = this.settings;
           const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
@@ -2716,6 +2737,11 @@ if (url.pathname === "/data/shipsForSale.json") {
 
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {
     this.broadcast({ type: "empireAlert", sender, content, botUsername });
+  }
+
+  /** Broadcast an arbitrary structured event to all connected dashboard clients. */
+  broadcastJson(data: unknown): void {
+    this.broadcast(data);
   }
 
   broadcastSkillsUpdate(bot: string, skills: Record<string, { level: number; xp: number; nextLevelXp: number }>): void {

@@ -32,6 +32,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
+import { flushStationFacilityCache } from "./stationFacilityCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
@@ -1916,6 +1917,51 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
 
   let resp = await bot.exec(command, params);
 
+  // Broadcast a live storage-change event whenever a faction deposit/withdraw
+  // succeeds (local docked OR remote station_id path), so the Station Command
+  // Center can refresh near-instantly. The station reference is the param
+  // station_id when a remote station was targeted, otherwise the bot's current
+  // docked "system|poi".
+  if (!resp.error && (command === "faction_deposit_items" || command === "faction_withdraw_items")) {
+    const p = (params as Record<string, unknown> | undefined) || {};
+    const stationId = (p.station_id as string | undefined) ||
+      (bot.docked ? `${bot.system}|${bot.poi}` : "");
+    if (stationId) {
+      const itemId = (p.item_id as string | undefined) || (p.itemId as string | undefined) || "";
+      const action = command === "faction_deposit_items" ? "deposit" : "withdraw";
+      server.broadcastJson({
+        type: "station_storage_change",
+        station: stationId,
+        itemId,
+        action,
+        bot: botName,
+      });
+    }
+  }
+
+  // Persist the per-station facility list cache when a docked bot queries its
+  // facilities (these calls already return the data we want to cache). The
+  // station key is the docked bot's "system|poi".
+  if (!resp.error && (command === "facility") && bot.docked) {
+    const action = ((params as Record<string, unknown> | undefined)?.action as string) || "";
+    if (action === "faction_list" || action === "list") {
+      const stationKey = `${bot.system}|${bot.poi}`;
+      try {
+        const { updateStationFacilityCache } = await import("./stationFacilityCache.js");
+        const d = resp.result as Record<string, unknown> | undefined;
+        const toEntries = (arr: unknown): any[] =>
+          Array.isArray(arr) ? arr : [];
+        updateStationFacilityCache(
+          stationKey,
+          toEntries(d?.faction_facilities),
+          toEntries(d?.player_facilities),
+        );
+      } catch (e) {
+        // best-effort cache write
+      }
+    }
+  }
+
   // Track player names from get_nearby responses
   if (!resp.error && resp.result && command === "get_nearby") {
     bot.trackNearbyPlayers(resp.result);
@@ -2608,6 +2654,7 @@ async function main(): Promise<void> {
     mapStore.flush();
     catalogStore.flush();
     flushFactionStorageCache();
+    flushStationFacilityCache();
     // Flush miner activity data to ensure no data loss
     flushMinerActivity().then(success => {
       if (success) {

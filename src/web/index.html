@@ -1603,7 +1603,10 @@
         if (name === "market") renderMarketPage();
         if (name === "missions") renderMissionsPage();
         if (name === "faction") renderFactionPage();
-        if (name !== "faction") stopFactionQueueUsageAutoRefresh();
+        if (name !== "faction") {
+          stopFactionQueueUsageAutoRefresh();
+          stopStationBaseStatsAutoRefresh();
+        }
         if (name === "shipyard") renderShipyardPage();
         if (name === "stats") {
           renderStatsTab();
@@ -2803,6 +2806,22 @@
                 addCombatLogEntry(msg.event);
               }
               break;
+            case "station_storage_change": {
+              // Live refresh hook for the Station Command Center. Only react when
+              // the station panel is active and the changed station is one we show.
+              const evStation = msg.station || "";
+              if (factionActivePanel === "station" && factionSelectedBot) {
+                const bot = bots.find((b) => b.username === factionSelectedBot);
+                const dockedStation = bot && bot.docked ? `${bot.system}|${bot.poi}` : "";
+                const matches =
+                  (evStation && evStation === dockedStation) ||
+                  (evStation && evStation === stationStorageStation);
+                if (matches) {
+                  scheduleStationStorageRefresh(factionSelectedBot);
+                }
+              }
+              break;
+            }
             case "empireAlert":
               if (msg.sender && msg.content) {
                 triggerEmpireAlert(msg.sender, msg.content, msg.botUsername);
@@ -12150,6 +12169,15 @@
       <select id="set-general-factionStation">${stationOpts}</select>
     </div>
 
+    <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:6px">
+      <div>
+        <div class="setting-label">Faction Stations (multi-station storage viewer)</div>
+        <div class="setting-hint">One station per line: <code>name|system|poi</code>. Populates the "Faction Storage — All Stations" dropdown in the Faction → Station panel. Leave empty to use only the Faction Storage Station above.</div>
+      </div>
+      <textarea id="set-general-factionStations" rows="4" style="width:420px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px;font-size:12px;font-family:monospace">${(Array.isArray(general.factionStations) ? general.factionStations : []).map((s) => `${s.name || ""}|${s.system || ""}|${s.poi || ""}`).join("\n")}</textarea>
+    </div>
+
+
     <div class="setting-row">
       <div>
         <div class="setting-label">Approved Fuel Stations</div>
@@ -12470,6 +12498,20 @@
           headerTitle:
             (document.getElementById("set-general-headerTitle").value || "")
               .trim() || "",
+          factionStations: (() => {
+            const ta = document.getElementById("set-general-factionStations");
+            if (!ta) return general.factionStations || [];
+            const parsed = [];
+            for (const raw of ta.value.split("\n")) {
+              const line = raw.trim();
+              if (!line) continue;
+              const parts = line.split("|").map((x) => x.trim());
+              if (parts.length >= 3 && parts[1] && parts[2]) {
+                parsed.push({ name: parts[0], system: parts[1], poi: parts[2] });
+              }
+            }
+            return parsed;
+          })(),
         };
         // Persist the "Add Bots from Account" checkbox selection too, so
         // unchecking a bot and pressing Save removes it from the selected-bot
@@ -19285,6 +19327,7 @@ When responding:
 
       function switchFactionPanel(panel) {
         if (panel !== "queueusage") stopFactionQueueUsageAutoRefresh();
+        if (panel !== "station") stopStationBaseStatsAutoRefresh();
         factionActivePanel = panel;
         if (factionSelectedBot) renderFactionContent(factionSelectedBot);
         if (panel === "queueusage" && factionSelectedBot) {
@@ -19300,6 +19343,9 @@ When responding:
               fetchFactionFacilities(factionSelectedBot);
             }
             fetchStationFacilities(factionSelectedBot);
+            startStationBaseStatsAutoRefresh(factionSelectedBot);
+          } else {
+            stationBaseStats = null;
           }
           const sum = document.getElementById("stationMaintenanceSummary");
           if (sum && stationFacilitiesData && stationFacilitiesData.length > 0) {
@@ -20547,6 +20593,7 @@ When responding:
 
         return `
     ${dockWarning}
+    ${renderStationCommandCenter(f, username, docked)}
     <div class="faction-section">
       <div class="faction-section-title">Station Maintenance Requirements</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
@@ -20568,10 +20615,315 @@ When responding:
         <span id="sf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${buildableCount} buildable</span>
       </div>
       <div id="stationBuildableTypes">
-        ${stationFacilityTypes.length > 0 ? renderStationBuildableTypesListHtml(stationFacilityTypes, username) : `<button class="sm" onclick="fetchStationBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`}
+        ${stationBuildOpen
+          ? (stationFacilityTypes.length > 0
+              ? renderStationBuildableTypesListHtml(stationFacilityTypes, username)
+              : `<button class="sm" onclick="fetchStationBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`)
+          : `<button class="sm" id="stationBuildToggle" onclick="toggleStationBuildList('${esc(username)}')" ${!docked ? "disabled" : ""}>▶ Build New Station Facility</button>`}
       </div>
     </div>
+    ${renderStationStorageViewer(username, docked)}
   `;
+      }
+
+      // ── Base Command Center card (docked only) ───────────────
+      function renderStationCommandCenter(f, username, docked) {
+        if (!docked) {
+          return `<div class="faction-section" id="stationCommandCenter">
+      <div class="faction-section-title">Station Command Center</div>
+      <div style="color:var(--yellow);font-size:12px">Bot must be docked at a station to view base stats. Station name/description editors and base stats are unavailable until docked.</div>
+    </div>`;
+        }
+        const base = stationBaseStats;
+        let statsHtml = `<button class="sm" onclick="fetchStationBaseStats('${esc(username)}')">Load Base Stats</button>`;
+        if (base) {
+          const b = base.base || {};
+          const cond = base.condition || {};
+          const condColor = /thriv/i.test(cond.condition || "")
+            ? "var(--green)"
+            : "var(--yellow)";
+          const pct = cond.satisfaction_pct != null ? `${cond.satisfaction_pct}%` : "?";
+          const pub = b.public_access
+            ? '<span style="color:var(--green)">Public</span>'
+            : '<span style="color:var(--orange)">Private</span>';
+          statsHtml = `
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        <button class="sm" onclick="fetchStationBaseStats('${esc(username)}')">Refresh</button>
+        <button class="sm" onclick="toggleStationRename('${esc(username)}')">✏️ Rename Station</button>
+        <button class="sm" onclick="toggleStationDesc('${esc(username)}')">📝 Edit Description</button>
+        <button class="sm" onclick="stationSetPublic('${esc(username)}', ${b.public_access ? "false" : "true"})">${b.public_access ? "Make Private" : "Make Public"}</button>
+        <span style="font-size:11px;color:var(--text-dim);margin-left:auto">${pub}</span>
+      </div>
+      ${stationRenameOpen ? `
+      <div id="stationRenameBox" style="display:flex;gap:6px;margin-bottom:10px;align-items:center">
+        <input type="text" id="station-rename-input" value="${esc(b.name || "")}" placeholder="New station name" style="flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px" />
+        <button class="primary sm" onclick="stationRenameSave('${esc(username)}')">Save</button>
+        <button class="sm" onclick="toggleStationRename('${esc(username)}')">Cancel</button>
+      </div>` : ""}
+      ${stationDescOpen ? `
+      <div id="stationDescBox" style="margin-bottom:10px">
+        <textarea id="station-desc-input" rows="3" placeholder="New station description" style="width:100%;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px;font-size:12px">${esc(b.description || "")}</textarea>
+        <div style="display:flex;gap:6px;margin-top:6px">
+          <button class="primary sm" onclick="stationDescSave('${esc(username)}')">Save</button>
+          <button class="sm" onclick="toggleStationDesc('${esc(username)}')">Cancel</button>
+        </div>
+      </div>` : ""}
+      <div class="faction-stat-grid">
+        <span class="fsl">Name</span><span class="fsv">${esc(b.name || "?")}</span>
+        <span class="fsl">Fuel</span><span class="fsv">${num(b.fuel || 0)}/${num(b.max_fuel || 0)}</span>
+        <span class="fsl">Hull</span><span class="fsv">${num(b.hull || 0)}/${num(b.max_hull || 0)}</span>
+        <span class="fsl">Shield</span><span class="fsv">${num(b.shield || 0)}/${num(b.max_shield || 0)}</span>
+        <span class="fsl">Armor</span><span class="fsv">${num(b.armor || 0)}</span>
+        <span class="fsl">Weapon DPS</span><span class="fsv">${num(b.weapon_dps || 0)}</span>
+        <span class="fsl">Weapon Reach</span><span class="fsv">${num(b.weapon_reach || 0)}</span>
+        <span class="fsl">Condition</span><span class="fsv" style="color:${condColor}">${esc(cond.condition || "?")}</span>
+        <span class="fsl">Satisfaction</span><span class="fsv">${pct}</span>
+        <span class="fsl">Services Met</span><span class="fsv">${num(cond.satisfied_count || 0)}/${num(cond.total_service_infra || 0)}</span>
+        ${b.refuel_price_each != null ? `<span class="fsl">Refuel $/fuel</span><span class="fsv">${num(b.refuel_price_each)}</span>` : ""}
+        ${b.repair_price_per_hull != null ? `<span class="fsl">Repair $/hull</span><span class="fsv">${num(b.repair_price_per_hull)}</span>` : ""}
+        ${b.market_fee_bps != null ? `<span class="fsl">Market Fee</span><span class="fsv">${b.market_fee_bps}bps</span>` : ""}
+      </div>
+      ${cond.condition_text ? `<div style="font-size:11px;color:var(--text-dim);margin-top:8px">${esc(cond.condition_text)}</div>` : ""}
+      ${b.description && !stationDescOpen ? `<div style="font-size:11px;color:var(--text-dim);margin-top:6px">${esc(b.description)}</div>` : ""}
+      <div style="font-size:11px;color:var(--text-dim);margin-top:8px">Base stats are only available for the docked station of the selected bot.</div>`;
+        }
+        return `<div class="faction-section" id="stationCommandCenter">
+      <div class="faction-section-title">Station Command Center</div>
+      ${statsHtml}
+    </div>`;
+      }
+
+      function toggleStationRename(username) {
+        stationRenameOpen = !stationRenameOpen;
+        if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+      }
+
+      function toggleStationDesc(username) {
+        stationDescOpen = !stationDescOpen;
+        if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+      }
+
+      async function fetchStationBaseStats(username) {
+        const container = document.getElementById("stationCommandCenter");
+        sendExec(username, "get_base", {}, (result) => {
+          if (!result.ok || !result.data) {
+            appendLine("system", `get_base failed: ${result.error || "no data"}`);
+            return;
+          }
+          const data = result.data;
+          stationBaseStats = data.structuredContent || data.result || data;
+          if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+        });
+      }
+
+      function stationRenameSave(username) {
+        const input = document.getElementById("station-rename-input");
+        if (!input) return;
+        const name = input.value.trim();
+        if (!name) return;
+        sendExec(username, "facility", { action: "station_set_name", name }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Station renamed to ${name}`);
+            stationRenameOpen = false;
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `Rename failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationDescSave(username) {
+        const input = document.getElementById("station-desc-input");
+        if (!input) return;
+        const description = input.value;
+        sendExec(username, "facility", { action: "set_description", description }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Station description updated`);
+            stationDescOpen = false;
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `Description update failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationSetPublic(username, value) {
+        sendExec(username, "facility", { action: "set_public", public: value }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Station public access set to ${value}`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_public failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      // ── Base stats auto-refresh timer (mirrors queue usage pattern) ──
+      function stopStationBaseStatsAutoRefresh() {
+        if (stationBaseStatsTimer) {
+          clearInterval(stationBaseStatsTimer);
+          stationBaseStatsTimer = null;
+        }
+      }
+
+      function startStationBaseStatsAutoRefresh(username) {
+        stopStationBaseStatsAutoRefresh();
+        const bot = bots.find((b) => b.username === username);
+        if (!bot || !bot.docked) return;
+        if (!stationBaseStats) fetchStationBaseStats(username);
+        stationBaseStatsTimer = setInterval(() => {
+          const c = document.getElementById("stationCommandCenter");
+          if (!c) {
+            stopStationBaseStatsAutoRefresh();
+            return;
+          }
+          fetchStationBaseStats(username);
+        }, 60000);
+      }
+
+      // ── 5-Station Faction Storage viewer + tracked items ──
+      function renderStationStorageViewer(username, docked) {
+        const general = settings.general || {};
+        const stations = Array.isArray(general.factionStations)
+          ? general.factionStations
+          : [];
+        const fallbackStation = general.factionStorageSystem && general.factionStorageStation
+          ? `${general.factionStorageSystem}|${general.factionStorageStation}`
+          : "";
+        const stationList = stations.length
+          ? stations
+          : fallbackStation
+            ? [{ name: "", system: general.factionStorageSystem, poi: general.factionStorageStation }]
+            : [];
+        if (!stationList.length) {
+          return `<div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Faction Storage — All Stations</div>
+      <div style="font-size:11px;color:var(--text-dim)">Configure <code>general.factionStations</code> in General settings (name, system, poi) to view all stations' faction storage here.</div>
+    </div>`;
+        }
+        const opts = stationList
+          .map((s) => {
+            const val = `${s.system}|${s.poi}`;
+            const label = s.name
+              ? `${s.name} (${s.system}|${s.poi})`
+              : (s.system + "|" + s.poi);
+            const sel = val === stationStorageStation ? " selected" : "";
+            return `<option value="${esc(val)}"${sel}>${esc(label)}</option>`;
+          })
+          .join("");
+        return `<div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Faction Storage — All Stations</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="stationStorageSelect" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px" onchange="stationStorageStation=this.value;fetchStationStorageViewer('${esc(username)}')">
+          ${opts}
+        </select>
+        <button class="sm" onclick="fetchStationStorageViewer('${esc(username)}')">Load</button>
+        <span style="font-size:11px;color:var(--text-dim)">Reads remotely — no docking required.</span>
+      </div>
+      <div id="stationStorageViewer"><div class="faction-no-data" style="font-size:11px">Select a station and click Load.</div></div>
+    </div>`;
+      }
+
+      async function fetchStationStorageViewer(username) {
+        const container = document.getElementById("stationStorageViewer");
+        if (!container) return;
+        if (!stationStorageStation) {
+          const sel = document.getElementById("stationStorageSelect");
+          stationStorageStation = sel ? sel.value : "";
+        }
+        if (!stationStorageStation) {
+          container.innerHTML = '<div class="faction-no-data">No station selected.</div>';
+          return;
+        }
+        container.innerHTML = '<div class="faction-no-data">Loading...</div>';
+        try {
+          const res = await fetch(`/api/faction-storage?station=${encodeURIComponent(stationStorageStation)}`);
+          const data = await res.json();
+          stationStorageData = data;
+          renderStationStorageTable(username);
+        } catch (e) {
+          container.innerHTML = `<div class="faction-no-data">Error: ${esc(String(e))}</div>`;
+        }
+      }
+
+      let _stationStorageRefreshTimer = null;
+      function scheduleStationStorageRefresh(username) {
+        if (_stationStorageRefreshTimer) clearTimeout(_stationStorageRefreshTimer);
+        _stationStorageRefreshTimer = setTimeout(() => {
+          _stationStorageRefreshTimer = null;
+          // Refresh the 5-station viewer if it's showing the changed station, and
+          // refresh base stats (docked station only) so fuel/credits stay fresh.
+          const bot = bots.find((b) => b.username === username);
+          const dockedStation = bot && bot.docked ? `${bot.system}|${bot.poi}` : "";
+          if (stationStorageStation && (stationStorageStation === stationStorageStation)) {
+            fetchStationStorageViewer(username);
+          }
+          if (stationBaseStats && dockedStation) {
+            fetchStationBaseStats(username);
+          }
+        }, 1500);
+      }
+
+      function renderStationStorageTable(username) {
+        const container = document.getElementById("stationStorageViewer");
+        if (!container || !stationStorageData) return;
+        const data = stationStorageData;
+        let items = data.items || [];
+        const credits = data.credits != null ? data.credits : data.treasury;
+        const fuelReserve = data.factionFuelReserve || 0;
+        const fuelCap = data.factionFuelCapacity || 0;
+        if (stationStorageSort === "alpha") {
+          items = items.slice().sort((a, b) =>
+            (a.name || a.item_id || a.itemId || "").toLowerCase().localeCompare(
+              (b.name || b.item_id || b.itemId || "").toLowerCase()));
+        } else {
+          items = items.slice().sort((a, b) =>
+            (b.quantity || b.count || 0) - (a.quantity || a.count || 0));
+        }
+        const rows = items.map((i) => {
+          const id = i.itemId || i.item_id || i.id || "?";
+          const name = i.name || id;
+          const qty = i.quantity || i.count || 0;
+          const prev = stationTrackedPrev[id];
+          let delta = "";
+          if (prev != null && prev !== qty) {
+            const d = qty - prev;
+            delta = ` <span style="font-size:10px;color:${d > 0 ? "var(--green)" : "var(--red)"}">(${d > 0 ? "+" : ""}${num(d)})</span>`;
+          }
+          return `<tr>
+      <td style="padding:3px 8px">${esc(name)}</td>
+      <td style="padding:3px 8px;font-family:monospace;color:var(--text-dim)">${esc(id)}</td>
+      <td style="padding:3px 8px;text-align:right;font-weight:600">${num(qty)}${delta}</td>
+    </tr>`;
+        }).join("");
+        const creditsStr = credits != null
+          ? `<div class="faction-storage-row"><span style="color:var(--yellow)">Credits</span><span>${Number(credits).toLocaleString()}cr</span></div>`
+          : "";
+        const fuelStr = fuelCap > 0
+          ? `<div class="faction-storage-row"><span style="color:var(--cyan)">Fuel</span><span>${Number(fuelReserve).toLocaleString()}/${Number(fuelCap).toLocaleString()}</span></div>`
+          : "";
+        // Update tracked delta baseline
+        items.forEach((i) => {
+          const id = i.itemId || i.item_id || i.id;
+          if (id) stationTrackedPrev[id] = i.quantity || i.count || 0;
+        });
+        container.innerHTML = `
+      ${creditsStr}
+      ${fuelStr}
+      <div style="display:flex;gap:8px;margin:6px 0">
+        <span style="font-size:11px;color:var(--text-dim)">Sort:</span>
+        <button class="sm" onclick="stationStorageSort='alpha';renderStationStorageTable('${esc(username)}')" style="${stationStorageSort === "alpha" ? "background:var(--accent);color:#fff" : ""}">Name</button>
+        <button class="sm" onclick="stationStorageSort='quantity';renderStationStorageTable('${esc(username)}')" style="${stationStorageSort === "quantity" ? "background:var(--accent);color:#fff" : ""}">Qty</button>
+        <button class="sm" onclick="fetchStationStorageViewer('${esc(username)}')">Refresh</button>
+      </div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="border-bottom:1px solid var(--border);color:var(--text-dim)">
+          <th style="text-align:left;padding:3px 8px">Item</th>
+          <th style="text-align:left;padding:3px 8px">ID</th>
+          <th style="text-align:right;padding:3px 8px">Qty</th>
+        </tr></thead>
+        <tbody>${rows || '<tr><td colspan="3" class="faction-no-data">Empty</td></tr>'}</tbody>
+      </table>`;
       }
 
       function switchStationFacilityCategory(category, username) {
@@ -20600,10 +20952,22 @@ When responding:
         renderStationBuildableTypesList(username);
       }
 
+      function toggleStationBuildList(username) {
+        stationBuildOpen = !stationBuildOpen;
+        renderStationBuildableTypesList(username);
+      }
+
       function renderStationBuildableTypesList(username) {
         const container = document.getElementById("stationBuildableTypes");
         if (!container) return;
         const types = stationFacilityTypes;
+        if (!stationBuildOpen) {
+          container.innerHTML =
+            '<button class="sm" id="stationBuildToggle" onclick="toggleStationBuildList(\'' +
+            esc(username) +
+            "')\">▶ Build New Station Facility</button>";
+          return;
+        }
         if (types.length === 0) {
           container.innerHTML =
             '<div class="faction-no-data">No station facility types in this category.</div>';
@@ -20820,10 +21184,17 @@ When responding:
             </div>
             <div style="display:flex;gap:4px">
               <button class="sm" style="font-size:10px;padding:2px 6px" onclick="stationToggleFacility('${esc(username)}','${esc(facId)}')">${active ? "Disable" : "Enable"}</button>
+              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="toggleStationFacilityRename('${esc(username)}','${esc(facId)}','${esc((fac.custom_name || name).replace(/'/g, "\\'"))}')">✏️</button>
             </div>
           </div>
           ${desc ? `<div class="fc-detail" style="margin-top:4px;font-size:11px;color:var(--text-dim)">${esc(desc)}</div>` : ""}
           ${maintHtml}
+          ${(stationFacilityRenameOpen[facId]) ? `
+          <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+            <input type="text" id="sf-rename-${esc(facId)}" value="${esc(fac.custom_name || name)}" placeholder="New facility name (3-32)" style="flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:11px" />
+            <button class="primary sm" onclick="stationFacilityRenameSave('${esc(username)}','${esc(facId)}')">Save</button>
+            <button class="sm" onclick="toggleStationFacilityRename('${esc(username)}','${esc(facId)}')">×</button>
+          </div>` : ""}
         </div>`;
           })
           .join("");
@@ -20840,6 +21211,36 @@ When responding:
               fetchStationFacilities(username);
             } else {
               appendLine("system", `Toggle failed: ${result.error || "unknown"}`);
+            }
+          },
+        );
+      }
+
+      function toggleStationFacilityRename(username, facilityId, currentName) {
+        if (stationFacilityRenameOpen[facilityId]) {
+          delete stationFacilityRenameOpen[facilityId];
+        } else {
+          stationFacilityRenameOpen[facilityId] = true;
+        }
+        fetchStationFacilities(username);
+      }
+
+      function stationFacilityRenameSave(username, facilityId) {
+        const input = document.getElementById(`sf-rename-${facilityId}`);
+        if (!input) return;
+        const customName = input.value.trim();
+        sendExec(
+          username,
+          "facility",
+          { action: "set_name", facility_id: facilityId, custom_name: customName },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: Facility ${facilityId} renamed`);
+              delete stationFacilityRenameOpen[facilityId];
+              fetchStationFacilities(username);
+            } else {
+              appendLine("system", `Facility rename failed: ${result.error || "unknown"}`);
+              if (result.data) appendLine("system", `Raw: ${JSON.stringify(result.data)}`);
             }
           },
         );
@@ -21796,6 +22197,17 @@ When responding:
       let stationFacilitiesData = [];
       let stationMaintenanceTimer = null;
       let stationMaintenanceCache = { cargo: [], storage: [] };
+      // Station Command Center state
+      let stationBuildOpen = false;
+      let stationBaseStats = null;       // get_base result
+      let stationBaseStatsTimer = null;  // auto-refresh interval
+      let stationRenameOpen = false;
+      let stationDescOpen = false;
+      let stationStorageStation = "";    // selected station for the 5-station storage viewer
+      let stationStorageData = null;
+      let stationStorageSort = "alpha";
+      let stationTrackedPrev = {};       // itemId -> last qty for delta
+      let stationFacilityRenameOpen = {}; // facId -> bool
 
       // Catalog ids of all player_station_buildable facilities (44 total).
       function getPlayerStationBuildableIds() {

@@ -1035,11 +1035,21 @@ export async function reconcileDeliveredWithDestination(
   }
 
   // Remote read of the destination's faction storage (no need to travel there).
-  // Resolve the configured destination reference to the plain hex POI id the
-  // server expects as `station_id` (faction bases are exposed as hex POI ids).
-  // A "system|poi" reference or a friendly name must be collapsed to just the
-  // POI id or the lookup is rejected with "Station not found".
-  const stationId = mapStore.resolveStationTarget(settings.destinationStation);
+  //
+  // CRITICAL: view_faction_storage's `station_id` identifies a faction BASE by
+  // its base_id (e.g. "7d1f97987d5eb46bf603b8027e1eec8c"), which is exactly
+  // what the UI stores in settings.destinationStation. We must pass that value
+  // THROUGH UNCHANGED. Do NOT run it through mapStore.resolveStationTarget():
+  // mapStore keys POIs by their poi.id, so for a base_id reference it rewrites
+  // the id to a DIFFERENT poi id — and view_faction_storage then reads the WRONG
+  // station's storage, producing wildly wrong delivered counts. (When the stored
+  // reference is already a poi id the server accepts, this is a no-op.)
+  const stationId = settings.destinationStation;
+  const resolved = mapStore.resolveStationIdentity(stationId);
+  if (!resolved.matched) {
+    ctx.log("error", `⚠️ Reconcile failed: destination station "${stationId}" is not a known station in mapStore`);
+    return { reconciled: 0, changed: [] };
+  }
   ctx.log("cargo", `🔄 Reconcile: reading destination faction storage (station_id=${stationId})`);
 
   // Do a DIRECT remote read — do NOT go through refreshFactionStorage, whose

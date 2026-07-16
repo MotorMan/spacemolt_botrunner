@@ -121,6 +121,85 @@ const RECONNECT_BASE_MS = 5000;
 const RECONNECT_MAX_MS = 120_000; // cap at 2 minutes between attempts
 const reconnectBackoff = new Map<string, { lastAttempt: number; attempts: number }>();
 
+/**
+ * How long to wait for the OLD socket to finish closing on the wire before we
+ * open a brand-new one for the same account.
+ *
+ * THIS IS THE FIX for the duplicate-login death spiral. `account.close()` (via
+ * `client.remove`) only calls `ws.close()`, which merely *initiates* the
+ * WebSocket close handshake and returns immediately — the server has NOT yet
+ * torn down the old session. If we open the new socket right away, the server
+ * still sees the previous session as live, treats our new login as a duplicate,
+ * and closes the NEW connection with `session_replaced` (4001). Because WE are
+ * the "other login", the recovery loop then just fights itself forever (the
+ * exact storm in the logs: "Forcing a fresh socket… / Still disconnected…"
+ * every 30s). The moment the routine stopped forcing reconnects, the old socket
+ * finished closing and the very next login succeeded — proving the race.
+ *
+ * So: after closing the old socket we WAIT for it to actually reach CLOSED (the
+ * ws "close" event / readyState === CLOSED) before logging in again. We also add
+ * a small settle delay so the server-side session teardown completes. Bounded by
+ * a timeout so a socket that never emits close can't wedge recovery forever.
+ */
+const OLD_SOCKET_CLOSE_TIMEOUT_MS = 8000;
+/** Extra pause after the old socket is confirmed closed, to let the server free the session slot. */
+const OLD_SOCKET_SETTLE_MS = 750;
+
+/** WebSocket.CLOSED readyState (per the WHATWG/ws spec) without importing ws types. */
+const WS_CLOSED = 3;
+
+/**
+ * Wait until an account's underlying WebSocket has fully closed.
+ *
+ * Reaches into the library's `account.socket` (a `Socket` wrapper) and its raw
+ * `ws`. Resolves when the socket is observably closed (its `closed` flag flips
+ * true on the ws "close" event, or the raw ws `readyState` is CLOSED), or when
+ * `timeoutMs` elapses — whichever comes first. Never rejects: a best-effort
+ * barrier that guarantees we don't race a half-open old socket against a new
+ * login. Safe to call after `account.close()` (which starts the close but does
+ * not await it).
+ */
+async function waitForAccountSocketClosed(
+  account: unknown,
+  timeoutMs = OLD_SOCKET_CLOSE_TIMEOUT_MS,
+): Promise<boolean> {
+  const sock = (account as { socket?: { closed?: boolean; ws?: unknown } } | null)?.socket;
+  if (!sock) return true; // no socket to wait on — treat as already closed
+  const isClosed = (): boolean => {
+    if (sock.closed === true) return true;
+    const ws = sock.ws as { readyState?: number } | null | undefined;
+    // No ws (never opened) counts as closed; otherwise require CLOSED state.
+    return !ws || ws.readyState === WS_CLOSED;
+  };
+  if (isClosed()) return true;
+
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (closed: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      clearTimeout(timer);
+      try {
+        const ws = sock.ws as { removeEventListener?: (t: string, cb: () => void) => void } | null | undefined;
+        ws?.removeEventListener?.("close", onClose);
+      } catch { /* best-effort */ }
+      resolve(closed);
+    };
+    const onClose = () => finish(true);
+    try {
+      const ws = sock.ws as { addEventListener?: (t: string, cb: () => void) => void } | null | undefined;
+      ws?.addEventListener?.("close", onClose);
+    } catch { /* best-effort — fall back to polling */ }
+    // Poll as a safety net in case the close event fired between our check and
+    // listener attach, or the ws implementation doesn't emit a "close" event.
+    const poll = setInterval(() => {
+      if (isClosed()) finish(true);
+    }, 100);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
 /** Milliseconds to wait before the NEXT forced reconnect for `id`. */
 function nextReconnectDelay(id: string): number {
   const b = reconnectBackoff.get(id);
@@ -722,13 +801,39 @@ export async function forceReconnectBot(id: string): Promise<void> {
     // and every command would fail forever. Evicting here guarantees a brand-new
     // `Account` with a live socket is built. Clerk creds are re-stored by
     // connectOwned, so dropping them is safe.
+    //
+    // CRITICAL ORDERING: capture the old Account references FIRST, then close +
+    // evict them, then WAIT for their sockets to actually finish closing on the
+    // wire BEFORE we open the replacement. `client.remove` → `account.close()`
+    // only calls `ws.close()`, which *starts* the WebSocket close handshake and
+    // returns immediately — the server has NOT yet torn down the old session.
+    // Opening the new socket before the old one is gone is exactly what made the
+    // server answer our own new login with `session_replaced` (4001) and killed
+    // it, spinning the recovery loop forever. We control this login, so we make
+    // absolutely sure the old socket is dead before the new one is born.
+    const oldAccounts: unknown[] = [];
     for (const client of getSpacemoltClients()) {
-      if (client.account(id)) {
+      const acct = client.account(id);
+      if (acct) {
+        oldAccounts.push(acct);
         try { client.remove(id); } catch { /* best-effort */ }
       }
     }
-    if (getConnectedAccount(id)) {
-      try { removeConnectedAccount(id); } catch { /* best-effort */ }
+    {
+      const acct = getConnectedAccount(id);
+      if (acct) {
+        oldAccounts.push(acct);
+        try { removeConnectedAccount(id); } catch { /* best-effort */ }
+      }
+    }
+
+    // Barrier: block until every old socket for this bot is confirmed CLOSED
+    // (or a bounded timeout elapses), then let the server settle. Only after
+    // this do we open the fresh socket — guaranteeing the server never sees two
+    // concurrent sessions for the same account.
+    if (oldAccounts.length) {
+      await Promise.all(oldAccounts.map((a) => waitForAccountSocketClosed(a)));
+      await new Promise<void>((r) => setTimeout(r, OLD_SOCKET_SETTLE_MS));
     }
 
     // Attempt the reconnect with a hard timeout so a hanging connectOwned can

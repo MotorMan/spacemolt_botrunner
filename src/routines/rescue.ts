@@ -1320,6 +1320,108 @@ async function fillCargoWithPremiumFuel(ctx: RoutineContext): Promise<boolean> {
 }
 
 /**
+ * Travel to the configured home station (or, if none is configured, the nearest
+ * available station in the home system) and dock there so the bot is "safe"
+ * rather than sitting at a random POI where it landed.
+ *
+ * This mirrors the robust docking behaviour of the return_home routine: when no
+ * specific home station is set it falls back to `findStation`, travels to it,
+ * docks, refuels, and tops up premium fuel cells.
+ *
+ * Precondition: the caller has already navigated the bot into `homeSystem`.
+ *
+ * @returns true if the bot ended up docked at a station, false otherwise.
+ */
+async function travelToHomeStationOrDockAnywhere(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getRescueSettings>,
+  homeSystem: string,
+  battleState?: BattleState,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  if (bot.docked && bot.poi) {
+    ctx.log("rescue", `✓ Already docked at ${bot.poi} — nothing to do`);
+    return true;
+  }
+
+  let targetStationId: string | null = null;
+
+  if (settings.homeStation) {
+    const [expectedSystem, stationId] = settings.homeStation.split("|");
+    if (expectedSystem === homeSystem && stationId) {
+      targetStationId = stationId;
+    }
+  }
+
+  if (!targetStationId) {
+    const { pois } = await getSystemInfo(ctx);
+    const fallback = findStation(pois);
+    if (fallback) {
+      targetStationId = fallback.id;
+      ctx.log("rescue", `No home station configured — using nearest station ${targetStationId}`);
+    }
+  }
+
+  if (!targetStationId) {
+    ctx.log("error", `No station available in ${homeSystem} — cannot dock at home base`);
+    return false;
+  }
+
+  if (bot.poi !== targetStationId) {
+    ctx.log("rescue", `🚀 Traveling to home station (${targetStationId})...`);
+    const travelResp = await bot.exec("travel", { target_poi: targetStationId });
+    if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
+      const errMsg = travelResp.error.message.toLowerCase();
+      if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+        await fleeFromBattle(ctx);
+        await ctx.sleep(5000);
+        return false;
+      }
+      ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+      return false;
+    }
+    await bot.refreshLocation();
+  }
+
+  ctx.log("rescue", `⚓ Docking at home station...`);
+  if (battleState) {
+    const dockResp = await bot.exec("dock");
+    if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+      ctx.log("combat", "Battle detected during docking - fleeing!");
+      return false;
+    }
+    if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+      return false;
+    }
+  } else {
+    if (!(await ensureDocked(ctx))) {
+      ctx.log("error", `❌ Failed to dock at home station`);
+      return false;
+    }
+  }
+
+  ctx.log("rescue", `✓ Docked at home station`);
+  ctx.log("rescue", `⛽ Refueling at home station...`);
+  const refuelResp = await bot.exec("refuel");
+  if (refuelResp.error) {
+    ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+    await ensureFueled(ctx, settings.refuelThreshold);
+  } else {
+    await bot.refreshShip();
+    ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+  }
+
+  ctx.log("rescue", `⛽ Filling cargo with premium fuel cells...`);
+  await fillCargoWithPremiumFuel(ctx);
+
+  return true;
+}
+
+/**
  * Retrieve actual credits of a bot by parsing its debug log.
  * Reads last 20 lines, finds most recent get_status response, extracts credits.
  */
@@ -2428,48 +2530,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
-              // If home station is configured, travel there and dock
-              if (settings.homeStation) {
-                const [expectedSystem, stationId] = settings.homeStation.split('|');
-                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-
-                if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-                  const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  // CRITICAL: Check for battle interrupt error
-                  if (travelResp.error) {
-                    const errMsg = travelResp.error.message.toLowerCase();
-                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                      await fleeFromBattle(ctx);
-                      await ctx.sleep(5000);
-                      continue;
-                    }
-                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-                  } else {
-                    ctx.log("rescue", `⚓ Docking at home station...`);
-                    const dockResp = await bot.exec("dock");
-                    if (dockResp.error) {
-                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
-                    } else {
-                      ctx.log("rescue", `✓ Docked at home station`);
-                      // Refuel after docking
-                      ctx.log("rescue", `⛽ Refueling at home station...`);
-                      const refuelResp = await bot.exec("refuel");
-                      if (refuelResp.error) {
-                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                      } else {
-                        await bot.refreshLocation();
-                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                      }
-                    }
-                  }
-                } else {
-                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
-                }
-              } else {
-                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
-              }
+              // Travel to the configured home station (or nearest station if none is
+              // configured) and dock so the bot is safe and refueled.
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -2489,56 +2552,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
-            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshLocation();
-            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshLocation();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
-            // If home station is configured, travel there and dock
-            if (settings.homeStation) {
-              const [expectedSystem, stationId] = settings.homeStation.split('|');
-              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-
-              if (expectedSystem === homeSystem && stationId) {
-                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-                const travelResp = await bot.exec("travel", { target_poi: stationId });
-                // CRITICAL: Check for battle interrupt error
-                if (travelResp.error) {
-                  const errMsg = travelResp.error.message.toLowerCase();
-                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                    await fleeFromBattle(ctx);
-                    await ctx.sleep(5000);
-                    continue;
-                  }
-                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-                } else {
-                  ctx.log("rescue", `⚓ Docking at home station...`);
-                  const dockResp = await bot.exec("dock");
-                  if (dockResp.error) {
-                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
-                  } else {
-                    ctx.log("rescue", `✓ Docked at home station`);
-                    // Refuel after docking
-                    ctx.log("rescue", `⛽ Refueling at home station...`);
-                    const refuelResp = await bot.exec("refuel");
-                    if (refuelResp.error) {
-                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                    } else {
-                      await bot.refreshLocation();
-                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                    }
-                  }
-                }
-              } else {
-                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
-              }
-            } else {
-              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+              // Travel to the configured home station (or nearest station if none is
+              // configured) and dock so the bot is safe and refueled.
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
             }
-          }
-          isReturningIdle = false;
-          idleStartTime = 0;
-          continue; // Restart loop after returning home
+            isReturningIdle = false;
+            idleStartTime = 0;
+            continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
           idleStartTime = 0;
@@ -3401,78 +3425,35 @@ if (travelSucceeded) {
     const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
-    if (needsToReturnHome && homeSystem) {
-      yield "return_home";
-      
-      if (!atHomeSystem) {
-        ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
-        await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
-        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-        if (!arrived) {
-          ctx.log("error", `Failed to return to home system ${homeSystem}`);
-        } else {
-          await bot.refreshLocation();
-          ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
-        }
-      } else {
-        ctx.log(logCategory, `At home system ${homeSystem} - traveling to home station...`);
-        await ensureUndocked(ctx);
-      }
+      if (needsToReturnHome && homeSystem) {
+        yield "return_home";
 
-      // If home station is configured, travel there and dock
-      if (settings.homeStation) {
-        const [expectedSystem, stationId] = settings.homeStation.split('|');
-        if (expectedSystem === homeSystem && stationId) {
-          if (bot.poi !== stationId) {
-            ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
-            const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
-              const errMsg = travelResp.error.message.toLowerCase();
-              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                await fleeFromBattle(ctx);
-                await ctx.sleep(5000);
-                continue;
-              }
-              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-            }
-          }
-          
-          ctx.log(logCategory, `⚓ Docking at home station...`);
-          const dockResp = await bot.exec("dock");
-          if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
-            ctx.log("combat", "Battle detected during docking - fleeing!");
-            continue;
-          }
-          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-            ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+        if (!atHomeSystem) {
+          ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
-            ctx.log(logCategory, `✓ Docked at home station`);
-            ctx.log("rescue", `⛽ Refueling at home station...`);
-            const refuelResp = await bot.exec("refuel");
-            if (refuelResp.error) {
-              ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-            } else {
-              await bot.refreshLocation();
-              ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-            }
-            ctx.log("rescue", `⛽ Filling cargo with premium fuel cells...`);
-            await fillCargoWithPremiumFuel(ctx);
+            await bot.refreshLocation();
+            ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
           }
+        } else {
+          ctx.log(logCategory, `At home system ${homeSystem} - going to home station...`);
+          await ensureUndocked(ctx);
         }
+
+        // Travel to the configured home station (or nearest station if none is
+        // configured) and dock so the bot is safe and refueled.
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+
+        // Update session state for return home
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          await updateRescueSession(bot.username, { state: "returning_home" });
+        }
+        continue;
       }
-      
-      if (!settings.homeStation) {
-        ctx.log("warn", `⚠️ No home station configured - will use ensureFueled to refuel at ${homeSystem}`);
-      }
-      
-      // Update session state for return home
-      if (recoveredSession || getActiveRescueSession(bot.username)) {
-        await updateRescueSession(bot.username, { state: "returning_home" });
-      }
-      continue;
-    }
     
     if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -4015,68 +3996,31 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
-    if (needsToReturnHome && homeSystem) {
-      yield "return_home";
-      
-      if (!atHomeSystem) {
-        ctx.log("rescue", `Returning to home system ${homeSystem}...`);
-        await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
-        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-        if (!arrived) {
-          ctx.log("error", `Failed to return to home system ${homeSystem}`);
-        } else {
-          await bot.refreshLocation();
-          ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
-        }
-      } else {
-        ctx.log("rescue", `At home system ${homeSystem} - traveling to home station...`);
-        await ensureUndocked(ctx);
-      }
+      if (needsToReturnHome && homeSystem) {
+        yield "return_home";
 
-      // If home station is configured, travel there and dock
-      if (settings.homeStation) {
-        const [expectedSystem, stationId] = settings.homeStation.split('|');
-        if (expectedSystem === homeSystem && stationId) {
-          if (bot.poi !== stationId) {
-            ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-            const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
-              const errMsg = travelResp.error.message.toLowerCase();
-              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                await fleeFromBattle(ctx);
-                await ctx.sleep(5000);
-                continue;
-              }
-              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-            }
-          }
-          
-          ctx.log("rescue", `⚓ Docking at home station...`);
-          const dockResp = await bot.exec("dock");
-          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-            ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+        if (!atHomeSystem) {
+          ctx.log("rescue", `Returning to home system ${homeSystem}...`);
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
-            ctx.log("rescue", `✓ Docked at home station`);
-            ctx.log("rescue", `⛽ Refueling at home station...`);
-            const refuelResp = await bot.exec("refuel");
-            if (refuelResp.error) {
-              ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-            } else {
-              await bot.refreshShip();
-              ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-            }
+            await bot.refreshLocation();
+            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
           }
+        } else {
+          ctx.log("rescue", `At home system ${homeSystem} - going to home station...`);
+          await ensureUndocked(ctx);
         }
+
+        // Travel to the configured home station (or nearest station if none is
+        // configured) and dock so the bot is safe and refueled.
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+
+        continue;
       }
-      
-      if (!settings.homeStation) {
-        ctx.log("warn", `⚠️ No home station configured - will use ensureFueled to refuel at ${homeSystem}`);
-      }
-      
-      continue;
-    }
     
     if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -4712,76 +4656,35 @@ if (refuelResp.error) {
     const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
-    if (needsToReturnHome && homeSystem) {
-      yield "return_home";
-      
-      if (!atHomeSystem) {
-        ctx.log("mayday", `Returning to home system ${homeSystem}...`);
-        await ensureUndocked(ctx);
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
-        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-        if (!arrived) {
-          ctx.log("error", `Failed to return to home system ${homeSystem}`);
-        } else {
-          await bot.refreshLocation();
-          ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
-        }
-      } else {
-        ctx.log("mayday", `At home system ${homeSystem} - traveling to home station...`);
-        await ensureUndocked(ctx);
-      }
+      if (needsToReturnHome && homeSystem) {
+        yield "return_home";
 
-      // If home station is configured, travel there and dock
-      if (settings.homeStation) {
-        const [expectedSystem, stationId] = settings.homeStation.split('|');
-        if (expectedSystem === homeSystem && stationId) {
-          if (bot.poi !== stationId) {
-            ctx.log("mayday", `🚀 Traveling to home station (${stationId})...`);
-            const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
-              const errMsg = travelResp.error.message.toLowerCase();
-              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                await fleeFromBattle(ctx);
-                await ctx.sleep(5000);
-                continue;
-              }
-              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-            }
-          }
-          
-          ctx.log("mayday", `⚓ Docking at home station...`);
-          const dockResp = await bot.exec("dock");
-          if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
-            ctx.log("combat", "Battle detected during docking - fleeing!");
-            continue;
-          }
-          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-            ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+        if (!atHomeSystem) {
+          ctx.log("mayday", `Returning to home system ${homeSystem}...`);
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
-            ctx.log("mayday", `✓ Docked at home station`);
-            ctx.log("mayday", `⛽ Refueling at home station...`);
-            const refuelResp = await bot.exec("refuel");
-            if (refuelResp.error) {
-              ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-            } else {
-              await bot.refreshShip();
-              ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-            }
+            await bot.refreshLocation();
+            ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
           }
+        } else {
+          ctx.log("mayday", `At home system ${homeSystem} - going to home station...`);
+          await ensureUndocked(ctx);
         }
+
+        // Travel to the configured home station (or nearest station if none is
+        // configured) and dock so the bot is safe and refueled.
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+
+        // Update session state for return home
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          await updateRescueSession(bot.username, { state: "returning_home" });
+        }
+        continue;
       }
-      
-      if (!settings.homeStation) {
-        ctx.log("warn", `⚠️ No home station configured - will use ensureFueled to refuel at ${homeSystem}`);
-      }
-      
-      // Update session state for return home
-      if (recoveredSession || getActiveRescueSession(bot.username)) {
-        await updateRescueSession(bot.username, { state: "returning_home" });
-      }
-      continue;
-    }
     
     if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -5644,48 +5547,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
-              // If home station is configured, travel there and dock
-              if (settings.homeStation) {
-                const [expectedSystem, stationId] = settings.homeStation.split('|');
-                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-
-                if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-                  const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  // CRITICAL: Check for battle interrupt error
-                  if (travelResp.error) {
-                    const errMsg = travelResp.error.message.toLowerCase();
-                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                      await fleeFromBattle(ctx);
-                      await ctx.sleep(5000);
-                      continue;
-                    }
-                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-                  } else {
-                    ctx.log("rescue", `⚓ Docking at home station...`);
-                    const dockResp = await bot.exec("dock");
-                    if (dockResp.error) {
-                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
-                    } else {
-                      ctx.log("rescue", `✓ Docked at home station`);
-                      // Refuel after docking
-                      ctx.log("rescue", `⛽ Refueling at home station...`);
-                      const refuelResp = await bot.exec("refuel");
-                      if (refuelResp.error) {
-                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                      } else {
-                        await bot.refreshLocation();
-                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                      }
-                    }
-                  }
-                } else {
-                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
-                }
-              } else {
-                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
-              }
+              // Travel to the configured home station (or nearest station if none is
+              // configured) and dock so the bot is safe and refueled.
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -5705,55 +5569,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (!arrived) {
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
-            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshLocation();
-            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshLocation();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
-            // If home station is configured, travel there and dock
-            if (settings.homeStation) {
-              const [expectedSystem, stationId] = settings.homeStation.split('|');
-              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-
-              if (expectedSystem === homeSystem && stationId) {
-                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-                const travelResp = await bot.exec("travel", { target_poi: stationId });
-                // CRITICAL: Check for battle interrupt error
-                if (travelResp.error) {
-                  const errMsg = travelResp.error.message.toLowerCase();
-                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                    await fleeFromBattle(ctx);
-                    await ctx.sleep(5000);
-                    continue;
-                  }
-                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-                } else {
-                  ctx.log("rescue", `⚓ Docking at home station...`);
-                  const dockResp = await bot.exec("dock");
-                  if (dockResp.error) {
-                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
-                  } else {
-                    ctx.log("rescue", `✓ Docked at home station`);
-                    // Refuel after docking
-                    ctx.log("rescue", `⛽ Refueling at home station...`);
-                    const refuelResp = await bot.exec("refuel");
-                    if (refuelResp.error) {
-                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                    } else {
-                      await bot.refreshShip();
-                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                    }
-                  }
-                }
-              } else {
-                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
-              }
-            } else {
-              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+              // Travel to the configured home station (or nearest station if none is
+              // configured) and dock so the bot is safe and refueled.
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
             }
-          }
-          isReturningIdle = false;
-          idleStartTime = 0;
+            isReturningIdle = false;
+            idleStartTime = 0;
           continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
@@ -7210,42 +7035,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         await bot.refreshLocation();
         ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
-        // If home station is configured, travel there and dock
-        if (settings.homeStation) {
-          const [expectedSystem, stationId] = settings.homeStation.split('|');
-          if (expectedSystem === homeSystem && stationId) {
-            ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
-            const travelResp = await bot.exec("travel", { target_poi: stationId });
-            // CRITICAL: Check for battle interrupt error
-            if (travelResp.error) {
-              const errMsg = travelResp.error.message.toLowerCase();
-              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                await fleeFromBattle(ctx);
-                await ctx.sleep(5000);
-                continue;
-              }
-              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
-            } else {
-              ctx.log("rescue", `⚓ Docking at home station...`);
-              const dockResp = await bot.exec("dock");
-              if (dockResp.error) {
-                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
-              } else {
-                ctx.log("rescue", `✓ Docked at home station`);
-                // Refuel after docking
-                ctx.log("rescue", `⛽ Refueling at home station...`);
-                const refuelResp = await bot.exec("refuel");
-                if (refuelResp.error) {
-                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                } else {
-                  await bot.refreshShip();
-                  ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                }
-              }
-            }
-          }
-        }
+        // Travel to the configured home station (or nearest station if none is
+        // configured) and dock so the bot is safe and refueled.
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -7255,38 +7047,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log("warn", "No home system set — skipping return home");
     } else {
       ctx.log(logCategory, `Already at home system ${homeSystem}`);
-      
-      // If home station is configured and we're in the system but not docked, travel there
-      if (settings.homeStation && !bot.docked) {
-        const [expectedSystem, stationId] = settings.homeStation.split('|');
-        if (expectedSystem === homeSystem && stationId) {
-          ctx.log("rescue", `🚀 Traveling to home station...`);
-          const travelResp = await bot.exec("travel", { target_poi: stationId });
-          // CRITICAL: Check for battle interrupt error
-          if (travelResp.error) {
-            const errMsg = travelResp.error.message.toLowerCase();
-            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await fleeFromBattle(ctx);
-              await ctx.sleep(5000);
-              continue;
-            }
-          }
-          if (!travelResp.error) {
-            ctx.log("rescue", `⚓ Docking at home station...`);
-            const dockResp = await bot.exec("dock");
-            if (!dockResp.error) {
-              ctx.log("rescue", `✓ Docked at home station`);
-              // Refuel after docking
-              ctx.log("rescue", `⛽ Refueling at home station...`);
-              const refuelResp = await bot.exec("refuel");
-              if (!refuelResp.error) {
-                await bot.refreshShip();
-                ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-              }
-            }
-          }
-        }
+
+      // If not already docked, travel to the configured home station (or nearest
+      // station if none is configured) and dock so the bot is safe and refueled.
+      if (!bot.docked) {
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
       }
     }
 

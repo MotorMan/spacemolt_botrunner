@@ -7,6 +7,7 @@ import {
   peerRequestText,
   type FileEntry,
 } from "./client_sync_files.js";
+import { botChatChannel } from "./bot_chat_channel.js";
 import type {
   RegisteredClient,
   PoiPayload,
@@ -112,7 +113,7 @@ export class ClientSyncMaster {
     return { ok: true, version: this.version, clientId, connectedClients: clients };
   }
 
-  public register(payload: { label: string; apiKey: string; password?: string; url?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
+  public register(payload: { label: string; apiKey: string; password?: string; url?: string; light?: boolean }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
     if (this.mode !== "master") {
       return Promise.resolve({ clientId: "", ok: false, error: "Master not in master mode" });
     }
@@ -132,6 +133,7 @@ export class ClientSyncMaster {
       connectedAt: now,
       lastSeen: now,
       selfUrl: payload.url || undefined,
+      light: !!payload.light,
     });
     return Promise.resolve({ clientId: id, ok: true });
   }
@@ -143,7 +145,10 @@ export class ClientSyncMaster {
    */
   public async pullFromSlave(clientId: string): Promise<number> {
     const client = this.clients.get(clientId);
-    if (!client || !client.selfUrl) return 0;
+    // Lightweight clients never participate in the heavy file sync: skip them
+    // entirely so their data dirs can't be touched/overwritten (this is the
+    // whole point of light mode — no file-level clobbering of other clients).
+    if (!client || !client.selfUrl || client.light) return 0;
     const dataDir = join(process.cwd(), "data");
     const disabled = this.disabledSyncFiles();
     let listed: { files: FileEntry[] };
@@ -206,7 +211,23 @@ export class ClientSyncMaster {
     if (c) c.lastSeen = Date.now();
   }
 
-  public chatRelay(_body: { channel: string; content: string; sender?: string }): { ok: boolean } {
+  public chatRelay(body: { channel: string; content: string; sender?: string; clientId?: string }): { ok: boolean } {
+    // Relay a client's non-API bot-chat message into this master's in-memory
+    // bot chat channel so routines on the master (mayday calls, periodic status
+    // checks, …) can see it. The message is tagged with the originating client
+    // label so every connected client (slave + light) that pulls `chat-history`
+    // sees the union of all clients' bot chat. This is what lets the lightweight
+    // connect mode share the cross-client bot chat channel without any of the
+    // heavy file sync that the full slave mode does.
+    const client = body.clientId ? this.clients.get(body.clientId) : undefined;
+    const label = client?.label;
+    const prefix = label ? `[${label}] ` : "";
+    botChatChannel.send({
+      sender: `${prefix}${body.sender || "remote"}`,
+      recipients: [],
+      channel: (body.channel as any) || "general",
+      content: String(body.content || ""),
+    });
     return { ok: true };
   }
 

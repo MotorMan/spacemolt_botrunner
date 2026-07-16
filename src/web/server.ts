@@ -1524,14 +1524,20 @@ if (url.pathname === "/data/shipsForSale.json") {
             const history = botChatChannel.getHistory(undefined, 100);
             return Response.json(history, { headers: cors });
           }
-          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
-            return Response.json(this.latestStatuses, { headers: cors });
-          }
           if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
             return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
           }
           if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
-            return Response.json(this.syncMaster?.getBots() ?? [], { headers: cors });
+            // Combined fleet: this node's own bots plus every connected client's
+            // bots (full name + status). Works for both full slaves and the
+            // lightweight "light" connect, since both push bot-status updates.
+            const combined = [...this.latestStatuses];
+            for (const b of (this.syncMaster?.getBots() ?? [])) {
+              const u = (b as unknown as Record<string, unknown>).username;
+              if (!u || combined.some((x) => (x as unknown as Record<string, unknown>).username === u)) continue;
+              combined.push(b as any);
+            }
+            return Response.json(combined, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/fleet-poll" && req.method === "GET") {
             // Cross-client fleet rescue poll: ask every connected client for its
@@ -1562,6 +1568,10 @@ if (url.pathname === "/data/shipsForSale.json") {
             const syncSlave = (globalThis as any).syncSlave;
             if (syncSlave) {
               return Response.json(syncSlave.getState(), { headers: cors });
+            }
+            const syncLight = (globalThis as any).syncLight;
+            if (syncLight) {
+              return Response.json({ ...syncLight.getState(), mode: "light" }, { headers: cors });
             }
             return Response.json({ connected: false, lastError: "Slave not running" }, { headers: cors });
           }
@@ -1638,7 +1648,7 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
             const body = await req.json() as { channel: string; content: string; sender?: string };
             const clientId = req.headers.get("x-client-id") || "";
-            const result = this.syncMaster?.chatRelay(body);
+            const result = this.syncMaster?.chatRelay({ ...body, clientId });
             return Response.json(result ?? { ok: false }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/bot-status" && req.method === "POST") {

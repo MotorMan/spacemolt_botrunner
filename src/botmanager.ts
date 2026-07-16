@@ -47,6 +47,7 @@ import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
+import { ClientSyncLightSlave } from "./client_sync_light_slave.js";
 import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
 import { perf, snapshotAndReset as perfSnapshotAndReset, setActivePlayers as perfSetActivePlayers } from "./perf.js";
 import { ensureInsured } from "./routines/common.js";
@@ -251,11 +252,14 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   let remote: Array<Record<string, unknown>> = [];
   const master = (globalThis as { syncMaster?: import("./client_sync_master.js").ClientSyncMaster }).syncMaster;
   const slave = (globalThis as { syncSlave?: import("./client_sync_slave.js").ClientSyncSlave }).syncSlave;
+  const light = (globalThis as { syncLight?: import("./client_sync_light_slave.js").ClientSyncLightSlave }).syncLight;
   try {
     if (master) {
       remote = await master.requestFleetRescuePoll();
     } else if (slave) {
       remote = await slave.pullFleetRescue();
+    } else if (light) {
+      remote = await light.pullFleetRescue();
     }
   } catch {
     // fall back to local-only fleet
@@ -1127,6 +1131,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
       disabledSyncFiles: Array.isArray(s.disabledSyncFiles) ? (s.disabledSyncFiles as string[]) : [],
     };
     const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
+    const syncLight = (globalThis as any).syncLight as ClientSyncLightSlave | undefined;
     if (newSettings.enabled && newSettings.mode === "slave" && newSettings.masterUrl) {
       if (syncSlave) {
         syncSlave.updateSettings(newSettings);
@@ -1141,6 +1146,25 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
         syncSlave.stop();
         delete (globalThis as any).syncSlave;
         server.logSystem(`Client sync slave stopped`);
+      }
+    }
+
+    // Lightweight client connect: shares only bot names/statuses + the non-API
+    // bot chat channel. No file sync at all.
+    if (newSettings.enabled && newSettings.mode === "light" && newSettings.masterUrl) {
+      if (syncLight) {
+        syncLight.updateSettings(newSettings);
+      } else {
+        const newLight = new ClientSyncLightSlave(newSettings);
+        newLight.start();
+        (globalThis as any).syncLight = newLight;
+        server.logSystem(`Client sync light started`);
+      }
+    } else {
+      if (syncLight) {
+        syncLight.stop();
+        delete (globalThis as any).syncLight;
+        server.logSystem(`Client sync light stopped`);
       }
     }
 
@@ -2207,6 +2231,12 @@ async function main(): Promise<void> {
       syncSlave.start();
       (globalThis as any).syncSlave = syncSlave;
       server.logSystem(`Client sync slave enabled, connecting to ${clientSyncSettings.masterUrl}`);
+    }
+    if (clientSyncSettings.enabled && clientSyncSettings.mode === "light" && clientSyncSettings.masterUrl) {
+      const syncLight = new ClientSyncLightSlave(clientSyncSettings);
+      syncLight.start();
+      (globalThis as any).syncLight = syncLight;
+      server.logSystem(`Client sync light enabled, connecting to ${clientSyncSettings.masterUrl}`);
     }
   }
 

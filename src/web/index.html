@@ -33970,11 +33970,12 @@ ignoreBlacklist: document.getElementById(
           <div class="setting-label">Mode</div>
           <div class="setting-hint">Master receives updates from slaves. Slave pulls data from master.</div>
         </div>
-        <select id="set-client_sync-mode" onchange="saveClientSyncSettings(); updateClientSyncModeUI()">
-          <option value="disabled" ${mode === "disabled" ? "selected" : ""}>Disabled</option>
-          <option value="master" ${mode === "master" ? "selected" : ""}>Master</option>
-          <option value="slave" ${mode === "slave" ? "selected" : ""}>Slave</option>
-        </select>
+          <select id="set-client_sync-mode" onchange="saveClientSyncSettings(); updateClientSyncModeUI()">
+            <option value="disabled" ${mode === "disabled" ? "selected" : ""}>Disabled</option>
+            <option value="master" ${mode === "master" ? "selected" : ""}>Master</option>
+            <option value="slave" ${mode === "slave" ? "selected" : ""}>Slave</option>
+            <option value="light" ${mode === "light" ? "selected" : ""}>Light (statuses + chat only)</option>
+          </select>
       </div>
 
       <div id="clientSyncMasterPanel" style="${mode === "master" ? "" : "display:none"}">
@@ -34007,7 +34008,7 @@ ignoreBlacklist: document.getElementById(
         </div>
       </div>
 
-      <div id="clientSyncSlavePanel" style="${mode === "slave" ? "" : "display:none"}">
+      <div id="clientSyncSlavePanel" style="${(mode === "slave" || mode === "light") ? "" : "display:none"}">
         <div class="setting-row">
           <div>
             <div class="setting-label">Master URL</div>
@@ -34242,8 +34243,9 @@ ignoreBlacklist: document.getElementById(
         const mode = document.getElementById("set-client_sync-mode").value;
         document.getElementById("clientSyncMasterPanel").style.display =
           mode === "master" ? "" : "none";
+        // Both slave and light connect out to a master with the same URL/key UI.
         document.getElementById("clientSyncSlavePanel").style.display =
-          mode === "slave" ? "" : "none";
+          (mode === "slave" || mode === "light") ? "" : "none";
         document.getElementById("clientSyncOptionsPanel").style.display =
           mode === "disabled" ? "none" : "";
         if (mode === "master") refreshClientSyncConnectedClients();
@@ -34290,7 +34292,7 @@ ignoreBlacklist: document.getElementById(
           "set-client_sync-masterUrl",
         ).value;
         const statusEl = document.getElementById("clientSyncStatus");
-        if (mode !== "slave") {
+        if (mode !== "slave" && mode !== "light") {
           if (statusEl) statusEl.textContent = "Not applicable";
           return;
         }
@@ -34369,7 +34371,7 @@ ignoreBlacklist: document.getElementById(
         ) {
           const mode = document.getElementById("set-client_sync-mode")?.value;
           if (mode === "master") refreshClientSyncConnectedClients();
-          if (mode === "slave") refreshClientSyncStatus();
+          if (mode === "slave" || mode === "light") refreshClientSyncStatus();
         }
       }, 5000);
 

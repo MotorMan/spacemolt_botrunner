@@ -1,6 +1,8 @@
+export type BotSyncMode = "disabled" | "master" | "slave" | "light";
+
 export interface SyncSettings {
   enabled: boolean;
-  mode: "master" | "slave" | string;
+  mode: BotSyncMode | string;
   masterUrl: string;
   apiKey: string;
   password?: string;
@@ -39,6 +41,10 @@ export interface RegisteredClient {
   lastSeen: number;
   ip?: string;
   selfUrl?: string;
+  /** True when this client connected in lightweight ("light") mode: it only
+   * shares bot names/statuses + the non-API bot chat channel and never takes
+   * part in the heavy two-way file sync. */
+  light?: boolean;
 }
 
 export interface PoiPayload {

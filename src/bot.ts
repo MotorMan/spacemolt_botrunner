@@ -18,7 +18,7 @@ import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
-import { loadSettings, saveStoppedState } from "./web/server.js";
+import { loadSettings, saveStoppedState, saveLastUsedRoutine } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
@@ -768,11 +768,36 @@ docked = false;
       // Mark bot as stopped-by-emergency so it won't auto-restart on mass disconnect
       saveStoppedState(this.username, "emergency");
 
+      // Reassign the bot's last-used routine to "return_home" so that nothing
+      // can ever automatically re-queue it into the routine it was just pulled
+      // out of (miner/trader/etc.). Emergency-Warp always drops the ship back at
+      // its home base, so return_home will find it already home, confirm dock,
+      // and then idle — keeping it home instead of re-entering the old routine.
+      saveLastUsedRoutine(this.username, "return_home");
+
       // Stop the routine immediately
       if (this._state === "running") {
         this._state = "stopping";
         this._abortController?.abort();
       }
+
+      // Once the aborted routine has unwound, explicitly start the return_home
+      // routine so the bot is in a "stay home" state (it is already home). This
+      // runs best-effort: if the bot is already busy with another routine it is
+      // skipped, and the re-assigned last-used routine guarantees that the next
+      // auto-resume / mass-reconnect still lands it on return_home, never the
+      // old routine.
+      const botName = this.username;
+      setTimeout(() => {
+        void (async () => {
+          const { handleStart, getBot } = await import("./botmanager.js");
+          const bot = getBot(botName);
+          if (!bot) return;
+          if (bot.state === "running") return;
+          await handleStart({ type: "start", bot: botName, routine: "return_home" });
+        })().catch(() => {});
+      }, 4000);
+
       return; // Don't log the original message again, we've already handled it
     }
 

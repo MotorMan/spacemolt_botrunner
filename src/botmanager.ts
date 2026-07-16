@@ -1432,7 +1432,7 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
   }, backoff);
 }
 
-async function handleStart(action: WebAction): Promise<WebActionResult> {
+export async function handleStart(action: WebAction): Promise<WebActionResult> {
   const botName = action.bot;
   if (!botName) return { ok: false, error: "No bot specified" };
 

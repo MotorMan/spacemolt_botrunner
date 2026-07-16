@@ -535,39 +535,64 @@ function registerClientDisconnectHandlers(): void {
   for (const client of getSpacemoltClients()) {
     if (registeredClients.has(client)) continue;
     registeredClients.add(client);
+
+    // The library reconnects a dropped account IN PLACE (same `Account`
+    // instance, fresh socket, re-authenticated). When that succeeds it fires
+    // `onAccountReconnected` — NOT `onAccountConnected` (the instance never
+    // changed), so our per-connect wiring doesn't re-run. We only need to clear
+    // our guards + backoff and refresh the table; the `Bot` already holds the
+    // (same) live `Account`. This is the happy path we want to WIN — so we must
+    // never race it with a forced evict/reconnect (that produced the duplicate
+    // `session_replaced` login storm).
+    client.onAccountReconnected((account) => {
+      const id = account.id || "";
+      if (!id) return;
+      terminalClosedBots.delete(id);
+      const bot = bots.get(id);
+      if (bot) bot.clearTerminalClosed();
+      resetReconnectBackoff(id);
+      server.logSystem(`Library reconnected "${id}" in place (same session) — socket restored.`);
+      refreshStatusTable();
+    });
+
     client.onAccountDisconnected((id, err) => {
       const code = (err && (err as { code?: number }).code) ?? undefined;
       const detail = code ?? (err && (err as { message?: string }).message) ?? "closed";
 
-      // Terminal close codes mean the player is connected ELSEWHERE (another
-      // botrunner / the website): the server will keep replacing any new session
-      // we open, so the library refuses to reconnect — and so must we. Stop the
-      // watchdog from fighting it forever (and spamming "cannot send on a closed
-      // socket"). The user has to disconnect the other session first.
-      if (code === CLOSE_CODE.SESSION_REPLACED || code === CLOSE_CODE.AUTH_TIMEOUT) {
-        terminalClosedBots.add(id);
+      // IMPORTANT: per @spacemolt/lib, `onAccountDisconnected` fires ONLY when
+      // the account is dropped for good — a terminal close (session_replaced /
+      // auth_timeout) OR the library's own in-place reconnect exhausted its
+      // retries. It does NOT fire for an ordinary blip (the library silently
+      // reconnects the same Account in place and fires `onAccountReconnected`
+      // instead). So by the time we're here, the library is DONE trying.
+      //
+      // We do NOT immediately fire a competing reconnect from this handler. The
+      // old code did, and combined with the per-command `sendResilient` loops +
+      // the health monitor it produced a storm of `client.remove()` +
+      // `connectOwned()` calls — each new socket looked like a duplicate login,
+      // the server answered `session_replaced` (4001), and the bot could never
+      // reconnect until the routine stopped. Instead we mark the bot's recovery
+      // as terminal; the single coalesced `runRecovery` loop in bot.ts then asks
+      // for exactly ONE forced fresh socket (deduped + backed off). A running
+      // bot recovers via that one path; an idle bot is picked up by the
+      // watchdog.
+      const terminal = code === CLOSE_CODE.SESSION_REPLACED || code === CLOSE_CODE.AUTH_TIMEOUT;
+      terminalClosedBots.add(id);
+      const bot = bots.get(id);
+      if (bot) bot.markTerminalClosed();
+
+      if (terminal) {
         server.logSystem(
-          `Connection to "${id}" closed (${detail}). Treated as a possible post-restart zombie — ` +
-          `auto-reconnect will keep dropping the dead socket and trying a fresh one on a backoff. ` +
+          `Connection to "${id}" closed by server (${detail}). ` +
+          `The single recovery path will request one fresh socket (backed off). ` +
           `If ${id} is genuinely connected elsewhere, disconnect it there and it will resume automatically.`,
         );
-        return;
+      } else {
+        server.logSystem(
+          `Library gave up reconnecting "${id}" (${detail}). ` +
+          `The single recovery path will request one fresh socket (backed off).`,
+        );
       }
-
-      // Any other close is non-terminal. The library's "auto-reconnect in place"
-      // is NOT reliable here: its `connect()` short-circuits on the SAME cached
-      // `Account` for an id regardless of socket state (see libClient.ts), so an
-      // in-place reconnect re-welds us to the dead socket and we sit there
-      // "pounding our heads against a closed door" — the exact "won't reconnect
-      // ever again" symptom. So the instant a non-terminal drop fires we DROP
-      // the dead account and force a brand-new socket ourselves, instead of
-      // waiting for a command to fail. The dedup guard in `forceReconnectBot`
-      // prevents this handler, the health monitor, and `sendResilient` from all
-      // racing the same reconnect at once.
-      server.logSystem(`Connection to "${id}" dropped (${detail}). Forcing a fresh socket right now...`);
-      forceReconnectBot(id).catch((reconnectErr) => {
-        server.logSystem(`Immediate reconnect of "${id}" failed (will retry on next watchdog pass): ${reconnectErr}`);
-      });
     });
   }
 }
@@ -790,17 +815,27 @@ async function ensureSelectedBotsConnected(): Promise<void> {
  * actually inspects the live connection, such a bot would sit there "doing
  * nothing" until a command happened to fail — the exact symptom reported.
  *
- * This timer polls every running bot's live `account.authenticated` flag (plus a
- * `readyState`-style check where the library exposes one) and, the moment it
- * sees a dead-but-not-reconnecting socket, force-drops it and opens a fresh one
- * via `forceReconnectBot`. The `reconnectingBots` guard + a per-bot throttle
- * keep this from ever racing the disconnect handler or `sendResilient`, and from
- * hammering a bot that's already mid-recovery. It is purely additive — the
- * existing 15s/2min watchdogs stay as backstops.
+ * This timer polls every bot's live `account.authenticated` flag but is now a
+ * BACKSTOP ONLY. A running bot's dropped socket is handled by the single
+ * coalesced `runRecovery` loop in bot.ts (driven by `sendResilient`), which
+ * first WAITS for @spacemolt/lib's own in-place reconnect before ever forcing a
+ * fresh socket. The health monitor must therefore NOT force-reconnect a bot the
+ * moment `authenticated` briefly flips false — that flag is transiently false
+ * during the library's normal in-place reconnect, and evicting then created the
+ * duplicate-login (`session_replaced`) storm that stopped the bot from ever
+ * reconnecting. So this only acts on a socket that has been dead for a SUSTAINED
+ * period (several consecutive checks), is NOT already being recovered, and whose
+ * bot has an active routine driving `runRecovery` OR is idle (nothing else will
+ * revive it). It stays purely additive to the existing watchdogs.
  */
 const HEALTH_CHECK_INTERVAL_MS = 15_000;
-const HEALTH_CHECK_THROTTLE_MS = 30_000; // at most one forced reconnect per bot per 30s
+const HEALTH_CHECK_THROTTLE_MS = 120_000; // at most one forced reconnect per bot per 2 min
+// A socket must look dead across this many consecutive checks before the
+// backstop acts — long enough that the library's own in-place reconnect (paced
+// through its rate-limited queue) has had a fair chance to restore it first.
+const HEALTH_DEAD_STREAK_REQUIRED = 4; // 4 × 15s = ~60s sustained-dead
 const lastHealthReconnect = new Map<string, number>();
+const healthDeadStreak = new Map<string, number>();
 
 function startConnectionHealthMonitor(): ReturnType<typeof setInterval> {
   return setInterval(() => {
@@ -822,7 +857,23 @@ function startConnectionHealthMonitor(): ReturnType<typeof setInterval> {
         ((acct as unknown as { readyState?: number }).readyState !== undefined &&
           (acct as unknown as { readyState?: number }).readyState !== 1);
 
-      if (!looksDead) continue;
+      if (!looksDead) {
+        healthDeadStreak.delete(bot.username);
+        continue;
+      }
+
+      // A running bot already has `runRecovery` driving reconnection (via
+      // sendResilient). Let that single path own it — the backstop must not race
+      // it. Only step in for bots with no active recovery in flight.
+      if (bot.hasActiveRecovery()) {
+        continue;
+      }
+
+      // Require a SUSTAINED dead streak so the library's in-place reconnect has
+      // had time to restore the socket before we ever consider forcing one.
+      const streak = (healthDeadStreak.get(bot.username) ?? 0) + 1;
+      healthDeadStreak.set(bot.username, streak);
+      if (streak < HEALTH_DEAD_STREAK_REQUIRED) continue;
 
       // Throttle: don't force-reconnect the same bot more than once per
       // HEALTH_CHECK_THROTTLE_MS, and never while one is already in flight.
@@ -830,10 +881,11 @@ function startConnectionHealthMonitor(): ReturnType<typeof setInterval> {
       const last = lastHealthReconnect.get(bot.username) ?? 0;
       if (now - last < HEALTH_CHECK_THROTTLE_MS) continue;
       lastHealthReconnect.set(bot.username, now);
+      healthDeadStreak.delete(bot.username);
 
       server.logSystem(
-        `Health monitor: socket for "${bot.username}" looks dead ` +
-          `(authenticated=${acct.authenticated}) — forcing a fresh socket.`,
+        `Health monitor: socket for "${bot.username}" has been dead ~${streak * (HEALTH_CHECK_INTERVAL_MS / 1000)}s ` +
+          `with no recovery in flight — requesting one fresh socket (backed off).`,
       );
       forceReconnectBot(bot.username).catch((err) => {
         server.logSystem(`Health monitor reconnect failed for "${bot.username}": ${err}`);

@@ -202,6 +202,32 @@ docked = false;
     this._terminalClosed = false;
   }
 
+  /**
+   * Mark this bot's socket as gone-for-good (the library fired
+   * `onAccountDisconnected` — a terminal close, or its in-place reconnect
+   * retries exhausted). The single coalesced `runRecovery` loop reads this to
+   * escalate from "wait for the library" to "request one forced fresh socket".
+   */
+  markTerminalClosed(): void {
+    this._terminalClosed = true;
+  }
+
+  /**
+   * The ONE in-flight socket-recovery promise for this bot, shared by every
+   * concurrent `sendResilient` caller. Without this, each of the (potentially
+   * dozens of) commands in flight when a socket drops spawned its OWN
+   * `waitForFreshSocket` loop — each with its own force-reconnect cadence and
+   * counter — so we'd fire `client.remove()` + `connectOwned()` many times per
+   * second. Every new socket the server saw looked like a duplicate login and
+   * got answered with `session_replaced` (4001), which killed the previous
+   * socket and re-armed the whole storm. That self-inflicted dupe-login loop is
+   * the "she won't reconnect until I stop the routine" bug: the instant the
+   * routine stopped and the storm ceased, the library's single in-place
+   * reconnect finally stuck. Coalescing to one shared recovery promise is what
+   * lets the library's own reconnect win.
+   */
+  private _recovery: Promise<boolean> | null = null;
+
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -437,17 +463,21 @@ docked = false;
         if (this.state === "stopping" || this._abortController?.signal.aborted) {
           throw err;
         }
-        // BE FORCEFUL: every single connection error means the socket is dead,
-        // so drop it and open a fresh one right now. A genuine elsewhere-session
-        // will hit the force cap below and end the routine; a zombie/blip socket
-        // is replaced instantly and the in-flight command is resent.
-        this.log("warn", `Disconnected (${message}) — dropping the dead socket and opening a fresh one...`);
+        // A connection error means the socket dropped. The library is (or will
+        // be) reconnecting the SAME Account in place — so we wait on the ONE
+        // shared recovery promise rather than each command forcing its own fresh
+        // socket (that was the duplicate-login storm). Only the first caller to
+        // hit this actually logs + drives recovery; the rest silently await it.
+        const first = !this.hasActiveRecovery();
+        if (first) {
+          this.log("warn", `Disconnected (${message}) — waiting for the socket to recover before resending...`);
+        }
         const reconnected = await this.waitForFreshSocket();
         if (!reconnected) {
-          // Stopped, terminal close (player connected elsewhere), or we ran out
-          // of force attempts. Stop retrying; surface the error so the routine
-          // ends. The botmanager's terminal-close guard then prevents an
-          // auto-restart that would just fight the server forever.
+          // Stopped or terminal close (the library gave up / connected
+          // elsewhere). Stop retrying; surface the error so the routine ends.
+          // The botmanager's terminal-close guard then prevents an auto-restart
+          // that would just fight the server forever.
           throw err;
         }
         this.log("system", `Reconnected — resending ${tool}/${action}`);
@@ -841,82 +871,101 @@ docked = false;
   }
 
   /**
-   * Force a brand-new socket and wait (BOUNDED) for it to authenticate. This is
-   * the heart of "be forceful": every check that finds a dead socket IMMEDIATELY
-   * drops it and asks the library for a fresh one — we never sit and hope a dead
-   * socket revives (it won't, you told me). Returns true once the live
-   * `account.authenticated` flips true, false if the bot was stopped, the
-   * connection is terminal (player connected elsewhere), or we exhausted the
-   * bounded force attempts.
+   * Wait for this bot's socket to come back after a drop. Returns true once the
+   * live `account.authenticated` flips true again, false if the bot was stopped
+   * or the connection is TERMINAL (the account is genuinely connected
+   * elsewhere / the library gave up).
    *
-   * The previous version polled `authenticated` forever (which could wedge
-   * `login()`/`refreshStatus()`), then a later version bounded it by a 20-minute
-   * wall clock — but that still gave up too early on slow post-restart
-   * reconnects, dropping the bot in hostile territory. This version keeps trying
-   * FOREVER while the bot is running: it defers the actual reconnect cadence to
-   * botmanager's shared exponential backoff (forceReconnectBot) so a socket that
-   * keeps dying is retried gently rather than hammered into a storm, but it
-   * NEVER ends the routine on a plain disconnect. It only resolves false when
-   * the user explicitly stops the bot or the connection is TERMINAL (account
-   * connected elsewhere) — otherwise it waits for recovery no matter how long.
+   * CRITICAL: this coalesces to ONE shared recovery promise per bot. When a
+   * socket drops there can be dozens of commands in flight (a routine fans out
+   * many `get_*` queries at once), and previously each one spawned its own
+   * recovery loop that independently force-reconnected the account. That storm
+   * of `client.remove()` + `connectOwned()` calls made the server see duplicate
+   * logins and answer with `session_replaced` (4001) — each new socket killing
+   * the last — so the bot could never reconnect until the routine stopped and
+   * the storm ceased. Sharing one promise means all callers await the SAME
+   * recovery, and the recovery itself defers to the library's own in-place
+   * reconnect first (see `runRecovery`).
    */
   private waitForFreshSocket(): Promise<boolean> {
-    const self = this;
-    const FORCE_EVERY_MS = 5000; // wake up this often to re-check the socket
-    // NOT bounded by wall clock anymore. The actual reconnect cadence is
-    // governed by botmanager's shared exponential backoff (forceReconnectBot),
-    // so a socket that keeps dying is retried gently (5s→10s→…→120s) rather
-    // than hammered into a storm. We keep trying FOREVER while the bot is
-    // running — a routine must never give up on a dropped socket just because
-    // the reconnect is taking longer than usual (server restart / slow
-    // reconnect). It only stops when the user explicitly stops it, or the
-    // connection is TERMINAL (the account is connected elsewhere / session
-    // replaced). A normal blip or restart just means we keep forcing fresh
-    // sockets until one authenticates.
-    let lastThrottle = 0;
-    let forceCount = 0;
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      const settle = (val: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearInterval(poll);
-        resolve(val);
-      };
-      const check = () => {
-        if (self.state === "stopping" || self._abortController?.signal.aborted) {
-          self.log("system", "Stop requested — aborting socket recovery.");
-          return settle(false);
+    if (!this._recovery) {
+      this._recovery = this.runRecovery().finally(() => {
+        this._recovery = null;
+      });
+    }
+    return this._recovery;
+  }
+
+  /** True while this bot's single coalesced socket-recovery loop is running. */
+  hasActiveRecovery(): boolean {
+    return this._recovery !== null;
+  }
+
+  /**
+   * The actual recovery driver — exactly ONE runs per bot at a time (guarded by
+   * `_recovery`). Strategy, in order of preference:
+   *
+   *   1. TRUST THE LIBRARY. `@spacemolt/lib` already reconnects the same
+   *      `Account` instance in place on any non-terminal drop (its client-level
+   *      `handleAccountDisconnected` → `account.reconnectOnce`, rate-limited).
+   *      During that window `account.authenticated` is briefly false, but the
+   *      socket is being rebuilt on the SAME instance — so we just WAIT for it
+   *      to flip back. We do NOT evict/replace it (that's what created the
+   *      duplicate-login storm). This grace window is generous.
+   *
+   *   2. Only if the library gives up — it fires `onAccountDisconnected`, which
+   *      the botmanager surfaces as a terminal close (`_terminalClosed`) — OR
+   *      the grace window elapses with no recovery, do we escalate to ONE forced
+   *      fresh socket via botmanager (bounded by its shared backoff). That's a
+   *      genuine last resort, not the per-tick hammer it used to be.
+   *
+   * Never resolves false on a plain blip while the bot is running; only on an
+   * explicit stop or a real terminal close.
+   */
+  private async runRecovery(): Promise<boolean> {
+    const POLL_MS = 500;
+    // How long to let the library's own in-place reconnect work before we
+    // escalate to a forced fresh socket. The library paces reconnects through
+    // its rate-limited queue, so a post-restart mass reconnect can legitimately
+    // take a while — but we don't wait forever without acting.
+    const LIBRARY_GRACE_MS = 30_000;
+    let cycle = 0;
+    for (;;) {
+      // Stop requested — bail immediately so the routine can end.
+      if (this.state === "stopping" || this._abortController?.signal.aborted) {
+        this.log("system", "Stop requested — aborting socket recovery.");
+        return false;
+      }
+      // Socket is back (library reconnected in place, or a forced reconnect
+      // succeeded). Resume.
+      const acct = this.account;
+      if (acct && acct.authenticated) {
+        if (cycle > 0) this.log("system", "Socket reconnected — resuming routine.");
+        return true;
+      }
+      // The library reported a TERMINAL close (session_replaced / auth_timeout,
+      // or its reconnect retries exhausted). That's the ONLY signal that means
+      // "this won't come back on its own". Ask botmanager for exactly one forced
+      // fresh socket (it dedups + backs off), then keep waiting.
+      if (this._terminalClosed) {
+        this.log("warn", "Library reported the socket gone for good — requesting one fresh socket (backed off)...");
+        this.clearTerminalClosed();
+        await this.forceSocketReconnect();
+      } else {
+        // Non-terminal drop: the library is (or should be) reconnecting the
+        // same Account in place. WAIT for it — do not evict/replace, which is
+        // what created the duplicate-login storm.
+        const waited = cycle * POLL_MS;
+        if (waited > 0 && waited % LIBRARY_GRACE_MS === 0) {
+          // Grace elapsed without recovery — nudge botmanager for one forced
+          // fresh socket (backed off), then keep waiting on the library again.
+          this.log("warn", "Still disconnected after grace window — requesting one fresh socket (backed off) and waiting for recovery...");
+          await this.forceSocketReconnect();
         }
-        const acct = self.account;
-        if (acct && acct.authenticated) {
-          self.log("system", "Socket reconnected — resuming routine.");
-          return settle(true);
-        }
-        // The library reported this account's socket closed (its onDisconnected
-        // fires on ANY drop — server restart, network blip, or a genuine
-        // elsewhere login). We don't assume WHY; we just keep dropping the dead
-        // socket and letting the shared backoff build a fresh one. A
-        // post-restart zombie reconnects eventually; a genuinely-elsewhere
-        // account re-dies and is caught by the terminal-close guard below.
-        // A slow-but-recovering reconnect simply keeps retrying here until it
-        // comes back — we never give up while running.
-        if (self._terminalClosed) {
-          self.clearTerminalClosed();
-        }
-        const now = Date.now();
-        if (now - lastThrottle > 30000) {
-          lastThrottle = now;
-          forceCount++;
-          self.log("warn", `Still disconnected — forcing a fresh socket (attempt #${forceCount}, backed off) and waiting for recovery before issuing more commands...`);
-        }
-        // Ask for a fresh socket. forceReconnectBot enforces the backoff, so
-        // this is cheap when we're already inside a cooldown window.
-        void self.forceSocketReconnect();
-      };
-      const poll = setInterval(check, FORCE_EVERY_MS);
-      check(); // force immediately on first sight of a dead socket
-    });
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+      cycle++;
+    }
   }
 
   /**

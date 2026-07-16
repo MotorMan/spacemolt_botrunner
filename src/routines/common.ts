@@ -805,6 +805,191 @@ const REFUEL_WAIT_RETRIES = 10;
 /** Seconds between refuel retries when waiting at station. */
 const REFUEL_WAIT_INTERVAL = 30_000;
 
+/**
+ * Fuel-cell items we can convert into fuel, ranked best-first by fuel-per-cell.
+ * Used when a docked station's fuel reserve is empty: we pull cells from
+ * faction/station storage or buy them from the market, then refuel from cargo.
+ */
+const FUEL_CELL_RANK: { id: string; fuel: number }[] = [
+  { id: "military_fuel_cell", fuel: 100 },
+  { id: "premium_fuel_cell", fuel: 50 },
+  { id: "fuel_cell", fuel: 20 },
+];
+
+function isFuelCellItemId(id: string): boolean {
+  const lower = (id || "").toLowerCase();
+  return lower === "military_fuel_cell" || lower === "premium_fuel_cell" || lower === "fuel_cell";
+}
+
+/** How many fuel cells of the given id fit in available cargo (by weight). */
+function maxFuelCellsForCargo(ctx: RoutineContext, itemId: string): number {
+  const { bot } = ctx;
+  const free = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+  return maxItemsForCargo(free, itemId);
+}
+
+/**
+ * When docked at a station whose fuel RESERVE is empty (station_fuel_empty) and we
+ * have no fuel cells in cargo, obtain the best available fuel cells and refuel:
+ *   1. Pull from FACTION storage (military > premium > regular) into cargo.
+ *   2. Else pull from STATION storage.
+ *   3. Else BUY the best cell type from the station market.
+ * Then call refuel (which consumes cargo cells) to fill the tank.
+ *
+ * Returns true if fuel improved (tank topped up or at least some cells consumed),
+ * false if we could not source any fuel cells at all.
+ */
+export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.docked) return false;
+
+  // Quick check: already topped up — nothing to do.
+  const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (startFuel >= 95) return false;
+
+  // Refresh storage views so we can see what's available here.
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+  await bot.refreshCargo();
+
+  let sourced = 0;
+  for (const { id } of FUEL_CELL_RANK) {
+    const have = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+    if (have > 0) continue;
+
+    // 1) Faction storage
+    const inFaction = bot.factionStorage.find((i) => i.itemId === id);
+    if (inFaction && inFaction.quantity > 0) {
+      const qty = Math.min(inFaction.quantity, maxFuelCellsForCargo(ctx, id) || inFaction.quantity);
+      if (qty > 0) {
+        const fResp = await bot.exec("storage", {
+          action: "deposit", target: "self", item_id: id, quantity: qty, source: "faction",
+        });
+        if (!fResp.error) {
+          await bot.refreshStorage();
+          const wResp = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+          if (!wResp.error) {
+            await bot.refreshCargo();
+            const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+            sourced += got;
+            ctx.log("system", `Pulled ${got}x ${id} from faction storage`);
+            continue;
+          }
+        }
+      }
+    }
+
+    // 2) Station storage
+    const inStation = bot.storage.find((i) => i.itemId === id);
+    if (inStation && inStation.quantity > 0) {
+      const qty = Math.min(inStation.quantity, maxFuelCellsForCargo(ctx, id) || inStation.quantity);
+      if (qty > 0) {
+        const wResp = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+          sourced += got;
+          ctx.log("system", `Pulled ${got}x ${id} from station storage`);
+          continue;
+        }
+      }
+    }
+
+    // 3) Buy from market
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      const hasMarket = station?.services?.market !== false;
+      if (hasMarket) {
+        const buyQty = Math.max(1, maxFuelCellsForCargo(ctx, id));
+        if (buyQty > 0) {
+          const buyResp = await bot.exec("buy", { item_id: id, quantity: buyQty });
+          if (!buyResp.error) {
+            await bot.refreshCargo();
+            const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+            if (got > 0) {
+              sourced += got;
+              ctx.log("system", `Bought ${got}x ${id} from market`);
+              continue;
+            }
+          }
+        }
+      }
+    } catch { /* market unavailable — skip */ }
+  }
+
+  // 4) If we sourced any cells (or already had some), refuel from cargo.
+  const totalCells = bot.inventory
+    .filter((i) => isFuelCellItemId(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
+  if (totalCells <= 0) {
+    ctx.log("error", "No fuel cells available in faction storage, station storage, or market");
+    return false;
+  }
+
+  // Refuel consumes cargo fuel cells. Try in place first; if the lib requires
+  // undocking to draw from cargo, fall back to undock -> refuel -> redock.
+  let improved = false;
+  for (let attempt = 0; attempt < 12 && bot.state === "running"; attempt++) {
+    const resp = await bot.exec("refuel");
+    if (resp.error) {
+      const msg = resp.error.message.toLowerCase();
+      if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) break;
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) {
+        // Out of cargo cells — try buying one more of the best affordable type.
+        const bought = await tryBuyOneFuelCell(ctx);
+        if (!bought) break;
+        continue;
+      }
+      if (msg.includes("station") && (msg.includes("dock") || msg.includes("undock"))) {
+        // Refuel wants us undocked to use cargo cells.
+        await ensureUndocked(ctx);
+        const uResp = await bot.exec("refuel");
+        await bot.refreshShip();
+        if (!uResp.error) improved = true;
+        const tResp = await bot.exec("travel", { target_poi: bot.poi });
+        if (!tResp.error || tResp.error?.message.includes("already")) {
+          await bot.exec("dock");
+          bot.docked = true;
+        }
+        continue;
+      }
+      break;
+    }
+    improved = true;
+    await bot.refreshShip();
+    const fp = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fp >= 95) break;
+  }
+
+  await bot.refreshShip();
+  const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (endFuel > startFuel) {
+    ctx.log("system", `Recovered fuel via stored/bought cells: ${startFuel}% → ${endFuel}%`);
+    return true;
+  }
+  return improved || sourced > 0;
+}
+
+/** Buy a single (best affordable) fuel cell from the market as a last-ditch top-up. */
+async function tryBuyOneFuelCell(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  for (const { id } of FUEL_CELL_RANK) {
+    if (maxFuelCellsForCargo(ctx, id) <= 0) continue;
+    try {
+      const buyResp = await bot.exec("buy", { item_id: id, quantity: 1 });
+      if (!buyResp.error) {
+        await bot.refreshCargo();
+        if ((bot.inventory.find((i) => i.itemId === id)?.quantity || 0) > 0) {
+          ctx.log("system", `Bought 1x ${id} from market to top up`);
+          return true;
+        }
+      }
+    } catch { /* skip */ }
+  }
+  return false;
+}
+
 /** Attempt to refuel to full. Calls refuel repeatedly until tank is full.
  *  If broke, sells cargo. If still can't refuel, waits at station and retries.
  *  Assumes docked.
@@ -864,6 +1049,14 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
       }
       // Sol Central is always assumed to have fuel
       if (!isSolCentralLoop && (msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
+        // Station reserve empty — try faction/station storage or market for fuel cells
+        // instead of giving up (a docked station often has cells even with 0 reserve).
+        if (bot.docked) {
+          const recovered = await acquireFuelCellsAndRefuel(ctx);
+          const fp = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (recovered && fp >= 95) return;
+          await bot.refreshShip();
+        }
         ctx.log("error", `Station out of fuel — cannot refuel here (${resp.error.message})`);
         return; // bail out immediately, do not wait
       }
@@ -900,13 +1093,20 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
     // Retry: sell + refuel
     await sellAllCargo(ctx);
     const refuelResp = await bot.exec("refuel");
-    if (refuelResp.error) {
-      const msg = refuelResp.error.message.toLowerCase();
-      if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
-        ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
-        break;
-      }
-    }
+     if (refuelResp.error) {
+       const msg = refuelResp.error.message.toLowerCase();
+       if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
+         // Reserve empty / no cargo cells — try faction/station storage or market before giving up.
+           if (bot.docked) {
+            const recovered = await acquireFuelCellsAndRefuel(ctx);
+            await bot.refreshShip();
+            fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+            if (recovered && fuelPct >= 50) return;
+          }
+         ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
+         break;
+       }
+     }
     await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= 50) {
@@ -1319,6 +1519,28 @@ export async function ensureFueled(
 
   if (fuelPct >= thresholdPct) {
     return true;
+  }
+
+  // Universal fallback: we're docked at some station whose reserve is empty and we
+  // have no cargo cells. Try to source fuel cells from faction/station storage or
+  // the market (NOT gated by the approved-fuel-station list) before giving up and
+  // wandering off to another station. The miner can otherwise deadlock here when
+  // the only station it's locked to has 0 reserve but plenty of cells in storage.
+  if (bot.docked) {
+    const recovered = await acquireFuelCellsAndRefuel(ctx);
+    await bot.refreshShip();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct >= thresholdPct) {
+      ctx.log("system", `Recovered fuel at docked station (${dockingStation?.name ?? bot.poi}) — fuel now ${fuelPct}%`);
+      return true;
+    }
+    if (recovered) {
+      // Fuel improved but still under threshold — re-run tryRefuel for any residual station reserve.
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      await bot.refreshShip();
+      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct >= thresholdPct) return true;
+    }
   }
 
   // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel

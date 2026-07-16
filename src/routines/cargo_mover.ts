@@ -45,6 +45,8 @@ import {
   startItemProgress,
   updateItemProgress,
   getItemProgress,
+  loadCargoMoverActivity,
+  saveCargoMoverActivity,
   createMovement,
   updateMovement,
   completeMovement,
@@ -1033,9 +1035,39 @@ export async function reconcileDeliveredWithDestination(
   }
 
   // Remote read of the destination's faction storage (no need to travel there).
-  await bot.refreshFactionStorage(false, settings.destinationStation);
+  // Resolve the configured destination reference to the plain hex POI id the
+  // server expects as `station_id` (faction bases are exposed as hex POI ids).
+  // A "system|poi" reference or a friendly name must be collapsed to just the
+  // POI id or the lookup is rejected with "Station not found".
+  const stationId = mapStore.resolveStationTarget(settings.destinationStation);
+  ctx.log("cargo", `🔄 Reconcile: reading destination faction storage (station_id=${stationId})`);
+
+  // Do a DIRECT remote read — do NOT go through refreshFactionStorage, whose
+  // "Station not found" fallback silently keeps the bot's existing factionStorage
+  // (which the live cargo-mover routine keeps overwriting with the SOURCE
+  // station's data). Reading straight off the response guarantees we reconcile
+  // against the actual destination, not whatever storage the bot last touched.
+  const destResp = await bot.exec("view_faction_storage", { station_id: stationId });
+  if (destResp.error) {
+    ctx.log("error", `⚠️ Reconcile failed: could not read destination faction storage: ${destResp.error.message}`);
+    return { reconciled: 0, changed: [] };
+  }
+
   const destQty = new Map<string, number>();
-  for (const i of bot.factionStorage) destQty.set(i.itemId, i.quantity);
+  const destResult = (destResp.result as Record<string, unknown>) || {};
+  const destItems = (
+    Array.isArray(destResult.items) ? destResult.items :
+    Array.isArray(destResult.stored_items) ? destResult.stored_items :
+    Array.isArray(destResult.faction_items) ? destResult.faction_items :
+    Array.isArray(destResult.faction_storage) ? destResult.faction_storage :
+    []
+  ) as Array<Record<string, unknown>>;
+  for (const i of destItems) {
+    const id = (((i.item_id as string) || (i.id as string) || "") as string).replace(/ /g, "_").toLowerCase();
+    const qty = (i.quantity as number) || (i.count as number) || 0;
+    if (id && qty > 0) destQty.set(id, qty);
+  }
+  ctx.log("cargo", `🔄 Reconcile: destination holds ${destQty.size} item type(s)`);
 
   const all = readSettings();
   const cargoMover = all.cargo_mover || {};
@@ -1060,13 +1092,18 @@ export async function reconcileDeliveredWithDestination(
     if (item) item.totalDelivered = newDelivered;
 
     // Update the activity-progress record so the dashboard + findMoveJobs agree.
-    const progress = getItemProgress(bot.username, configItem.itemId);
+    // getItemProgress returns a freshly-loaded object, so mutate it on the
+    // loaded activity document and persist that document explicitly (the
+    // in-place mutation alone is lost on the next disk read).
+    const activity = loadCargoMoverActivity();
+    const progress = activity.itemProgress[`${bot.username}:${configItem.itemId}`];
     if (progress) {
       progress.totalDelivered = newDelivered;
       progress.lastUpdatedAt = new Date().toISOString();
       if (progress.targetQuantity > 0 && newDelivered >= progress.targetQuantity) {
         progress.isComplete = true;
       }
+      saveCargoMoverActivity(activity);
     }
 
     changed.push({

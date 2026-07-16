@@ -150,6 +150,47 @@ export function getBotStatuses(): BotStatus[] {
     .map((b) => b.status());
 }
 
+/**
+ * Get the combined fleet status across EVERY connected client for fleet rescue.
+ *
+ * This is what the rescue routine's `getFleetStatus` is wired to. It returns the
+ * local bots plus, when client-sync is active, the bots reported by every other
+ * connected client — either by polling the master directly (this node is the
+ * master) or by asking the slave's master for the cross-client fleet poll. The
+ * result is de-duplicated by username with local data taking precedence, so a
+ * rescue bot sees its own fleet plus the whole connected fleet's fuel/positions
+ * in one list — without each stranded bot having to request a rescue itself.
+ *
+ * The cross-client poll is best-effort: any failure falls back to local-only
+ * statuses so rescue across this node's own bots still works.
+ */
+export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
+  const local = getBotStatuses();
+  const localNames = new Set(local.map((b) => b.username));
+
+  let remote: Array<Record<string, unknown>> = [];
+  const master = (globalThis as { syncMaster?: import("./client_sync_master.js").ClientSyncMaster }).syncMaster;
+  const slave = (globalThis as { syncSlave?: import("./client_sync_slave.js").ClientSyncSlave }).syncSlave;
+  try {
+    if (master) {
+      remote = await master.requestFleetRescuePoll();
+    } else if (slave) {
+      remote = await slave.pullFleetRescue();
+    }
+  } catch {
+    // fall back to local-only fleet
+  }
+
+  const merged: BotStatus[] = [...local];
+  for (const r of remote) {
+    const username = (r.username as string) || "";
+    if (!username || localNames.has(username)) continue; // local wins / skip dupes
+    merged.push(r as unknown as BotStatus);
+  }
+  merged.sort((a, b) => a.username.localeCompare(b.username));
+  return merged;
+}
+
 /** Get the bot-to-bot chat channel service (for routines to use). */
 export function getBotChatChannel() {
   return botChatChannel;
@@ -1390,7 +1431,10 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   }
 
   const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort")
-    ? { getFleetStatus: () => [...bots.values()].map(b => b.status()) }
+    ? {
+        getFleetStatus: () => [...bots.values()].map(b => b.status()),
+        getFleetStatusAsync: () => getCombinedFleetStatus(),
+      }
     : undefined;
 
   // Add bot chat functions to all routines

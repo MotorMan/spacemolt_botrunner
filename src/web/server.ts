@@ -1437,6 +1437,14 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
             return Response.json(this.syncMaster?.getBots() ?? [], { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/fleet-poll" && req.method === "GET") {
+            // Cross-client fleet rescue poll: ask every connected client for its
+            // local bots' fuel status + positions and return the union. Used by
+            // rescue bots to see the whole connected fleet without each stranded
+            // bot having to request a rescue itself.
+            const poll = await this.syncMaster?.requestFleetRescuePoll();
+            return Response.json(poll ?? [], { headers: cors });
+          }
           if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
             return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });
           }

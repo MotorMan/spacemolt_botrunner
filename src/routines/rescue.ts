@@ -5253,7 +5253,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Check fleet status (only if not resuming and no manual rescue) ──
     if (!recoveredSession && !manualRescueTarget) {
       yield "scan_fleet";
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Cross-client fleet rescue poll: ask every connected client for its local
+      // bots' fuel status + positions (via the synced client-connect channel),
+      // so we see the whole connected fleet here instead of relying on each
+      // stranded bot broadcasting a rescue request. Falls back to the local
+      // fleet when client-sync isn't active.
+      const fleet = (await ctx.getFleetStatusAsync?.()) || ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
         ctx.log("info", "No fleet data available — waiting...");
         await ctx.sleep(settings.scanIntervalSec * 1000);
@@ -5261,6 +5266,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Mark all fleet bots as "own" so we never ghost them or blacklist them, even across restarts
+      const remoteMembers = fleet.filter((m) => (m as unknown as Record<string, unknown>)._clientId);
+      if (remoteMembers.length > 0) {
+        const clients = new Set(remoteMembers.map((m) => String((m as unknown as Record<string, unknown>)._clientLabel || (m as unknown as Record<string, unknown>)._clientId)));
+        ctx.log("rescue", `🌐 Cross-client fleet poll: ${remoteMembers.length} bot(s) from ${clients.size} other client(s) in combined fleet`);
+      }
       for (const member of fleet) {
         if (member.username !== bot.username && !isOwnBot(member.username)) {
           markAsOwnBot(member.username);

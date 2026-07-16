@@ -234,4 +234,53 @@ export class ClientSyncMaster {
     }
     return out;
   }
+
+  /**
+   * Cross-client fleet rescue poll.
+   *
+   * Instead of having every stranded bot broadcast a rescue request (which has
+   * to round-trip through the synced bot-chat channel and is easy to miss), the
+   * rescue bot *itself* polls each connected client for that client's local
+   * bots' fuel status + positions — exactly the data the rescue bot would read
+   * if it were running locally inside every other client. We hit each client's
+   * own `/api/client-sync/bots` endpoint (the non-API, client-connect side of
+   * the sync channel) and return the union of every client's bots.
+   *
+   * This is what powers fleet rescue across the whole connected fleet without
+   * the stranded bots needing to do anything special: a single rescue bot polls
+   * all clients and sees every bot's fuel/position in one place. Returns an
+   * empty array (never throws) if no clients advertise a reachable URL.
+   */
+  public async requestFleetRescuePoll(): Promise<Array<Record<string, unknown>>> {
+    const combined: Array<Record<string, unknown>> = [];
+    for (const [clientId, c] of this.clients) {
+      if (!c.selfUrl) continue;
+      try {
+        const data = await peerRequest(
+          c.selfUrl,
+          "/api/client-sync/bots",
+          this.apiKey,
+          this.password || "",
+        );
+        if (Array.isArray(data)) {
+          for (const s of data) {
+            const entry = { ...(s as Record<string, unknown>) } as Record<string, unknown>;
+            entry._clientId = clientId;
+            entry._clientLabel = c.label;
+            combined.push(entry);
+          }
+        }
+      } catch {
+        // A single unreachable client must not break the whole fleet poll.
+        continue;
+      }
+    }
+    return combined;
+  }
+}
+
+export async function pollFleetRescue(): Promise<Array<Record<string, unknown>>> {
+  const master = (globalThis as { syncMaster?: ClientSyncMaster }).syncMaster;
+  if (!master) return [];
+  return master.requestFleetRescuePoll();
 }

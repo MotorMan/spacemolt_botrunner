@@ -226,6 +226,37 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
   }
 
   /**
+   * Pull the master's cross-client fleet rescue poll: a single request that asks
+   * every connected client for its local bots' fuel status + positions and
+   * returns the union. This is how a rescue bot running on a *slave* node sees
+   * the whole connected fleet — it polls the master once instead of each bot
+   * needing to request its own rescue over the synced bot-chat channel.
+   *
+   * Returns this node's own local bot statuses on failure (so a rescue bot on a
+   * disconnected slave still sees its own fleet). Never throws.
+   */
+  public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
+    if (!this.clientId) return this.localFleetStatuses();
+    try {
+      const data = await this.request<Array<Record<string, unknown>>>("/api/client-sync/fleet-poll");
+      if (Array.isArray(data)) return data;
+    } catch {
+      // fall back to local-only fleet status
+    }
+    return this.localFleetStatuses();
+  }
+
+  /** This node's own local bot statuses (used as a fallback for fleet rescue). */
+  private async localFleetStatuses(): Promise<Array<Record<string, unknown>>> {
+    try {
+      const { getBotStatuses } = await import("./botmanager.js");
+      return (getBotStatuses() as unknown[]) as Array<Record<string, unknown>>;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Two-way file sync against the master.
    *
    * PULL: fetch the master's combined repository listing and merge any file

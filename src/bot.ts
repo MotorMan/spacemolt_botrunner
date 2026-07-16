@@ -91,6 +91,8 @@ export interface RoutineContext {
   getFleetStatus?: () => BotStatus[];
   /** Optional: get fresh status for a specific bot by name (used by rescue routine for credit checks). */
   getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
+  /** Optional: get fleet status across ALL connected clients (cross-client rescue poll). */
+  getFleetStatusAsync?: () => Promise<BotStatus[]>;
   /** Optional: send a chat message to other bots. */
   sendBotChat?: (
     content: string,

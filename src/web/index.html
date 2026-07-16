@@ -29022,9 +29022,17 @@ ignoreBlacklist: document.getElementById(
           const detail = (data.changed || []).map(c => `${c.itemName}: ${c.oldDelivered}→${c.newDelivered}`).join(", ");
           const stationNote = data.stationId ? ` [station_id=${data.stationId}]` : "";
           const errNote = data.readError ? ` READ ERROR: ${data.readError}` : "";
-          if (statusEl) statusEl.textContent = `Reconciled ${data.reconciled} item(s)${stationNote}${errNote}${detail ? ": " + detail : ""}`;
+          const summary = `Reconciled ${data.reconciled} item(s)${stationNote}${errNote}${detail ? ":\n" + detail : ""}`;
+          // Log to console so it survives the panel re-render below, and alert so
+          // the diagnostic (station_id / read error / changes) is impossible to miss.
+          console.log("[cargo_mover reconcile]", JSON.stringify(data, null, 2));
+          window.alert(summary);
+          // Re-render AFTER the alert; the re-render destroys cm-admin-status, so
+          // we can't rely on the status line to show the result.
           renderCargoMoverSettings(document.getElementById("settingsContent"));
           refreshCargoMoverLiveStatuses();
+          const statusEl2 = document.getElementById("cm-admin-status");
+          if (statusEl2) statusEl2.textContent = summary;
         } catch (e) {
           if (statusEl) statusEl.textContent = `Error: ${e.message}`;
           alert("Reconcile failed: " + e.message);

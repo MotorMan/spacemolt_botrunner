@@ -33247,6 +33247,7 @@ ignoreBlacklist: document.getElementById(
         const remoteBotNameStyle = cs.remoteBotNameStyle || "prefix";
         const selfUrl = cs.selfUrl || "";
         const syncWildlife = cs.syncWildlife !== false;
+        const disabledSyncFiles = Array.isArray(cs.disabledSyncFiles) ? cs.disabledSyncFiles : [];
 
         if (mode === "master" && !apiKey) {
           // No key present yet (e.g. first-time master). Generate one locally
@@ -33431,6 +33432,23 @@ ignoreBlacklist: document.getElementById(
             <option value="suffix" ${remoteBotNameStyle === "suffix" ? "selected" : ""}>Suffix</option>
           </select>
         </div>
+
+        <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+          <div style="margin-bottom:4px;font-size:13px;font-weight:500;color:var(--text-bright)">Per-File Sync</div>
+          <div class="setting-hint" style="margin-bottom:8px">
+            The raw file sync copies every data file to/from the combined repo, which can
+            overwrite personal per-client state (last used routine, stopped state, loadouts, …).
+            Uncheck a file to stop syncing/overwriting it entirely (no pull, no push).
+          </div>
+          <div style="margin-bottom:8px;display:flex;gap:8px;flex-wrap:wrap">
+            <button class="sm" onclick="refreshClientSyncFileList()">Refresh File List</button>
+            <button class="sm" onclick="setAllClientSyncFiles(true)">Enable All</button>
+            <button class="sm" onclick="setAllClientSyncFiles(false)">Disable All</button>
+          </div>
+          <div id="clientSyncFileList" data-disabled='${esc(JSON.stringify(disabledSyncFiles))}' style="font-size:12px;color:var(--text-dim);max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:4px;padding:8px">
+            Loading file list...
+          </div>
+        </div>
       </div>
 
       <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
@@ -33452,6 +33470,79 @@ ignoreBlacklist: document.getElementById(
       </div>
     </div>
   `;
+        // Populate the per-file toggle list once the DOM is in place.
+        setTimeout(() => refreshClientSyncFileList(), 0);
+      }
+
+      // Fetch the list of syncable files and render a checkbox per file. The
+      // container's data-disabled attribute holds the currently-disabled paths
+      // (from settings). Checked = synced, unchecked = opted out (no pull/push).
+      function refreshClientSyncFileList() {
+        const container = document.getElementById("clientSyncFileList");
+        if (!container) return;
+        let disabled = [];
+        try {
+          disabled = JSON.parse(container.getAttribute("data-disabled") || "[]");
+        } catch (e) {
+          disabled = [];
+        }
+        const disabledSet = new Set(disabled);
+        fetch("/api/client-sync/synced-file-list")
+          .then((r) => r.json())
+          .then((data) => {
+            const paths = (data && Array.isArray(data.paths)) ? data.paths : [];
+            // Keep any disabled paths that no longer exist locally so toggling
+            // them off still persists (e.g. file present only on other clients).
+            for (const d of disabled) {
+              if (!paths.includes(d)) paths.push(d);
+            }
+            paths.sort();
+            if (paths.length === 0) {
+              container.textContent = "No syncable files found.";
+              return;
+            }
+            container.innerHTML = paths
+              .map((p) => {
+                const on = !disabledSet.has(p);
+                return `<label class="checkbox-label" style="display:flex;align-items:center;gap:6px;padding:2px 0">
+                  <input type="checkbox" class="client-sync-file-toggle" data-path="${esc(p)}" ${on ? "checked" : ""} onchange="saveClientSyncSettings()">
+                  <span>${esc(p)}</span>
+                </label>`;
+              })
+              .join("");
+          })
+          .catch(() => {
+            container.textContent = "Failed to load file list.";
+          });
+      }
+
+      function setAllClientSyncFiles(enabled) {
+        document
+          .querySelectorAll(".client-sync-file-toggle")
+          .forEach((el) => {
+            el.checked = enabled;
+          });
+        saveClientSyncSettings();
+      }
+
+      // Collect the disabled (unchecked) file paths from the rendered toggles.
+      // If the list hasn't been rendered yet, fall back to the previously-saved
+      // disabled list stored on the container so we never wipe it on save.
+      function collectDisabledSyncFiles() {
+        const toggles = document.querySelectorAll(".client-sync-file-toggle");
+        if (toggles.length === 0) {
+          const container = document.getElementById("clientSyncFileList");
+          try {
+            return JSON.parse(container?.getAttribute("data-disabled") || "[]");
+          } catch (e) {
+            return [];
+          }
+        }
+        const disabled = [];
+        toggles.forEach((el) => {
+          if (!el.checked) disabled.push(el.getAttribute("data-path"));
+        });
+        return disabled;
       }
 
       function updateClientSyncModeUI() {
@@ -33648,6 +33739,7 @@ ignoreBlacklist: document.getElementById(
               "set-client_sync-pushLocalDiscoveries",
             ).checked,
             selfUrl: document.getElementById("set-client_sync-selfUrl").value,
+            disabledSyncFiles: collectDisabledSyncFiles(),
           },
         };
         settings = Object.assign({}, settings, newSettings);

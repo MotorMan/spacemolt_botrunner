@@ -1018,6 +1018,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
       remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
       pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
       selfUrl: ((s.selfUrl as string) || ""),
+      disabledSyncFiles: Array.isArray(s.disabledSyncFiles) ? (s.disabledSyncFiles as string[]) : [],
     };
     const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
     if (newSettings.enabled && newSettings.mode === "slave" && newSettings.masterUrl) {
@@ -1035,6 +1036,13 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
         delete (globalThis as any).syncSlave;
         server.logSystem(`Client sync slave stopped`);
       }
+    }
+
+    // Keep a live master in sync with edited settings (per-file opt-out list,
+    // api key, password, mode) so changes apply without a restart.
+    const syncMaster = (globalThis as any).syncMaster as import("./client_sync_master.js").ClientSyncMaster | undefined;
+    if (syncMaster) {
+      syncMaster.updateSettings(s);
     }
   }
   
@@ -2041,6 +2049,7 @@ async function main(): Promise<void> {
       remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
       pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,
       selfUrl: (csSettings.selfUrl as string) || "",
+      disabledSyncFiles: Array.isArray(csSettings.disabledSyncFiles) ? (csSettings.disabledSyncFiles as string[]) : [],
     };
     if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
       const syncSlave = new ClientSyncSlave(clientSyncSettings);

@@ -563,6 +563,7 @@ if (!this.settings.fuel_service) {
         remoteBotNameStyle: "prefix",
         pushLocalDiscoveries: true,
         selfUrl: "",
+        disabledSyncFiles: [],
       };
       saveSettings(this.settings);
     }

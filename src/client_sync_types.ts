@@ -20,6 +20,14 @@ export interface SyncSettings {
   remoteBotNameStyle: "prefix" | "suffix";
   pushLocalDiscoveries: boolean;
   selfUrl?: string;
+  /**
+   * Per-file opt-out list for the raw file sync. Any relative data-dir path
+   * (e.g. `lastUsedRoutine.json`, `personalities/foo.json`) present here is
+   * neither pulled/overwritten from the master nor pushed up to it. This lets
+   * a client keep personal per-client state (last used routine, stopped state,
+   * loadouts, …) instead of having it clobbered by the combined repo.
+   */
+  disabledSyncFiles?: string[];
 }
 
 export interface RegisteredClient {

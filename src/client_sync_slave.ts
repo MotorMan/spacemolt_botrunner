@@ -269,6 +269,13 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
    * master and POST any that changed. The master deep-merges them into the
    * combined repo, so every other client converges on our writes.
    */
+  /** True if this file path has been opted out of sync via settings. */
+  private isFileSyncDisabled(relPath: string): boolean {
+    const disabled = this.settings.disabledSyncFiles;
+    if (!Array.isArray(disabled) || disabled.length === 0) return false;
+    return disabled.includes(relPath);
+  }
+
   private async syncFiles(): Promise<void> {
     if (!this.clientId) return;
     const dataDir = join(process.cwd(), "data");
@@ -277,6 +284,9 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     const masterList = await this.request<{ files: FileEntry[] }>("/api/client-sync/local-files");
     if (masterList && Array.isArray(masterList.files)) {
       for (const f of masterList.files) {
+        // Skip files the user opted out of: don't let the combined repo
+        // overwrite this client's personal copy.
+        if (this.isFileSyncDisabled(f.path)) continue;
         const last = this.lastPulled.get(f.path);
         if (last === f.hash) continue;
         const content = await this.requestText(`/api/client-sync/local-file?path=${encodeURIComponent(f.path)}`);
@@ -300,6 +310,9 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     // ── PUSH to master ──
     const localList = listSyncedFiles(dataDir);
     for (const f of localList) {
+      // Skip files the user opted out of: don't upload this client's personal
+      // copy into the combined repo either.
+      if (this.isFileSyncDisabled(f.path)) continue;
       const last = this.lastPushed.get(f.path);
       if (last === f.hash) continue;
       const content = readSyncedFile(dataDir, f.path);

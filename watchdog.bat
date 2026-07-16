@@ -6,7 +6,7 @@ REM Normal shutdown (exit code 0) will not trigger restart
 
 setlocal enabledelayedexpansion
 
-set RESTART_DELAY=30
+set RESTART_DELAY=5
 set MANUAL_RESTART_DELAY=5
 set SCRIPT_DIR=%~dp0
 

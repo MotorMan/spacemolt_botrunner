@@ -20631,7 +20631,8 @@ When responding:
         if (!docked) {
           return `<div class="faction-section" id="stationCommandCenter">
       <div class="faction-section-title">Station Command Center</div>
-      <div style="color:var(--yellow);font-size:12px">Bot must be docked at a station to view base stats. Station name/description editors and base stats are unavailable until docked.</div>
+      <div style="color:var(--yellow);font-size:12px">Bot must be docked at a station to view base stats. Station name/description editors, base stats, and station fee controls are unavailable until docked.</div>
+      ${renderStationEconomyTaxes(f, username, docked)}
     </div>`;
         }
         const base = stationBaseStats;
@@ -20690,6 +20691,7 @@ When responding:
         return `<div class="faction-section" id="stationCommandCenter">
       <div class="faction-section-title">Station Command Center</div>
       ${statsHtml}
+      ${renderStationEconomyTaxes(f, username, docked)}
     </div>`;
       }
 
@@ -20754,6 +20756,268 @@ When responding:
             fetchStationBaseStats(username);
           } else {
             appendLine("system", `set_public failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      // ── Station Economy & Taxes card ─────────────────────────
+      // Station fee/pricing setters (docked owner only) plus tax preview/prepay
+      // tools for the selected pilot and their faction. Fee setters go through
+      // bot.exec("facility", {action, ...}); tax tools use the dedicated
+      // get_tax_estimate / prepay_tax / get_faction_tax_estimate /
+      // faction_prepay_tax commands (already bridged in commandBridge.ts).
+      function renderStationEconomyTaxes(f, username, docked) {
+        const b = (stationBaseStats && stationBaseStats.base) || {};
+        // Current values seeded from get_base when available.
+        const marketFeePct = b.market_fee_bps != null ? Math.round(b.market_fee_bps / 100) : "";
+        const refuelPrice = b.refuel_price_each != null ? b.refuel_price_each : "";
+        const repairPrice = b.repair_price_per_hull != null ? b.repair_price_per_hull : "";
+        const autoBuyFuel = !!b.auto_buy_fuel;
+        const allowOutsiders = !!b.allow_outsider_facilities;
+
+        const toggle = `<div class="faction-section-title" style="cursor:pointer;user-select:none" onclick="toggleStationEcon('${esc(username)}')">${stationEconOpen ? "▼" : "▶"} Station Economy &amp; Taxes</div>`;
+        if (!stationEconOpen) {
+          return `<div class="faction-section" style="margin-top:14px" id="stationEconCard">${toggle}</div>`;
+        }
+
+        // Fee/pricing setters require docking + station ownership.
+        const feeControls = docked ? `
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">Station fees &amp; pricing (owner/admin, applies to the docked station):</div>
+      <div class="station-econ-grid" style="display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center">
+        <label class="fsl">Market Fee %</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="number" id="econ-market-fee" min="0" max="10" step="1" value="${marketFeePct}" placeholder="0-10" style="width:80px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px" />
+          <button class="sm" onclick="stationSetMarketFee('${esc(username)}')">Set</button>
+        </div>
+        <label class="fsl">Refuel Price /fuel</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="number" id="econ-refuel-price" min="0" step="1" value="${refuelPrice}" placeholder="cr per fuel" style="width:80px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px" />
+          <button class="sm" onclick="stationSetRefuelPrice('${esc(username)}')">Set</button>
+        </div>
+        <label class="fsl">Repair Price /hull</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="number" id="econ-repair-price" min="0" step="1" value="${repairPrice}" placeholder="cr per hull" style="width:80px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px" />
+          <button class="sm" onclick="stationSetRepairPrice('${esc(username)}')">Set</button>
+        </div>
+        <label class="fsl">Auto-Buy Fuel</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:${autoBuyFuel ? "var(--green)" : "var(--text-dim)"}">${autoBuyFuel ? "On" : "Off"}</span>
+          <button class="sm" onclick="stationSetAutoBuyFuel('${esc(username)}', ${autoBuyFuel ? "false" : "true"})">${autoBuyFuel ? "Turn Off" : "Turn On"}</button>
+        </div>
+        <label class="fsl">Outsider Builds</label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:11px;color:${allowOutsiders ? "var(--green)" : "var(--text-dim)"}">${allowOutsiders ? "Allowed" : "Blocked"}</span>
+          <button class="sm" onclick="stationSetBuildPolicy('${esc(username)}', ${allowOutsiders ? "false" : "true"})">${allowOutsiders ? "Block Outsiders" : "Allow Outsiders"}</button>
+        </div>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:4px">Load base stats above to pre-fill current values. Values apply per-tick (1 mutation / 10s).</div>
+` : `<div style="font-size:11px;color:var(--yellow);margin-bottom:8px">Dock at your station to adjust market fee, refuel/repair prices, auto-buy fuel, and build policy.</div>`;
+
+        return `<div class="faction-section" style="margin-top:14px" id="stationEconCard">
+      ${toggle}
+      ${feeControls}
+      <div style="border-top:1px solid var(--border);margin:12px 0 8px"></div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">Tax tools (preview what's owed and prepay ahead of the next assessment):</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <button class="sm" onclick="fetchStationTaxEstimate('${esc(username)}')">Preview My Taxes</button>
+        <button class="sm" onclick="fetchStationFactionTaxEstimate('${esc(username)}')">Preview Faction Taxes</button>
+      </div>
+      <div id="stationTaxEstimate">${renderStationTaxEstimateHtml(username)}</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:10px">
+        <input type="number" id="econ-prepay-personal" min="1" step="1000" placeholder="credits" style="width:110px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px" />
+        <button class="sm" onclick="stationPrepayTax('${esc(username)}')">Prepay My Tax</button>
+        <input type="number" id="econ-prepay-faction" min="1" step="1000" placeholder="credits" style="width:110px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px" />
+        <button class="sm" onclick="stationFactionPrepayTax('${esc(username)}')">Prepay Faction Tax</button>
+      </div>
+    </div>`;
+      }
+
+      function renderStationTaxEstimateHtml(username) {
+        const parts = [];
+        const t = stationTaxData;
+        if (t) {
+          const owed = t.income_tax_total != null ? t.income_tax_total : 0;
+          const propOwed = t.property_tax_total != null ? t.property_tax_total : 0;
+          const prepaid = t.tax_prepaid != null ? t.tax_prepaid : 0;
+          const active = t.tax_collection_active ? '<span style="color:var(--green)">active</span>' : '<span style="color:var(--text-dim)">inactive</span>';
+          const nextSec = t.next_assessment_approx_seconds != null ? t.next_assessment_approx_seconds : null;
+          const rates = Array.isArray(t.sales_tax_rates)
+            ? t.sales_tax_rates.map((r) => `${esc(r.empire)}: ${(r.rate_bps / 100).toFixed(2)}%`).join(", ")
+            : "";
+          parts.push(`<div style="font-size:11px;padding:6px 8px;background:var(--bg-input);border-radius:4px;margin-bottom:6px">
+        <div style="font-weight:600;color:var(--cyan);margin-bottom:3px">My Taxes</div>
+        <div>Income tax owed: <b>${num(owed)} cr</b> &nbsp; Property tax: <b>${num(propOwed)} cr</b></div>
+        <div>Prepaid: ${num(prepaid)} cr &nbsp; Collection: ${active}${nextSec != null ? ` &nbsp; Next assessment: ~${Math.round(nextSec / 60)}m` : ""}</div>
+        ${rates ? `<div style="color:var(--text-dim)">Sales tax: ${rates}</div>` : ""}
+        ${t.taxable_income_to_date != null ? `<div style="color:var(--text-dim)">Taxable income to date: ${num(t.taxable_income_to_date)} cr</div>` : ""}
+      </div>`);
+        }
+        const ft = stationFactionTaxData;
+        if (ft) {
+          const owed = ft.income_tax_total != null ? ft.income_tax_total : 0;
+          const prepaid = ft.tax_prepaid != null ? ft.tax_prepaid : 0;
+          const active = ft.tax_collection_active ? '<span style="color:var(--green)">active</span>' : '<span style="color:var(--text-dim)">inactive</span>';
+          const nextSec = ft.next_assessment_approx_seconds != null ? ft.next_assessment_approx_seconds : null;
+          const net = ft.net_taxable_profit != null ? ft.net_taxable_profit : null;
+          const rows = Array.isArray(ft.income_tax)
+            ? ft.income_tax.map((r) => `${esc(r.empire)}: ${(r.rate_bps / 100).toFixed(2)}% → ${num(r.owed || 0)} cr`).join("<br>")
+            : "";
+          parts.push(`<div style="font-size:11px;padding:6px 8px;background:var(--bg-input);border-radius:4px;margin-bottom:6px">
+        <div style="font-weight:600;color:var(--orange);margin-bottom:3px">Faction Taxes${ft.faction_name ? ` — ${esc(ft.faction_name)}` : ""}</div>
+        <div>Corporate income tax owed: <b>${num(owed)} cr</b> &nbsp; Prepaid: ${num(prepaid)} cr</div>
+        <div>Collection: ${active}${nextSec != null ? ` &nbsp; Next: ~${Math.round(nextSec / 60)}m` : ""}${net != null ? ` &nbsp; Net taxable profit: ${num(net)} cr` : ""}</div>
+        ${rows ? `<div style="color:var(--text-dim);margin-top:3px">${rows}</div>` : ""}
+      </div>`);
+        }
+        if (!parts.length) {
+          return '<div class="faction-no-data" style="font-size:11px">Click a preview button to estimate taxes.</div>';
+        }
+        return parts.join("");
+      }
+
+      function toggleStationEcon(username) {
+        stationEconOpen = !stationEconOpen;
+        if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+      }
+
+      // ── Fee / pricing setters (facility actions) ──────────────
+      function stationSetMarketFee(username) {
+        const el = document.getElementById("econ-market-fee");
+        if (!el) return;
+        const fee_percent = parseInt(el.value, 10);
+        if (isNaN(fee_percent) || fee_percent < 0 || fee_percent > 10) {
+          appendLine("system", "Market fee must be an integer 0-10.");
+          return;
+        }
+        sendExec(username, "facility", { action: "set_market_fee", fee_percent }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Market fee set to ${fee_percent}%`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_market_fee failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationSetRefuelPrice(username) {
+        const el = document.getElementById("econ-refuel-price");
+        if (!el) return;
+        const price = parseInt(el.value, 10);
+        if (isNaN(price) || price < 0) {
+          appendLine("system", "Refuel price must be a non-negative integer.");
+          return;
+        }
+        sendExec(username, "facility", { action: "set_refuel_price", price }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Refuel price set to ${price} cr/fuel`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_refuel_price failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationSetRepairPrice(username) {
+        const el = document.getElementById("econ-repair-price");
+        if (!el) return;
+        const price = parseInt(el.value, 10);
+        if (isNaN(price) || price < 0) {
+          appendLine("system", "Repair price must be a non-negative integer.");
+          return;
+        }
+        sendExec(username, "facility", { action: "set_repair_price", price }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Repair price set to ${price} cr/hull`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_repair_price failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationSetAutoBuyFuel(username, value) {
+        sendExec(username, "facility", { action: "set_auto_buy_fuel", auto_buy_fuel: value }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Auto-buy fuel set to ${value}`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_auto_buy_fuel failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationSetBuildPolicy(username, value) {
+        sendExec(username, "facility", { action: "set_build_policy", allow_outsiders: value }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Outsider builds ${value ? "allowed" : "blocked"}`);
+            fetchStationBaseStats(username);
+          } else {
+            appendLine("system", `set_build_policy failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      // ── Tax preview / prepay ──────────────────────────────────
+      function unwrapExec(data) {
+        return (data && (data.structuredContent || data.result || data)) || {};
+      }
+
+      function fetchStationTaxEstimate(username) {
+        sendExec(username, "get_tax_estimate", {}, (result) => {
+          if (!result.ok || !result.data) {
+            appendLine("system", `get_tax_estimate failed: ${result.error || "no data"}`);
+            return;
+          }
+          stationTaxData = unwrapExec(result.data);
+          const el = document.getElementById("stationTaxEstimate");
+          if (el) el.innerHTML = renderStationTaxEstimateHtml(username);
+        });
+      }
+
+      function fetchStationFactionTaxEstimate(username) {
+        sendExec(username, "get_faction_tax_estimate", {}, (result) => {
+          if (!result.ok || !result.data) {
+            appendLine("system", `get_faction_tax_estimate failed: ${result.error || "no data"}`);
+            return;
+          }
+          stationFactionTaxData = unwrapExec(result.data);
+          const el = document.getElementById("stationTaxEstimate");
+          if (el) el.innerHTML = renderStationTaxEstimateHtml(username);
+        });
+      }
+
+      function stationPrepayTax(username) {
+        const el = document.getElementById("econ-prepay-personal");
+        if (!el) return;
+        const amount = parseInt(el.value, 10);
+        if (isNaN(amount) || amount <= 0) {
+          appendLine("system", "Prepay amount must be a positive integer.");
+          return;
+        }
+        sendExec(username, "prepay_tax", { amount }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Prepaid ${num(amount)} cr toward personal tax`);
+            fetchStationTaxEstimate(username);
+          } else {
+            appendLine("system", `prepay_tax failed: ${result.error || "unknown"}`);
+          }
+        });
+      }
+
+      function stationFactionPrepayTax(username) {
+        const el = document.getElementById("econ-prepay-faction");
+        if (!el) return;
+        const amount = parseInt(el.value, 10);
+        if (isNaN(amount) || amount <= 0) {
+          appendLine("system", "Prepay amount must be a positive integer.");
+          return;
+        }
+        sendExec(username, "faction_prepay_tax", { amount }, (result) => {
+          if (result.ok) {
+            appendLine("system", `${username}: Prepaid ${num(amount)} cr toward faction tax`);
+            fetchStationFactionTaxEstimate(username);
+          } else {
+            appendLine("system", `faction_prepay_tax failed: ${result.error || "unknown"}`);
           }
         });
       }
@@ -22208,6 +22472,9 @@ When responding:
       let stationStorageSort = "alpha";
       let stationTrackedPrev = {};       // itemId -> last qty for delta
       let stationFacilityRenameOpen = {}; // facId -> bool
+      let stationEconOpen = false;       // Station Economy & Taxes card expanded
+      let stationTaxData = null;         // get_tax_estimate result (personal)
+      let stationFactionTaxData = null;  // get_faction_tax_estimate result
 
       // Catalog ids of all player_station_buildable facilities (44 total).
       function getPlayerStationBuildableIds() {

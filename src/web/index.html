@@ -19268,6 +19268,10 @@ When responding:
           startFactionQueueUsageAutoRefresh(factionSelectedBot);
         }
         if (panel === "station" && factionSelectedBot) {
+          const bot = bots.find((b) => b.username === factionSelectedBot);
+          const docked = bot ? bot.docked : false;
+          // Auto-load station facilities (docked bot required by the API).
+          if (docked) fetchStationFacilities(factionSelectedBot);
           // Auto-calculate maintenance if we already have facility data.
           const sum = document.getElementById("stationMaintenanceSummary");
           if (sum && stationFacilitiesData && stationFacilitiesData.length > 0) {
@@ -20722,13 +20726,15 @@ When responding:
                 : Array.isArray(d.facilities)
                   ? d.facilities
                   : [];
-            // Keep only player-station facilities (service/infrastructure/defense),
-            // which are the same entries returned by `facility faction_list`.
-            const facilities = all.filter((fac) => isStationFacility(fac));
+            const matched = all.filter((fac) => isStationFacility(fac));
+            // TEMP DEBUG: show how many came back and a sample so we can see the
+            // live shape. Remove once the filter is confirmed working.
+            const debugHtml = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">DEBUG: ${all.length} total facilities, ${matched.length} matched as station. Sample keys: ${all.length ? esc(Object.keys(all[0]).join(",")) : "none"}</div>` + (all.length ? `<pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow:auto">${esc(JSON.stringify(all.slice(0, 3), null, 1))}</pre>` : "");
+            const facilities = matched;
             stationFacilitiesData = facilities;
             if (facilities.length === 0) {
               container.innerHTML =
-                '<div class="faction-no-data">No station facilities at this station.</div>';
+                debugHtml + '<div class="faction-no-data">No station facilities at this station.</div>';
               return;
             }
             facilities.sort((a, b) =>
@@ -20738,7 +20744,7 @@ When responding:
                   (b.name || b.facility_type || b.type || "?").toLowerCase(),
                 ),
             );
-            container.innerHTML = facilities
+            container.innerHTML = debugHtml + facilities
               .map((fac) => {
                 const name = fac.name || fac.facility_type || fac.type || "?";
                 const facId = fac.facility_id || fac.id || "";

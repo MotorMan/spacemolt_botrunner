@@ -20869,21 +20869,49 @@ When responding:
         }
 
         let allGood = true;
+        // Cycle timing: one maintenance cycle is 100 ticks; 1 tick = 10s real time.
+        const TICKS_PER_CYCLE = 100;
+        const SECONDS_PER_TICK = 10;
+        const SECS_PER_CYCLE = TICKS_PER_CYCLE * SECONDS_PER_TICK;
+        const fmtDuration = (secs) => {
+          if (secs === Infinity) return "—";
+          const d = Math.floor(secs / 86400);
+          const h = Math.floor((secs % 86400) / 3600);
+          const m = Math.floor((secs % 3600) / 60);
+          const s = Math.floor(secs % 60);
+          if (d > 0) return `${d}d ${h}h`;
+          if (h > 0) return `${h}h ${m}m`;
+          if (m > 0) return `${m}m ${s}s`;
+          return `${s}s`;
+        };
         const rows = Object.entries(totals)
           .sort((a, b) => a[0].localeCompare(b[0]))
           .map(([itemId, need]) => {
             const have =
-              (inv.items[itemId] || 0) + (inv.storage[itemId] || 0);
+              (inv.items[itemId] || 0) +
+              (inv.storage[itemId] || 0) +
+              (inv.factionStorage[itemId] || 0);
             const ok = have >= need;
             if (!ok) allGood = false;
             const haveStr = num(have);
             const color = ok ? "var(--green)" : "var(--red)";
+            // Estimate until depletion at the current per-cycle burn. Excess stock
+            // (have above this round's need) is consumed first, then it goes short.
+            const cyclesLeft = need > 0 ? have / need : Infinity;
+            const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+            const depletion =
+              have <= 0
+                ? "depleted"
+                : need <= 0
+                  ? "—"
+                  : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`;
             return `<tr>
           <td style="padding:4px 8px">${esc(catalogName(itemId))}</td>
           <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim)">${esc(itemId)}</td>
           <td style="padding:4px 8px;text-align:right;font-weight:600">${num(need)}</td>
           <td style="padding:4px 8px;text-align:right;color:${color}">${haveStr}</td>
           <td style="padding:4px 8px;text-align:right;color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+          <td style="padding:4px 8px;text-align:right;color:var(--text-dim);font-size:11px">${depletion}</td>
         </tr>`;
           })
           .join("");
@@ -20908,46 +20936,54 @@ When responding:
             <th style="padding:4px 8px;text-align:right">Need/round</th>
             <th style="padding:4px 8px;text-align:right">You have</th>
             <th style="padding:4px 8px;text-align:right">Status</th>
+            <th style="padding:4px 8px;text-align:right">Est. until depletion</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
       </table>
-      <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage on this bot. Refresh after delivering items.</div>
+      <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes the current 100-tick (1000s) maintenance cycle; it is an estimate and does not account for unknown cycle start timing. Refresh after delivering items.</div>
       ${contribHtml}
     `;
       }
 
-      // Collect cargo + personal station storage for the given bot.
+      // Collect cargo + personal station storage + local faction storage for the given bot.
       async function collectStationInventory(username) {
         const items = {};
         const storage = {};
+        const factionStorage = {};
+        const addTo = (target, res) => {
+          if (!res || !res.ok || !res.data) return;
+          const arr =
+            res.data.items ||
+            res.data.storage ||
+            res.data.cargo ||
+            res.data ||
+            [];
+          const list = Array.isArray(arr) ? arr : Object.values(arr);
+          list.forEach((c) => {
+            const id = c.item_id || c.id;
+            if (id)
+              target[id] = (target[id] || 0) + (c.quantity || c.count || 0);
+          });
+        };
         // Cargo items via get_cargo.
         const cargoRes = await new Promise((resolve) => {
           sendExec(username, "get_cargo", {}, resolve);
         });
-        if (cargoRes && cargoRes.ok && cargoRes.data) {
-          const arr =
-            cargoRes.data.cargo || cargoRes.data.items || cargoRes.data || [];
-          const list = Array.isArray(arr) ? arr : Object.values(arr);
-          list.forEach((c) => {
-            const id = c.item_id || c.id;
-            if (id) items[id] = (items[id] || 0) + (c.quantity || c.count || 0);
-          });
-        }
+        addTo(items, cargoRes);
         // Personal station storage.
         const storeRes = await new Promise((resolve) => {
           sendExec(username, "view_storage", { target: "self" }, resolve);
         });
-        if (storeRes && storeRes.ok && storeRes.data) {
-          const arr =
-            storeRes.data.items || storeRes.data.storage || storeRes.data || [];
-          const list = Array.isArray(arr) ? arr : Object.values(arr);
-          list.forEach((c) => {
-            const id = c.item_id || c.id;
-            if (id) storage[id] = (storage[id] || 0) + (c.quantity || c.count || 0);
-          });
-        }
-        return { items, storage };
+        addTo(storage, storeRes);
+        // Local faction storage (view_faction_storage: { items: [...] }). The bot
+        // must be docked to the station to read it, which is also required to see
+        // the station facilities, so this is always valid here.
+        const facRes = await new Promise((resolve) => {
+          sendExec(username, "view_faction_storage", undefined, resolve);
+        });
+        addTo(factionStorage, facRes);
+        return { items, storage, factionStorage };
       }
 
       function renderFactionQueueUsage(f, username) {

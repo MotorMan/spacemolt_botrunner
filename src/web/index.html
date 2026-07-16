@@ -29020,7 +29020,9 @@ ignoreBlacklist: document.getElementById(
           const data = await resp.json();
           if (!resp.ok) throw new Error(data.error || "reconcile failed");
           const detail = (data.changed || []).map(c => `${c.itemName}: ${c.oldDelivered}→${c.newDelivered}`).join(", ");
-          if (statusEl) statusEl.textContent = `Reconciled ${data.reconciled} item(s)${detail ? ": " + detail : ""}`;
+          const stationNote = data.stationId ? ` [station_id=${data.stationId}]` : "";
+          const errNote = data.readError ? ` READ ERROR: ${data.readError}` : "";
+          if (statusEl) statusEl.textContent = `Reconciled ${data.reconciled} item(s)${stationNote}${errNote}${detail ? ": " + detail : ""}`;
           renderCargoMoverSettings(document.getElementById("settingsContent"));
           refreshCargoMoverLiveStatuses();
         } catch (e) {

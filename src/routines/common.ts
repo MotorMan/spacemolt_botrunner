@@ -170,6 +170,15 @@ export function isStationPoi(poi: SystemPOI): boolean {
   return poi.has_base || !!poi.base_id || (poi.type || "").toLowerCase() === "station";
 }
 
+/** True only when a station is KNOWN to offer a market. Avoids attempting buys at
+ *  stations whose services are undefined/unknown (which would error with no_market). */
+export function stationHasMarket(poi: SystemPOI | undefined): boolean {
+  if (!poi) return false;
+  const s = poi.services;
+  if (Array.isArray(s)) return s.includes("market");
+  return s?.market === true;
+}
+
 /** Find the first station POI in a list. Optionally filter by required service. */
 export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices, excludePirates: boolean = true): SystemPOI | null {
   if (requiredService) {
@@ -899,8 +908,7 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
     try {
       const { pois } = await getSystemInfo(ctx);
       const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
-      const hasMarket = station?.services?.market !== false;
-      if (hasMarket) {
+      if (stationHasMarket(station)) {
         const buyQty = Math.max(1, maxFuelCellsForCargo(ctx, id));
         if (buyQty > 0) {
           const buyResp = await bot.exec("buy", { item_id: id, quantity: buyQty });
@@ -914,6 +922,8 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
             }
           }
         }
+      } else {
+        ctx.log("trade", `Station has no market — skipping buy of ${id}`);
       }
     } catch { /* market unavailable — skip */ }
   }
@@ -974,6 +984,9 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
 /** Buy a single (best affordable) fuel cell from the market as a last-ditch top-up. */
 async function tryBuyOneFuelCell(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
+  const { pois } = await getSystemInfo(ctx);
+  const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+  if (!stationHasMarket(station)) return false;
   for (const { id } of FUEL_CELL_RANK) {
     if (maxFuelCellsForCargo(ctx, id) <= 0) continue;
     try {
@@ -1490,9 +1503,20 @@ export async function ensureFueled(
   // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
   // via the refuel command even while docked at a station.
   // Undock first so cargo fuel cells are used one at a time (refuel undocked = use cargo)
-  if (wasDocked) {
-    ctx.log("system", "Undocking to use cargo fuel cells before reaching for station fuel...");
+  //
+  // CRITICAL: Only undock if we actually HAVE fuel cells in cargo. Otherwise we
+  // pointlessly undock, fail the refuel, and then fall through to a market buy at a
+  // station that has no market. If cargo is empty, skip straight to the storage/market
+  // fallback which checks faction/station storage first and only buys where a market exists.
+  const cargoFuelCells = bot.inventory
+    .filter((i) => isFuelCellItemId(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
+
+  if (wasDocked && cargoFuelCells > 0) {
+    ctx.log("system", `Undocking to use ${cargoFuelCells} cargo fuel cells before reaching for station fuel...`);
     await ensureUndocked(ctx);
+  } else if (wasDocked && cargoFuelCells === 0) {
+    ctx.log("system", "No fuel cells in cargo — skipping cargo refuel, will source from storage/market");
   }
 
   let cargoFuelAttempts = 0;

@@ -1027,41 +1027,56 @@ function updateDeliveryTracking(
 export async function reconcileDeliveredWithDestination(
   ctx: RoutineContext,
   settings: CargoMoverSettings,
-): Promise<{ reconciled: number; changed: Array<{ itemId: string; itemName: string; oldDelivered: number; newDelivered: number }> }> {
+): Promise<{ reconciled: number; changed: Array<{ itemId: string; itemName: string; oldDelivered: number; newDelivered: number }>; stationId?: string | null; readError?: string }> {
   const { bot } = ctx;
   if (settings.destinationStorageType !== "faction") {
     ctx.log("cargo", `⚠️ Reconcile skipped: destination storage type is "${settings.destinationStorageType}" (only faction destinations can be reconciled)`);
-    return { reconciled: 0, changed: [] };
+    return { reconciled: 0, changed: [], stationId: settings.destinationStation, readError: "not a faction destination" };
   }
 
   // Remote read of the destination's faction storage (no need to travel there).
   //
-  // CRITICAL: view_faction_storage's `station_id` identifies a faction BASE by
+  // The server's view_faction_storage `station_id` identifies a faction BASE by
   // its base_id (e.g. "7d1f97987d5eb46bf603b8027e1eec8c"), which is exactly
-  // what the UI stores in settings.destinationStation. We must pass that value
-  // THROUGH UNCHANGED. Do NOT run it through mapStore.resolveStationTarget():
-  // mapStore keys POIs by their poi.id, so for a base_id reference it rewrites
-  // the id to a DIFFERENT poi id — and view_faction_storage then reads the WRONG
-  // station's storage, producing wildly wrong delivered counts. (When the stored
-  // reference is already a poi id the server accepts, this is a no-op.)
-  const stationId = settings.destinationStation;
-  const resolved = mapStore.resolveStationIdentity(stationId);
-  if (!resolved.matched) {
-    ctx.log("error", `⚠️ Reconcile failed: destination station "${stationId}" is not a known station in mapStore`);
-    return { reconciled: 0, changed: [] };
+  // what the UI stores in settings.destinationStation. We try several id forms
+  // in order until one returns data, so a base_id / poi_id / system|poi
+  // reference all work regardless of how the station was configured:
+  //   1. the raw configured value (usually the base_id the server wants)
+  //   2. mapStore's resolved POI hex id
+  // This guarantees we read the REAL destination and never silently fall back
+  // to whatever storage the bot last touched.
+  const candidates: string[] = [];
+  const raw = settings.destinationStation;
+  if (raw) {
+    candidates.push(raw);
+    const resolved = mapStore.resolveStationIdentity(raw);
+    if (resolved.matched && resolved.poiId && resolved.poiId !== raw) {
+      candidates.push(resolved.poiId);
+    }
   }
-  ctx.log("cargo", `🔄 Reconcile: reading destination faction storage (station_id=${stationId})`);
+  // De-dupe while preserving order.
+  const triedIds = [...new Set(candidates)];
 
-  // Do a DIRECT remote read — do NOT go through refreshFactionStorage, whose
-  // "Station not found" fallback silently keeps the bot's existing factionStorage
-  // (which the live cargo-mover routine keeps overwriting with the SOURCE
-  // station's data). Reading straight off the response guarantees we reconcile
-  // against the actual destination, not whatever storage the bot last touched.
-  const destResp = await bot.exec("view_faction_storage", { station_id: stationId });
-  if (destResp.error) {
-    ctx.log("error", `⚠️ Reconcile failed: could not read destination faction storage: ${destResp.error.message}`);
-    return { reconciled: 0, changed: [] };
+  let destResp: any = { error: { message: "no station configured" } };
+  let usedStationId: string | null = null;
+  for (const tryId of triedIds) {
+    ctx.log("cargo", `🔄 Reconcile: trying view_faction_storage station_id=${tryId}`);
+    const resp = await bot.exec("view_faction_storage", { station_id: tryId });
+    if (!resp.error) {
+      destResp = resp;
+      usedStationId = tryId;
+      break;
+    }
+    ctx.log("cargo", `🔄 Reconcile: station_id=${tryId} failed: ${resp.error.message}`);
   }
+
+  if (destResp.error || !usedStationId) {
+    const msg = destResp.error?.message || "unknown error";
+    ctx.log("error", `⚠️ Reconcile failed: could not read destination faction storage for any candidate id (${triedIds.join(", ")}): ${msg}`);
+    return { reconciled: 0, changed: [], stationId: triedIds[0] || raw, readError: msg };
+  }
+
+  ctx.log("cargo", `🔄 Reconcile: READ destination faction storage via station_id=${usedStationId}`);
 
   const destQty = new Map<string, number>();
   const destResult = (destResp.result as Record<string, unknown>) || {};
@@ -1077,34 +1092,31 @@ export async function reconcileDeliveredWithDestination(
     const qty = (i.quantity as number) || (i.count as number) || 0;
     if (id && qty > 0) destQty.set(id, qty);
   }
-  ctx.log("cargo", `🔄 Reconcile: destination holds ${destQty.size} item type(s)`);
+  ctx.log("cargo", `🔄 Reconcile: destination (${usedStationId}) holds ${destQty.size} item type(s): ${[...destQty.entries()].map(([k, v]) => `${k}=${v}`).join(", ")}`);
 
   const all = readSettings();
   const cargoMover = all.cargo_mover || {};
   const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
   const changed: Array<{ itemId: string; itemName: string; oldDelivered: number; newDelivered: number }> = [];
 
+  // COMPLETE OVERWRITE: set every configured item's delivered count to exactly
+  // what the destination actually holds (capped at any delivery target), and
+  // zero out configured items that are not present at the destination. This
+  // discards any inflated/stale cumulative counts.
   for (const configItem of settings.items) {
     const actual = destQty.get(configItem.itemId) || 0;
-    // The destination can't physically hold more than what's there, so the
-    // real delivered amount is at most the destination's stored quantity. When
-    // a delivery target is configured, delivered should never exceed it either.
     const cap = (configItem.totalToDeliver && configItem.totalToDeliver > 0)
       ? configItem.totalToDeliver
       : Number.MAX_SAFE_INTEGER;
     const newDelivered = Math.min(actual, cap);
 
     const oldDelivered = configItem.totalDelivered || 0;
-    if (newDelivered === oldDelivered) continue;
 
-    // Update the settings mirror.
+    // Always overwrite the settings mirror.
     const item = items.find((it) => it.itemId === configItem.itemId);
     if (item) item.totalDelivered = newDelivered;
 
-    // Update the activity-progress record so the dashboard + findMoveJobs agree.
-    // getItemProgress returns a freshly-loaded object, so mutate it on the
-    // loaded activity document and persist that document explicitly (the
-    // in-place mutation alone is lost on the next disk read).
+    // Overwrite the activity-progress record so the dashboard + findMoveJobs agree.
     const activity = loadCargoMoverActivity();
     const progress = activity.itemProgress[`${bot.username}:${configItem.itemId}`];
     if (progress) {
@@ -1116,12 +1128,14 @@ export async function reconcileDeliveredWithDestination(
       saveCargoMoverActivity(activity);
     }
 
-    changed.push({
-      itemId: configItem.itemId,
-      itemName: configItem.itemName,
-      oldDelivered,
-      newDelivered,
-    });
+    if (newDelivered !== oldDelivered) {
+      changed.push({
+        itemId: configItem.itemId,
+        itemName: configItem.itemName,
+        oldDelivered,
+        newDelivered,
+      });
+    }
     ctx.log("cargo", `🔄 Reconciled ${configItem.itemName}: delivered ${oldDelivered} → ${newDelivered} (destination holds ${actual})`);
   }
 
@@ -1129,7 +1143,7 @@ export async function reconcileDeliveredWithDestination(
     writeSettings({ cargo_mover: { items } });
   }
 
-  return { reconciled: changed.length, changed };
+  return { reconciled: changed.length, changed, stationId: usedStationId, readError: undefined };
 }
 
 /** Build the ordered, filtered list of items to bulk-move from the source

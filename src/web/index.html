@@ -19270,9 +19270,14 @@ When responding:
         if (panel === "station" && factionSelectedBot) {
           const bot = bots.find((b) => b.username === factionSelectedBot);
           const docked = bot ? bot.docked : false;
-          // Auto-load station facilities (docked bot required by the API).
-          if (docked) fetchStationFacilities(factionSelectedBot);
-          // Auto-calculate maintenance if we already have facility data.
+          if (docked) {
+            // Ensure the shared faction facility cache is populated (it's the
+            // reliable source that already contains station facilities).
+            if (!factionFacilitiesData || factionFacilitiesData.length === 0) {
+              fetchFactionFacilities(factionSelectedBot);
+            }
+            fetchStationFacilities(factionSelectedBot);
+          }
           const sum = document.getElementById("stationMaintenanceSummary");
           if (sum && stationFacilitiesData && stationFacilitiesData.length > 0) {
             fetchStationMaintenance(factionSelectedBot);
@@ -20710,44 +20715,46 @@ When responding:
         if (!container) return;
         container.innerHTML = '<div class="faction-no-data">Loading...</div>';
 
-        // Pull from both `faction_list` (faction_facilities) and `list`
-        // (player_facilities) and merge — station facilities can surface under
-        // either depending on how they were built.
-        const collectFrom = (result, key) => {
-          if (!result || !result.ok || !result.data) return [];
-          const d = result.data;
-          const arr = Array.isArray(d)
-            ? d
-            : Array.isArray(d[key])
-              ? d[key]
-              : Array.isArray(d.facilities)
-                ? d.facilities
-                : [];
-          return arr;
-        };
-
-        const flRes = await new Promise((resolve) =>
-          sendExec(username, "facility", { action: "faction_list" }, resolve),
-        );
-        const listRes = await new Promise((resolve) =>
-          sendExec(username, "facility", { action: "list" }, resolve),
-        );
-
-        const fromFl = collectFrom(flRes, "faction_facilities");
-        const fromList = collectFrom(listRes, "player_facilities");
-
-        const merged = {};
-        [...fromFl, ...fromList].forEach((fac) => {
-          const fid = fac.facility_id || fac.id;
-          if (fid) merged[fid] = fac;
-        });
-        const all = Object.values(merged);
+        // Prefer the faction tab's already-loaded facility list (factionFacilitiesData),
+        // which provably contains station facilities like the Locker Bay. Only fall
+        // back to a fresh fetch if it isn't populated yet.
+        let all = [];
+        if (Array.isArray(factionFacilitiesData) && factionFacilitiesData.length > 0) {
+          all = factionFacilitiesData;
+        } else {
+          const collectFrom = (result, key) => {
+            if (!result || !result.ok || !result.data) return [];
+            const d = result.data;
+            const arr = Array.isArray(d)
+              ? d
+              : Array.isArray(d[key])
+                ? d[key]
+                : Array.isArray(d.facilities)
+                  ? d.facilities
+                  : [];
+            return arr;
+          };
+          const flRes = await new Promise((resolve) =>
+            sendExec(username, "facility", { action: "faction_list" }, resolve),
+          );
+          const listRes = await new Promise((resolve) =>
+            sendExec(username, "facility", { action: "list" }, resolve),
+          );
+          const fromFl = collectFrom(flRes, "faction_facilities");
+          const fromList = collectFrom(listRes, "player_facilities");
+          const merged = {};
+          [...fromFl, ...fromList].forEach((fac) => {
+            const fid = fac.facility_id || fac.id;
+            if (fid) merged[fid] = fac;
+          });
+          all = Object.values(merged);
+        }
 
         const matched = all.filter((fac) => isStationFacility(fac));
         // TEMP DEBUG: show source counts and a sample so we can see the live
         // shape. Remove once the filter is confirmed working.
         const sample = all[0] ? esc(JSON.stringify(all.slice(0, 3), null, 1)) : "none";
-        const debugHtml = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">DEBUG: faction_list=${fromFl.length}, list=${fromList.length}, merged=${all.length}, matched=${matched.length}. Keys: ${all.length ? esc(Object.keys(all[0]).join(",")) : "none"}</div>` + (all.length ? `<pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow:auto">${sample}</pre>` : "");
+        const debugHtml = `<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">DEBUG: fromFactionCache=${Array.isArray(factionFacilitiesData) ? factionFacilitiesData.length : 0}, merged=${all.length}, matched=${matched.length}. Keys: ${all.length ? esc(Object.keys(all[0]).join(",")) : "none"}</div>` + (all.length ? `<pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;max-height:160px;overflow:auto">${sample}</pre>` : "");
 
         const facilities = matched;
         stationFacilitiesData = facilities;

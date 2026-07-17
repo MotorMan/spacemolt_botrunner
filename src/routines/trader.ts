@@ -1582,8 +1582,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   const startSystem = bot.system;
 
   // ── Cloaking setup (one-time at routine start) ──
+  // Only cloak now if already undocked. If docked, the bot must stay docked for
+  // the market-analysis phase; navigateToSystem() will cloak it before travel.
   const settings = getTraderSettings(bot.username);
-  if (settings.autoCloak) {
+  if (settings.autoCloak && !bot.docked) {
     await enableCloakingIfPossible(ctx);
   }
 
@@ -1671,9 +1673,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Cloak status check (every cycle when autoCloak enabled) ──
-    // Re-verify cloaking status and re-enable if needed (but only if we have fuel)
-    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
-      ctx.log("trade", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+    // Re-verify cloaking status and re-enable if needed — but ONLY while undocked.
+    // Cloaking undocks the ship, so re-enabling it while docked would break the
+    // docked-only operations below (analyze_market, missions, etc.) because
+    // ensureDocked() short-circuits on a stale docked flag. The bot always
+    // re-docks at the top of the docked phase, and navigateToSystem() re-cloaks
+    // before each jump, so do NOT cloak here when already docked.
+    if (settings.autoCloak && !bot.isCloaked && !bot.docked && bot.fuel > 0) {
+      ctx.log("trade", "Cloak status check: bot undocked and not cloaked — re-enabling cloak");
       await enableCloakingIfPossible(ctx);
     }
 

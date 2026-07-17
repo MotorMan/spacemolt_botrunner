@@ -3471,12 +3471,16 @@ export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boo
     const resp = await bot.exec("cloak", { enable: true });
     if (!resp.error) {
       bot.isCloaked = true;
+      // Cloaking always undocks the ship — clear the stale docked flag so
+      // downstream ensureDocked() actually re-docks (e.g. before analyze_market).
+      bot.docked = false;
       ctx.log("system", `Cloaking enabled in ${bot.system}`);
       return true;
     }
     const msg = String(resp.error.message || "").toLowerCase();
     if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
       bot.isCloaked = true;
+      bot.docked = false;
       return true;
     }
     ctx.log("warn", `Could not enable cloaking: ${resp.error.message}`);

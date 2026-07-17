@@ -19450,6 +19450,26 @@ When responding:
         </div>
       </div>
     </div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Ally Access</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
+        Grant allied factions access to your faction's facilities and fuel. Changes are sent via <code>faction_edit</code> (no effect until enabled).
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-facility" onchange="factionEditAllyAccess('${esc(username)}','ally_facility_access',this.checked)">
+          <span>Facility Access — allied members use your facilities free (no rental fee)</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-fuel" onchange="factionEditAllyAccess('${esc(username)}','ally_fuel_access',this.checked)">
+          <span>Fuel Access — allied members may refuel at your fuel bunkers</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-intel-optout" onchange="factionEditAllyAccess('${esc(username)}','ally_intel_opt_out',this.checked)">
+          <span>Intel Opt-Out — don't share your intel with allies</span>
+        </label>
+      </div>
+    </div>
   `;
       }
 
@@ -19570,7 +19590,13 @@ When responding:
             ? allies
                 .map((a) => {
                   const name = a.name || a.faction_name || a;
-                  return `<div class="faction-card"><span class="fc-name" style="color:var(--green)">${esc(String(name))}</span></div>`;
+                  const id = a.faction_id || a.id || name;
+                  return `<div class="faction-card" style="display:flex;justify-content:space-between;align-items:center">
+          <span class="fc-name" style="color:var(--green)">${esc(String(name))}</span>
+          <div class="fc-actions">
+            <button class="sm" style="font-size:10px" onclick="factionRemoveAlly('${esc(username)}','${esc(String(id))}')">Remove</button>
+          </div>
+        </div>`;
                 })
                 .join("")
             : '<div class="faction-no-data">No allies</div>';
@@ -19618,13 +19644,14 @@ When responding:
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
         <input type="text" id="faction-diplo-target" placeholder="Faction name" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px;flex:1;min-width:120px">
       </div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap">
-        <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_set_ally')">Set Ally</button>
-        <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_set_enemy')">Set Enemy</button>
-        <button class="sm" style="background:var(--red);border:none;color:#fff" onclick="factionDiploAction('${esc(username)}','faction_declare_war')">Declare War</button>
-        <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_propose_peace')">Propose Peace</button>
-        <button class="sm" style="background:var(--green);border:none;color:#000" onclick="factionDiploAction('${esc(username)}','faction_accept_peace')">Accept Peace</button>
-      </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_set_ally')">Set Ally</button>
+          <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_remove_ally')">Remove Ally</button>
+          <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_set_enemy')">Set Enemy</button>
+          <button class="sm" style="background:var(--red);border:none;color:#fff" onclick="factionDiploAction('${esc(username)}','faction_declare_war')">Declare War</button>
+          <button class="sm" onclick="factionDiploAction('${esc(username)}','faction_propose_peace')">Propose Peace</button>
+          <button class="sm" style="background:var(--green);border:none;color:#000" onclick="factionDiploAction('${esc(username)}','faction_accept_peace')">Accept Peace</button>
+        </div>
     </div>
   `;
       }
@@ -24976,6 +25003,26 @@ async function fetchPersonalFacilityTypes(username) {
         );
       }
 
+      function factionRemoveAlly(username, target) {
+        if (!target) return;
+        sendExec(
+          username,
+          "faction_remove_ally",
+          { faction_name: target, faction_id: target, target },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: removed ally ${target}`);
+              fetchFactionInfo(username);
+            } else {
+              appendLine(
+                "system",
+                `Remove ally failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
       function factionProposePeace(username, target) {
         sendExec(
           username,
@@ -25111,6 +25158,26 @@ async function fetchPersonalFacilityTypes(username) {
               "system",
               `Edit faction failed: ${result.error || "unknown"}`,
             );
+          }
+        });
+      }
+
+      function factionEditAllyAccess(username, field, value) {
+        const params = {};
+        params[field] = value === true;
+        sendExec(username, "faction_edit", params, (result) => {
+          if (result.ok) {
+            appendLine(
+              "system",
+              `${username}: faction_edit ${field} -> ${params[field]}`,
+            );
+          } else {
+            appendLine(
+              "system",
+              `faction_edit ${field} failed: ${result.error || "unknown"}`,
+            );
+            // Re-render to reset the toggle to its previous state
+            if (factionSelectedBot) renderFactionContent(factionSelectedBot);
           }
         });
       }

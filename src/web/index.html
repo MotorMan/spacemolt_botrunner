@@ -21788,37 +21788,16 @@ When responding:
         const dockWarning = !docked
           ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to analyze queue usage.</div>'
           : "";
-        const allyFacility = f.ally_facility_access === true;
-        const allyFuel = f.ally_fuel_access === true;
-        const allyIntelOptOut = f.ally_intel_opt_out === true;
         return `
     <div class="faction-section">
-      <div class="faction-section-title">Edit Faction</div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <input type="text" id="faction-edit-desc" placeholder="New description" value="${esc(desc)}" style="flex:1;min-width:200px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
-          <button class="sm" onclick="factionEditDesc('${esc(username)}')">Update Description</button>
-        </div>
-      </div>
-    </div>
-    <div class="faction-section" style="margin-top:16px">
-      <div class="faction-section-title">Ally Access</div>
+      <div class="faction-section-title">Faction Facility Queue Usage</div>
       <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
-        Grant allied factions access to your faction's facilities and fuel. Changes are sent via <code>faction_edit</code> (no effect until enabled).
+        Shows queued production runs across your faction facilities, split between
+        your own runs and external (other players') runs, with projected external profit.
       </div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
-          <input type="checkbox" id="faction-edit-ally-facility"${allyFacility ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_facility_access',this.checked)">
-          <span>Facility Access — allied members use your facilities free (no rental fee)</span>
-        </label>
-        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
-          <input type="checkbox" id="faction-edit-ally-fuel"${allyFuel ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_fuel_access',this.checked)">
-          <span>Fuel Access — allied members may refuel at your fuel bunkers</span>
-        </label>
-        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
-          <input type="checkbox" id="faction-edit-ally-intel-optout"${allyIntelOptOut ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_intel_opt_out',this.checked)">
-          <span>Intel Opt-Out — don't share your intel with allies</span>
-        </label>
+      ${dockWarning}
+      <div id="factionFacilityQueueUsage">
+        <div class="faction-no-data">Loading queue usage...</div>
       </div>
     </div>
   `;

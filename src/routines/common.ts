@@ -4,7 +4,7 @@
  * Provides: docking, refueling, repairing, navigation, system parsing,
  * ore parsing, and safety checks.
  */
-import type { RoutineContext } from "../bot.js";
+import type { Bot, RoutineContext } from "../bot.js";
 import { isConnectionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
@@ -144,11 +144,69 @@ export function isScenicPoi(type: string): boolean {
 
 // ── Item size helpers ────────────────────────────────────────
 
-/** Get the cargo size (weight per unit) of an item from the catalog. Defaults to 1 if unknown. */
+const packageSizeCache = new Map<string, number>();
+
+/** Get the cargo size (weight per unit) of an item from the catalog. Defaults to 1 if unknown.
+ *  For package IDs, checks the async inspect cache first so pre-inspected packages
+ *  resolve to their true size synchronously. */
 export function getItemSize(itemId: string): number {
+  if (itemId.startsWith("package:")) {
+    const cached = packageSizeCache.get(itemId);
+    if (cached !== undefined) {
+      return cached;
+    }
+  }
   const item = catalogStore.getItem(itemId);
   const size = item?.size as number | undefined;
   return (size && size > 0) ? size : 1;
+}
+
+/** Async version of getItemSize that uses the `inspect` command for packages,
+ *  which are not in the catalog and whose true cargo size is unknown client-side.
+ *  Results are cached per package ID for the lifetime of the process. */
+export async function getItemSizeAsync(bot: Bot, itemId: string): Promise<number> {
+  if (!itemId.startsWith("package:")) {
+    return getItemSize(itemId);
+  }
+
+  const cached = packageSizeCache.get(itemId);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  try {
+    const resp = await bot.exec("inspect", { id: itemId });
+    if (!resp.error && resp.result) {
+      const result = resp.result as Record<string, unknown>;
+      const structured = result.structuredContent as Record<string, unknown> | undefined;
+      if (structured?.kind === "package") {
+        const pkg = structured.package as Record<string, unknown> | undefined;
+        const size = typeof pkg?.size === "number" ? pkg.size : undefined;
+        if (size && size > 0) {
+          packageSizeCache.set(itemId, size);
+          return size;
+        }
+      }
+    }
+  } catch {
+    // ignore inspect failures, fall through to default
+  }
+
+  const fallback = getItemSize(itemId);
+  packageSizeCache.set(itemId, fallback);
+  return fallback;
+}
+
+/** Pre-inspect any package IDs found in the given storage array and cache their sizes.
+ *  This avoids repeated inspect calls during planning/loading. Fires inspections in
+ *  parallel and swallows individual failures. */
+export async function preInspectPackageSizes(bot: Bot, items: Array<{ itemId: string }>): Promise<void> {
+  const packageItems = items.filter(i => i.itemId.startsWith("package:"));
+  if (packageItems.length === 0) return;
+
+  await Promise.allSettled(
+    packageItems.map(i => getItemSizeAsync(bot, i.itemId))
+  );
 }
 
 /** How many units of an item fit in the given free cargo weight. */

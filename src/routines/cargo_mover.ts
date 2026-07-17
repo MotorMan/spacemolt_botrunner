@@ -33,6 +33,8 @@ import {
   getBattleStatus,
   fleeFromBattle,
   getItemSize,
+  getItemSizeAsync,
+  preInspectPackageSizes,
   maxItemsForCargo,
   enableCloakingIfPossible,
   type BattleState,
@@ -1307,6 +1309,11 @@ async function runBulkMovePhase(
   }
 
   // ── Plan what to move ─────────────────────────────────────
+  // Pre-inspect any packages in source storage so their true cargo size is
+  // known before planning — packages are not in the catalog and default to
+  // size 1, which causes massive overbooking of cargo space.
+  await preInspectPackageSizes(bot, bot.factionStorage.map(i => ({ itemId: i.itemId })));
+
   const planned = planBulkItems(ctx, bot.factionStorage, settings, destHas);
   if (planned.length === 0) {
     if (settings.bulkSeedMode) {
@@ -2250,6 +2257,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     await bot.refreshStatus();
+
+    // Pre-inspect any package items so their true cargo size is known before
+    // planning — packages are not in the catalog and default to size 1, which
+    // causes massive overbooking of cargo space.
+    await preInspectPackageSizes(bot, [
+      ...settings.items.map(i => ({ itemId: i.itemId })),
+      ...bot.factionStorage.map(i => ({ itemId: i.itemId })),
+      ...bot.storage.map(i => ({ itemId: i.itemId })),
+    ]);
+
     // Re-find jobs now that storage is updated with cleared items
     let jobs = findMoveJobs(ctx, settings, sourceSystem, destSystem);
     if (jobs.length === 0) {

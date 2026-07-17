@@ -528,17 +528,16 @@ async function withdrawFromStorage(
       return { success: withdrawn > 0, withdrawnQty: withdrawn };
     }
     if (wResp.error.message.includes("cargo_full")) {
-      // Try to parse available space from error message
+      const itemSize = getItemSize(itemId);
       const match = wResp.error.message.match(/only (\d+) available/);
       const availableSpace = match ? parseInt(match[1], 10) : Math.max(1, Math.floor(actualQty / 2));
-      if (availableSpace > 0) {
-        // Step 1: Move partial amount from faction to station storage
-        const smallFactionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: availableSpace, source: "faction" });
+      const availableQty = Math.max(1, Math.floor(availableSpace / itemSize));
+      ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): parsed ${availableSpace} space → trying partial ${availableQty}x`);
+      if (availableQty > 0) {
+        const smallFactionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: availableQty, source: "faction" });
         if (!smallFactionResp.error) {
-          // Refresh station storage
           await bot.refreshStorage();
-          // Step 2: Withdraw partial amount from station to cargo
-          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableSpace });
+          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
           if (!smallWResp.error) {
             await bot.refreshCargo();
             const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
@@ -602,12 +601,13 @@ async function withdrawFromStorage(
     }
     ctx.log("error", `Withdraw from personal storage failed: ${wResp.error.message}`);
     if (wResp.error.message.includes("cargo_full")) {
-      // Try to parse available space from error message
+      const itemSize = getItemSize(itemId);
       const match = wResp.error.message.match(/only (\d+) available/);
       const availableSpace = match ? parseInt(match[1], 10) : Math.max(1, Math.floor(actualQty / 2));
-      ctx.log("cargo", `Cargo full error - parsed available space: ${availableSpace}`);
-      if (availableSpace > 0) {
-        const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableSpace });
+      const availableQty = Math.max(1, Math.floor(availableSpace / itemSize));
+      ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): parsed ${availableSpace} space → trying partial ${availableQty}x`);
+      if (availableQty > 0) {
+        const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
         if (!smallWResp.error) {
           await bot.refreshCargo();
           const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
@@ -782,6 +782,20 @@ async function depositToDestination(
       location: `${bot.system}/${bot.poi}`,
       error: dResp.error.message,
     });
+
+    const factionCapErr = dResp.error.message.toLowerCase().includes("storage_cap_exceeded") ||
+      dResp.error.message.toLowerCase().includes("cap reached") ||
+      dResp.error.message.toLowerCase().includes("too many") ||
+      dResp.error.message.toLowerCase().includes("maximum") ||
+      dResp.error.message.toLowerCase().includes("full");
+    if (factionCapErr) {
+      ctx.log("warn", `⚠️ Faction storage full for ${itemId} — falling back to personal (station) storage deposit`);
+      const fallback = await depositToDestination(ctx, itemId, quantity, "personal");
+      if (fallback.success) {
+        return fallback;
+      }
+    }
+
     return { success: false, depositedQty: 0 };
   }
 
@@ -2231,7 +2245,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           if (item.quantity <= 0) continue;
           // Deposit to faction storage, not personal storage
           const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-          if (!dResp.error) deposited.push(`${item.quantity}x ${item.name}`);
+          if (!dResp.error) {
+            deposited.push(`${item.quantity}x ${item.name}`);
+          } else if (dResp.error.message.toLowerCase().includes("storage_cap_exceeded") || dResp.error.message.toLowerCase().includes("cap reached") || dResp.error.message.toLowerCase().includes("too many") || dResp.error.message.toLowerCase().includes("maximum") || dResp.error.message.toLowerCase().includes("full")) {
+            ctx.log("warn", `⚠️ Faction storage full for ${item.name} during clear — falling back to personal (station) storage deposit`);
+            const fallbackResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            if (!fallbackResp.error) {
+              deposited.push(`${item.quantity}x ${item.name} (station fallback)`);
+            } else {
+              ctx.log("error", `Fallback station deposit also failed for ${item.name}: ${fallbackResp.error.message}`);
+            }
+          }
         }
         if (deposited.length > 0) {
           ctx.log("cargo", `✅ Cleared cargo to faction storage: ${deposited.join(", ")}`);

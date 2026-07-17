@@ -540,6 +540,10 @@ async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker
   const { bot } = ctx;
   const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
   tracker.syncWithServer(serverJobs);
+  // Drop any job we track locally whose recipe no longer resolves to a known
+  // catalog recipe — these are phantom jobs (stale session state, or jobs the
+  // queue poller couldn't match) that would otherwise inflate "pending" output.
+  tracker.prunePhantomJobs(new Set(recipes.map(r => r.recipe_id)));
   tracker.save();
 }
 
@@ -1083,7 +1087,10 @@ async function executeCraftingPlan(
       let hasPending = false;
       const produced = new Map<string, number>();
       for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
-        const pending = prog.queued - prog.completed;
+        // A job can only still produce what it has left to run. Crediting more
+        // than `remaining` would let a single phantom/huge job flood the planner
+        // with fake stock (e.g. 299k water ice from one stale job).
+        const pending = Math.min(prog.queued - prog.completed, prog.remaining);
         if (pending <= 0) continue;
         hasPending = true;
         const r = recipeIndex.get(recipeId);

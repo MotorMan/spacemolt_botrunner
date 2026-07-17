@@ -147,6 +147,25 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
     }
   }
 
+  // Drop locally-tracked jobs whose recipeId is no longer valid (e.g. stale
+  // jobs rehydrated from a previous session, or jobs whose recipe string the
+  // queue poller could never resolve to a catalog recipe_id). Such jobs can
+  // never be reconciled against the live server queue, so they would otherwise
+  // linger forever as phantom "pending" output and inflate the planner's
+  // perceived stock (e.g. falsely reporting hundreds of thousands of water ice).
+  prunePhantomJobs(validRecipeIds: Set<string>): void {
+    const toRemove: string[] = [];
+    for (const [jobId, job] of Array.from(this.jobs.entries())) {
+      if (!validRecipeIds.has(job.recipeId)) {
+        toRemove.push(jobId);
+      }
+    }
+    for (const jobId of toRemove) {
+      this.jobs.delete(jobId);
+      this.cleanupIndex(jobId);
+    }
+  }
+
   clearCompleted(): void {
     const toRemove: string[] = [];
     for (const [jobId, job] of Array.from(this.jobs.entries())) {

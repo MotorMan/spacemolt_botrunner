@@ -18966,6 +18966,11 @@ When responding:
         factionSelectedBot = username;
         factionData = null;
         factionActivePanel = "overview";
+        // Default the 5-station faction storage viewer to the station this bot
+        // is docked at, so it shows the station we're actually managing rather
+        // than a previously selected far-away station.
+        const selBot = bots.find((b) => b.username === username);
+        stationStorageStation = selBot && selBot.docked ? `${selBot.system}|${selBot.poi}` : "";
         renderFactionSidebar();
         fetchFactionInfo(username);
       }
@@ -19344,6 +19349,11 @@ When responding:
             }
             fetchStationFacilities(factionSelectedBot);
             startStationBaseStatsAutoRefresh(factionSelectedBot);
+            // Auto-load the docked station's faction storage viewer if it isn't
+            // already showing that station.
+            if (stationStorageStation === `${bot.system}|${bot.poi}`) {
+              fetchStationStorageViewer(factionSelectedBot);
+            }
           } else {
             stationBaseStats = null;
           }

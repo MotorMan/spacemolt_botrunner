@@ -1454,6 +1454,10 @@ async function runBulkMovePhase(
   for (const p of planned) {
     if (skipped.has(p.itemId)) { failedItems++; continue; }
     while (bot.state === "running") {
+      // Use the LIVE hold reading (re-synced each attempt); the in-memory tracker
+      // can lag the game's cache and would otherwise keep probing a full hold.
+      await bot.refreshCargo();
+      cargoUsed = Math.max(cargoUsed, bot.cargo);
       const freeSpace = Math.max(0, cargoMax - cargoUsed);
       if (freeSpace <= 0) break;
       const itemSize = getItemSize(p.itemId);
@@ -1476,9 +1480,12 @@ async function runBulkMovePhase(
         ctx.log("cargo", `✅ Loaded ${res.withdrawnQty}x ${p.itemName} (cargo ${cargoUsed}/${cargoMax})`);
         if (p.quantity <= 0) break;
       } else {
-        // This item couldn't be loaded (full cargo, wrong size, etc.). Skip it
-        // and move on to the next planned item instead of aborting the whole
-        // phase — other items may still fit.
+        // This item couldn't be loaded (full cargo, wrong size, etc.). Re-sync the
+        // tracker from the live hold (a cargo_full means it's fuller than we thought)
+        // and skip this item — other items may still fit.
+        await bot.refreshCargo();
+        cargoUsed = Math.max(cargoUsed, bot.cargo);
+        if (cargoMax - cargoUsed <= 0) { loadedAny = loadedAny || false; break; }
         ctx.log("warn", `⚠️ Could not load ${p.itemName} this pass (cargo ${cargoUsed}/${cargoMax}) — skipping and continuing`);
         skipped.add(p.itemId);
         failedItems++;
@@ -2503,17 +2510,23 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // are accounted for and we never overfill the hold.
     let cargoUsed = bot.cargo;
     const cargoMax = bot.cargoMax;
-    
+    // Set true once the hold is actually full (per live bot.cargo). When set we
+    // stop looping over jobs and go deliver instead of probing every item.
+    let cargoIsFull = false;
+
     while (bot.state === "running") {
       await bot.refreshStatus();
       await bot.refreshCargo();
-      
-      // Use manual cargo tracking for accuracy
-      const freeSpace = Math.max(0, cargoMax - cargoUsed);
+
+      // Prefer the LIVE cargo reading over the in-memory tracker. The tracker is
+      // only used to add loaded quantities; if a load partially succeeds or the
+      // game's cache lags, `bot.cargo` is the ground truth for free space.
+      cargoUsed = Math.max(cargoUsed, bot.cargo);
 
       // If cargo is full, go deliver
-      if (freeSpace <= 0) {
+      if (cargoMax - cargoUsed <= 0) {
         ctx.log("cargo", `📦 Cargo full (${cargoUsed}/${cargoMax}) — delivering...`);
+        cargoIsFull = true;
         break;
       }
 
@@ -2525,29 +2538,39 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         const remaining = jobRemaining.get(job.itemId) || 0;
         if (remaining <= 0) continue;
 
-        // Check if cargo is full before attempting withdrawal
-        const currentFree = Math.max(0, cargoMax - cargoUsed);
-        if (currentFree <= 0) {
+        // Recompute free space from the LIVE hold every time, never the stale
+        // tracker, so a full hold stops us from probing more items.
+        const liveFree = Math.max(0, cargoMax - Math.max(cargoUsed, bot.cargo));
+        if (liveFree <= 0) {
           ctx.log("cargo", `📦 Cargo full (${cargoUsed}/${cargoMax}) — stopping loading`);
           loadedThisIteration = true; // Signal to break outer loop
+          cargoIsFull = true;
           break;
         }
 
-        ctx.log("cargo", `🔄 Loading loop: ${job.itemName} remaining=${remaining}, freeSpace=${currentFree}, cargo=${cargoUsed}/${cargoMax}`);
-
-        // Calculate how many items fit in cargo space (considering item size)
         const itemSize = getItemSize(job.itemId);
-        const maxFitInCargo = Math.floor(currentFree / itemSize);
-
-        // Calculate how much we can actually load (limited by remaining, and cargo capacity)
-        const loadQty = Math.min(remaining, maxFitInCargo);
-        if (loadQty <= 0) {
-          ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${currentFree})`);
+        // If even ONE unit won't fit, skip this item without a network call —
+        // it can never load until cargo is freed.
+        if (itemSize > liveFree) {
+          ctx.log("cargo", `Skipping ${job.itemName}: one unit (size ${itemSize}) won't fit in ${liveFree} free — skipping until cargo clears`);
           failedThisIteration++;
           continue;
         }
 
-        ctx.log("cargo", `Attempting to withdraw ${loadQty}x ${job.itemName} from ${job.storageType} (item size: ${itemSize}, cargo space: ${currentFree})`);
+        ctx.log("cargo", `🔄 Loading loop: ${job.itemName} remaining=${remaining}, freeSpace=${liveFree}, cargo=${cargoUsed}/${cargoMax}`);
+
+        // Calculate how many items fit in cargo space (considering item size)
+        const maxFitInCargo = Math.floor(liveFree / itemSize);
+
+        // Calculate how much we can actually load (limited by remaining, and cargo capacity)
+        const loadQty = Math.min(remaining, maxFitInCargo);
+        if (loadQty <= 0) {
+          ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${liveFree})`);
+          failedThisIteration++;
+          continue;
+        }
+
+        ctx.log("cargo", `Attempting to withdraw ${loadQty}x ${job.itemName} from ${job.storageType} (item size: ${itemSize}, cargo space: ${liveFree})`);
         yield "withdraw_items";
 
         // Retry failed withdrawals up to 3 times to handle temporary API issues
@@ -2572,6 +2595,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (!withdrawResult.success || withdrawResult.withdrawnQty <= 0) {
           ctx.log("error", `Failed to withdraw ${job.itemId} from ${job.storageType} after ${maxRetries} attempts — marking as depleted`);
+          // Re-sync the in-memory tracker with the LIVE hold: a cargo_full here
+          // means the hold is actually fuller than we thought. If it's now full,
+          // stop probing other jobs and go deliver.
+          await bot.refreshCargo();
+          cargoUsed = Math.max(cargoUsed, bot.cargo);
+          if (cargoMax - cargoUsed <= 0) {
+            ctx.log("cargo", `📦 Cargo full after failed withdraw (${cargoUsed}/${cargoMax}) — stopping loading`);
+            cargoIsFull = true;
+            loadedThisIteration = true;
+            break;
+          }
           // After multiple retries, assume the item is truly unavailable
           failedThisIteration++;
           continue;

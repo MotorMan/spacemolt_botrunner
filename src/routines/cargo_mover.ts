@@ -33,6 +33,7 @@ import {
   getBattleStatus,
   fleeFromBattle,
   getItemSize,
+  setItemSize,
   getItemSizeAsync,
   preInspectPackageSizes,
   maxItemsForCargo,
@@ -542,6 +543,7 @@ async function withdrawFromStorage(
         const availableSpace = parseInt(spaceMatch[2], 10);
         const actualItemSize = neededSpace / Math.max(1, actualQty);
         const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
+        setItemSize(itemId, actualItemSize);
         ctx.log("cargo", `Cargo full error for ${itemId}: parsed need=${neededSpace}, available=${availableSpace}, size=${actualItemSize.toFixed(1)} → retrying withdraw with ${availableQty}x`);
         if (availableQty > 0) {
           const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
@@ -637,6 +639,7 @@ async function withdrawFromStorage(
         const availableSpace = parseInt(spaceMatch[2], 10);
         const actualItemSize = neededSpace / Math.max(1, actualQty);
         const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
+        setItemSize(itemId, actualItemSize);
         ctx.log("cargo", `Cargo full error for ${itemId}: parsed need=${neededSpace}, available=${availableSpace}, size=${actualItemSize.toFixed(1)} → retrying withdraw with ${availableQty}x`);
         if (availableQty > 0) {
           const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
@@ -1357,6 +1360,35 @@ async function runBulkMovePhase(
   await bot.refreshFactionStorage(false, settings.sourceStation);
   await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
 
+  // ── Empty a full hold BEFORE planning/loading ──────────────
+  // If the bot starts a bulk-move phase with a (near) full hold — e.g. it was
+  // restarted mid-haul or the previous pass didn't deliver — there is no free
+  // space to load into, so every load attempt would cargo_full and the phase
+  // would bail with "could not load anything". Dump the hold first (faction
+  // storage, falling back to personal storage on a per-item cap error) so the
+  // load loop always begins with space available.
+  await bot.refreshCargo();
+  const bulkFullness = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 1;
+  if (bot.inventory.length > 0 && bulkFullness >= 0.9) {
+    ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full — emptying to storage before loading`);
+    for (const item of [...bot.inventory]) {
+      if (item.quantity <= 0) continue;
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      if (!dResp.error) {
+        ctx.log("cargo", `🧹 Bulk startup: emptied ${item.quantity}x ${item.name} to faction storage`);
+      } else if (dResp.error.message.toLowerCase().includes("storage_cap_exceeded") || dResp.error.message.toLowerCase().includes("cap reached") || dResp.error.message.toLowerCase().includes("too many") || dResp.error.message.toLowerCase().includes("maximum") || dResp.error.message.toLowerCase().includes("full")) {
+        const fb = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        if (!fb.error) ctx.log("cargo", `🧹 Bulk startup: emptied ${item.quantity}x ${item.name} to personal storage`);
+        else ctx.log("error", `Bulk startup: could not empty ${item.name}: ${fb.error.message}`);
+      } else {
+        ctx.log("error", `Bulk startup: failed to empty ${item.name}: ${dResp.error.message}`);
+      }
+    }
+    await bot.refreshCargo();
+  }
+
   // ── Re-check REMOTE destination faction storage ───────────
   // Read the destination's faction storage so we can see what it already has
   // (and what it doesn't) before we start hauling. This feeds seed mode and the
@@ -1414,14 +1446,19 @@ async function runBulkMovePhase(
   let cargoUsed = bot.cargo;
   const cargoMax = bot.cargoMax;
   let loadedAny = false;
+  // Track items we've already tried and failed to load so we don't retry them
+  // forever (e.g. a size we still don't know, or simply no space).
+  const skipped = new Set<string>();
+  let failedItems = 0;
 
   for (const p of planned) {
+    if (skipped.has(p.itemId)) { failedItems++; continue; }
     while (bot.state === "running") {
       const freeSpace = Math.max(0, cargoMax - cargoUsed);
       if (freeSpace <= 0) break;
       const itemSize = getItemSize(p.itemId);
-      const maxFit = Math.floor(freeSpace / itemSize);
-      if (maxFit <= 0) break;
+      const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
+      if (maxFit <= 0) { skipped.add(p.itemId); failedItems++; break; }
 
       await bot.refreshFactionStorage(false, settings.sourceStation);
       const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
@@ -1429,7 +1466,7 @@ async function runBulkMovePhase(
         ? Math.max(0, p.quantity - (destHas.has(p.itemId) ? 0 : 0))
         : p.quantity;
       const loadQty = Math.min(maxFit, inStorage, stillNeeded);
-      if (loadQty <= 0) break;
+      if (loadQty <= 0) { skipped.add(p.itemId); failedItems++; break; }
 
       const res = await withdrawFromStorage(ctx, p.itemId, loadQty, "faction");
       if (res.success && res.withdrawnQty > 0) {
@@ -1439,6 +1476,12 @@ async function runBulkMovePhase(
         ctx.log("cargo", `✅ Loaded ${res.withdrawnQty}x ${p.itemName} (cargo ${cargoUsed}/${cargoMax})`);
         if (p.quantity <= 0) break;
       } else {
+        // This item couldn't be loaded (full cargo, wrong size, etc.). Skip it
+        // and move on to the next planned item instead of aborting the whole
+        // phase — other items may still fit.
+        ctx.log("warn", `⚠️ Could not load ${p.itemName} this pass (cargo ${cargoUsed}/${cargoMax}) — skipping and continuing`);
+        skipped.add(p.itemId);
+        failedItems++;
         break;
       }
     }
@@ -1446,7 +1489,7 @@ async function runBulkMovePhase(
   }
 
   if (!loadedAny) {
-    ctx.log("info", "Bulk move: could not load anything — waiting 60s");
+    ctx.log("info", `Bulk move: could not load anything (${failedItems}/${planned.length} items skipped) — waiting 60s`);
     await ctx.sleep(60000);
     return;
   }

@@ -145,11 +145,25 @@ export function isScenicPoi(type: string): boolean {
 // ── Item size helpers ────────────────────────────────────────
 
 const packageSizeCache = new Map<string, number>();
+/** Runtime size overrides learned from cargo_full errors at load time. The catalog
+ *  sometimes reports size 1 for items whose true in-game cargo weight is much larger
+ *  (e.g. 101); when we observe the real size we cache it so the rest of the routine
+ *  stops overbooking cargo. */
+const runtimeSizeCache = new Map<string, number>();
+
+/** Record the true per-unit cargo size observed for an item (e.g. from a cargo_full
+ *  error's "Need X but only Y available" math). Overrides the catalog value afterwards. */
+export function setItemSize(itemId: string, size: number): void {
+  if (size > 0) runtimeSizeCache.set(itemId, size);
+}
 
 /** Get the cargo size (weight per unit) of an item from the catalog. Defaults to 1 if unknown.
  *  For package IDs, checks the async inspect cache first so pre-inspected packages
- *  resolve to their true size synchronously. */
+ *  resolve to their true size synchronously. Runtime overrides (learned from in-game
+ *  errors) take precedence over the catalog value. */
 export function getItemSize(itemId: string): number {
+  const runtime = runtimeSizeCache.get(itemId);
+  if (runtime !== undefined) return runtime;
   if (itemId.startsWith("package:")) {
     const cached = packageSizeCache.get(itemId);
     if (cached !== undefined) {

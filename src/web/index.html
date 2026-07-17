@@ -20656,10 +20656,21 @@ When responding:
           ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage station facilities.</div>'
           : "";
 
-        stationFacilityTypes = Object.values(catalog.facilities || {}).filter(
+        const buildableCount = Object.values(catalog.facilities || {}).filter(
           (t) => t.player_station_buildable,
-        );
-        const buildableCount = stationFacilityTypes.length;
+        ).length;
+        // Filter to the currently-selected category so a base-stats refresh
+        // (auto or manual) doesn't revert the list to all categories mixed.
+        // Sort by display name so the list order stays stable across renders.
+        stationFacilityTypes = Object.values(catalog.facilities || {})
+          .filter((t) => t.player_station_buildable && t.category === stationFacilityCategory)
+          .sort((a, b) =>
+            (a.name || a.facility_type || a.type || "?")
+              .toLowerCase()
+              .localeCompare(
+                (b.name || b.facility_type || b.type || "?").toLowerCase(),
+              ),
+          );
 
         const catBtns = stationFacilityCategories
           .map((c) => {
@@ -20673,7 +20684,7 @@ When responding:
 
         return `
     ${dockWarning}
-    ${renderStationCommandCenter(f, username, docked)}
+    ${renderStationCommandCenterHtml(f, username, docked)}
     <div class="faction-section">
       <div class="faction-section-title">Station Maintenance Requirements</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
@@ -20707,7 +20718,7 @@ When responding:
       }
 
       // ── Base Command Center card (docked only) ───────────────
-      function renderStationCommandCenter(f, username, docked) {
+      function renderStationCommandCenterHtml(f, username, docked) {
         if (!docked) {
           return `<div class="faction-section" id="stationCommandCenter">
       <div class="faction-section-title">Station Command Center</div>
@@ -20786,7 +20797,6 @@ When responding:
       }
 
       async function fetchStationBaseStats(username) {
-        const container = document.getElementById("stationCommandCenter");
         sendExec(username, "get_base", {}, (result) => {
           if (!result.ok || !result.data) {
             appendLine("system", `get_base failed: ${result.error || "no data"}`);
@@ -20794,8 +20804,20 @@ When responding:
           }
           const data = result.data;
           stationBaseStats = data.structuredContent || data.result || data;
-          if (factionSelectedBot) renderFactionContent(factionSelectedBot);
+          refreshStationCommandCenter(username);
         });
+      }
+
+      // Re-render ONLY the Station Command Center card (base stats + economy
+      // panel) instead of the whole faction content. This keeps the Build New
+      // Station Facility list (selected category, open/closed, scroll, in-
+      // progress Build) stable across base-stats refreshes.
+      function refreshStationCommandCenter(username) {
+        const container = document.getElementById("stationCommandCenter");
+        if (!container) return;
+        const bot = bots.find((b) => b.username === username);
+        const docked = bot ? bot.docked : false;
+        container.outerHTML = renderStationCommandCenterHtml(factionData, username, docked);
       }
 
       function stationRenameSave(username) {
@@ -21272,9 +21294,15 @@ When responding:
 
       function switchStationFacilityCategory(category, username) {
         stationFacilityCategory = category;
-        stationFacilityTypes = Object.values(catalog.facilities || {}).filter(
-          (t) => t.player_station_buildable && t.category === category,
-        );
+        stationFacilityTypes = Object.values(catalog.facilities || {})
+          .filter((t) => t.player_station_buildable && t.category === category)
+          .sort((a, b) =>
+            (a.name || a.facility_type || a.type || "?")
+              .toLowerCase()
+              .localeCompare(
+                (b.name || b.facility_type || b.type || "?").toLowerCase(),
+              ),
+          );
         stationFacilityCategories.forEach((c) => {
           const btn = document.getElementById(`sf-cat-${c}`);
           if (btn) {

@@ -98,6 +98,26 @@ import {
 
 // ── Settings ─────────────────────────────────────────────────
 
+/**
+ * Debug target list for verifying the lightweight ("light") client-connect mode.
+ * Each bot here is expected to live on its OWN separate remote client. The rescue
+ * routine logs the status + location of every one of these each fleet scan, so we
+ * can confirm the light connect is surfacing every remote bot's name/full status
+ * back to this client (the prerequisite for cross-client rescues). Remove or empty
+ * this if you don't want the debug spam.
+ */
+const LIGHT_CONNECT_TEST_BOTS: string[] = [
+  "Ima Wolf",
+  "Irena Kirk",
+  "Marlen massey",
+  "Effie Cole",
+  "Maya Berg",
+  "Kaiya Zyla",
+  "Della Dee",
+  "Lacy Blesk",
+  "Becky Bray",
+];
+
 function getRescueSettings(): {
   fuelThreshold: number;
   ghostThreshold: number;
@@ -5173,6 +5193,27 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       if (remoteMembers.length > 0) {
         const clients = new Set(remoteMembers.map((m) => String((m as unknown as Record<string, unknown>)._clientLabel || (m as unknown as Record<string, unknown>)._clientId)));
         ctx.log("rescue", `🌐 Cross-client fleet poll: ${remoteMembers.length} bot(s) from ${clients.size} other client(s) in combined fleet`);
+      }
+
+      // ── LIGHT-CONNECT VERIFICATION ──
+      // Debug status checks for the known remote bots (each on its own separate
+      // client connected via the lightweight "light" client-connect mode). This
+      // verifies the light mode is actually surfacing every remote bot's name +
+      // full status + location back to this client so the rescue routine can act
+      // on them. Logs once per fleet scan.
+      for (const name of LIGHT_CONNECT_TEST_BOTS) {
+        const m = fleet.find((b) => b.username === name);
+        if (!m) {
+          ctx.log("rescue", `🔎 [light-test] ${name}: NOT VISIBLE in combined fleet (light connect not sharing this bot)`);
+          continue;
+        }
+        const rec = m as unknown as Record<string, unknown>;
+        const fuelPct = m.maxFuel > 0 ? Math.round((m.fuel / m.maxFuel) * 100) : 100;
+        const clientLabel = String(rec._clientLabel || rec._clientId || "?");
+        ctx.log(
+          "rescue",
+          `🔎 [light-test] ${name}: OK | client=${clientLabel} | state=${m.state} | routine=${m.routine ?? "-"} | fuel=${fuelPct}% (${m.fuel}/${m.maxFuel}) | system=${m.system} | poi=${m.poi} | docked=${m.docked} | credits=${m.credits}`,
+        );
       }
       for (const member of fleet) {
         if (member.username !== bot.username && !isOwnBot(member.username)) {

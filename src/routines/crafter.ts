@@ -1086,15 +1086,21 @@ async function executeCraftingPlan(
     const accountPending = (): { hasPending: boolean; produced: Map<string, number> } => {
       let hasPending = false;
       const produced = new Map<string, number>();
-      for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
-        // A job can only still produce what it has left to run. Crediting more
-        // than `remaining` would let a single phantom/huge job flood the planner
-        // with fake stock (e.g. 299k water ice from one stale job).
-        const pending = Math.min(prog.queued - prog.completed, prog.remaining);
+      // Iterate the actual jobs (not just the aggregated progress) so we can use
+      // each job's server-reported `runsRemaining` directly. A job can only still
+      // produce what the server says is left to run; crediting the full
+      // `quantity - completed` would let a stale/over-reported job (e.g. one the
+      // server already finished but still echoes a huge runs_total) flood the
+      // planner with fake stock — that's what made water ice read as ~299k.
+      for (const job of tracker.getActiveJobs()) {
+        const r = recipeIndex.get(job.recipeId);
+        if (!r) continue;
+        const pending = Math.max(
+          0,
+          Math.min(job.quantity - job.completed, job.runsRemaining),
+        );
         if (pending <= 0) continue;
         hasPending = true;
-        const r = recipeIndex.get(recipeId);
-        if (!r) continue;
         const outId = r.output_item_id.toLowerCase();
         produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
       }
@@ -1146,7 +1152,7 @@ async function executeCraftingPlan(
         return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
       };
 
-     const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes);
+      const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!);
      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
      for (const plan of plans) {
        log("craft", formatCraftingPlan(plan));

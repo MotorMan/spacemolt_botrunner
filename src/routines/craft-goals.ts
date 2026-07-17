@@ -23,7 +23,8 @@ interface Recipe {
 interface CraftingNode {
   recipe: Recipe;
   quantityNeeded: number;        // Total quantity needed for parent goals (in items)
-  quantityHave: number;          // Current inventory count
+  quantityHave: number;          // Real current inventory count (NOT including in-flight pending)
+  quantityPending: number;       // Output credited from in-flight jobs not yet produced
   quantityToCraft: number;       // Net quantity to craft (needed - have) - in ITEMS
   children: CraftingNode[];      // Prerequisite recipes
   depth: number;
@@ -220,6 +221,7 @@ function buildCraftingTree(
   facilityAvailableRecipes?: Set<string>,
   depth: number = 0,
   visited: Set<string> = new Set(),
+  baseCountFn?: (itemId: string) => number,
 ): CraftingNode | null {
   // Cycle detection
   if (visited.has(goalRecipe.output_item_id)) {
@@ -234,10 +236,13 @@ function buildCraftingTree(
 
   visited.add(goalRecipe.output_item_id);
 
+  const realHave = (baseCountFn || countItemFn)(goalRecipe.output_item_id);
+  const totalHave = countItemFn(goalRecipe.output_item_id);
   const node: CraftingNode = {
     recipe: goalRecipe,
     quantityNeeded: quantityToCraftInItems,
-    quantityHave: countItemFn(goalRecipe.output_item_id),
+    quantityHave: realHave,
+    quantityPending: Math.max(0, totalHave - realHave),
     quantityToCraft: quantityToCraftInItems,
     children: [],
     depth,
@@ -270,6 +275,7 @@ function buildCraftingTree(
       facilityAvailableRecipes,
       depth + 1,
       new Set(visited),
+      baseCountFn,
     );
 
     if (childNode) {
@@ -321,6 +327,7 @@ export function calculateCraftingPlan(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  baseCountFn?: (itemId: string) => number,
 ): CraftingPlan | null {
   const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes);
 
@@ -335,6 +342,9 @@ export function calculateCraftingPlan(
     recipes,
     countItemFn,
     facilityAvailableRecipes,
+    0,
+    new Set(),
+    baseCountFn,
   );
 
   if (!tree) {
@@ -405,12 +415,16 @@ export function calculateMultiGoalPlan(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  baseCountFn?: (itemId: string) => number,
 ): CraftingPlan[] {
   const plans: CraftingPlan[] = [];
 
   // Create a mutable inventory counter that updates as we plan
   const inventory = new Map<string, number>();
   const baseCount = countItemFn;
+  // Real current stock, used purely for the displayed "have" (excludes
+  // in-flight pending and planned-but-not-yet-queued output).
+  const baseStock = baseCountFn || countItemFn;
 
   // Initialize inventory
   const allItemIds = new Set<string>();
@@ -449,6 +463,9 @@ export function calculateMultiGoalPlan(
       recipes,
       (itemId) => inventory.get(itemId) || 0,
       facilityAvailableRecipes,
+      0,
+      new Set(),
+      baseStock,
     );
 
     if (tree) {
@@ -480,7 +497,12 @@ export function calculateMultiGoalPlan(
 export function formatCraftingTree(node: CraftingNode, prefix: string = ""): string {
   const lines: string[] = [];
   
-  const haveStr = node.quantityHave > 0 ? ` (have ${node.quantityHave})` : "";
+  let haveStr = "";
+  if (node.quantityPending > 0) {
+    haveStr = ` (have ${node.quantityHave}, ${node.quantityPending} pending)`;
+  } else if (node.quantityHave > 0) {
+    haveStr = ` (have ${node.quantityHave})`;
+  }
   lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${node.quantityToCraft}x${haveStr}`);
   
   for (const child of node.children) {

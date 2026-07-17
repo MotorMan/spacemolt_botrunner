@@ -851,6 +851,135 @@ async function depositToDestination(
   return { success: false, depositedQty: 0 };
 }
 
+/**
+ * Batch-withdraw a set of items from faction/personal storage into cargo in a
+ * SINGLE game action (one tick) instead of one command per item. Uses the
+ * unified v2 `storage` command with an `items` array; the server moves every
+ * requested stack in one write and reports per-item success. This removes the
+ * per-item withdrawal delay that previously dominated the load loop.
+ *
+ * The actually-moved quantity of each item is computed from a before/after
+ * cargo diff (immune to response-shape differences and to the lagging
+ * `bot.cargo` cache), so the caller's quantity accounting stays exact even when
+ * the hold fills partway through the batch.
+ *
+ * @returns A map of itemId -> quantity actually moved into cargo.
+ */
+async function bulkWithdrawFromStorage(
+  ctx: RoutineContext,
+  requested: Array<{ itemId: string; quantity: number }>,
+  storageType: 'faction' | 'personal',
+): Promise<Map<string, number>> {
+  const { bot } = ctx;
+  const valid = requested.filter((r) => r.itemId && r.quantity > 0);
+  const moved = new Map<string, number>();
+  if (valid.length === 0) return moved;
+
+  const before = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
+
+  const resp = await bot.exec("storage", {
+    action: "withdraw",
+    source: storageType,
+    items: valid.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+  });
+
+  await bot.refreshCargo();
+  if (storageType === 'faction') {
+    await bot.refreshFactionStorage(false, undefined, true);
+  } else {
+    await bot.refreshStorage();
+  }
+
+  if (resp.error) {
+    // A whole-batch failure (e.g. cargo already full, station service issue).
+    // Return whatever the cargo diff shows landed; the caller re-checks space
+    // and falls back to per-item withdrawal for anything still pending.
+    ctx.log("warn", `Bulk withdraw failed: ${resp.error.message} — diffing cargo for partial moves`);
+  }
+
+  const after = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const delta = (after.get(id) || 0) - (before.get(id) || 0);
+    if (delta > 0) moved.set(id, delta);
+  }
+  return moved;
+}
+
+/**
+ * Batch-deposit a set of cargo items to the destination in a SINGLE game action
+ * (one tick) instead of one command per item, using the unified v2 `storage`
+ * command with an `items` array. `faction`/`personal` targets go through the
+ * `storage` command; `send_gift` still uses the per-item `send_gift` path (the
+ * unified storage command does not gift) — see `depositToDestination`.
+ *
+ * The actually-deposited quantity of each item is computed from a before/after
+ * storage diff so the caller's delivered-count accounting stays exact.
+ *
+ * @returns A map of itemId -> quantity actually deposited.
+ */
+async function bulkDepositToDestination(
+  ctx: RoutineContext,
+  items: Array<{ itemId: string; quantity: number }>,
+  storageType: "faction" | "personal" | "send_gift",
+  destinationBotName?: string,
+): Promise<Map<string, number>> {
+  const { bot } = ctx;
+  const valid = items.filter((r) => r.itemId && r.quantity > 0);
+  const deposited = new Map<string, number>();
+  if (valid.length === 0) return deposited;
+
+  if (storageType === "send_gift") {
+    // Delegate to the per-item gift path (it already verifies each gift left
+    // cargo). Aggregate the per-item results.
+    for (const it of valid) {
+      const res = await depositToDestination(ctx, it.itemId, it.quantity, "send_gift", destinationBotName);
+      if (res.success && res.depositedQty > 0) {
+        deposited.set(it.itemId, (deposited.get(it.itemId) || 0) + res.depositedQty);
+      }
+    }
+    return deposited;
+  }
+
+  const before = new Map<string, number>();
+  if (storageType === "faction") {
+    await bot.refreshFactionStorage(false, undefined, true);
+    for (const i of bot.factionStorage) before.set(i.itemId, i.quantity);
+  } else {
+    await bot.refreshStorage();
+    for (const i of bot.storage) before.set(i.itemId, i.quantity);
+  }
+
+  const resp = await bot.exec("storage", {
+    action: "deposit",
+    target: storageType,
+    items: valid.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+  });
+
+  // Server-side storage reads can lag a tick; pause briefly then refresh so the
+  // before/after diff sees the deposit.
+  await sleep(1000);
+  if (storageType === "faction") {
+    await bot.refreshFactionStorage(false, undefined, true);
+    for (const i of bot.factionStorage) {
+      const b = before.get(i.itemId) || 0;
+      const delta = i.quantity - b;
+      if (delta > 0) deposited.set(i.itemId, (deposited.get(i.itemId) || 0) + delta);
+    }
+  } else {
+    await bot.refreshStorage();
+    for (const i of bot.storage) {
+      const b = before.get(i.itemId) || 0;
+      const delta = i.quantity - b;
+      if (delta > 0) deposited.set(i.itemId, (deposited.get(i.itemId) || 0) + delta);
+    }
+  }
+
+  if (resp.error) {
+    ctx.log("warn", `Bulk deposit failed: ${resp.error.message} — counted ${deposited.size} item type(s) via storage diff`);
+  }
+  return deposited;
+}
+
 /** Deliver every deliverable item currently in the hold to the destination.
  *  Used by the graceful-shutdown path so cargo is never abandoned when the
  *  routine is asked to stop. Fuel cells are never deposited (see
@@ -1388,76 +1517,55 @@ async function runBulkMovePhase(
   }
 
   // ── Load as much as fits into cargo ───────────────────────
+  // Pull every planned item from faction storage into cargo in ONE batch action
+  // (single tick) instead of one withdrawal per item — the unified `storage`
+  // command moves all the requested stacks at once. We cap each item to what
+  // fits the hold (by true item size) so the batch never overflows, then
+  // reconcile the actual moved quantities from the cargo diff. A single batch
+  // can still partially fill the hold; we loop a few passes until the hold is
+  // full or every planned item is loaded.
   await bot.refreshCargo();
-  let cargoUsed = bot.cargo;
   const cargoMax = bot.cargoMax;
   let loadedAny = false;
-  // Track items we've already tried and failed to load so we don't retry them
-  // forever (e.g. a size we still don't know, or simply no space).
-  const skipped = new Set<string>();
-  let failedItems = 0;
-  // Package IDs whose true size we've resolved via inspect this phase, so each
-  // is inspected at most once and never overbooked into a too-small hold.
-  const inspectedPackages = new Set<string>();
 
-  for (const p of planned) {
-    if (skipped.has(p.itemId)) { failedItems++; continue; }
-    while (bot.state === "running") {
-      // Use the LIVE hold reading (re-synced each attempt); the in-memory tracker
-      // can lag the game's cache and would otherwise keep probing a full hold.
-      await bot.refreshCargo();
-      cargoUsed = Math.max(cargoUsed, bot.cargo);
-      const freeSpace = Math.max(0, cargoMax - cargoUsed);
-      if (freeSpace <= 0) break;
-      // Packages default to a bogus size of 1 when not yet inspected; resolve the
-      // true size now so we never try to fit a 100-space package into 1 free space.
+  for (let pass = 0; pass < 6 && bot.state === "running"; pass++) {
+    await bot.refreshCargo();
+    const cargoUsed = cargoUsedFromInventory(bot);
+    const freeSpace = Math.max(0, cargoMax - cargoUsed);
+    if (freeSpace <= 0) break;
+
+    // Package IDs whose true size we've resolved via inspect this phase, so each
+    // is inspected at most once and never overbooked into a too-small hold.
+    const batch: Array<{ itemId: string; quantity: number }> = [];
+    for (const p of planned) {
+      if (p.quantity <= 0) continue;
       let itemSize = getItemSize(p.itemId);
-      if (p.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(p.itemId)) {
-        inspectedPackages.add(p.itemId);
+      if (p.itemId.startsWith("package:") && itemSize <= 1) {
         itemSize = await getItemSizeAsync(bot, p.itemId);
       }
       const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
-      if (maxFit <= 0) { skipped.add(p.itemId); failedItems++; break; }
-
+      if (maxFit <= 0) continue;
       await bot.refreshFactionStorage(false, settings.sourceStation);
       const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
-      const stillNeeded = settings.bulkSeedMode
-        ? Math.max(0, p.quantity - (destHas.has(p.itemId) ? 0 : 0))
-        : p.quantity;
-      const loadQty = Math.min(maxFit, inStorage, stillNeeded);
-      if (loadQty <= 0) { skipped.add(p.itemId); failedItems++; break; }
-
-      const res = await withdrawFromStorage(ctx, p.itemId, loadQty, "faction");
-      if (res.success && res.withdrawnQty > 0) {
-        cargoUsed += res.withdrawnQty * itemSize;
-        loadedAny = true;
-        p.quantity -= res.withdrawnQty;
-        ctx.log("cargo", `✅ Loaded ${res.withdrawnQty}x ${p.itemName} (cargo ${cargoUsed}/${cargoMax})`);
-        if (p.quantity <= 0) break;
-      } else {
-        // This item couldn't be loaded (full cargo, wrong size, etc.). Re-sync the
-        // tracker from the REAL free space: trust the server's "only N available"
-        // figure (immune to the lagging bot.cargo cache), else a fresh live refresh.
-        // A cargo_full means the hold is fuller than we thought, so once pinned we
-        // skip this item — other items may still fit.
-        if (typeof res.availableSpace === "number") {
-          cargoUsed = cargoMax - res.availableSpace;
-        } else {
-          await bot.refreshCargo();
-          cargoUsed = Math.max(cargoUsed, bot.cargo);
-        }
-        if (cargoMax - cargoUsed <= 0) { loadedAny = loadedAny || false; break; }
-        ctx.log("warn", `⚠️ Could not load ${p.itemName} this pass (cargo ${cargoUsed}/${cargoMax}) — skipping and continuing`);
-        skipped.add(p.itemId);
-        failedItems++;
-        break;
-      }
+      const loadQty = Math.min(maxFit, inStorage, p.quantity);
+      if (loadQty > 0) batch.push({ itemId: p.itemId, quantity: loadQty });
     }
-    if (Math.max(0, cargoMax - cargoUsed) <= 0) break;
+
+    if (batch.length === 0) break;
+
+    const moved = await bulkWithdrawFromStorage(ctx, batch, "faction");
+    if (moved.size > 0) loadedAny = true;
+    for (const [itemId, qty] of moved) {
+      const p = planned.find((pp) => pp.itemId === itemId);
+      const name = p?.itemName || itemId;
+      if (p) p.quantity -= qty;
+      ctx.log("cargo", `✅ Loaded ${qty}x ${name} (cargo ${cargoUsedFromInventory(bot)}/${cargoMax})`);
+    }
+    if (planned.every((p) => p.quantity <= 0)) break;
   }
 
   if (!loadedAny) {
-    ctx.log("info", `Bulk move: could not load anything (${failedItems}/${planned.length} items skipped) — waiting 60s`);
+    ctx.log("info", `Bulk move: could not load anything — waiting 60s`);
     await ctx.sleep(60000);
     return;
   }
@@ -1483,12 +1591,25 @@ async function runBulkMovePhase(
   if (!await dockAtStation(ctx)) { await ctx.sleep(30000); return; }
 
   await bot.refreshCargo();
-  for (const item of bot.inventory) {
-    if (item.quantity <= 0) continue;
-    if (isBulkSkipItem(item.itemId)) continue;
-    const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
-    if (depositQty <= 0) continue;
-    await depositToDestination(ctx, item.itemId, depositQty, settings.destinationStorageType, settings.destinationBotName);
+  const deliverItems = bot.inventory
+    .filter((item) => {
+      if (item.quantity <= 0) return false;
+      if (isBulkSkipItem(item.itemId)) return false;
+      return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
+    })
+    .map((item) => ({
+      itemId: item.itemId,
+      quantity: fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells),
+    }));
+
+  if (deliverItems.length > 0) {
+    const deposited = await bulkDepositToDestination(
+      ctx,
+      deliverItems,
+      settings.destinationStorageType,
+      settings.destinationBotName,
+    );
+    ctx.log("cargo", `📦 Bulk move delivered ${deposited.size} item type(s) to destination in one action`);
   }
 
   await tryRefuel(ctx);
@@ -2471,9 +2592,6 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // are accounted for and we never overfill the hold.
     let cargoUsed = bot.cargo;
     const cargoMax = bot.cargoMax;
-    // Set true once the hold is actually full (per live bot.cargo). When set we
-    // stop looping over jobs and go deliver instead of probing every item.
-    let cargoIsFull = false;
     // Package IDs whose true size we've resolved via inspect this pass, so each
     // is inspected at most once and never overbooked into a too-small hold.
     const inspectedPackages = new Set<string>();
@@ -2490,138 +2608,111 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // If cargo is full, go deliver
       if (cargoMax - cargoUsed <= 0) {
         ctx.log("cargo", `📦 Cargo full (${cargoUsed}/${cargoMax}) — delivering...`);
-        cargoIsFull = true;
         break;
       }
 
-      // Try to load from each job that still has items
+      // Try to load from each job that still has items. Instead of one
+      // withdrawal command per item (one tick each), we gather every job's
+      // remaining quantity — capped by how much fits the hold by true item
+      // size — and issue a SINGLE batched `storage` withdrawal. The server
+      // moves all the requested stacks in one write; we then reconcile the
+      // actually-moved quantities (from the cargo diff) with each job's
+      // remaining counter and tracking. This removes the per-item tick cost
+      // that used to bottleneck the load loop.
       let loadedThisIteration = false;
-      let failedThisIteration = 0;
-      
-      for (const job of jobs) {
-        const remaining = jobRemaining.get(job.itemId) || 0;
-        if (remaining <= 0) continue;
 
-        // Recompute free space from the AUTHORITATIVE live inventory every time,
-        // never the drifting manual tracker, so a full hold stops us from probing
-        // more items (and so we never over-request into a cargo_full).
-        cargoUsed = cargoUsedFromInventory(bot);
-        const liveFree = Math.max(0, cargoMax - cargoUsed);
-        if (liveFree <= 0) {
-          ctx.log("cargo", `📦 Cargo full (${cargoUsed}/${cargoMax}) — stopping loading`);
-          loadedThisIteration = true; // Signal to break outer loop
-          cargoIsFull = true;
-          break;
-        }
-
-        // Packages default to a bogus size of 1 when not yet inspected; resolve
-        // the true size now so the fit check below can never believe a 100-space
-        // package fits in 1 free space. Inspect each package id at most once.
-        let itemSize = getItemSize(job.itemId);
-        if (job.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(job.itemId)) {
-          inspectedPackages.add(job.itemId);
-          itemSize = await getItemSizeAsync(bot, job.itemId);
-        }
-        // If even ONE unit won't fit, skip this item without a network call —
-        // it can never load until cargo is freed.
-        if (itemSize > liveFree) {
-          ctx.log("cargo", `Skipping ${job.itemName}: one unit (size ${itemSize}) won't fit in ${liveFree} free — skipping until cargo clears`);
-          failedThisIteration++;
-          continue;
-        }
-
-        ctx.log("cargo", `🔄 Loading loop: ${job.itemName} remaining=${remaining}, freeSpace=${liveFree}, cargo=${cargoUsed}/${cargoMax}`);
-
-        // Calculate how many items fit in cargo space (considering item size)
-        const maxFitInCargo = Math.floor(liveFree / itemSize);
-
-        // Calculate how much we can actually load (limited by remaining, and cargo capacity)
-        const loadQty = Math.min(remaining, maxFitInCargo);
-        if (loadQty <= 0) {
-          ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${liveFree})`);
-          failedThisIteration++;
-          continue;
-        }
-
-        ctx.log("cargo", `Attempting to withdraw ${loadQty}x ${job.itemName} from ${job.storageType} (item size: ${itemSize}, cargo space: ${liveFree})`);
-        yield "withdraw_items";
-
-        // Retry failed withdrawals up to 3 times to handle temporary API issues
-        let withdrawResult: { success: boolean; withdrawnQty: number; availableSpace?: number } = { success: false, withdrawnQty: 0 };
-        let retryCount = 0;
-        const maxRetries = 3;
-
-        while (retryCount < maxRetries) {
-          withdrawResult = await withdrawFromStorage(ctx, job.itemId, loadQty, job.storageType);
-          ctx.log("cargo", `Withdraw result: success=${withdrawResult.success}, withdrawnQty=${withdrawResult.withdrawnQty}${retryCount > 0 ? ` (retry ${retryCount}/${maxRetries - 1})` : ''}`);
-
-          if (withdrawResult.success && withdrawResult.withdrawnQty > 0) {
-            break; // Success
-          }
-
-          retryCount++;
-          if (retryCount < maxRetries) {
-            ctx.log("cargo", `Withdraw failed, retrying in 5 seconds... (${retryCount}/${maxRetries - 1})`);
-            await ctx.sleep(5000);
-          }
-        }
-
-        if (!withdrawResult.success || withdrawResult.withdrawnQty <= 0) {
-          ctx.log("error", `Failed to withdraw ${job.itemId} from ${job.storageType} after ${maxRetries} attempts — marking as depleted`);
-          // Re-sync the in-memory tracker with the REAL free space. Prefer the
-          // server's own "only N available" figure (cargo_full errors are ground
-          // Re-anchor to the authoritative live inventory so free space is
-          // correct on the next iteration and we never over-request into a
-          // cargo_full. (We already set the item's true size from the error in
-          // withdrawFromStorage, so the next pass sizes the load correctly.)
-          await bot.refreshCargo();
-          cargoUsed = cargoUsedFromInventory(bot);
-          if (cargoMax - cargoUsed <= 0) {
-            ctx.log("cargo", `📦 Cargo full after failed withdraw (${cargoUsed}/${cargoMax}) — stopping loading`);
-            cargoIsFull = true;
-            loadedThisIteration = true;
-            break;
-          }
-          // After multiple retries, assume the item is truly unavailable
-          failedThisIteration++;
-          continue;
-        }
-
-        // Reset consecutive failures on success
-        consecutiveFailures = 0;
-
-        // Re-anchor the cargo tracker to the AUTHORITATIVE inventory total
-        // (quantity × true size) rather than incrementing by qty × size, which
-        // drifts whenever a size estimate is wrong and leads to over-requesting
-        // into a cargo_full. refreshCargo already repopulated bot.inventory.
-        cargoUsed = cargoUsedFromInventory(bot);
-
-        const newRemaining = remaining - withdrawResult.withdrawnQty;
-        jobRemaining.set(job.itemId, newRemaining);
-        totalMoved += withdrawResult.withdrawnQty;
-        ctx.log("cargo", `✅ Loaded ${withdrawResult.withdrawnQty}x ${job.itemName} (${newRemaining} remaining, cargo: ${cargoUsed}/${cargoMax})`);
-        // Robust milestone log: item is now physically in the cargo hold.
-        logCargoActivity(bot.username, "cargo_loaded", `Loaded ${withdrawResult.withdrawnQty}x ${job.itemName} into cargo (${newRemaining} remaining to load)`, {
-          itemId: job.itemId,
-          itemName: job.itemName,
-          quantity: withdrawResult.withdrawnQty,
-          location: `${bot.system}/${bot.poi}`,
-        });
+      // Resolve true sizes (packages need an inspect) and cap each job to what
+      // fits the current free space, exactly as the old per-item fit check did.
+      const cargoUsedNow = cargoUsedFromInventory(bot);
+      const liveFreeNow = Math.max(0, cargoMax - cargoUsedNow);
+      if (liveFreeNow <= 0) {
+        ctx.log("cargo", `📦 Cargo full (${cargoUsedNow}/${cargoMax}) — stopping loading`);
         loadedThisIteration = true;
+      } else {
+        const batch: Array<{ itemId: string; quantity: number; storageType: 'faction' | 'personal' }> = [];
+        for (const job of jobs) {
+          const remaining = jobRemaining.get(job.itemId) || 0;
+          if (remaining <= 0) continue;
 
-        // Update item progress tracking
-        updateItemProgress(bot.username, job.itemId, { withdrawn: withdrawResult.withdrawnQty });
+          let itemSize = getItemSize(job.itemId);
+          if (job.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(job.itemId)) {
+            inspectedPackages.add(job.itemId);
+            itemSize = await getItemSizeAsync(bot, job.itemId);
+          }
+          // If even ONE unit won't fit, skip this item without a network call —
+          // it can never load until cargo is freed.
+          if (itemSize > liveFreeNow) {
+            ctx.log("cargo", `Skipping ${job.itemName}: one unit (size ${itemSize}) won't fit in ${liveFreeNow} free — skipping until cargo clears`);
+            continue;
+          }
 
-        // Update global withdrawn tracking
-        updateWithdrawnQuantity(job.itemId, withdrawResult.withdrawnQty);
+          const maxFitInCargo = Math.floor(liveFreeNow / Math.max(1, itemSize));
+          const loadQty = Math.min(remaining, maxFitInCargo);
+          if (loadQty <= 0) {
+            ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${liveFreeNow})`);
+            continue;
+          }
 
-        // If we couldn't load the full amount due to cargo space, cargo is nearly full
-        if (withdrawResult.withdrawnQty < loadQty) {
-          ctx.log("cargo", `⚠️ Partial load: got ${withdrawResult.withdrawnQty} of ${loadQty} requested (cargo nearly full, ${cargoMax - cargoUsed} space left)`);
-          // Cargo is essentially full - break to deliver
-          loadedThisIteration = true;
-          break;
+          ctx.log("cargo", `🔄 Batch loading: ${job.itemName} remaining=${remaining}, will load up to ${loadQty} (size ${itemSize}, free ${liveFreeNow})`);
+          batch.push({ itemId: job.itemId, quantity: loadQty, storageType: job.storageType });
         }
+
+        if (batch.length > 0) {
+          yield "withdraw_items";
+          // All jobs in a single routine share the same source storage type, so
+          // we can issue one batched withdrawal across the type. (Mixed
+          // faction/personal sources are not used together here.)
+          const byType = new Map<'faction' | 'personal', Array<{ itemId: string; quantity: number }>>();
+          for (const b of batch) {
+            if (!byType.has(b.storageType)) byType.set(b.storageType, []);
+            byType.get(b.storageType)!.push({ itemId: b.itemId, quantity: b.quantity });
+          }
+
+          const movedAll = new Map<string, number>();
+          for (const [storageType, items] of byType) {
+            const moved = await bulkWithdrawFromStorage(ctx, items, storageType);
+            for (const [itemId, qty] of moved) movedAll.set(itemId, (movedAll.get(itemId) || 0) + qty);
+          }
+
+          // Reconcile each job's remaining counter and update tracking exactly
+          // as the old per-item path did.
+          for (const b of batch) {
+            const movedQty = movedAll.get(b.itemId) || 0;
+            if (movedQty <= 0) {
+              ctx.log("warn", `⚠️ Could not load ${b.itemId} this pass — skipping and continuing`);
+              continue;
+            }
+
+            consecutiveFailures = 0;
+            const remainingBefore = jobRemaining.get(b.itemId) || 0;
+            const newRemaining = Math.max(0, remainingBefore - movedQty);
+            jobRemaining.set(b.itemId, newRemaining);
+            totalMoved += movedQty;
+            const job = jobs.find((j) => j.itemId === b.itemId);
+            ctx.log("cargo", `✅ Loaded ${movedQty}x ${job?.itemName || b.itemId} (${newRemaining} remaining, cargo: ${cargoUsedFromInventory(bot)}/${cargoMax})`);
+            logCargoActivity(bot.username, "cargo_loaded", `Loaded ${movedQty}x ${job?.itemName || b.itemId} into cargo (${newRemaining} remaining to load)`, {
+              itemId: b.itemId,
+              itemName: job?.itemName || b.itemId,
+              quantity: movedQty,
+              location: `${bot.system}/${bot.poi}`,
+            });
+            loadedThisIteration = true;
+
+            updateItemProgress(bot.username, b.itemId, { withdrawn: movedQty });
+            updateWithdrawnQuantity(b.itemId, movedQty);
+
+            // If we couldn't load the full amount we asked for, the hold is
+            // (nearly) full — stop loading and go deliver.
+            if (movedQty < b.quantity) {
+              ctx.log("cargo", `⚠️ Partial load: got ${movedQty} of ${b.quantity} requested (cargo nearly full) — delivering`);
+              loadedThisIteration = true;
+              break;
+            }
+          }
+        }
+        // Re-anchor the cargo tracker to the authoritative inventory total so
+        // the full-hold check below (and the next pass) use fresh free space.
+        cargoUsed = cargoUsedFromInventory(bot);
       }
 
       // If we loaded something, continue to next iteration to fill remaining space
@@ -2926,115 +3017,48 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     yield "deposit_items";
 
-    // Check destination storage BEFORE depositing to establish baseline
-    let destStorageBefore: Array<{ itemId: string; name: string; quantity: number }> = [];
-    let canVerifyDelivery = true;
-
-    if (settings.destinationStorageType === "faction") {
-      await bot.refreshFactionStorage();
-      destStorageBefore = [...bot.factionStorage];
-    } else if (settings.destinationStorageType === "personal") {
-      await bot.refreshStorage();
-      destStorageBefore = [...bot.storage];
-    } else if (settings.destinationStorageType === "send_gift") {
-      // Cannot verify gift deliveries - fall back to deposit function reporting
-      canVerifyDelivery = false;
-      ctx.log("cargo", `📦 Gift delivery selected - cannot verify actual delivery to recipient storage`);
-    }
-
     await bot.refreshCargo();
     // Deposit ALL items in cargo to the destination
     const itemsToDeposit = [...bot.inventory];
 
     if (itemsToDeposit.length > 0) {
-      ctx.log("cargo", `📦 Depositing ${itemsToDeposit.length} item type(s) to destination...`);
-      let depositErrors = 0;
-      for (const item of itemsToDeposit) {
-        if (item.quantity <= 0) continue;
-        // Premium/energy cells never leave the ship; military cells keep the
-        // required reserve aboard and deposit only the excess.
-        if (isNeverDepositFuelItem(item.itemId)) continue;
-        const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
-        if (depositQty <= 0) {
-          ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
-          continue;
-        }
-        if (item.itemId === "military_fuel_cell") {
-          ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
-        }
+      ctx.log("cargo", `📦 Depositing ${itemsToDeposit.length} item type(s) to destination (batch)...`);
 
-        const depositResult = await depositToDestination(
-          ctx,
-          item.itemId,
-          depositQty,
-          settings.destinationStorageType,
-          settings.destinationBotName,
-        );
-        if (!depositResult.success) {
-          ctx.log("error", `❌ Failed to deliver ${depositQty}x ${item.name}`);
-          depositErrors++;
-        }
-      }
-
-      let deliveredItems: { itemId: string; quantity: number }[] = [];
-
-      if (canVerifyDelivery) {
-        // Check destination storage AFTER depositing to count what actually arrived
-        let destStorageAfter: Array<{ itemId: string; name: string; quantity: number }> = [];
-        if (settings.destinationStorageType === "faction") {
-          await bot.refreshFactionStorage();
-          destStorageAfter = [...bot.factionStorage];
-        } else if (settings.destinationStorageType === "personal") {
-          await bot.refreshStorage();
-          destStorageAfter = [...bot.storage];
-        }
-
-        // Calculate what actually arrived by comparing before/after
-        const beforeMap = new Map(destStorageBefore.map(item => [item.itemId, item.quantity]));
-
-        for (const afterItem of destStorageAfter) {
-          const beforeQty = beforeMap.get(afterItem.itemId) || 0;
-          const arrivedQty = Math.max(0, afterItem.quantity - beforeQty);
-
-          if (arrivedQty > 0) {
-            deliveredItems.push({ itemId: afterItem.itemId, quantity: arrivedQty });
-            ctx.log("cargo", `✅ Verified delivery: ${arrivedQty}x ${afterItem.name} arrived at destination`);
-          }
-        }
-
-        if (deliveredItems.length > 0) {
-          ctx.log("cargo", `📊 Verified total delivery: ${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} items across ${deliveredItems.length} types`);
-        }
-
-        if (depositErrors > 0) {
-          ctx.log("warn", `⚠️ ${depositErrors} deposit operations reported errors, but verified ${deliveredItems.length} successful deliveries`);
-        }
-      } else {
-        // For gift deliveries, fall back to deposit function reporting
-        ctx.log("cargo", `📦 Using reported delivery quantities for gift delivery (cannot verify)`);
-        for (const item of itemsToDeposit) {
-          if (item.quantity <= 0) continue;
+      // Batch every deliverable cargo item into a single `storage` action (one
+      // tick) instead of one deposit per item. `bulkDepositToDestination`
+      // computes the actually-deposited quantities via a before/after storage
+      // diff, equivalent to the previous per-item verification, but far faster.
+      const depositList = itemsToDeposit
+        .filter((item) => {
+          if (item.quantity <= 0) return false;
           // Premium/energy cells never leave the ship; military cells keep the
           // required reserve aboard and deposit only the excess.
-          if (isNeverDepositFuelItem(item.itemId)) continue;
+          if (isNeverDepositFuelItem(item.itemId)) return false;
+          return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
+        })
+        .map((item) => {
           const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
-          if (depositQty <= 0) continue;
           if (item.itemId === "military_fuel_cell") {
             ctx.log("cargo", `🔋 Depositing ${depositQty}x military_fuel_cell (keeping reserve ${settings.militaryFuelCells}, carrying ${item.quantity})`);
           }
+          return { itemId: item.itemId, quantity: depositQty };
+        });
 
-          const depositResult = await depositToDestination(
-            ctx,
-            item.itemId,
-            depositQty,
-            settings.destinationStorageType,
-            settings.destinationBotName,
-          );
-          if (depositResult.success) {
-            ctx.log("cargo", `✅ Reported delivery: ${depositResult.depositedQty}x ${item.name} to ${settings.destinationBotName}`);
-            deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
-          }
-        }
+      const depositedMap = await bulkDepositToDestination(
+        ctx,
+        depositList,
+        settings.destinationStorageType,
+        settings.destinationBotName,
+      );
+
+      let deliveredItems: { itemId: string; quantity: number }[] = [];
+      for (const [itemId, quantity] of depositedMap) {
+        deliveredItems.push({ itemId, quantity });
+        ctx.log("cargo", `✅ Verified delivery: ${quantity}x ${itemId} arrived at destination`);
+      }
+
+      if (deliveredItems.length > 0) {
+        ctx.log("cargo", `📊 Verified total delivery: ${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} items across ${deliveredItems.length} types`);
       }
 
       totalTrips++;

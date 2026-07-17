@@ -2247,6 +2247,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     routine: Routine,
     opts?: {
       getFleetStatus?: () => BotStatus[];
+      getFleetStatusAsync?: () => Promise<BotStatus[]>;
       getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
       sendBotChat?: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => void;
       getAllBotNames?: () => string[];
@@ -2298,6 +2299,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         });
       },
       getFleetStatus: opts?.getFleetStatus,
+      getFleetStatusAsync: opts?.getFleetStatusAsync,
       getBotFreshStatus: opts?.getBotFreshStatus,
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,

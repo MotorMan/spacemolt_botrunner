@@ -1898,6 +1898,47 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
 
+    // ── STARTUP CARGO DUMP ────────────────────────────────────
+    // If the hold is (near) full when a cycle begins, the load loop below would
+    // see zero free space, fail to load anything, and just sleep 60s forever
+    // ("stuck"). Empty the hold FIRST so every cycle starts clean. This is
+    // especially important after a crash/restart where a previous run left the
+    // ship loaded. We dump everything except operational fuel/energy cells, and
+    // fall back from faction → personal storage when a stack is at the faction
+    // cap (the "too many of that item in storage" case). Items that are this
+    // bot's own in-transit cargo are left aboard only when the hold is NOT full,
+    // so a genuinely full hold always gets emptied regardless of transit flags.
+    await bot.refreshCargo();
+    const cargoFullness = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 1;
+    if (bot.docked && bot.inventory.length > 0 && cargoFullness >= 0.9) {
+      ctx.log("cargo", `🧹 Startup: hold is ${Math.round(cargoFullness * 100)}% full — emptying cargo to storage before loading`);
+      const startupClear = bot.inventory.filter(item => {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+        // When the hold is full we dump everything (transit flags don't matter —
+        // a full hold must be cleared to make progress).
+        return true;
+      });
+      for (const item of startupClear) {
+        if (item.quantity <= 0) continue;
+        const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        if (!dResp.error) {
+          ctx.log("cargo", `🧹 Startup: emptied ${item.quantity}x ${item.name} to faction storage`);
+        } else if (dResp.error.message.toLowerCase().includes("storage_cap_exceeded") || dResp.error.message.toLowerCase().includes("cap reached") || dResp.error.message.toLowerCase().includes("too many") || dResp.error.message.toLowerCase().includes("maximum") || dResp.error.message.toLowerCase().includes("full")) {
+          ctx.log("warn", `⚠️ Startup: faction storage full for ${item.name} — falling back to personal (station) storage`);
+          const fb = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          if (!fb.error) {
+            ctx.log("cargo", `🧹 Startup: emptied ${item.quantity}x ${item.name} to personal storage`);
+          } else {
+            ctx.log("error", `Startup: could not empty ${item.name} to either storage: ${fb.error.message}`);
+          }
+        } else {
+          ctx.log("error", `Startup: failed to empty ${item.name} to faction storage: ${dResp.error.message}`);
+        }
+      }
+      await bot.refreshCargo();
+    }
+
     // ── CARGO DELIVERY RECOVERY ─────────────────────────────────
     // On restart, check if bot has cargo items that need to be delivered.
     // If so, skip directly to delivery instead of going back to source.
@@ -2339,8 +2380,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Pre-inspect any package items so their true cargo size is known before
     // planning — packages are not in the catalog and default to size 1, which
-    // causes massive overbooking of cargo space.
+    // causes massive overbooking of cargo space. Includes cargo, source faction
+    // storage, and personal storage so in-transit packages aboard are sized too.
     await preInspectPackageSizes(bot, [
+      ...bot.inventory.map(i => ({ itemId: i.itemId })),
       ...settings.items.map(i => ({ itemId: i.itemId })),
       ...bot.factionStorage.map(i => ({ itemId: i.itemId })),
       ...bot.storage.map(i => ({ itemId: i.itemId })),

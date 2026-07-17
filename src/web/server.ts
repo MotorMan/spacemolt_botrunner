@@ -1030,7 +1030,7 @@ if (!this.settings.fuel_service) {
             const raw = readFileSync(taxesPath, "utf-8");
             const taxes = JSON.parse(raw);
             const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
-            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0;
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0, totalTaxDue = 0;
             for (const [botName, data] of Object.entries(taxes)) {
               const botData = data as { lastTaxEstimate?: any; history: any[] };
               bots[botName] = botData;
@@ -1040,6 +1040,7 @@ if (!this.settings.fuel_service) {
                 totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
                 totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
                 totalTaxPrepaid += botData.lastTaxEstimate.tax_prepaid || 0;
+                totalTaxDue += (botData.lastTaxEstimate.income_tax_total || 0) + (botData.lastTaxEstimate.property_tax_total || 0);
               }
             }
             return Response.json({
@@ -1050,6 +1051,7 @@ if (!this.settings.fuel_service) {
                 totalPropertyTax,
                 totalAssessedValue,
                 totalTaxPrepaid,
+                totalTaxDue,
                 botCount: Object.keys(taxes).length
               }
             });

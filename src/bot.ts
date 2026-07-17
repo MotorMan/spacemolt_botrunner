@@ -1987,6 +1987,81 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   /**
+   * Idempotently top up this bot's personal tax-prepayment pool so it covers
+   * the current estimated tax bill. Only the *shortfall* (owed minus what is
+   * already prepaid) is ever sent, so re-running this daily can never stack a
+   * huge double-prepayment on top of a small bill — prepaid credits are escrowed
+   * and only refunded after Sunday's assessment, so over-paying is money frozen
+   * until then.
+   *
+   * The wallet is checked first; if it can't cover the shortfall, credits are
+   * pulled from faction storage via `faction_withdraw_credits` (requires a
+   * docked bot with ManageTreasury access) before prepaying.
+   *
+   * Returns the amount actually prepaid (0 if already covered or it failed).
+   */
+  async prepayTaxShortfall(opts?: { maxPrepay?: number; useFactionStorage?: boolean }): Promise<number> {
+    const maxPrepay = opts?.maxPrepay ?? Infinity;
+    const useFactionStorage = opts?.useFactionStorage ?? true;
+
+    // Refresh the live estimate so we never act on stale data.
+    const estimate = await this.updateTaxEstimate();
+    if (!estimate) {
+      this.log("warn", "prepayTaxShortfall: could not fetch tax estimate");
+      return 0;
+    }
+
+    const owed = estimate.income_tax_total + estimate.property_tax_total;
+    const alreadyPrepaid = estimate.tax_prepaid;
+    const shortfall = Math.max(0, Math.ceil(owed - alreadyPrepaid));
+
+    if (shortfall <= 0) {
+      this.log("system", `Tax prepay not needed: owed=${owed}, prepaid=${alreadyPrepaid} (fully covered)`);
+      return 0;
+    }
+
+    const wanted = Math.min(shortfall, maxPrepay);
+    if (!Number.isFinite(wanted) || wanted <= 0) {
+      this.log("system", `Tax prepay capped: shortfall=${shortfall} exceeds maxPrepay=${maxPrepay}`);
+      return 0;
+    }
+
+    // Ensure we have a current wallet balance.
+    await this.refreshStatus();
+    let wallet = this.credits;
+
+    if ((wallet ?? 0) < wanted && useFactionStorage) {
+      const need = Math.ceil(wanted - (wallet ?? 0));
+      this.log("system", `Tax prepay: withdrawing ${need}cr from faction storage (wallet=${wallet ?? 0}, want=${wanted})`);
+      const wres = await this.exec("faction_withdraw_credits", { amount: need });
+      if (wres.error) {
+        this.log("warn", `Tax prepay faction withdraw failed: ${wres.error.message}`);
+        // Fall back to whatever is in the wallet.
+      } else {
+        await this.refreshStatus();
+        wallet = this.credits;
+      }
+    }
+
+    const available = Math.max(0, Math.floor(wallet ?? 0));
+    const toPrepay = Math.min(wanted, available);
+
+    if (toPrepay <= 0) {
+      this.log("warn", `Tax prepay skipped: no available credits (wallet=${wallet ?? 0}, want=${wanted})`);
+      return 0;
+    }
+
+    const res = await this.exec("prepay_tax", { amount: toPrepay });
+    if (res.error) {
+      this.log("error", `Tax prepay failed: ${res.error.message}`);
+      return 0;
+    }
+
+    this.log("system", `Tax prepay: sent ${toPrepay}cr (owed=${owed}, prepaid was=${alreadyPrepaid}, shortfall=${shortfall})`);
+    return toPrepay;
+  }
+
+  /**
    * Call view_storage and return the full response (including hint field).
    * Pass station_id to query a specific station remotely.
    */

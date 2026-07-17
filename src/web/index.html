@@ -1204,6 +1204,10 @@
               <span class="stat-value" id="taxTotalPrepaid">0</span
               ><span class="stat-label">Total Tax Prepaid</span>
             </div>
+            <div class="stat-item">
+              <span class="stat-value" id="taxTotalDue" style="color: var(--orange)">0</span
+              ><span class="stat-label">Total Taxes Due</span>
+            </div>
           </div>
           <div style="margin-top: 8px; padding: 8px; background: var(--bg-secondary); border-radius: 6px;">
             <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px">
@@ -1246,6 +1250,9 @@
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
                       Property Tax
+                    </th>
+                    <th style="text-align: right; padding: 6px 12px; color: var(--orange)">
+                      Total Due
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
                       Tax Prepaid
@@ -3939,6 +3946,9 @@
         document.getElementById("taxTotalPrepaid").textContent = num(
           fleetTotals.totalTaxPrepaid || 0,
         );
+        document.getElementById("taxTotalDue").textContent = num(
+          fleetTotals.totalTaxDue || 0,
+        );
 
         updateFactionPrepayFunds();
 
@@ -3959,12 +3969,16 @@
               ? formatTimestamp(estimate.timestamp)
               : "-";
             const jsBotName = escJs(botName);
+            const incomeTax = estimate.income_tax_total || 0;
+            const propertyTax = estimate.property_tax_total || 0;
+            const totalDue = incomeTax + propertyTax;
             return `<tr>
       <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${esc(botName)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.taxable_income_to_date || 0)}</td>
-      <td style="padding:6px 12px;text-align:right">${num(estimate.income_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(incomeTax)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.assessed_property_value || 0)}</td>
-      <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(propertyTax)}</td>
+      <td style="padding:6px 12px;text-align:right;color:var(--orange);font-weight:600">${num(totalDue)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.tax_prepaid || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
       <td style="padding:6px 12px;text-align:center">
@@ -12093,6 +12107,11 @@
           ? general.approvedFuelStations
           : [];
 
+        const tax = general.tax || {};
+        const taxAutoPrepay = !!tax.autoPrepayOnStartup;
+        const taxAutoPrepayMax = typeof tax.autoPrepayMax === "number" ? tax.autoPrepayMax : 0;
+        const taxAutoPrepayUseFaction = tax.autoPrepayUseFactionStorage !== false;
+
         // Build station options from mapData (sorted alphabetically by station
         // name + system so the dropdown isn't in random map-discovery order).
         let stationOpts = '<option value="">(not set)</option>';
@@ -12393,6 +12412,18 @@
         <div id="clerkPlayersList" style="width:100%;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;border:1px solid var(--border);border-radius:6px;padding:6px"></div>
       </div>
 
+      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
+        <div>
+          <div class="setting-label">Tax Auto-Prepay on Startup</div>
+          <div class="setting-hint">When bots start up docked, top up each bot's personal tax-prepayment pool to cover its current estimated bill. Only the <b>shortfall</b> over what is already prepaid is ever sent (idempotent — re-running can't over-pay), and credits are pulled from faction storage if the wallet is short. Disabled by default. Runs once per startup; also re-checks on each live estimate refresh.</div>
+        </div>
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="set-general-taxAutoPrepay" ${taxAutoPrepay ? "checked" : ""} /> Enable</label>
+          <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="set-general-taxAutoPrepayFaction" ${taxAutoPrepayUseFaction ? "checked" : ""} /> Pull from faction storage if wallet short</label>
+          <span style="display:flex;gap:6px;align-items:center">Max per bot: <input type="number" id="set-general-taxAutoPrepayMax" min="0" step="1000000" value="${taxAutoPrepayMax}" style="width:140px" /> <span style="color:var(--text-dim);font-size:11px">0 = no cap</span></span>
+        </div>
+      </div>
+
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -12512,6 +12543,18 @@
             }
             return parsed;
           })(),
+          tax: {
+            autoPrepayOnStartup: document.getElementById(
+              "set-general-taxAutoPrepay",
+            ).checked,
+            autoPrepayUseFactionStorage: document.getElementById(
+              "set-general-taxAutoPrepayFaction",
+            ).checked,
+            autoPrepayMax:
+              parseInt(
+                document.getElementById("set-general-taxAutoPrepayMax").value,
+              ) || 0,
+          },
         };
         // Persist the "Add Bots from Account" checkbox selection too, so
         // unchecking a bot and pressing Save removes it from the selected-bot

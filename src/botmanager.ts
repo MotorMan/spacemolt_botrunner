@@ -28,6 +28,7 @@ import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { fuelServiceRoutine } from "./routines/fuelService.js";
 import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
+import { idleRoutine } from "./routines/1-idle.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -332,6 +333,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
   fuel_service: { name: "FuelService", fn: fuelServiceRoutine },
   stealth_skill_grind: { name: "StealthSkillGrind", fn: stealthSkillGrindRoutine },
+  "1-idle": { name: "1-Idle", fn: idleRoutine },
 };
 
 /** Categories that go to the broadcast panel instead of bot log. */

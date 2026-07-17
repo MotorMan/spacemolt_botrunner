@@ -30,12 +30,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("warn", `Anti-idle get_nearby failed: ${err instanceof Error ? err.message : String(err)}`);
       return null;
     });
-    if (nearbyResp) {
-      if (nearbyResp.error) {
-        ctx.log("warn", `Anti-idle get_nearby failed: ${nearbyResp.error.message}`);
-      } else {
-        ctx.log("system", "Anti-idle ping (get_nearby) sent");
-      }
+    if (nearbyResp && nearbyResp.error) {
+      ctx.log("warn", `Anti-idle get_nearby failed: ${nearbyResp.error.message}`);
     }
 
     // Refresh cargo + location so the bot's status stays up to date.

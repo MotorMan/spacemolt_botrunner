@@ -572,6 +572,21 @@ if (!this.settings.fuel_service) {
       this.settings.clientSync.apiKey = generatedKey;
       saveSettings(this.settings);
     }
+    // When this node is the client-sync MASTER, bring the master up eagerly at
+    // startup (not just on the first inbound /api/client-sync request). This
+    // publishes it on globalThis so botmanager.getCombinedFleetStatus — which
+    // the rescue routine uses for its cross-client fleet poll — can find it
+    // immediately, and it lets slaves register before the rescue bot runs its
+    // first scan. Without this, a rescue bot on the master node never saw the
+    // connected slaves' pushed bot statuses.
+    if (this.settings.clientSync.mode === "master") {
+      if (!this.syncMaster) {
+        this.syncMaster = new ClientSyncMaster(this.settings.clientSync);
+        (globalThis as unknown as { syncMaster: ClientSyncMaster }).syncMaster = this.syncMaster;
+        this.syncMaster.saveSettings();
+      }
+      this.syncMaster.startFileSync((this.settings.clientSync.pollIntervalSec as number) || 15);
+    }
     // Initialize periodic refresh setting in general
     if (!this.settings.general || typeof this.settings.general !== "object") {
       this.settings.general = {};
@@ -1497,6 +1512,12 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (!this.syncMaster) {
             const csSettings = this.settings.clientSync || {};
             this.syncMaster = new ClientSyncMaster(csSettings);
+            // Expose the master on globalThis so botmanager.getCombinedFleetStatus
+            // (used by rescue's cross-client fleet poll) can find it. The slave and
+            // light slave already publish themselves on globalThis; the master must
+            // too, otherwise a rescue bot running ON the master node only ever sees
+            // its own local bots and never the connected slaves' pushed statuses.
+            (globalThis as unknown as { syncMaster: ClientSyncMaster }).syncMaster = this.syncMaster;
             this.syncMaster.saveSettings();
             // Persist any key the master lazily generated so disk matches memory.
             saveSettings(this.settings);

@@ -2159,6 +2159,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!recoveredSessionHandled) {
       await bot.refreshLocation();
       await bot.refreshCargo();
+
+      // ── Early fuel-cell offload ──
+      // Fuel cells are a cargo blocker: if they fill the hold, cargoCapacity
+      // collapses to 0 and every route computes "buy 0x" → permanent skip loop.
+      // While docked, deposit the EXCESS above a small reserve into faction
+      // storage so the hold has room for actual trade goods. We keep a modest
+      // reserve (no route chosen yet) so the bot can still fuel between jumps.
+      if (bot.docked) {
+        const FREE_TRADE_SPACE = Math.max(50, Math.floor((bot.cargoMax > 0 ? bot.cargoMax : 50) * 0.5));
+        const fuelReserveSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
+        let fuelCellWeight = 0;
+        for (const item of bot.inventory) {
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) {
+            fuelCellWeight += item.quantity * getItemSize(item.itemId);
+          }
+        }
+        const freeSpace = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
+        if (freeSpace < FREE_TRADE_SPACE) {
+          const offloadSummary: string[] = [];
+          for (const item of [...bot.inventory]) {
+            const lower = item.itemId.toLowerCase();
+            if (!(lower.includes("fuel") || lower.includes("energy_cell"))) continue;
+            const excess = item.quantity - fuelReserveSlots;
+            if (excess <= 0) continue;
+            const dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: excess });
+            if (!dResp.error) {
+              offloadSummary.push(`${excess}x ${item.name}`);
+            }
+          }
+          if (offloadSummary.length > 0) {
+            ctx.log("trade", `Offloaded cargo-blocking fuel cells to faction storage: ${offloadSummary.join(", ")}`);
+            await bot.refreshCargo();
+          }
+        }
+      }
+
       let fuelCellWeight = 0;
       for (const item of bot.inventory) {
         const lower = item.itemId.toLowerCase();

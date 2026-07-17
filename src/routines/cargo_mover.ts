@@ -468,7 +468,7 @@ async function withdrawFromStorage(
   itemId: string,
   quantity: number,
   storageType: 'faction' | 'personal',
-): Promise<{ success: boolean; withdrawnQty: number }> {
+): Promise<{ success: boolean; withdrawnQty: number; availableSpace?: number }> {
   const { bot } = ctx;
 
   // Log withdrawal attempt
@@ -481,6 +481,10 @@ async function withdrawFromStorage(
 
   // Check how much we have in cargo before withdrawing
   const cargoBefore = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+  // Ground-truth free cargo space parsed from a cargo_full error ("only N available").
+  // The game's cached bot.cargo can lag a tick; when we see a cargo_full we trust
+  // the server's own "available" figure so the caller stops over-probing a full hold.
+  let cargoFullAvailable: number | undefined;
 
   if (storageType === 'faction') {
     const inFaction = bot.factionStorage.find((i) => i.itemId === itemId);
@@ -541,6 +545,7 @@ async function withdrawFromStorage(
       if (spaceMatch) {
         const neededSpace = parseInt(spaceMatch[1], 10);
         const availableSpace = parseInt(spaceMatch[2], 10);
+        cargoFullAvailable = availableSpace;
         const actualItemSize = neededSpace / Math.max(1, actualQty);
         const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
         setItemSize(itemId, actualItemSize);
@@ -558,13 +563,14 @@ async function withdrawFromStorage(
               quantity: withdrawn,
               location: `${bot.system}/${bot.poi}`,
             });
-            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+            return { success: withdrawn > 0, withdrawnQty: withdrawn, availableSpace };
           }
         }
       } else {
         const itemSize = getItemSize(itemId);
         const fallbackMatch = wResp.error.message.match(/only (\d+) available/);
         const availableSpace = fallbackMatch ? parseInt(fallbackMatch[1], 10) : Math.max(1, Math.floor(actualQty / 2));
+        cargoFullAvailable = availableSpace;
         const availableQty = Math.max(0, Math.floor(cargoFree / itemSize));
         ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): freeSpace=${cargoFree}, parsed ${availableSpace} space → retrying withdraw with ${availableQty}x`);
         if (availableQty > 0) {
@@ -580,7 +586,7 @@ async function withdrawFromStorage(
               quantity: withdrawn,
               location: `${bot.system}/${bot.poi}`,
             });
-            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+            return { success: withdrawn > 0, withdrawnQty: withdrawn, availableSpace };
           }
         }
       }
@@ -592,7 +598,7 @@ async function withdrawFromStorage(
       location: `${bot.system}/${bot.poi}`,
       error: wResp.error.message,
     });
-    return { success: false, withdrawnQty: 0 };
+    return { success: false, withdrawnQty: 0, availableSpace: cargoFullAvailable };
   } else {
     // Personal storage - check current bot's storage
     const inPersonal = bot.storage.find((i) => i.itemId === itemId);
@@ -637,6 +643,7 @@ async function withdrawFromStorage(
       if (spaceMatch) {
         const neededSpace = parseInt(spaceMatch[1], 10);
         const availableSpace = parseInt(spaceMatch[2], 10);
+        cargoFullAvailable = availableSpace;
         const actualItemSize = neededSpace / Math.max(1, actualQty);
         const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
         setItemSize(itemId, actualItemSize);
@@ -654,13 +661,14 @@ async function withdrawFromStorage(
               quantity: withdrawn,
               location: `${bot.system}/${bot.poi}`,
             });
-            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+            return { success: withdrawn > 0, withdrawnQty: withdrawn, availableSpace };
           }
         }
       } else {
         const itemSize = getItemSize(itemId);
         const fallbackMatch = wResp.error.message.match(/only (\d+) available/);
         const availableSpace = fallbackMatch ? parseInt(fallbackMatch[1], 10) : Math.max(1, Math.floor(actualQty / 2));
+        cargoFullAvailable = availableSpace;
         const availableQty = Math.max(0, Math.floor(cargoFree / itemSize));
         ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): freeSpace=${cargoFree}, parsed ${availableSpace} space → retrying withdraw with ${availableQty}x`);
         if (availableQty > 0) {
@@ -676,7 +684,7 @@ async function withdrawFromStorage(
               quantity: withdrawn,
               location: `${bot.system}/${bot.poi}`,
             });
-            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+            return { success: withdrawn > 0, withdrawnQty: withdrawn, availableSpace };
           }
         }
       }
@@ -687,7 +695,7 @@ async function withdrawFromStorage(
       location: `${bot.system}/${bot.poi}`,
       error: wResp.error.message,
     });
-    return { success: false, withdrawnQty: 0 };
+    return { success: false, withdrawnQty: 0, availableSpace: cargoFullAvailable };
   }
 }
 
@@ -1481,10 +1489,16 @@ async function runBulkMovePhase(
         if (p.quantity <= 0) break;
       } else {
         // This item couldn't be loaded (full cargo, wrong size, etc.). Re-sync the
-        // tracker from the live hold (a cargo_full means it's fuller than we thought)
-        // and skip this item — other items may still fit.
-        await bot.refreshCargo();
-        cargoUsed = Math.max(cargoUsed, bot.cargo);
+        // tracker from the REAL free space: trust the server's "only N available"
+        // figure (immune to the lagging bot.cargo cache), else a fresh live refresh.
+        // A cargo_full means the hold is fuller than we thought, so once pinned we
+        // skip this item — other items may still fit.
+        if (typeof res.availableSpace === "number") {
+          cargoUsed = cargoMax - res.availableSpace;
+        } else {
+          await bot.refreshCargo();
+          cargoUsed = Math.max(cargoUsed, bot.cargo);
+        }
         if (cargoMax - cargoUsed <= 0) { loadedAny = loadedAny || false; break; }
         ctx.log("warn", `⚠️ Could not load ${p.itemName} this pass (cargo ${cargoUsed}/${cargoMax}) — skipping and continuing`);
         skipped.add(p.itemId);
@@ -2574,7 +2588,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         yield "withdraw_items";
 
         // Retry failed withdrawals up to 3 times to handle temporary API issues
-        let withdrawResult = { success: false, withdrawnQty: 0 };
+        let withdrawResult: { success: boolean; withdrawnQty: number; availableSpace?: number } = { success: false, withdrawnQty: 0 };
         let retryCount = 0;
         const maxRetries = 3;
 
@@ -2595,11 +2609,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (!withdrawResult.success || withdrawResult.withdrawnQty <= 0) {
           ctx.log("error", `Failed to withdraw ${job.itemId} from ${job.storageType} after ${maxRetries} attempts — marking as depleted`);
-          // Re-sync the in-memory tracker with the LIVE hold: a cargo_full here
-          // means the hold is actually fuller than we thought. If it's now full,
-          // stop probing other jobs and go deliver.
-          await bot.refreshCargo();
-          cargoUsed = Math.max(cargoUsed, bot.cargo);
+          // Re-sync the in-memory tracker with the REAL free space. Prefer the
+          // server's own "only N available" figure (cargo_full errors are ground
+          // truth and immune to the game's lagging bot.cargo cache); fall back to
+          // a fresh live refresh. A cargo_full here means the hold is fuller than
+          // our tracker believed, so once we pin the true free space we stop
+          // probing items that can't fit and go deliver.
+          if (typeof withdrawResult.availableSpace === "number") {
+            cargoUsed = cargoMax - withdrawResult.availableSpace;
+          } else {
+            await bot.refreshCargo();
+            cargoUsed = Math.max(cargoUsed, bot.cargo);
+          }
           if (cargoMax - cargoUsed <= 0) {
             ctx.log("cargo", `📦 Cargo full after failed withdraw (${cargoUsed}/${cargoMax}) — stopping loading`);
             cargoIsFull = true;

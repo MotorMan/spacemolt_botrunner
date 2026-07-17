@@ -228,6 +228,11 @@ docked = false;
    */
   private _recovery: Promise<boolean> | null = null;
 
+  /** Progressive backoff (ms) applied after a rate-limit/IP-block error, so we
+   *  stop hammering the server and let the temporary block window elapse. Grows
+   *  by 30s per hit (capped at 5min) and resets after a clean command. */
+  private _rateLimitBackoff = 30_000;
+
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -863,6 +868,9 @@ docked = false;
     try {
       const res = await acct.send(tool, action, body);
       const result = extractLibResult(res);
+      // A clean command means we're no longer rate-limited; ease the backoff
+      // back to its base so normal operation resumes promptly.
+      this._rateLimitBackoff = 30_000;
       return { result, error: undefined, notifications: [] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -891,6 +899,17 @@ docked = false;
         return { error: { code: "not_in_battle", message }, result: undefined, notifications: [] };
       }
       this.log("error", `libExec ${command} failed: ${message}`);
+      // Rate-limit / IP-block protection: the server temporarily bans an IP for
+      // excessive command rate. If we blindly return the error, routines retry
+      // immediately and the storm keeps the IP blocked (or escalates the ban).
+      // Instead, pause here so the block window elapses before we issue more
+      // commands. We sleep in increasing steps so repeated hits back off harder.
+      if (/excessive rate limit|temporarily blocked|rate limit|too many requests/i.test(message)) {
+        const penalty = this._rateLimitBackoff;
+        this._rateLimitBackoff = Math.min(this._rateLimitBackoff + 30_000, 300_000);
+        this.log("warn", `⏳ Rate limit hit — backing off ${Math.round(penalty / 1000)}s before next command to avoid an IP ban`);
+        await sleep(penalty);
+      }
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
     }
   }

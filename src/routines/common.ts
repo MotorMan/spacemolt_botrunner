@@ -144,7 +144,13 @@ export function isScenicPoi(type: string): boolean {
 
 // ── Item size helpers ────────────────────────────────────────
 
-const packageSizeCache = new Map<string, number>();
+/** Cargo size (weight per unit) of a dynamically-generated package. Package IDs
+ *  are NOT in the local catalog, and we must NOT `inspect` them (each inspect is a
+ *  network command and issuing many in a row trips the server's rate limiter and
+ *  gets the bot's IP banned). Per game knowledge every package occupies a fixed
+ *  100 cargo space, so we hardcode that and never hit the network for it. */
+export const PACKAGE_CARGO_SIZE = 100;
+
 /** Runtime size overrides learned from cargo_full errors at load time. The catalog
  *  sometimes reports size 1 for items whose true in-game cargo weight is much larger
  *  (e.g. 101); when we observe the real size we cache it so the rest of the routine
@@ -157,83 +163,39 @@ export function setItemSize(itemId: string, size: number): void {
   if (size > 0) runtimeSizeCache.set(itemId, size);
 }
 
-/** Get the cargo size (weight per unit) of an item from the catalog. Defaults to 1 if unknown.
- *  For package IDs, checks the async inspect cache first so pre-inspected packages
- *  resolve to their true size synchronously. Runtime overrides (learned from in-game
- *  errors) take precedence over the catalog value. */
+/** Get the cargo size (weight per unit) of an item.
+ *
+ *  Sizes come from the LOCAL catalog (catalog.json) — no network call. Almost
+ *  every item exists there, so this is authoritative for 99.99% of cases.
+ *
+ *  Dynamically-generated `package:*` items are NOT in the catalog. We must never
+ *  `inspect` them (that's a rate-limited network command that gets us banned when
+ *  called in bulk), so we simply return the fixed PACKAGE_CARGO_SIZE.
+ *
+ *  Runtime overrides (learned from in-game cargo_full errors) take precedence. */
 export function getItemSize(itemId: string): number {
   const runtime = runtimeSizeCache.get(itemId);
   if (runtime !== undefined) return runtime;
   if (itemId.startsWith("package:")) {
-    const cached = packageSizeCache.get(itemId);
-    if (cached !== undefined) {
-      return cached;
-    }
+    return PACKAGE_CARGO_SIZE;
   }
   const item = catalogStore.getItem(itemId);
-  const size = item?.size as number | undefined;
+  const size = (item?.size as number | undefined) ?? undefined;
   return (size && size > 0) ? size : 1;
 }
 
-/** Async version of getItemSize that uses the `inspect` command for packages,
- *  which are not in the catalog and whose true cargo size is unknown client-side.
- *  Results are cached per package ID for the lifetime of the process. */
+/** Async size lookup kept for API compatibility. Unlike the old implementation it
+ *  performs NO `inspect` network call (that risks a rate-limit ban); it resolves
+ *  sizes purely from the local catalog / the fixed package size. */
 export async function getItemSizeAsync(bot: Bot, itemId: string): Promise<number> {
-  if (!itemId.startsWith("package:")) {
-    return getItemSize(itemId);
-  }
-
-  const cached = packageSizeCache.get(itemId);
-  if (cached !== undefined) {
-    return cached;
-  }
-
-  try {
-    const resp = await bot.exec("inspect", { id: itemId });
-    if (!resp.error && resp.result) {
-      // libExec already unwraps the library envelope via extractLibResult, so
-      // resp.result IS the structuredContent body (there is no nested
-      // .structuredContent layer here). The inspector returns something like
-      // { kind: "package", package: { size: N, ... } }.
-      const body = resp.result as Record<string, unknown>;
-      const pkg =
-        (body.package as Record<string, unknown> | undefined) ??
-        (body.kind === "package" ? body : undefined);
-      const size = typeof pkg?.size === "number" ? pkg.size : undefined;
-      if (size && size > 0) {
-        packageSizeCache.set(itemId, size);
-        return size;
-      }
-      // Some responses nest the package under a differently-named field or put
-      // size at the top level — be defensive and scan for any numeric size.
-      const topSize = typeof body.size === "number" ? body.size : undefined;
-      if (topSize && topSize > 0) {
-        packageSizeCache.set(itemId, topSize);
-        return topSize;
-      }
-    }
-  } catch {
-    // ignore inspect failures, fall through to default
-  }
-
-  // IMPORTANT: do NOT cache the fallback size (1) for a package we failed to
-  // inspect. Caching 1 would poison the package size forever and let the load
-  // loop believe a 100-space package fits in 1 free space. Leave it uncached so
-  // the next cycle re-inspects, and so callers can detect "size unknown" and
-  // resolve it (via inspect) before attempting a load.
   return getItemSize(itemId);
 }
 
-/** Pre-inspect any package IDs found in the given storage array and cache their sizes.
- *  This avoids repeated inspect calls during planning/loading. Fires inspections in
- *  parallel and swallows individual failures. */
-export async function preInspectPackageSizes(bot: Bot, items: Array<{ itemId: string }>): Promise<void> {
-  const packageItems = items.filter(i => i.itemId.startsWith("package:"));
-  if (packageItems.length === 0) return;
-
-  await Promise.allSettled(
-    packageItems.map(i => getItemSizeAsync(bot, i.itemId))
-  );
+/** No-op retained for API compatibility. Packages are no longer inspected (that
+ *  would spam rate-limited `inspect` commands and get us banned); their size is a
+ *  fixed constant, so there is nothing to pre-inspect. */
+export async function preInspectPackageSizes(_bot: Bot, _items: Array<{ itemId: string }>): Promise<void> {
+  return;
 }
 
 /** Authoritative count of cargo actually aboard, computed from the live inventory

@@ -34,8 +34,6 @@ import {
   fleeFromBattle,
   getItemSize,
   setItemSize,
-  getItemSizeAsync,
-  preInspectPackageSizes,
   cargoUsedFromInventory,
   maxItemsForCargo,
   enableCloakingIfPossible,
@@ -326,6 +324,14 @@ function isBulkSkipItem(itemId: string): boolean {
     lower === "military_fuel_cell" ||
     lower.includes("energy_cell")
   );
+}
+
+/** Dynamically-generated packages (`package:*`). They are NOT in the local
+ *  catalog and we must NOT inspect them (each inspect is a rate-limited network
+ *  command that gets us banned in bulk), so we never load or move them. Their
+ *  cargo size is the fixed PACKAGE_CARGO_SIZE constant from common.ts. */
+function isPackageItem(itemId: string): boolean {
+  return itemId.startsWith("package:");
 }
 
 /** Operational cells that must NEVER be deposited at the destination — they
@@ -1042,7 +1048,14 @@ function findMoveJobs(
 
   ctx.log("cargo", `findMoveJobs: bot.storage has ${bot.storage.length} items, bot.factionStorage has ${bot.factionStorage.length} items`);
 
-  for (const configItem of settings.items) {
+   for (const configItem of settings.items) {
+    // Packages are dynamically generated, not in the catalog, and must never be
+    // loaded (no inspect, fixed size) — skip them entirely from planning.
+    if (isPackageItem(configItem.itemId)) {
+      ctx.log("cargo", `  ${configItem.itemName}: skipping package:* (not cargo-mover eligible)`);
+      continue;
+    }
+
     // Delivered progress = max of persisted settings count and activity-log
     // progress (robust across restarts / manual edits).
     const delivered = Math.max(
@@ -1341,6 +1354,10 @@ function planBulkItems(
   let candidates = sourceItems.filter((i) => {
     if (!i.itemId || i.quantity <= 0) return false;
     if (isBulkSkipItem(i.itemId)) return false;
+    // Never load dynamically-generated packages — they're not in the catalog
+    // and inspecting them to learn their size would spam rate-limited commands
+    // and get us banned. They're blocked from the cargo mover entirely.
+    if (isPackageItem(i.itemId)) return false;
     // Items that already have a presence at the destination are skipped while
     // seeding — we bring every OTHER item in first, then seed them on a later
     // pass once the rest all have a presence.
@@ -1488,8 +1505,6 @@ async function runBulkMovePhase(
   // Pre-inspect any packages in source storage so their true cargo size is
   // known before planning — packages are not in the catalog and default to
   // size 1, which causes massive overbooking of cargo space.
-  await preInspectPackageSizes(bot, bot.factionStorage.map(i => ({ itemId: i.itemId })));
-
   const planned = planBulkItems(ctx, bot.factionStorage, settings, destHas);
   if (planned.length === 0) {
     if (settings.bulkSeedMode) {
@@ -1534,15 +1549,12 @@ async function runBulkMovePhase(
     const freeSpace = Math.max(0, cargoMax - cargoUsed);
     if (freeSpace <= 0) break;
 
-    // Package IDs whose true size we've resolved via inspect this phase, so each
-    // is inspected at most once and never overbooked into a too-small hold.
+    // Package IDs are excluded from `planned` (blocked entirely) and resolve to
+    // the fixed PACKAGE_CARGO_SIZE, so no inspect/network call is ever needed.
     const batch: Array<{ itemId: string; quantity: number }> = [];
     for (const p of planned) {
       if (p.quantity <= 0) continue;
-      let itemSize = getItemSize(p.itemId);
-      if (p.itemId.startsWith("package:") && itemSize <= 1) {
-        itemSize = await getItemSizeAsync(bot, p.itemId);
-      }
+      const itemSize = getItemSize(p.itemId);
       const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
       if (maxFit <= 0) continue;
       await bot.refreshFactionStorage(false, settings.sourceStation);
@@ -1595,6 +1607,7 @@ async function runBulkMovePhase(
     .filter((item) => {
       if (item.quantity <= 0) return false;
       if (isBulkSkipItem(item.itemId)) return false;
+      if (isPackageItem(item.itemId)) return false;
       return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
     })
     .map((item) => ({
@@ -2510,17 +2523,11 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     await bot.refreshStatus();
 
-    // Pre-inspect any package items so their true cargo size is known before
-    // planning — packages are not in the catalog and default to size 1, which
-    // causes massive overbooking of cargo space. Includes cargo, source faction
-    // storage, and personal storage so in-transit packages aboard are sized too.
-    await preInspectPackageSizes(bot, [
-      ...bot.inventory.map(i => ({ itemId: i.itemId })),
-      ...settings.items.map(i => ({ itemId: i.itemId })),
-      ...bot.factionStorage.map(i => ({ itemId: i.itemId })),
-      ...bot.storage.map(i => ({ itemId: i.itemId })),
-    ]);
-
+    // NOTE: items resolve their cargo size from the LOCAL catalog (catalog.json)
+    // via getItemSize — no network call. Packages (`package:*`) are blocked from
+    // loading entirely and use a fixed size, so there is nothing to pre-inspect
+    // and we must never issue `inspect` commands (they're rate-limited and would
+    // get us banned in bulk).
     // Re-find jobs now that storage is updated with cleared items
     let jobs = findMoveJobs(ctx, settings, sourceSystem, destSystem);
     if (jobs.length === 0) {
@@ -2592,10 +2599,6 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // are accounted for and we never overfill the hold.
     let cargoUsed = bot.cargo;
     const cargoMax = bot.cargoMax;
-    // Package IDs whose true size we've resolved via inspect this pass, so each
-    // is inspected at most once and never overbooked into a too-small hold.
-    const inspectedPackages = new Set<string>();
-
     while (bot.state === "running") {
       await bot.refreshStatus();
       await bot.refreshCargo();
@@ -2621,8 +2624,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // that used to bottleneck the load loop.
       let loadedThisIteration = false;
 
-      // Resolve true sizes (packages need an inspect) and cap each job to what
-      // fits the current free space, exactly as the old per-item fit check did.
+      // Resolve true sizes from the local catalog (no network call) and cap each
+      // job to what fits the current free space.
       const cargoUsedNow = cargoUsedFromInventory(bot);
       const liveFreeNow = Math.max(0, cargoMax - cargoUsedNow);
       if (liveFreeNow <= 0) {
@@ -2634,11 +2637,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           const remaining = jobRemaining.get(job.itemId) || 0;
           if (remaining <= 0) continue;
 
-          let itemSize = getItemSize(job.itemId);
-          if (job.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(job.itemId)) {
-            inspectedPackages.add(job.itemId);
-            itemSize = await getItemSizeAsync(bot, job.itemId);
-          }
+          const itemSize = getItemSize(job.itemId);
           // If even ONE unit won't fit, skip this item without a network call —
           // it can never load until cargo is freed.
           if (itemSize > liveFreeNow) {

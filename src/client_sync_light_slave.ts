@@ -81,7 +81,11 @@ export class ClientSyncLightSlave {
     if (this.settings.password) headers["X-Password"] = this.settings.password;
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
-    const url = `${this.settings.masterUrl}${path}`;
+    // Normalize masterUrl so a trailing slash can't produce a malformed
+    // double-slash path (register() uses new URL() which already normalizes,
+    // but the plain fetch here must match).
+    const base = (this.settings.masterUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
 
@@ -215,12 +219,19 @@ export class ClientSyncLightSlave {
    * Never throws.
    */
   public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
-    if (!this.clientId) return this.localFleetStatuses();
+    if (!this.clientId) {
+      this.log("pullFleetRescue: no clientId (not registered) — returning local-only fleet");
+      return this.localFleetStatuses();
+    }
     try {
       const data = await this.request<Array<Record<string, unknown>>>("/api/client-sync/fleet-poll");
-      if (Array.isArray(data)) return data;
-    } catch {
-      // fall back to local-only fleet status
+      if (Array.isArray(data)) {
+        this.log(`pullFleetRescue: got ${data.length} remote bot(s) from master`);
+        return data;
+      }
+      this.logError(`pullFleetRescue: master returned non-array (${typeof data}) — falling back to local-only`);
+    } catch (err) {
+      this.logError(`pullFleetRescue: fetch failed (${err instanceof Error ? err.message : String(err)}) — falling back to local-only`);
     }
     return this.localFleetStatuses();
   }

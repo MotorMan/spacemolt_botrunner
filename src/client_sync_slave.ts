@@ -75,10 +75,13 @@ export class ClientSyncSlave {
     if (this.settings.password) headers["X-Password"] = this.settings.password;
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
-    const url = `${this.settings.masterUrl}${path}`;
+    // Normalize masterUrl so a trailing slash can't produce a malformed
+    // double-slash path (register() uses new URL() which already normalizes).
+    const base = (this.settings.masterUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
-    
+
     try {
       const res = await fetch(url, { ...init, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: controller.signal });
       clearTimeout(timeoutId);
@@ -105,7 +108,10 @@ export class ClientSyncSlave {
     if (this.settings.password) headers["X-Password"] = this.settings.password;
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
-    const url = `${this.settings.masterUrl}${path}`;
+    // Normalize masterUrl so a trailing slash can't produce a malformed
+    // double-slash path (register() uses new URL() which already normalizes).
+    const base = (this.settings.masterUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     try {

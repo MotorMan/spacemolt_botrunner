@@ -494,25 +494,32 @@ async function withdrawFromStorage(
       });
       return { success: false, withdrawnQty: 0 };
     }
-    const actualQty = Math.min(quantity, inFaction.quantity);
+    let actualQty = Math.min(quantity, inFaction.quantity);
 
     // Step 1: Move from faction storage to station storage
-    const factionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: actualQty, source: "faction" });
+    let factionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: actualQty, source: "faction" });
     if (factionResp.error) {
-      ctx.log("error", `Failed to move ${itemId} from faction to station storage: ${factionResp.error.message}`);
-      logCargoActivity(bot.username, "withdraw_failed", `Failed to move ${itemId} from faction storage: ${factionResp.error.message}`, {
-        itemId,
-        quantity,
-        location: `${bot.system}/${bot.poi}`,
-        error: factionResp.error.message,
-      });
-      return { success: false, withdrawnQty: 0 };
+      const msg = factionResp.error.message.toLowerCase();
+      const invalidQty = msg.includes("invalid_quantity") || msg.includes("must be transferred with quantity");
+      if (invalidQty) {
+        ctx.log("warn", `Faction transfer requires quantity 1 for ${itemId} — retrying single-unit transfer`);
+        factionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: 1, source: "faction" });
+        actualQty = 1;
+      }
+      if (factionResp.error) {
+        ctx.log("error", `Failed to move ${itemId} from faction to station storage: ${factionResp.error.message}`);
+        logCargoActivity(bot.username, "withdraw_failed", `Failed to move ${itemId} from faction storage: ${factionResp.error.message}`, {
+          itemId,
+          quantity,
+          location: `${bot.system}/${bot.poi}`,
+          error: factionResp.error.message,
+        });
+        return { success: false, withdrawnQty: 0 };
+      }
     }
 
-    // Refresh station storage to verify the transfer
     await bot.refreshStorage();
 
-    // Step 2: Withdraw from station storage to cargo
     const wResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: actualQty });
     if (!wResp.error) {
       await bot.refreshCargo();
@@ -528,15 +535,37 @@ async function withdrawFromStorage(
       return { success: withdrawn > 0, withdrawnQty: withdrawn };
     }
     if (wResp.error.message.includes("cargo_full")) {
-      const itemSize = getItemSize(itemId);
-      const match = wResp.error.message.match(/only (\d+) available/);
-      const availableSpace = match ? parseInt(match[1], 10) : Math.max(1, Math.floor(actualQty / 2));
-      const availableQty = Math.max(1, Math.floor(availableSpace / itemSize));
-      ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): parsed ${availableSpace} space → trying partial ${availableQty}x`);
-      if (availableQty > 0) {
-        const smallFactionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: availableQty, source: "faction" });
-        if (!smallFactionResp.error) {
-          await bot.refreshStorage();
+      const cargoFree = Math.max(0, bot.cargoMax - bot.cargo);
+      const spaceMatch = wResp.error.message.match(/Need (\d+) but only (\d+) available/);
+      if (spaceMatch) {
+        const neededSpace = parseInt(spaceMatch[1], 10);
+        const availableSpace = parseInt(spaceMatch[2], 10);
+        const actualItemSize = neededSpace / Math.max(1, actualQty);
+        const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
+        ctx.log("cargo", `Cargo full error for ${itemId}: parsed need=${neededSpace}, available=${availableSpace}, size=${actualItemSize.toFixed(1)} → retrying withdraw with ${availableQty}x`);
+        if (availableQty > 0) {
+          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
+          if (!smallWResp.error) {
+            await bot.refreshCargo();
+            const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+            const withdrawn = Math.max(0, cargoAfter - cargoBefore);
+            ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId} from faction storage`);
+            logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from faction storage (partial, cargo full)`, {
+              itemId,
+              itemName: inFaction.name || itemId,
+              quantity: withdrawn,
+              location: `${bot.system}/${bot.poi}`,
+            });
+            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+          }
+        }
+      } else {
+        const itemSize = getItemSize(itemId);
+        const fallbackMatch = wResp.error.message.match(/only (\d+) available/);
+        const availableSpace = fallbackMatch ? parseInt(fallbackMatch[1], 10) : Math.max(1, Math.floor(actualQty / 2));
+        const availableQty = Math.max(0, Math.floor(cargoFree / itemSize));
+        ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): freeSpace=${cargoFree}, parsed ${availableSpace} space → retrying withdraw with ${availableQty}x`);
+        if (availableQty > 0) {
           const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
           if (!smallWResp.error) {
             await bot.refreshCargo();
@@ -601,25 +630,51 @@ async function withdrawFromStorage(
     }
     ctx.log("error", `Withdraw from personal storage failed: ${wResp.error.message}`);
     if (wResp.error.message.includes("cargo_full")) {
-      const itemSize = getItemSize(itemId);
-      const match = wResp.error.message.match(/only (\d+) available/);
-      const availableSpace = match ? parseInt(match[1], 10) : Math.max(1, Math.floor(actualQty / 2));
-      const availableQty = Math.max(1, Math.floor(availableSpace / itemSize));
-      ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): parsed ${availableSpace} space → trying partial ${availableQty}x`);
-      if (availableQty > 0) {
-        const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
-        if (!smallWResp.error) {
-          await bot.refreshCargo();
-          const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
-          const withdrawn = Math.max(0, cargoAfter - cargoBefore);
-          ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId}`);
-          logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from personal storage (partial, cargo full)`, {
-            itemId,
-            itemName: inPersonal.name || itemId,
-            quantity: withdrawn,
-            location: `${bot.system}/${bot.poi}`,
-          });
-          return { success: withdrawn > 0, withdrawnQty: withdrawn };
+      const cargoFree = Math.max(0, bot.cargoMax - bot.cargo);
+      const spaceMatch = wResp.error.message.match(/Need (\d+) but only (\d+) available/);
+      if (spaceMatch) {
+        const neededSpace = parseInt(spaceMatch[1], 10);
+        const availableSpace = parseInt(spaceMatch[2], 10);
+        const actualItemSize = neededSpace / Math.max(1, actualQty);
+        const availableQty = Math.max(0, Math.floor(availableSpace / actualItemSize));
+        ctx.log("cargo", `Cargo full error for ${itemId}: parsed need=${neededSpace}, available=${availableSpace}, size=${actualItemSize.toFixed(1)} → retrying withdraw with ${availableQty}x`);
+        if (availableQty > 0) {
+          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
+          if (!smallWResp.error) {
+            await bot.refreshCargo();
+            const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+            const withdrawn = Math.max(0, cargoAfter - cargoBefore);
+            ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId}`);
+            logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from personal storage (partial, cargo full)`, {
+              itemId,
+              itemName: inPersonal.name || itemId,
+              quantity: withdrawn,
+              location: `${bot.system}/${bot.poi}`,
+            });
+            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+          }
+        }
+      } else {
+        const itemSize = getItemSize(itemId);
+        const fallbackMatch = wResp.error.message.match(/only (\d+) available/);
+        const availableSpace = fallbackMatch ? parseInt(fallbackMatch[1], 10) : Math.max(1, Math.floor(actualQty / 2));
+        const availableQty = Math.max(0, Math.floor(cargoFree / itemSize));
+        ctx.log("cargo", `Cargo full error for ${itemId} (size ${itemSize}): freeSpace=${cargoFree}, parsed ${availableSpace} space → retrying withdraw with ${availableQty}x`);
+        if (availableQty > 0) {
+          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableQty });
+          if (!smallWResp.error) {
+            await bot.refreshCargo();
+            const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+            const withdrawn = Math.max(0, cargoAfter - cargoBefore);
+            ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId}`);
+            logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from personal storage (partial, cargo full)`, {
+              itemId,
+              itemName: inPersonal.name || itemId,
+              quantity: withdrawn,
+              location: `${bot.system}/${bot.poi}`,
+            });
+            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+          }
         }
       }
     }

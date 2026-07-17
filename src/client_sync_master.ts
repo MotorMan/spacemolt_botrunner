@@ -104,7 +104,14 @@ export class ClientSyncMaster {
   }
 
   public getClients(): RegisteredClient[] {
-    return Array.from(this.clients.values());
+    const out: RegisteredClient[] = [];
+    for (const c of this.clients.values()) {
+      const entry: RegisteredClient = { ...c };
+      const statuses = this.botStatuses.get(c.clientId) || [];
+      entry.botCount = statuses.length;
+      out.push(entry);
+    }
+    return out;
   }
 
   public hello(clientId: string): HelloResponse {

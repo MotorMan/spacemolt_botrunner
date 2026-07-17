@@ -1092,6 +1092,29 @@ function findStrandedBots(
 }
 
 /**
+ * Resolve the live fleet for target-position tracking.
+ *
+ * Prefers the cross-client poll (`getFleetStatusAsync`) over the local-only
+ * `getFleetStatus`, because a rescue target may live on a *different* connected
+ * client (full slave or light connect). The cross-client fleet is a superset of
+ * the local fleet (local bots are always included), so it never loses local
+ * targets — it just additionally contains remote ones. Using it here is what
+ * lets a rescue bot actually follow a stranded bot that isn't in its own client,
+ * instead of always hitting "Target not in fleet status - using cached
+ * location" and rescuing against stale coordinates. Falls back to the local
+ * fleet if the cross-client poll is unavailable or empty (network/mode off).
+ */
+async function getTrackingFleet(ctx: RoutineContext): Promise<BotStatus[]> {
+  try {
+    const remote = await ctx.getFleetStatusAsync?.();
+    if (remote && remote.length) return remote;
+  } catch {
+    // best-effort: fall through to local-only fleet
+  }
+  return ctx.getFleetStatus?.() || [];
+}
+
+/**
  * Check if the ship has the refueling_pump module installed.
  * Returns true if the module is found, false otherwise.
  */
@@ -1750,6 +1773,14 @@ let creditTopOffIntervalId: NodeJS.Timeout | null = null;
 let creditTopOffRoutineActive = false;
 const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
+// How long a freshly-rescued bot is skipped by the fleet scan after a successful
+// rescue. This is essential for cross-client rescue: the remote client only
+// pushes its updated (refueled) status every `pollIntervalSec` (often 120s),
+// so for a while after we deliver fuel the master's fleet snapshot still shows
+// the target at low fuel. Without this cooldown the next scan would immediately
+// re-rescue the same bot we just filled up. Covers remote AND local targets.
+const rescueCompletionCooldownMs = 10 * 60 * 1000;
+const rescueCompletionCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms)
 
 /**
  * Check if credit top-off background loop should continue running.
@@ -5242,10 +5273,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
         let targets = shouldHandleFleetRescue(bot.username, strandedBots.length) ? strandedBots : [];
 
-       // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
+       // Filter out bots that are in a temporary cooldown (e.g. hidden POI,
+       // unreachable) or were just successfully rescued (stale remote push).
        const now = Date.now();
        targets = targets.filter(t => {
-         const expiry = ownBotRescueCooldown.get(t.username);
+         const expiry = ownBotRescueCooldown.get(t.username) || rescueCompletionCooldown.get(t.username);
          if (expiry && expiry > now) {
            return false;
          }
@@ -6357,7 +6389,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       // CRITICAL: Refresh target's current position from fleet status after arriving at system
       // This ensures we have the most up-to-date location, especially for bots that may have moved
-      const fleet = ctx.getFleetStatus?.() || [];
+      const fleet = await getTrackingFleet(ctx);
       const targetBot = fleet.find(b => b.username === target.username);
       if (targetBot) {
         const oldSystem = target.system;
@@ -6375,8 +6407,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // For our own bots, do an additional refresh to handle hidden POI scenarios
       const isOurBot = isOwnBot(target.username);
       if (isOurBot) {
-        ctx.log("rescue", `🔄 Additional position refresh for our own bot ${target.username}...`);
-        const fleet2 = ctx.getFleetStatus?.() || [];
+         ctx.log("rescue", `🔄 Additional position refresh for our own bot ${target.username}...`);
+        const fleet2 = await getTrackingFleet(ctx);
         const targetBot2 = fleet2.find(b => b.username === target.username);
         if (targetBot2) {
           target.poi = targetBot2.poi || target.poi;
@@ -6421,7 +6453,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // For our own bots, refresh position on each attempt
         if (isOurBot && travelAttempts > 1) {
           ctx.log("rescue", `🔄 Re-refreshing position for ${target.username} (attempt ${travelAttempts})...`);
-          const fleet = ctx.getFleetStatus?.() || [];
+          const fleet = await getTrackingFleet(ctx);
           const targetBot = fleet.find(b => b.username === target.username);
           if (targetBot) {
             target.poi = targetBot.poi || target.poi;
@@ -6570,7 +6602,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const isOurBot = isOwnBot(target.username);
         if (isOurBot) {
           ctx.log("rescue", `🔍 Checking fleet status for ${target.username} after travel failure...`);
-          const fleet = ctx.getFleetStatus?.() || [];
+          const fleet = await getTrackingFleet(ctx);
           const targetBot = fleet.find(b => b.username === target.username);
           
           if (targetBot && targetBot.system === target.system) {
@@ -6722,7 +6754,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       const isOurBot = isOwnBot(target.username);
       if (isOurBot) {
         ctx.log("rescue", `🔄 Final position check for our bot ${target.username}...`);
-        const fleet = ctx.getFleetStatus?.() || [];
+        const fleet = await getTrackingFleet(ctx);
         const targetBot = fleet.find(b => b.username === target.username);
         if (targetBot) {
           const oldPoi = target.poi;
@@ -7130,6 +7162,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
         }
       }
+
+      // Put the target on a completion cooldown so the next fleet scan (which may
+      // still be reading the remote client's stale, pre-refuel push) doesn't
+      // immediately re-rescue the same bot we just filled up. This covers remote
+      // targets too — a rescue bot on one client can't see another client's live
+      // fuel until that client's next status push arrives.
+      rescueCompletionCooldown.set(target.username, Date.now() + rescueCompletionCooldownMs);
+      ctx.log("rescue", `🕒 Cooldown set for ${target.username} (${rescueCompletionCooldownMs / 60000}min) to avoid stale re-rescue`);
     }
 
     if (isMaydayTarget) {

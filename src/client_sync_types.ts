@@ -45,6 +45,11 @@ export interface RegisteredClient {
    * shares bot names/statuses + the non-API bot chat channel and never takes
    * part in the heavy two-way file sync. */
   light?: boolean;
+  /** Number of bot statuses this client last pushed (0 means it's connected
+   * but contributed no bots — usually because none of its bots are currently
+   * game-connected at push time). Surfaced in the master's client list so a
+   * "connected but NOT VISIBLE" client is diagnosable at a glance. */
+  botCount?: number;
 }
 
 export interface PoiPayload {

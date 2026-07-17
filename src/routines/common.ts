@@ -236,6 +236,18 @@ export async function preInspectPackageSizes(bot: Bot, items: Array<{ itemId: st
   );
 }
 
+/** Authoritative count of cargo actually aboard, computed from the live inventory
+ *  (quantity × true item size) rather than a manually-incremented tracker that can
+ *  drift when an item's size estimate is wrong. Use this to re-anchor `cargoUsed`
+ *  after every load so free-space math never over-requests into a cargo_full. */
+export function cargoUsedFromInventory(bot: Bot): number {
+  let used = 0;
+  for (const item of bot.inventory) {
+    used += item.quantity * getItemSize(item.itemId);
+  }
+  return used;
+}
+
 /** How many units of an item fit in the given free cargo weight. */
 export function maxItemsForCargo(freeWeight: number, itemId: string): number {
   if (freeWeight <= 0) return 0;

@@ -20847,7 +20847,7 @@ When responding:
       // get_tax_estimate / prepay_tax / get_faction_tax_estimate /
       // faction_prepay_tax commands (already bridged in commandBridge.ts).
       function renderStationEconomyTaxes(f, username, docked) {
-        const b = (stationBaseStats && stationBaseStats.base) || {};
+        const b = (stationBaseStats && (stationBaseStats.base || stationBaseStats)) || {};
         // Current values seeded from get_base when available.
         const marketFeePct = b.market_fee_bps != null ? Math.round(b.market_fee_bps / 100) : "";
         const refuelPrice = b.refuel_price_each != null ? b.refuel_price_each : "";
@@ -21760,15 +21760,38 @@ When responding:
         const dockWarning = !docked
           ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to analyze queue usage.</div>'
           : "";
+        const allyFacility = f.ally_facility_access === true;
+        const allyFuel = f.ally_fuel_access === true;
+        const allyIntelOptOut = f.ally_intel_opt_out === true;
         return `
-    ${dockWarning}
     <div class="faction-section">
-      <div class="faction-section-title">Facility Queue Usage</div>
-      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
-        <button class="sm" onclick="fetchFactionFacilityQueueUsage('${esc(username)}')">Refresh Now</button>
-        <span style="font-size:11px;color:var(--text-dim)">Queries each facility's job list (non-mutating) to split total queued runs into your own vs. other players' (external/public) usage. Auto-loads and refreshes every 60s while this tab is open.</span>
+      <div class="faction-section-title">Edit Faction</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="faction-edit-desc" placeholder="New description" value="${esc(desc)}" style="flex:1;min-width:200px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+          <button class="sm" onclick="factionEditDesc('${esc(username)}')">Update Description</button>
+        </div>
       </div>
-      <div id="factionFacilityQueueUsage"><div class="faction-no-data" style="font-size:11px">Loading queue usage...</div></div>
+    </div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Ally Access</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px">
+        Grant allied factions access to your faction's facilities and fuel. Changes are sent via <code>faction_edit</code> (no effect until enabled).
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-facility"${allyFacility ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_facility_access',this.checked)">
+          <span>Facility Access — allied members use your facilities free (no rental fee)</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-fuel"${allyFuel ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_fuel_access',this.checked)">
+          <span>Fuel Access — allied members may refuel at your fuel bunkers</span>
+        </label>
+        <label style="display:flex;gap:8px;align-items:center;font-size:12px">
+          <input type="checkbox" id="faction-edit-ally-intel-optout"${allyIntelOptOut ? " checked" : ""} onchange="factionEditAllyAccess('${esc(username)}','ally_intel_opt_out',this.checked)">
+          <span>Intel Opt-Out — don't share your intel with allies</span>
+        </label>
+      </div>
     </div>
   `;
       }
@@ -25167,17 +25190,19 @@ async function fetchPersonalFacilityTypes(username) {
         params[field] = value === true;
         sendExec(username, "faction_edit", params, (result) => {
           if (result.ok) {
+            // Persist the new state so re-renders (and the cached factionData)
+            // reflect it instead of resetting to unchecked.
+            if (factionData) factionData[field] = params[field];
             appendLine(
               "system",
               `${username}: faction_edit ${field} -> ${params[field]}`,
             );
+            if (factionSelectedBot) renderFactionContent(factionSelectedBot);
           } else {
             appendLine(
               "system",
               `faction_edit ${field} failed: ${result.error || "unknown"}`,
             );
-            // Re-render to reset the toggle to its previous state
-            if (factionSelectedBot) renderFactionContent(factionSelectedBot);
           }
         });
       }

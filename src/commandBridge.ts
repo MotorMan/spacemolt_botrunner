@@ -397,7 +397,8 @@ export function buildLibDispatch(
     if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
   }
   if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
-  if (command === "faction_prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+  // faction_prepay_tax posts to spacemolt_faction/prepay_tax, whose required
+  // field is `amount` (NOT `quantity` like the personal prepay_tax). Keep it as-is.
   if (command === "send_gift") {
     body.item_id = "credits";
     if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }

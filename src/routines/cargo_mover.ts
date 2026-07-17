@@ -1458,6 +1458,9 @@ async function runBulkMovePhase(
   // forever (e.g. a size we still don't know, or simply no space).
   const skipped = new Set<string>();
   let failedItems = 0;
+  // Package IDs whose true size we've resolved via inspect this phase, so each
+  // is inspected at most once and never overbooked into a too-small hold.
+  const inspectedPackages = new Set<string>();
 
   for (const p of planned) {
     if (skipped.has(p.itemId)) { failedItems++; continue; }
@@ -1468,7 +1471,13 @@ async function runBulkMovePhase(
       cargoUsed = Math.max(cargoUsed, bot.cargo);
       const freeSpace = Math.max(0, cargoMax - cargoUsed);
       if (freeSpace <= 0) break;
-      const itemSize = getItemSize(p.itemId);
+      // Packages default to a bogus size of 1 when not yet inspected; resolve the
+      // true size now so we never try to fit a 100-space package into 1 free space.
+      let itemSize = getItemSize(p.itemId);
+      if (p.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(p.itemId)) {
+        inspectedPackages.add(p.itemId);
+        itemSize = await getItemSizeAsync(bot, p.itemId);
+      }
       const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
       if (maxFit <= 0) { skipped.add(p.itemId); failedItems++; break; }
 
@@ -2527,6 +2536,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // Set true once the hold is actually full (per live bot.cargo). When set we
     // stop looping over jobs and go deliver instead of probing every item.
     let cargoIsFull = false;
+    // Package IDs whose true size we've resolved via inspect this pass, so each
+    // is inspected at most once and never overbooked into a too-small hold.
+    const inspectedPackages = new Set<string>();
 
     while (bot.state === "running") {
       await bot.refreshStatus();
@@ -2562,7 +2574,14 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           break;
         }
 
-        const itemSize = getItemSize(job.itemId);
+        // Packages default to a bogus size of 1 when not yet inspected; resolve
+        // the true size now so the fit check below can never believe a 100-space
+        // package fits in 1 free space. Inspect each package id at most once.
+        let itemSize = getItemSize(job.itemId);
+        if (job.itemId.startsWith("package:") && itemSize <= 1 && !inspectedPackages.has(job.itemId)) {
+          inspectedPackages.add(job.itemId);
+          itemSize = await getItemSizeAsync(bot, job.itemId);
+        }
         // If even ONE unit won't fit, skip this item without a network call —
         // it can never load until cargo is freed.
         if (itemSize > liveFree) {

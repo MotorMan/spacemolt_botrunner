@@ -191,24 +191,37 @@ export async function getItemSizeAsync(bot: Bot, itemId: string): Promise<number
   try {
     const resp = await bot.exec("inspect", { id: itemId });
     if (!resp.error && resp.result) {
-      const result = resp.result as Record<string, unknown>;
-      const structured = result.structuredContent as Record<string, unknown> | undefined;
-      if (structured?.kind === "package") {
-        const pkg = structured.package as Record<string, unknown> | undefined;
-        const size = typeof pkg?.size === "number" ? pkg.size : undefined;
-        if (size && size > 0) {
-          packageSizeCache.set(itemId, size);
-          return size;
-        }
+      // libExec already unwraps the library envelope via extractLibResult, so
+      // resp.result IS the structuredContent body (there is no nested
+      // .structuredContent layer here). The inspector returns something like
+      // { kind: "package", package: { size: N, ... } }.
+      const body = resp.result as Record<string, unknown>;
+      const pkg =
+        (body.package as Record<string, unknown> | undefined) ??
+        (body.kind === "package" ? body : undefined);
+      const size = typeof pkg?.size === "number" ? pkg.size : undefined;
+      if (size && size > 0) {
+        packageSizeCache.set(itemId, size);
+        return size;
+      }
+      // Some responses nest the package under a differently-named field or put
+      // size at the top level — be defensive and scan for any numeric size.
+      const topSize = typeof body.size === "number" ? body.size : undefined;
+      if (topSize && topSize > 0) {
+        packageSizeCache.set(itemId, topSize);
+        return topSize;
       }
     }
   } catch {
     // ignore inspect failures, fall through to default
   }
 
-  const fallback = getItemSize(itemId);
-  packageSizeCache.set(itemId, fallback);
-  return fallback;
+  // IMPORTANT: do NOT cache the fallback size (1) for a package we failed to
+  // inspect. Caching 1 would poison the package size forever and let the load
+  // loop believe a 100-space package fits in 1 free space. Leave it uncached so
+  // the next cycle re-inspects, and so callers can detect "size unknown" and
+  // resolve it (via inspect) before attempting a load.
+  return getItemSize(itemId);
 }
 
 /** Pre-inspect any package IDs found in the given storage array and cache their sizes.

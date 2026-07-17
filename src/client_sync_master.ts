@@ -295,8 +295,15 @@ export class ClientSyncMaster {
    */
   public async requestFleetRescuePoll(): Promise<Array<Record<string, unknown>>> {
     const combined: Array<Record<string, unknown>> = [];
+    // Lightweight clients push their bot statuses to us (they don't expose a
+    // reachable server / file sync), so their bots already live in `botStatuses`
+    // — fold those in directly instead of polling a self URL that may not exist.
+    for (const b of this.getBots()) {
+      combined.push(b);
+    }
+    // Full slaves still advertise a reachable selfUrl; poll those for live bots.
     for (const [clientId, c] of this.clients) {
-      if (!c.selfUrl) continue;
+      if (c.light || !c.selfUrl) continue;
       try {
         const data = await peerRequest(
           c.selfUrl,

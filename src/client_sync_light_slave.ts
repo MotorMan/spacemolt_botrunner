@@ -30,6 +30,10 @@ export class ClientSyncLightSlave {
   private lastError: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private lastConnectAttempt = 0;
+  /** Reason the last cross-client fleet pull fell back to local-only. Surfaced
+   *  to the rescue routine so a connectivity failure is visible in the rescue
+   *  log (otherwise it's only on this node's console). */
+  private lastPullError: string | null = null;
   /** Hash of the last bot-chat message we relayed, to avoid echo loops. */
   private lastRelayedChat: string | null = null;
 
@@ -236,6 +240,7 @@ export class ClientSyncLightSlave {
    * Never throws.
    */
   public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
+    this.lastPullError = null;
     // If we aren't registered yet (e.g. this runs from a rescue scan that fired
     // before our poll cycle completed a register after a client restart), try a
     // one-shot register now so we still pull the master's full combined fleet
@@ -247,11 +252,14 @@ export class ClientSyncLightSlave {
         if (reg.ok) {
           this.connectionState = "connected";
         }
-      } catch {
-        // fall through to local-only below
+      } catch (err) {
+        this.lastPullError = `register failed: ${err instanceof Error ? err.message : String(err)}`;
+        this.logError(`pullFleetRescue: ${this.lastPullError}`);
+        return this.localFleetStatuses();
       }
     }
     if (!this.clientId) {
+      this.lastPullError = "not registered (no clientId)";
       this.log("pullFleetRescue: no clientId (not registered) — returning local-only fleet");
       return this.localFleetStatuses();
     }
@@ -261,11 +269,19 @@ export class ClientSyncLightSlave {
         this.log(`pullFleetRescue: got ${data.length} remote bot(s) from master`);
         return data;
       }
-      this.logError(`pullFleetRescue: master returned non-array (${typeof data}) — falling back to local-only`);
+      this.lastPullError = `master returned non-array (${typeof data})`;
+      this.logError(`pullFleetRescue: ${this.lastPullError} — falling back to local-only`);
     } catch (err) {
-      this.logError(`pullFleetRescue: fetch failed (${err instanceof Error ? err.message : String(err)}) — falling back to local-only`);
+      this.lastPullError = `fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+      this.logError(`pullFleetRescue: ${this.lastPullError} — falling back to local-only`);
     }
     return this.localFleetStatuses();
+  }
+
+  /** Last reason the cross-client fleet pull fell back to local-only, or null
+   *  if the last pull succeeded. Used by the rescue routine for diagnostics. */
+  public getLastPullError(): string | null {
+    return this.lastPullError;
   }
 
   /** This node's own local bot statuses (used as a fallback for fleet rescue). */

@@ -254,6 +254,7 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   const master = (globalThis as { syncMaster?: import("./client_sync_master.js").ClientSyncMaster }).syncMaster;
   const slave = (globalThis as { syncSlave?: import("./client_sync_slave.js").ClientSyncSlave }).syncSlave;
   const light = (globalThis as { syncLight?: import("./client_sync_light_slave.js").ClientSyncLightSlave }).syncLight;
+  let pullError: string | null = null;
   try {
     if (master) {
       // Master already holds the whole combined fleet in memory (every slave's
@@ -268,11 +269,21 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
       // Retry a few times, forcing a fresh register between attempts, so the
       // scan always gets the real combined fleet no matter the connection state.
       remote = await pullRemoteWithRetry(() => slave.pullFleetRescue(), async () => { await slave.forceRegister(); });
+      pullError = slave.getLastPullError();
     } else if (light) {
       remote = await pullRemoteWithRetry(() => light.pullFleetRescue(), async () => { await light.forceRegister(); });
+      pullError = light.getLastPullError();
     }
-  } catch {
+  } catch (err) {
+    pullError = `exception: ${err instanceof Error ? err.message : String(err)}`;
     // fall back to local-only fleet
+  }
+
+  // Surface a cross-client pull failure to the rescue routine's log so a
+  // connectivity problem is visible where the user is actually looking (the
+  // rescue scan), not only on this node's console.
+  if (pullError && remote.length === 0) {
+    console.warn(`[ClientSync] cross-client fleet pull fell back to local-only: ${pullError}`);
   }
 
   const merged: BotStatus[] = [...local];

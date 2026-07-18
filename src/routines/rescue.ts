@@ -1904,32 +1904,34 @@ function stopCreditTopOffBackground(): void {
  * 4. Issue 'refuel target=player_id' command to transfer fuel
  * 5. Return to idle scanning
  */
-export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext) {
-  const { bot } = ctx;
+  export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext) {
+    const { bot } = ctx;
 
-  await bot.refreshLocation();
-  const settings = getRescueSettings();
-  const homeSystem = settings.homeSystem || bot.system;
+    await bot.refreshLocation();
+    const settings = getRescueSettings();
+    const homeSystem = settings.homeSystem || bot.system;
 
-  await enableRescueCloak(ctx, settings);
+    await enableRescueCloak(ctx, settings);
 
-  ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
+    ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
 
-  // Check if this bot should ONLY do credit top-off (no rescue operations)
-  if (shouldOnlyCreditTopOff(bot.username)) {
-    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
-    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
-    
-    // Start the credit top-off background loop and idle
-    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
-    
-    while (bot.state === "running") {
-      await ctx.sleep(30000);
+    // Check if this bot should ONLY do credit top-off (no rescue operations)
+    if (shouldOnlyCreditTopOff(bot.username)) {
+      ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+      ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+      
+      // Start the credit top-off background loop and idle
+      startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+      
+      try {
+        while (bot.state === "running") {
+          await ctx.sleep(30000);
+        }
+      } finally {
+        stopCreditTopOffBackground();
+      }
+      return;
     }
-    
-    stopCreditTopOffBackground();
-    return;
-  }
 
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
@@ -1994,6 +1996,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   registerCooperationHandler(bot.username, botChatHandler);
   ctx.log("coop", `🤝 Registered Bot Chat handler for rescue cooperation`);
 
+  try {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -3680,12 +3683,14 @@ if (travelSucceeded) {
     // Short cooldown before next scan
     await ctx.sleep(10000);
   }
-
-  // Cleanup when routine exits
-  stopCreditTopOffBackground();
-  if (isCooperationEnabled()) {
-    unregisterCooperationHandler(bot.username, botChatHandler);
-    ctx.log("coop", `🤝 Unregistered Bot Chat handler for cooperation`);
+  } finally {
+    // Always stop the background credit top-off loop, even if the routine was
+    // force-stopped via generator.return() (which skips code after the loop).
+    stopCreditTopOffBackground();
+    if (isCooperationEnabled()) {
+      unregisterCooperationHandler(bot.username, botChatHandler);
+      ctx.log("coop", `🤝 Unregistered Bot Chat handler for cooperation`);
+    }
   }
 }
 
@@ -4888,30 +4893,32 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
  * 6. Scavenge loop on the stranded bot picks up the fuel cells
  * 7. Return to idle scanning
  */
-export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
-  const { bot } = ctx;
+  export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
+    const { bot } = ctx;
 
-  await bot.refreshLocation();
-  const settings = getRescueSettings();
-  const homeSystem = settings.homeSystem || bot.system;
+    await bot.refreshLocation();
+    const settings = getRescueSettings();
+    const homeSystem = settings.homeSystem || bot.system;
 
-  await enableRescueCloak(ctx, settings);
+    await enableRescueCloak(ctx, settings);
 
-  // Check if this bot should ONLY do credit top-off (no rescue operations)
-  if (shouldOnlyCreditTopOff(bot.username)) {
-    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
-    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
-    
-    // Start the credit top-off background loop and idle
-    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
-    
-    while (bot.state === "running") {
-      await ctx.sleep(30000);
+    // Check if this bot should ONLY do credit top-off (no rescue operations)
+    if (shouldOnlyCreditTopOff(bot.username)) {
+      ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+      ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+      
+      // Start the credit top-off background loop and idle
+      startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+      
+      try {
+        while (bot.state === "running") {
+          await ctx.sleep(30000);
+        }
+      } finally {
+        stopCreditTopOffBackground();
+      }
+      return;
     }
-    
-    stopCreditTopOffBackground();
-    return;
-  }
 
   // ── Register cooperation handler for Bot Chat Channel coordination ──
   if (isCooperationEnabled()) {
@@ -5033,6 +5040,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // Log category - determined when target is selected
     let logCategory: string = "rescue";
 
+  try {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -5236,7 +5244,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const needle = name.toLowerCase();
         const m = fleet.find((b) => b.username.toLowerCase() === needle);
         if (!m) {
-          ctx.log("rescue", `🔎 [light-test] ${name}: NOT VISIBLE in combined fleet (light connect not sharing this bot)`);
+          // Print the requested name but note it's a case-insensitive miss so a
+          // real (capitalization-only) mismatch is obvious and not mistaken for a
+          // connectivity failure. The real username lives in the fleet data.
+          ctx.log("rescue", `🔎 [light-test] ${name}: NOT VISIBLE in combined fleet (matched case-insensitively against ${fleet.length} bot(s))`);
           continue;
         }
         const rec = m as unknown as Record<string, unknown>;
@@ -5244,8 +5255,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const clientLabel = String(rec._clientLabel || rec._clientId || "?");
         ctx.log(
           "rescue",
-          `🔎 [light-test] ${name}: OK | client=${clientLabel} | state=${m.state} | routine=${m.routine ?? "-"} | fuel=${fuelPct}% (${m.fuel}/${m.maxFuel}) | system=${m.system} | poi=${m.poi} | docked=${m.docked} | credits=${m.credits}`,
+          `🔎 [light-test] ${m.username}: OK | client=${clientLabel} | state=${m.state} | routine=${m.routine ?? "-"} | fuel=${fuelPct}% (${m.fuel}/${m.maxFuel}) | system=${m.system} | poi=${m.poi} | docked=${m.docked} | credits=${m.credits}`,
         );
+      }
+      // Diagnostic: if the fleet is entirely local (no _clientId entries), this
+      // rescue bot is NOT seeing any cross-client data — the master pull returned
+      // only local bots. That is the real failure mode to chase (vs. a per-bot
+      // casing issue, which the per-bot lines above already surface).
+      if (remoteMembers.length === 0) {
+        ctx.log("rescue", `⚠️ [light-test] combined fleet has NO remote clients (${fleet.length} local-only bot(s)) — cross-client pull returned only this client's bots`);
       }
       for (const member of fleet) {
         if (member.username !== bot.username && !isOwnBot(member.username)) {
@@ -7186,20 +7204,22 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     // Short cooldown before next scan
     await ctx.sleep(10000);
   }
+  } finally {
+    // Always stop the background credit top-off loop, even if the routine was
+    // force-stopped via generator.return() (which skips code after the loop).
+    stopCreditTopOffBackground();
 
-  // Cleanup when routine exits
-  stopCreditTopOffBackground();
-
-  // Unregister cooperation handler if it was registered
-  if (isCooperationEnabled()) {
-    const cooperationHandler = (message: BotChatMessage) => {
-      const result = processBotChatMessage(message);
-      if (result.isClaim && result.claim) {
-        // The claim is already recorded by processBotChatMessage via recordRescueClaim
-        ctx.log("coop", `📥 Processed incoming rescue claim: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps) by ${result.claim.botName}`);
-      }
-    };
-    unregisterCooperationHandler(bot.username, cooperationHandler);
-    ctx.log("coop", `📡 Unregistered cooperation handler for Bot Chat Channel coordination`);
+    // Unregister cooperation handler if it was registered
+    if (isCooperationEnabled()) {
+      const cooperationHandler = (message: BotChatMessage) => {
+        const result = processBotChatMessage(message);
+        if (result.isClaim && result.claim) {
+          // The claim is already recorded by processBotChatMessage via recordRescueClaim
+          ctx.log("coop", `📥 Processed incoming rescue claim: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps) by ${result.claim.botName}`);
+        }
+      };
+      unregisterCooperationHandler(bot.username, cooperationHandler);
+      ctx.log("coop", `📡 Unregistered cooperation handler for Bot Chat Channel coordination`);
+    }
   }
 };

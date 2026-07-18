@@ -160,6 +160,15 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     }
   }
 
+  /** Force (re)registration with the master. Used by one-shot fleet pulls so a
+   *  rescue scan always reaches a registered state even if the normal poll cycle
+   *  hasn't run yet (e.g. right after a client restart). */
+  public async forceRegister(): Promise<void> {
+    if (this.running) return; // poll cycle will register on its own
+    const reg = await this.register();
+    if (reg.ok) this.connectionState = "connected";
+  }
+
   private async pullMap(): Promise<void> {
     const data = await this.request<{ systems: Record<string, unknown> }>("/api/client-sync/map");
     if (data && typeof data === "object" && "systems" in data) {
@@ -250,6 +259,18 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
    * disconnected slave still sees its own fleet). Never throws.
    */
   public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
+    // If we aren't registered yet (e.g. this runs from a rescue scan that fired
+    // before our poll cycle completed a register after a client restart), try a
+    // one-shot register now so we still pull the master's full combined fleet
+    // instead of silently falling back to local-only. Never throws.
+    if (!this.clientId) {
+      try {
+        const reg = await this.register();
+        if (reg.ok) this.connectionState = "connected";
+      } catch {
+        // fall through to local-only below
+      }
+    }
     if (!this.clientId) return this.localFleetStatuses();
     try {
       const data = await this.request<Array<Record<string, unknown>>>("/api/client-sync/fleet-poll");

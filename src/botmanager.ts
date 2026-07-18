@@ -256,11 +256,20 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   const light = (globalThis as { syncLight?: import("./client_sync_light_slave.js").ClientSyncLightSlave }).syncLight;
   try {
     if (master) {
+      // Master already holds the whole combined fleet in memory (every slave's
+      // pushed statuses + its own local bots), so this is always up to date and
+      // needs no network round-trip.
       remote = await master.requestFleetRescuePoll();
     } else if (slave) {
-      remote = await slave.pullFleetRescue();
+      // Slave/light fetch the master's fleet over the network. Clients restart
+      // all the time, so a single attempt can land while this node is mid-
+      // (re)registration (clientId null) and silently fall back to local-only —
+      // which would make the rescue bot "lose" the whole fleet at scan time.
+      // Retry a few times, forcing a fresh register between attempts, so the
+      // scan always gets the real combined fleet no matter the connection state.
+      remote = await pullRemoteWithRetry(() => slave.pullFleetRescue(), async () => { await slave.forceRegister(); });
     } else if (light) {
-      remote = await light.pullFleetRescue();
+      remote = await pullRemoteWithRetry(() => light.pullFleetRescue(), async () => { await light.forceRegister(); });
     }
   } catch {
     // fall back to local-only fleet
@@ -274,6 +283,33 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   }
   merged.sort((a, b) => a.username.localeCompare(b.username));
   return merged;
+}
+
+/**
+ * Pull a remote fleet status, retrying across transient "not registered yet"
+ * states. `pull` returns [] when this node has no clientId (local-only
+ * fallback); we retry up to a few times, calling `register` between attempts so
+ * a rescue scan that coincides with a client restart still gets the master's
+ * full combined fleet instead of only the local bots. Never throws.
+ */
+async function pullRemoteWithRetry(
+  pull: () => Promise<Array<Record<string, unknown>>>,
+  register: () => Promise<void>,
+): Promise<Array<Record<string, unknown>>> {
+  let last: Array<Record<string, unknown>> = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      last = await pull();
+    } catch {
+      last = [];
+    }
+    // A non-empty result means we got the remote fleet (or at least our own
+    // pushed bot). Good enough — stop retrying.
+    if (last.length > 0) return last;
+    // Empty → likely not registered / master unreachable. Register then retry.
+    try { await register(); } catch { /* next attempt */ }
+  }
+  return last;
 }
 
 /** Get the bot-to-bot chat channel service (for routines to use). */

@@ -146,6 +146,15 @@ export class ClientSyncLightSlave {
     }
   }
 
+  /** Force (re)registration with the master. Used by one-shot fleet pulls so a
+   *  rescue scan always reaches a registered state even if the normal poll cycle
+   *  hasn't run yet (e.g. right after a client restart). */
+  public async forceRegister(): Promise<void> {
+    if (this.running) return; // poll cycle will register on its own
+    const reg = await this.register();
+    if (reg.ok) this.connectionState = "connected";
+  }
+
   /** Push this node's bot names + full statuses up to the master.
    *  Returns true if the master accepted the push (client is known), false if
    *  the master rejected it (e.g. "client not found" after a master restart) —
@@ -227,6 +236,21 @@ export class ClientSyncLightSlave {
    * Never throws.
    */
   public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
+    // If we aren't registered yet (e.g. this runs from a rescue scan that fired
+    // before our poll cycle completed a register after a client restart), try a
+    // one-shot register now so we still pull the master's full combined fleet
+    // instead of silently falling back to local-only and "losing" every remote
+    // bot. Never throws.
+    if (!this.clientId) {
+      try {
+        const reg = await this.register();
+        if (reg.ok) {
+          this.connectionState = "connected";
+        }
+      } catch {
+        // fall through to local-only below
+      }
+    }
     if (!this.clientId) {
       this.log("pullFleetRescue: no clientId (not registered) — returning local-only fleet");
       return this.localFleetStatuses();

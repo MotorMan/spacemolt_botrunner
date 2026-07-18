@@ -109,7 +109,7 @@ import {
 const LIGHT_CONNECT_TEST_BOTS: string[] = [
   "Ima Wolf",
   "Irena Kirk",
-  "Marlen massey",
+  "Marlen Massey",
   "Effie Cole",
   "Maya Berg",
   "Kaiya Zyla",
@@ -5233,7 +5233,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // full status + location back to this client so the rescue routine can act
       // on them. Logs once per fleet scan.
       for (const name of LIGHT_CONNECT_TEST_BOTS) {
-        const m = fleet.find((b) => b.username === name);
+        const needle = name.toLowerCase();
+        const m = fleet.find((b) => b.username.toLowerCase() === needle);
         if (!m) {
           ctx.log("rescue", `🔎 [light-test] ${name}: NOT VISIBLE in combined fleet (light connect not sharing this bot)`);
           continue;

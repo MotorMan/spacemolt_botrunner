@@ -20616,6 +20616,46 @@ When responding:
         );
       }
 
+      // ── Ticks-left build countdown (fake, ~10s/tick) ──────────────
+      // Facilities under construction report `ticks_to_complete`/`ticks_left`
+      // in the live `facility list` payload. We can't get a real-time tick feed
+      // cheaply, so we render the starting value and fake the countdown by
+      // decrementing every 10 seconds — close enough for a UI glance.
+      function ticksLeftFor(fac) {
+        if (!fac) return null;
+        const t = fac.ticks_to_complete ?? fac.ticks_left ?? fac.build_ticks_left ?? null;
+        if (t == null) return null;
+        const n = Number(t);
+        return Number.isFinite(n) ? n : null;
+      }
+
+      function renderTicksLeftBadge(facId, ticks) {
+        const n = Number(ticks);
+        if (!Number.isFinite(n) || n <= 0) return "";
+        const color =
+          n <= 5 ? "var(--red)" : n <= 15 ? "var(--orange)" : "var(--text-dim)";
+        return `<span class="tl-badge" id="tl-${esc(facId)}" style="margin-left:8px;font-size:10px;color:${color};font-family:monospace" title="Ticks left to build (estimated)">TL:${n}</span>`;
+      }
+
+      // Decrement every visible TL: badge once per ~10s to fake a live tick countdown.
+      if (!window.__tlTickTimer) {
+        window.__tlTickTimer = setInterval(() => {
+          document.querySelectorAll(".tl-badge").forEach((el) => {
+            const m = /^TL:(\d+)$/.exec(el.textContent || "");
+            if (!m) return;
+            const next = Number(m[1]) - 1;
+            if (next <= 0) {
+              el.textContent = "TL:0";
+              el.style.color = "var(--green)";
+              return;
+            }
+            el.textContent = `TL:${next}`;
+            el.style.color =
+              next <= 5 ? "var(--red)" : next <= 15 ? "var(--orange)" : "var(--text-dim)";
+          });
+        }, 10000);
+      }
+
       function renderFactionFacilities(f, username) {
         const bot = bots.find((b) => b.username === username);
         const docked = bot ? bot.docked : false;
@@ -21561,6 +21601,7 @@ When responding:
               <span class="fc-name">${esc(name)}</span>
               <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="margin-left:8px;font-size:10px">${status}</span>
+              ${renderTicksLeftBadge(facId, ticksLeftFor(fac))}
               ${cat ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(cat)}</span>` : ""}
             </div>
             <div style="display:flex;gap:4px">
@@ -21912,6 +21953,7 @@ When responding:
               <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
               <span style="font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="font-size:10px">${status}</span>
+              ${renderTicksLeftBadge(facId, ticksLeftFor(fac))}
               ${canManage ? `
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)"></span>

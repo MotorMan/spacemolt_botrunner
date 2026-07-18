@@ -82,6 +82,7 @@ interface CraftTradeSettings {
   forceOwnFacility: boolean;
   craftingPreset: string;
   blacklistedRecipes: string[];
+  craftingHomeBase: string;
   maxConcurrentOrders: number;
   orderTimeoutMin: number;
   minMarginPct: number;
@@ -118,6 +119,8 @@ function getCraftTradeSettings(username?: string): CraftTradeSettings {
     forceOwnFacility: (t.forceOwnFacility as boolean) ?? true,
     craftingPreset: (t.craftingPreset as string) || "fast",
     blacklistedRecipes: arr(t.blacklistedRecipes),
+    craftingHomeBase: (t.craftingHomeBase as string) ||
+      (general.factionStorageStation as string) || "",
     maxConcurrentOrders: (t.maxConcurrentOrders as number) || 3,
     orderTimeoutMin: (t.orderTimeoutMin as number) || 360,
     minMarginPct: (t.minMarginPct as number) || 10,
@@ -524,6 +527,7 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
     allowRentalPurchase: false,
     rentalSpendingLimit: 0,
     cycleTimeSec: 30,
+    craftingHomeBase: s.craftingHomeBase,
   };
 
   const facTypeByRecipe = new Map<string, string>();

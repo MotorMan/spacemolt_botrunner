@@ -2224,7 +2224,31 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.log("warn", "Faction storage refresh returned 0 items");
       }
 
-      this.factionStorage = entries;
+      // Guard against a degraded live read clobbering good data. The server can
+      // return a partial/near-empty payload (e.g. only the 18 items of the
+      // station the bot happens to be docked at, instead of the full hub
+      // storage at factionStorageStation) even when a previous read already
+      // populated bot.factionStorage with the real thousands of items. If we
+      // overwrite the good set with the tiny one, the crafter suddenly "loses"
+      // its holdings (e.g. the 536k aluminum_sheet) and wrongly decides it must
+      // re-smelt them — which then fails on aluminum_ore and holds the whole
+      // chain. Only accept the live result when it carries a comparable or
+      // larger amount of stock than what we already had; otherwise keep the
+      // prior holdings. We compare total quantity (not item-type count) so a
+      // genuine, large spend-down of existing holdings is still accepted, while
+      // a clearly broken read (18 items vs thousands) is rejected.
+      const priorCount = this.factionStorage.length;
+      const sumQty = (xs: { quantity: number }[]) => xs.reduce((n, x) => n + (x.quantity || 0), 0);
+      const priorQty = priorCount > 0 ? sumQty(this.factionStorage) : 0;
+      const liveQty = sumQty(entries);
+      const looksDegraded = priorQty > 0 && liveQty < priorQty * 0.5;
+      if (entries.length > 0 && !looksDegraded) {
+        this.factionStorage = entries;
+      } else if (priorCount > 0) {
+        this.log("warn", `Faction storage live refresh returned only ${liveQty} total qty vs ${priorQty} already held - keeping prior holdings to avoid undercounting`);
+      } else {
+        this.factionStorage = entries;
+      }
       this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
       this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;
       updateFactionStorageCache(factionName, entries, cacheKey, this.factionFuelReserve, this.factionFuelCapacity);

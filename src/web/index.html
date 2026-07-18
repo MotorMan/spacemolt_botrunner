@@ -13313,9 +13313,32 @@
           )
           .join("");
 
+        // Crafting home base storage: the faction-storage station the crafter
+        // should read its holdings from. This is critical now that crafters can
+        // roam away from the faction home base — reading the wrong station makes
+        // the planner "lose" its stock (e.g. aluminum_sheet) and wrongly try to
+        // re-smelt everything. Defaults to general.factionStorageStation.
+        const generalFactionStorageStation =
+          (settings.general && settings.general.factionStorageStation) || "";
+        const craftingHomeBase =
+          crafter.craftingHomeBase ||
+          generalFactionStorageStation ||
+          "";
+        const craftingHomeBaseInherited = !crafter.craftingHomeBase;
+
         panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Manage multiple crafter profiles. Each profile can have different recipes and limits. Assign profiles to individual bots.</div>
+
+    <!-- Crafting Home Base Storage (most important) -->
+    <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg);border-color:#b8860b">
+      <div style="font-weight:700;margin-bottom:4px;color:var(--text-bright)">🏠 Crafting Home Base Storage</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        The faction-storage station the crafter reads its materials from. Set this if your crafter is crafting somewhere other than the faction home base — otherwise it may read the wrong station and think its stock (e.g. aluminum_sheet) is empty, holding the whole chain.
+      </div>
+      <input type="text" id="set-crafter-craftingHomeBase" value="${esc(craftingHomeBase)}" placeholder="e.g. sol_central" style="min-width:220px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:13px">
+      ${craftingHomeBaseInherited && generalFactionStorageStation ? `<span style="font-size:11px;color:var(--dim);margin-left:6px">inherited from general.factionStorageStation</span>` : ``}
+    </div>
 
     <!-- Crafter Profile Management Section -->
     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
@@ -13961,6 +13984,11 @@
             parseInt(
               document.getElementById("set-crafter-cycleTimeSec")?.value,
             ) || 30,
+          // Crafting home base storage: the faction-storage station the crafter
+          // reads from. Empty string means "inherit general.factionStorageStation".
+          craftingHomeBase:
+            (document.getElementById("set-crafter-craftingHomeBase")?.value || "")
+              .trim() || "",
           requestItems,
           blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
           forceOwnFacility,

@@ -64,6 +64,7 @@ async function getCrafterSettings(): Promise<{
   allowRentalPurchase: boolean;
   rentalSpendingLimit: number;
   cycleTimeSec: number;
+  craftingHomeBase: string;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -71,6 +72,8 @@ async function getCrafterSettings(): Promise<{
   const text = existsSync(file) ? readFileSync(file, "utf-8") : "";
   const raw = JSON.parse(text || "{}");
   const c = (raw.crafter as Record<string, unknown>) || {};
+  const general = (raw.general as Record<string, unknown>) || {};
+  const generalFactionStorageStation = (general.factionStorageStation as string) || "";
 
   const blacklistedRecipes: string[] = ((c.blacklistedRecipes as string[]) || [
     "basic_silicon_refinement",
@@ -167,6 +170,11 @@ async function getCrafterSettings(): Promise<{
     allowRentalPurchase: (c.allowRentalPurchase as boolean) ?? false,
     rentalSpendingLimit: (c.rentalSpendingLimit as number) || 0,
     cycleTimeSec: (c.cycleTimeSec as number) || 30,
+    // The faction-storage station the crafter reads its materials from. A
+    // crafter can roam away from the faction home base, so this must be set
+    // explicitly (falling back to general.factionStorageStation) — otherwise it
+    // reads the wrong station and "loses" its stock, holding the whole chain.
+    craftingHomeBase: (c.craftingHomeBase as string) || generalFactionStorageStation || "",
   };
 }
 
@@ -446,6 +454,7 @@ export interface CrafterSettings {
   allowRentalPurchase: boolean;
   rentalSpendingLimit: number;
   cycleTimeSec: number;
+  craftingHomeBase: string;
 }
 
 function isRentalAllowed(settings: CrafterSettings): boolean {
@@ -1190,8 +1199,9 @@ async function executeCraftingPlan(
       // Re-read faction storage LIVE each pass. As queued jobs consume/produce
       // materials on the server, the holdings change continuously; a stale count
       // here is what makes the planner think it needs to re-refine materials it
-      // already has enough of (e.g. steel_plate).
-      await bot.refreshFactionStorage(true);
+      // already has enough of (e.g. steel_plate). Target the crafting home base
+      // station so a roaming crafter reads the right storage.
+      await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
 
 
      // Recompute which goals still need production using live stock + in-flight output.
@@ -1529,7 +1539,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Force a LIVE view_faction_storage read every round. The crafter must never
     // plan against a stale snapshot — its own jobs are constantly changing the
     // station's holdings, so a cached read undercounts materials (e.g. steel).
-    await bot.refreshFactionStorage(true);
+    // Target the crafting home base station explicitly: a roaming crafter may be
+    // docked elsewhere, and reading the current station's (near-empty) storage
+    // would make the planner "lose" its stock and wrongly re-smelt everything.
+    const craftingHomeBase = settings.craftingHomeBase || undefined;
+    await bot.refreshFactionStorage(true, craftingHomeBase);
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {

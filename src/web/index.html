@@ -13354,6 +13354,31 @@
           "";
         const craftingHomeBaseInherited = !crafter.craftingHomeBase;
 
+        // Build station options from mapData (sorted alphabetically by station
+        // name + system so the dropdown isn't in random map-discovery order).
+        const craftingHomeBaseStationList = [];
+        for (const [sysId, sys] of Object.entries(mapData || {})) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(
+              b.base_name || b.name || b.id || "",
+            ),
+          )) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const val = poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            craftingHomeBaseStationList.push({ val, label, sysName });
+          }
+        }
+        craftingHomeBaseStationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        let craftingHomeBaseOpts = '<option value="">(use general.factionStorageStation)</option>';
+        for (const { val, label, sysName } of craftingHomeBaseStationList) {
+          const sel = val === craftingHomeBase ? " selected" : "";
+          craftingHomeBaseOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+        }
+
         panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Manage multiple crafter profiles. Each profile can have different recipes and limits. Assign profiles to individual bots.</div>
@@ -13364,8 +13389,8 @@
       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
         The faction-storage station the crafter reads its materials from. Set this if your crafter is crafting somewhere other than the faction home base — otherwise it may read the wrong station and think its stock (e.g. aluminum_sheet) is empty, holding the whole chain.
       </div>
-      <input type="text" id="set-crafter-craftingHomeBase" value="${esc(craftingHomeBase)}" placeholder="e.g. sol_central" style="min-width:220px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:13px">
-      ${craftingHomeBaseInherited && generalFactionStorageStation ? `<span style="font-size:11px;color:var(--dim);margin-left:6px">inherited from general.factionStorageStation</span>` : ``}
+      <select id="set-crafter-craftingHomeBase" style="min-width:240px">${craftingHomeBaseOpts}</select>
+      ${craftingHomeBaseInherited && generalFactionStorageStation ? `<div style="font-size:11px;color:var(--dim);margin-top:6px">inherited from general.factionStorageStation (${esc(generalFactionStorageStation)})</div>` : ``}
     </div>
 
     <!-- Crafter Profile Management Section -->

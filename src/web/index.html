@@ -4273,7 +4273,7 @@
       }
 
       let _factionFundsInFlight = false;
-      /** Fetch faction treasury in the background for the stats bar. */
+      /** Fetch faction treasury + home-station fuel in the background for the stats bar. */
       function refreshFactionFunds() {
         const fuelDisplayEl = document.getElementById("factionFuelDisplay");
         if (fuelDisplayEl) {
@@ -4281,14 +4281,21 @@
           fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
         }
         if (_factionFundsInFlight) return;
+        // Use the configured global home base station so we read the right station,
+        // not whatever station an arbitrary docked bot happens to be at.
+        const homeStation =
+          (settings.general && settings.general.factionStorageStation) || "";
         // faction_info does not return credits/treasury — use view_faction_storage which does,
         // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
         const docked = bots.filter((b) => b.docked);
         const pick =
           docked.find((b) => b.state === "running") ?? docked[0] ?? null;
         if (!pick) {
-          // No docked bot — fetch from faction-storage API endpoint
-          fetch("/api/faction-storage")
+          // No docked bot — fetch the home station's fuel from the faction-storage API cache.
+          const url = homeStation
+            ? `/api/faction-storage?station=${encodeURIComponent(homeStation)}`
+            : "/api/faction-storage";
+          fetch(url)
             .then((r) => r.json())
             .then((data) => {
               if (data.factionFuelReserve != null) {
@@ -4305,7 +4312,10 @@
         }
 
         _factionFundsInFlight = true;
-        sendExec(pick.username, "view_faction_storage", undefined, (result) => {
+        // Pass the home station so the read targets the configured base, not the
+        // bot's current docked station (which may be a different/outdated base).
+        const params = homeStation ? { station_id: homeStation } : undefined;
+        sendExec(pick.username, "view_faction_storage", params, (result) => {
           _factionFundsInFlight = false;
           if (result.ok && result.data) {
             const credits = result.data.credits ?? null;
@@ -36634,16 +36644,13 @@ function saveFuelServiceSettings() {
               quantity: e.quantity || 0,
             }),
           );
-          factionFuelReserve = data.factionFuelReserve || 0;
           console.log(
             "Loaded faction storage items:",
             globalFactionStorage.length,
           );
-          const fuelDisplayEl = document.getElementById("factionFuelDisplay");
-          if (fuelDisplayEl) {
-            const fuelK = (factionFuelReserve / 1000).toFixed(1);
-            fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-          }
+          // NOTE: fuel reserve is owned by refreshFactionFunds (which targets the
+          // configured home station), so we do NOT overwrite it from this disk
+          // cache here — that cache can be stale and would clobber the live value.
           // Re-render market if visible
           if (
             document.getElementById("page-market")?.classList.contains("active")
@@ -36658,6 +36665,8 @@ function saveFuelServiceSettings() {
       connect();
       loadGlobalFactionStorage(); // Load immediately on page load
       setInterval(refreshFactionFunds, 60000);
+      // Re-read the home-station fuel cache from disk (written by docked bots)
+      setInterval(loadGlobalFactionStorage, 60000);
       // Poll battle status every 2 seconds when in battle
       setInterval(pollBattleStatus, 2000);
     </script>

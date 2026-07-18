@@ -1627,8 +1627,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       } else if (ship.ammo != null) {
         this.ammo = ship.ammo as number;
       }
+      const ews = this.hasEwsModule(modulesArray);
+      if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
       this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-      this.hasEmergencyWarpStabilizer = this.hasEwsModule(modulesArray);
     }
 
     // Towing state handling - moved outside ship block since it's on player/location
@@ -1750,7 +1751,8 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         if (totalAmmo > 0) this.ammo = totalAmmo;
         else if (ship.ammo != null) this.ammo = ship.ammo as number;
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-        this.hasEmergencyWarpStabilizer = this.hasEwsModule(modulesArray);
+        const ews = this.hasEwsModule(modulesArray);
+        if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
         this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
       }
       const creditsValue = r.credits ?? player?.credits;
@@ -2378,7 +2380,8 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
       }).filter(Boolean);
       this.hasPathfinderDrive = this.hasPathfinderModule(modules);
-      this.hasEmergencyWarpStabilizer = this.hasEwsModule(modules);
+      const ews = this.hasEwsModule(modules);
+      if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
     }
     return this.installedMods;
   }
@@ -2398,22 +2401,44 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
   }
 
   /** Detect whether an installed module is an Emergency Warp Stabilizer. */
-  private hasEwsModule(modules: Array<Record<string, unknown> | string>): boolean {
+  /**
+   * Detect whether an installed module is an Emergency Warp Stabilizer.
+   * Returns `true`/`false` only when the module list contains resolvable
+   * module objects; returns `null` when the list is empty or contains only
+   * opaque UUID strings (unresolvable) so callers can keep the last known
+   * value instead of wrongly reporting "no EWS".
+   */
+  private hasEwsModule(modules: Array<Record<string, unknown> | string>): boolean | null {
+    if (modules.length === 0) return null;
+    let sawResolvable = false;
     for (const m of modules) {
       if (typeof m === "string") {
-        if (m === "emergency_warp_stabilizer") return true;
+        // A bare string is an opaque UUID we can't classify — skip it.
         continue;
       }
+      sawResolvable = true;
       const mod = m as Record<string, unknown>;
-      const id = mod.type_id || mod.module_id || mod.mod_id || mod.id;
-      if (typeof id === "string" && id === "emergency_warp_stabilizer") return true;
+      const id = mod.type_id || mod.module_id || mod.mod_id || mod.id || mod.item_id;
+      if (typeof id === "string" && id.toLowerCase() === "emergency_warp_stabilizer") return true;
       const stats = mod.stats as Record<string, unknown> | undefined;
       if (stats && stats.special === "emergency_warp_stabilizer") return true;
       if (mod.special === "emergency_warp_stabilizer") return true;
       const n = mod.name;
       if (typeof n === "string" && n.toLowerCase().includes("emergency warp stabilizer")) return true;
     }
-    return false;
+    // We had real module objects but none were EWS → definitively absent.
+    return sawResolvable ? false : null;
+  }
+
+  /**
+   * Update the cached EWS flag only from a *definitive* signal. `get_status`
+   * often omits enriched module data, so we must not clobber a known `true`
+   * (learned from get_ship) with a `false` inferred from an empty/UUID-only
+   * module list. A `null` result means "unknown" → keep the prior value.
+   */
+  private updateEwsFromModules(modules: Array<Record<string, unknown> | string>): void {
+    const result = this.hasEwsModule(modules);
+    if (result !== null) this.hasEmergencyWarpStabilizer = result;
   }
 
   async pollCurrentTick(): Promise<number | null> {

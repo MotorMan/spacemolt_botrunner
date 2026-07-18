@@ -12052,6 +12052,33 @@
         }, 800);
       }
 
+      // Move the bottom "Save Settings" bar up into a sticky header row,
+      // aligned to the right of the page title + description. This keeps the
+      // button visible at all times instead of requiring a scroll to the
+      // bottom of long settings pages. FuelRescue (rescue) is intentionally
+      // excluded — it gets a modernization pass separately.
+      function promoteSettingsSaveBar(panel) {
+        if (!panel || activeSettingsTab === "rescue") return;
+        const saveBar = panel.querySelector(".settings-save-bar");
+        if (!saveBar) return;
+        const h3 = panel.querySelector("h3");
+        if (!h3) return;
+
+        const headerBar = document.createElement("div");
+        headerBar.className = "settings-header-bar";
+
+        const left = document.createElement("div");
+        left.className = "settings-header-text";
+        left.appendChild(h3);
+        const desc = panel.querySelector(".settings-desc");
+        if (desc) left.appendChild(desc);
+
+        headerBar.appendChild(left);
+        headerBar.appendChild(saveBar);
+
+        panel.insertBefore(headerBar, panel.firstChild);
+      }
+
       function renderSettingsPanel() {
         const panel = document.getElementById("settingsContent");
         if (!panel) return;
@@ -12100,6 +12127,7 @@
           // form controls so background refreshes can detect unsaved edits.
           Promise.resolve(fn(panel))
             .then(captureSettingsPanelSnapshot)
+            .then(() => promoteSettingsSaveBar(panel))
             .catch(showRenderError);
         } catch (e) {
           showRenderError(e);
@@ -13159,7 +13187,7 @@
             } else {
               cachedSettingsRecipes = cachedSettingsRecipes || [];
             }
-            if (activeSettingsTab === "crafter") renderCrafterSettings(panel);
+            if (activeSettingsTab === "crafter") renderSettingsPanel();
           },
         );
       }

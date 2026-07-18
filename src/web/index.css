@@ -1208,9 +1208,32 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .settings-save-bar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-top: 20px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
+}
+/* When promoted into the page header (most settings pages), the save bar
+   sits on the right of the title + description and has no top border. */
+.settings-header-bar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-header-bar .settings-header-text {
+  flex: 1;
+  min-width: 0;
+}
+.settings-header-bar .settings-save-bar {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+  flex-shrink: 0;
+  align-self: center;
 }
 
 /* ── Map page ───────────────────────────────────── */

@@ -20636,7 +20636,12 @@ When responding:
       // decrementing every 10 seconds — close enough for a UI glance.
       function ticksLeftFor(fac) {
         if (!fac) return null;
-        const t = fac.ticks_to_complete ?? fac.ticks_left ?? fac.build_ticks_left ?? null;
+        const t =
+          fac.ticks_until_complete ??
+          fac.ticks_to_complete ??
+          fac.ticks_left ??
+          fac.build_ticks_left ??
+          null;
         if (t == null) return null;
         const n = Number(t);
         return Number.isFinite(n) ? n : null;

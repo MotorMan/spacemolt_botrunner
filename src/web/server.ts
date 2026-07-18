@@ -1566,9 +1566,11 @@ if (url.pathname === "/data/shipsForSale.json") {
             // Cross-client fleet rescue poll: ask every connected client for its
             // local bots' fuel status + positions and return the union. Used by
             // rescue bots to see the whole connected fleet without each stranded
-            // bot having to request a rescue itself.
+            // bot having to request a rescue itself. Also returns the client
+            // roster so a rescue bot can see which clients are connected (and
+            // which one is missing from the combined fleet).
             const poll = await this.syncMaster?.requestFleetRescuePoll();
-            return Response.json(poll ?? [], { headers: cors });
+            return Response.json(poll ?? { bots: [], clients: [] }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
             return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });

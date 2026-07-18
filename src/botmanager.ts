@@ -251,6 +251,7 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   const localNames = new Set(local.map((b) => b.username));
 
   let remote: Array<Record<string, unknown>> = [];
+  let roster: Array<Record<string, unknown>> = [];
   const master = (globalThis as { syncMaster?: import("./client_sync_master.js").ClientSyncMaster }).syncMaster;
   const slave = (globalThis as { syncSlave?: import("./client_sync_slave.js").ClientSyncSlave }).syncSlave;
   const light = (globalThis as { syncLight?: import("./client_sync_light_slave.js").ClientSyncLightSlave }).syncLight;
@@ -260,7 +261,9 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
       // Master already holds the whole combined fleet in memory (every slave's
       // pushed statuses + its own local bots), so this is always up to date and
       // needs no network round-trip.
-      remote = await master.requestFleetRescuePoll();
+      const poll = await master.requestFleetRescuePoll();
+      remote = poll.bots;
+      roster = poll.clients;
     } else if (slave) {
       // Slave/light fetch the master's fleet over the network. Clients restart
       // all the time, so a single attempt can land while this node is mid-
@@ -268,10 +271,14 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
       // which would make the rescue bot "lose" the whole fleet at scan time.
       // Retry a few times, forcing a fresh register between attempts, so the
       // scan always gets the real combined fleet no matter the connection state.
-      remote = await pullRemoteWithRetry(() => slave.pullFleetRescue(), async () => { await slave.forceRegister(); });
+      const poll = await pullRemoteWithRetry(() => slave.pullFleetRescue(), async () => { await slave.forceRegister(); });
+      remote = poll.bots;
+      roster = poll.clients;
       pullError = slave.getLastPullError();
     } else if (light) {
-      remote = await pullRemoteWithRetry(() => light.pullFleetRescue(), async () => { await light.forceRegister(); });
+      const poll = await pullRemoteWithRetry(() => light.pullFleetRescue(), async () => { await light.forceRegister(); });
+      remote = poll.bots;
+      roster = poll.clients;
       pullError = light.getLastPullError();
     }
   } catch (err) {
@@ -286,6 +293,19 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
     console.warn(`[ClientSync] cross-client fleet pull fell back to local-only: ${pullError}`);
   }
 
+  // Roster diagnostic: report every client the master knows about and flag any
+  // that contributed 0 bots (registered but not pushing — the usual cause of a
+  // "missing" client in the combined fleet). This directly answers "which
+  // client is missing?" without having to open the master dashboard.
+  if (roster.length > 0) {
+    const missing = roster.filter((c) => Number(c.botCount ?? 0) === 0).map((c) => String(c.label || c.clientId));
+    const labels = roster.map((c) => `${c.label}(${c.botCount})`).join(", ");
+    console.log(`[ClientSync] master roster: ${labels}`);
+    if (missing.length > 0) {
+      console.warn(`[ClientSync] clients with 0 pushed bots (will be missing from fleet): ${missing.join(", ")}`);
+    }
+  }
+
   const merged: BotStatus[] = [...local];
   for (const r of remote) {
     const username = (r.username as string) || "";
@@ -298,25 +318,25 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
 
 /**
  * Pull a remote fleet status, retrying across transient "not registered yet"
- * states. `pull` returns [] when this node has no clientId (local-only
- * fallback); we retry up to a few times, calling `register` between attempts so
- * a rescue scan that coincides with a client restart still gets the master's
- * full combined fleet instead of only the local bots. Never throws.
+ * states. `pull` returns {bots:[],clients:[]} when this node has no clientId
+ * (local-only fallback); we retry up to a few times, calling `register` between
+ * attempts so a rescue scan that coincides with a client restart still gets the
+ * master's full combined fleet instead of only the local bots. Never throws.
  */
 async function pullRemoteWithRetry(
-  pull: () => Promise<Array<Record<string, unknown>>>,
+  pull: () => Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }>,
   register: () => Promise<void>,
-): Promise<Array<Record<string, unknown>>> {
-  let last: Array<Record<string, unknown>> = [];
+): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
+  let last: { bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> } = { bots: [], clients: [] };
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       last = await pull();
     } catch {
-      last = [];
+      last = { bots: [], clients: [] };
     }
     // A non-empty result means we got the remote fleet (or at least our own
     // pushed bot). Good enough — stop retrying.
-    if (last.length > 0) return last;
+    if (last.bots.length > 0) return last;
     // Empty → likely not registered / master unreachable. Register then retry.
     try { await register(); } catch { /* next attempt */ }
   }

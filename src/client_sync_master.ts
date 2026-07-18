@@ -361,7 +361,13 @@ export class ClientSyncMaster {
    * all clients and sees every bot's fuel/position in one place. Returns an
    * empty array (never throws) if no clients advertise a reachable URL.
    */
-  public async requestFleetRescuePoll(): Promise<Array<Record<string, unknown>>> {
+  /** Result of a cross-client fleet poll: the union of every client's bots, plus
+   *  a roster of every registered client (label + how many bots it last pushed +
+   *  when it was last seen). The roster lets a rescue bot on a slave/light node
+   *  see at a glance which clients are connected and — crucially — which one is
+   *  missing from the combined fleet (e.g. a client that registered but hasn't
+   *  pushed any statuses yet, or was pruned for being silent). */
+  public async requestFleetRescuePoll(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
     const combined: Array<Record<string, unknown>> = [];
     // Lightweight clients push their bot statuses to us (they don't expose a
     // reachable server / file sync), so their bots already live in `botStatuses`
@@ -395,12 +401,18 @@ export class ClientSyncMaster {
         continue;
       }
     }
-    return combined;
+    const clients = this.getClients().map((c) => ({
+      label: c.label,
+      botCount: c.botCount,
+      lastSeen: c.lastSeen,
+      light: c.light,
+    }));
+    return { bots: combined, clients };
   }
 }
 
-export async function pollFleetRescue(): Promise<Array<Record<string, unknown>>> {
+export async function pollFleetRescue(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
   const master = (globalThis as { syncMaster?: ClientSyncMaster }).syncMaster;
-  if (!master) return [];
+  if (!master) return { bots: [], clients: [] };
   return master.requestFleetRescuePoll();
 }

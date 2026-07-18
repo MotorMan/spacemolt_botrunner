@@ -98,26 +98,6 @@ import {
 
 // ── Settings ─────────────────────────────────────────────────
 
-/**
- * Debug target list for verifying the lightweight ("light") client-connect mode.
- * Each bot here is expected to live on its OWN separate remote client. The rescue
- * routine logs the status + location of every one of these each fleet scan, so we
- * can confirm the light connect is surfacing every remote bot's name/full status
- * back to this client (the prerequisite for cross-client rescues). Remove or empty
- * this if you don't want the debug spam.
- */
-const LIGHT_CONNECT_TEST_BOTS: string[] = [
-  "Ima Wolf",
-  "Irena Kirk",
-  "Marlen Massey",
-  "Effie Cole",
-  "Maya Berg",
-  "Kaiya Zyla",
-  "Della Dee",
-  "Lacy Blesk",
-  "Becky Bray",
-];
-
 function getRescueSettings(): {
   fuelThreshold: number;
   ghostThreshold: number;
@@ -5227,44 +5207,21 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
         continue;
       }
 
-      // Mark all fleet bots as "own" so we never ghost them or blacklist them, even across restarts
+      // Single fleet-health heartbeat. `fleet` already includes THIS client's own
+      // local bots plus every remote client's pushed bots, so fleet.length is the
+      // true total across all connected clients (not just the cross-client slice).
+      // A sharp drop here (or "0 other") is the signal that a client dropped and
+      // the per-client diagnostics in getCombinedFleetStatus's console log will
+      // name which one. One line, once per scan — easy to spot when something's
+      // wrong without the old per-bot name dump.
       const remoteMembers = fleet.filter((m) => (m as unknown as Record<string, unknown>)._clientId);
+      const clients = new Set(remoteMembers.map((m) => String((m as unknown as Record<string, unknown>)._clientLabel || (m as unknown as Record<string, unknown>)._clientId)));
       if (remoteMembers.length > 0) {
-        const clients = new Set(remoteMembers.map((m) => String((m as unknown as Record<string, unknown>)._clientLabel || (m as unknown as Record<string, unknown>)._clientId)));
-        ctx.log("rescue", `🌐 Cross-client fleet poll: ${remoteMembers.length} bot(s) from ${clients.size} other client(s) in combined fleet`);
+        ctx.log("rescue", `🌐 Fleet connected: ${fleet.length} bot(s) total — ${remoteMembers.length} remote from ${clients.size} other client(s)`);
+      } else {
+        ctx.log("rescue", `⚠️ Fleet connected: ${fleet.length} bot(s) but 0 remote — cross-client pull returned only this client's bots`);
       }
 
-      // ── LIGHT-CONNECT VERIFICATION ──
-      // Debug status checks for the known remote bots (each on its own separate
-      // client connected via the lightweight "light" client-connect mode). This
-      // verifies the light mode is actually surfacing every remote bot's name +
-      // full status + location back to this client so the rescue routine can act
-      // on them. Logs once per fleet scan.
-      for (const name of LIGHT_CONNECT_TEST_BOTS) {
-        const needle = name.toLowerCase();
-        const m = fleet.find((b) => b.username.toLowerCase() === needle);
-        if (!m) {
-          // Print the requested name but note it's a case-insensitive miss so a
-          // real (capitalization-only) mismatch is obvious and not mistaken for a
-          // connectivity failure. The real username lives in the fleet data.
-          ctx.log("rescue", `🔎 [light-test] ${name}: NOT VISIBLE in combined fleet (matched case-insensitively against ${fleet.length} bot(s))`);
-          continue;
-        }
-        const rec = m as unknown as Record<string, unknown>;
-        const fuelPct = m.maxFuel > 0 ? Math.round((m.fuel / m.maxFuel) * 100) : 100;
-        const clientLabel = String(rec._clientLabel || rec._clientId || "?");
-        ctx.log(
-          "rescue",
-          `🔎 [light-test] ${m.username}: OK | client=${clientLabel} | state=${m.state} | routine=${m.routine ?? "-"} | fuel=${fuelPct}% (${m.fuel}/${m.maxFuel}) | system=${m.system} | poi=${m.poi} | docked=${m.docked} | credits=${m.credits}`,
-        );
-      }
-      // Diagnostic: if the fleet is entirely local (no _clientId entries), this
-      // rescue bot is NOT seeing any cross-client data — the master pull returned
-      // only local bots. That is the real failure mode to chase (vs. a per-bot
-      // casing issue, which the per-bot lines above already surface).
-      if (remoteMembers.length === 0) {
-        ctx.log("rescue", `⚠️ [light-test] combined fleet has NO remote clients (${fleet.length} local-only bot(s)) — cross-client pull returned only this client's bots`);
-      }
       for (const member of fleet) {
         if (member.username !== bot.username && !isOwnBot(member.username)) {
           markAsOwnBot(member.username);

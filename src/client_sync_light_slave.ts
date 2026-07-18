@@ -27,6 +27,12 @@ export class ClientSyncLightSlave {
   private running = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastSync = 0;
+  /** How long since the last *successful* push before we treat the connection as
+   *  stale and force a re-register. Set from pollIntervalSec on start; this is
+   *  what catches the "master restarted, our pushes are silently failing, but
+   *  settings still says Connected" case — without it the clientId stays valid
+   *  forever and the slave never reconnects. */
+  private staleMs = 60000;
   private lastError: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private lastConnectAttempt = 0;
@@ -34,6 +40,8 @@ export class ClientSyncLightSlave {
    *  to the rescue routine so a connectivity failure is visible in the rescue
    *  log (otherwise it's only on this node's console). */
   private lastPullError: string | null = null;
+  /** Roster of clients the master reported in the last fleet poll. */
+  private lastClients: Array<Record<string, unknown>> = [];
   /** Hash of the last bot-chat message we relayed, to avoid echo loops. */
   private lastRelayedChat: string | null = null;
 
@@ -46,6 +54,10 @@ export class ClientSyncLightSlave {
     this.running = true;
     console.log(`[ClientSync-Light] Starting lightweight client connect`);
     const intervalMs = Math.max(5, this.settings.pollIntervalSec * 1000);
+    // Treat the link as stale after ~4 missed poll cycles (min 30s). The master
+    // prunes silent clients at 10min, so this is well within that window and
+    // lets a client self-heal long before the master forgets it.
+    this.staleMs = Math.max(30000, intervalMs * 4);
     this.timer = setInterval(() => this.pollCycle(), intervalMs);
     this.pollCycle();
   }
@@ -239,7 +251,7 @@ export class ClientSyncLightSlave {
    * (named + full status) without each stranded bot having to request a rescue.
    * Never throws.
    */
-  public async pullFleetRescue(): Promise<Array<Record<string, unknown>>> {
+  public async pullFleetRescue(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
     this.lastPullError = null;
     // If we aren't registered yet (e.g. this runs from a rescue scan that fired
     // before our poll cycle completed a register after a client restart), try a
@@ -264,12 +276,13 @@ export class ClientSyncLightSlave {
       return this.localFleetStatuses();
     }
     try {
-      const data = await this.request<Array<Record<string, unknown>>>("/api/client-sync/fleet-poll");
-      if (Array.isArray(data)) {
-        this.log(`pullFleetRescue: got ${data.length} remote bot(s) from master`);
-        return data;
+      const data = await this.request<{ bots?: Array<Record<string, unknown>>; clients?: Array<Record<string, unknown>> }>("/api/client-sync/fleet-poll");
+      if (data && Array.isArray(data.bots)) {
+        this.lastClients = Array.isArray(data.clients) ? data.clients : [];
+        this.log(`pullFleetRescue: got ${data.bots.length} remote bot(s) from master`);
+        return { bots: data.bots, clients: this.lastClients };
       }
-      this.lastPullError = `master returned non-array (${typeof data})`;
+      this.lastPullError = `master returned unexpected shape (${typeof data})`;
       this.logError(`pullFleetRescue: ${this.lastPullError} — falling back to local-only`);
     } catch (err) {
       this.lastPullError = `fetch failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -284,19 +297,36 @@ export class ClientSyncLightSlave {
     return this.lastPullError;
   }
 
+  /** Roster of clients the master reported in the last fleet poll (label +
+   *  botCount + lastSeen). Used by the rescue routine to show which clients are
+   *  connected and which one is missing. */
+  public getLastClients(): Array<Record<string, unknown>> {
+    return this.lastClients;
+  }
+
   /** This node's own local bot statuses (used as a fallback for fleet rescue). */
-  private async localFleetStatuses(): Promise<Array<Record<string, unknown>>> {
+  private async localFleetStatuses(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
     try {
       const { getBotStatuses } = await import("./botmanager.js");
-      return (getBotStatuses() as unknown[]) as Array<Record<string, unknown>>;
+      return { bots: (getBotStatuses() as unknown[]) as Array<Record<string, unknown>>, clients: [] };
     } catch {
-      return [];
+      return { bots: [], clients: [] };
     }
   }
 
   private async pollCycle(): Promise<void> {
     if (!this.running) return;
     try {
+      // Stale-connection self-heal: if we had synced before but haven't pushed
+      // successfully in staleMs (e.g. the master restarted and now silently
+      // rejects/ignores our pushes), force a re-register so we don't sit there
+      // "connected" forever while actually dead. This is what catches the case
+      // where settings says Connected but no data is flowing.
+      if (this.clientId && this.lastSync !== 0 && Date.now() - this.lastSync > this.staleMs) {
+        this.log(`Connection stale (last sync ${Math.round((Date.now() - this.lastSync) / 1000)}s ago) — forcing re-register`);
+        this.clientId = null;
+        this.connectionState = 'disconnected';
+      }
       if (!this.clientId) {
         this.log('Registering with master...');
         const reg = await this.register();

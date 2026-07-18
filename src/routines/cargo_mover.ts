@@ -2656,22 +2656,36 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           batch.push({ itemId: job.itemId, quantity: loadQty, storageType: job.storageType });
         }
 
-        if (batch.length > 0) {
-          yield "withdraw_items";
-          // All jobs in a single routine share the same source storage type, so
-          // we can issue one batched withdrawal across the type. (Mixed
-          // faction/personal sources are not used together here.)
-          const byType = new Map<'faction' | 'personal', Array<{ itemId: string; quantity: number }>>();
-          for (const b of batch) {
-            if (!byType.has(b.storageType)) byType.set(b.storageType, []);
-            byType.get(b.storageType)!.push({ itemId: b.itemId, quantity: b.quantity });
-          }
+          if (batch.length > 0) {
+            yield "withdraw_items";
+            const movedAll = new Map<string, number>();
 
-          const movedAll = new Map<string, number>();
-          for (const [storageType, items] of byType) {
-            const moved = await bulkWithdrawFromStorage(ctx, items, storageType);
-            for (const [itemId, qty] of moved) movedAll.set(itemId, (movedAll.get(itemId) || 0) + qty);
-          }
+            // Single item: use the regular per-item storage command rather than
+            // the batched `items` form. The batch path is only for 2+ items;
+            // a lone item in a batch can hit the same "must be transferred with
+            // quantity" / invalid_quantity quirks that the single path already
+            // works around, and there is no tick-saving benefit to batching one.
+            if (batch.length === 1) {
+              const b = batch[0];
+              const res = await withdrawFromStorage(ctx, b.itemId, b.quantity, b.storageType);
+              if (res.success && res.withdrawnQty > 0) {
+                movedAll.set(b.itemId, res.withdrawnQty);
+              }
+            } else {
+              // All jobs in a single routine share the same source storage type, so
+              // we can issue one batched withdrawal across the type. (Mixed
+              // faction/personal sources are not used together here.)
+              const byType = new Map<'faction' | 'personal', Array<{ itemId: string; quantity: number }>>();
+              for (const b of batch) {
+                if (!byType.has(b.storageType)) byType.set(b.storageType, []);
+                byType.get(b.storageType)!.push({ itemId: b.itemId, quantity: b.quantity });
+              }
+
+              for (const [storageType, items] of byType) {
+                const moved = await bulkWithdrawFromStorage(ctx, items, storageType);
+                for (const [itemId, qty] of moved) movedAll.set(itemId, (movedAll.get(itemId) || 0) + qty);
+              }
+            }
 
           // Reconcile each job's remaining counter and update tracking exactly
           // as the old per-item path did.
@@ -3043,12 +3057,26 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           return { itemId: item.itemId, quantity: depositQty };
         });
 
-      const depositedMap = await bulkDepositToDestination(
-        ctx,
-        depositList,
-        settings.destinationStorageType,
-        settings.destinationBotName,
-      );
+      // Batch every deliverable cargo item into a single `storage` action (one
+      // tick) instead of one deposit per item — but ONLY when there are 2+ items.
+      // A single item uses the regular per-item `depositToDestination` command so
+      // the batched `items` form is never sent for a lone item.
+      const depositedMap = depositList.length === 1
+        ? await depositToDestination(
+            ctx,
+            depositList[0].itemId,
+            depositList[0].quantity,
+            settings.destinationStorageType,
+            settings.destinationBotName,
+          ).then((r) => r.success && r.depositedQty > 0
+            ? new Map([[depositList[0].itemId, r.depositedQty]])
+            : new Map<string, number>())
+        : await bulkDepositToDestination(
+            ctx,
+            depositList,
+            settings.destinationStorageType,
+            settings.destinationBotName,
+          );
 
       let deliveredItems: { itemId: string; quantity: number }[] = [];
       for (const [itemId, quantity] of depositedMap) {

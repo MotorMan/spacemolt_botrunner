@@ -21,6 +21,29 @@ interface Recipe {
   category?: string;
 }
 
+// The output with the LOWEST quantity per run is the limiting factor for a
+// multi-output recipe (e.g. electrolyze_water -> 4x hydrogen + 2x oxygen): the
+// effective throughput is bounded by the smaller output, so requests and
+// "have" counts must be measured against it.
+export function lowestOutputItem(recipe: Recipe): { item_id: string; name: string; quantity: number } {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return { item_id: recipe.output_item_id, name: recipe.output_name, quantity: recipe.output_quantity || 1 };
+  }
+  return recipe.outputs.reduce((min, o) =>
+    (o.quantity || 1) < (min.quantity || 1) ? o : min
+  );
+}
+
+// Human-readable list of all outputs, e.g. "4x hydrogen_gas + 2x oxygen_gas".
+export function formatOutputs(recipe: Recipe): string {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return `${recipe.output_quantity || 1}x ${recipe.output_name || recipe.output_item_id}`;
+  }
+  return recipe.outputs
+    .map(o => `${o.quantity}x ${o.name || o.item_id}`)
+    .join(" + ");
+}
+
 interface CraftingNode {
   recipe: Recipe;
   quantityNeeded: number;        // Total quantity needed for parent goals (in items)
@@ -44,6 +67,7 @@ interface CraftingPlan {
   nodes: CraftingNode[];
   flatOrder: CraftingPlanItem[]; // Sorted: craft these first
   totalSteps: number;
+  goalRecipe?: Recipe;
 }
 
 const DEFAULT_BLACKLISTED_RECIPES = new Set([
@@ -237,8 +261,13 @@ function buildCraftingTree(
 
   visited.add(goalRecipe.output_item_id);
 
-  const realHave = (baseCountFn || countItemFn)(goalRecipe.output_item_id);
-  const totalHave = countItemFn(goalRecipe.output_item_id);
+  // For multi-output recipes the meaningful "have" is against the LIMITING
+  // output (smallest per-run quantity), since every other output scales with
+  // runs and the limiter gates how many runs are actually useful.
+  const limiter = lowestOutputItem(goalRecipe);
+  const limiterId = limiter.item_id;
+  const realHave = (baseCountFn || countItemFn)(limiterId);
+  const totalHave = countItemFn(limiterId);
   const node: CraftingNode = {
     recipe: goalRecipe,
     quantityNeeded: quantityToCraftInItems,
@@ -367,6 +396,7 @@ export function calculateCraftingPlan(
     nodes: [tree],
     flatOrder,
     totalSteps: flatOrder.length,
+    goalRecipe,
   };
 }
 
@@ -477,6 +507,7 @@ export function calculateMultiGoalPlan(
         nodes: [tree],
         flatOrder,
         totalSteps: flatOrder.length,
+        goalRecipe,
       };
       plans.push(plan);
 
@@ -507,19 +538,18 @@ export function calculateMultiGoalPlan(
  */
 export function formatCraftingTree(node: CraftingNode, prefix: string = ""): string {
   const lines: string[] = [];
-  
-  let haveStr = "";
-  if (node.quantityPending > 0) {
-    haveStr = ` (have ${node.quantityHave}, ${node.quantityPending} pending)`;
-  } else if (node.quantityHave > 0) {
-    haveStr = ` (have ${node.quantityHave})`;
-  }
-  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${node.quantityToCraft}x${haveStr}`);
-  
+
+  const limiter = lowestOutputItem(node.recipe);
+  const outStr = formatOutputs(node.recipe);
+  const haveStr = node.quantityHave > 0 || node.quantityPending > 0
+    ? ` (limiting ${limiter.name}: have ${node.quantityHave}${node.quantityPending > 0 ? `, ${node.quantityPending} pending` : ""})`
+    : "";
+  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${node.quantityToCraft} runs -> ${outStr}${haveStr}`);
+
   for (const child of node.children) {
     lines.push(formatCraftingTree(child, prefix + "│  "));
   }
-  
+
   return lines.join("\n");
 }
 
@@ -531,8 +561,9 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
     return `✓ ${plan.goalItem}: Already have ${plan.goalQuantity}x`;
   }
 
+  const outStr = plan.goalRecipe ? ` -> ${formatOutputs(plan.goalRecipe)}` : "";
   const lines = [
-    `🎯 Goal: ${plan.goalQuantity}x ${plan.goalItem}`,
+    `🎯 Goal: ${plan.goalQuantity} runs of ${plan.goalItem}${outStr}`,
     `   Steps: ${plan.totalSteps} recipes to craft`,
   ];
 

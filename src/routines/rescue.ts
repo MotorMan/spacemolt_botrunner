@@ -1046,6 +1046,94 @@ async function checkTargetStillNeedsRescue(
   };
 }
 
+/**
+ * Parse a `different_location` refuel error into the target's reported location.
+ *
+ * The server returns messages like:
+ *   "You are not at the same location as Wexler V6U-PA (they are at Epsilon Eridani Ice Fields). Travel to their location first."
+ *
+ * Returns the raw location name the target moved to (e.g. "Epsilon Eridani Ice
+ * Fields"), or null if the message doesn't match / isn't a different_location error.
+ */
+function parseDifferentLocationError(message: string): string | null {
+  if (!message) return null;
+  const lower = message.toLowerCase();
+  if (!lower.includes("different_location") && !lower.includes("not at the same location")) {
+    return null;
+  }
+  // Extract the "(they are at <LOCATION>)" clause
+  const m = message.match(/they are at\s+([^)]+)\)/i);
+  if (m && m[1]) {
+    return m[1].trim();
+  }
+  return null;
+}
+
+/**
+ * Resolve a free-text POI/location name (as reported by the server, e.g.
+ * "Epsilon Eridani Ice Fields") to the system that contains it.
+ *
+ * Strategy:
+ *  1. Look through every known system's POIs for a matching POI name/id and
+ *     return that system's id + the matched POI id/name.
+ *  2. Fall back to matching the leading words of the location against a known
+ *     system name (e.g. "Epsilon Eridani Ice Fields" -> system "Epsilon Eridani").
+ *
+ * Returns { systemId, poiId, poiName } when a system can be determined, else null.
+ */
+function resolveSystemForLocationName(
+  locationName: string,
+): { systemId: string; poiId: string | null; poiName: string } | null {
+  if (!locationName) return null;
+  const norm = (s: string) => s.toLowerCase().replace(/_/g, " ").trim();
+  const wanted = norm(locationName);
+
+  const systems = mapStore.getSystems();
+
+  // 1. Exact / partial POI name match across all systems
+  for (const sys of systems) {
+    for (const poi of sys.pois || []) {
+      const pName = norm(poi.name || "");
+      const pId = norm(poi.id || "");
+      if (pName === wanted || pId === wanted || (pName && (pName.includes(wanted) || wanted.includes(pName)))) {
+        return { systemId: sys.id, poiId: poi.id || null, poiName: poi.name || locationName };
+      }
+    }
+  }
+
+  // 2. Match the location's leading words against a system name.
+  //    Prefer the longest system-name match that is a prefix of the location.
+  let best: { systemId: string; poiName: string } | null = null;
+  let bestLen = 0;
+  for (const sys of systems) {
+    const sName = norm(sys.name || sys.id || "");
+    if (!sName) continue;
+    if (wanted === sName || wanted.startsWith(sName + " ")) {
+      if (sName.length > bestLen) {
+        bestLen = sName.length;
+        best = { systemId: sys.id, poiName: locationName };
+      }
+    }
+  }
+  if (best) {
+    return { systemId: best.systemId, poiId: null, poiName: best.poiName };
+  }
+
+  return null;
+}
+
+/**
+ * Compute the number of jumps between two systems using the local map store.
+ * Returns null when no known route exists.
+ */
+function jumpsBetweenSystems(fromSystem: string, toSystem: string): number | null {
+  const norm = (s: string) => s.toLowerCase().replace(/_/g, " ").trim();
+  if (norm(fromSystem) === norm(toSystem)) return 0;
+  const route = mapStore.findRoute(fromSystem, toSystem);
+  if (!route || route.length < 1) return null;
+  return route.length - 1;
+}
+
 /** Find bots that need fuel rescue. */
 function findStrandedBots(
   fleet: BotStatus[],
@@ -2798,6 +2886,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     }
 
     // ── Navigate to stranded bot's system ──
+    // Tracks whether we ACTUALLY delivered fuel this mission. Only when this is
+    // true may we bill the player and announce a completed rescue. A failed
+    // refuel (target not found / moved away / any error) must NOT be billed or
+    // reported as a successful rescue. Declared at routine-loop scope so the
+    // post-transfer billing/failure logic can read it.
+    let rescueDelivered = false;
     if (!skipToReturnHome) {
       ctx.log("rescue", `🔍 Navigation debug: target.system=${target?.system}, bot.system=${bot.system}, isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}, skipToReturnHome=${skipToReturnHome}`);
       yield "navigate_to_target";
@@ -3257,34 +3351,108 @@ if (travelSucceeded) {
           const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
           ctx.log(logCategory, `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-         const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
-        // Check for battle notifications after refuel
-        if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
-          ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
-          continue;
-        }
+          // Attempt the refuel, with up to a couple of retargets if the player
+          // has moved a short distance (1-2 systems) since we cached their
+          // location. Each retarget navigates to their new system/POI and
+          // retries the transfer.
+          const MAX_RETARGETS = 2;
+          let retargets = 0;
+          let refuelError: string | null = null;
 
-        if (refuelResp.error) {
-          ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
-        } else {
-          let fuelDelivered = 0;
-          const result = refuelResp.result as Record<string, unknown> | undefined;
-          if (result) {
-            const fuelDelta = result.fuel as number || result.quantity as number || 0;
-            const fuelNow = result.fuel_now as number || result.fuel as number || bot.fuel;
-            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
-            const targetName = result.target_player_name as string || result.targetName as string || target.username;
-            fuelDelivered = Math.abs(fuelDelta);
+          while (true) {
+            const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+            // Check for battle notifications after refuel
+            if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
+              ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
+              refuelError = "battle";
+              break;
+            }
 
-            ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${targetName}`);
-            ctx.log(logCategory, `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
-          } else {
-            ctx.log(logCategory, `✓ Fuel transfer complete for ${target.username}`);
+            if (!refuelResp.error) {
+              let fuelDelivered = 0;
+              const result = refuelResp.result as Record<string, unknown> | undefined;
+              if (result) {
+                const fuelDelta = result.fuel as number || result.quantity as number || 0;
+                const fuelNow = result.fuel_now as number || result.fuel as number || bot.fuel;
+                const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+                const targetName = result.target_player_name as string || result.targetName as string || target.username;
+                fuelDelivered = Math.abs(fuelDelta);
+
+                ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${targetName}`);
+                ctx.log(logCategory, `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
+              } else {
+                ctx.log(logCategory, `✓ Fuel transfer complete for ${target.username}`);
+              }
+              rescueDelivered = true;
+              if (recoveredSession || getActiveRescueSession(bot.username)) {
+                await updateRescueSession(bot.username, { fuelDelivered });
+              }
+              break;
+            }
+
+            // Refuel returned an error.
+            refuelError = refuelResp.error.message;
+            ctx.log("error", `Refuel command failed: ${refuelError}`);
+
+            // ── BONUS: target moved a short distance — retarget and retry ──
+            const movedLocation = parseDifferentLocationError(refuelError);
+            if (movedLocation && retargets < MAX_RETARGETS) {
+              const resolved = resolveSystemForLocationName(movedLocation);
+              if (!resolved) {
+                ctx.log(logCategory, `⚠️ ${target.username} moved to "${movedLocation}" but the system is unknown — cannot retarget`);
+                break;
+              }
+
+              const jumps = jumpsBetweenSystems(bot.system, resolved.systemId);
+              if (jumps === null || jumps > 2) {
+                ctx.log(logCategory, `⚠️ ${target.username} moved to ${resolved.systemId} (${jumps ?? "unknown"} jumps away) — too far to retarget, aborting`);
+                break;
+              }
+
+              retargets++;
+              ctx.log(logCategory, `🔄 ${target.username} moved to ${resolved.poiName} (${resolved.systemId}, ${jumps} jump${jumps !== 1 ? "s" : ""} away) — retargeting (attempt ${retargets}/${MAX_RETARGETS})...`);
+
+              // Update our target to the new location and count the extra jumps
+              target.system = resolved.systemId;
+              target.poi = resolved.poiName;
+
+              // Navigate to the new system if needed
+              if (normalizeSystemName(bot.system) !== normalizeSystemName(resolved.systemId)) {
+                await ensureUndocked(ctx);
+                const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+                const arrived = await navigateToSystem(ctx, resolved.systemId, safetyOpts);
+                if (!arrived) {
+                  ctx.log("error", `Failed to reach ${target.username}'s new system ${resolved.systemId} — aborting retarget`);
+                  break;
+                }
+                // Track the extra jumps for accurate billing
+                if (recoveredSession || getActiveRescueSession(bot.username)) {
+                  const s = getActiveRescueSession(bot.username);
+                  const prevJumps = s?.jumpsCompleted || 0;
+                  await updateRescueSession(bot.username, { jumpsCompleted: prevJumps + jumps });
+                }
+              }
+
+              // Travel to their POI within the new system when we know the id
+              if (resolved.poiId) {
+                const travelResp = await bot.exec("travel", { target_poi: resolved.poiId });
+                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                  ctx.log("combat", "Battle detected while retargeting - fleeing!");
+                  refuelError = "battle";
+                  break;
+                }
+                if (!travelResp.error) {
+                  bot.poi = resolved.poiName;
+                }
+              }
+
+              // Loop back around and retry the refuel at the new location
+              continue;
+            }
+
+            // Not a recoverable "moved" error (or out of retargets) — stop.
+            break;
           }
-          if (recoveredSession || getActiveRescueSession(bot.username)) {
-            await updateRescueSession(bot.username, { fuelDelivered });
-          }
-        }
       } else {
         // Fallback: Use fuel cell delivery method (jettison for them to collect)
         ctx.log(logCategory, `Delivering fuel cells to ${target.username} (no Refueling Pump)...`);
@@ -3319,6 +3487,7 @@ if (travelSucceeded) {
           } else {
             const jettisonedFuel = fuelItem.quantity * 10;
             ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them (${jettisonedFuel} fuel units)`);
+            rescueDelivered = true;
             if (recoveredSession || getActiveRescueSession(bot.username)) {
               await updateRescueSession(bot.username, { fuelDelivered: jettisonedFuel });
             }
@@ -3430,6 +3599,7 @@ if (travelSucceeded) {
                 } else {
                   const jettisonedFuel = purchasedItem.quantity * 10;
                   ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them (${jettisonedFuel} fuel units)`);
+                  rescueDelivered = true;
                   if (recoveredSession || getActiveRescueSession(bot.username)) {
                     await updateRescueSession(bot.username, { fuelDelivered: jettisonedFuel });
                   }
@@ -3443,6 +3613,70 @@ if (travelSucceeded) {
           }
         }
       }
+    }
+
+    // ── Handle a FAILED fuel transfer ──
+    // If we never actually delivered fuel (target not found, moved out of reach,
+    // any refuel error), we must NOT bill the player or announce a successful
+    // rescue. Instead notify the target we couldn't complete it, fail the
+    // session, and return home without charging them.
+    //
+    // Skipped when recovering a session that was already returning home
+    // (skipToReturnHome) — in that case fuel was delivered on a prior cycle and
+    // we're only finishing the trip back.
+    if (!rescueDelivered && !skipToReturnHome) {
+      ctx.log(logCategory, `❌ Rescue of ${target.username} was NOT completed — no fuel delivered. Skipping bill and completion message.`);
+
+      if (isMaydayTarget || isManualRescueTarget) {
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+          try {
+            const result = await aiChatService.sendPrivateMessage(bot, target.username, {
+              situation: `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`,
+              currentSystem: bot.system,
+              targetSystem: target.system,
+              jumps: undefined,
+              fuelRefueled: 0,
+              playerFuelPct: undefined,
+              credits: 0,
+            });
+            if (result.ok) {
+              ctx.log(logCategory, `📧 Notified ${target.username} that the rescue could not be completed (no charge)`);
+            } else {
+              ctx.log("warn", `Failed-rescue notice to ${target.username} failed: ${result.error}`);
+            }
+          } catch (e) {
+            ctx.log("warn", `Failed to send failed-rescue notice: ${e}`);
+          }
+        }
+      }
+
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        await failRescueSession(bot.username, "Fuel transfer failed - target not reachable at reported location");
+      }
+
+      // Record a ghost so repeated no-shows are down-weighted for future rescues.
+      try {
+        recordGhost(target.username);
+      } catch { /* best-effort */ }
+
+      // Return home to refuel/idle, then continue the loop (no billing).
+      if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+        yield "return_home";
+        await ensureUndocked(ctx);
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (arrived) {
+          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+        } else {
+          ctx.log("error", `Failed to return to home system ${homeSystem} after failed rescue`);
+        }
+      }
+
+      idleStartTime = 0;
+      isReturningIdle = false;
+      await ctx.sleep(10000);
+      continue;
     }
 
     // Note: Rescue complete message and bill are sent immediately after fuel delivery

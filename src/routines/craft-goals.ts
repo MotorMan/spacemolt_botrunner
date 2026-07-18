@@ -17,6 +17,7 @@ interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
+  outputs: Array<{ item_id: string; name: string; quantity: number }>;
   category?: string;
 }
 
@@ -479,11 +480,21 @@ export function calculateMultiGoalPlan(
       };
       plans.push(plan);
 
-      // Update inventory as if we crafted everything in this plan
+      // Update inventory as if we crafted everything in this plan. Multi-output
+      // recipes (e.g. electrolyze_water -> hydrogen + oxygen) must credit EVERY
+      // output, otherwise the planner never sees the secondary outputs as
+      // "produced" and keeps trying to craft them by some other (nonexistent)
+      // recipe.
       for (const item of plan.flatOrder) {
-        const craftedQty = item.quantityToCraft * (item.recipe.output_quantity || 1);
-        const current = inventory.get(item.recipe.output_item_id) || 0;
-        inventory.set(item.recipe.output_item_id, current + craftedQty);
+        const runs = item.quantityToCraft;
+        const outs = (item.recipe.outputs && item.recipe.outputs.length > 0)
+          ? item.recipe.outputs
+          : [{ item_id: item.recipe.output_item_id, name: item.recipe.output_name, quantity: item.recipe.output_quantity || 1 }];
+        for (const o of outs) {
+          const craftedQty = runs * (o.quantity || 1);
+          const current = inventory.get(o.item_id) || 0;
+          inventory.set(o.item_id, current + craftedQty);
+        }
       }
     }
   }

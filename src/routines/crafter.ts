@@ -172,6 +172,12 @@ async function getCrafterSettings(): Promise<{
 
 // ── Recipe helpers ────────────────────────────────────────────
 
+export interface RecipeOutput {
+  item_id: string;
+  name: string;
+  quantity: number;
+}
+
 export interface Recipe {
   recipe_id: string;
   name: string;
@@ -179,8 +185,38 @@ export interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
+  // All outputs of the recipe (1+ entries). `output_item_id`/`output_quantity`
+  // keep pointing at the FIRST output for backward compatibility; `outputs`
+  // carries every produced item so multi-output recipes (e.g. electrolyze_water
+  // -> hydrogen_gas + oxygen_gas) are tracked and requested correctly.
+  outputs: RecipeOutput[];
   category?: string;
   effective_time_per_run?: number;
+}
+
+// The output with the LOWEST quantity per run is the limiting factor: a recipe
+// that yields 4x hydrogen and 2x oxygen only advances both by runs, so the
+// effective throughput is bounded by the smaller output. Requests must be sized
+// against this item, otherwise the high-output item (hydrogen) alone makes the
+// planner think the goal is already satisfied while the other (oxygen) stays at
+// zero.
+export function lowestOutputItem(recipe: Recipe): RecipeOutput {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return { item_id: recipe.output_item_id, name: recipe.output_name, quantity: recipe.output_quantity || 1 };
+  }
+  return recipe.outputs.reduce((min, o) =>
+    (o.quantity || 1) < (min.quantity || 1) ? o : min
+  );
+}
+
+// Human-readable list of all outputs, e.g. "4x hydrogen_gas, 2x oxygen_gas".
+export function formatOutputs(recipe: Recipe): string {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return `${recipe.output_quantity || 1}x ${recipe.output_name || recipe.output_item_id}`;
+  }
+  return recipe.outputs
+    .map(o => `${o.quantity}x ${o.name || o.item_id}`)
+    .join(", ");
 }
 
 export function parseRecipes(data: unknown): Recipe[] {
@@ -202,9 +238,15 @@ export function parseRecipes(data: unknown): Recipe[] {
   return raw.map(r => {
     const comps = (r.components || r.ingredients || r.inputs || r.materials || []) as Array<Record<string, unknown>>;
     const rawOutputs = r.outputs || r.output || r.result || r.produces;
-    const output: Record<string, unknown> = Array.isArray(rawOutputs)
-      ? (rawOutputs[0] as Record<string, unknown>) || {}
-      : (rawOutputs as Record<string, unknown>) || {};
+    const outputList: Array<Record<string, unknown>> = Array.isArray(rawOutputs)
+      ? (rawOutputs as Array<Record<string, unknown>>)
+      : (rawOutputs ? [rawOutputs as Record<string, unknown>] : []);
+    const output: Record<string, unknown> = outputList[0] || {};
+    const outputs: RecipeOutput[] = outputList.map(o => ({
+      item_id: (o.item_id as string) || (o.id as string) || (o.item as string) || "",
+      name: (o.name as string) || (o.item_name as string) || (o.item_id as string) || (o.id as string) || "",
+      quantity: (o.quantity as number) || (o.amount as number) || (o.count as number) || 1,
+    })).filter(o => o.item_id);
     return {
       recipe_id: (r.recipe_id as string) || (r.id as string) || "",
       name: (r.name as string) || (r.recipe_id as string) || "",
@@ -213,9 +255,10 @@ export function parseRecipes(data: unknown): Recipe[] {
         name: (c.name as string) || (c.item_name as string) || (c.item_id as string) || (c.id as string) || "",
         quantity: (c.quantity as number) || (c.amount as number) || (c.count as number) || 1,
       })),
-      output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || "",
-      output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || "",
-      output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || 1,
+      output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || (outputs[0]?.item_id ?? ""),
+      output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || (outputs[0]?.name ?? ""),
+      output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || (outputs[0]?.quantity ?? 1),
+      outputs,
       category: (r.category as string) || "",
     };
   }).filter(r => r.recipe_id);
@@ -522,12 +565,15 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
   }
   const progressSummaries: string[] = [];
   for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
-    const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
-    const completed = progress.completed * outputQty;
-    const queued = progress.queued * outputQty;
-    const remaining = progress.remaining;
+    const recipe = recipes.find(r => r.recipe_id === recipeId);
+    const completedOutputs = (recipe && recipe.outputs.length > 0)
+      ? recipe.outputs.map(o => `${o.quantity * progress.completed}x ${o.name || o.item_id}`).join("+")
+      : `${progress.completed * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
+    const queuedOutputs = (recipe && recipe.outputs.length > 0)
+      ? recipe.outputs.map(o => `${o.quantity * progress.queued}x ${o.name || o.item_id}`).join("+")
+      : `${progress.queued * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
     const name = recipeNames.get(recipeId) || recipeId;
-    progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+    progressSummaries.push(`${completedOutputs}/${queuedOutputs} ${name} (${progress.remaining} runs remaining)`);
   }
   if (progressSummaries.length > 0) {
     log("craft", `[Queue Status] ${progressSummaries.join(", ")}`);
@@ -760,11 +806,20 @@ export async function queueCraftJob(
   venue: ResolvedVenue,
   settings: CrafterSettings,
   ownFacilityMap: OwnFacilityMap = new Map(),
+  // Per-run quantity of the OUTPUT we are sizing the request against. For
+  // multi-output recipes the caller must pass the limiting output's quantity
+  // (lowestOutputItem().quantity); otherwise runs are mis-sized against the
+  // first output and the smaller secondary outputs never get produced.
+  outputPerRun: number = 0,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
   const recipe = recipes?.find(r => r.recipe_id === recipeId);
-  const outputQty = recipe?.output_quantity || 1;
+  // Prefer the explicitly-passed limiting output quantity; fall back to the
+  // recipe's first output for single-output recipes.
+  const outputQty = outputPerRun > 0
+    ? outputPerRun
+    : (recipe?.output_quantity || 1);
   const originalRuns = Math.ceil(quantity / outputQty);
 
   if (tracker.hasPendingJob(recipeId, originalRuns)) {
@@ -1013,20 +1068,28 @@ async function queueAllRecipesOnce(
     for (const item of allPlanItems) {
       if (bot.state !== "running") break;
 
-      const outputQty = item.recipe.output_quantity || 1;
+      // Size everything in RUNS and against the LIMITING output so multi-output
+      // recipes produce every output (e.g. electrolyze_water -> both hydrogen and
+      // oxygen), instead of letting the largest output mask the deficit.
+      const limiter = lowestOutputItem(item.recipe);
+      const outputPerRun = limiter.quantity || 1;
       const progress = tracker.getProgress(item.recipe.recipe_id);
-      const queuedItems = progress.queued * outputQty;
-      const completedItems = progress.completed * outputQty;
+      const queuedRuns = progress.queued;
+      const completedRuns = progress.completed;
 
-      const remainingItems = item.quantityToCraft - completedItems - queuedItems;
-      if (remainingItems <= 0) {
-        const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
-        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+      // item.quantityToCraft is expressed in the recipe's first-output items;
+      // convert to the limiting-output frame so the run count is correct.
+      const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
+      const remainingRuns = Math.ceil((targetLimiterItems - completedRuns * outputPerRun - queuedRuns * outputPerRun) / outputPerRun);
+      const runsToQueue = Math.max(0, remainingRuns);
+      if (runsToQueue <= 0) {
+        const actualQueued = progress.queued;
+        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
         continue;
       }
 
        const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
-       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap);
+       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
            ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
@@ -1040,10 +1103,10 @@ async function queueAllRecipesOnce(
        }
 
       const actualQueued = queueResult.queuedRuns || 0;
-      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-      queuedItemsTotal += actualQueued * outputQty;
-      if (actualQueued * outputQty < remainingItems) {
-        ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x (awaiting sub-materials)`);
+      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
+      queuedItemsTotal += actualQueued * outputPerRun;
+      if (actualQueued * outputPerRun < runsToQueue * outputPerRun) {
+        ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued} runs / ${runsToQueue} (limits: ${formatOutputs(item.recipe)}) (awaiting sub-materials)`);
       }
     }
 
@@ -1101,8 +1164,13 @@ async function executeCraftingPlan(
         );
         if (pending <= 0) continue;
         hasPending = true;
-        const outId = r.output_item_id.toLowerCase();
-        produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
+        const outs = (r.outputs && r.outputs.length > 0)
+          ? r.outputs
+          : [{ item_id: r.output_item_id, name: r.output_name, quantity: r.output_quantity || 1 }];
+        for (const o of outs) {
+          const outId = o.item_id.toLowerCase();
+          produced.set(outId, (produced.get(outId) || 0) + (o.quantity || 1) * pending);
+        }
       }
       return { hasPending, produced };
     };
@@ -1308,7 +1376,7 @@ async function craftFromCategories(
 
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
-    ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
+    ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (outputs: ${formatOutputs(target)}; category: ${target.category})`);
     const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
     const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap);
     if (!queueResult.success) {
@@ -1321,7 +1389,7 @@ async function craftFromCategories(
       continue;
     }
 
-    crafted.push(`1x ${target.output_name}`);
+    crafted.push(formatOutputs(target));
     totalCrafted++;
     bot.stats.totalCrafted++;
 
@@ -1559,18 +1627,28 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      const currentStock = countItem(recipe.output_item_id);
+      // Base the request on the LOWEST output (limiting factor): a multi-output
+      // recipe only advances all outputs by whole runs, so we must size the goal
+      // against the smallest per-run output. Otherwise the large output alone
+      // (e.g. 4x hydrogen) makes the planner think the goal is met while the
+      // other output (e.g. 2x oxygen) stays at zero.
+      const limiter = lowestOutputItem(recipe);
+      const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
+      const currentStock = countItem(limiter.item_id);
       const progress = tracker.getProgress(recipe.recipe_id);
-      const queuedItems = progress.queued * (recipe.output_quantity || 1);
+      const queuedRuns = progress.queued;
+      const queuedItems = queuedRuns * (limiter.quantity || 1);
       const stockIncludingQueue = currentStock + queuedItems;
-      const needed = limit - stockIncludingQueue;
+      const needed = limitRuns * (limiter.quantity || 1) - stockIncludingQueue;
       if (needed <= 0) {
-        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} (plus ${queuedItems} in queue)`);
+        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} of limiting output ${limiter.name} (outputs: ${formatOutputs(recipe)}; plus ${queuedItems} in queue)`);
         continue;
       }
 
-      ctx.log("craft", `Goal: ${needed}x ${recipe.name} (have ${currentStock}/${limit}, plus ${queuedItems} in queue)`);
-      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
+      ctx.log("craft", `Goal: ${limitRuns} runs of ${recipe.name} -> ${formatOutputs(recipe)} (limiting: ${limiter.quantity}x ${limiter.name}, have ${currentStock}/${limit}, plus ${queuedItems} queued)`);
+      // Track the goal by the limiting output item so every produced item
+      // (including the secondary ones) is actually requested and counted.
+      goalItems.push({ itemId: limiter.item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {
@@ -1621,12 +1699,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       const progressSummaries: string[] = [];
       for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
-        const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
-        const completed = progress.completed * outputQty;
-        const queued = progress.queued * outputQty;
-        const remaining = progress.remaining;
+        const recipe = recipes.find(r => r.recipe_id === recipeId);
+        const completedOutputs = (recipe && recipe.outputs.length > 0)
+          ? recipe.outputs.map(o => `${o.quantity * progress.completed}x ${o.name || o.item_id}`).join("+")
+          : `${progress.completed * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
+        const queuedOutputs = (recipe && recipe.outputs.length > 0)
+          ? recipe.outputs.map(o => `${o.quantity * progress.queued}x ${o.name || o.item_id}`).join("+")
+          : `${progress.queued * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
         const name = recipeNames.get(recipeId) || recipeId;
-        progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+        progressSummaries.push(`${completedOutputs}/${queuedOutputs} ${name} (${progress.remaining} runs remaining)`);
       }
       if (progressSummaries.length > 0) {
         ctx.log("craft", `In progress: ${progressSummaries.join(", ")}`);

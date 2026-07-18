@@ -6975,6 +6975,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       await updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
+    // Tracks whether we ACTUALLY delivered fuel/help this mission. Only when this
+    // is true may we bill the player and announce a completed rescue. A failed
+    // refuel (target not found / tank already full because someone else got there
+    // first / moved away / any error) must NOT be billed or reported as success.
+    let rescueDelivered = false;
+    // Set when the refuel failed specifically because the target's tank was
+    // already full — i.e. another rescuer beat us to it. We treat this as a
+    // "no charge, already handled" case rather than a no-show ghost.
+    let alreadyRescuedByOther = false;
+
     // Check if target is actually at the location (for non-station targets)
     let targetFound = true;
     if (!target.docked) {
@@ -7073,27 +7083,98 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
 
-      if (refuelResp.error) {
-        ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
-      } else {
-        const result = refuelResp.result as Record<string, unknown> | undefined;
-        let fuelDelivered = 0;
-        if (result) {
-          const fuelDelta = result.fuel as number || result.quantity as number || 0;
-          const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
-          fuelDelivered = Math.abs(fuelDelta);
-          ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${target.username}`);
-          ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);
-        }
-        ctx.log(logCategory, `Delivery complete for ${target.username}!`);
+      // Attempt the refuel, with up to a couple of retargets if the player has
+      // moved a short distance (1-2 systems) since we cached their location.
+      const MAX_RETARGETS = 2;
+      let retargets = 0;
+      let refuelResult = refuelResp;
 
-        // Track fuel delivered in session for billing
-        if (recoveredSession || getActiveRescueSession(bot.username)) {
-          await updateRescueSession(bot.username, { fuelDelivered });
+      while (true) {
+        if (!refuelResult.error) {
+          const result = refuelResult.result as Record<string, unknown> | undefined;
+          let fuelDelivered = 0;
+          if (result) {
+            const fuelDelta = result.fuel as number || result.quantity as number || 0;
+            const targetFuelNow = result.target_fuel_now as number || result.target_fuel as number || 0;
+            fuelDelivered = Math.abs(fuelDelta);
+            ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${target.username}`);
+            ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);
+          }
+          ctx.log(logCategory, `Delivery complete for ${target.username}!`);
+          rescueDelivered = true;
+
+          // Track fuel delivered in session for billing
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            await updateRescueSession(bot.username, { fuelDelivered });
+          }
+
+          // Skip faction chat here - billing code will send it after delay
+          ctx.log("rescue", `Will send faction announcement after billing delay...`);
+          break;
         }
 
-        // Skip faction chat here - billing code will send it after delay
-        ctx.log("rescue", `Will send faction announcement after billing delay...`);
+        // Refuel returned an error.
+        const errMsg = refuelResult.error.message;
+        ctx.log("error", `Refuel command failed: ${errMsg}`);
+
+        // ── Someone else already rescued them (tank full) ──
+        const errLower = errMsg.toLowerCase();
+        if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
+          alreadyRescuedByOther = true;
+          ctx.log(logCategory, `ℹ️ ${target.username}'s tank is already full — another rescuer beat us to it. No charge.`);
+          break;
+        }
+
+        // ── BONUS: target moved a short distance — retarget and retry ──
+        const movedLocation = parseDifferentLocationError(errMsg);
+        if (movedLocation && retargets < MAX_RETARGETS) {
+          const resolved = resolveSystemForLocationName(movedLocation);
+          if (!resolved) {
+            ctx.log(logCategory, `⚠️ ${target.username} moved to "${movedLocation}" but the system is unknown — cannot retarget`);
+            break;
+          }
+
+          const jumps = jumpsBetweenSystems(bot.system, resolved.systemId);
+          if (jumps === null || jumps > 2) {
+            ctx.log(logCategory, `⚠️ ${target.username} moved to ${resolved.systemId} (${jumps ?? "unknown"} jumps away) — too far to retarget, aborting`);
+            break;
+          }
+
+          retargets++;
+          ctx.log(logCategory, `🔄 ${target.username} moved to ${resolved.poiName} (${resolved.systemId}, ${jumps} jump${jumps !== 1 ? "s" : ""} away) — retargeting (attempt ${retargets}/${MAX_RETARGETS})...`);
+
+          target.system = resolved.systemId;
+          target.poi = resolved.poiName;
+
+          if (normalizeSystemName(bot.system) !== normalizeSystemName(resolved.systemId)) {
+            await ensureUndocked(ctx);
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+            const arrived = await navigateToSystem(ctx, resolved.systemId, safetyOpts);
+            if (!arrived) {
+              ctx.log("error", `Failed to reach ${target.username}'s new system ${resolved.systemId} — aborting retarget`);
+              break;
+            }
+            if (recoveredSession || getActiveRescueSession(bot.username)) {
+              const s = getActiveRescueSession(bot.username);
+              const prevJumps = s?.jumpsCompleted || 0;
+              await updateRescueSession(bot.username, { jumpsCompleted: prevJumps + jumps });
+            }
+          }
+
+          if (resolved.poiId) {
+            const travelResp = await bot.exec("travel", { target_poi: resolved.poiId });
+            if (!travelResp.error) {
+              bot.poi = resolved.poiName;
+            }
+          }
+
+          // Retry the refuel at the new location
+          refuelResult = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+          continue;
+        }
+
+        // Not a recoverable error (or out of retargets) — stop.
+        break;
       }
     } else if (target.docked) {
       // Target is docked — dock at same station and send gift
@@ -7121,6 +7202,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (recoveredSession || getActiveRescueSession(bot.username)) {
               await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
+            rescueDelivered = true;
           }
         }
 
@@ -7131,6 +7213,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             credits: settings.rescueCredits,
             message: "Emergency credits from FuelRescue bot — refuel ASAP!",
           });
+          rescueDelivered = true;
         }
 
         ctx.log(logCategory, `Delivery complete for ${target.username}!`);
@@ -7159,6 +7242,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (recoveredSession || getActiveRescueSession(bot.username)) {
               await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
+            rescueDelivered = true;
           }
         }
       } else {
@@ -7189,9 +7273,83 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               message: "Emergency credits — dock here to collect and refuel!",
             });
             ctx.log(logCategory, `Sent ${settings.rescueCredits} credits to ${target.username}'s storage at ${station.name}`);
+            rescueDelivered = true;
           }
         }
       }
+    }
+
+    // ── Handle a FAILED / unnecessary rescue ──
+    // If we never actually delivered fuel/help this cycle, we must NOT bill the
+    // player or announce a successful rescue. This covers: target not found,
+    // moved out of reach, tank already full because another rescuer got there
+    // first, or any other refuel/delivery error.
+    //
+    // Skipped when recovering a session that was already returning home
+    // (skipToReturnHome) — in that case fuel was delivered on a prior cycle.
+    if (!rescueDelivered && !skipToReturnHome) {
+      if (alreadyRescuedByOther) {
+        ctx.log(logCategory, `✅ ${target.username} was already rescued by someone else — no bill, no announcement.`);
+      } else {
+        ctx.log(logCategory, `❌ Rescue of ${target.username} was NOT completed — no fuel delivered. Skipping bill and completion message.`);
+      }
+
+      if (isMaydayTarget || isManualRescueTarget) {
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+          try {
+            const situation = alreadyRescuedByOther
+              ? `You arrived to help but their fuel tank was already full — another rescuer reached them first. Let them know all is well, there's no charge, and they're good to go.`
+              : `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`;
+            const result = await aiChatService.sendPrivateMessage(bot, target.username, {
+              situation,
+              currentSystem: bot.system,
+              targetSystem: target.system,
+              jumps: undefined,
+              fuelRefueled: 0,
+              playerFuelPct: undefined,
+              credits: 0,
+            });
+            if (result.ok) {
+              ctx.log(logCategory, `📧 Notified ${target.username} (no charge)`);
+            } else {
+              ctx.log("warn", `No-charge notice to ${target.username} failed: ${result.error}`);
+            }
+          } catch (e) {
+            ctx.log("warn", `Failed to send no-charge notice: ${e}`);
+          }
+        }
+      }
+
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        await failRescueSession(bot.username, alreadyRescuedByOther
+          ? "Target already rescued by another - no fuel needed"
+          : "Fuel transfer failed - target not reachable at reported location");
+      }
+
+      // Only record a ghost for genuine no-shows, NOT when another rescuer simply
+      // beat us to it (the player was legitimately there and got helped).
+      if (!alreadyRescuedByOther) {
+        try { recordGhost(target.username); } catch { /* best-effort */ }
+      }
+
+      // Return home to refuel/idle, then continue the loop (no billing).
+      if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+        yield "return_home";
+        await ensureUndocked(ctx);
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (arrived) {
+          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+        } else {
+          ctx.log("error", `Failed to return to home system ${homeSystem} after incomplete rescue`);
+        }
+      }
+
+      idleStartTime = 0;
+      isReturningIdle = false;
+      await ctx.sleep(10000);
+      continue;
     }
 
     // ── Send rescue bill IMMEDIATELY after fuel delivery ──

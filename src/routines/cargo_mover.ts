@@ -61,6 +61,7 @@ import {
   updateDeliveredQuantity,
   updateWithdrawnQuantity,
   updateLockActivity,
+  getItemLocks,
   getAvailableItemQuantity,
   getBotClaimedQuantity,
   canClaimItemQuantity,
@@ -1142,13 +1143,22 @@ function findMoveJobs(
     }
   }
 
-  // Limit locked quantity per item to allow multiple bots to work on the same items
-  // Reduce maxCarry to allow concurrent access
-  jobs.forEach(job => {
+  // Limit locked quantity per item to allow multiple bots to work on the same
+  // items concurrently WITHOUT over-claiming the shared hold. The concurrency
+  // divisor is the real number of distinct bots that currently hold an ACTIVE
+  // lock on this item (including this bot), not a hardcoded guess. A lone bot
+  // therefore gets the FULL hold (divisor 1); two bots split it 50/50, etc.
+  // Using a fixed "/2" here when only one bot is running was capping every load
+  // at half the hold and hauling only ~half of what fits.
+  for (const job of jobs) {
     const itemSize = getItemSize(job.itemId);
-    const maxCarryConcurrent = Math.floor(bot.cargoMax / itemSize / 2); // Allow 2 bots per item
-    job.availableQty = Math.min(job.availableQty, maxCarryConcurrent);
-  });
+    const itemLocks = getItemLocks(job.itemId);
+    const concurrentBots = Math.max(1, itemLocks.length);
+    const share = Math.floor(bot.cargoMax / itemSize / concurrentBots);
+    // The bot that is about to load should always be able to fill its own share;
+    // never let the divisor drop an otherwise-full hold below what one bot can carry.
+    job.availableQty = Math.min(job.availableQty, Math.max(share, Math.floor(bot.cargoMax / itemSize)));
+  }
 
   return jobs;
 }
@@ -2625,11 +2635,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       let loadedThisIteration = false;
 
       // Resolve true sizes from the local catalog (no network call) and cap each
-      // job to what fits the current free space.
-      const cargoUsedNow = cargoUsedFromInventory(bot);
-      const liveFreeNow = Math.max(0, cargoMax - cargoUsedNow);
+      // job to what fits the current free space. Prefer the LIVE server cargo
+      // reading (`bot.cargo`) over the size-multiplied inventory estimate: the
+      // server's own "used" value is ground truth and already accounts for
+      // everything aboard (e.g. the military fuel cells the bot loaded itself),
+      // so a wrong/stale catalog size can never shrink the budget below the real
+      // free space and leave the hold half-empty.
+      const liveCargoUsed = Math.max(cargoUsedFromInventory(bot), bot.cargo);
+      const liveFreeNow = Math.max(0, cargoMax - liveCargoUsed);
       if (liveFreeNow <= 0) {
-        ctx.log("cargo", `📦 Cargo full (${cargoUsedNow}/${cargoMax}) — stopping loading`);
+        ctx.log("cargo", `📦 Cargo full (${liveCargoUsed}/${cargoMax}) — stopping loading`);
         loadedThisIteration = true;
       } else {
         const batch: Array<{ itemId: string; quantity: number; storageType: 'faction' | 'personal' }> = [];

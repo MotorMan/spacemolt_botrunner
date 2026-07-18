@@ -76,6 +76,10 @@ export class ClientSyncMaster {
   /** The client currently designated to download `catalog.json` from the
    *  gameserver. Only this one is allowed to do the expensive fetch. */
   private downloaderClientId: string | null = null;
+  /** True while the master itself is fetching the catalog from the gameserver
+   *  (the common post-patch case where no client yet has the new version). Guards
+   *  against multiple clients each triggering a master fetch in the same window. */
+  private masterFetchPending = false;
   /** Cached gameserver version (from `get_version` / the OpenAPI spec). */
   private gsVersionCache: { v: string | null; at: number } | null = null;
   constructor(settings: Record<string, unknown>) {
@@ -195,18 +199,17 @@ export class ClientSyncMaster {
       return { ok: true, gameServerVersion: G, action: "upload", version };
     }
 
-    // Nobody has the gameserver version yet — elect exactly one downloader.
-    const live = new Set(this.clients.keys());
-    if (this.downloaderClientId && !live.has(this.downloaderClientId)) {
-      this.downloaderClientId = null;
-    }
-    if (!this.downloaderClientId) {
-      this.downloaderClientId = clientId;
-      this.log(`No client has catalog v${G} yet — electing ${clientId} to download it from the gameserver`);
-      return { ok: true, gameServerVersion: G, action: "download_and_upload", version };
-    }
-    if (this.downloaderClientId === clientId) {
-      return { ok: true, gameServerVersion: G, action: "download_and_upload", version };
+    // Nobody has the gameserver version yet. After a patch this is the common
+    // case: every client is still on the old catalog and none can serve the new
+    // one. Rather than elect a *client* to download (which would still hammer the
+    // gameserver from a client node), the master itself fetches the fresh
+    // catalog.json ONCE and relays it to the whole fleet. This keeps the actual
+    // gameserver download on the master and lets clients stay connected (no mass
+    // disconnect / re-register storm).
+    if (!this.masterFetchPending) {
+      this.masterFetchPending = true;
+      this.log(`No client has catalog v${G} yet — master will fetch it from the gameserver and relay to the fleet`);
+      return { ok: true, gameServerVersion: G, action: "master_fetch", version };
     }
     return { ok: true, gameServerVersion: G, action: "none", version };
   }
@@ -227,6 +230,19 @@ export class ClientSyncMaster {
     this.downloaderClientId = null;
     this.log(`Adopted catalog v${v ?? "?"} from ${clientId} — relaying to the rest of the fleet`);
     return { ok: true, version: v };
+  }
+
+  /**
+   * Called by the server after it performs the master-side gameserver fetch (the
+   * `master_fetch` action) and uploads the result. Clears the `masterFetchPending`
+   * guard so the next reporting client sees the now-relayable copy. If the fetch
+   * failed (no catalog supplied), the guard is cleared so a later client can
+   * retry without being permanently stuck.
+   */
+  public masterCatalogFetched(catalog: Record<string, unknown> | null): { ok: boolean; version: string | null } {
+    this.masterFetchPending = false;
+    if (!catalog || typeof catalog !== "object") return { ok: false, version: null };
+    return this.catalogUpload("master", catalog);
   }
 
   /** Diagnostic snapshot of the catalog orchestration state. */

@@ -1702,7 +1702,7 @@ if (url.pathname === "/data/shipsForSale.json") {
           }
           if (url.pathname === "/api/client-sync/catalog-version" && req.method === "POST") {
             // A connected client reports its local catalog.json version. The
-            // master runs the single-download election (only ONE client fetches
+            // master runs the single-download election (only ONE node fetches
             // from the gameserver) and tells this client what to do next.
             const body = await req.json() as { version?: string | null; lastFetched?: string | null };
             const cid = req.headers.get("x-client-id") || "";
@@ -1710,8 +1710,21 @@ if (url.pathname === "/data/shipsForSale.json") {
               cid,
               typeof body.version === "string" ? body.version : null,
               typeof body.lastFetched === "string" ? body.lastFetched : null,
-            );
-            return Response.json(result ?? { ok: false, gameServerVersion: null, action: "none" }, { headers: cors });
+            ) ?? { ok: false, gameServerVersion: null, action: "none" };
+            // When no client has the new gameserver version (the common post-patch
+            // case), the master itself downloads catalog.json ONCE and relays it to
+            // the fleet — so clients never hammer the gameserver and stay connected.
+            if (result.action === "master_fetch") {
+              try {
+                await catalogStore.fetchFromLib();
+                const res = this.syncMaster?.masterCatalogFetched(catalogStore.getAll()) ?? { ok: false, version: null };
+                console.log(`[ClientSync] Master fetched catalog v${res.version ?? "?"} from gameserver — relaying to fleet`);
+              } catch (err) {
+                this.syncMaster?.masterCatalogFetched(null);
+                console.error(`[ClientSync] Master catalog fetch failed:`, err);
+              }
+            }
+            return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/catalog-upload" && req.method === "POST") {
             // A designated client uploads its (freshly fetched) catalog so the

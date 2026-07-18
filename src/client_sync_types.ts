@@ -113,7 +113,7 @@ export interface CatalogVersionResponse {
   ok: boolean;
   /** The gameserver version (from `get_version` / the OpenAPI spec). */
   gameServerVersion: string | null;
-  action: "none" | "upload" | "download_and_upload" | "accept_catalog";
+  action: "none" | "upload" | "download_and_upload" | "master_fetch" | "accept_catalog";
   /** Present on `accept_catalog`: the up-to-date catalog to adopt. */
   catalog?: Record<string, unknown>;
   /** This client's reported version, echoed back for logging. */

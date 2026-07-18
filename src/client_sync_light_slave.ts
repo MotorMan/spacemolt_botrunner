@@ -44,6 +44,9 @@ export class ClientSyncLightSlave {
   private lastClients: Array<Record<string, unknown>> = [];
   /** Hash of the last bot-chat message we relayed, to avoid echo loops. */
   private lastRelayedChat: string | null = null;
+  /** Last time we ran the catalog-sync step (throttled to avoid spamming the
+   *  master with version reports every poll cycle). */
+  private lastCatalogSync = 0;
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -244,6 +247,73 @@ export class ClientSyncLightSlave {
     }
   }
 
+  /** Read our local catalog version + lastFetched without forcing a load. */
+  private async localCatalogInfo(): Promise<{ version: string | null; lastFetched: string | null }> {
+    try {
+      const { catalogStore } = await import("./catalogstore.js");
+      const all = catalogStore.getAll();
+      return {
+        version: typeof all.version === "string" ? all.version : null,
+        lastFetched: typeof all.lastFetched === "string" ? all.lastFetched : null,
+      };
+    } catch {
+      return { version: null, lastFetched: null };
+    }
+  }
+
+  /**
+   * Fleet-wide catalog convergence.
+   *
+   * Every connected client used to independently download `catalog.json` from the
+   * gameserver, which rate-limits that endpoint — so only one client actually
+   * got the fresh file and the rest were stuck on stale versions. Instead, we
+   * report our local catalog version to the master, which elects exactly ONE
+   * client to fetch it from the gameserver and then relays that single copy to
+   * the rest of us. The master's verdict tells us which role to play:
+   *
+   *  - `none`: we're already current (or orchestration is inactive) — nothing to do.
+   *  - `accept_catalog`: adopt the catalog the master relays and replace ours.
+   *  - `upload`: we already have the gameserver version — send our copy up so the
+   *     master can relay it to the others.
+   *  - `download_and_upload`: we're the elected one — fetch once from the
+   *     gameserver, then upload so everyone converges.
+   *
+   * Never throws.
+   */
+  private async syncCatalog(): Promise<void> {
+    if (!this.settings.syncCatalog) return;
+    const now = Date.now();
+    // Throttle the version report so we don't hit the master every poll cycle;
+    // the master's election is sticky enough that 30s granularity is plenty.
+    if (now - this.lastCatalogSync < 30000) return;
+    this.lastCatalogSync = now;
+
+    const { version, lastFetched } = await this.localCatalogInfo();
+    let resp: { ok?: boolean; gameServerVersion?: string | null; action?: string; catalog?: Record<string, unknown>; version?: string | null };
+    try {
+      resp = await this.request<typeof resp>("/api/client-sync/catalog-version", { method: "POST" }, { version, lastFetched });
+    } catch {
+      return;
+    }
+    const action = resp?.action;
+    try {
+      const { catalogStore } = await import("./catalogstore.js");
+      if (action === "accept_catalog" && resp.catalog && typeof resp.catalog === "object") {
+        catalogStore.replaceWith(resp.catalog as Record<string, unknown>);
+        this.log(`Adopted up-to-date catalog from master (was v${version ?? "?"})`);
+      } else if (action === "upload") {
+        await this.request<{ ok?: boolean }>("/api/client-sync/catalog-upload", { method: "POST" }, { catalog: catalogStore.getAll() });
+        this.log(`Uploaded local catalog (v${version ?? "?"}) to master`);
+      } else if (action === "download_and_upload") {
+        await catalogStore.fetchFromLib();
+        await this.request<{ ok?: boolean }>("/api/client-sync/catalog-upload", { method: "POST" }, { catalog: catalogStore.getAll() });
+        this.log(`Downloaded fresh catalog (v${catalogStore.getAll().version ?? "?"}) from gameserver and shared to master`);
+      }
+    } catch (err) {
+      this.logError(`Catalog sync (${action}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
    * Pull the master's cross-client fleet rescue poll: a single request that asks
    * every connected client for its local bots' fuel status + positions and
@@ -353,6 +423,11 @@ export class ClientSyncLightSlave {
       }
       await this.pushChat();
       await this.pullChat();
+      // Fleet-wide catalog convergence: the master elects ONE client to fetch
+      // catalog.json from the gameserver and relays that single copy to the
+      // rest of us — so we don't all hammer the (rate-limited) endpoint and end
+      // up on stale versions.
+      await this.syncCatalog();
       this.lastSync = Date.now();
       this.lastError = null;
     } catch (err) {

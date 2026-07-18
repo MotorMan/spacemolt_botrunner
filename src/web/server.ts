@@ -1700,6 +1700,35 @@ if (url.pathname === "/data/shipsForSale.json") {
             const ok = this.syncMaster?.civilianTransportUpdate(body);
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/catalog-version" && req.method === "POST") {
+            // A connected client reports its local catalog.json version. The
+            // master runs the single-download election (only ONE client fetches
+            // from the gameserver) and tells this client what to do next.
+            const body = await req.json() as { version?: string | null; lastFetched?: string | null };
+            const cid = req.headers.get("x-client-id") || "";
+            const result = await this.syncMaster?.reportCatalogVersion(
+              cid,
+              typeof body.version === "string" ? body.version : null,
+              typeof body.lastFetched === "string" ? body.lastFetched : null,
+            );
+            return Response.json(result ?? { ok: false, gameServerVersion: null, action: "none" }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog-upload" && req.method === "POST") {
+            // A designated client uploads its (freshly fetched) catalog so the
+            // master can relay the single copy to every other connected client.
+            const body = await req.json() as { catalog?: Record<string, unknown> };
+            const cid = req.headers.get("x-client-id") || "";
+            const res = this.syncMaster?.catalogUpload(cid, body.catalog ?? null) ?? { ok: false, version: null };
+            // Keep the master node's own catalog store fresh so /api/catalog
+            // reflects the fleet-converged copy instead of a stale local one.
+            if (res.ok && body.catalog) {
+              try { catalogStore.replaceWith(body.catalog); } catch { /* non-fatal */ }
+            }
+            return Response.json(res, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog-sync-state" && req.method === "GET") {
+            return Response.json(this.syncMaster?.getCatalogSyncState() ?? {}, { headers: cors });
+          }
           if (url.pathname.startsWith("/api/client-sync/clients/") && req.method === "DELETE") {
             const id = decodeURIComponent(url.pathname.slice("/api/client-sync/clients/".length));
             const ok = this.syncMaster?.disconnect(id);

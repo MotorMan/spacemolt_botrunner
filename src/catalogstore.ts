@@ -218,6 +218,21 @@ class CatalogStore {
     this.dirty = false;
   }
 
+  /**
+   * Replace the in-memory catalog (and on-disk file) with a verbatim payload
+   * received from a peer (the client-sync master relays a single
+   * fleet-converged `catalog.json` so only one node ever downloads it from the
+   * gameserver). The payload is treated exactly like a server payload — every
+   * top-level section is preserved and `lastFetched` is refreshed.
+   */
+  replaceWith(raw: Record<string, unknown>): void {
+    this.applyRaw(raw);
+    this.lastFetched = typeof raw.lastFetched === "string" ? raw.lastFetched : new Date().toISOString();
+    this.dirty = true;
+    this.writeToDisk();
+    debugLog("catalog", `Replaced catalog from remote sync: ${this.getSummary()}`);
+  }
+
   /** Flush pending writes to disk immediately. Call on shutdown. */
   flush(): void {
     if (this.saveTimer) {

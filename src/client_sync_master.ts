@@ -7,6 +7,11 @@ import {
   peerRequestText,
   type FileEntry,
 } from "./client_sync_files.js";
+import {
+  deriveOpenApiMeta,
+  fetchOpenApiV2Spec,
+  loadLatestOpenApiV2Spec,
+} from "./openapi.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 import type {
   RegisteredClient,
@@ -17,6 +22,10 @@ import type {
   PassengerPayload,
   BotStatusPush,
   HelloResponse,
+  CatalogVersionReport,
+  CatalogVersionResponse,
+  CatalogSyncState,
+  CatalogSyncStateClient,
 } from "./client_sync_types.js";
 
 export type {
@@ -28,6 +37,10 @@ export type {
   PassengerPayload,
   BotStatusPush,
   HelloResponse,
+  CatalogVersionReport,
+  CatalogVersionResponse,
+  CatalogSyncState,
+  CatalogSyncStateClient,
 } from "./client_sync_types.js";
 
 function generateApiKey(): string {
@@ -47,6 +60,24 @@ export class ClientSyncMaster {
   private apiKey: string;
   private password: string;
   private mode: string;
+
+  // ── Catalog orchestration ──────────────────────────────────
+  // Instead of every connected client independently downloading the gameserver's
+  // `catalog.json` (which rate-limits, so only one succeeds and the rest stay
+  // stale), the master elects a *single* client to fetch it and then relays that
+  // one copy to every other client. State below tracks who has what version.
+  /** Per-client last-reported catalog version + when we heard it. */
+  private catalogVersions = new Map<string, { version: string | null; lastFetched: string | null; lastSeen: number }>();
+  /** The one good catalog copy the master is relaying (matches the gameserver
+   *  version), plus where it came from and its version string. */
+  private latestCatalog: Record<string, unknown> | null = null;
+  private latestCatalogVersion: string | null = null;
+  private latestCatalogFrom: string | null = null;
+  /** The client currently designated to download `catalog.json` from the
+   *  gameserver. Only this one is allowed to do the expensive fetch. */
+  private downloaderClientId: string | null = null;
+  /** Cached gameserver version (from `get_version` / the OpenAPI spec). */
+  private gsVersionCache: { v: string | null; at: number } | null = null;
   constructor(settings: Record<string, unknown>) {
     this.settings = settings;
     this.mode = (settings.mode as string) || "slave";
@@ -84,6 +115,133 @@ export class ClientSyncMaster {
   public saveSettings(): void {
     this.settings.apiKey = this.apiKey;
     this.settings.password = this.password;
+  }
+
+  private log(msg: string): void {
+    console.log(`[ClientSync] ${msg}`);
+  }
+
+  /**
+   * Resolve the gameserver version (e.g. "0.501.0") — the version a client's
+   * `catalog.json` must match to be considered up to date. Derived from the
+   * OpenAPI spec's `info.x-gameserver-version` (the same value `get_version`
+   * reports), which is the authoritative gameserver version. Cached for 5min so
+   * the per-cycle version reports don't re-read/re-fetch the spec every time.
+   */
+  private async getGameServerVersion(): Promise<string | null> {
+    const now = Date.now();
+    if (this.gsVersionCache && now - this.gsVersionCache.at < 5 * 60 * 1000) {
+      return this.gsVersionCache.v;
+    }
+    let v: string | null = null;
+    try {
+      let spec = loadLatestOpenApiV2Spec(process.cwd());
+      if (!spec) {
+        const r = await fetchOpenApiV2Spec();
+        spec = r.spec;
+      }
+      if (spec) v = deriveOpenApiMeta(spec).gameServerVersion;
+    } catch {
+      v = null;
+    }
+    this.gsVersionCache = { v, at: now };
+    return v;
+  }
+
+  /**
+   * A connected client reports its local `catalog.json` version. The master runs
+   * the single-download election and returns what that client should do:
+   *
+   *  - If the master already holds a copy matching the gameserver version, it
+   *    tells every client whose version differs to `accept_catalog` (relay), and
+   *    clients already matching get `none`.
+   *  - Otherwise (no good copy yet): a client that already has the gameserver
+   *    version is told to `upload` its copy so the master can relay it; failing
+   *    that, exactly one client is elected `download_and_upload` (the lone
+   *    gameserver fetch), and everyone else waits (`none`).
+   *
+   * Never throws. If the gameserver version can't be determined we fall back to
+   * `none` everywhere so clients keep their current behaviour rather than
+   * orchestrating against an unknown target.
+   */
+  public async reportCatalogVersion(
+    clientId: string,
+    version: string | null,
+    lastFetched: string | null,
+  ): Promise<CatalogVersionResponse> {
+    this.catalogVersions.set(clientId, { version, lastFetched, lastSeen: Date.now() });
+    this.touch(clientId);
+
+    const G = await this.getGameServerVersion();
+    if (!G) {
+      return { ok: true, gameServerVersion: null, action: "none", version };
+    }
+
+    // We already hold a fleet-converged copy matching the gameserver version —
+    // relay it to anyone who doesn't have it yet.
+    if (this.latestCatalog && this.latestCatalogVersion === G) {
+      const local = this.catalogVersions.get(clientId);
+      if (local && local.version === G) {
+        return { ok: true, gameServerVersion: G, action: "none", version: local.version };
+      }
+      return { ok: true, gameServerVersion: G, action: "accept_catalog", catalog: this.latestCatalog, version: local?.version ?? null };
+    }
+
+    // No good copy yet. If this client already has the right version, have it
+    // upload its copy so the master can start relaying. (If multiple clients
+    // report a match before the upload lands, both may upload — harmless and
+    // idempotent; once `latestCatalog` is set the relay phase takes over.)
+    if (version === G) {
+      return { ok: true, gameServerVersion: G, action: "upload", version };
+    }
+
+    // Nobody has the gameserver version yet — elect exactly one downloader.
+    const live = new Set(this.clients.keys());
+    if (this.downloaderClientId && !live.has(this.downloaderClientId)) {
+      this.downloaderClientId = null;
+    }
+    if (!this.downloaderClientId) {
+      this.downloaderClientId = clientId;
+      this.log(`No client has catalog v${G} yet — electing ${clientId} to download it from the gameserver`);
+      return { ok: true, gameServerVersion: G, action: "download_and_upload", version };
+    }
+    if (this.downloaderClientId === clientId) {
+      return { ok: true, gameServerVersion: G, action: "download_and_upload", version };
+    }
+    return { ok: true, gameServerVersion: G, action: "none", version };
+  }
+
+  /**
+   * A client uploads its catalog (after `upload` or `download_and_upload`). The
+   * master stores it as the fleet-converged copy so subsequent version reports
+   * relay it to everyone else. Returns the adopted version.
+   */
+  public catalogUpload(clientId: string, catalog: Record<string, unknown> | null): { ok: boolean; version: string | null } {
+    if (!catalog || typeof catalog !== "object") return { ok: false, version: null };
+    const v = typeof catalog.version === "string" ? catalog.version : null;
+    this.latestCatalog = catalog;
+    this.latestCatalogVersion = v;
+    this.latestCatalogFrom = clientId;
+    const lastFetched = typeof catalog.lastFetched === "string" ? catalog.lastFetched : new Date().toISOString();
+    this.catalogVersions.set(clientId, { version: v, lastFetched, lastSeen: Date.now() });
+    this.downloaderClientId = null;
+    this.log(`Adopted catalog v${v ?? "?"} from ${clientId} — relaying to the rest of the fleet`);
+    return { ok: true, version: v };
+  }
+
+  /** Diagnostic snapshot of the catalog orchestration state. */
+  public getCatalogSyncState(): CatalogSyncState {
+    const clients: CatalogSyncStateClient[] = [];
+    for (const [id, v] of this.catalogVersions) {
+      clients.push({ clientId: id, version: v.version, lastFetched: v.lastFetched });
+    }
+    return {
+      gameServerVersion: this.gsVersionCache?.v ?? null,
+      latestCatalogVersion: this.latestCatalogVersion,
+      latestCatalogFrom: this.latestCatalogFrom,
+      downloader: this.downloaderClientId,
+      clients,
+    };
   }
 
   public getSettings(): Record<string, unknown> {
@@ -227,6 +385,8 @@ export class ClientSyncMaster {
       if (now - (c.lastSeen || 0) > ClientSyncMaster.STALE_CLIENT_MS) {
         this.clients.delete(cid);
         this.botStatuses.delete(cid);
+        this.catalogVersions.delete(cid);
+        if (this.downloaderClientId === cid) this.downloaderClientId = null;
       }
     }
   }
@@ -251,6 +411,8 @@ export class ClientSyncMaster {
 
   public disconnect(clientId: string): boolean {
     this.botStatuses.delete(clientId);
+    this.catalogVersions.delete(clientId);
+    if (this.downloaderClientId === clientId) this.downloaderClientId = null;
     return this.clients.delete(clientId);
   }
 

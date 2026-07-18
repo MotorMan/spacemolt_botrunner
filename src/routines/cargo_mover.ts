@@ -2747,6 +2747,107 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       }
     }
 
+    // ── PRE-DEPARTURE CARGO VERIFICATION ─────────────────────
+    // Before we leave the source with "loaded" marked in memory, double-check the
+    // hold actually contains what we intended to pick up. A movers-in-motion run
+    // is assumed healthy, so a silent under-load (batch cleared the remaining
+    // counter but cargo never landed) would otherwise sail off looking fine and
+    // only surface later as a stuck / mismatched delivery. Re-read cargo, compare
+    // against each job's intended quantity, and re-attempt any shortfalls still
+    // available at the source. Only escalate to a red error when we genuinely
+    // cannot load (source empty / cargo full / repeated failure) so it shows up
+    // in the activity log like the other stalled cases.
+    await bot.refreshCargo();
+    const verifyStart = Date.now();
+    const verifyTimeoutMs = 120000;
+    let verifyPass = 0;
+    while (Date.now() - verifyStart < verifyTimeoutMs && bot.state === "running") {
+      verifyPass++;
+      await bot.refreshCargo();
+      const cargoNow = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
+      const shortfalls: Array<{ job: typeof jobs[number]; missing: number; haveInCargo: number }> = [];
+
+      for (const job of jobs) {
+        const originalQty = job.availableQty || 0;
+        const remainingUnloaded = jobRemaining.get(job.itemId) || 0;
+        const intendedLoaded = originalQty - remainingUnloaded;
+        if (intendedLoaded <= 0) continue;
+
+        const haveInCargo = cargoNow.get(job.itemId) || 0;
+        const missing = intendedLoaded - haveInCargo;
+        if (missing > 0) {
+          shortfalls.push({ job, missing, haveInCargo });
+        }
+      }
+
+      if (shortfalls.length === 0) break;
+
+      // Something we meant to load isn't in the hold — try to recover it.
+      ctx.log("warn", `⚠️ Pre-departure verify (pass ${verifyPass}): ${shortfalls.length} item type(s) short of intended load — attempting to recover before leaving`);
+      logCargoActivity(bot.username, "load_verify", `Cargo verification found ${shortfalls.length} shortfall(s) — re-loading before departure`, {
+        location: `${bot.system}/${bot.poi}`,
+      });
+
+      const cargoUsedV = cargoUsedFromInventory(bot);
+      const freeV = Math.max(0, cargoMax - cargoUsedV);
+      if (freeV <= 0) {
+        // Hold is genuinely full — whatever is missing simply won't fit. Leave
+        // it behind; this is expected (we only carry what fits), not a stall.
+        ctx.log("cargo", `📦 Hold full (${cargoUsedV}/${cargoMax}) — cannot recover ${shortfalls.length} shortfall(s); departing with what fits`);
+        break;
+      }
+
+      let recoveredAny = false;
+      for (const s of shortfalls) {
+        const itemSize = getItemSize(s.job.itemId);
+        const maxFitV = Math.floor(freeV / Math.max(1, itemSize));
+        if (maxFitV <= 0) continue;
+        const tryQty = Math.min(s.missing, maxFitV);
+
+        let got = 0;
+        if (shortfalls.length === 1) {
+          // Single remaining shortfall → regular per-item storage command.
+          const res = await withdrawFromStorage(ctx, s.job.itemId, tryQty, s.job.storageType);
+          got = res.success ? res.withdrawnQty : 0;
+        } else {
+          const moved = await bulkWithdrawFromStorage(ctx, [{ itemId: s.job.itemId, quantity: tryQty }], s.job.storageType);
+          got = moved.get(s.job.itemId) || 0;
+        }
+        if (got > 0) {
+          const before = jobRemaining.get(s.job.itemId) || 0;
+          jobRemaining.set(s.job.itemId, Math.max(0, before - got));
+          recoveredAny = true;
+        }
+      }
+
+      if (!recoveredAny) {
+        // Couldn't load the missing amounts (source empty / service error).
+        // Surface as a red error so it's visible in the activity log, then stop
+        // retrying to avoid a tight loop.
+        for (const s of shortfalls) {
+          const haveInStorageV = s.job.storageType === 'faction'
+            ? (bot.factionStorage.find((i) => i.itemId === s.job.itemId)?.quantity || 0)
+            : (bot.storage.find((i) => i.itemId === s.job.itemId)?.quantity || 0);
+          ctx.log("error", `⚠️ LOAD VERIFY FAILED: ${s.job.itemName} — wanted ${s.job.availableQty}x, only ${s.haveInCargo}x in cargo, ${s.missing}x missing (source has ${haveInStorageV}x). Not departing clean.`);
+          logCargoActivity(bot.username, "load_verify_failed", `Could not load ${s.missing}x ${s.job.itemName} (cargo=${s.haveInCargo}, source=${haveInStorageV}) — departure blocked`, {
+            itemId: s.job.itemId,
+            itemName: s.job.itemName,
+            quantity: s.missing,
+            location: `${bot.system}/${bot.poi}`,
+            error: "Pre-departure cargo verification failed",
+          });
+        }
+        allJobsCompleted = false;
+        break;
+      }
+    }
+
+    if (Date.now() - verifyStart >= verifyTimeoutMs) {
+      ctx.log("error", `⚠️ LOAD VERIFY TIMEOUT: could not confirm full load within ${verifyTimeoutMs / 1000}s — departing with whatever is in cargo`);
+    } else {
+      ctx.log("cargo", `✅ Pre-departure cargo verification passed — hold matches intended load (${cargoUsedFromInventory(bot)}/${cargoMax})`);
+    }
+
     // Track loaded items as in-transit before traveling
     const loadedItems = [];
     for (const [itemId, remaining] of jobRemaining) {

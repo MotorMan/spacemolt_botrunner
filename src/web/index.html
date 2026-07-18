@@ -22058,12 +22058,19 @@ When responding:
                 <span style="font-size:11px;color:var(--text-dim)"></span>
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
                 <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>
+                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">✏️ Rename</button>
               </div>
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)">PPR:</span>
                 <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
                 <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
-              </div>` : ``}
+              </div>
+              ${(factionFacilityRenameOpen[facId]) ? `
+              <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
+                <input type="text" id="ff-rename-${esc(facId)}" value="${esc(fac.custom_name || name)}" placeholder="New facility name (3-32)" style="flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:11px" />
+                <button class="primary sm" onclick="factionFacilityRenameSave('${esc(username)}','${esc(facId)}')">Save</button>
+                <button class="sm" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">×</button>
+              </div>` : ""}` : ``}
               <div style="display:flex;gap:4px;margin-left:auto">
                 ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
@@ -22415,6 +22422,43 @@ When responding:
         );
       }
 
+      function toggleFactionFacilityRename(username, facilityId) {
+        if (factionFacilityRenameOpen[facilityId]) {
+          delete factionFacilityRenameOpen[facilityId];
+        } else {
+          factionFacilityRenameOpen[facilityId] = true;
+        }
+        fetchFactionFacilities(username);
+      }
+
+      function factionFacilityRenameSave(username, facilityId) {
+        const input = document.getElementById(`ff-rename-${facilityId}`);
+        if (!input) return;
+        const customName = input.value.trim();
+        if (!customName) {
+          appendLine("system", "Enter a valid facility name (3-32 chars)");
+          return;
+        }
+        sendExec(
+          username,
+          "facility",
+          { action: "set_name", facility_id: facilityId, custom_name: customName },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: facility ${facilityId} renamed`);
+              delete factionFacilityRenameOpen[facilityId];
+              fetchFactionFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `Facility rename failed: ${result.error || "unknown"}`,
+              );
+              if (result.data) appendLine("system", `Raw: ${JSON.stringify(result.data)}`);
+            }
+          },
+        );
+      }
+
       function factionSetFacilityAccess(username, facilityId, access) {
         sendExec(
           username,
@@ -22702,6 +22746,7 @@ When responding:
       let factionFacilityCategory = "faction";
       let factionFacilityPublic = {};
       let factionFacilityPrice = {};
+      let factionFacilityRenameOpen = {}; // facId -> bool
       let factionFacilitiesData = [];
       let factionQueueUsageData = null;
       let factionQueueUsageSort = "external";

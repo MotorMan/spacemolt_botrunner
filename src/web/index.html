@@ -13695,18 +13695,27 @@
           )
           .join(", ");
         const rawOutputs = r.outputs || r.output || r.result || r.produces;
-        const output = Array.isArray(rawOutputs)
-          ? rawOutputs[0] || {}
-          : rawOutputs || {};
-        const outName =
-          output.name ||
-          output.item_name ||
-          output.item_id ||
-          output.id ||
-          r.name ||
-          "?";
-        const outQty = output.quantity || output.amount || 1;
-        detail.textContent = `${compStr} → ${outQty}x ${outName}`;
+        const outputList = Array.isArray(rawOutputs)
+          ? rawOutputs
+          : rawOutputs
+            ? [rawOutputs]
+            : [];
+        const outStr = outputList
+          .map((o) => {
+            const qty = o.quantity || o.amount || 1;
+            const name =
+              o.name ||
+              o.item_name ||
+              o.item_id ||
+              o.id ||
+              r.name ||
+              "?";
+            return `${qty}x ${name}`;
+          })
+          .join(", ");
+        detail.textContent = outStr
+          ? `${compStr} → ${outStr}`
+          : compStr;
       }
 
       function addCraftItem() {

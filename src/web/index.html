@@ -4273,7 +4273,14 @@
       }
 
       let _factionFundsInFlight = false;
-      /** Fetch faction treasury + home-station fuel in the background for the stats bar. */
+      /**
+       * Fetch the home-station fuel supply (and faction treasury) for the stats bar.
+       * The fuel is read for the station configured in settings/general/Faction Storage
+       * Station ("system|poi"), NOT whatever station an arbitrary docked bot sits at.
+       * We go through the server's `live` faction-storage endpoint, which resolves the
+       * station reference to the hex POI and performs a remote view_faction_storage — so
+       * it works without the bot being docked at that base.
+       */
       function refreshFactionFunds() {
         const fuelDisplayEl = document.getElementById("factionFuelDisplay");
         if (fuelDisplayEl) {
@@ -4281,17 +4288,15 @@
           fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
         }
         if (_factionFundsInFlight) return;
-        // Use the configured global home base station so we read the right station,
-        // not whatever station an arbitrary docked bot happens to be at.
+
         const homeStation =
           (settings.general && settings.general.factionStorageStation) || "";
-        // faction_info does not return credits/treasury — use view_faction_storage which does,
-        // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
-        const docked = bots.filter((b) => b.docked);
-        const pick =
-          docked.find((b) => b.state === "running") ?? docked[0] ?? null;
-        if (!pick) {
-          // No docked bot — fetch the home station's fuel from the faction-storage API cache.
+        // Need any connected bot to perform the remote read. Running preferred.
+        const liveBot =
+          bots.find((b) => b.state === "running") ?? bots[0] ?? null;
+
+        if (!liveBot) {
+          // No bot connected — fall back to whatever is cached on disk.
           const url = homeStation
             ? `/api/faction-storage?station=${encodeURIComponent(homeStation)}`
             : "/api/faction-storage";
@@ -4312,33 +4317,48 @@
         }
 
         _factionFundsInFlight = true;
-        // Pass the home station so the read targets the configured base, not the
-        // bot's current docked station (which may be a different/outdated base).
-        const params = homeStation ? { station_id: homeStation } : undefined;
-        sendExec(pick.username, "view_faction_storage", params, (result) => {
-          _factionFundsInFlight = false;
-          if (result.ok && result.data) {
-            const credits = result.data.credits ?? null;
-            if (credits != null) {
-              factionTreasury = credits;
-              if (factionData) factionData.treasury = credits;
-              const label = num(credits) + "cr";
-              document.getElementById("statFaction").textContent = label;
-              const pEl = document.getElementById("pStatFaction");
-              if (pEl) pEl.textContent = label;
+        // Live read of the home base's faction storage (resolves station + fuel).
+        const liveUrl =
+          `/api/faction-storage?live=1&bot=${encodeURIComponent(liveBot.username)}` +
+          (homeStation
+            ? `&station=${encodeURIComponent(homeStation)}`
+            : "");
+        fetch(liveUrl)
+          .then((r) => r.json())
+          .then((data) => {
+            _factionFundsInFlight = false;
+            if (data.factionFuelReserve != null) {
+              factionFuelReserve = data.factionFuelReserve;
+              factionFuelCapacity = data.factionFuelCapacity || 0;
+              if (fuelDisplayEl) {
+                const fuelK = (factionFuelReserve / 1000).toFixed(1);
+                fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
+              }
             }
-            const fuelReserve = result.data.factionFuelReserve ?? 0;
-            const fuelCapacity = result.data.factionFuelCapacity ?? 0;
-            if (fuelCapacity > 0) {
-              factionFuelReserve = fuelReserve;
-              factionFuelCapacity = fuelCapacity;
+          })
+          .catch(() => {
+            _factionFundsInFlight = false;
+          });
+
+        // Faction treasury (credits) is global, not station-specific — refresh it
+        // from any docked bot via view_faction_storage (no station needed).
+        const docked = bots.find((b) => b.docked);
+        if (docked) {
+          sendExec(docked.username, "view_faction_storage", undefined, (result) => {
+            if (result.ok && result.data) {
+              const credits = result.data.credits ?? null;
+              if (credits != null) {
+                factionTreasury = credits;
+                if (factionData) factionData.treasury = credits;
+                const label = num(credits) + "cr";
+                const fEl = document.getElementById("statFaction");
+                if (fEl) fEl.textContent = label;
+                const pEl = document.getElementById("pStatFaction");
+                if (pEl) pEl.textContent = label;
+              }
             }
-            if (fuelDisplayEl) {
-              const fuelK = (factionFuelReserve / 1000).toFixed(1);
-              fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-            }
-          }
-        });
+          });
+        }
       }
 
       // ── Bot Profile ────────────────────────────────────────────

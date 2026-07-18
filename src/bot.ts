@@ -72,6 +72,13 @@ export interface BotStatus {
   faction: string | null;
   isCloaked: boolean;
   /**
+   * Whether the active ship has an Emergency Warp Stabilizer (EWS) module
+   * installed. null = unknown (no ship data yet). false = known NOT equipped
+   * (ship will be destroyed if it enters battle). Surfaced on the dashboard
+   * with a red dot next to the bot name.
+   */
+  hasEmergencyWarpStabilizer: boolean | null;
+  /**
    * Transient flag set only for bot cards that have been rehydrated from the
    * persisted active-bot snapshot at client startup — i.e. bots that were
    * active last run but have not yet reconnected this session. The dashboard
@@ -250,6 +257,7 @@ docked = false;
 
   shipSpeed = 1;
   hasPathfinderDrive = false;
+  hasEmergencyWarpStabilizer: boolean | null = null;
   installedMods: string[] = [];
   lastKnownTick?: number;
 
@@ -1620,6 +1628,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.ammo = ship.ammo as number;
       }
       this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+      this.hasEmergencyWarpStabilizer = this.hasEwsModule(modulesArray);
     }
 
     // Towing state handling - moved outside ship block since it's on player/location
@@ -1741,6 +1750,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         if (totalAmmo > 0) this.ammo = totalAmmo;
         else if (ship.ammo != null) this.ammo = ship.ammo as number;
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+        this.hasEmergencyWarpStabilizer = this.hasEwsModule(modulesArray);
         this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
       }
       const creditsValue = r.credits ?? player?.credits;
@@ -2368,6 +2378,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
       }).filter(Boolean);
       this.hasPathfinderDrive = this.hasPathfinderModule(modules);
+      this.hasEmergencyWarpStabilizer = this.hasEwsModule(modules);
     }
     return this.installedMods;
   }
@@ -2382,6 +2393,25 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const n = mod.name;
       if (typeof n === "string" && n.toLowerCase().includes("pathfinder")) return true;
       if (mod.special === "pathfinder_drive") return true;
+    }
+    return false;
+  }
+
+  /** Detect whether an installed module is an Emergency Warp Stabilizer. */
+  private hasEwsModule(modules: Array<Record<string, unknown> | string>): boolean {
+    for (const m of modules) {
+      if (typeof m === "string") {
+        if (m === "emergency_warp_stabilizer") return true;
+        continue;
+      }
+      const mod = m as Record<string, unknown>;
+      const id = mod.type_id || mod.module_id || mod.mod_id || mod.id;
+      if (typeof id === "string" && id === "emergency_warp_stabilizer") return true;
+      const stats = mod.stats as Record<string, unknown> | undefined;
+      if (stats && stats.special === "emergency_warp_stabilizer") return true;
+      if (mod.special === "emergency_warp_stabilizer") return true;
+      const n = mod.name;
+      if (typeof n === "string" && n.toLowerCase().includes("emergency warp stabilizer")) return true;
     }
     return false;
   }
@@ -3952,6 +3982,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       factionFuelCapacity: this.factionFuelCapacity,
       faction: this.faction,
       isCloaked: this.isCloaked,
+      hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,
     };
   }
 

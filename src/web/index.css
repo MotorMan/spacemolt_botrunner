@@ -282,6 +282,19 @@ table.bot-table tbody td:nth-child(8) {
   color: var(--green);
 }
 
+/* Red "no Emergency Warp Stabilizer" indicator appended to bot names */
+.ews-warning-dot {
+  color: var(--red);
+  margin-left: 4px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  text-shadow: 0 0 4px rgba(239, 68, 68, 0.8);
+}
+.bot-card-name-text .ews-warning-dot,
+.grid-bot-name .ews-warning-dot { margin-left: 4px; }
+
 .state-badge {
   display: inline-block;
   font-size: 11px;

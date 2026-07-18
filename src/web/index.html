@@ -2840,6 +2840,19 @@
 
       // ── Bot table rendering ────────────────────────────────────
 
+      /**
+       * Render a red "no EWS" dot appended to a bot name when the active ship
+       * is known to NOT have an Emergency Warp Stabilizer installed. Hovering
+       * shows a warning that entering battle will destroy the ship.
+       * Returns "" when status is unknown or EWS is equipped.
+       */
+      function ewsWarningDot(bot) {
+        if (bot.hasEmergencyWarpStabilizer === false) {
+          return `<span class="ews-warning-dot" title="⚠ No Emergency Warp Stabilizer equipped — entering battle will DESTROY this ship!">●</span>`;
+        }
+        return "";
+      }
+
       function renderBots() {
         // If a routine dropdown in the dashboard table is focused/open, skip re-rendering
         // The browser's native dropdown closes when the element is removed from DOM
@@ -2967,7 +2980,7 @@
                   : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
             }
             return `<tr data-bot="${esc(bot.username)}">
-      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
+      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}</td>
       <td class="ship-cell">${esc(bot.shipName || "-")}</td>
       <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
@@ -3209,7 +3222,7 @@
         return `
     <div class="grid-bot-card ${bot.offline ? 'ghost' : ''}" onclick="openProfile('${esc(bot.username)}')">
       <div class="grid-bot-header">
-        <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}</span>
+        <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}${ewsWarningDot(bot)}</span>
         <span class="state-badge ${bot.offline ? 'state-offline' : 'state-' + bot.state}">${esc(stateLabel)}</span>
       </div>
       <div class="grid-bot-ship">${esc(bot.shipName || "-")}</div>
@@ -3458,7 +3471,7 @@
       <div class="bot-card-header">
         <div class="bot-card-name">
           <span class="bot-card-name-icon"></span>
-          <span class="bot-card-name-text ${bot.isCloaked ? 'cloaked' : ''}" title="${esc(bot.username)}">${esc(bot.username)}</span>
+          <span class="bot-card-name-text ${bot.isCloaked ? 'cloaked' : ''}" title="${esc(bot.username)}">${esc(bot.username)}${ewsWarningDot(bot)}</span>
           <span class="bot-card-ship" title="${esc(bot.shipName || "")}">${esc(bot.shipName || "-")}</span>
         </div>
         <div class="bot-card-status">

@@ -125,8 +125,8 @@ export class ClientSyncSlave {
     }
   }
 
-  private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<void> {
-    await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload);
+  private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<{ ok?: boolean }> {
+    return (await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload)) as { ok?: boolean };
   }
 
 private async register(): Promise<{ ok: boolean; error?: string }> {
@@ -220,7 +220,10 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     await this.request<{ ok: boolean }>("/api/client-sync/wildlife-update", { method: "POST" }, data);
   }
 
-  private async pushStatuses(): Promise<void> {
+  /** Push this node's bot statuses to the master. Returns true if the master
+   *  accepted the push (client known), false if rejected (e.g. master restarted
+   *  and forgot this clientId) — caller should then force a re-register. */
+  private async pushStatuses(): Promise<boolean> {
     let statuses: Record<string, unknown>[] = [];
     try {
       const { getBotStatuses } = await import("./botmanager.js");
@@ -228,7 +231,12 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     } catch {
       // best-effort: ignore if bot manager is unavailable
     }
-    await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
+    try {
+      const res = await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
+      return !!(res && (res as { ok?: boolean }).ok);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -338,7 +346,15 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       if (!this.clientId) {
         this.log('Registering with master...');
         const reg = await this.register();
-        if (!reg.ok) throw new Error(reg.error || "register failed");
+        if (!reg.ok) {
+          // Registration failed — only now drop our client id so we retry next
+          // cycle. A transient failure must not poison an already-registered
+          // client.
+          this.clientId = null;
+          this.connectionState = 'disconnected';
+          throw new Error(reg.error || "register failed");
+        }
+        this.connectionState = 'connected';
       }
       if (this.settings.syncMap) await this.pullMap();
       if (this.settings.syncCatalog) await this.pullCatalog();
@@ -348,7 +364,14 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
         await this.pushWildlife();
         await this.pullWildlife();
       }
-      await this.pushStatuses();
+      const pushed = await this.pushStatuses();
+      if (!pushed) {
+        // Master rejected the push (client not found — e.g. master restarted).
+        // Force a re-register next cycle instead of pushing to a stale id.
+        this.clientId = null;
+        this.connectionState = 'disconnected';
+        this.logError(`Status push rejected by master — will re-register next cycle`);
+      }
       if (this.settings.pushLocalDiscoveries) {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });
         await this.pushLocal("market-update", { station: "", orders: [] });
@@ -358,8 +381,11 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       this.lastError = null;
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
-      this.clientId = null;
-      this.connectionState = 'disconnected';
+      // NB: do NOT null clientId on a generic error (chat pull, file sync,
+      // transient blip). Nuking the id on every blip churned re-registrations
+      // and left clients "connected" but never pushing. Only register failure
+      // / rejected push drops the id.
+      if (!this.clientId) this.connectionState = 'disconnected';
       this.logError(`Sync failed: ${this.lastError}`);
     }
   }

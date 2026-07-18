@@ -1644,29 +1644,16 @@ if (url.pathname === "/data/shipsForSale.json") {
             return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/test-register" && req.method === "POST") {
-            const body = await req.json() as { masterUrl: string; apiKey: string; label: string; password?: string };
+            const body = await req.json() as { masterUrl: string; apiKey: string; label?: string; password?: string };
             const testCors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
-            if (!body.masterUrl) {
-              return Response.json({ ok: false, error: "masterUrl required" }, { headers: testCors });
+            // Validate the master is reachable and the credentials are correct,
+            // but do NOT permanently register a client here — that's what made the
+            // connected-clients list pile up with one-shot "Test Connection" pings.
+            if (!this.syncMaster) {
+              return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: testCors });
             }
-            try {
-              const testUrl = `${body.masterUrl}/api/client-sync/register`;
-              const res = await fetch(testUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ apiKey: body.apiKey, label: body.label || "test", password: body.password })
-              });
-              let payload: { ok: boolean; clientId?: string; error?: string };
-              try { 
-                payload = await res.json(); 
-              } catch { 
-                payload = { ok: false, error: "invalid response" }; 
-              }
-              return Response.json(payload, { headers: testCors });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              return Response.json({ ok: false, error: msg }, { headers: testCors });
-            }
+            const result = this.syncMaster.validateConnection({ apiKey: body.apiKey, password: body.password });
+            return Response.json(result, { headers: testCors });
           }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
             const body = await req.json() as { channel: string; content: string; sender?: string };
@@ -1678,6 +1665,12 @@ if (url.pathname === "/data/shipsForSale.json") {
             const body = await req.json() as { clientId?: string; statuses: BotStatusPush[] };
             const cid = body.clientId || req.headers.get("x-client-id") || "";
             const ok = this.syncMaster?.botStatusPush(cid, body.statuses);
+            if (!ok && cid) {
+              // Client pushed statuses but isn't a registered client — usually
+              // the master restarted and forgot it, or the slave is pushing with
+              // a stale clientId. The slave detects ok:false and re-registers.
+              console.warn(`[ClientSync] bot-status push rejected: unknown clientId "${cid}" (master has ${this.syncMaster?.getClients().length} clients)`);
+            }
             return Response.json({ ok: !!ok }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/poi-update" && req.method === "POST") {

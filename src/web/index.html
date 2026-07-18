@@ -34426,13 +34426,21 @@ ignoreBlacklist: document.getElementById(
               return;
             }
             container.innerHTML = clients
-              .map(
-                (c) =>
-                  `<div style="margin-bottom:4px;padding:4px;background:#1a1a1a;border-radius:4px">
-          <span style="font-weight:500">${esc(c.label || c.clientId)}</span>
-          <span style="color:var(--text-dim);font-size:11px;margin-left:8px">${new Date(c.connectedAt).toLocaleString()}</span>
-        </div>`,
-              )
+              .map((c) => {
+                const last = c.lastSeen ? new Date(c.lastSeen) : null;
+                const ageMs = last ? Date.now() - last.getTime() : Infinity;
+                const stale = ageMs > 10 * 60 * 1000;
+                const freshColor = stale ? "var(--red, #ff4444)" : "var(--green, #00ff00)";
+                const botInfo = typeof c.botCount === "number" ? ` · ${c.botCount} bot(s)` : "";
+                const seen = last
+                  ? `<span style="color:${freshColor};font-size:11px;margin-left:8px">seen ${last.toLocaleTimeString()}${stale ? " (STALE)" : ""}</span>`
+                  : `<span style="color:var(--text-dim);font-size:11px;margin-left:8px">never seen</span>`;
+                return `<div style="margin-bottom:4px;padding:4px;background:#1a1a1a;border-radius:4px">
+          <span style="font-weight:500">${esc(c.label || c.clientId)}</span>${botInfo}
+          <span style="color:var(--text-dim);font-size:11px;margin-left:8px">connected ${new Date(c.connectedAt).toLocaleString()}</span>
+          ${seen}
+        </div>`;
+              })
               .join("");
           })
           .catch(() => {});

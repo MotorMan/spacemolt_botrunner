@@ -146,8 +146,11 @@ export class ClientSyncLightSlave {
     }
   }
 
-  /** Push this node's bot names + full statuses up to the master. */
-  private async pushStatuses(): Promise<void> {
+  /** Push this node's bot names + full statuses up to the master.
+   *  Returns true if the master accepted the push (client is known), false if
+   *  the master rejected it (e.g. "client not found" after a master restart) —
+   *  in which case the caller should force a re-register. */
+  private async pushStatuses(): Promise<boolean> {
     let statuses: Record<string, unknown>[] = [];
     try {
       const { getBotStatuses } = await import("./botmanager.js");
@@ -155,7 +158,12 @@ export class ClientSyncLightSlave {
     } catch {
       // best-effort: ignore if bot manager is unavailable
     }
-    await this.request<{ ok: boolean }>("/api/client-sync/bot-status", { method: "POST" }, { clientId: this.clientId, statuses });
+    try {
+      const res = await this.request<{ ok: boolean }>("/api/client-sync/bot-status", { method: "POST" }, { clientId: this.clientId, statuses });
+      return !!(res && (res as { ok?: boolean }).ok);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -252,19 +260,38 @@ export class ClientSyncLightSlave {
       if (!this.clientId) {
         this.log('Registering with master...');
         const reg = await this.register();
-        if (!reg.ok) throw new Error(reg.error || "register failed");
+        if (!reg.ok) {
+          // Registration failed — only now drop our client id so we retry next
+          // cycle. A transient failure here (bad network, master restart) must
+          // NOT poison a client that already registered successfully.
+          this.clientId = null;
+          this.connectionState = 'disconnected';
+          throw new Error(reg.error || "register failed");
+        }
+        this.connectionState = 'connected';
       }
       // The ONLY two things a light client shares are bot statuses + the
       // non-API bot chat channel. No file sync, no map/market/etc.
-      await this.pushStatuses();
+      const pushed = await this.pushStatuses();
+      if (!pushed) {
+        // Master rejected the push (client not found — e.g. master restarted and
+        // forgot us). Force a re-register next cycle so we don't keep pushing to
+        // a stale clientId forever. The rest of this cycle can still run.
+        this.clientId = null;
+        this.connectionState = 'disconnected';
+        this.logError(`Status push rejected by master — will re-register next cycle`);
+      }
       await this.pushChat();
       await this.pullChat();
       this.lastSync = Date.now();
       this.lastError = null;
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
-      this.clientId = null;
-      this.connectionState = 'disconnected';
+      // NB: we intentionally do NOT null clientId here on a generic error
+      // (chat pull, transient network blip, …). Nuking the id on every blip
+      // churned re-registrations and left clients stuck "connected" but never
+      // pushing. Only registration failure / rejected push drops the id.
+      if (!this.clientId) this.connectionState = 'disconnected';
       this.logError(`Sync failed: ${this.lastError}`);
     }
   }

@@ -39,6 +39,11 @@ export class ClientSyncMaster {
   private clients = new Map<string, RegisteredClient>();
   private botStatuses = new Map<string, unknown[]>();
   private readonly version = "1.0.0";
+  /** Max time to wait for a single full slave's selfUrl fleet poll before
+   *  skipping it. Kept short so one slow/unreachable slave can't stall the
+   *  whole cross-client fleet poll (which would time out light/slave rescue
+   *  bots' `pullFleetRescue` and make them fall back to local-only). */
+  private static readonly FLEET_POLL_TIMEOUT_MS = 3000;
   private apiKey: string;
   private password: string;
   private mode: string;
@@ -130,14 +135,29 @@ export class ClientSyncMaster {
     if (this.password && payload.password !== this.password) {
       return Promise.resolve({ clientId: "", ok: false, error: "Invalid password" });
     }
-    const id = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     const now = Date.now();
+    const label = payload.label || "";
+    // Reuse an existing client with the same non-empty label instead of always
+    // minting a brand-new clientId. Otherwise every reconnect / "Test Connection"
+    // click piles up a duplicate entry (and a fresh clientId), and the master's
+    // client list grows without bound while the old entries keep their (now
+    // orphaned) bot statuses. Labels are user-assigned and meant to be unique
+    // per physical client, so deduping on label is the correct identity.
+    let id: string | undefined;
+    if (label) {
+      for (const [cid, c] of this.clients) {
+        if (c.label === label) { id = cid; break; }
+      }
+    }
+    if (!id) {
+      id = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    }
     this.clients.set(id, {
       clientId: id,
-      label: payload.label || id,
+      label: label || id,
       apiKey: payload.apiKey,
       password: payload.password,
-      connectedAt: now,
+      connectedAt: this.clients.get(id)?.connectedAt ?? now,
       lastSeen: now,
       selfUrl: payload.url || undefined,
       light: !!payload.light,
@@ -191,12 +211,33 @@ export class ClientSyncMaster {
   }
 
   private fileSyncTimer: ReturnType<typeof setInterval> | null = null;
+  /** Clients not seen for this long are considered dead and pruned (their
+   *  botStatuses dropped too). 10min >> any sane pollIntervalSec (<=120s), so a
+   *  healthy client mid-cycle is never evicted; only genuinely gone clients
+   *  (and the orphaned duplicates left by the old always-new-clientId register)
+   *  are cleaned up. */
+  private static readonly STALE_CLIENT_MS = 10 * 60 * 1000;
 
-  /** Periodically re-poll slaves so files changed without a push still converge. */
+  /** Drop clients we haven't heard from in STALE_CLIENT_MS, clearing their
+   *  cached bot statuses so getBots()/requestFleetRescuePoll stop serving
+   *  stale bots for a client that's no longer connected. */
+  public pruneStaleClients(): void {
+    const now = Date.now();
+    for (const [cid, c] of this.clients) {
+      if (now - (c.lastSeen || 0) > ClientSyncMaster.STALE_CLIENT_MS) {
+        this.clients.delete(cid);
+        this.botStatuses.delete(cid);
+      }
+    }
+  }
+
+  /** Periodically re-poll slaves so files changed without a push still converge,
+   *  and prune clients that have gone silent. */
   public startFileSync(intervalSec: number): void {
     if (this.fileSyncTimer) return;
     const ms = Math.max(5000, intervalSec * 1000);
     this.fileSyncTimer = setInterval(() => {
+      this.pruneStaleClients();
       this.pullAllSlaves().catch(() => {});
     }, ms);
   }
@@ -244,6 +285,26 @@ export class ClientSyncMaster {
     c.lastSeen = Date.now();
     this.botStatuses.set(clientId, statuses as unknown[]);
     return true;
+  }
+
+  /**
+   * Validate a prospective client's credentials WITHOUT permanently registering
+   * it. Used by the dashboard "Test Connection" button, which must prove the
+   * master is reachable and the apiKey/password/mode are correct but must NOT
+   * leave a lingering client entry every time it's clicked (that's what caused
+   * the master's connected-clients list to pile up with one-shot pings).
+   */
+  public validateConnection(payload: { apiKey: string; password?: string }): { ok: boolean; error?: string } {
+    if (this.mode !== "master") {
+      return { ok: false, error: "Master not in master mode" };
+    }
+    if (payload.apiKey !== this.apiKey) {
+      return { ok: false, error: "Invalid API key" };
+    }
+    if (this.password && payload.password !== this.password) {
+      return { ok: false, error: "Invalid password" };
+    }
+    return { ok: true };
   }
 
   public poiUpdate(_payload: PoiPayload): boolean {
@@ -309,15 +370,18 @@ export class ClientSyncMaster {
       combined.push(b);
     }
     // Full slaves still advertise a reachable selfUrl; poll those for live bots.
+    // Their pushed statuses already live in `botStatuses` (folded in above), so
+    // this is just a freshness re-poll. Bound it tightly: a single unreachable/
+    // slow full slave must NEVER stall the whole fleet poll (which would make a
+    // light/slave rescue bot's `pullFleetRescue` time out and fall back to
+    // local-only). Skip any client that can't answer within FLEET_POLL_TIMEOUT.
     for (const [clientId, c] of this.clients) {
       if (c.light || !c.selfUrl) continue;
       try {
-        const data = await peerRequest(
-          c.selfUrl,
-          "/api/client-sync/bots",
-          this.apiKey,
-          this.password || "",
-        );
+        const data = await Promise.race([
+          peerRequest(c.selfUrl, "/api/client-sync/bots", this.apiKey, this.password || ""),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ClientSyncMaster.FLEET_POLL_TIMEOUT_MS)),
+        ]);
         if (Array.isArray(data)) {
           for (const s of data) {
             const entry = { ...(s as Record<string, unknown>) } as Record<string, unknown>;

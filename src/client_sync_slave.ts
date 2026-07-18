@@ -427,11 +427,14 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       }
       const pushed = await this.pushStatuses();
       if (!pushed) {
-        // Master rejected the push (client not found — e.g. master restarted).
-        // Force a re-register next cycle instead of pushing to a stale id.
+        // Master rejected the push (client not found — e.g. master restarted, or
+        // this slave is pointed at a different master instance than the one it
+        // registered with). Force a re-register next cycle instead of pushing to
+        // a stale id. Log the masterUrl so a misconfigured URL (e.g. localhost
+        // when the real master is on another host) is obvious.
         this.clientId = null;
         this.connectionState = 'disconnected';
-        this.logError(`Status push rejected by master — will re-register next cycle`);
+        this.logError(`Status push rejected by master at ${this.settings.masterUrl} — will re-register next cycle`);
       }
       if (this.settings.pushLocalDiscoveries) {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });

@@ -3,6 +3,7 @@ import type { BotChatMessage } from "../bot_chat_channel.js";
 import * as fs from 'fs';
 import * as path from 'path';
 import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
+import { getLastFleetRoster, getLastFleetPullError } from "../botmanager.js";
 import { updateFactionStorageCache, getFactionStorageCache, type FactionStorageEntry } from "../factionStorageCache.js";
 import {
   findStation,
@@ -5220,6 +5221,23 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
         ctx.log("rescue", `🌐 Fleet connected: ${fleet.length} bot(s) total — ${remoteMembers.length} remote from ${clients.size} other client(s)`);
       } else {
         ctx.log("rescue", `⚠️ Fleet connected: ${fleet.length} bot(s) but 0 remote — cross-client pull returned only this client's bots`);
+        // Surface WHY there's no remote data: the master's roster (which clients
+        // it sees + how many bots each pushed) and the last pull error, if any.
+        // This is the actual diagnostic for "a client is missing" — without it
+        // we'd only know 0 remote and not WHICH client failed to push.
+        const roster = getLastFleetRoster();
+        if (roster.length > 0) {
+          const parts = roster.map((c) => `${c.label}=${c.botCount ?? 0}bot${(c.light ? "/light" : "")}`).join(", ");
+          ctx.log("rescue", `📋 Master sees ${roster.length} client(s): ${parts}`);
+          const missing = roster.filter((c) => Number(c.botCount ?? 0) === 0).map((c) => String(c.label || c.clientId));
+          if (missing.length > 0) {
+            ctx.log("rescue", `🚫 Clients with 0 pushed bots (missing from fleet): ${missing.join(", ")}`);
+          }
+        } else {
+          ctx.log("rescue", `📋 Master roster is EMPTY — this client may be pointed at a master that knows of no other clients (wrong master URL, or no other client has registered/pushed yet)`);
+        }
+        const perr = getLastFleetPullError();
+        if (perr) ctx.log("rescue", `🔌 Last cross-client pull error: ${perr}`);
       }
 
       for (const member of fleet) {

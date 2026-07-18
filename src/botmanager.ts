@@ -313,7 +313,23 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
     merged.push(r as unknown as BotStatus);
   }
   merged.sort((a, b) => a.username.localeCompare(b.username));
+  lastFleetRoster = roster;
+  lastFleetPullError = pullError;
   return merged;
+}
+
+/** Last cross-client fleet roster the master reported (client label → botCount
+ *  + lastSeen), captured on the most recent `getCombinedFleetStatus()` call.
+ *  Exposed so the rescue routine can show WHICH clients the master sees (and
+ *  which are missing) directly in its scan log, instead of only on the node
+ *  console where nobody is watching. */
+let lastFleetRoster: Array<Record<string, unknown>> = [];
+let lastFleetPullError: string | null = null;
+export function getLastFleetRoster(): Array<Record<string, unknown>> {
+  return lastFleetRoster;
+}
+export function getLastFleetPullError(): string | null {
+  return lastFleetPullError;
 }
 
 /**

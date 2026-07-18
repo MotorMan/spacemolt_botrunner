@@ -22058,7 +22058,7 @@ When responding:
                 <span style="font-size:11px;color:var(--text-dim)"></span>
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
                 <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>
-                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">✏️ Rename</button>
+                <button class="sm" style="font-size:10px;padding:2px 6px" title="Rename facility" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">✏️</button>
               </div>
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)">PPR:</span>

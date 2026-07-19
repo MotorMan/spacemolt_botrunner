@@ -1577,7 +1577,7 @@
         if (name === "shipyard") renderShipyardPage();
         if (name === "stats") {
           renderStatsTab();
-          refreshFactionFunds();
+          refreshHomeStationFuel();
           loadTaxesDataAndRender();
           switchStatsView("main");
         }
@@ -2295,7 +2295,7 @@
                 lastUsedRoutines = { ...settings.botAssignments };
               }
               renderBots();
-              setTimeout(refreshFactionFunds, 2000);
+              setTimeout(refreshHomeStationFuel, 2000);
               updateChatBotSelect();
               // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
               if (
@@ -2405,24 +2405,8 @@
                 renderBots();
                 renderStats();
                 updateChatBotSelect();
-                // Update faction fuel from any bot that has it
-                for (const bot of bots) {
-                  if (
-                    bot.factionFuelReserve != null &&
-                    bot.factionFuelCapacity != null &&
-                    bot.factionFuelCapacity > 0
-                  ) {
-                    factionFuelReserve = bot.factionFuelReserve;
-                    factionFuelCapacity = bot.factionFuelCapacity;
-                    const fuelDisplayEl =
-                      document.getElementById("factionFuelDisplay");
-                    if (fuelDisplayEl) {
-                      const fuelK = (factionFuelReserve / 1000).toFixed(1);
-                      fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-                    }
-                    break;
-                  }
-                }
+                // Update the home-station fuel from the live bots[] snapshot.
+                refreshHomeStationFuel();
                 // Update skills data for live updates (when debug logging is disabled)
                 if (skillsLoaded && skillsData && skillsData.bots) {
                   for (const bot of bots) {
@@ -4274,91 +4258,32 @@
 
       let _factionFundsInFlight = false;
       /**
-       * Fetch the home-station fuel supply (and faction treasury) for the stats bar.
-       * The fuel is read for the station configured in settings/general/Faction Storage
-       * Station ("system|poi"), NOT whatever station an arbitrary docked bot sits at.
-       * We go through the server's `live` faction-storage endpoint, which resolves the
-       * station reference to the hex POI and performs a remote view_faction_storage — so
-       * it works without the bot being docked at that base.
+       * Update the "Home Station Fuel" stat bar.
+       * Source of truth: the home station's OWN base fuel (base.fuel / base.max_fuel),
+       * captured from get_poi/get_base results whenever a bot is physically at the
+       * configured global home station (settings.general.factionStorageStation). Bots
+       * run get_poi constantly on entering/docking, so this refreshes on its own — no
+       * polling or remote reads required. We read it off the live bots[] snapshot.
        */
-      function refreshFactionFunds() {
+      function refreshHomeStationFuel() {
         const fuelDisplayEl = document.getElementById("factionFuelDisplay");
-        if (fuelDisplayEl) {
-          const fuelK = (factionFuelReserve / 1000).toFixed(1);
-          fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-        }
-        if (_factionFundsInFlight) return;
-
+        if (!fuelDisplayEl) return;
         const homeStation =
           (settings.general && settings.general.factionStorageStation) || "";
-        // Need any connected bot to perform the remote read. Running preferred.
-        const liveBot =
-          bots.find((b) => b.state === "running") ?? bots[0] ?? null;
-
-        if (!liveBot) {
-          // No bot connected — fall back to whatever is cached on disk.
-          const url = homeStation
-            ? `/api/faction-storage?station=${encodeURIComponent(homeStation)}`
-            : "/api/faction-storage";
-          fetch(url)
-            .then((r) => r.json())
-            .then((data) => {
-              if (data.factionFuelReserve != null) {
-                factionFuelReserve = data.factionFuelReserve;
-                factionFuelCapacity = data.factionFuelCapacity || 0;
-                if (fuelDisplayEl) {
-                  const fuelK = (factionFuelReserve / 1000).toFixed(1);
-                  fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-                }
-              }
-            })
-            .catch(() => {});
-          return;
+        // Find a bot whose last home-base fuel capture matches the configured home POI.
+        const src = homeStation
+          ? bots.find(
+              (b) =>
+                b.homeBaseFuelPoi === homeStation &&
+                (b.homeBaseFuel > 0 || b.homeBaseMaxFuel > 0),
+            )
+          : null;
+        if (src) {
+          factionFuelReserve = src.homeBaseFuel;
+          factionFuelCapacity = src.homeBaseMaxFuel;
         }
-
-        _factionFundsInFlight = true;
-        // Live read of the home base's faction storage (resolves station + fuel).
-        const liveUrl =
-          `/api/faction-storage?live=1&bot=${encodeURIComponent(liveBot.username)}` +
-          (homeStation
-            ? `&station=${encodeURIComponent(homeStation)}`
-            : "");
-        fetch(liveUrl)
-          .then((r) => r.json())
-          .then((data) => {
-            _factionFundsInFlight = false;
-            if (data.factionFuelReserve != null) {
-              factionFuelReserve = data.factionFuelReserve;
-              factionFuelCapacity = data.factionFuelCapacity || 0;
-              if (fuelDisplayEl) {
-                const fuelK = (factionFuelReserve / 1000).toFixed(1);
-                fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
-              }
-            }
-          })
-          .catch(() => {
-            _factionFundsInFlight = false;
-          });
-
-        // Faction treasury (credits) is global, not station-specific — refresh it
-        // from any docked bot via view_faction_storage (no station needed).
-        const docked = bots.find((b) => b.docked);
-        if (docked) {
-          sendExec(docked.username, "view_faction_storage", undefined, (result) => {
-            if (result.ok && result.data) {
-              const credits = result.data.credits ?? null;
-              if (credits != null) {
-                factionTreasury = credits;
-                if (factionData) factionData.treasury = credits;
-                const label = num(credits) + "cr";
-                const fEl = document.getElementById("statFaction");
-                if (fEl) fEl.textContent = label;
-                const pEl = document.getElementById("pStatFaction");
-                if (pEl) pEl.textContent = label;
-              }
-            }
-          });
-        }
+        const fuelK = (factionFuelReserve / 1000).toFixed(1);
+        fuelDisplayEl.textContent = `Home Station Fuel: ${fuelK}K`;
       }
 
       // ── Bot Profile ────────────────────────────────────────────
@@ -36668,8 +36593,8 @@ function saveFuelServiceSettings() {
             "Loaded faction storage items:",
             globalFactionStorage.length,
           );
-          // NOTE: fuel reserve is owned by refreshFactionFunds (which targets the
-          // configured home station), so we do NOT overwrite it from this disk
+          // NOTE: home-station fuel is owned by refreshHomeStationFuel() (read from
+          // the live bots[] snapshot), so we do NOT overwrite it from this disk
           // cache here — that cache can be stale and would clobber the live value.
           // Re-render market if visible
           if (
@@ -36684,9 +36609,10 @@ function saveFuelServiceSettings() {
 
       connect();
       loadGlobalFactionStorage(); // Load immediately on page load
-      setInterval(refreshFactionFunds, 60000);
-      // Re-read the home-station fuel cache from disk (written by docked bots)
       setInterval(loadGlobalFactionStorage, 60000);
+      // Re-evaluate the home-station fuel from the live bots[] snapshot. Bots push
+      // updated status (incl. home-base fuel) whenever they're at the home POI.
+      setInterval(refreshHomeStationFuel, 10000);
       // Poll battle status every 2 seconds when in battle
       setInterval(pollBattleStatus, 2000);
     </script>

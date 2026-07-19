@@ -6598,17 +6598,24 @@
       <button class="danger sm" onclick="mcJettison()">Jettison</button>
     </div>
 
-    <div class="cmd-group">
-      <label>Deposit All</label>
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Bulk Move (100 items / tick)</label>
       <select id="mc-depall-source">
         <option value="cargo_to_station">Cargo → Station</option>
         <option value="cargo_to_faction">Cargo → Faction</option>
         <option value="station_to_faction">Station → Faction</option>
         <option value="station_to_cargo">Station → Cargo</option>
         <option value="faction_to_station">Faction → Station</option>
+        <option value="faction_to_cargo">Faction → Cargo</option>
       </select>
-      <button class="primary sm" onclick="mcDepositAll()">Start Queue</button>
+      <button class="primary sm" onclick="mcDepositAll()">Start Bulk Move</button>
       <button class="sm" onclick="mcStopDepositAll()">Stop</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Bulk All Fleet</label>
+      <button class="primary sm" onclick="mcDepositAllAllBots()" title="Run the same bulk move on every bot at once">Move All Bots</button>
+      <span id="mc-depall-fleet-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
     </div>
 
     <div class="cmd-group">
@@ -8262,6 +8269,22 @@
               });
             }
           }
+        } else if (mode === "faction_to_cargo") {
+          // Withdraw all items from faction storage to cargo
+          // Command: storage action=withdraw target=self item_id=X quantity=Y source=faction
+          const factionItems = profileFactionStorage || [];
+          for (const item of factionItems) {
+            const itemId = item.item_id;
+            const qty = item.quantity || item.count || 1;
+            if (qty > 0 && itemId) {
+              items.push({
+                item_id: itemId,
+                quantity: qty,
+                source: "faction",
+                action: "withdraw",
+              });
+            }
+          }
         }
 
         return { mode, items, index: 0 };
@@ -8286,7 +8309,48 @@
           : "var(--yellow)";
       }
 
-      /** Process next item in the deposit queue */
+      /** Maximum items per single bulk `storage` request. The server rejects a
+       *  bulk request larger than this ("Too many items in one bulk request:
+       *  N (max 100)"), so we chunk every batch to 100 items. */
+      const BULK_MAX_ITEMS = 100;
+
+      /** Split an item list into chunks of at most BULK_MAX_ITEMS entries. */
+      function chunkBulkItems(items) {
+        if (items.length <= BULK_MAX_ITEMS) return [items];
+        const chunks = [];
+        for (let i = 0; i < items.length; i += BULK_MAX_ITEMS) {
+          chunks.push(items.slice(i, i + BULK_MAX_ITEMS));
+        }
+        return chunks;
+      }
+
+      /** Translate a queue entry into the unified v2 `storage` command params
+       *  for a bulk request. The `storage` command moves EVERY item in its
+       *  `items` array in ONE tick, so we only need to set the action /
+       *  source / target once per chunk. */
+      function mcBulkStorageParams(items) {
+        // All queued items in a single mode share the same action/source/target.
+        const first = items[0];
+        const params = {
+          action: first.action === "withdraw" ? "withdraw" : "deposit",
+          items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })),
+        };
+        if (first.action === "withdraw") {
+          // station→cargo uses source 'storage'; faction→cargo uses 'faction'.
+          params.source = first.source === "faction" ? "faction" : "storage";
+          params.target = "self";
+        } else {
+          // deposit: target 'faction' or 'self' (station); source cargo/storage/faction.
+          params.target = first.target === "faction" ? "faction" : "self";
+          if (first.source) params.source = first.source;
+        }
+        return params;
+      }
+
+      /** Process the queue in BULK: instead of one command per item per tick we
+       *  send up to 100 items in a single `storage` command, advancing the
+       *  whole chunk in one tick. This lets a full hold/station of mixed items
+       *  transfer in a handful of ticks rather than hundreds. */
       function mcProcessDepositQueue() {
         if (!depositAllRunning || !depositAllQueue) return;
 
@@ -8294,7 +8358,7 @@
 
         if (index >= items.length) {
           logResponse(
-            `<span class="resp-ok">Deposit All complete! All items transferred.</span>`,
+            `<span class="resp-ok">Bulk Move complete! All items transferred.</span>`,
           );
           depositAllRunning = false;
           depositAllQueue = null;
@@ -8302,46 +8366,15 @@
           return;
         }
 
-        const item = items[index];
+        const remaining = items.slice(index, index + BULK_MAX_ITEMS);
         const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
-
-        // Normal processing for other modes
-        const verb = item.action === "withdraw" ? "withdrawing" : "depositing";
+        const verb = remaining[0].action === "withdraw" ? "withdrawing" : "depositing";
         logResponse(
-          `<span class="resp-cmd">${ts} > ${verb} ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`,
+          `<span class="resp-cmd">${ts} > ${verb} ${remaining.length} item(s) in bulk (${index + 1}-${index + remaining.length}/${items.length})</span>`,
         );
 
-        // All transfer operations use V2 API commands
-        let command;
-        const params = {
-          item_id: item.item_id,
-          quantity: item.quantity,
-        };
-
-        if (item.action === "withdraw") {
-          // Withdraw from storage to cargo
-          command = "withdraw_items";
-          // For station->cargo, just use item_id + quantity (no source/target needed)
-          // For faction->cargo, use source="faction" target="self"
-          if (item.source === "faction") {
-            params.source = "faction";
-            params.target = "self";
-          }
-        } else {
-          // Deposit (default action)
-          if (item.target === "faction") {
-            // Deposit to faction storage using deposit_items with target: 'faction'
-            command = "deposit_items";
-            params.source = item.source; // 'cargo' or 'storage'
-            params.target = item.target; // 'faction'
-          } else {
-            // Deposit to station storage (target === 'self')
-            command = "deposit_items";
-            params.source = item.source; // 'cargo' or 'storage'
-          }
-        }
-
-        sendExec(profileBot, command, params, (result) => {
+        const params = mcBulkStorageParams(remaining);
+        sendExec(profileBot, "storage", params, (result) => {
           if (result.ok) {
             logResponse(`<span class="resp-ok">OK</span>`);
           } else {
@@ -8350,20 +8383,20 @@
             );
           }
 
-          depositAllQueue.index++;
+          depositAllQueue.index += remaining.length;
           mcUpdateQueueStatus();
 
-          // Wait a bit before next item (respect tick rate)
+          // One chunk per tick.
           setTimeout(mcProcessDepositQueue, TICK_COOLDOWN_MS + 500);
         });
       }
 
-      /** Start the deposit all queue */
+      /** Start the bulk move queue for the current profile bot. */
       function mcDepositAll() {
         if (!profileBot) return;
         if (depositAllRunning) {
           logResponse(
-            '<span class="resp-err">Deposit All already running</span>',
+            '<span class="resp-err">Bulk Move already running</span>',
           );
           return;
         }
@@ -8373,7 +8406,7 @@
 
         if (!queue || queue.items.length === 0) {
           logResponse(
-            '<span class="resp-err">No items to deposit in source</span>',
+            '<span class="resp-err">No items to move in source</span>',
           );
           return;
         }
@@ -8382,12 +8415,145 @@
         depositAllRunning = true;
 
         logResponse(
-          `<span class="resp-cmd">Starting Deposit All: ${mode} (${queue.items.length} items)</span>`,
+          `<span class="resp-cmd">Starting Bulk Move: ${mode} (${queue.items.length} items, ${Math.ceil(queue.items.length / BULK_MAX_ITEMS)} tick(s))</span>`,
         );
         mcUpdateQueueStatus();
 
         // Start processing
         setTimeout(mcProcessDepositQueue, 500);
+      }
+
+      /** Run the same bulk move on every bot at once, one bot per tick so we
+       *  don't hammer the server. Each bot builds its own queue from its own
+       *  cargo/storage and moves up to 100 items per tick via the `storage`
+       *  bulk command. */
+      let fleetBulkMove = null; // { mode, bots: string[], index }
+      function mcDepositAllAllBots() {
+        if (fleetBulkMove) {
+          logResponse('<span class="resp-err">Fleet bulk move already running</span>');
+          return;
+        }
+        const mode = val("mc-depall-source");
+        const others = bots
+          .map((b) => b.username)
+          .filter((u) => u && bots.find((b) => b.username === u));
+        if (others.length === 0) {
+          logResponse('<span class="resp-err">No bots available</span>');
+          return;
+        }
+        fleetBulkMove = { mode, bots: others, index: 0 };
+        logResponse(
+          `<span class="resp-cmd">Starting fleet Bulk Move: ${mode} across ${others.length} bot(s)</span>`,
+        );
+        mcProcessFleetBulkMove();
+      }
+
+      function mcProcessFleetBulkMove() {
+        if (!fleetBulkMove) return;
+        if (fleetBulkMove.index >= fleetBulkMove.bots.length) {
+          logResponse(
+            `<span class="resp-ok">Fleet Bulk Move complete! All ${fleetBulkMove.bots.length} bot(s) processed.</span>`,
+          );
+          fleetBulkMove = null;
+          const st = document.getElementById("mc-depall-fleet-status");
+          if (st) {
+            st.textContent = "Idle";
+            st.style.color = "var(--text-dim)";
+          }
+          return;
+        }
+
+        const botName = fleetBulkMove.bots[fleetBulkMove.index];
+        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+        logResponse(
+          `<span class="resp-cmd">${ts} > [${fleetBulkMove.index + 1}/${fleetBulkMove.bots.length}] ${botName}: refreshing storage...</span>`,
+        );
+
+        // Refresh the bot's cargo + both storages so the queue reflects reality,
+        // then run its bulk move using the bot's own data (no global swapping).
+        sendExec(botName, "get_cargo", {}, () => {
+          sendExec(botName, "view_storage", {}, () => {
+            sendExec(botName, "view_storage", { target: "faction" }, () => {
+              mcRunFleetBulkMoveForBot(botName, fleetBulkMove.mode, () => {
+                fleetBulkMove.index++;
+                const st = document.getElementById("mc-depall-fleet-status");
+                if (st) {
+                  st.textContent = `Processing: ${fleetBulkMove.index}/${fleetBulkMove.bots.length}`;
+                  st.style.color = "var(--green)";
+                }
+                setTimeout(mcProcessFleetBulkMove, TICK_COOLDOWN_MS + 500);
+              });
+            });
+          });
+        });
+      }
+
+      /** Build + run the bulk move queue for a single fleet bot, then call done. */
+      function mcRunFleetBulkMoveForBot(botName, mode, done) {
+        const realBot = bots.find((b) => b.username === botName);
+        const faction = (realBot && realBot.factionStorage) || [];
+        const cargo = (realBot && realBot.inventory) || [];
+        const storage = (realBot && realBot.storage) || [];
+
+        const queue = mcBuildDepositQueueFor(mode, cargo, storage, faction);
+        if (!queue || queue.items.length === 0) {
+          logResponse(
+            `<span class="resp-err">${botName}: no items to move</span>`,
+          );
+          done();
+          return;
+        }
+
+        logResponse(
+          `<span class="resp-cmd">${botName}: ${queue.items.length} item(s) to move (${Math.ceil(queue.items.length / BULK_MAX_ITEMS)} tick(s))</span>`,
+        );
+
+        let idx = 0;
+        const step = () => {
+          if (idx >= queue.items.length) {
+            logResponse(`<span class="resp-ok">${botName}: done</span>`);
+            done();
+            return;
+          }
+          const chunk = queue.items.slice(idx, idx + BULK_MAX_ITEMS);
+          const params = mcBulkStorageParams(chunk);
+          const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+          logResponse(
+            `<span class="resp-cmd">${ts} > ${botName}: bulk ${idx + 1}-${idx + chunk.length}/${queue.items.length}</span>`,
+          );
+          sendExec(botName, "storage", params, (result) => {
+            if (!result.ok) {
+              logResponse(
+                `<span class="resp-err">${botName}: failed: ${esc(result.error || "unknown")}</span>`,
+              );
+            }
+            idx += chunk.length;
+            setTimeout(step, TICK_COOLDOWN_MS + 500);
+          });
+        };
+        step();
+      }
+
+      /** Build the deposit/move queue for an explicit cargo/storage/faction set
+       *  (used by the fleet-wide bulk move where each bot has its own data). */
+      function mcBuildDepositQueueFor(mode, cargo, storage, factionItems) {
+        const items = [];
+        const push = (list, source, target, action) => {
+          for (const item of list) {
+            const itemId = item.itemId || item.item_id;
+            const qty = item.quantity || item.count || 1;
+            if (qty > 0 && itemId) {
+              items.push({ item_id: itemId, quantity: qty, source, target, action });
+            }
+          }
+        };
+        if (mode === "cargo_to_station") push(cargo, "cargo", "self", "deposit");
+        else if (mode === "cargo_to_faction") push(cargo, "cargo", "faction", "deposit");
+        else if (mode === "station_to_faction") push(storage, "storage", "faction", "deposit");
+        else if (mode === "station_to_cargo") push(storage, "storage", "self", "withdraw");
+        else if (mode === "faction_to_station") push(factionItems, "faction", "self", "deposit");
+        else if (mode === "faction_to_cargo") push(factionItems, "faction", "self", "withdraw");
+        return { mode, items, index: 0 };
       }
 
       /** Stop the deposit all queue */

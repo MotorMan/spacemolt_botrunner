@@ -904,10 +904,14 @@ function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
  *  storage but NOT yet into cargo (hold filled, interruption, a rejected stack)
  *  are returned to faction.
  *
- *  Uses the proven per-item `faction_deposit_items` command (the same one the
- *  rest of the routine uses for station→faction) rather than the bulk `storage`
- *  variant, which was observed failing silently and leaving items stranded.
- *  Returns the number of item types moved. */
+ *  The command is the unified `storage` `withdraw` with `source:"storage"` and
+ *  `target:"faction"` — that moves STATION storage → faction directly (bypassing
+ *  cargo), which is exactly the inverse of the load's `faction→station` step.
+ *  (NOTE: `faction_deposit_items` is the WRONG command here — it moves cargo→
+ *  faction and fails with "insufficient_cargo" when the items are only in
+ *  station storage. That mistake was the cause of the earlier error spam.)
+ *  The `items` array is chunked to <= BULK_MAX_ITEMS so the server never rejects
+ *  the whole batch. Returns the number of item types moved. */
 async function bulkStationToFaction(
   ctx: RoutineContext,
   excludeFuel = true,
@@ -925,11 +929,17 @@ async function bulkStationToFaction(
   });
   if (candidates.length === 0) return 0;
 
+  const chunks = chunkBulkItems(candidates.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
   let movedTypes = 0;
-  for (const item of candidates) {
-    const resp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-    if (!resp.error) movedTypes++;
-    else ctx.log("warn", `Station→faction failed for ${item.itemId}: ${resp.error.message}`);
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "withdraw",
+      source: "storage",
+      target: "faction",
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (!resp.error) movedTypes += chunk.length;
+    else ctx.log("warn", `Bulk station→faction failed: ${resp.error.message} — will retry remaining chunks`);
   }
   await sleep(BULK_SETTLE_MS);
   await bot.refreshFactionStorage(false, undefined, true);

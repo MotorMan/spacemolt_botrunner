@@ -628,6 +628,12 @@ interface CraftQuote {
   fee: number;
   labor: number;
   creditsTotal: number;
+  // Server-authoritative affordability for the whole quoted job. This already
+  // accounts for faction storage/treasury coverage (when deliver_to is omitted
+  // the server auto-draws from the faction when personal funds can't cover it),
+  // so it is the correct signal to gate on — not a naive fee-vs-limit compare.
+  haveCredits: boolean;
+  haveInputs: boolean;
   venue: string;
   venueType: string;
   recipe: string;
@@ -641,10 +647,25 @@ function parseCraftQuote(result: unknown): CraftQuote {
     fee: typeof cost.fee === "number" ? (cost.fee as number) : 0,
     labor: typeof cost.labor === "number" ? (cost.labor as number) : 0,
     creditsTotal: typeof r.credits_total === "number" ? (r.credits_total as number) : 0,
+    // Only treat the job as affordable/faction-covered when the server says so
+    // explicitly. Absence must NOT auto-cover a paid rental (that would bypass
+    // the personal spending limit), so default to false when the field is missing.
+    haveCredits: r.have_credits === true,
+    haveInputs: r.have_inputs === true,
     venue: (r.venue as string) || "",
     venueType: (r.venue_type as string) || "",
     recipe: (r.recipe as string) || "",
   };
+}
+
+// Some recipes can only be produced at a real facility and error out when we
+// try preset=workshop (hand-crafting). Detect that specific server error so we
+// don't treat an impossible workshop fallback as a hard block.
+function isFacilityOnlyError(msg: string | undefined): boolean {
+  const m = (msg || "").toLowerCase();
+  return m.includes("can only be made at a facility") ||
+    (m.includes("can't be hand-crafted") || m.includes("cant be hand-crafted")) ||
+    m.includes("drop preset=workshop");
 }
 
 interface FinalVenue {
@@ -734,6 +755,12 @@ export async function resolveFinalVenue(
     attemptedPreset = "workshop";
     const ws = await dryRun("workshop", undefined);
     if (ws.error) {
+      // Facility-only recipes can't be hand-crafted, so the workshop fallback is
+      // impossible. Since rental is disabled by config, we can't run this here.
+      if (isFacilityOnlyError(ws.error.message)) {
+        log("warn", `${recipeName} can only be made at a facility and rental is disabled - skipping (enable allowRentalPurchase/allowExternalFacilities to craft it).`);
+        return { blocked: true, rentalFee: 0, label: "facility-only (rental disabled)" };
+      }
       log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
       return { blocked: true, rentalFee: 0, label: "workshop-failed" };
     }
@@ -741,22 +768,39 @@ export async function resolveFinalVenue(
     return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (rental avoided)" };
   }
 
-  // External rental is allowed — enforce the spending limit.
+    // External rental is allowed — enforce the spending limit.
   let rentalFee = 0;
   if (!attemptedFacility && quote.external && v.allowRental) {
     rentalFee = quote.fee;
     if (settings.allowRentalPurchase && settings.rentalSpendingLimit > 0) {
       if (rentalSpentThisSession + rentalFee > settings.rentalSpendingLimit) {
-        log("warn", `Rental fee ${rentalFee}cr would exceed spending limit ${settings.rentalSpendingLimit}cr for ${recipeName} - falling back to workshop (hand-crafting)`);
-        attemptedFacility = undefined;
-        attemptedPreset = "workshop";
+        log("warn", `Rental fee ${rentalFee}cr would exceed spending limit ${settings.rentalSpendingLimit}cr for ${recipeName} - trying workshop (hand-crafting)`);
         const ws = await dryRun("workshop", undefined);
         if (ws.error) {
-          log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
-          return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+          // Facility-only recipe: hand-crafting is impossible, so there is no
+          // cheaper venue. Rather than hard-blocking the whole crafting chain,
+          // honor the auto-routed facility when the server confirms the job is
+          // actually affordable (have_credits — this already includes faction
+          // storage/treasury coverage when personal funds fall short). The
+          // spending limit still applies to recipes that CAN hand-craft.
+          if (isFacilityOnlyError(ws.error.message)) {
+            if (quote.haveCredits) {
+              log("warn", `${recipeName} can only be made at a facility (${rentalFee}cr) and exceeds the rental spending limit (${settings.rentalSpendingLimit}cr), but the job is affordable (faction/treasury may cover it) - proceeding at the facility.`);
+              // Don't count faction-covered facility jobs against the personal
+              // rental spend; the limit is about capping bot-initiated rentals.
+              rentalFee = 0;
+            } else {
+              log("warn", `${recipeName} can only be made at a facility (${rentalFee}cr), exceeds the rental spending limit (${settings.rentalSpendingLimit}cr, spent ${rentalSpentThisSession}cr), and isn't affordable - blocking. Raise rentalSpendingLimit or fund the faction treasury to craft it.`);
+              return { blocked: true, rentalFee: 0, label: "facility-only (limit reached)" };
+            }
+          } else {
+            log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
+            return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+          }
+        } else {
+          quote = parseCraftQuote(ws.result);
+          return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
         }
-        quote = parseCraftQuote(ws.result);
-        return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
       }
     }
   }

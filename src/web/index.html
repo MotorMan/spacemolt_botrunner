@@ -1185,6 +1185,7 @@
             <div class="bot-table-header">
               <span>Tax History by Bot</span>
               <div style="display: flex; gap: 8px">
+                <button class="sm" onclick="refreshTaxesData()" id="taxRefreshBtn">⟳ Refresh</button>
                 <input
                   type="text"
                   class="filter-input"
@@ -4031,9 +4032,18 @@
       }
 
       async function refreshTaxesData() {
-        taxesLoaded = false;
-        await loadTaxesData();
-        renderTaxesTab();
+        const btn = document.getElementById("taxRefreshBtn");
+        if (btn) { btn.disabled = true; btn.textContent = "⟳ Refreshing…"; }
+        try {
+          taxesLoaded = false;
+          await loadTaxesData();
+          loadTaxesBar();
+          const factionTax = await loadFactionTaxEstimate();
+          renderFactionTaxBar(factionTax);
+          renderTaxesTab();
+        } finally {
+          if (btn) { btn.disabled = false; btn.textContent = "⟳ Refresh"; }
+        }
       }
 
       function updateFactionPrepayFunds() {

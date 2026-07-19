@@ -872,6 +872,24 @@ async function depositToDestination(
  *
  * @returns A map of itemId -> quantity actually moved into cargo.
  */
+/** The unified v2 `storage` command rejects a bulk request with more than
+ *  this many items per call (`invalid_payload: Too many items in one bulk
+ *  request: N (max 100)`). Any batch we send must be chunked to stay under it. */
+const BULK_MAX_ITEMS = 100;
+
+/** Split a list of item requests into chunks no larger than `BULK_MAX_ITEMS`
+ *  so the unified `storage` command never rejects the whole batch for being
+ *  too large. Returns the original list wrapped in a single chunk when it is
+ *  already within the limit. */
+function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
+  if (items.length <= BULK_MAX_ITEMS) return [items];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += BULK_MAX_ITEMS) {
+    chunks.push(items.slice(i, i + BULK_MAX_ITEMS));
+  }
+  return chunks;
+}
+
 async function bulkWithdrawFromStorage(
   ctx: RoutineContext,
   requested: Array<{ itemId: string; quantity: number }>,
@@ -884,11 +902,25 @@ async function bulkWithdrawFromStorage(
 
   const before = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
 
-  const resp = await bot.exec("storage", {
-    action: "withdraw",
-    source: storageType,
-    items: valid.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
-  });
+  // The server caps a single bulk request at BULK_MAX_ITEMS item entries. Sending
+  // more (e.g. all 228 source item types at once) fails the ENTIRE batch with
+  // invalid_payload, moving nothing. Chunk into smaller requests so each succeeds.
+  const chunks = chunkBulkItems(valid);
+  let lastErr: string | undefined;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "withdraw",
+      source: storageType,
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (resp.error) {
+      // A whole-chunk failure (e.g. cargo already full, station service issue).
+      // Record it and keep going through the other chunks; whatever landed is
+      // counted from the cargo diff below.
+      lastErr = resp.error.message;
+      ctx.log("warn", `Bulk withdraw chunk failed: ${resp.error.message} — diffing cargo for partial moves`);
+    }
+  }
 
   await bot.refreshCargo();
   if (storageType === 'faction') {
@@ -897,11 +929,8 @@ async function bulkWithdrawFromStorage(
     await bot.refreshStorage();
   }
 
-  if (resp.error) {
-    // A whole-batch failure (e.g. cargo already full, station service issue).
-    // Return whatever the cargo diff shows landed; the caller re-checks space
-    // and falls back to per-item withdrawal for anything still pending.
-    ctx.log("warn", `Bulk withdraw failed: ${resp.error.message} — diffing cargo for partial moves`);
+  if (lastErr && moved.size === 0) {
+    ctx.log("warn", `Bulk withdraw failed: ${lastErr}`);
   }
 
   const after = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
@@ -956,11 +985,21 @@ async function bulkDepositToDestination(
     for (const i of bot.storage) before.set(i.itemId, i.quantity);
   }
 
-  const resp = await bot.exec("storage", {
-    action: "deposit",
-    target: storageType,
-    items: valid.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
-  });
+  // The server caps a single bulk request at BULK_MAX_ITEMS item entries. Chunk
+  // so each request succeeds instead of the whole deposit being rejected.
+  const chunks = chunkBulkItems(valid);
+  let lastErr: string | undefined;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "deposit",
+      target: storageType,
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (resp.error) {
+      lastErr = resp.error.message;
+      ctx.log("warn", `Bulk deposit chunk failed: ${resp.error.message} — counted ${deposited.size} item type(s) via storage diff`);
+    }
+  }
 
   // Server-side storage reads can lag a tick; pause briefly then refresh so the
   // before/after diff sees the deposit.
@@ -981,8 +1020,8 @@ async function bulkDepositToDestination(
     }
   }
 
-  if (resp.error) {
-    ctx.log("warn", `Bulk deposit failed: ${resp.error.message} — counted ${deposited.size} item type(s) via storage diff`);
+  if (lastErr && deposited.size === 0) {
+    ctx.log("warn", `Bulk deposit failed: ${lastErr}`);
   }
   return deposited;
 }
@@ -1555,6 +1594,12 @@ async function runBulkMovePhase(
 
   for (let pass = 0; pass < 6 && bot.state === "running"; pass++) {
     await bot.refreshCargo();
+    // Refresh the SOURCE faction storage ONCE per pass (not per-item) so we know
+    // what is still available to load. Doing this inside the per-item loop below
+    // previously issued one live API call per item per pass — with hundreds of
+    // item types that saturated the client and triggered the "live refresh
+    // returned only N total qty vs already held — keeping prior holdings" spam.
+    await bot.refreshFactionStorage(false, settings.sourceStation);
     const cargoUsed = cargoUsedFromInventory(bot);
     const freeSpace = Math.max(0, cargoMax - cargoUsed);
     if (freeSpace <= 0) break;
@@ -1567,7 +1612,6 @@ async function runBulkMovePhase(
       const itemSize = getItemSize(p.itemId);
       const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
       if (maxFit <= 0) continue;
-      await bot.refreshFactionStorage(false, settings.sourceStation);
       const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
       const loadQty = Math.min(maxFit, inStorage, p.quantity);
       if (loadQty > 0) batch.push({ itemId: p.itemId, quantity: loadQty });

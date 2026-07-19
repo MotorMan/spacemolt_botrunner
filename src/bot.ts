@@ -69,6 +69,11 @@ export interface BotStatus {
   skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
   factionFuelReserve?: number;
   factionFuelCapacity?: number;
+  /** Home station's OWN base fuel (base.fuel), captured when a bot is at the configured home POI. */
+  homeBaseFuel?: number;
+  homeBaseMaxFuel?: number;
+  /** Hex POI id the homeBaseFuel was last captured for. */
+  homeBaseFuelPoi?: string;
   faction: string | null;
   isCloaked: boolean;
   /**
@@ -186,6 +191,16 @@ docked = false;
 
   /** Cached faction fuel capacity from last view_faction_storage. */
   factionFuelCapacity: number = 0;
+
+  /**
+   * Base fuel of the configured global home station (settings.general.factionStorageStation),
+   * captured from get_poi/get_base results when a bot is physically at that POI.
+   * This is the station's own fuel reserve (base.fuel), distinct from faction storage fuel.
+   */
+  homeBaseFuel: number = 0;
+  homeBaseMaxFuel: number = 0;
+  /** Hex POI id the homeBaseFuel was last captured for (to avoid stale cross-station hits). */
+  homeBaseFuelPoi: string = "";
 
   /** Whether the bot's ship is currently cloaked. */
   isCloaked = false;
@@ -1318,6 +1333,49 @@ docked = false;
             const factionName = factionFromResponse || factionFromCache || this.faction;
             if (factionName) {
               updateFactionStorageCache(factionName, [], station, fuelReserve, fuelCapacity);
+            }
+          }
+          // Capture the home station's OWN base fuel (base.fuel / base.max_fuel) whenever
+          // this get_poi result is for the configured global home station. Bots run
+          // get_poi constantly on entering/docking at a POI, so a bot at the home base
+          // will refresh this frequently. We match on the POI id or base id.
+          const homeStationId =
+            ((loadSettings().general as Record<string, unknown>)?.factionStorageStation as string) || "";
+          if (homeStationId) {
+            const poiId = (result.poi as Record<string, unknown>)?.id as string || "";
+            const baseObj = (result.base as Record<string, unknown>) || {};
+            const baseId =
+              (baseObj.id as string) ||
+              (baseObj.poi_id as string) ||
+              "";
+            if (poiId === homeStationId || baseId === homeStationId) {
+              const baseFuel = (baseObj.fuel as number) || 0;
+              const baseMaxFuel = (baseObj.max_fuel as number) || 0;
+              if (baseFuel > 0 || baseMaxFuel > 0) {
+                this.homeBaseFuel = baseFuel;
+                this.homeBaseMaxFuel = baseMaxFuel;
+                this.homeBaseFuelPoi = homeStationId;
+              }
+            }
+          }
+        }
+
+        // get_base (with a base_id) returns the home station's own fuel directly.
+        if (command === "get_base" && !resp.error && resp.result) {
+          const baseObj = (resp.result as Record<string, unknown>).base as Record<string, unknown> || (resp.result as Record<string, unknown>);
+          const baseId =
+            (baseObj.id as string) ||
+            (baseObj.poi_id as string) ||
+            "";
+          const homeStationId =
+            ((loadSettings().general as Record<string, unknown>)?.factionStorageStation as string) || "";
+          if (homeStationId && baseId === homeStationId) {
+            const baseFuel = (baseObj.fuel as number) || 0;
+            const baseMaxFuel = (baseObj.max_fuel as number) || 0;
+            if (baseFuel > 0 || baseMaxFuel > 0) {
+              this.homeBaseFuel = baseFuel;
+              this.homeBaseMaxFuel = baseMaxFuel;
+              this.homeBaseFuelPoi = homeStationId;
             }
           }
         }
@@ -4029,6 +4087,9 @@ if (this.craftQueueTracker && jobId && recipeId) {
       skills: this.getSkillsSnapshot(),
       factionFuelReserve: this.factionFuelReserve,
       factionFuelCapacity: this.factionFuelCapacity,
+      homeBaseFuel: this.homeBaseFuel,
+      homeBaseMaxFuel: this.homeBaseMaxFuel,
+      homeBaseFuelPoi: this.homeBaseFuelPoi,
       faction: this.faction,
       isCloaked: this.isCloaked,
       hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,

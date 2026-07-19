@@ -1491,6 +1491,14 @@ async function runBulkMovePhase(
     if (!await dockAtStation(ctx)) { await ctx.sleep(30000); return; }
   }
 
+  // Bail out promptly if a stop was requested while we were travelling/docking.
+  // Without this the phase would run its full load+deliver chain before the
+  // cycle-level stop check could run, making stop feel unresponsive.
+  if (bot.shouldStopAfterCycle() || bot.state !== "running") {
+    ctx.log("cargo", "🛑 Bulk move: stop requested — aborting phase early after returning to source");
+    return;
+  }
+
   // ── Maintenance at source ─────────────────────────────────
   await tryRefuel(ctx);
   await repairShip(ctx);
@@ -2002,6 +2010,29 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // instead of the hand-picked items list. Runs each cycle and returns here
     // to loop, so seed mode naturally progresses pass-by-pass.
     if (settings.enableBulkMove) {
+      // Honor a stop request before starting a new bulk phase. When bulk mode is
+      // on the shared graceful-shutdown block below is skipped, so without this
+      // check the routine would keep launching fresh bulk phases and ignore the
+      // stop signal until one phase happened to finish — making it look like the
+      // bot was ignoring "stop". Deliver anything already aboard first, then stop.
+      if (bot.shouldStopAfterCycle()) {
+        const gSettings = getCargoMoverSettings(bot.username);
+        ctx.log("cargo", "🛑 Stop requested during bulk move — delivering cargo aboard, then stopping...");
+        logCargoActivity(bot.username, "graceful_stop", "Graceful shutdown requested (bulk move)", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        await bot.refreshCargo();
+        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && !isPackageItem(i.itemId))) {
+          await deliverCargoAboard(ctx, gSettings);
+        }
+        for (const item of gSettings.items) {
+          releaseQuantityLock(bot.username, item.itemId, "stopped");
+        }
+        bot.clearStopAfterCycle();
+        ctx.log("cargo", "🛑 Graceful shutdown — stopped after bulk move");
+        bot.initiateStop();
+        return;
+      }
       yield "bulk_move";
       await runBulkMovePhase(ctx, settings, safetyOpts, warnedNoCloak);
       continue;

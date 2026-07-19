@@ -183,6 +183,13 @@ docked = false;
   /** Cached faction storage items from last view_faction_storage. */
   factionStorage: CargoItem[] = [];
 
+  /** Which station the `factionStorage` cache currently represents (the resolved
+   *  station id of the last successful read). Faction storage is PER-STATION, so
+   *  a read of a *different* station must always replace the cache — even if the
+   *  new read carries far less quantity. Only a read of the SAME station may be
+   *  rejected as a degraded (partial) payload. */
+  factionStorageStation: string | null = null;
+
   /** Cached faction ID from last get_status (null if not in a faction). */
   faction: string | null = null;
 
@@ -2292,20 +2299,34 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       // re-smelt them — which then fails on aluminum_ore and holds the whole
       // chain. Only accept the live result when it carries a comparable or
       // larger amount of stock than what we already had; otherwise keep the
-      // prior holdings. We compare total quantity (not item-type count) so a
-      // genuine, large spend-down of existing holdings is still accepted, while
-      // a clearly broken read (18 items vs thousands) is rejected.
       const priorCount = this.factionStorage.length;
       const sumQty = (xs: { quantity: number }[]) => xs.reduce((n, x) => n + (x.quantity || 0), 0);
       const priorQty = priorCount > 0 ? sumQty(this.factionStorage) : 0;
       const liveQty = sumQty(entries);
-      const looksDegraded = priorQty > 0 && liveQty < priorQty * 0.5;
+
+      // Only treat a read as "degraded" when it is a re-read of the SAME station
+      // that we already cached. Faction storage is per-station; a small read is
+      // completely legitimate when it's a DIFFERENT (e.g. the cargo mover's real
+      // source) station whose holdings genuinely differ from the previously cached
+      // station. The old blanket `liveQty < priorQty * 0.5` guard kept the wrong
+      // (large) station's holdings forever and made the bot believe phantom stock
+      // was "already held" — so it planned against items that didn't exist at the
+      // station it was actually docked at. Now a read of a new station always
+      // replaces the cache; only a same-station read that suddenly collapses is
+      // rejected as a partial/transient payload.
+      const sameStation = this.factionStorageStation !== null &&
+        stationIdParam !== undefined &&
+        this.factionStorageStation === stationIdParam;
+      const looksDegraded = sameStation && priorQty > 0 && liveQty < priorQty * 0.5;
+
       if (entries.length > 0 && !looksDegraded) {
         this.factionStorage = entries;
-      } else if (priorCount > 0) {
-        this.log("warn", `Faction storage live refresh returned only ${liveQty} total qty vs ${priorQty} already held - keeping prior holdings to avoid undercounting`);
+        this.factionStorageStation = stationIdParam ?? null;
+      } else if (priorCount > 0 && looksDegraded) {
+        this.log("warn", `Faction storage live refresh (${stationIdParam ?? "current station"}) returned only ${liveQty} total qty vs ${priorQty} already held at this station - keeping prior holdings to avoid undercounting`);
       } else {
         this.factionStorage = entries;
+        this.factionStorageStation = stationIdParam ?? null;
       }
       this.factionFuelReserve = (result?.faction_fuel_reserve as number) || 0;
       this.factionFuelCapacity = (result?.faction_fuel_capacity as number) || 0;

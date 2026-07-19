@@ -902,23 +902,44 @@ async function bulkWithdrawFromStorage(
 
   const before = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
 
-  // The server caps a single bulk request at BULK_MAX_ITEMS item entries. Sending
-  // more (e.g. all 228 source item types at once) fails the ENTIRE batch with
-  // invalid_payload, moving nothing. Chunk into smaller requests so each succeeds.
-  const chunks = chunkBulkItems(valid);
+  // IMPORTANT: the unified `storage` command has NO direct faction→cargo move.
+  //  - `withdraw` with `source:"faction", target:"self"` moves faction →
+  //    STATION (personal) storage, NOT into the cargo hold.
+  //  - `withdraw_items` pulls STATION storage → cargo.
+  // So to load from faction storage we must do BOTH steps (exactly like the
+  // working per-item `withdrawFromStorage` path): faction→station first, then
+  // station→cargo. For personal storage there is only the station→cargo step.
+  // Each bulk request is chunked to <= BULK_MAX_ITEMS items so the server
+  // never rejects it with "Too many items in one bulk request".
   let lastErr: string | undefined;
+
+  if (storageType === 'faction') {
+    const chunks = chunkBulkItems(valid);
+    for (const chunk of chunks) {
+      const resp = await bot.exec("storage", {
+        action: "deposit",
+        target: "self",
+        source: "faction",
+        items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+      });
+      if (resp.error) {
+        lastErr = resp.error.message;
+        ctx.log("warn", `Bulk faction→station failed: ${resp.error.message} — will still attempt station→cargo for anything that moved`);
+      }
+    }
+    // Give the station-storage write a beat to settle before pulling it into cargo.
+    await sleep(300);
+  }
+
+  // Station storage → cargo (the real "load into hold" step for both sources).
+  const chunks = chunkBulkItems(valid);
   for (const chunk of chunks) {
-    const resp = await bot.exec("storage", {
-      action: "withdraw",
-      source: storageType,
+    const resp = await bot.exec("withdraw_items", {
       items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
     });
     if (resp.error) {
-      // A whole-chunk failure (e.g. cargo already full, station service issue).
-      // Record it and keep going through the other chunks; whatever landed is
-      // counted from the cargo diff below.
-      lastErr = resp.error.message;
-      ctx.log("warn", `Bulk withdraw chunk failed: ${resp.error.message} — diffing cargo for partial moves`);
+      lastErr = lastErr ?? resp.error.message;
+      ctx.log("warn", `Bulk station→cargo failed: ${resp.error.message} — diffing cargo for partial moves`);
     }
   }
 

@@ -877,6 +877,13 @@ async function depositToDestination(
  *  request: N (max 100)`). Any batch we send must be chunked to stay under it. */
 const BULK_MAX_ITEMS = 100;
 
+/** Pause after a bulk storage transfer so the server's read cache (faction +
+ *  station storage) settles before we refresh and diff. The load loop and the
+ *  cleanup step both read storage immediately after a write; without this the
+ *  stale pre-write snapshot makes us believe items "disappeared" (and leave
+ *  them stranded in station storage). */
+const BULK_SETTLE_MS = 2000;
+
 /** Split a list of item requests into chunks no larger than `BULK_MAX_ITEMS`
  *  so the unified `storage` command never rejects the whole batch for being
  *  too large. Returns the original list wrapped in a single chunk when it is
@@ -888,6 +895,49 @@ function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
     chunks.push(items.slice(i, i + BULK_MAX_ITEMS));
   }
   return chunks;
+}
+
+/** Push everything currently sitting in the bot's STATION (personal) storage
+ *  back into the SOURCE faction storage in one or more bulk actions. This is the
+ *  cleanup safety net for the two-step faction→station→cargo load: any items
+ *  that got moved out of faction storage into station storage but NOT yet into
+ *  cargo (hold filled, interruption, a rejected stack) are returned to faction
+ *  so nothing is ever stranded in personal storage. The unified `storage`
+ *  command moves all entries in a chunk even if one item fails, so a partial
+ *  failure still recovers the rest. Returns the number of item types moved. */
+async function bulkStationToFaction(
+  ctx: RoutineContext,
+  excludeFuel = true,
+): Promise<number> {
+  const { bot } = ctx;
+  await bot.refreshStorage();
+  const candidates = bot.storage.filter((i) => {
+    if (i.quantity <= 0) return false;
+    if (excludeFuel) {
+      const lower = i.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+    }
+    if (isPackageItem(i.itemId)) return false;
+    return true;
+  });
+  if (candidates.length === 0) return 0;
+
+  const chunks = chunkBulkItems(candidates.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
+  let movedTypes = 0;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "deposit",
+      target: "faction",
+      source: "storage",
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (!resp.error) movedTypes += chunk.length;
+    else ctx.log("warn", `Bulk station→faction failed: ${resp.error.message} — will retry remaining chunks`);
+  }
+  await sleep(BULK_SETTLE_MS);
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+  return movedTypes;
 }
 
 async function bulkWithdrawFromStorage(
@@ -928,7 +978,7 @@ async function bulkWithdrawFromStorage(
       }
     }
     // Give the station-storage write a beat to settle before pulling it into cargo.
-    await sleep(300);
+    await sleep(BULK_SETTLE_MS);
   }
 
   // Station storage → cargo (the real "load into hold" step for both sources).
@@ -943,9 +993,13 @@ async function bulkWithdrawFromStorage(
     }
   }
 
+  // Settle, then refresh with live (cache-bypass) reads so the cargo diff below
+  // measures the TRUE result of the transfer and we never lose track of what was
+  // actually withdrawn (which would otherwise strand items in station storage).
+  await sleep(BULK_SETTLE_MS);
   await bot.refreshCargo();
   if (storageType === 'faction') {
-    await bot.refreshFactionStorage(false, undefined, true);
+    await bot.refreshFactionStorage(true, undefined, true);
   } else {
     await bot.refreshStorage();
   }
@@ -1022,11 +1076,11 @@ async function bulkDepositToDestination(
     }
   }
 
-  // Server-side storage reads can lag a tick; pause briefly then refresh so the
-  // before/after diff sees the deposit.
-  await sleep(1000);
+  // Server-side storage reads can lag a tick; settle briefly then refresh with
+  // a live (cache-bypass) read so the before/after diff sees the real deposit.
+  await sleep(BULK_SETTLE_MS);
   if (storageType === "faction") {
-    await bot.refreshFactionStorage(false, undefined, true);
+    await bot.refreshFactionStorage(true, undefined, true);
     for (const i of bot.factionStorage) {
       const b = before.get(i.itemId) || 0;
       const delta = i.quantity - b;
@@ -1520,6 +1574,20 @@ async function runBulkMovePhase(
     return;
   }
 
+  // ── Recover any orphaned station-storage items back to faction ───────
+  // The two-step load (faction→station→cargo) can leave items stranded in the
+  // bot's personal/station storage if a previous pass was interrupted (hold
+  // filled, crash, stop, battle). Push them back to faction BEFORE we plan/load
+  // so they're counted correctly and never lost in personal storage.
+  try {
+    const recovered = await bulkStationToFaction(ctx, true);
+    if (recovered > 0) {
+      ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction before loading`);
+    }
+  } catch (e) {
+    ctx.log("warn", `Station→faction recovery before load failed: ${e instanceof Error ? e.message : e}`);
+  }
+
   // ── Maintenance at source ─────────────────────────────────
   await tryRefuel(ctx);
   await repairShip(ctx);
@@ -1706,6 +1774,20 @@ async function runBulkMovePhase(
       settings.destinationBotName,
     );
     ctx.log("cargo", `📦 Bulk move delivered ${deposited.size} item type(s) to destination in one action`);
+  }
+
+  // ── Recover any orphaned station-storage items back to faction ───────
+  // After delivering cargo, whatever the two-step load left behind in station
+  // storage (hold filled mid-batch, a rejected stack) must return to faction so
+  // it is never stranded in personal storage. We are docked at the SOURCE
+  // station here, so this deposits into the source's faction storage.
+  try {
+    const recovered = await bulkStationToFaction(ctx, true);
+    if (recovered > 0) {
+      ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction after delivery`);
+    }
+  } catch (e) {
+    ctx.log("warn", `Station→faction recovery after delivery failed: ${e instanceof Error ? e.message : e}`);
   }
 
   await tryRefuel(ctx);
@@ -1943,6 +2025,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           continue;
         }
         await deliverCargoAboard(ctx, gSettings);
+        // Recover anything stranded in station storage back to faction so it is
+        // never left behind in personal storage when we shut down.
+        try {
+          const recovered = await bulkStationToFaction(ctx, true);
+          if (recovered > 0) {
+            ctx.log("cargo", `🧹 Graceful shutdown: recovered ${recovered} station-storage item type(s) to faction`);
+          }
+        } catch (e) {
+          ctx.log("warn", `Graceful shutdown station→faction recovery failed: ${e instanceof Error ? e.message : e}`);
+        }
         await tryRefuel(ctx);
       }
 

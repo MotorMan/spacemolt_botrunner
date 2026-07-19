@@ -9735,6 +9735,28 @@
           }
 
           if (isStorageCommand && result.ok) {
+            // The storage command RESPONSE already carries the full post-action
+            // cargo hold, so apply it immediately for an instant cargo-viewer
+            // update — no need to wait on the follow-up get_cargo round-trip.
+            // (Personal/faction storage lists are NOT in the response, so those
+            // still need the fetches below.)
+            if (result.data && Array.isArray(result.data.cargo)) {
+              const bot = bots.find((b) => b.username === profileBot);
+              if (bot) {
+                const respCargo = result.data.cargo.map((item) => ({
+                  itemId: item.item_id || item.itemId,
+                  name:
+                    item.name ||
+                    item.item_name ||
+                    catalogName(item.item_id || item.itemId),
+                  quantity: item.quantity,
+                }));
+                bot.inventory = respCargo;
+                _pendingFreshCargo = respCargo;
+                renderProfileSidebar();
+                renderManualControls(true);
+              }
+            }
             // After commands that modify storage, refresh all data from server then update UI
             const getFreshBot = () =>
               bots.find((b) => b.username === profileBot);

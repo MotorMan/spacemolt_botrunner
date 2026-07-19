@@ -131,6 +131,28 @@ const BOT_COLORS = [
 ];
 const RESET = "\x1b[0m";
 
+/**
+ * Commands whose response carries the full post-action cargo hold (and updated
+ * ship cargo used/capacity + credits). After any of these succeeds we adopt the
+ * returned `cargo` array straight into `this.inventory` so the cargo viewer is
+ * current the instant the command responds — no follow-up get_cargo needed —
+ * and fire the immediate-UI-push hook. These are the item-moving storage/market
+ * commands the cargo mover fires in bursts. `storage` is the unified v2 command
+ * (deposit/withdraw/loot/jettison via payload.action).
+ */
+const CARGO_AFFECTING_COMMANDS = new Set<string>([
+  "storage",
+  "deposit_items",
+  "withdraw_items",
+  "faction_deposit_items",
+  "faction_withdraw_items",
+  "send_gift",
+  "loot_wreck",
+  "jettison",
+  "buy",
+  "sell",
+]);
+
 let colorIndex = 0;
 
 export class Bot {
@@ -200,6 +222,21 @@ docked = false;
    * botmanager; bot.ts never calls it directly.
    */
   onDocked?: () => void;
+
+  /**
+   * Optional callback fired (fire-and-forget) whenever this bot's cached cargo,
+   * personal storage, or faction storage changes as a direct result of a
+   * command response (deposit/withdraw/gift/buy/sell/etc.), so the dashboard can
+   * push an IMMEDIATE status broadcast instead of waiting for the next periodic
+   * (~2s) refresh tick. This is what keeps the cargo/storage viewers "peppy"
+   * during a cargo-mover run that fires many storage commands in quick
+   * succession. Set by the botmanager; bot.ts only invokes it.
+   */
+  onStateChanged?: () => void;
+
+  /** Throttle timer for onStateChanged so a burst of storage commands coalesces
+   *  into a small number of broadcasts instead of one per command. */
+  private _stateChangedTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Cached faction fuel reserve from last view_faction_storage. */
   factionFuelReserve: number = 0;
@@ -1511,6 +1548,16 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           }
         }
 
+        // Storage / cargo-moving commands return the FULL post-action cargo hold
+        // (plus ship cargo used/capacity + credits). Apply it directly so the
+        // cargo viewer updates the instant the command responds — with no extra
+        // get_cargo round-trip — and fire the UI hook for an immediate dashboard
+        // push. This is what makes item moves feel "peppy" during a cargo-mover
+        // run that fires many storage commands in a row.
+        if (!resp.error && resp.result && CARGO_AFFECTING_COMMANDS.has(command)) {
+          this.syncCargoFromResponse(resp.result);
+        }
+
         if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
           this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
           this.logPosition();
@@ -2012,6 +2059,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
+    this.notifyStateChanged();
   }
 
   /** Fetch station storage contents and cache them. Pass station_id to check remotely. */
@@ -2024,6 +2072,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
+    this.notifyStateChanged();
   }
 
   /**
@@ -2351,6 +2400,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       updateFactionStorageCache(factionName, entries, cacheKey, this.factionFuelReserve, this.factionFuelCapacity);
       this.log("info", `Refreshed faction storage${label}: ${entries.length} items${forceLive ? " (live)" : ""}`);
     }
+    this.notifyStateChanged();
   }
 
   // ── Realtime market push handling ─────────────────────────
@@ -4095,6 +4145,74 @@ if (this.craftQueueTracker && jobId && recipeId) {
   }
 
   /** Get a summary of the bot's current state. */
+  /**
+   * Fire the `onStateChanged` UI hook, throttled. A cargo-mover run issues many
+   * storage commands back-to-back; coalescing to at most one broadcast every
+   * ~150ms keeps the dashboard snappy without flooding it with redundant
+   * whole-fleet status pushes.
+   */
+  notifyStateChanged(): void {
+    if (!this.onStateChanged) return;
+    if (this._stateChangedTimer) return;
+    this._stateChangedTimer = setTimeout(() => {
+      this._stateChangedTimer = null;
+      try {
+        this.onStateChanged?.();
+      } catch {
+        // never let a UI push break command flow
+      }
+    }, 150);
+  }
+
+  /**
+   * Update the cached cargo hold (and derived cargo used/max + credits) directly
+   * from a command response that carries the post-action state, then fire the
+   * UI hook so the dashboard reflects the move immediately.
+   *
+   * The v2 `storage` deposit/withdraw responses (and the legacy
+   * deposit_items/withdraw_items/faction_deposit_items paths) return the FULL
+   * updated `cargo` array plus `ship.cargo_used`/`cargo_capacity` after the
+   * transfer, so we can refresh the cargo viewer with ZERO extra network calls —
+   * no waiting on a follow-up get_cargo tick. Returns true if it found a cargo
+   * array to apply.
+   */
+  private syncCargoFromResponse(result: unknown): boolean {
+    if (!result || typeof result !== "object") return false;
+    let r = result as Record<string, unknown>;
+    if (r.data && typeof r.data === "object") r = r.data as Record<string, unknown>;
+    if (r.structuredContent && typeof r.structuredContent === "object") {
+      r = r.structuredContent as Record<string, unknown>;
+    }
+
+    let applied = false;
+
+    // Full post-action cargo hold — the authoritative new inventory.
+    if (Array.isArray(r.cargo)) {
+      this.inventory = this.parseItemList(r, "cargo");
+      applied = true;
+    }
+
+    // Ship block carries the exact cargo used/capacity after the move.
+    const ship = (r.ship as Record<string, unknown>) || {};
+    if (typeof ship.cargo_used === "number") this.cargo = ship.cargo_used;
+    if (typeof ship.cargo_capacity === "number") this.cargoMax = ship.cargo_capacity;
+
+    // `details` fallbacks (cargo_remaining/cargo_total) when no ship block.
+    const details = (r.details as Record<string, unknown>) || {};
+    if (ship.cargo_used === undefined) {
+      const used = (details.cargo_used as number) ?? (details.cargo_total as number);
+      if (typeof used === "number") this.cargo = used;
+    }
+
+    // Keep credits fresh (faction credit withdraws / gifts return player.credits).
+    const player = (r.player as Record<string, unknown>) || {};
+    const creditsValue = (player.credits as number) ?? (r.credits as number);
+    if (typeof creditsValue === "number") this.credits = creditsValue;
+
+    if (applied) this.notifyStateChanged();
+    return applied;
+  }
+
   status(): BotStatus {
     return {
       username: this.username,

@@ -556,6 +556,7 @@ function addOwnedAccountAsBot(account: Account): void {
     existing.unsubscribeEvents();
     existing.subscribeEvents();
     existing.onDocked = () => void maybeAutoPrepayTax(existing, "dock");
+    existing.onStateChanged = () => refreshStatusTable();
     server.logSystem(`Reconnected owned account: ${id}`);
     initBot(existing, account);
     flushEarlyLogin(id);
@@ -566,6 +567,7 @@ function addOwnedAccountAsBot(account: Account): void {
   setupBotLogging(bot);
   bot.subscribeEvents();
   bot.onDocked = () => void maybeAutoPrepayTax(bot, "dock");
+  bot.onStateChanged = () => refreshStatusTable();
   bots.set(id, bot);
   server.logSystem(`Connected owned account: ${id}`);
 

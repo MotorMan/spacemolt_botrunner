@@ -555,6 +555,7 @@ function addOwnedAccountAsBot(account: Account): void {
     existing.instrumentSend();
     existing.unsubscribeEvents();
     existing.subscribeEvents();
+    existing.onDocked = () => void maybeAutoPrepayTax(existing, "dock");
     server.logSystem(`Reconnected owned account: ${id}`);
     initBot(existing, account);
     flushEarlyLogin(id);
@@ -564,6 +565,7 @@ function addOwnedAccountAsBot(account: Account): void {
   const bot = new Bot(id, BASE_DIR, account);
   setupBotLogging(bot);
   bot.subscribeEvents();
+  bot.onDocked = () => void maybeAutoPrepayTax(bot, "dock");
   bots.set(id, bot);
   server.logSystem(`Connected owned account: ${id}`);
 
@@ -1647,6 +1649,48 @@ function scheduleAutoRestart(botName: string, errorMsg: string): void {
   }, backoff);
 }
 
+/**
+ * If tax auto-prepay is enabled (settings.general.tax.autoPrepayOnStartup) and
+ * the bot is currently docked, top up its personal tax-prepayment pool to cover
+ * the current estimated bill. Only the shortfall over what is already prepaid is
+ * ever sent, so re-running can never stack a huge over-payment on a small bill.
+ * Pulls from faction storage only when the wallet can't cover the shortfall and
+ * the operator left useFactionStorage enabled.
+ *
+ * Fire-and-forget safe: never throws. Used on bot startup, routine start, and
+ * the daily recheck so a docked bot always has its pool topped up regardless of
+ * when/why it came online.
+ */
+async function maybeAutoPrepayTax(bot: Bot, label: string): Promise<void> {
+  const generalSettings = (server.settings as Record<string, unknown>).general as Record<string, unknown> | undefined;
+  const taxSettings = (generalSettings?.tax as Record<string, unknown> | undefined) || {};
+  if (!taxSettings.autoPrepayOnStartup) return;
+  if (!bot.docked) return;
+
+  // Make sure docked/credit state is fresh before deciding.
+  try {
+    await bot.refreshStatus();
+  } catch {
+    /* best-effort */
+  }
+  if (!bot.docked) return;
+
+  const maxPrepayRaw = typeof taxSettings.autoPrepayMax === "number" ? taxSettings.autoPrepayMax : 0;
+  // 0 means "no cap" in the UI — map it back to Infinity.
+  const maxPrepay = maxPrepayRaw > 0 ? maxPrepayRaw : Infinity;
+  try {
+    const prepaid = await bot.prepayTaxShortfall({
+      maxPrepay,
+      useFactionStorage: taxSettings.autoPrepayUseFactionStorage !== false,
+    });
+    if (prepaid > 0) {
+      server.logSystem(`[${label}] Auto-prepaid ${prepaid}cr of tax for ${bot.username}`);
+    }
+  } catch (err) {
+    server.logSystem(`[${label}] Tax auto-prepay failed for ${bot.username}: ${err}`);
+  }
+}
+
 export async function handleStart(action: WebAction): Promise<WebActionResult> {
   const botName = action.bot;
   if (!botName) return { ok: false, error: "No bot specified" };
@@ -1699,6 +1743,14 @@ export async function handleStart(action: WebAction): Promise<WebActionResult> {
 
   saveLastUsedRoutine(botName, routineKey);
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
+
+  // Top up this bot's personal tax-prepayment pool on routine start (idempotent:
+  // only the shortfall over what is already prepaid is sent). Gated by the
+  // tax.autoPrepayOnStartup setting and requires the bot be docked (so it can
+  // pull from faction storage if the wallet is short). Non-blocking on the
+  // routine launch — fire-and-forget so a slow/failed prepay never delays the
+  // routine itself.
+  void maybeAutoPrepayTax(bot, "routine-start").then(() => refreshStatusTable());
 
   // Store routine parameters on bot object if provided (for manual_rescue etc.)
   if (action.params) {
@@ -2448,29 +2500,6 @@ async function main(): Promise<void> {
           server.logSystem(`Tax collection failed for ${name}: ${err}`);
         }
 
-        // Optional: on startup, top up each bot's personal tax-prepayment pool
-        // to cover its current estimated bill. Only the shortfall over what is
-        // already prepaid is sent, and only for docked bots (so we can pull from
-        // faction storage if the wallet is short). Gated by
-        // settings.general.tax.autoPrepayOnStartup — never runs unless enabled,
-        // so a misconfig can't drain faction credits.
-        const generalSettings = (settings as Record<string, unknown>).general as Record<string, unknown> | undefined;
-        const taxSettings = (generalSettings?.tax as Record<string, unknown> | undefined) || {};
-        if (taxSettings.autoPrepayOnStartup && bot.docked) {
-          try {
-            const maxPrepay = typeof taxSettings.autoPrepayMax === "number" ? taxSettings.autoPrepayMax : Infinity;
-            const prepaid = await bot.prepayTaxShortfall({
-              maxPrepay,
-              useFactionStorage: taxSettings.autoPrepayUseFactionStorage !== false,
-            });
-            if (prepaid > 0) {
-              server.logSystem(`Auto-prepaid ${prepaid}cr of tax for ${name}`);
-            }
-          } catch (err) {
-            server.logSystem(`Tax auto-prepay failed for ${name}: ${err}`);
-          }
-        }
-
         const routineKey = getLastUsedRoutine(name) || assignments[name];
         if (!routineKey || !ROUTINES[routineKey]) {
           server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
@@ -2625,7 +2654,7 @@ async function main(): Promise<void> {
 
   // Daily tax auto-prepay recheck: for docked, running bots, top up each bot's
   // personal tax-prepayment pool to cover its current estimated bill. Because
-  // prepayTaxShortfall only sends the shortfall over what is already prepaid,
+  // maybeAutoPrepayTax only sends the shortfall over what is already prepaid,
   // re-running daily can never stack a huge over-payment on a small bill — the
   // escrowed credits only refund after Sunday's assessment. Gated by
   // settings.general.tax.autoPrepayOnStartup so it never drains faction credits
@@ -2636,19 +2665,8 @@ async function main(): Promise<void> {
     intervals.push(setInterval(async () => {
       try {
         for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-          if (!bot.docked || bot.state !== "running" || !bot.isConnected()) continue;
-          const maxPrepay = typeof taxSettingsDaily.autoPrepayMax === "number" ? taxSettingsDaily.autoPrepayMax : Infinity;
-          const prepaid = await bot.prepayTaxShortfall({
-            maxPrepay,
-            useFactionStorage: taxSettingsDaily.autoPrepayUseFactionStorage !== false,
-          }).catch((err) => {
-            server.logSystem(`Daily tax auto-prepay failed for ${name}: ${err}`);
-            return 0;
-          });
-          if (prepaid > 0) {
-            server.logSystem(`Daily auto-prepaid ${prepaid}cr of tax for ${name}`);
-            refreshStatusTable();
-          }
+          if (bot.state !== "running" || !bot.isConnected()) continue;
+          await maybeAutoPrepayTax(bot, "daily");
         }
       } catch (err) {
         console.error("Error in daily tax prepay recheck:", err);

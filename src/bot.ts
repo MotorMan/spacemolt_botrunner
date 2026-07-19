@@ -193,6 +193,14 @@ docked = false;
   /** Cached faction ID from last get_status (null if not in a faction). */
   faction: string | null = null;
 
+  /**
+   * Optional callback fired (fire-and-forget) the moment this bot transitions
+   * from undocked to docked, as detected by `applyStatusResult`. Used to trigger
+   * dock-time housekeeping (e.g. tax prepay) without polling. Set by the
+   * botmanager; bot.ts never calls it directly.
+   */
+  onDocked?: () => void;
+
   /** Cached faction fuel reserve from last view_faction_storage. */
   factionFuelReserve: number = 0;
 
@@ -1636,6 +1644,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     const player = r.player as Record<string, unknown> | undefined;
     const p = location || player || r;
 
+    const wasDocked = this.docked;
     this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
     this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
     this.docked = location?.docked_at != null
@@ -1643,6 +1652,9 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       : (p.docked_at_base != null
         ? !!(p.docked_at_base)
         : (p.docked as boolean) ?? (p.status === "docked"));
+    if (!wasDocked && this.docked) {
+      try { this.onDocked?.(); } catch { /* hook errors must never break status parsing */ }
+    }
     this.location =
       (location?.system_name as string) ||
       (location?.system_id as string) ||

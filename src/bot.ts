@@ -2166,6 +2166,12 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     }
 
     this.log("system", `Tax prepay: sent ${toPrepay}cr (owed=${owed}, prepaid was=${alreadyPrepaid}, shortfall=${shortfall})`);
+
+    // Re-fetch the live estimate so the new tax_prepaid balance is persisted to
+    // data/taxes.json (the Refresh button only reads that file). Without this the
+    // web UI would keep showing the stale pre-prepay balance until the next
+    // scheduled estimate refresh.
+    await this.updateTaxEstimate();
     return toPrepay;
   }
 

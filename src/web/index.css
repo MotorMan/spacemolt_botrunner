@@ -295,6 +295,18 @@ table.bot-table tbody td:nth-child(8) {
 .bot-card-name-text .ews-warning-dot,
 .grid-bot-name .ews-warning-dot { margin-left: 4px; }
 
+/* Anchor (⚓) indicator appended to bot names when docked at a station */
+.docked-indicator {
+  color: var(--blue, #38bdf8);
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+}
+.bot-card-name-text .docked-indicator,
+.grid-bot-name .docked-indicator { margin-left: 4px; }
+
 .state-badge {
   display: inline-block;
   font-size: 11px;

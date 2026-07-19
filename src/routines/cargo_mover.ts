@@ -898,13 +898,16 @@ function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
 }
 
 /** Push everything currently sitting in the bot's STATION (personal) storage
- *  back into the SOURCE faction storage in one or more bulk actions. This is the
- *  cleanup safety net for the two-step faction→station→cargo load: any items
- *  that got moved out of faction storage into station storage but NOT yet into
- *  cargo (hold filled, interruption, a rejected stack) are returned to faction
- *  so nothing is ever stranded in personal storage. The unified `storage`
- *  command moves all entries in a chunk even if one item fails, so a partial
- *  failure still recovers the rest. Returns the number of item types moved. */
+ *  back into the SOURCE faction storage, so it is never stranded in personal
+ *  storage. This is the cleanup safety net for the two-step faction→station→
+ *  cargo load: any items that got moved out of faction storage into station
+ *  storage but NOT yet into cargo (hold filled, interruption, a rejected stack)
+ *  are returned to faction.
+ *
+ *  Uses the proven per-item `faction_deposit_items` command (the same one the
+ *  rest of the routine uses for station→faction) rather than the bulk `storage`
+ *  variant, which was observed failing silently and leaving items stranded.
+ *  Returns the number of item types moved. */
 async function bulkStationToFaction(
   ctx: RoutineContext,
   excludeFuel = true,
@@ -922,17 +925,11 @@ async function bulkStationToFaction(
   });
   if (candidates.length === 0) return 0;
 
-  const chunks = chunkBulkItems(candidates.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
   let movedTypes = 0;
-  for (const chunk of chunks) {
-    const resp = await bot.exec("storage", {
-      action: "deposit",
-      target: "faction",
-      source: "storage",
-      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
-    });
-    if (!resp.error) movedTypes += chunk.length;
-    else ctx.log("warn", `Bulk station→faction failed: ${resp.error.message} — will retry remaining chunks`);
+  for (const item of candidates) {
+    const resp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+    if (!resp.error) movedTypes++;
+    else ctx.log("warn", `Station→faction failed for ${item.itemId}: ${resp.error.message}`);
   }
   await sleep(BULK_SETTLE_MS);
   await bot.refreshFactionStorage(false, undefined, true);
@@ -1013,6 +1010,23 @@ async function bulkWithdrawFromStorage(
     const delta = (after.get(id) || 0) - (before.get(id) || 0);
     if (delta > 0) moved.set(id, delta);
   }
+
+  // Anything we moved faction→station that did NOT make it into cargo (hold
+  // filled, a rejected stack) is now stranded in station storage. Return it to
+  // faction immediately so it is never left in personal storage and other cargo
+  // movers can still reach it. (The whole-routine cleanup also runs, but doing
+  // it here keeps station storage empty after every single load attempt.)
+  if (storageType === 'faction' && moved.size < valid.length) {
+    try {
+      const recovered = await bulkStationToFaction(ctx, true);
+      if (recovered > 0) {
+        ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) left in station storage back to faction`);
+      }
+    } catch (e) {
+      ctx.log("warn", `Station→faction recovery after load failed: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+
   return moved;
 }
 
@@ -1703,15 +1717,28 @@ async function runBulkMovePhase(
 
     // Package IDs are excluded from `planned` (blocked entirely) and resolve to
     // the fixed PACKAGE_CARGO_SIZE, so no inspect/network call is ever needed.
+    //
+    // CRITICAL: allocate the hold GREEDILY across items so the TOTAL weight moved
+    // this pass never exceeds freeSpace. The previous code computed `maxFit =
+    // freeSpace / itemSize` PER ITEM, so every item was allocated the entire
+    // hold — the sum across 28 items was ~28x the hold, and the faction→station
+    // step shoved all of it into station storage while cargo only absorbed one
+    // load's worth. The rest piled up in personal station storage every cycle.
+    // Now we subtract each item's weight from a running `remaining` budget so we
+    // only ever request what actually fits.
+    let remaining = freeSpace;
     const batch: Array<{ itemId: string; quantity: number }> = [];
     for (const p of planned) {
       if (p.quantity <= 0) continue;
-      const itemSize = getItemSize(p.itemId);
-      const maxFit = Math.floor(freeSpace / Math.max(1, itemSize));
+      const itemSize = Math.max(1, getItemSize(p.itemId));
+      const maxFit = Math.floor(remaining / itemSize);
       if (maxFit <= 0) continue;
       const inStorage = bot.factionStorage.find((i) => i.itemId === p.itemId)?.quantity || 0;
       const loadQty = Math.min(maxFit, inStorage, p.quantity);
-      if (loadQty > 0) batch.push({ itemId: p.itemId, quantity: loadQty });
+      if (loadQty > 0) {
+        batch.push({ itemId: p.itemId, quantity: loadQty });
+        remaining -= loadQty * itemSize;
+      }
     }
 
     if (batch.length === 0) break;

@@ -8243,6 +8243,10 @@
         const storage = bot.storage || [];
 
         const items = [];
+        // station→cargo must use the dedicated `withdraw_items` command (the only
+        // way to pull STATION storage into the cargo hold). The unified `storage`
+        // command has no station→cargo move (see cargo_mover.bulkWithdrawFromStorage).
+        let command = "storage";
 
         if (mode === "cargo_to_station") {
           // Deposit all items from cargo to station storage
@@ -8290,8 +8294,9 @@
             }
           }
         } else if (mode === "station_to_cargo") {
-          // Withdraw all items from station storage to cargo
-          // Command: storage action=withdraw target=<player> item_id=X quantity=Y source=storage
+          // Withdraw all items from station storage to cargo.
+          // Command: withdraw_items (station storage → cargo hold).
+          command = "withdraw_items";
           for (const item of storage) {
             const itemId = item.itemId || item.item_id;
             const qty = item.quantity || item.count || 1;
@@ -8301,6 +8306,7 @@
                 quantity: qty,
                 source: "storage",
                 action: "withdraw",
+                command: "withdraw_items",
               });
             }
           }
@@ -8339,7 +8345,7 @@
           }
         }
 
-        return { mode, items, index: 0 };
+        return { mode, command, items, index: 0 };
       }
 
       /** Update the queue status display */
@@ -8381,14 +8387,21 @@
        *  `items` array in ONE tick, so we only need to set the action /
        *  source / target once per chunk. */
       function mcBulkStorageParams(items) {
-        // All queued items in a single mode share the same action/source/target.
         const first = items[0];
+        // station→cargo (and any mode flagged command:"withdraw_items") must use the
+        // dedicated withdraw_items command — the only path that pulls STATION storage
+        // into the cargo hold. The unified `storage` command has no station→cargo
+        // move and rejects it with invalid_source (see cargo_mover.bulkWithdrawFromStorage).
+        if (first.command === "withdraw_items") {
+          return { items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })) };
+        }
+        // All queued items in a single mode share the same action/source/target.
         const params = {
           action: first.action === "withdraw" ? "withdraw" : "deposit",
           items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })),
         };
         if (first.action === "withdraw") {
-          // station→cargo uses source 'storage'; faction→cargo uses 'faction'.
+          // Remaining withdraw mode is faction→cargo: source 'faction' only.
           params.source = first.source === "faction" ? "faction" : "storage";
           params.target = "self";
         } else {
@@ -8534,7 +8547,8 @@
 
         const params = mcBulkStorageParams(remaining);
         const moveMode = depositAllQueue.mode;
-        sendExec(profileBot, "storage", params, (result) => {
+        const moveCommand = depositAllQueue.command || "storage";
+        sendExec(profileBot, moveCommand, params, (result) => {
           if (result.ok) {
             logResponse(`<span class="resp-ok">OK</span>`);
           } else {
@@ -8681,11 +8695,12 @@
           }
           const chunk = queue.items.slice(idx, idx + BULK_MAX_ITEMS);
           const params = mcBulkStorageParams(chunk);
+          const moveCommand = queue.command || "storage";
           const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
           logResponse(
             `<span class="resp-cmd">${ts} > ${botName}: bulk ${idx + 1}-${idx + chunk.length}/${queue.items.length}</span>`,
           );
-          sendExec(botName, "storage", params, (result) => {
+          sendExec(botName, moveCommand, params, (result) => {
             if (!result.ok) {
               logResponse(
                 `<span class="resp-err">${botName}: failed: ${esc(result.error || "unknown")}</span>`,
@@ -8706,22 +8721,22 @@
        *  (used by the fleet-wide bulk move where each bot has its own data). */
       function mcBuildDepositQueueFor(mode, cargo, storage, factionItems) {
         const items = [];
-        const push = (list, source, target, action) => {
+        const push = (list, source, target, action, command) => {
           for (const item of list) {
             const itemId = item.itemId || item.item_id;
             const qty = item.quantity || item.count || 1;
             if (qty > 0 && itemId) {
-              items.push({ item_id: itemId, quantity: qty, source, target, action });
+              items.push({ item_id: itemId, quantity: qty, source, target, action, command });
             }
           }
         };
         if (mode === "cargo_to_station") push(cargo, "cargo", "self", "deposit");
         else if (mode === "cargo_to_faction") push(cargo, "cargo", "faction", "deposit");
         else if (mode === "station_to_faction") push(storage, "storage", "faction", "deposit");
-        else if (mode === "station_to_cargo") push(storage, "storage", "self", "withdraw");
+        else if (mode === "station_to_cargo") push(storage, "storage", "self", "withdraw", "withdraw_items");
         else if (mode === "faction_to_station") push(factionItems, "faction", "self", "deposit");
         else if (mode === "faction_to_cargo") push(factionItems, "faction", "self", "withdraw");
-        return { mode, items, index: 0 };
+        return { mode, command: (mode === "station_to_cargo" ? "withdraw_items" : "storage"), items, index: 0 };
       }
 
       /** Stop the deposit all queue */

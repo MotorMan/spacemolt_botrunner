@@ -2319,6 +2319,24 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 // If a raid somehow forced us undocked, we just fight normally and re-dock after.
 
 /**
+ * Dock at the CURRENT station POI without traveling. Station protection keeps
+ * the bot at one station, so we must NOT call the generic `ensureDocked` (which
+ * will travel between a station's multiple POIs and cause a dock/undock
+ * flip-flop). Just issue a plain dock where we already are.
+ */
+async function dockAtStation(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.docked) return true;
+  const resp = await bot.exec("dock");
+  if (!resp.error || (resp.error?.message || "").toLowerCase().includes("already")) {
+    bot.docked = true;
+    return true;
+  }
+  ctx.log("warn", `Dock at current station failed: ${resp.error?.message}`);
+  return false;
+}
+
+/**
  * Run a full hunter combat engagement against whatever battle is happening at
  * the station. Mirrors what the other hunter modes do when pulled into a fight:
  * analyze, engage the side, then fight until the battle ends.
@@ -2375,13 +2393,8 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
 
   ctx.log("info", "Station Protection mode: docking at station as a visual deterrent, uncloaked, awaiting attacks (battle push notifications only).");
 
-  // Ensure we're docked at the station.
-  if (!bot.docked) {
-    const homed = await ensureDocked(ctx);
-    if (!homed) {
-      ctx.log("error", "Could not dock at station — will retry next cycle");
-    }
-  }
+  // Ensure we're docked at the station (without traveling between POIs).
+  await dockAtStation(ctx);
 
   // Initial docked housekeeping + make sure we are NOT cloaked (visual deterrent).
   if (bot.docked) {
@@ -2414,7 +2427,7 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
       await stationProtectionFight(ctx, s);
       // After the fight, return to the station and resume waiting.
       ctx.log("info", "Station defense complete — returning to dock to resume protection.");
-      const redocked = await ensureDocked(ctx);
+      const redocked = await dockAtStation(ctx);
       if (redocked) {
         if (bot.isCloaked) {
           const uncloakResp = await bot.exec("cloak", { enable: false });
@@ -2465,14 +2478,17 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
       }
       lastMaintenance = Date.now();
     } else if (!bot.docked) {
-      // We got undocked somehow (e.g. raid yanked us out). If there's a battle,
-      // fight it; otherwise just re-dock and keep waiting.
-      ctx.log("info", "No longer docked during station protection — re-docking.");
-      await ensureDocked(ctx);
+      // We got undocked somehow (e.g. raid yanked us out). Re-dock at the
+      // CURRENT station POI — do NOT travel between POIs (that causes a
+      // dock/undock flip-flop on stations with multiple POIs).
+      ctx.log("info", "No longer docked during station protection — re-docking at current station.");
+      await dockAtStation(ctx);
       if (bot.isCloaked) {
         const uncloakResp = await bot.exec("cloak", { enable: false });
         if (!uncloakResp.error) await bot.refreshLocation();
       }
+      // Brief pause so a failed re-dock doesn't spin instantly.
+      await ctx.sleep(3000);
     }
 
     // Idle: do nothing but wait. The library's battle push will flip

@@ -1669,10 +1669,9 @@ async function runBulkMovePhase(
   try {
     await bot.refreshFactionStorage(false, settings.destinationStation);
     const destItems = bot.factionStorage;
-    ctx.log("cargo", `🔎 Destination faction storage (${settings.destinationStation}) has ${destItems.length} item type(s):`);
-    for (const d of destItems.slice().sort((a, b) => (a.name || a.itemId).localeCompare(b.name || b.itemId))) {
+    ctx.log("cargo", `🔎 Destination faction storage (${settings.destinationStation}) has ${destItems.length} item type(s)`);
+    for (const d of destItems) {
       if (d.quantity > 0) destHas.add(d.itemId);
-      ctx.log("cargo", `     - ${d.name || d.itemId}: ${d.quantity}`);
     }
     // Restore the SOURCE station storage into cache for the load step below.
     await bot.refreshFactionStorage(false, settings.sourceStation);
@@ -1707,9 +1706,6 @@ async function runBulkMovePhase(
   }
 
   ctx.log("cargo", `📋 Bulk move plan: ${planned.length} item type(s)${settings.bulkSeedMode ? ` (seeding ${settings.bulkSeedAmount} each)` : ""}`);
-  for (const p of planned) {
-    ctx.log("cargo", `     - ${p.itemName}: ${p.quantity}`);
-  }
 
   // ── Load as much as fits into cargo ───────────────────────
   // Pull every planned item from faction storage into cargo in ONE batch action

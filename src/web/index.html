@@ -22365,6 +22365,20 @@ When responding:
                     const canManage = !factionService;
                     const upgradeInfo = factionFacilityUpgrades[facId];
                     const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
+                    // Infrastructure / service / defense facilities are station
+                    // facilities that cannot be made public, priced, or transferred
+                    // to a player — hide those controls for them (rename stays).
+                    const facCat = (fac.category || "").toLowerCase();
+                    const restricted =
+                      stationFacilityCategories.includes(facCat) ||
+                      (() => {
+                        const cd = resolveStationCatalog(fac);
+                        return cd
+                          ? stationFacilityCategories.includes(
+                              (cd.category || "").toLowerCase(),
+                            ) || !!cd.player_station_buildable
+                          : false;
+                      })();
                     if (!(facId in factionFacilityPublic)) {
                       if (fac.production && typeof fac.production.public === "boolean")
                         factionFacilityPublic[facId] = fac.production.public;
@@ -22396,15 +22410,16 @@ When responding:
               ${canManage ? `
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)"></span>
-                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>
-                <span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>
+                ${restricted ? "" : `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityAccess('${esc(username)}','${esc(facId)}','${isPublic ? "private" : "public"}')">${isPublic ? "Make Private" : "Make Public"}</button>`}
+                ${restricted ? `<span style="font-size:11px;color:var(--text-dim)">Private</span>` : `<span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>`}
                 <button class="sm" style="font-size:10px;padding:2px 6px" title="Rename facility" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">✏️</button>
               </div>
+              ${restricted ? "" : `
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <span style="font-size:11px;color:var(--text-dim)">PPR:</span>
                 <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
                 <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
-              </div>
+              </div>`}
               ${(factionFacilityRenameOpen[facId]) ? `
               <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
                 <input type="text" id="ff-rename-${esc(facId)}" value="${esc(fac.custom_name || name)}" placeholder="New facility name (3-32)" style="flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:11px" />
@@ -22412,7 +22427,7 @@ When responding:
                 <button class="sm" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">×</button>
               </div>` : ""}` : ``}
               <div style="display:flex;gap:4px;margin-left:auto">
-                ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
+                ${canTransfer && !restricted ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
                 ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
                </div>

@@ -3124,20 +3124,41 @@ getSkillLevel(skillId: string): number {
    * This works even when HTTP requests are hanging (524 timeouts).
    * @returns true if in battle, false otherwise
    */
+  /**
+   * Authoritatively clear our cached battle state. Called when the spacemolt-lib
+   * push channel tells us the battle is over (battle_ended) or we have left it
+   * (battle_left). This is the source of truth for "we are no longer in battle"
+   * and must immediately override any stale cached flag, otherwise the bot keeps
+   * believing it is in battle (from an old WebSocket update) and refuses to move.
+   */
+  clearBattleState(reason: string): void {
+    if (this.currentBattle.inBattle || this.currentBattle.battleId) {
+      debugLogForBot(this.username, "bot:battle", `${this.username} clearing battle state (${reason}). Was battle ${this.currentBattle.battleId}`);
+    }
+    this.currentBattle.inBattle = false;
+    this.currentBattle.battleId = null;
+    this.currentBattle.participants = [];
+    this.currentBattle.lastUpdate = Date.now();
+  }
+
+  /**
+   * Check if we're currently in battle based on the battle state maintained from
+   * spacemolt-lib push events (battle_update / battle_damage set it; battle_ended
+   * / battle_left clear it). The 120s staleness guard is a last-resort safety net
+   * for the rare case where an end/left event is missed entirely — it must never
+   * be the primary mechanism, or the bot gets stuck locked out of movement.
+   */
   isInBattle(): boolean {
-    // Check if we're in battle and the last update was recent (within 120 seconds)
     if (!this.currentBattle.inBattle) return false;
-    
+
     const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
     // Use 120 second timeout instead of 60 to be more lenient during HTTP errors
     if (timeSinceUpdate > 120000) {
-      // Battle state is stale - clear it
-      this.currentBattle.inBattle = false;
-      this.currentBattle.battleId = null;
-      this.currentBattle.participants = [];
+      // Battle state is stale and no end/left event ever arrived - clear it
+      this.clearBattleState("stale-timeout");
       return false;
     }
-    
+
     return true;
   }
 
@@ -3409,7 +3430,20 @@ getSkillLevel(skillId: string): number {
 
       // ── BATTLE STATE TRACKING: Update global battle state from WebSocket notifications ──
       // This allows battle detection even when HTTP requests are hanging (524 timeouts)
-      if (msgType === "battle_update" && data && typeof data === "object") {
+      if (msgType === "battle_started" && data && typeof data === "object") {
+        // Authoritative lib signal that a battle we're in has begun. Set the flag
+        // immediately (battle_update may not have arrived yet).
+        const battleId = (data.battle_id as string) || "";
+        if (battleId) {
+          this.currentBattle.inBattle = true;
+          this.currentBattle.battleId = battleId;
+          this.currentBattle.lastUpdate = Date.now();
+          this.currentBattle.participants = Array.isArray(data.participants)
+            ? (data.participants as Array<Record<string, unknown>>)
+            : this.currentBattle.participants;
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle_started: ${battleId}`);
+        }
+       } else if (msgType === "battle_update" && data && typeof data === "object") {
         const battleId = (data.battle_id as string) || "";
         const tick = (data.tick as number) || 0;
         const participants = Array.isArray(data.participants) ? data.participants : [];
@@ -3422,6 +3456,25 @@ getSkillLevel(skillId: string): number {
           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
 
           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+        }
+       } else if (msgType === "battle_ended" && data && typeof data === "object") {
+        // Authoritative lib signal: the battle is over for everyone. Clear our
+        // battle flag immediately so isInBattle() stops reporting a stale
+        // "still in battle" long after the fight actually ended.
+        const endedBattleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+        if (!this.currentBattle.battleId || this.currentBattle.battleId === endedBattleId) {
+          this.clearBattleState(`battle_ended (${endedBattleId})`);
+        }
+       } else if (msgType === "battle_left" && data && typeof data === "object") {
+        // Authoritative lib signal: a participant left the battle. If WE left,
+        // clear our battle flag. We match on player_id/username since a side can
+        // still be fighting after we disengage.
+        const leftId = (data.player_id as string) || "";
+        const leftName = (data.username as string) || "";
+        const isUs = leftName === this.username ||
+          (!leftId && !leftName); // Civilian/bot self-leave notifications omit ids
+        if (isUs) {
+          this.clearBattleState(`battle_left (${leftName || leftId || "us"})`);
         }
        } else if (msgType === "battle_damage" && data && typeof data === "object") {
          // Battle damage also indicates we're in battle

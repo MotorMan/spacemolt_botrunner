@@ -793,6 +793,18 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
   const { bot } = ctx;
   await bot.refreshLocation();
 
+  // ── COMBAT GUARD: While in battle, dock/jump/refuel are all rejected by the
+  // server with `in_battle`. Resolving the fight is the only thing that matters;
+  // fuel is irrelevant until we're free. Flee first, then attempt recovery. ──
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", "Emergency fuel recovery interrupted by battle — fleeing first (in battle, fuel does not matter!)");
+    await checkAndFleeFromBattle(ctx, "emergencyFuelRecovery");
+    if (ctx.bot.isInBattle()) {
+      ctx.log("combat", "Still in battle after flee attempt — cannot recover fuel now");
+      return false;
+    }
+  }
+
   ctx.log("error", "EMERGENCY: Fuel target not met — attempting recovery...");
 
   // First: scavenge nearby wrecks/containers for fuel cells
@@ -1539,8 +1551,26 @@ export async function ensureFueled(
   opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
+
+  // ── COMBAT GUARD: In a battle, fuel is irrelevant — it's life or death.
+  // Every refuel/dock/jump/travel command is rejected by the server with
+  // `in_battle`, so attempting to fuel while fighting just deadlocks the bot
+  // forever (it keeps "navigating to refuel" and every command fails). Resolve
+  // the battle FIRST, then come back for fuel. ───────────────────────────────
   await bot.refreshShip();
   await bot.refreshLocation();
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", "Fuel check interrupted by battle — resolving combat before fueling (in battle, fuel does not matter!)");
+    const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
+    if (fled || !ctx.bot.isInBattle()) {
+      // Battle resolved (or was a stale flag) — re-evaluate fuel below.
+    } else {
+      // Still in battle and couldn't resolve it — bail so the caller can retry.
+      ctx.log("combat", "Still in battle after flee attempt — cannot fuel now, returning to caller");
+      return false;
+    }
+  }
+
   let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
@@ -4550,7 +4580,12 @@ export async function checkAndFleeFromBattle(
   ctx: RoutineContext,
   logPrefix?: string,
 ): Promise<boolean> {
-  // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call)
+  // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call, and
+  // works even when HTTP requests are hanging). This flag is now driven
+  // authoritatively by spacemolt-lib push events: battle_update / battle_damage
+  // set it, and battle_ended / battle_left immediately clear it (see
+  // Bot.handleNotifications), so it no longer lingers as a stale "still in
+  // battle" lock after the fight is actually over.
   if (ctx.bot.isInBattle()) {
     const prefix = logPrefix ? `[${logPrefix}] ` : "";
     ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);

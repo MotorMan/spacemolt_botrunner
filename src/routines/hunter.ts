@@ -38,6 +38,8 @@
  *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
  *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
  *   cloakOnStart    — stay cloaked until attack command, then re-cloak after battle (default: false)
+ *   meatShield      — enter/continue battles even with no weapons/ammo instead of aborting to resupply (default: false)
+ *   stopOnDeath     — stop the routine on death instead of respawning into a new hunt (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -224,6 +226,8 @@ function getHunterSettings(username?: string): {
   desiredEmergencyWarpDevices: number;
   pirateBaseSystem: string;
   patrolRadius: number;
+  meatShield: boolean;
+  stopOnDeath: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -276,6 +280,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
+    meatShield: (h.meatShield as boolean) ?? false,
+    stopOnDeath: (h.stopOnDeath as boolean) ?? false,
   };
 }
 
@@ -926,6 +932,48 @@ async function checkFactionAlerts(
   return null;
 }
 
+// ── Death handling ───────────────────────────────────────────
+//
+// Result of a death check at the top of a routine loop iteration:
+//   "ok"   — bot is alive, routine should continue
+//   "wait" — bot is dead but still recovering/unavailable; loop should sleep + continue
+//   "stop" — stopOnDeath is enabled; routine should return (stop) immediately
+type DeathHandleResult = "ok" | "wait" | "stop";
+
+/**
+ * Hunter death handling.
+ *
+ * By default the routine recovers from death (claim insurance, respawn, re-dock/
+ * repair) and keeps hunting from wherever it respawns. When `settings.stopOnDeath`
+ * is enabled we instead STOP the routine entirely — the ship stays where it
+ * respawned and the bot does not immediately start hunting from a random point.
+ */
+async function handleDeath(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<DeathHandleResult> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const dead = bot.hull <= 0 || bot.isDead;
+  if (!dead) return "ok";
+
+  if (settings.stopOnDeath) {
+    ctx.log(
+      "system",
+      "💀 Death detected and stopOnDeath is enabled — stopping hunter routine instead of respawning into a hunt.",
+    );
+    ctx.bot.stop();
+    return "stop";
+  }
+
+  const alive = await detectAndRecoverFromDeath(ctx);
+  if (!alive) {
+    await ctx.sleep(30000);
+    return "wait";
+  }
+  return "ok";
+}
+
 // ── Hunter routine ───────────────────────────────────────────
 
 export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -1027,10 +1075,11 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
   while (bot.state === "running") {
     // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
     const settings = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
@@ -1376,10 +1425,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
         // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-        if (!hasAmmo) {
+        if (!hasAmmo && !settings.meatShield) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
           break;
+        }
+        if (!hasAmmo) {
+          ctx.log("combat", "Meat-shield mode — no ammo but entering battle anyway");
         }
 
         yield "engage";
@@ -1604,10 +1656,11 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
   while (bot.state === "running") {
     // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
     const settings = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
@@ -1807,10 +1860,13 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
         // Pre-fight ammo check
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-        if (!hasAmmo) {
+        if (!hasAmmo && !settings.meatShield) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
           break;
+        }
+        if (!hasAmmo) {
+          ctx.log("combat", "Meat-shield mode — no ammo but entering battle anyway");
         }
 
         yield "engage";
@@ -2020,10 +2076,11 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
   while (bot.state === "running") {
     // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
     const settings = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
@@ -2165,7 +2222,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       // Pre-fight ammo check
       const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-      if (!hasAmmo) {
+      if (!hasAmmo && !settings.meatShield) {
         ctx.log("combat", "Out of ammo — aborting to resupply");
         break;
         }
@@ -2214,7 +2271,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-          if (!hasAmmo) {
+          if (!hasAmmo && !settings.meatShield) {
             ctx.log("combat", "No ammo after kill — aborting to resupply");
             break;
           }
@@ -2344,10 +2401,10 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
 
   while (bot.state === "running") {
     // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
     const s = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, s);
+    if (death === "stop") return;
+    if (death === "wait") continue;
 
     // ── Instant battle detection via lib push events ──
     // bot.isInBattle() is set by the library the moment a battle push arrives
@@ -2436,6 +2493,10 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const patrolList = settings.patrolSystems || [];
     if (patrolList.length === 0) {
       ctx.log("error", "patrol_systems mode but no patrolSystems configured — falling back to roam_systems");
@@ -2819,6 +2880,10 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
   let profileIndex = initialProfileIndex;
 
   while (bot.state === "running") {
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const cycleMode = settings.patrolCycleMode || "sequential";
     let targetIndex: number;
 
@@ -2993,6 +3058,10 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
   while (bot.state === "running") {
     const currentSettings = getHunterSettings(bot.username);
+    const death = await handleDeath(ctx, currentSettings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
     const currentSafetyOpts = {
       fuelThresholdPct: currentSettings.refuelThreshold,
       hullThresholdPct: currentSettings.repairThreshold,

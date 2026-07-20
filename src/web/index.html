@@ -28133,6 +28133,8 @@ ignoreBlacklist: document.getElementById(
         const hunterHomeStation = h.homeStation || "";
         const ammoReloadAbsoluteThreshold = h.ammoReloadAbsoluteThreshold ?? 1;
         const ammoReloadPercentThreshold = h.ammoReloadPercentThreshold ?? 25;
+        const meatShield = h.meatShield ?? false;
+        const stopOnDeath = h.stopOnDeath ?? false;
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
         const tierOpts = tierOptions
@@ -28498,6 +28500,28 @@ ignoreBlacklist: document.getElementById(
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Meat-Shield Mode</div>
+        <div class="setting-hint">Enter and fight battles even when the ship has no weapons/ammo (instead of aborting to resupply). The bot acts as if it has weapons.</div>
+      </div>
+      <select id="set-hunter-meatShield">
+        <option value="false"${!meatShield ? " selected" : ""}>Disabled</option>
+        <option value="true"${meatShield ? " selected" : ""}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Stop Routine on Death</div>
+        <div class="setting-hint">When the bot dies, stop the hunter routine instead of respawning and immediately hunting from the respawn location.</div>
+      </div>
+      <select id="set-hunter-stopOnDeath">
+        <option value="false"${!stopOnDeath ? " selected" : ""}>Disabled</option>
+        <option value="true"${stopOnDeath ? " selected" : ""}>Enabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -28576,6 +28600,10 @@ ignoreBlacklist: document.getElementById(
             ) || 25,
           cloakOnStart:
             document.getElementById("set-hunter-cloakOnStart").value === "true",
+          meatShield:
+            document.getElementById("set-hunter-meatShield").value === "true",
+          stopOnDeath:
+            document.getElementById("set-hunter-stopOnDeath").value === "true",
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols
             : [],

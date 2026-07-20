@@ -2385,15 +2385,15 @@
               if (profileBot) mcInitRescueSystems();
               break;
             case "status":
-              // Only update bots array if we're not in the middle of refreshing storage
-              // (to avoid clobbering fresh data from our own fetches)
-              // Also check if we recently refreshed storage (within last 30 seconds to ensure fresh data is rendered)
-              const _storageRefreshTime = window._lastStorageRefresh || 0;
-              const _blockStatusUpdate =
-                window._refreshingStorage ||
-                Date.now() - _storageRefreshTime < 30000;
-              
-              // Preserve fresh cargo/storage data if available (from recent storage commands) BEFORE overwriting bots
+              // Apply the latest server snapshot, but only suppress the
+              // bots-array assignment while a storage fetch is actively in
+              // flight (a few hundred ms). The previous 30s suppression of ALL
+              // status-driven UI updates meant the top bar / state badge would
+              // not refresh (e.g. when a bot stopped) for up to 30s after any
+              // storage action. Fresh cargo/storage is still preserved below.
+              const _blockStatusUpdate = !!window._refreshingStorage;
+
+              // Preserve fresh cargo/storage data if available (from recent storage commands)
               // The status message may contain stale inventory/storage from bot.status()
               const freshCargo = _pendingFreshCargo;
               const freshStorage = _pendingFreshStorage;
@@ -2403,12 +2403,9 @@
                 bots = msg.bots || [];
               }
 
-              // Restore fresh data to the bot that matches the profile bot (for both blocked and unblocked status updates)
-              if (
-                profileBot &&
-                (_blockStatusUpdate || freshCargo || freshStorage || freshFactionStorage) &&
-                (freshCargo || freshStorage || freshFactionStorage)
-              ) {
+              // Restore fresh data to the bot that matches the profile bot (skip the
+              // stale inventory carried by the status message when we have fresher data)
+              if (profileBot && (freshCargo || freshStorage || freshFactionStorage)) {
                 const profileBotIndex = bots.findIndex(
                   (b) => b.username === profileBot,
                 );
@@ -2558,10 +2555,9 @@
                   }
                 }
               } else {
-                const _reason = window._refreshingStorage
-                  ? "refreshingStorage is true"
-                  : `recently refreshed (${(Date.now() - _storageRefreshTime) / 1000}s ago)`;
-                console.log(`[DEBUG] status handler: BLOCKED - ${_reason}`);
+                console.log(
+                  `[DEBUG] status handler: BLOCKED - refreshingStorage is true`,
+                );
               }
               break;
             case "log":
@@ -4398,6 +4394,11 @@
               window._profileActionsCloseTimeout = setTimeout(() => {
                 window._profileActionsOpen = false;
                 window._profileActionsCloseTimeout = null;
+                // Flush any renders that were deferred while the dropdown was open
+                if (window._deferredProfileSidebarRender) {
+                  window._deferredProfileSidebarRender = false;
+                  renderProfileSidebar();
+                }
               }, 200);
             }
           });
@@ -4577,7 +4578,7 @@
             ? prevProfileSel.value
             : lastUsedRoutines[bot.username] || bot.routine || "miner";
           actions = `
-      <select id="profile-routine" onchange="renderProfileSidebar()">
+      <select id="profile-routine" onchange="renderProfileSidebar(); renderManualControls(true);">
         ${routines.map((r) => `<option value="${esc(r)}"${r === prevProfileRoutine ? " selected" : ""}>${esc(r)}</option>`).join("")}
       </select>
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
@@ -5863,10 +5864,14 @@
           return;
         }
 
-        // Skip sidebar rebuild if a topbar dropdown is open
+        // Don't rebuild while a topbar dropdown is open (rebuilding would close
+        // the native <select>). Defer the render instead of dropping it so the
+        // update isn't lost (e.g. when the routine dropdown changes).
         if (window._profileActionsOpen) {
+          window._deferredProfileSidebarRender = true;
           return;
         }
+        window._deferredProfileSidebarRender = false;
 
         renderProfileTopbar();
 

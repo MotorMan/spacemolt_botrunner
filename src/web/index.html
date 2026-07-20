@@ -8394,6 +8394,113 @@
         return params;
       }
 
+      /**
+       * After a manual-control storage move finishes, refresh ONLY the views
+       * that actually changed so the page stays peppy — no more stale
+       * "still shows the old items" situation after a transfer.
+       *
+       * Per the manual-control design we intentionally do NOT refresh faction
+       * storage (the user only cares about the local station/cargo views here).
+       * The refresh fires on the relevant target/source of the move:
+       *
+       *   cargo_to_station   -> station storage + cargo
+       *   cargo_to_faction   -> cargo            (faction dest skipped)
+       *   station_to_faction -> station storage  (faction dest skipped)
+       *   station_to_cargo   -> station storage + cargo
+       *   faction_to_station -> station storage
+       *   faction_to_cargo   -> cargo            (faction source skipped)
+       *
+       * Works exactly like the mcExec storage refresh: it blocks stale status
+       * updates from clobbering the fresh data while the round-trips complete.
+       */
+      function mcRefreshAfterStorageMove(mode) {
+        if (!profileBot) return;
+        const bot = bots.find((b) => b.username === profileBot);
+        if (!bot) return;
+
+        const needCargo = [
+          "cargo_to_station",
+          "cargo_to_faction",
+          "station_to_cargo",
+          "faction_to_cargo",
+        ].includes(mode);
+        const needStation = [
+          "cargo_to_station",
+          "station_to_faction",
+          "station_to_cargo",
+          "faction_to_station",
+        ].includes(mode);
+
+        // Nothing to refresh for unknown modes.
+        if (!needCargo && !needStation) return;
+
+        // Block status updates from clobbering our fresh data.
+        window._refreshingStorage = true;
+        window._lastStorageRefresh = Date.now();
+
+        let pending = 0;
+        const done = () => {
+          renderProfileSidebar();
+          renderManualControls(true); // force render (don't block)
+          updateStorageDropdowns();
+          window._blockRenderUntil = Date.now() + 10000;
+          setTimeout(() => {
+            window._refreshingStorage = false;
+          }, 100);
+        };
+        const check = () => {
+          if (pending === 0) done();
+        };
+
+        if (needCargo) {
+          pending++;
+          sendExec(profileBot, "get_cargo", {}, (r) => {
+            if (r.ok && r.data) {
+              const cargo = (r.data.cargo || r.data.items || []).map(
+                (item) => ({
+                  itemId: item.item_id || item.itemId,
+                  name:
+                    item.name ||
+                    item.item_name ||
+                    catalogName(item.item_id || item.itemId),
+                  quantity: item.quantity,
+                }),
+              );
+              bot.inventory = cargo;
+              _pendingFreshCargo = cargo;
+            }
+            pending--;
+            check();
+          });
+        }
+
+        if (needStation) {
+          pending++;
+          sendExec(profileBot, "view_storage", {}, (r) => {
+            if (r.ok && r.data) {
+              const storage = (
+                r.data.items ||
+                r.data.storage ||
+                []
+              ).map((item) => ({
+                itemId: item.item_id || item.itemId,
+                name:
+                  item.name ||
+                  item.item_name ||
+                  catalogName(item.item_id || item.itemId),
+                quantity: item.quantity,
+              }));
+              bot.storage = storage;
+              _pendingFreshStorage = storage;
+            }
+            pending--;
+            check();
+          });
+        }
+
+        if (pending === 0) done();
+      }
+
       /** Process the queue in BULK: instead of one command per item per tick we
        *  send up to 100 items in a single `storage` command, advancing the
        *  whole chunk in one tick. This lets a full hold/station of mixed items
@@ -8421,6 +8528,7 @@
         );
 
         const params = mcBulkStorageParams(remaining);
+        const moveMode = depositAllQueue.mode;
         sendExec(profileBot, "storage", params, (result) => {
           if (result.ok) {
             logResponse(`<span class="resp-ok">OK</span>`);
@@ -8432,6 +8540,10 @@
 
           depositAllQueue.index += remaining.length;
           mcUpdateQueueStatus();
+
+          // Refresh the views that changed so the page updates as soon as this
+          // chunk finishes transferring (peppy). Faction storage is skipped.
+          mcRefreshAfterStorageMove(moveMode);
 
           // One chunk per tick.
           setTimeout(mcProcessDepositQueue, TICK_COOLDOWN_MS + 500);
@@ -8575,6 +8687,10 @@
               );
             }
             idx += chunk.length;
+            if (botName === profileBot) {
+              // Keep the open profile's storage/cargo views peppy.
+              mcRefreshAfterStorageMove(mode);
+            }
             setTimeout(step, TICK_COOLDOWN_MS + 500);
           });
         };
@@ -8723,6 +8839,9 @@
           loadoutWithdrawalRunning = false;
           loadoutWithdrawalQueue = null;
           mcUpdateLoadoutWithdrawalStatus();
+          // Items left faction storage and landed in station storage — refresh
+          // station storage (faction refresh intentionally skipped).
+          mcRefreshAfterStorageMove("station_to_faction");
           return;
         }
 
@@ -8936,6 +9055,8 @@
           giftSendAllRunning = false;
           giftSendAllQueue = null;
           mcUpdateGiftQueueStatus();
+          // Items left station storage — refresh it (faction refresh skipped).
+          mcRefreshAfterStorageMove("station_to_faction");
           return;
         }
 

@@ -1483,6 +1483,14 @@
         return catalog.facilities[id];
       }
 
+      // A facility is a "pure upgrade" of another if it declares an
+      // `upgrades_from` source. Those are upgraded in-place via the existing
+      // facility upgrade path, not built fresh from this list, so we hide them
+      // here to keep only genuinely buildable facilities visible.
+      function isStationBuildableBase(f) {
+        return !!f.player_station_buildable && !f.upgrades_from;
+      }
+
       const activityEl = document.getElementById("activityLog");
       const broadcastEl = document.getElementById("broadcastLog");
       const systemEl = document.getElementById("systemLog");
@@ -3555,7 +3563,7 @@
       };
 
       // ── Bulk Start Idle Bots ────────────────────────────────────
-      const BULK_START_DELAY_MS = 200; // small gap between bot starts to keep the UI responsive during bulk start/stop
+      const BULK_START_DELAY_MS = 10; // small gap between bot starts to keep the UI responsive during bulk start/stop
 
       /** Populate the bulk start routine dropdown */
       function updateBulkStartDropdown() {
@@ -20946,13 +20954,13 @@ When responding:
           : "";
 
         const buildableCount = Object.values(catalog.facilities || {}).filter(
-          (t) => t.player_station_buildable,
+          (t) => isStationBuildableBase(t),
         ).length;
         // Filter to the currently-selected category so a base-stats refresh
         // (auto or manual) doesn't revert the list to all categories mixed.
         // Sort by display name so the list order stays stable across renders.
         stationFacilityTypes = Object.values(catalog.facilities || {})
-          .filter((t) => t.player_station_buildable && t.category === stationFacilityCategory)
+          .filter((t) => isStationBuildableBase(t) && t.category === stationFacilityCategory)
           .sort((a, b) =>
             (a.name || a.facility_type || a.type || "?")
               .toLowerCase()
@@ -20965,7 +20973,7 @@ When responding:
           .map((c) => {
             const active = c === stationFacilityCategory;
             const cnt = Object.values(catalog.facilities || {}).filter(
-              (t) => t.player_station_buildable && t.category === c,
+              (t) => isStationBuildableBase(t) && t.category === c,
             ).length;
             return `<button class="sm" id="sf-cat-${c}" style="${active ? "background:var(--accent);color:#fff" : ""}" onclick="switchStationFacilityCategory('${c}','${esc(username)}')">${c.charAt(0).toUpperCase() + c.slice(1)} (${cnt})</button>`;
           })
@@ -21584,7 +21592,7 @@ When responding:
       function switchStationFacilityCategory(category, username) {
         stationFacilityCategory = category;
         stationFacilityTypes = Object.values(catalog.facilities || {})
-          .filter((t) => t.player_station_buildable && t.category === category)
+          .filter((t) => isStationBuildableBase(t) && t.category === category)
           .sort((a, b) =>
             (a.name || a.facility_type || a.type || "?")
               .toLowerCase()

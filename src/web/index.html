@@ -21815,6 +21815,43 @@ When responding:
             '<div class="faction-no-data">No station facilities at this station.</div>';
           return;
         }
+
+        // Fetch available upgrades so we can surface the per-round consumables
+        // of the resulting facility (so users don't blind-upgrade into a
+        // permanently offline facility they can't feed).
+        stationFacilityUpgrades = {};
+        sendExec(
+          username,
+          "facility",
+          { action: "upgrades" },
+          (upResult) => {
+            if (upResult.ok && upResult.data) {
+              const upData = upResult.data;
+              const allUpgrades = [
+                ...(Array.isArray(upData.upgrades) ? upData.upgrades : []),
+                ...(Array.isArray(upData.faction_upgrades)
+                  ? upData.faction_upgrades
+                  : []),
+              ];
+              allUpgrades.forEach((u) => {
+                const key = u.your_facility_id || u.facility_id;
+                if (key) stationFacilityUpgrades[key] = u;
+              });
+            }
+            renderStationFacilitiesList(username);
+          },
+        );
+      }
+
+      function renderStationFacilitiesList(username) {
+        const container = document.getElementById("stationFacilitiesList");
+        if (!container) return;
+        const facilities = stationFacilitiesData || [];
+        if (facilities.length === 0) {
+          container.innerHTML =
+            '<div class="faction-no-data">No station facilities at this station.</div>';
+          return;
+        }
         facilities.sort((a, b) =>
           (a.name || a.facility_type || a.type || "?")
             .toLowerCase()
@@ -21843,6 +21880,8 @@ When responding:
                   .join(", ") +
                 "</div>"
               : "";
+            const upgradeInfo = stationFacilityUpgrades[facId];
+            const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
             return `<div class="faction-card" id="sf-card-${esc(facId)}">
           <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
             <div>
@@ -21854,6 +21893,7 @@ When responding:
             </div>
             <div style="display:flex;gap:4px">
               <button class="sm" style="font-size:10px;padding:2px 6px" onclick="stationToggleFacility('${esc(username)}','${esc(facId)}')">${active ? "Disable" : "Enable"}</button>
+              ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showStationFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade</button>` : ""}
               <button class="sm" style="font-size:10px;padding:2px 6px" onclick="toggleStationFacilityRename('${esc(username)}','${esc(facId)}','${esc((fac.custom_name || name).replace(/'/g, "\\'"))}')">✏️</button>
             </div>
           </div>
@@ -21868,6 +21908,121 @@ When responding:
         </div>`;
           })
           .join("");
+      }
+
+      // ── Station facility upgrade details ──────────────────────────
+      // Lists the build materials AND, crucially, the per-round consumables
+      // (maintenance_inputs) of the resulting facility, so the user can see
+      // what they'll need to keep feeding the upgraded facility each tick.
+      function showStationFacilityUpgradeDetails(username, facilityId) {
+        const container = document.getElementById("stationFacilitiesList");
+        if (!container) return;
+
+        const upgradeInfo = stationFacilityUpgrades[facilityId];
+        if (!upgradeInfo || !upgradeInfo.upgrade_to) {
+          container.innerHTML =
+            '<div class="faction-no-data">No upgrade available for this facility.</div>';
+          return;
+        }
+
+        const up = upgradeInfo.upgrade_to;
+        const uName = up.name || up.facility_type || up.type || "?";
+        const uLevel = up.level ?? "";
+        const levelStr = uLevel ? ` Lv${uLevel}` : "";
+        const desc = up.description || up.desc || "";
+        const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+        const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
+        const mats = up.materials || up.requirements || up.build_materials || [];
+
+        let matsHtml = "";
+        if (Array.isArray(mats) && mats.length > 0) {
+          matsHtml =
+            '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials (one-time):</div>' +
+            mats
+              .map((m) => {
+                const mName = m.name || m.item_name || m.item_id || "?";
+                const mQty = m.quantity || m.count || m.amount || 1;
+                return `<div style="font-size:11px;padding:2px 0">• ${mQty}x ${esc(mName)}</div>`;
+              })
+              .join("");
+        } else if (
+          typeof mats === "object" &&
+          !Array.isArray(mats) &&
+          Object.keys(mats).length > 0
+        ) {
+          matsHtml =
+            '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials (one-time):</div>' +
+            Object.entries(mats)
+              .map(([k, v]) => `<div style="font-size:11px;padding:2px 0">• ${v}x ${esc(k)}</div>`)
+              .join("");
+        }
+
+        // Resolve the resulting facility's catalog definition to surface its
+        // per-round consumables (maintenance_inputs) — this is the data the
+        // user needs to avoid a permanently-offline facility.
+        const upgradeType = up.type_id || up.facility_type || up.type || "";
+        const targetCat = upgradeType ? getCatalogFacility(upgradeType) : null;
+        const maint = (targetCat && targetCat.maintenance_inputs) || [];
+        let maintHtml = "";
+        if (Array.isArray(maint) && maint.length > 0) {
+          maintHtml =
+            '<div style="font-size:11px;color:var(--cyan);margin-top:8px">Required Consumables / round (after upgrade):</div>' +
+            maint
+              .map((m) => {
+                const mName = m.name || m.item_id || "?";
+                const mQty = m.quantity || 1;
+                return `<div style="font-size:11px;padding:2px 0;color:var(--cyan)">• ${mQty}x ${esc(mName)}</div>`;
+              })
+              .join("");
+        }
+
+        const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">Upgrade to ${esc(uName)}${esc(levelStr)}</div>
+        </div>
+        <button class="sm" onclick="fetchStationFacilities('${esc(username)}')">Back to List</button>
+      </div>
+      ${desc ? `<div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>` : ""}
+      ${costStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Upgrade Cost: ${esc(costStr)}</div>` : ""}
+      ${matsHtml}
+      ${maintHtml}
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="upgradeStationFacility('${esc(username)}','${esc(facilityId)}','${esc(upgradeType)}')">Upgrade Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        Upgrading withdraws required materials and consumes the upgrade cost. The facility needs its per-round consumables or it will go offline.
+      </div>
+    </div>
+  `;
+
+        container.innerHTML = detailHtml;
+      }
+
+      function upgradeStationFacility(username, facilityId, upgradeType) {
+        const container = document.getElementById("stationFacilitiesList");
+        if (!container) return;
+        if (!upgradeType) {
+          appendLine("system", "No upgrade type ID");
+          return;
+        }
+        container.innerHTML =
+          '<div class="faction-no-data">Upgrading station facility...</div>';
+        sendExec(
+          username,
+          "facility",
+          { action: "upgrade", facility_id: facilityId, facility_type: upgradeType },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: ${result.data?.hint || "Station facility upgraded!"}`);
+              fetchStationFacilities(username);
+            } else {
+              appendLine("system", `Upgrade failed: ${result.error || "unknown"}`);
+              fetchStationFacilities(username);
+            }
+          },
+        );
       }
 
       function stationToggleFacility(username, facilityId) {
@@ -22926,6 +23081,7 @@ When responding:
       let stationStorageSort = "alpha";
       let stationTrackedPrev = {};       // itemId -> last qty for delta
       let stationFacilityRenameOpen = {}; // facId -> bool
+      let stationFacilityUpgrades = {};  // facId -> upgrades response entry
       let stationEconOpen = false;       // Station Economy & Taxes card expanded
       let stationTaxData = null;         // get_tax_estimate result (personal)
       let stationFactionTaxData = null;  // get_faction_tax_estimate result

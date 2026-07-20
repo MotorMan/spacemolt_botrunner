@@ -84,6 +84,13 @@ export interface BotStatus {
    */
   hasEmergencyWarpStabilizer: boolean | null;
   /**
+   * Outstanding bounties (in credits) keyed by faction name, parsed from
+   * get_status `player.standings[faction].outstanding_bounty`. Surfaced on the
+   * dashboard with a jail-bars indicator next to the bot name when non-empty.
+   * Empty object = no bounties / unknown.
+   */
+  bounties: Record<string, number>;
+  /**
    * Transient flag set only for bot cards that have been rehydrated from the
    * persisted active-bot snapshot at client startup — i.e. bots that were
    * active last run but have not yet reconnected this session. The dashboard
@@ -326,6 +333,8 @@ docked = false;
   hasPathfinderDrive = false;
   hasEmergencyWarpStabilizer: boolean | null = null;
   installedMods: string[] = [];
+  /** Outstanding bounties (credits) keyed by faction. Parsed in applyStatusResult. */
+  bounties: Record<string, number> = {};
   lastKnownTick?: number;
 
   /** Accumulated stats for this bot. */
@@ -1455,7 +1464,20 @@ if (command === "get_status") {
                this.location;
 
              this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
-             this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+    this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+
+    // Outstanding bounties: get_status puts per-faction standings on
+    // `player.standings[faction].outstanding_bounty`. Parse any > 0 into a map.
+    const standings = (player?.standings as Record<string, Record<string, unknown>> | undefined)
+      ?? (r.standings as Record<string, Record<string, unknown>> | undefined);
+    if (standings && typeof standings === "object") {
+      const parsed: Record<string, number> = {};
+      for (const [faction, data] of Object.entries(standings)) {
+        const amt = (data?.outstanding_bounty as number) ?? (data?.bounty as number) ?? 0;
+        if (amt > 0) parsed[faction] = amt;
+      }
+      this.bounties = parsed;
+    }
              if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
                this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
              }
@@ -4250,6 +4272,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       faction: this.faction,
       isCloaked: this.isCloaked,
       hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,
+      bounties: this.bounties,
     };
   }
 

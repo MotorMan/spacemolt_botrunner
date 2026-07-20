@@ -21065,6 +21065,9 @@ When responding:
         <span class="fsl">Armor</span><span class="fsv">${num(b.armor || 0)}</span>
         <span class="fsl">Weapon DPS</span><span class="fsv">${num(b.weapon_dps || 0)}</span>
         <span class="fsl">Weapon Reach</span><span class="fsv">${num(b.weapon_reach || 0)}</span>
+        ${renderStationLifeSupportRow(base)}
+        ${renderStationPowerRow(base)}
+        ${renderStationBatteryRow(base)}
         <span class="fsl">Condition</span><span class="fsv" style="color:${condColor}">${esc(cond.condition || "?")}</span>
         <span class="fsl">Satisfaction</span><span class="fsv">${pct}</span>
         <span class="fsl">Services Met</span><span class="fsv">${num(cond.satisfied_count || 0)}/${num(cond.total_service_infra || 0)}</span>
@@ -21081,6 +21084,39 @@ When responding:
       ${statsHtml}
       ${renderStationEconomyTaxes(f, username, docked)}
     </div>`;
+      }
+
+      function renderStationLifeSupportRow(base) {
+        const ls = base && base.life_support;
+        if (!ls) return "";
+        const supply = num(ls.supply != null ? ls.supply : "?");
+        const demand = num(ls.demand != null ? ls.demand : "?");
+        const usedPct = ls.supply ? Math.round((ls.demand / ls.supply) * 100) : 0;
+        const plants = ls.plants != null ? ls.plants : "?";
+        const free = ls.supply != null && ls.demand != null ? num(ls.supply - ls.demand) : "?";
+        const color = usedPct >= 100 ? "var(--red)" : usedPct >= 80 ? "var(--orange)" : "var(--green)";
+        return `<span class="fsl">Life Support</span><span class="fsv" style="color:${color}">${demand}/${supply} used (${usedPct}%) · ${plants} plant(s), ${free} free</span>`;
+      }
+
+      function renderStationPowerRow(base) {
+        const p = base && base.power;
+        if (!p) return "";
+        const supply = num(p.supply != null ? p.supply : "?");
+        const draw = num(p.current_draw != null ? p.current_draw : "?");
+        const eff = p.efficiency != null ? Math.round(p.efficiency * 100) : "?";
+        const usedPct = p.supply ? Math.round((p.current_draw / p.supply) * 100) : 0;
+        const color = usedPct >= 100 ? "var(--red)" : usedPct >= 80 ? "var(--orange)" : "var(--green)";
+        return `<span class="fsl">Power</span><span class="fsv" style="color:${color}">${draw}/${supply} used (${usedPct}%) · eff ${eff}%</span>`;
+      }
+
+      function renderStationBatteryRow(base) {
+        const p = base && base.power;
+        if (!p || p.battery_capacity == null) return "";
+        const cap = num(p.battery_capacity);
+        const stored = num(p.battery_stored != null ? p.battery_stored : 0);
+        const lvlPct = p.battery_capacity ? Math.round((p.battery_stored / p.battery_capacity) * 100) : 0;
+        const color = lvlPct <= 0 ? "var(--red)" : lvlPct < 20 ? "var(--orange)" : "var(--green)";
+        return `<span class="fsl">Battery</span><span class="fsv" style="color:${color}">${stored}/${cap} (${lvlPct}%)</span>`;
       }
 
       function toggleStationRename(username) {

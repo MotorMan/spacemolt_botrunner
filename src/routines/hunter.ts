@@ -175,7 +175,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection";
 
 export type PatrolCycleMode = "random" | "sequential";
 
@@ -1006,6 +1006,10 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "patrol_radius") {
     yield* patrolRadiusRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "station_protection") {
+    yield* stationProtectionRoutine(ctx);
     return;
   }
 
@@ -2234,6 +2238,190 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // After fighting, wait a bit before next scan
     await ctx.sleep(5000);
+  }
+}
+
+// ── Station Protection Routine ────────────────────────────────
+//
+// "Visual deterrent" mode: the hunter docks at the station and sits, uncloaked,
+// as a show of force. It performs the usual docked housekeeping (cargo check,
+// ammo top-off, repair kits, shield charges, fuel, repairs, missions, insurance)
+// on a slow cadence. It does NOT roam or scan for prey.
+//
+// Detection is via the spacemolt-lib battle push events, which Bot already
+// tracks in `bot.currentBattle` / `bot.isInBattle()` the instant a battle
+// starts/updates anywhere the bot is involved (including a station raid that
+// pulls the docked defender in). We do NO polling — we just idle and check the
+// `isInBattle()` flag, which is updated for free by the library's push
+// subscription. The moment it flips we:
+//   1. Undock (a docked ship cannot fight) — we assume a raid does NOT
+//      auto-undock us, so we do it ourselves.
+//   2. Join the fight as a regular hunter (full combat loop).
+//   3. Once the battle is over, re-dock with the station and resume waiting.
+//
+// If a raid somehow forced us undocked, we just fight normally and re-dock after.
+
+/**
+ * Run a full hunter combat engagement against whatever battle is happening at
+ * the station. Mirrors what the other hunter modes do when pulled into a fight:
+ * analyze, engage the side, then fight until the battle ends.
+ */
+async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
+  const { bot } = ctx;
+
+  // A docked ship cannot participate in a battle. Undock if still docked
+  // (a raid is assumed NOT to auto-undock us, so we do it ourselves).
+  if (bot.docked) {
+    ctx.log("combat", "Station under attack — undocking to defend!");
+    const undockResp = await bot.exec("undock");
+    if (!undockResp.error) {
+      bot.docked = false;
+    } else {
+      ctx.log("error", `Failed to undock for defense: ${undockResp.error.message}`);
+      // If undock fails we can't fight, bail and stay put.
+      return;
+    }
+  }
+
+  ctx.log("combat", `⚠️ Station battle detected (ID: ${bot.currentBattle.battleId}) — defending as hunter!`);
+
+  const analysis = await analyzeExistingBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `Skipping station battle: ${analysis.reason}`);
+    return;
+  }
+
+  if (analysis.sideId !== undefined) {
+    const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+    if (engageResp.error) {
+      const errMsg = engageResp.error.message.toLowerCase();
+      if (!errMsg.includes("already in a battle") && !errMsg.includes("already_in_battle")) {
+        ctx.log("error", `Failed to join station defense: ${engageResp.error.message}`);
+        return;
+      }
+    }
+  }
+
+  const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  if (fakeTarget) {
+    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+  }
+  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
+}
+
+async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  const settings = getHunterSettings(bot.username);
+
+  ctx.log("info", "Station Protection mode: docking at station as a visual deterrent, uncloaked, awaiting attacks (battle push notifications only).");
+
+  // Ensure we're docked at the station.
+  if (!bot.docked) {
+    const homed = await ensureDocked(ctx);
+    if (!homed) {
+      ctx.log("error", "Could not dock at station — will retry next cycle");
+    }
+  }
+
+  // Initial docked housekeeping + make sure we are NOT cloaked (visual deterrent).
+  if (bot.docked) {
+    if (bot.isCloaked) {
+      const uncloakResp = await bot.exec("cloak", { enable: false });
+      if (!uncloakResp.error) ctx.log("system", "Uncloaked — station protection must remain visible");
+    }
+    await repairShip(ctx);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
+    await ensureHunterResupply(ctx);
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+  }
+
+  // Docked housekeeping only runs on this cadence — the rest of the time we idle.
+  const MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
+  let lastMaintenance = 0;
+
+  while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await ctx.sleep(30000); continue; }
+
+    const s = getHunterSettings(bot.username);
+
+    // ── Instant battle detection via lib push events ──
+    // bot.isInBattle() is set by the library the moment a battle push arrives
+    // (battle_started / battle_update / battle_damage). No polling required.
+    if (bot.isInBattle()) {
+      ctx.log("combat", "Battle push received at station — engaging as hunter!");
+      await stationProtectionFight(ctx, s);
+      // After the fight, return to the station and resume waiting.
+      ctx.log("info", "Station defense complete — returning to dock to resume protection.");
+      const redocked = await ensureDocked(ctx);
+      if (redocked) {
+        if (bot.isCloaked) {
+          const uncloakResp = await bot.exec("cloak", { enable: false });
+          if (!uncloakResp.error) ctx.log("system", "Uncloaked after defense — resuming visible deterrent");
+        }
+        await repairShip(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await ensureHunterResupply(ctx);
+        await ensureAmmoLoaded(ctx, s.ammoThreshold, s.maxReloadAttempts, s.ammoReloadAbsoluteThreshold, s.ammoReloadPercentThreshold);
+      }
+      lastMaintenance = Date.now();
+      continue;
+    }
+
+    // ── Keep the deterrent visible: never cloaked while docked ──
+    if (bot.docked && bot.isCloaked) {
+      const uncloakResp = await bot.exec("cloak", { enable: false });
+      if (!uncloakResp.error) ctx.log("system", "Re-uncloaked (station protection stays visible)");
+    }
+
+    // ── Docked housekeeping on a slow timer (not every loop) ──
+    if (bot.docked && Date.now() - lastMaintenance >= MAINTENANCE_INTERVAL_MS) {
+      yield "docked_maintenance";
+      await bot.refreshLocation();
+      await bot.refreshShip();
+      logStatus(ctx);
+      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+
+      // Field-consumable / ammo top-off (the "usual check cargo" + restock).
+      await ensureHunterResupply(ctx);
+      await ensureAmmoLoaded(ctx, s.ammoThreshold, s.maxReloadAttempts, s.ammoReloadAbsoluteThreshold, s.ammoReloadPercentThreshold);
+      if (shieldPct < (s.shieldRechargePct ?? 80)) {
+        await topUpShields(ctx, (s.shieldRechargePct ?? 80) / 100);
+      }
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      if (hullPct <= s.repairThreshold) {
+        await repairShip(ctx);
+      }
+
+      // Missions + insurance upkeep while docked.
+      await completeActiveMissions(ctx);
+      await checkAndAcceptMissions(ctx);
+      await ensureInsured(ctx);
+      if (bot.isCloaked) {
+        const uncloakResp = await bot.exec("cloak", { enable: false });
+        if (!uncloakResp.error) ctx.log("system", "Uncloaked during maintenance — station protection stays visible");
+      }
+      lastMaintenance = Date.now();
+    } else if (!bot.docked) {
+      // We got undocked somehow (e.g. raid yanked us out). If there's a battle,
+      // fight it; otherwise just re-dock and keep waiting.
+      ctx.log("info", "No longer docked during station protection — re-docking.");
+      await ensureDocked(ctx);
+      if (bot.isCloaked) {
+        const uncloakResp = await bot.exec("cloak", { enable: false });
+        if (!uncloakResp.error) await bot.refreshLocation();
+      }
+    }
+
+    // Idle: do nothing but wait. The library's battle push will flip
+    // isInBattle() the instant a fight breaks out — no polling needed.
+    yield "waiting";
+    await ctx.sleep(2000);
   }
 }
 

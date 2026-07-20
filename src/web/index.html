@@ -697,8 +697,19 @@
               Fuel Service
             </div>
           </div>
-          <div class="settings-panel" id="settingsContent">
-            <!-- filled by JS -->
+          <div class="settings-panel">
+            <div class="settings-header-bar" id="settingsHeaderBar">
+              <div class="settings-header-text">
+                <h3 id="settingsHeaderTitle"></h3>
+                <div class="settings-desc" id="settingsHeaderDesc"></div>
+              </div>
+              <div class="settings-header-actions" id="settingsHeaderActions">
+                <!-- save/action buttons moved here by JS -->
+              </div>
+            </div>
+            <div class="settings-content-scroll" id="settingsContent">
+              <!-- filled by JS -->
+            </div>
           </div>
         </div>
       </div>
@@ -2617,9 +2628,7 @@
                 if (activeTab) {
                   const tabId = activeTab.id?.replace("tab-", "");
                   if (tabId === "cargo_mover") {
-                    renderCargoMoverSettings(
-                      document.getElementById("settingsContent"),
-                    );
+                    rerenderCurrentSettings();
                   }
                 }
               }
@@ -12140,31 +12149,66 @@
         }, 800);
       }
 
-      // Move the bottom "Save Settings" bar up into a sticky header row,
-      // aligned to the right of the page title + description. This keeps the
-      // button visible at all times instead of requiring a scroll to the
-      // bottom of long settings pages. FuelRescue (rescue) is intentionally
-      // excluded — it gets a modernization pass separately.
-      function promoteSettingsSaveBar(panel) {
-        if (!panel || activeSettingsTab === "rescue") return;
-        const saveBar = panel.querySelector(".settings-save-bar");
-        if (!saveBar) return;
-        const h3 = panel.querySelector("h3");
-        if (!h3) return;
+      // Populate the PERSISTENT settings header (title + description + save
+      // buttons) from the freshly-rendered page content. The header lives
+      // outside #settingsContent, so it is never destroyed when the page body
+      // re-renders — this keeps the Save button anchored at the top with no
+      // flicker or full-page reflow on every change.
+      //
+      // The per-page render templates still emit their own <h3>, .settings-desc
+      // and .settings-save-bar inside the content; we lift the title/desc text
+      // and the save buttons up into the header, then remove the originals from
+      // the scrolling body so nothing is duplicated. FuelRescue (rescue) is
+      // intentionally left with its inline layout.
+      function syncSettingsHeader(panel) {
+        const bar = document.getElementById("settingsHeaderBar");
+        const titleEl = document.getElementById("settingsHeaderTitle");
+        const descEl = document.getElementById("settingsHeaderDesc");
+        const actionsEl = document.getElementById("settingsHeaderActions");
+        if (!bar || !titleEl || !descEl || !actionsEl) return;
 
-        const headerBar = document.createElement("div");
-        headerBar.className = "settings-header-bar";
+        if (activeSettingsTab === "rescue") {
+          // Rescue keeps its inline header; hide the shared header bar.
+          bar.style.display = "none";
+          return;
+        }
+        bar.style.display = "";
 
-        const left = document.createElement("div");
-        left.className = "settings-header-text";
-        left.appendChild(h3);
-        const desc = panel.querySelector(".settings-desc");
-        if (desc) left.appendChild(desc);
+        // Title
+        const h3 = panel ? panel.querySelector("h3") : null;
+        titleEl.textContent = h3 ? h3.textContent : "";
+        if (h3) h3.remove();
 
-        headerBar.appendChild(left);
-        headerBar.appendChild(saveBar);
+        // Description
+        const desc = panel ? panel.querySelector(".settings-desc") : null;
+        if (desc) {
+          descEl.innerHTML = desc.innerHTML;
+          descEl.style.display = "";
+          desc.remove();
+        } else {
+          descEl.innerHTML = "";
+          descEl.style.display = "none";
+        }
 
-        panel.insertBefore(headerBar, panel.firstChild);
+        // Save / action buttons: move the buttons from the in-content save bar
+        // up into the persistent header actions area.
+        const saveBar = panel ? panel.querySelector(".settings-save-bar") : null;
+        actionsEl.innerHTML = "";
+        if (saveBar) {
+          while (saveBar.firstChild) {
+            actionsEl.appendChild(saveBar.firstChild);
+          }
+          saveBar.remove();
+        }
+      }
+
+      // Re-render the currently active settings tab in place. All the per-page
+      // interaction handlers (add/remove item, toggle, refresh, etc.) call this
+      // instead of invoking their render function directly, so every re-render
+      // funnels through renderSettingsPanel() and keeps the persistent header
+      // (title/description/save button) in sync without flicker.
+      function rerenderCurrentSettings() {
+        renderSettingsPanel();
       }
 
       function renderSettingsPanel() {
@@ -12207,6 +12251,7 @@
           // Isolate a single broken tab so it can't blank the whole panel.
           console.error(`Failed to render settings tab '${activeSettingsTab}':`, e);
           panel.innerHTML = `<h3>${esc(activeSettingsTab)} Settings</h3><div class="settings-desc" style="color:#d32f2f">This tab failed to render: ${esc(String((e && e.message) || e))}</div>`;
+          syncSettingsHeader(panel);
         };
         try {
           // fn may be async; catch both synchronous throws and rejected promises
@@ -12215,7 +12260,7 @@
           // form controls so background refreshes can detect unsaved edits.
           Promise.resolve(fn(panel))
             .then(captureSettingsPanelSnapshot)
-            .then(() => promoteSettingsSaveBar(panel))
+            .then(() => syncSettingsHeader(panel))
             .catch(showRenderError);
         } catch (e) {
           showRenderError(e);
@@ -12930,9 +12975,7 @@
         if (!settings.system_blacklist.includes(systemId)) {
           settings.system_blacklist.push(systemId);
         }
-        renderSystemBlacklistSettings(
-          document.getElementById("settingsContent"),
-        );
+        rerenderCurrentSettings();
       }
 
       function addToBlacklistFromText() {
@@ -12966,9 +13009,7 @@
         }
 
         input.value = "";
-        renderSystemBlacklistSettings(
-          document.getElementById("settingsContent"),
-        );
+        rerenderCurrentSettings();
       }
 
       function removeFromBlacklist(systemId) {
@@ -12976,9 +13017,7 @@
         settings.system_blacklist = settings.system_blacklist.filter(
           (s) => s.toLowerCase() !== systemId.toLowerCase(),
         );
-        renderSystemBlacklistSettings(
-          document.getElementById("settingsContent"),
-        );
+        rerenderCurrentSettings();
       }
 
       function saveBlacklistSettings() {
@@ -13241,7 +13280,7 @@
         const s = { homeSystem, homeStation };
         send({ type: "saveSettings", routine: botName, settings: s });
         settings[botName] = Object.assign(settings[botName] || {}, s);
-        renderReturnHomeSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function clearReturnHomeBotOverride(botName) {
@@ -13250,7 +13289,7 @@
         send({ type: "saveSettings", routine: botName, settings: s });
         delete settings[botName].homeSystem;
         delete settings[botName].homeStation;
-        renderReturnHomeSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       // ── Crafter Settings ────────────────────────────────────────
@@ -13774,7 +13813,7 @@
     </div>
 
     <div class="settings-save-bar">
-      <button class="sm" onclick="cachedSettingsRecipes=null;renderCrafterSettings(document.getElementById('settingsContent'))">Refresh Recipes</button>
+      <button class="sm" onclick="cachedSettingsRecipes=null;rerenderCurrentSettings()">Refresh Recipes</button>
       <button class="primary" onclick="saveCrafterSettings()">Save Settings</button>
     </div>
   `;
@@ -13916,7 +13955,7 @@
           crafters.find((c) => c.name === currentCrafterName) || crafters[0];
         if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
         currentProfile.craftLimits[id] = qty;
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addCraftCategory() {
@@ -13954,7 +13993,7 @@
         }
 
         if (addedCount > 0) {
-          renderCrafterSettings(document.getElementById("settingsContent"));
+          rerenderCurrentSettings();
         } else {
           alert(`No items found in category "${category}".`);
         }
@@ -13971,7 +14010,7 @@
         if (!currentProfile?.craftLimits) return;
 
         delete currentProfile.craftLimits[id];
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function toggleAllCategories(checkbox) {
@@ -14143,7 +14182,7 @@
         settings.crafter = s;
 
         // Re-render to show updated values
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       // ── Crafting Loadouts ───────────────────────────────────────
@@ -14206,7 +14245,7 @@
 
           if (response.ok) {
             await loadCraftingLoadouts();
-            renderCrafterSettings(document.getElementById("settingsContent"));
+            rerenderCurrentSettings();
             alert(`Loadout "${name}" saved successfully!`);
           } else {
             const error = await response.json();
@@ -14246,7 +14285,7 @@
           crafters.find((c) => c.name === currentCrafterName) || crafters[0];
         currentProfile.craftLimits = JSON.parse(JSON.stringify(loadout));
 
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         saveCrafterSettings();
       }
 
@@ -14271,7 +14310,7 @@
 
           if (response.ok) {
             await loadCraftingLoadouts();
-            renderCrafterSettings(document.getElementById("settingsContent"));
+            rerenderCurrentSettings();
             alert(`Loadout "${name}" deleted.`);
           } else {
             const error = await response.json();
@@ -14294,7 +14333,7 @@
         saveCrafterSettings();
 
         window._currentCrafterProfile = select.value;
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addCrafterProfile() {
@@ -15312,7 +15351,7 @@
         }
 
         // Re-render the crafter settings to show the new recipes
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
 
         if (addedCount > 0) {
           alert(
@@ -15397,7 +15436,7 @@
         }
 
         // Re-render the crafter settings to show the new recipes
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
 
         if (addedCount > 0) {
           alert(
@@ -15589,7 +15628,7 @@
         }
 
         // Re-render the crafter settings to show the new recipes
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
 
         const shipCount = multiShipLoadoutState.ships.length;
         if (addedCount > 0) {
@@ -15619,7 +15658,7 @@
         if (!currentProfile) return;
 
         currentProfile.craftLimits = {};
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       // ── Crafter Request Items helpers ───────────────────────────
@@ -15786,7 +15825,7 @@
           settings.crafter.requestItems.push({ itemId, quantity });
         }
 
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeCrafterRequestItem(itemId) {
@@ -15794,7 +15833,7 @@
         settings.crafter.requestItems = settings.crafter.requestItems.filter(
           (r) => r.itemId !== itemId,
         );
-        renderCrafterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       // ── Rescue settings ────────────────────────────────────────
@@ -16724,9 +16763,7 @@
             settings: s,
           });
           settings.faction_trader = s;
-          renderFactionTraderSettings(
-            document.querySelector("#settings-panel"),
-          );
+          rerenderCurrentSettings();
         }
       }
 
@@ -16739,7 +16776,7 @@
         });
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;
-        renderFactionTraderSettings(document.querySelector("#settings-panel"));
+        rerenderCurrentSettings();
       }
 
       function addCategoryTrade() {
@@ -16769,7 +16806,7 @@
         });
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;
-        renderFactionTraderSettings(document.querySelector("#settings-panel"));
+        rerenderCurrentSettings();
       }
 
       function removeCategoryTrade(idx) {
@@ -16779,7 +16816,7 @@
         s.categoryTrade.splice(idx, 1);
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;
-        renderFactionTraderSettings(document.querySelector("#settings-panel"));
+        rerenderCurrentSettings();
       }
 
       function saveFactionTraderSettings() {
@@ -17168,7 +17205,7 @@
             settings.trade_buyer.maxPrices = {};
           settings.trade_buyer.maxPrices[itemId] = maxPrice;
         }
-        renderTradeBuyerSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeTradeBuyerItem(itemId) {
@@ -17180,7 +17217,7 @@
         if (settings.trade_buyer.maxPrices) {
           delete settings.trade_buyer.maxPrices[itemId];
         }
-        renderTradeBuyerSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function saveTradeBuyerSettings() {
@@ -28330,7 +28367,7 @@ ignoreBlacklist: document.getElementById(
         if (!settings.hunter.patrolSystems.includes(systemId)) {
           settings.hunter.patrolSystems.push(systemId);
         }
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addToHunterPatrolFromText() {
@@ -28361,7 +28398,7 @@ ignoreBlacklist: document.getElementById(
         }
 
         input.value = "";
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeFromHunterPatrol(systemId) {
@@ -28370,7 +28407,7 @@ ignoreBlacklist: document.getElementById(
         settings.hunter.patrolSystems = settings.hunter.patrolSystems.filter(
           (s) => s.toLowerCase() !== systemId.toLowerCase(),
         );
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       // ── Hunter Patrol Profile Management (crafter-style) ───────────
@@ -28397,7 +28434,7 @@ ignoreBlacklist: document.getElementById(
           name: name.trim(),
           patrolSystems: [],
         });
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function editHunterPatrolProfile(index) {
@@ -28409,7 +28446,7 @@ ignoreBlacklist: document.getElementById(
         if (!newName || !newName.trim()) return;
 
         profile.name = newName.trim();
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -28425,7 +28462,7 @@ ignoreBlacklist: document.getElementById(
 
         settings.hunter.hunterPatrols.splice(index, 1);
         window._currentHunterPatrolIndex = undefined;
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -28435,7 +28472,7 @@ ignoreBlacklist: document.getElementById(
 
       function selectHunterPatrolProfile(index) {
         window._currentHunterPatrolIndex = index;
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addSystemToCurrentHunterProfileFromSelect() {
@@ -28449,7 +28486,7 @@ ignoreBlacklist: document.getElementById(
         const profile = settings.hunter.hunterPatrols[idx];
         if (!profile.patrolSystems) profile.patrolSystems = [];
         profile.patrolSystems.push(systemId);
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -28483,7 +28520,7 @@ ignoreBlacklist: document.getElementById(
         }
 
         input.value = "";
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -28507,7 +28544,7 @@ ignoreBlacklist: document.getElementById(
           profile.patrolSystems.splice(removeIndex, 1);
         }
 
-        renderHunterSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -28705,7 +28742,7 @@ ignoreBlacklist: document.getElementById(
         send({ type: "saveSettings", routine: botUsername, settings: updated });
         settings[botUsername] = updated;
         // Re-render to update effective miner display
-        renderEscortSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function saveEscortSettings() {
@@ -29839,7 +29876,7 @@ ignoreBlacklist: document.getElementById(
     </div>
 
     <div class="settings-save-bar">
-      <button class="sm" onclick="renderCargoMoverSettings(document.getElementById('settingsContent'))">Refresh</button>
+      <button class="sm" onclick="rerenderCurrentSettings()">Refresh</button>
       <button class="primary" onclick="saveCargoMoverSettings()">Save Settings</button>
     </div>
   `;
@@ -29962,9 +29999,7 @@ ignoreBlacklist: document.getElementById(
                 category: i.category || "",
               }))
               .filter((i) => i.itemId && i.quantity > 0);
-            renderCargoMoverSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           } else {
             alert(
               "Failed to load faction storage: " +
@@ -30015,9 +30050,7 @@ ignoreBlacklist: document.getElementById(
                 category: i.category || "",
               }))
               .filter((i) => i.itemId && i.quantity > 0);
-            renderCargoMoverSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           } else {
             alert(
               "Failed to load personal storage: " +
@@ -30046,7 +30079,7 @@ ignoreBlacklist: document.getElementById(
           storageType: "faction",
           category: item?.category || "",
         });
-        renderCargoMoverSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addCargoMoverPersonalItem() {
@@ -30071,13 +30104,13 @@ ignoreBlacklist: document.getElementById(
           sourceBot,
           category: item?.category || "",
         });
-        renderCargoMoverSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeCargoMoverItem(idx) {
         if (!settings.cargo_mover?.items) return;
         settings.cargo_mover.items.splice(idx, 1);
-        renderCargoMoverSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function setCargoMoverDeliveryTarget(idx) {
@@ -30114,7 +30147,7 @@ ignoreBlacklist: document.getElementById(
           item.totalDelivered = 0;
         }
 
-        renderCargoMoverSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       async function reconcileCargoMoverDelivered() {
@@ -30144,7 +30177,7 @@ ignoreBlacklist: document.getElementById(
           window.alert(summary);
           // Re-render AFTER the alert; the re-render destroys cm-admin-status, so
           // we can't rely on the status line to show the result.
-          renderCargoMoverSettings(document.getElementById("settingsContent"));
+          rerenderCurrentSettings();
           refreshCargoMoverLiveStatuses();
           const statusEl2 = document.getElementById("cm-admin-status");
           if (statusEl2) statusEl2.textContent = summary;
@@ -30386,7 +30419,7 @@ ignoreBlacklist: document.getElementById(
         }
 
         // Re-render the cargo mover settings to show the new items
-        renderCargoMoverSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
 
         if (addedCount > 0) {
           alert(
@@ -30629,7 +30662,7 @@ ignoreBlacklist: document.getElementById(
       </div>
 
       <div class="settings-save-bar">
-        <button class="sm" onclick="loadFuelTransferLoadouts(); renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
+        <button class="sm" onclick="loadFuelTransferLoadouts(); rerenderCurrentSettings()">Refresh</button>
         <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
       </div>
   `;
@@ -30645,13 +30678,13 @@ ignoreBlacklist: document.getElementById(
         if (!settings.fuel_transport.stations.includes(val)) {
           settings.fuel_transport.stations.push(val);
         }
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeFuelTransportStation(idx) {
         if (!settings.fuel_transport?.stations) return;
         settings.fuel_transport.stations.splice(idx, 1);
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addFuelTransportItem() {
@@ -30671,13 +30704,13 @@ ignoreBlacklist: document.getElementById(
           itemName,
           targetQuantity: qty,
         });
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeFuelTransportItem(idx) {
         if (!settings.fuel_transport?.items) return;
         settings.fuel_transport.items.splice(idx, 1);
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       async function loadFuelTransportFactionStorage() {
@@ -30698,9 +30731,7 @@ ignoreBlacklist: document.getElementById(
                   quantity: i.quantity || 0,
                 }))
                 .filter((i) => i.itemId && i.quantity > 0);
-              renderFuelTransportSettings(
-                document.getElementById("settingsContent"),
-              );
+              rerenderCurrentSettings();
             } else {
               alert(
                 "Failed to load faction storage: " +
@@ -30736,9 +30767,7 @@ ignoreBlacklist: document.getElementById(
                 quantity: i.quantity || 0,
               }))
               .filter((i) => i.itemId && i.quantity > 0);
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           } else {
             alert("Failed to load faction storage from cache");
           }
@@ -30787,9 +30816,7 @@ ignoreBlacklist: document.getElementById(
                     quantity: i.quantity || 0,
                   }))
                   .filter((i) => i.itemId && i.quantity > 0);
-                renderFuelTransportSettings(
-                  document.getElementById("settingsContent"),
-                );
+                rerenderCurrentSettings();
                 alert(
                   `Loaded ${ftFactionItems.length} items from faction storage cache (${data.factionName || "unknown"} at ${homeStation}).`,
                 );
@@ -30825,9 +30852,7 @@ ignoreBlacklist: document.getElementById(
                       quantity: i.quantity || 0,
                     }))
                     .filter((i) => i.itemId && i.quantity > 0);
-                  renderFuelTransportSettings(
-                    document.getElementById("settingsContent"),
-                  );
+                  rerenderCurrentSettings();
                   alert(
                     `Loaded ${ftFactionItems.length} items from faction storage cache (${cacheData.factionName || "unknown"} at ${cache.station}).`,
                   );
@@ -30875,7 +30900,7 @@ ignoreBlacklist: document.getElementById(
           itemName: item.itemName || item.itemId,
           targetQuantity: item.targetQuantity,
         }));
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       async function saveFuelTransferLoadoutPrompt() {
@@ -30905,9 +30930,7 @@ ignoreBlacklist: document.getElementById(
 
           if (response.ok) {
             await loadFuelTransferLoadouts();
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
             alert(`Loadout "${name}" saved successfully!`);
           } else {
             const error = await response.json();
@@ -30939,9 +30962,7 @@ ignoreBlacklist: document.getElementById(
 
           if (response.ok) {
             await loadFuelTransferLoadouts();
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           } else {
             const error = await response.json();
             alert(
@@ -30965,9 +30986,7 @@ ignoreBlacklist: document.getElementById(
           );
           if (response.ok) {
             await loadFuelTransferLoadouts();
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           }
         } catch (e) {
           console.warn(`Failed to set loadout active: ${e.message}`);
@@ -30996,7 +31015,7 @@ ignoreBlacklist: document.getElementById(
           itemName: item.itemName || item.itemId,
           targetQuantity: item.targetQuantity,
         }));
-        renderFuelTransportSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function saveFuelTransferLoadoutPrompt() {
@@ -31026,9 +31045,7 @@ ignoreBlacklist: document.getElementById(
 
           if (response.ok) {
             await loadFuelTransferLoadouts();
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
             alert(`Loadout "${name}" saved successfully!`);
           } else {
             const error = await response.json();
@@ -31060,9 +31077,7 @@ ignoreBlacklist: document.getElementById(
 
           if (response.ok) {
             await loadFuelTransferLoadouts();
-            renderFuelTransportSettings(
-              document.getElementById("settingsContent"),
-            );
+            rerenderCurrentSettings();
           } else {
             const error = await response.json();
             alert(
@@ -31574,7 +31589,7 @@ ignoreBlacklist: document.getElementById(
         if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
         ms.moduleItems.push({ itemId, maxQty, doNotSell: false });
         settings.module_seller = ms;
-        renderModuleSellerSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeModuleItem(btn) {
@@ -31584,7 +31599,7 @@ ignoreBlacklist: document.getElementById(
         if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
         ms.moduleItems = ms.moduleItems.filter((i) => i.itemId !== itemId);
         settings.module_seller = ms;
-        renderModuleSellerSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function saveModuleSellerSettings() {
@@ -35155,7 +35170,7 @@ ignoreBlacklist: document.getElementById(
         }
         input.value = "";
         document.getElementById("fs-facility-suggestions").innerHTML = "";
-        renderFuelServiceSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function updateFuelServiceFacilityPriority(facilityId, priority) {
@@ -35170,7 +35185,7 @@ ignoreBlacklist: document.getElementById(
       function removeFuelServiceFacility(idx) {
         if (!settings.fuel_service?.facilityConfigs) return;
         settings.fuel_service.facilityConfigs.splice(idx, 1);
-        renderFuelServiceSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function updateFuelServiceFacility(facilityId, checked) {
@@ -35184,7 +35199,7 @@ ignoreBlacklist: document.getElementById(
           fs.facilityConfigs = fs.facilityConfigs.filter((c) => c.id !== facilityId);
         }
         settings.fuel_service = fs;
-        renderFuelServiceSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function addFuelServiceStation() {
@@ -35196,13 +35211,13 @@ ignoreBlacklist: document.getElementById(
         if (!settings.fuel_service.stations.includes(val)) {
           settings.fuel_service.stations.push(val);
         }
-        renderFuelServiceSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
       function removeFuelServiceStation(idx) {
         if (!settings.fuel_service?.stations) return;
         settings.fuel_service.stations.splice(idx, 1);
-        renderFuelServiceSettings(document.getElementById("settingsContent"));
+        rerenderCurrentSettings();
       }
 
 function saveFuelServiceSettings() {

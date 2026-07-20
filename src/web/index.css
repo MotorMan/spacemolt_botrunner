@@ -1165,11 +1165,20 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 }
 .settings-panel {
   flex: 1;
+  min-height: 0;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* Scrollable body below the persistent header bar. */
+.settings-content-scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  padding: 16px 24px 20px;
 }
 .settings-panel h3 {
   font-size: 15px;
@@ -1181,6 +1190,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 20px;
+}
+/* The persistent header content (title/desc) has no bottom margin — the
+   header bar itself provides spacing. */
+.settings-header-bar .settings-desc {
+  margin-bottom: 0;
 }
 .setting-row {
   display: flex;
@@ -1225,27 +1239,34 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding-top: 14px;
   border-top: 1px solid var(--border);
 }
-/* When promoted into the page header (most settings pages), the save bar
-   sits on the right of the title + description and has no top border. */
+/* Persistent settings header bar: title + description on the left, save /
+   action buttons on the right. Lives outside the scrollable content area so
+   it never disappears or reflows when the page body re-renders. */
 .settings-header-bar {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
-  padding-bottom: 14px;
+  flex-shrink: 0;
+  padding: 16px 24px;
   border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
 }
 .settings-header-bar .settings-header-text {
   flex: 1;
   min-width: 0;
 }
-.settings-header-bar .settings-save-bar {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: none;
+.settings-header-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
   flex-shrink: 0;
-  align-self: center;
+  align-items: center;
+}
+/* Hide any leftover in-content save bars (buttons are relocated to the
+   persistent header). Kept as a safety net for pages not yet migrated. */
+.settings-content-scroll .settings-save-bar {
+  display: none;
 }
 
 /* ── Map page ───────────────────────────────────── */

@@ -1631,8 +1631,18 @@ async function runBulkMovePhase(
   // load loop always begins with space available.
   await bot.refreshCargo();
   const bulkFullness = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 1;
-  if (bot.inventory.length > 0 && bulkFullness >= 0.9) {
-    ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full — emptying to storage before loading`);
+  // In bulk mode EVERY item is re-loaded from faction storage anyway, so any
+  // non-fuel / non-package cargo left in the hold (a prior interrupted run, a
+  // hold that's full-but-under-90% on a large ship, etc.) must be dumped before
+  // planning — otherwise the load loop sees no free space and bails with
+  // "could not load anything". The >=0.9 heuristic alone misses the under-90%
+  // case on big holds, which is exactly how a bot gets stuck hauling a full
+  // cargo it can't unload. Dump whenever orphaned cargo is present.
+  const bulkHasOrphanCargo = bot.inventory.some(
+    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && !isPackageItem(i.itemId),
+  );
+  if (bot.inventory.length > 0 && (bulkFullness >= 0.9 || bulkHasOrphanCargo)) {
+    ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full (orphan cargo present: ${bulkHasOrphanCargo}) — emptying to storage before loading`);
     for (const item of [...bot.inventory]) {
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();

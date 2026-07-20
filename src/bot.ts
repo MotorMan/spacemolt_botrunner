@@ -22,6 +22,7 @@ import { loadSettings, saveStoppedState, saveLastUsedRoutine } from "./web/serve
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
+import { catalogStore } from "./catalogstore.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1708,6 +1709,14 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
   private applyStatusResult(r: Record<string, unknown>): void {
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, r);
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
+
+    // The `get_status`/`get_state` response carries the live gameserver version
+    // (top-level `version`). Whenever it differs from the catalog we hold, kick
+    // off a version-driven catalog refresh (conditional GET → 304 until the file
+    // is republished, then a fresh 200). This is how we pick up the frequent
+    // game patches within moments of the first status report — no 24h wait.
+    const gsVersion = typeof r.version === "string" ? r.version : null;
+    if (gsVersion) void catalogStore.noteGameServerVersion(gsVersion);
 
     const location = r.location as Record<string, unknown> | undefined;
     const player = r.player as Record<string, unknown> | undefined;

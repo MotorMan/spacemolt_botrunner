@@ -305,7 +305,7 @@ export class ClientSyncLightSlave {
         await this.request<{ ok?: boolean }>("/api/client-sync/catalog-upload", { method: "POST" }, { catalog: catalogStore.getAll() });
         this.log(`Uploaded local catalog (v${version ?? "?"}) to master`);
       } else if (action === "download_and_upload") {
-        await catalogStore.fetchFromLib();
+        await catalogStore.fetchFromLib(true);
         await this.request<{ ok?: boolean }>("/api/client-sync/catalog-upload", { method: "POST" }, { catalog: catalogStore.getAll() });
         this.log(`Downloaded fresh catalog (v${catalogStore.getAll().version ?? "?"}) from gameserver and shared to master`);
       }

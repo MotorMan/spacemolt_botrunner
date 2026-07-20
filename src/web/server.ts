@@ -1716,7 +1716,7 @@ if (url.pathname === "/data/shipsForSale.json") {
             // the fleet — so clients never hammer the gameserver and stay connected.
             if (result.action === "master_fetch") {
               try {
-                await catalogStore.fetchFromLib();
+                await catalogStore.fetchFromLib(true);
                 const res = this.syncMaster?.masterCatalogFetched(catalogStore.getAll()) ?? { ok: false, version: null };
                 console.log(`[ClientSync] Master fetched catalog v${res.version ?? "?"} from gameserver — relaying to fleet`);
               } catch (err) {

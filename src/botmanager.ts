@@ -2447,9 +2447,14 @@ async function main(): Promise<void> {
     server.logSystem("Galaxy map seed failed — will rely on exploration data");
   });
 
-  // Download and persist the V2 OpenAPI spec under a versioned filename
-  // (e.g. openapi-V2-V0.501.0.json) for offline websocket / spacemolt-lib / CLI use.
-  refreshOpenApiV2Spec().then(({ meta, path, saved, changed, throttled }) => {
+  // Resolve + persist the V2 OpenAPI spec under a versioned filename
+  // (e.g. openapi-V2-V0.501.0.json) for offline websocket / spacemolt-lib / CLI
+  // use. Its `gameServerVersion` drives the version-based catalog refresh — there
+  // is no more fixed 24h timer; the catalog is re-fetched the moment the live
+  // gameserver version (from the spec or any bot's get_state) differs from the
+  // catalog we hold.
+  const specPromise = refreshOpenApiV2Spec();
+  specPromise.then(({ meta, path, saved, changed, throttled }) => {
     const changeNote = changed ? "changed" : throttled ? "throttled — reused cached" : "unchanged (304)";
     console.log(`[OPENAPI] V2 spec ${meta.gameServerVersion} ${changeNote} ${saved ? "saved" : "already present"} -> ${path}`);
   }).catch((err) => {
@@ -2486,12 +2491,18 @@ async function main(): Promise<void> {
     // lets the 2s status push + watchdog start immediately.
     void (async () => {
       try {
-        if (catalogStore.isStale() || await catalogStore.checkVersionChangedLib()) {
-          await catalogStore.fetchFromLib();
+        // Reconcile the catalog against the live gameserver version (from the
+        // OpenAPI spec we just resolved). If the server has patched since our
+        // cached catalog was written, a fresh catalog.json is fetched; otherwise
+        // this is a cheap no-op (version already matches).
+        const { meta } = await specPromise;
+        if (await catalogStore.noteGameServerVersion(meta.gameServerVersion)) {
           server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+        } else {
+          server.logSystem(`Catalog up to date (${catalogStore.getSummary()})`);
         }
       } catch (err) {
-        server.logSystem(`Catalog fetch failed: ${err}`);
+        server.logSystem(`Catalog sync failed: ${err}`);
       }
 
       for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
@@ -2520,11 +2531,14 @@ async function main(): Promise<void> {
 
   refreshStatusTable();
 
-  // Load catalog data (fetch if stale, using first available bot session)
-  if (!catalogStore.isStale()) {
-    server.logSystem(`Catalog loaded from cache (${catalogStore.getSummary()})`);
+  // Catalog freshness is now version-driven (see `catalogStore.noteGameServerVersion`):
+  // whenever the live gameserver version — from the OpenAPI spec at startup or any
+  // bot's get_state at runtime — differs from the catalog we hold, a fresh
+  // catalog.json is fetched. No fixed 24h timer.
+  if (catalogStore.isStale()) {
+    server.logSystem("No cached catalog — will fetch once the gameserver version is known.");
   } else {
-    server.logSystem("Catalog data is stale, will fetch after first bot login...");
+    server.logSystem(`Catalog loaded from cache (${catalogStore.getSummary()})`);
   }
 
   // Periodic timers (store IDs for cleanup). `intervals` is declared at the top
@@ -2756,32 +2770,6 @@ async function main(): Promise<void> {
     const statuses = [...bots.values()].map(b => b.status());
     server.flushBotStats(statuses);
   }, 60000));
-
-  // Daily catalog refresh (24h)
-  intervals.push(setInterval(async () => {
-    // Check if stale OR server version changed
-    let needsRefresh = catalogStore.isStale();
-    if (!needsRefresh && bots.size > 0) {
-      const firstBot = bots.values().next().value;
-      if (firstBot?.isConnected()) {
-        needsRefresh = await catalogStore.checkVersionChangedLib();
-      }
-    }
-    if (!needsRefresh) return;
-    // Find first bot with an active session
-    for (const [, bot] of bots) {
-      if (bot.isConnected()) {
-        try {
-          await catalogStore.fetchFromLib();
-          server.logSystem(`Catalog refreshed (${catalogStore.getSummary()})`);
-          refreshSkillNames();
-        } catch (err) {
-          server.logSystem(`Catalog refresh failed: ${err}`);
-        }
-        break;
-      }
-    }
-  }, 24 * 60 * 60 * 1000));
 
   // Periodic ERROR state check - auto-restart bots that crashed. This is a
   // safety net; the routine's own .catch already schedules a backed-off

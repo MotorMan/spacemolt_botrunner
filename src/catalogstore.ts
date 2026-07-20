@@ -69,7 +69,10 @@ interface IndexedCatalog {
 const DATA_DIR = join(process.cwd(), "data");
 const CATALOG_FILE = join(DATA_DIR, "catalog.json");
 const SAVE_DEBOUNCE_MS = 5000;
-const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
+/** Floor between version-driven reconcile attempts, so a fleet of bots all
+ *  reporting the same not-yet-republished gameserver version can't storm the
+ *  gameserver with catalog requests during a patch window. */
+const RECONCILE_COOLDOWN_MS = 30_000;
 
 /** Top-level keys the store normalizes into id-keyed indexes. */
 const KNOWN_COLLECTION_KEYS = new Set(["items", "ships", "skills", "recipes", "facilities"]);
@@ -81,10 +84,52 @@ const KNOWN_COLLECTION_KEYS = new Set(["items", "ships", "skills", "recipes", "f
  * with only `version/ships/items/recipes/skills/facilities`, which would drop
  * any new top-level key (e.g. `achievements`) before we ever see it.
  */
-async function fetchRawCatalog(httpBaseUrl: string): Promise<Record<string, unknown>> {
+/**
+ * Result of a raw `catalog.json` fetch. The endpoint is served with HTTP
+ * caching headers (`ETag` / `Last-Modified`) — the server's intended
+ * "has this changed?" signal. We surface those headers so callers can issue a
+ * conditional request and cheaply detect a new release via a `304`, instead of
+ * re-downloading the full payload or (worse) trusting a cached version string.
+ */
+interface RawCatalogResponse {
+  /** HTTP status. `304` means "unchanged since your last request". */
+  status: number;
+  /** Server `ETag` header (quotes/weak `W/` prefix preserved verbatim). */
+  etag: string | null;
+  /** Server `Last-Modified` header, if no `ETag` was provided. */
+  lastModified: string | null;
+  /** Parsed payload — `null` on a `304` (body is intentionally empty). */
+  data: Record<string, unknown> | null;
+}
+
+/**
+ * Fetch the raw `catalog.json` exactly as the server publishes it — arrays and
+ * every top-level section included. We deliberately do NOT go through
+ * `@spacemolt/lib`'s `client.catalog()`: its `fetchCatalog` rebuilds the object
+ * with only `version/ships/items/recipes/skills/facilities`, which would drop
+ * any new top-level key (e.g. `achievements`) before we ever see it, AND the
+ * client caches the catalog for the process lifetime so its `version` never
+ * updates — which is why a new game release was never detected.
+ *
+ * When `ifNoneMatch` / `ifModifiedSince` are supplied we send a conditional
+ * request; the server answers `304 Not Modified` (no body) when the catalog is
+ * unchanged, letting us skip the download entirely.
+ */
+async function fetchRawCatalog(
+  httpBaseUrl: string,
+  opts: { ifNoneMatch?: string | null; ifModifiedSince?: string | null } = {},
+): Promise<RawCatalogResponse> {
   const base = httpBaseUrl.replace(/\/$/, "");
   const url = `${base}/api/catalog.json`;
-  const res = await fetch(url, { headers: { accept: "application/json" } });
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
+  else if (opts.ifModifiedSince) headers["If-Modified-Since"] = opts.ifModifiedSince;
+  const res = await fetch(url, { headers });
+  const etag = res.headers.get("etag");
+  const lastModified = res.headers.get("last-modified");
+  if (res.status === 304) {
+    return { status: 304, etag, lastModified, data: null };
+  }
   if (!res.ok) {
     throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
   }
@@ -92,7 +137,7 @@ async function fetchRawCatalog(httpBaseUrl: string): Promise<Record<string, unkn
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw new Error(`catalog.json returned a non-object payload`);
   }
-  return data as Record<string, unknown>;
+  return { status: 200, etag, lastModified, data: data as Record<string, unknown> };
 }
 
 /** Build an id-keyed record from either an array of entries or an id-keyed object. */
@@ -118,9 +163,17 @@ class CatalogStore {
   private extra: Record<string, unknown> = {};
   private version: string | null = null;
   private lastFetched: string | null = null;
+  /** Server `ETag` from the last fetch — our conditional-request token. */
+  private etag: string | null = null;
+  /** Server `Last-Modified` — fallback validation token when no `ETag`. */
+  private lastModified: string | null = null;
+  /** The gameserver version we last reconciled the catalog against. */
+  private lastGameServerVersion: string | null = null;
+  /** Timestamp of the last version-driven reconcile attempt (cooldown gate). */
+  private lastReconcileAt = 0;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
-  private _fetchPromise: Promise<void> | null = null;
+  private _fetchPromise: Promise<boolean> | null = null;
 
   constructor() {
     this.load();
@@ -135,10 +188,13 @@ class CatalogStore {
     if (existsSync(CATALOG_FILE)) {
       try {
         const parsed = JSON.parse(readFileSync(CATALOG_FILE, "utf-8")) as Record<string, unknown>;
-        // `lastFetched` is metadata we add on write — strip it so `raw` stays
-        // server-faithful and never re-persists a stale copy of itself.
-        const { lastFetched, ...serverRaw } = parsed;
+        // `lastFetched`/`etag`/`lastModified` are metadata we add on write —
+        // strip them so `raw` stays server-faithful and never re-persists a
+        // stale copy of itself, and so the validation tokens survive reload.
+        const { lastFetched, etag, lastModified, ...serverRaw } = parsed;
         this.lastFetched = typeof lastFetched === "string" ? lastFetched : null;
+        this.etag = typeof etag === "string" ? etag : null;
+        this.lastModified = typeof lastModified === "string" ? lastModified : null;
         this.applyRaw(serverRaw);
         return;
       } catch {
@@ -149,6 +205,8 @@ class CatalogStore {
     this.extra = {};
     this.version = null;
     this.lastFetched = null;
+    this.etag = null;
+    this.lastModified = null;
   }
 
   /** Fold a verbatim server payload into our indexed + extra views. */
@@ -200,6 +258,8 @@ class CatalogStore {
       const out = {
         version: this.version,
         lastFetched: this.lastFetched,
+        etag: this.etag,
+        lastModified: this.lastModified,
         items: this.indexed.items,
         ships: this.indexed.ships,
         skills: this.indexed.skills,
@@ -228,6 +288,11 @@ class CatalogStore {
   replaceWith(raw: Record<string, unknown>): void {
     this.applyRaw(raw);
     this.lastFetched = typeof raw.lastFetched === "string" ? raw.lastFetched : new Date().toISOString();
+    // Data came from a peer, not the gameserver — our HTTP validation tokens
+    // are no longer meaningful for this payload. Clear them so the next
+    // gameserver fetch revalidates unconditionally.
+    this.etag = null;
+    this.lastModified = null;
     this.dirty = true;
     this.writeToDisk();
     debugLog("catalog", `Replaced catalog from remote sync: ${this.getSummary()}`);
@@ -242,13 +307,53 @@ class CatalogStore {
     this.writeToDisk();
   }
 
-  // ── Staleness check ───────────────────────────────────────
+  // ── Version-driven refresh ───────────────────────────────
 
-  /** True if catalog data is missing or older than 24 hours. */
+  /** The catalog's `version` field (the gameserver version it matches), or null. */
+  getVersion(): string | null {
+    return this.version;
+  }
+
+  /**
+   * True if we have never loaded a catalog (first run / corrupt file). Used only
+   * for bootstrap — there is deliberately NO time-based staleness check anymore:
+   * the gameserver can ship multiple patches a day, so the catalog is kept fresh
+   * purely by reacting to gameserver-version changes (see `noteGameServerVersion`).
+   */
   isStale(): boolean {
-    if (!this.lastFetched) return true;
-    const age = Date.now() - new Date(this.lastFetched).getTime();
-    return age > STALE_MS;
+    return this.version === null;
+  }
+
+  /**
+   * React to learning the current gameserver version. If it differs from the
+   * catalog we already hold, reconcile: a *conditional* GET fetches the fresh
+   * `catalog.json` only once the file has actually been republished (a `304`
+   * keeps us cheap until then), so a new patch lands within moments of the
+   * first version report — no 24h wait, no download storm.
+   *
+   * @returns `true` if a fresh catalog was downloaded.
+   */
+  async noteGameServerVersion(gsVersion: string | null): Promise<boolean> {
+    if (!gsVersion) return false;
+    // Already holding a catalog that matches the live gameserver version.
+    if (this.version === gsVersion) {
+      this.lastGameServerVersion = gsVersion;
+      return false;
+    }
+    const now = Date.now();
+    // A different version is in play but we already reconciled for THIS exact
+    // version recently (server may not have republished the catalog file yet) —
+    // back off until the cooldown elapses so the fleet doesn't hammer it.
+    if (gsVersion === this.lastGameServerVersion && now - this.lastReconcileAt < RECONCILE_COOLDOWN_MS) {
+      return false;
+    }
+    this.lastGameServerVersion = gsVersion;
+    this.lastReconcileAt = now;
+    try {
+      return await this.fetchFromLib(false);
+    } catch {
+      return false;
+    }
   }
 
   // ── Fetch the raw catalog.json (preserves all sections) ───
@@ -256,39 +361,52 @@ class CatalogStore {
   /**
    * Fetch the catalog directly from the server's `catalog.json` endpoint and
    * store it verbatim. Replaces the previous `client.catalog()` path, which
-   * silently dropped any top-level key it didn't explicitly model.
+   * silently dropped any top-level key it didn't explicitly model AND cached
+   * the catalog for the process lifetime — so the version never updated and a
+   * new game release went unnoticed.
+   *
+   * Uses the server's `ETag`/`Last-Modified` headers to issue a *conditional*
+   * request: if the catalog hasn't changed since our last fetch the server
+   * answers `304` with no body and we keep the cached copy (just bumping
+   * `lastFetched`). This is what reliably detects a new game version — both on
+   * a scheduled refresh and on every client restart — without re-downloading.
+   *
+   * @param force When true, ignore any cached validation token and always
+   *   re-download (used by master/slave sync that must publish a fresh copy).
+   * @returns `true` if the catalog was actually updated, `false` on a `304`.
    */
-  async fetchFromLib(): Promise<void> {
+  async fetchFromLib(force = false): Promise<boolean> {
     if (this._fetchPromise) return this._fetchPromise;
-    this._fetchPromise = this._doFetchFromLib().finally(() => {
+    this._fetchPromise = this._doFetchFromLib(force).finally(() => {
       this._fetchPromise = null;
     });
     return this._fetchPromise;
   }
 
-  private async _doFetchFromLib(): Promise<void> {
-    const raw = await fetchRawCatalog(getSpacemoltClient().httpBaseUrl);
-    this.applyRaw(raw);
+  private async _doFetchFromLib(force: boolean): Promise<boolean> {
+    const ifNoneMatch = force ? null : this.etag;
+    const ifModifiedSince = force ? null : this.lastModified;
+    const res = await fetchRawCatalog(getSpacemoltClient().httpBaseUrl, { ifNoneMatch, ifModifiedSince });
+
+    // `304 Not Modified` — server's "it hasn't changed" signal. Keep the
+    // cached payload; only refresh the staleness timestamp (and re-persist the
+    // surviving validation tokens). No body was returned to apply.
+    if (res.status === 304) {
+      this.lastFetched = new Date().toISOString();
+      this.dirty = true;
+      this.writeToDisk();
+      debugLog("catalog", "Catalog unchanged (HTTP 304) — kept cached copy");
+      return false;
+    }
+
+    this.applyRaw(res.data!);
+    this.etag = res.etag;
+    this.lastModified = res.lastModified;
     this.lastFetched = new Date().toISOString();
     this.dirty = true;
     this.writeToDisk();
     debugLog("catalog", `Fetched raw catalog.json: ${this.getSummary()}`);
-  }
-
-  /**
-   * Compare the server's catalog version against what we have. Uses the
-   * library's `catalog()` (cached, cheap) purely to read the `version` string;
-   * the actual payload is fetched separately via `_doFetchFromLib` so we keep
-   * the full, un-stripped file.
-   */
-  async checkVersionChangedLib(): Promise<boolean> {
-    if (this.version === null) return true;
-    try {
-      const cache = await getSpacemoltClient().catalog();
-      return (cache.version ?? null) !== this.version;
-    } catch {
-      return false;
-    }
+    return true;
   }
 
 

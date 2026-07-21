@@ -16,6 +16,7 @@
  */
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { catalogStore } from "../catalogstore.js";
 import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureUndocked,
@@ -325,6 +326,11 @@ function isBulkSkipItem(itemId: string): boolean {
     lower === "military_fuel_cell" ||
     lower.includes("energy_cell")
   );
+}
+
+function isHazardousItem(itemId: string): boolean {
+  const item = catalogStore.getItem(itemId);
+  return item?.hazardous === true;
 }
 
 /** Dynamically-generated packages (`package:*`). They are NOT in the local
@@ -1195,6 +1201,12 @@ function findMoveJobs(
       continue;
     }
 
+    // Skip hazardous items unless the bot has lead-lined cargo hold modules.
+    if (isHazardousItem(configItem.itemId) && bot.hasLeadLinedCargoHold === false) {
+      ctx.log("cargo", `  ${configItem.itemName}: skipping hazardous item (no lead-lined cargo module)`);
+      continue;
+    }
+
     // Delivered progress = max of persisted settings count and activity-log
     // progress (robust across restarts / manual edits).
     const delivered = Math.max(
@@ -1498,24 +1510,29 @@ function planBulkItems(
   settings: CargoMoverSettings,
   destHas: Set<string>,
 ): Array<{ itemId: string; itemName: string; quantity: number }> {
-  const { bot } = ctx;
-  let candidates = sourceItems.filter((i) => {
-    if (!i.itemId || i.quantity <= 0) return false;
-    if (isBulkSkipItem(i.itemId)) return false;
-    // Never load dynamically-generated packages — they're not in the catalog
-    // and inspecting them to learn their size would spam rate-limited commands
-    // and get us banned. They're blocked from the cargo mover entirely.
-    if (isPackageItem(i.itemId)) return false;
-    // Items that already have a presence at the destination are skipped while
-    // seeding — we bring every OTHER item in first, then seed them on a later
-    // pass once the rest all have a presence.
-    if (settings.bulkSeedMode && destHas.has(i.itemId)) return false;
-    if (i.quantity > settings.bulkIgnoreOver) {
-      ctx.log("cargo", `  ⏭️ Skipping ${i.name}: ${i.quantity} in storage exceeds ignore-over threshold (${settings.bulkIgnoreOver})`);
-      return false;
-    }
-    return true;
-  });
+const { bot } = ctx;
+   let candidates = sourceItems.filter((i) => {
+     if (!i.itemId || i.quantity <= 0) return false;
+     if (isBulkSkipItem(i.itemId)) return false;
+     // Never load dynamically-generated packages — they're not in the catalog
+     // and inspecting them to learn their size would spam rate-limited commands
+     // and get us banned. They're blocked from the cargo mover entirely.
+     if (isPackageItem(i.itemId)) return false;
+// Skip hazardous items unless the bot has lead-lined cargo hold modules.
+      if (isHazardousItem(i.itemId) && bot.hasLeadLinedCargoHold === false) {
+        ctx.log("cargo", `  ⏭️ Skipping ${i.name}: hazardous item (no lead-lined cargo module)`);
+        return false;
+      }
+     // Items that already have a presence at the destination are skipped while
+     // seeding — we bring every OTHER item in first, then seed them on a later
+     // pass once the rest all have a presence.
+     if (settings.bulkSeedMode && destHas.has(i.itemId)) return false;
+     if (i.quantity > settings.bulkIgnoreOver) {
+       ctx.log("cargo", `  ⏭️ Skipping ${i.name}: ${i.quantity} in storage exceeds ignore-over threshold (${settings.bulkIgnoreOver})`);
+       return false;
+     }
+     return true;
+   });
 
   // During seed mode, cap each item to the seed amount.
   let planned = candidates.map((i) => ({

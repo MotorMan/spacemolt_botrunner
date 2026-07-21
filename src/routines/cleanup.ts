@@ -33,6 +33,7 @@ import {
   handleBattleNotifications,
   getBattleStatus,
   fleeFromBattle,
+  enableCloakingIfPossible,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -44,6 +45,8 @@ function getCleanupSettings(username?: string): {
   repairThreshold: number;
   focusStationId: string;
   depositAllStorage: boolean;
+  enableCloak: boolean;
+  cloakIgnoreBlacklist: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -58,6 +61,8 @@ function getCleanupSettings(username?: string): {
     repairThreshold: (t.repairThreshold as number) || 40,
     focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
     depositAllStorage: (t.depositAllStorage as boolean) ?? true,
+    enableCloak: (t.enableCloak as boolean) ?? false,
+    cloakIgnoreBlacklist: (t.cloakIgnoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -82,6 +87,55 @@ interface StorageHintEntry {
   name?: string;
   items?: number;
   credits?: number;
+}
+
+// ── Cloaking helpers ────────────────────────────────────────
+
+/** Re-cloak the ship whenever it is undocked and has a cloak module. */
+async function ensureCloaked(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.docked) return bot.isCloaked;
+  if (bot.isCloaked) {
+    ctx.log("cleanup", "Cloak already active");
+    return true;
+  }
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("cleanup", "Cloaking enabled (ship has cloak module)");
+  } else {
+    ctx.log("cleanup", "No cloaking module available — could not cloak");
+  }
+  return cloaked;
+}
+
+/** Undock and re-cloak. Use before any jump/travel. */
+async function undockForTravel(ctx: RoutineContext): Promise<void> {
+  await ensureUndocked(ctx);
+  await ensureCloaked(ctx);
+}
+
+/** Enable cloak at startup/cycle start: undock, cloak, re-dock. */
+async function enableCloakAtDock(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
+  if (!settings.enableCloak) return;
+  const { bot } = ctx;
+  if (bot.isCloaked) return;
+  if (!bot.docked) {
+    ctx.log("cleanup", "Not docked — cannot enable cloak at dock, will cloak before travel instead");
+    return;
+  }
+  ctx.log("cleanup", "Undocking before cloaking to control state...");
+  await ensureUndocked(ctx);
+  await ctx.sleep(500);
+  await bot.refreshShip();
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("cleanup", "Cloaking enabled — re-docking at home station");
+    try {
+      await ensureDocked(ctx);
+    } catch {
+      // dock failed — that's okay, we're cloaked and can travel
+    }
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -774,7 +828,20 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
     };
+
+    // ── Cloak: enable at startup/cycle start if configured ──
+    await enableCloakAtDock(ctx, settings);
+
+    // ── Cloak: re-enable after refuel/rescue if lost ──
+    if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+      ctx.log("cleanup", "Cloak check: not cloaked, attempting to re-enable...");
+      const cloaked = await enableCloakingIfPossible(ctx);
+      if (cloaked) {
+        ctx.log("cleanup", "Cloaking re-enabled successfully");
+      }
+    }
 
     // ── Phase 0: Clean home station storage ──
     yield "clean_home_station";
@@ -1052,7 +1119,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalItems = 0;
 
     // Sort by distance (same-system first, then by jump count, avoiding blacklisted systems)
-    const blacklist = getSystemBlacklist();
+    const blacklist = bot.isCloaked && settings.cloakIgnoreBlacklist ? [] : getSystemBlacklist();
     stationsWithStorage.sort((a, b) => {
       const aLocal = a.systemId === bot.system ? 0 : 1;
       const bLocal = b.systemId === bot.system ? 0 : 1;
@@ -1072,7 +1139,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("travel", `Heading to ${station.poiName} in ${station.systemId}...`);
 
       if (bot.system !== station.systemId) {
-        await ensureUndocked(ctx);
+        await undockForTravel(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
           ctx.log("error", `Cannot refuel to reach ${station.systemId} — skipping`);
@@ -1111,7 +1178,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx);
       
       // Force refresh status to get accurate poi after undocking
       await bot.refreshLocation();
@@ -1205,6 +1272,11 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       if (storedCredits === 0 && !hasItems) {
         ctx.log("info", `${station.poiName}: empty — skipping`);
         await tryRefuel(ctx);
+        // Re-enable cloak after refuel if we were rescued and settings allow it
+        if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+          ctx.log("cleanup", "Re-enabling cloak after refuel...");
+          await enableCloakingIfPossible(ctx);
+        }
         // If this is the only station (or last station), we're done - don't keep looping
         if (stationsWithStorage.length === 1) {
           ctx.log("info", "Only station was empty - ending cleanup cycle");
@@ -1262,6 +1334,11 @@ for (const order of orderList) {
 
       // Refuel while docked
       await tryRefuel(ctx);
+      // Re-enable cloak after refuel if we were rescued and settings allow it
+      if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+        ctx.log("cleanup", "Re-enabling cloak after refuel...");
+        await enableCloakingIfPossible(ctx);
+      }
 
       // If cargo >= 80% full, deposit at home before continuing
       await bot.refreshCargo();

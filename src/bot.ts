@@ -330,10 +330,11 @@ docked = false;
   /** The ID of the wreck being towed (if any). */
   towingWreckId: string | null = null;
 
-  shipSpeed = 1;
-  hasPathfinderDrive = false;
-  hasEmergencyWarpStabilizer: boolean | null = null;
-  installedMods: string[] = [];
+shipSpeed = 1;
+   hasPathfinderDrive = false;
+   hasEmergencyWarpStabilizer: boolean | null = null;
+   installedMods: string[] = [];
+   hasLeadLinedCargoHold: boolean | null = null;
   /** Outstanding bounties (credits) keyed by faction. Parsed in applyStatusResult. */
   bounties: Record<string, number> = {};
   lastKnownTick?: number;
@@ -1782,10 +1783,11 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       } else if (ship.ammo != null) {
         this.ammo = ship.ammo as number;
       }
-      const ews = this.hasEwsModule(modulesArray);
-      if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
-      this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-    }
+const ews = this.hasEwsModule(modulesArray);
+       if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
+       this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+       this.updateLeadLinedCargoFromModules(modulesArray);
+     }
 
     // Towing state handling - moved outside ship block since it's on player/location
     if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
@@ -1908,6 +1910,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
         const ews = this.hasEwsModule(modulesArray);
         if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
+        this.updateLeadLinedCargoFromModules(modulesArray);
         this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
       }
       const creditsValue = r.credits ?? player?.credits;
@@ -2584,6 +2587,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.hasPathfinderDrive = this.hasPathfinderModule(modules);
       const ews = this.hasEwsModule(modules);
       if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
+      this.updateLeadLinedCargoFromModules(modules);
     }
     return this.installedMods;
   }
@@ -2630,6 +2634,30 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
     }
     // We had real module objects but none were EWS → definitively absent.
     return sawResolvable ? false : null;
+  }
+
+  /** Detect whether the ship has lead-lined cargo modules. */
+  private hasLeadLinedCargoModule(modules: Array<Record<string, unknown> | string>): boolean | null {
+    if (modules.length === 0) return null;
+    for (const m of modules) {
+      if (typeof m === "string") continue;
+      const mod = m as Record<string, unknown>;
+      const modId = (mod.type_id as string) || (mod.module_id as string) || (mod.mod_id as string) || "";
+      const modName = (mod.name as string) || "";
+      const modType = (mod.type as string) || "";
+      const modSpecial = (mod.special as string) || "";
+      const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`.toLowerCase();
+      if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Update the cached lead-lined cargo flag from module list. */
+  private updateLeadLinedCargoFromModules(modules: Array<Record<string, unknown> | string>): void {
+    const result = this.hasLeadLinedCargoModule(modules);
+    if (result !== null) this.hasLeadLinedCargoHold = result;
   }
 
   /**

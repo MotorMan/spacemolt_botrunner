@@ -13203,6 +13203,8 @@
         const cleanupStation = cleanup.homeStation || "";
         const focusStationId = cleanup.focusStationId || "";
         const depositAllStorage = cleanup.depositAllStorage !== false;
+        const enableCloak = cleanup.enableCloak === true;
+        const cloakIgnoreBlacklist = cleanup.cloakIgnoreBlacklist === true;
         const generalSystem = general.factionStorageSystem || "";
         const generalStation = general.factionStorageStation || "";
 
@@ -13280,6 +13282,28 @@
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable Cloak</div>
+        <div class="setting-hint">When enabled, the cleanup bot will cloak on startup and before each travel jump. Cloaked bots are immune to pirate ambushes and can safely enter blacklisted systems when Cloak Ignore Blacklist is also enabled.</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="set-cleanup-enableCloak"${enableCloak ? " checked" : ""} />
+        <span>Enable cloaking</span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Cloak Ignore Blacklist</div>
+        <div class="setting-hint">When enabled with cloaking, cleanup can enter blacklisted systems (pirate zones, hot zones). Cloaked bots are invulnerable to attacks, making this safe for high-risk operations.</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="set-cleanup-cloakIgnoreBlacklist"${cloakIgnoreBlacklist ? " checked" : ""} />
+        <span>Ignore blacklist while cloaked</span>
+      </label>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveCleanupSettings()">Save Settings</button>
     </div>
@@ -13297,11 +13321,17 @@
         const depositAllStorage =
           document.getElementById("set-cleanup-depositAllStorage").value ===
           "true";
+        const enableCloak =
+          document.getElementById("set-cleanup-enableCloak")?.checked ?? false;
+        const cloakIgnoreBlacklist =
+          document.getElementById("set-cleanup-cloakIgnoreBlacklist")?.checked ?? false;
         const s = {
           homeSystem,
           homeStation,
           focusStationId,
           depositAllStorage,
+          enableCloak,
+          cloakIgnoreBlacklist,
         };
         send({ type: "saveSettings", routine: "cleanup", settings: s });
         settings.cleanup = Object.assign(settings.cleanup || {}, s);

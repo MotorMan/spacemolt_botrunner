@@ -3542,6 +3542,31 @@ this.currentBattle.lastUpdate = Date.now();
               await this.sendBattleResponseToAI(attackerName, totalDamage);
 }
           }
+        } else if (msgType === "battle_alert" && data && typeof data === "object") {
+         const alertData = data as Record<string, unknown>;
+         const battleId = (alertData.battle_id as string) || "";
+         const systemId = (alertData.system_id as string) || "";
+         const participants = Array.isArray(alertData.participants)
+           ? (alertData.participants as Array<Record<string, unknown>>)
+           : [];
+         const sides = Array.isArray(alertData.sides)
+           ? (alertData.sides as Array<Record<string, unknown>>)
+           : [];
+         const message = (alertData.message as string) || "";
+
+         if (battleId) {
+           const isAtBattleSystem = systemId && systemId === this.system;
+           const isDockedAtStation = this.docked;
+
+           if ((isAtBattleSystem || systemId === "") && isDockedAtStation) {
+             this.currentBattle.inBattle = true;
+             this.currentBattle.battleId = battleId;
+             this.currentBattle.lastUpdate = Date.now();
+             this.currentBattle.participants = participants;
+
+             debugLogForBot(this.username, "bot:battle", `${this.username} battle_alert: ${battleId} at station (${message})`);
+           }
+         }
         } else if ((msgType === "crafting_update" || type === "crafting_update") && data && typeof data === "object") {
           const d = data as Record<string, unknown>;
           const jobs = (d.jobs as Array<Record<string, unknown>>) || [];

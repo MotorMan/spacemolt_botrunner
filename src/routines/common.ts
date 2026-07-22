@@ -1548,7 +1548,7 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -1561,13 +1561,29 @@ export async function ensureFueled(
   await bot.refreshLocation();
   if (ctx.bot.isInBattle()) {
     ctx.log("combat", "Fuel check interrupted by battle — resolving combat before fueling (in battle, fuel does not matter!)");
-    const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
-    if (fled || !ctx.bot.isInBattle()) {
-      // Battle resolved (or was a stale flag) — re-evaluate fuel below.
+    if (!opts?.skipFleeCheck) {
+      const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
+      if (fled || !ctx.bot.isInBattle()) {
+        // Battle resolved (or was a stale flag) — re-evaluate fuel below.
+      } else {
+        // Still in battle and couldn't resolve it — bail so the caller can retry.
+        ctx.log("combat", "Still in battle after flee attempt — cannot fuel now, returning to caller");
+        return false;
+      }
     } else {
-      // Still in battle and couldn't resolve it — bail so the caller can retry.
-      ctx.log("combat", "Still in battle after flee attempt — cannot fuel now, returning to caller");
-      return false;
+      // Combat routine: do not auto-flee from here. Clear stale state if the
+      // API disagrees, otherwise return control so the caller can handle the
+      // battle with proper analysis (fight / flee based on tier / hull).
+      const status = await getBattleStatus(ctx);
+      if (!status && ctx.bot.isInBattle()) {
+        ctx.log("combat", "Clearing stale WebSocket battle state (API reports no battle)");
+        ctx.bot.currentBattle.inBattle = false;
+        ctx.bot.currentBattle.battleId = null;
+        ctx.bot.currentBattle.participants = [];
+      } else if (status) {
+        ctx.log("combat", "Active battle detected during fuel check — returning to caller to handle combat");
+        return false;
+      }
     }
   }
 
@@ -2216,8 +2232,8 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked) });
-     if (!fueled) {
+      const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+      if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }

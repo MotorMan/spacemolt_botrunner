@@ -1107,7 +1107,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -1686,7 +1686,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -2104,9 +2104,35 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
+    // ── Battle check — defend the station if under attack ──
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus && battleStatus.is_participant) {
+      ctx.log("combat", `⚠️ Station under attack (ID: ${battleStatus.battle_id}) — defending as hunter!`);
+      await stationProtectionFight(ctx, settings);
+      ctx.log("info", "Station defense complete — returning to protection post.");
+      if (bot.system !== originalSystem) {
+        ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
+        const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", `Could not return to ${originalSystem} — staying in ${bot.system}`);
+        }
+      }
+      if (bot.poi !== originalPoi) {
+        ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
+        const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
+        } else {
+          bot.poi = originalPoi;
+        }
+      }
+      await dockAtStation(ctx);
+      continue;
+    }
+
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);

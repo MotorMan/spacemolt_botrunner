@@ -1012,91 +1012,126 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
 
-  // Register the bot chat channel listener so allied hunters can pull us into
-  // creature/pirate battles happening in our POI.
-  ensureHunterCoordListener(bot.username);
+  // Observation setup
+  let observationUnsub: (() => void) | null = null;
+  // Initial observation subscription (passive)
+  if (bot.account) {
+    try {
+      await bot.subscribeToObservation(false);
+      ctx.log("info", "Subscribed to observation (passive)");
 
-  // Cloak on start if cloakOnStart is enabled.
-  // Cloaking requires being UNDOCKED, so if we're docked we undock first, activate
-  // the cloak, then immediately re-dock so the start-of-routine resupply (which can
-  // only run while docked) still works. This prevents the ship from getting stuck
-  // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
-  const wasDockedAtStart = bot.docked;
-  if (initialSettings.mode !== "station_protection" && initialSettings.cloakOnStart && !bot.isCloaked) {
-    // Undock first if currently docked — the cloak command cannot enable while docked.
-    if (bot.docked) {
-      const undockResp = await bot.exec("undock");
-      if (!undockResp.error) {
-        bot.docked = false;
-      } else {
-        ctx.log("warn", `Failed to undock for cloak: ${undockResp.error.message}`);
-      }
+      // Set up listener for observation updates
+      const obsHandler = (payload: any) => {
+        ctx.log("info", `Observation update: ${JSON.stringify(payload)}`);
+      };
+      // @ts-ignore: account.on exists
+      const off = bot.account.on("observation_update", obsHandler);
+      observationUnsub = off;
+      ctx.log("info", "Listening for observation updates");
+    } catch (err) {
+      ctx.log("error", `Failed to subscribe to observation: ${err}`);
     }
+  } else {
+    ctx.log("warn", "Bot account not available, skipping observation subscription");
+  }
 
-    const cloakResp = await bot.exec("cloak", { enable: true });
-    if (!cloakResp.error) {
-      ctx.log("system", "Cloak enabled on routine start (cloakOnStart)");
+  try {
+    // Register the bot chat channel listener so allied hunters can pull us into
+    // creature/pirate battles happening in our POI.
+    ensureHunterCoordListener(bot.username);
 
-      // Re-dock so we remain at the station for the start-of-routine resupply.
-      if (wasDockedAtStart) {
-        const redockResp = await bot.exec("dock");
-        if (!redockResp.error || (redockResp.error?.message || "").toLowerCase().includes("already")) {
-          bot.docked = true;
+    // Cloak on start if cloakOnStart is enabled.
+    // Cloaking requires being UNDOCKED, so if we're docked we undock first, activate
+    // the cloak, then immediately re-dock so the start-of-routine resupply (which can
+    // only run while docked) still works. This prevents the ship from getting stuck
+    // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
+    const wasDockedAtStart = bot.docked;
+    if (initialSettings.mode !== "station_protection" && initialSettings.cloakOnStart && !bot.isCloaked) {
+      // Undock first if currently docked — the cloak command cannot enable while docked.
+      if (bot.docked) {
+        const undockResp = await bot.exec("undock");
+        if (!undockResp.error) {
+          bot.docked = false;
         } else {
-          ctx.log("warn", `Failed to re-dock after cloak (continuing undocked): ${redockResp.error.message}`);
+          ctx.log("warn", `Failed to undock for cloak: ${undockResp.error.message}`);
         }
       }
-    } else {
-      const msg = cloakResp.error.message.toLowerCase();
-      if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
-        ctx.log("warn", `Failed to cloak on start: ${cloakResp.error.message}`);
+
+      const cloakResp = await bot.exec("cloak", { enable: true });
+      if (!cloakResp.error) {
+        ctx.log("system", "Cloak enabled on routine start (cloakOnStart)");
+
+        // Re-dock so we remain at the station for the start-of-routine resupply.
+        if (wasDockedAtStart) {
+          const redockResp = await bot.exec("dock");
+          if (!redockResp.error || (redockResp.error?.message || "").toLowerCase().includes("already")) {
+            bot.docked = true;
+          } else {
+            ctx.log("warn", `Failed to re-dock after cloak (continuing undocked): ${redockResp.error.message}`);
+          }
+        }
+      } else {
+        const msg = cloakResp.error.message.toLowerCase();
+        if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+          ctx.log("warn", `Failed to cloak on start: ${cloakResp.error.message}`);
+        }
+      }
+    }
+
+    // If we started the routine while docked at home base, refuel, repair, then restock
+    if (bot.docked) {
+      await repairShip(ctx);
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      await ensureHunterResupply(ctx);
+      if (initialSettings.mode !== "station_protection") {
+        await ensureUndocked(ctx);
+      }
+      await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
+    }
+
+    // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
+    if (initialSettings.mode !== "station_protection") {
+      await useRepairKits(ctx);
+    }
+
+    if (initialSettings.mode === "roam_system") {
+      yield* roamSystemRoutine(ctx);
+      return;
+    }
+    if (initialSettings.mode === "stationary") {
+      yield* stationaryRoutine(ctx);
+      return;
+    }
+    if (initialSettings.mode === "patrol_systems") {
+      yield* patrolSystemsRoutine(ctx);
+      return;
+    }
+    if (initialSettings.mode === "cycle_patrols") {
+      yield* cyclePatrolsRoutine(ctx);
+      return;
+    }
+    if (initialSettings.mode === "patrol_radius") {
+      yield* patrolRadiusRoutine(ctx);
+      return;
+    }
+    if (initialSettings.mode === "station_protection") {
+      yield* stationProtectionRoutine(ctx);
+      return;
+    }
+
+    // Default to roam_systems
+    yield* roamSystemsRoutine(ctx);
+  } finally {
+    // Clean up observation subscription
+    if (observationUnsub) {
+      try {
+        observationUnsub();
+        ctx.log("info", "Unsubscribed from observation updates");
+      } catch (err) {
+        ctx.log("error", `Error unsubscribing from observation updates: ${err}`);
       }
     }
   }
-
-  // If we started the routine while docked at home base, refuel, repair, then restock
-  if (bot.docked) {
-    await repairShip(ctx);
-    await tryRefuel(ctx, { skipApprovedCheck: true });
-    await ensureHunterResupply(ctx);
-    if (initialSettings.mode !== "station_protection") {
-      await ensureUndocked(ctx);
-    }
-    await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
-  }
-
-  // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
-  if (initialSettings.mode !== "station_protection") {
-    await useRepairKits(ctx);
-  }
-
-  if (initialSettings.mode === "roam_system") {
-    yield* roamSystemRoutine(ctx);
-    return;
-  }
-  if (initialSettings.mode === "stationary") {
-    yield* stationaryRoutine(ctx);
-    return;
-  }
-  if (initialSettings.mode === "patrol_systems") {
-    yield* patrolSystemsRoutine(ctx);
-    return;
-  }
-  if (initialSettings.mode === "cycle_patrols") {
-    yield* cyclePatrolsRoutine(ctx);
-    return;
-  }
-  if (initialSettings.mode === "patrol_radius") {
-    yield* patrolRadiusRoutine(ctx);
-    return;
-  }
-  if (initialSettings.mode === "station_protection") {
-    yield* stationProtectionRoutine(ctx);
-    return;
-  }
-
-  // Default to roam_systems
-  yield* roamSystemsRoutine(ctx);
 };
 
 // ── Roam Systems Routine (original behavior) ────────────────────

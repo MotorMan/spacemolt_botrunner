@@ -28599,7 +28599,7 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-label">Min Pirates to Flee</div>
         <div class="setting-hint">Flee from combat if this many or more pirates are present in the area.</div>
       </div>
-      <input type="number" id="set-hunter-minPiratesToFlee" min="1" max="10" value="${minPiratesToFlee}">
+      <input type="number" id="set-hunter-minPiratesToFlee" min="1" max="100" value="${minPiratesToFlee}">
     </div>
 
     <div class="setting-row">
@@ -29155,7 +29155,7 @@ ignoreBlacklist: document.getElementById(
           <div class="setting-label">Min Pirates to Flee</div>
           <div class="setting-hint">Flee from combat if this many or more pirates are present in the area.</div>
         </div>
-        <input type="number" id="set-escort-minPiratesToFlee" min="1" max="10" value="${globalMinPiratesToFlee}">
+        <input type="number" id="set-escort-minPiratesToFlee" min="1" max="100" value="${globalMinPiratesToFlee}">
       </div>
 
       <div class="setting-row">
@@ -29487,7 +29487,7 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-label">Min Pirates to Flee</div>
         <div class="setting-hint">Flee from combat if this many or more pirates are present.</div>
       </div>
-      <input type="number" id="set-fleet-hunter-minPiratesToFlee" min="1" max="10" value="${minPiratesToFlee}">
+      <input type="number" id="set-fleet-hunter-minPiratesToFlee" min="1" max="100" value="${minPiratesToFlee}">
     </div>
 
     <div class="setting-row">
@@ -34369,7 +34369,7 @@ ignoreBlacklist: document.getElementById(
 
       <div class="cmd-group">
         <label>Min Pirates to Flee</label>
-        <input type="number" id="fc-min-pirates-flee" min="1" max="10" value="${fleetHunterSettings.minPiratesToFlee ?? 3}">
+        <input type="number" id="fc-min-pirates-flee" min="1" max="100" value="${fleetHunterSettings.minPiratesToFlee ?? 3}">
         <button class="sm" onclick="fcSetMinPiratesFlee()">Save</button>
       </div>
 

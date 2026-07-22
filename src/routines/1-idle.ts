@@ -6,6 +6,10 @@
  * and refreshes the bot's cargo + location so its dashboard/status stays
  * current. It takes no game actions and never moves the ship, so it is safe to
  * leave running on any idle bot.
+ *
+ * Additionally, this routine subscribes to passive observation to receive live
+ * updates about nearby objects, system agents, and signatures. It resubscribes
+ * whenever the bot's location (system/POI) changes.
  */
 import type { Routine, RoutineContext } from "../bot.js";
 
@@ -13,6 +17,32 @@ const IDLE_INTERVAL_MS = 30_000;
 
 export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
+
+  // Track observation subscription state
+  let observationUnsub: (() => void) | null = null;
+  let lastObservationPoiId: string = bot.poi;
+  let lastObservationSystemId: string = bot.system;
+
+  // Initial observation subscription (passive)
+  if (bot.account) {
+    try {
+      await bot.subscribeToObservation(false);
+      ctx.log("info", "Subscribed to observation (passive)");
+
+      // Set up listener for observation updates
+      const obsHandler = (payload: any) => {
+        ctx.log("info", `Observation update: ${JSON.stringify(payload)}`);
+      };
+      // @ts-ignore: account.on exists
+      const off = bot.account.on("observation_update", obsHandler);
+      observationUnsub = off;
+      ctx.log("info", "Listening for observation updates");
+    } catch (err) {
+      ctx.log("error", `Failed to subscribe to observation: ${err}`);
+    }
+  } else {
+    ctx.log("warn", "Bot account not available, skipping observation subscription");
+  }
 
   while (bot.state === "running") {
     yield "anti_idle";
@@ -42,6 +72,60 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("warn", "Anti-idle location refresh failed");
     });
 
+    // Check if location (system/POI) has changed since last observation subscription
+    if (
+      bot.poi !== lastObservationPoiId ||
+      bot.system !== lastObservationSystemId
+    ) {
+      ctx.log("info", `Location changed from ${lastObservationSystemId}/${lastObservationPoiId} to ${bot.system}/${bot.poi}`);
+
+      // Clean up existing observation subscription
+      if (observationUnsub) {
+        try {
+          observationUnsub();
+          ctx.log("info", "Unsubscribed from observation updates due to location change");
+        } catch (err) {
+          ctx.log("error", `Error unsubscribing from observation updates: ${err}`);
+        }
+        observationUnsub = null;
+      }
+
+      // Attempt to resubscribe to observation for new location
+      if (bot.account) {
+        try {
+          await bot.subscribeToObservation(false);
+          ctx.log("info", `Subscribed to observation (passive) for new location: ${bot.system}/${bot.poi}`);
+
+          // Set up listener for observation updates
+          const obsHandler = (payload: any) => {
+            ctx.log("info", `Observation update: ${JSON.stringify(payload)}`);
+          };
+          // @ts-ignore: account.on exists
+          const off = bot.account.on("observation_update", obsHandler);
+          observationUnsub = off;
+          ctx.log("info", "Listening for observation updates");
+
+          // Update last known location
+          lastObservationPoiId = bot.poi;
+          lastObservationSystemId = bot.system;
+        } catch (err) {
+          ctx.log("error", `Failed to subscribe to observation for new location: ${err}`);
+        }
+      } else {
+        ctx.log("warn", "Bot account not available, skipping observation resubscription");
+      }
+    }
+
     await ctx.sleep(IDLE_INTERVAL_MS);
+  }
+
+  // Clean up observation subscription on routine exit
+  if (observationUnsub) {
+    try {
+      observationUnsub();
+      ctx.log("info", "Unsubscribed from observation updates");
+    } catch (err) {
+      ctx.log("error", `Error unsubscribing from observation updates: ${err}`);
+    }
   }
 };

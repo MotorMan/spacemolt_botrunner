@@ -3250,8 +3250,9 @@ getSkillLevel(skillId: string): number {
    * Anchors a watch at the current POI/system and returns the initial snapshot.
    * Subsequent updates arrive via observation_update push events.
    */
-  async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
-    const libObs = this.libObservationState();
+async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
+     console.error(`[${this.username}] >>> subscribeToObservation called activeScan=${activeScan}`);
+     const libObs = this.libObservationState();
     if (libObs.subscribed && !activeScan) {
       console.error(`[${this.username}] >>> subscribeToObservation(library already active=true, porting cache)`);
       this.observationSession = { id: "active", poi_id: libObs.poiId, system_id: libObs.systemId };
@@ -3327,20 +3328,21 @@ getSkillLevel(skillId: string): number {
    * Return a synthetic get_nearby-shaped result built from the live
    * observation cache, so existing parseNearby() logic keeps working.
    */
-  getObservationResult(): Record<string, unknown> {
-    return {
-      nearby: this.observationNearby,
-      system_agents: this.observationSystemAgents,
-      players: this.observationNearby,
-      objects: this.observationNearby,
-      nearby_players: this.observationNearby,
-      ships: [],
-      pirates: [],
-      creatures: [],
-      empire_npcs: [],
-      unknown_signature: this.observationUnknownSignature,
-    };
-  }
+getObservationResult(): Record<string, unknown> {
+     const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
+     return {
+       nearby: allNearby,
+       system_agents: this.observationSystemAgents,
+       players: this.observationNearby,
+       objects: this.observationNearby,
+       nearby_players: this.observationNearby,
+       ships: [],
+       pirates: [],
+       creatures: [],
+       empire_npcs: [],
+       unknown_signature: this.observationUnknownSignature,
+     };
+   }
 
   /**
    * Process an observation_update push event from the server and update
@@ -3365,49 +3367,50 @@ getSkillLevel(skillId: string): number {
     this.observationTick = tick;
     this.observationUnknownSignature = unknownSig;
 
-    const nearbyMap = new Map<string, Record<string, unknown>>();
-    for (const e of this.observationNearby) {
-      const key = (e.username as string) || (e.player_id as string) || "";
-      if (key) nearbyMap.set(key, e);
-    }
-    for (const e of this.observationSystemAgents) {
-      const key = (e.username as string) || (e.player_id as string) || "";
-      if (key) nearbyMap.set(key, e);
-    }
+const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
+     const systemNpcMap = new Map<string, Record<string, unknown>>();
+     for (const e of this.observationNearby) {
+       const key = (e.username as string) || (e.player_id as string) || "";
+       if (key) nearbyPlayerMap.set(key, e);
+     }
+     for (const e of this.observationSystemAgents) {
+       const key = (e.username as string) || (e.player_id as string) || "";
+       if (key) systemNpcMap.set(key, e);
+     }
 
-    const departures: string[] = [];
-    if (Array.isArray(data.nearby_departed)) {
-      for (const pid of data.nearby_departed as string[]) {
-        nearbyMap.delete(pid);
-        departures.push(pid);
-      }
-    }
-    if (Array.isArray(data.system_departed)) {
-      for (const pid of data.system_departed as string[]) {
-        nearbyMap.delete(pid);
-        departures.push(pid);
-      }
-    }
-    if (departures.length > 0) {
-      debugLogForBot(this.username, "bot:observation", `${this.username} observation departed: ${departures.join(", ")}`);
-      this.log("observation", `Departed: ${departures.join(", ")}`);
-    }
+     const departures: string[] = [];
+     if (Array.isArray(data.nearby_departed)) {
+       for (const pid of data.nearby_departed as string[]) {
+         nearbyPlayerMap.delete(pid);
+         departures.push(pid);
+       }
+     }
+     if (Array.isArray(data.system_departed)) {
+       for (const pid of data.system_departed as string[]) {
+         systemNpcMap.delete(pid);
+         departures.push(pid);
+       }
+     }
+     if (departures.length > 0) {
+       debugLogForBot(this.username, "bot:observation", `${this.username} observation departed: ${departures.join(", ")}`);
+       this.log("observation", `Departed: ${departures.join(", ")}`);
+     }
 
-    if (Array.isArray(data.nearby_changed)) {
-      for (const e of data.nearby_changed as Array<Record<string, unknown>>) {
-        const key = (e.username as string) || (e.player_id as string) || "";
-        if (key) nearbyMap.set(key, e);
-      }
-    }
-    if (Array.isArray(data.system_changed)) {
-      for (const e of data.system_changed as Array<Record<string, unknown>>) {
-        const key = (e.username as string) || (e.player_id as string) || "";
-        if (key) nearbyMap.set(key, e);
-      }
-    }
+     if (Array.isArray(data.nearby_changed)) {
+       for (const e of data.nearby_changed as Array<Record<string, unknown>>) {
+         const key = (e.username as string) || (e.player_id as string) || "";
+         if (key) nearbyPlayerMap.set(key, e);
+       }
+     }
+     if (Array.isArray(data.system_changed)) {
+       for (const e of data.system_changed as Array<Record<string, unknown>>) {
+         const key = (e.username as string) || (e.player_id as string) || "";
+         if (key) systemNpcMap.set(key, e);
+       }
+     }
 
-    this.observationNearby = Array.from(nearbyMap.values());
-    this.observationSystemAgents = this.observationNearby;
+     this.observationNearby = Array.from(nearbyPlayerMap.values());
+     this.observationSystemAgents = Array.from(systemNpcMap.values());
 
     const cloakedResolved = Array.isArray(data.cloaked_resolved) ? (data.cloaked_resolved as Array<Record<string, unknown>>).length : 0;
     const cloakedLost = Array.isArray(data.cloaked_lost) ? (data.cloaked_lost as string[]).length : 0;

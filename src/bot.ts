@@ -1195,6 +1195,7 @@ shipSpeed = 1;
       "base_destroyed",
       "base_raid_update",
     );
+    this.log("system", `Registered @spacemolt/lib typed event handlers including observation_update`);
 
     // Track terminal closes (the player is connected elsewhere / reconnect gave
     // up). A routine server-restart blip is NOT terminal — the library
@@ -3216,8 +3217,9 @@ getSkillLevel(skillId: string): number {
    * Subsequent updates arrive via observation_update push events.
    */
   async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
+    console.error(`[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) called`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
-
+    console.error(`[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
       this.log("error", `subscribe_observation failed: ${resp.error.message}`);
       return resp;
@@ -3239,6 +3241,7 @@ getSkillLevel(skillId: string): number {
     this.observationActiveScan = !!(sc.active_scan);
     this.observationTick = 0;
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
+    this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
     return resp;
   }
 
@@ -3279,6 +3282,8 @@ getSkillLevel(skillId: string): number {
    * the cached nearby / system_agent lists.
    */
   private handleObservationUpdate(data: Record<string, unknown>): void {
+    debugLogForBot(this.username, "bot:observation", `${this.username} >>> handleObservationUpdate received`);
+    
     const poiId = (data.poi_id as string) || this.observationSession?.poi_id || "";
     const systemId = (data.system_id as string) || this.observationSession?.system_id || "";
     const tick = (data.tick as number) || 0;

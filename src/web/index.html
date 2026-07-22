@@ -16058,6 +16058,7 @@
         const ignorePirateFleeWhenCloaked = r.ignorePirateFleeWhenCloaked ?? true;
         const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
         const disableFactionAnnouncements = r.disableFactionAnnouncements === true;
+        const disablePrivateMessages = r.disablePrivateMessages === true;
 
         // Build a single, full-station dropdown covering every known station
         // across all systems. Each option value is "system|poiId" so both the
@@ -16274,6 +16275,11 @@
       <small style="color:var(--dim)">Don't send rescue start/complete messages to faction chat (quieter operation)</small>
     </div>
 
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-disablePrivateMessages" ${disablePrivateMessages ? "checked" : ""}> Disable private messages</label>
+      <small style="color:var(--dim)">Don't send rescue invoices or messages via private chat (stealth mode)</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
     `;
       }
@@ -16353,6 +16359,9 @@
           ).checked,
           disableFactionAnnouncements: document.getElementById(
             "set-rescue-disableFactionAnnouncements",
+          ).checked,
+          disablePrivateMessages: document.getElementById(
+            "set-rescue-disablePrivateMessages",
           ).checked,
         };
         send({ type: "saveSettings", routine: "rescue", settings: s });

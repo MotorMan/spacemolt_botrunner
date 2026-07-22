@@ -124,12 +124,13 @@ function getRescueSettings(): {
   maydayRescueEnabled: boolean;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
-  ignoreBlacklist: boolean;
-  ignorePirateFleeWhenCloaked: boolean;
-  enableCloak: boolean;
-  dontRejectMaydaysInBlacklistSystems: boolean;
-  disableFactionAnnouncements: boolean;
-} {
+ignoreBlacklist: boolean;
+    ignorePirateFleeWhenCloaked: boolean;
+    enableCloak: boolean;
+    dontRejectMaydaysInBlacklistSystems: boolean;
+    disableFactionAnnouncements: boolean;
+    disablePrivateMessages: boolean;
+  } {
   const all = readSettings();
   const r = all.rescue || {};
   const ft = all.fuel_transfer || {};
@@ -169,6 +170,7 @@ function getRescueSettings(): {
     enableCloak: (r.enableCloak as boolean) ?? false,
     dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
     disableFactionAnnouncements: (r.disableFactionAnnouncements as boolean) ?? false,
+    disablePrivateMessages: (r.disablePrivateMessages as boolean) ?? false,
   };
 }
 
@@ -869,8 +871,13 @@ async function sendRescueBill(
   jumpsToTarget: number,
   jumpsToHome: number,
   fuelDelivered: number,
-  isMayday: boolean
+  isMayday: boolean,
+  settings: { disablePrivateMessages: boolean }
 ): Promise<void> {
+  if (settings.disablePrivateMessages) {
+    ctx.log("rescue", `🔇 Private message disabled for rescue bill to ${targetUsername}`);
+    return;
+  }
   const aiChatService = (globalThis as any).aiChatService;
   ctx.log("rescue", `📧 DEBUG sendRescueBill: target=${targetUsername}, jumps=${jumpsToTarget}+${jumpsToHome}, fuel=${fuelDelivered}, total=${bill.total}, isMayday=${isMayday}`);
   if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
@@ -2339,27 +2346,31 @@ skipToReturnHome = true;
           // to the POI will fail. Decline early and inform the player we can't reach them.
           if (mayday.poi && isWormholeEntranceOrExit(mayday.poi, mayday.system)) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target at wormhole POI "${mayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system,
-                  targetSystem: mayday.system,
-                  jumps: undefined,
-                  fuelRefueled: undefined,
-                  playerFuelPct: undefined,
-                });
-                ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
-              } catch (e) {
-                ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                    currentSystem: ctx.bot.system,
+                    targetSystem: mayday.system,
+                    jumps: undefined,
+                    fuelRefueled: undefined,
+                    playerFuelPct: undefined,
+                  });
+                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
+                } catch (e) {
+                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                }
               }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (wormhole POI)`);
             }
             markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
@@ -2401,27 +2412,31 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
 
               // Send decline message to the player via private message
-              const aiChatService = (globalThis as any).aiChatService;
-              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-                try {
-                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+              if (!settings.disablePrivateMessages) {
+                const aiChatService = (globalThis as any).aiChatService;
+                if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                  try {
+                    await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                      situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system,
-                    targetSystem: mayday.system,
-                    jumps: pirateProximity.jumps,
-                    fuelRefueled: undefined,
-                    playerFuelPct: undefined,
-                  });
-                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
-                } catch (e) {
-                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                      currentSystem: ctx.bot.system,
+                      targetSystem: mayday.system,
+                      jumps: pirateProximity.jumps,
+                      fuelRefueled: undefined,
+                      playerFuelPct: undefined,
+                    });
+                    ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
+                  } catch (e) {
+                    ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                  }
                 }
+              } else {
+                ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (pirate proximity)`);
               }
 
               markMaydayHandled(mayday);
@@ -2469,21 +2484,25 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
             markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: undefined,
-                });
-              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                    fuelRefueled: undefined, playerFuelPct: undefined,
+                  });
+                } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+              }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (blacklisted system)`);
             }
             markMaydayHandled(mayday);
             continue;
@@ -2514,21 +2533,25 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
             markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: undefined,
-                });
-              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                    fuelRefueled: undefined, playerFuelPct: undefined,
+                  });
+                } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+              }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (no viable route)`);
             }
             markMaydayHandled(mayday);
             continue;
@@ -3173,25 +3196,29 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         // Send halfway message to let player know we're on the way
         if (target && (isMaydayTarget || isManualRescueTarget)) {
-          const halfwayAiChatService = (globalThis as any).aiChatService;
-          if (halfwayAiChatService && typeof halfwayAiChatService.sendPrivateMessage === "function") {
-            try {
-              const result = await halfwayAiChatService.sendPrivateMessage(bot, target.username, {
-                situation: `You are halfway through the rescue mission. You have reached the target system (${target.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
-                currentSystem: bot.system,
-                targetSystem: target.system,
-                jumps: undefined,
-                playerFuelPct: target.fuelPct,
-                fuelRefueled: undefined,
-              });
-              if (result.ok) {
-                ctx.log(logCategory, `✓ Sent halfway message to ${target.username}`);
-              } else {
-                ctx.log("warn", `Halfway message to ${target.username} failed: ${result.error}`);
+          if (!settings.disablePrivateMessages) {
+            const halfwayAiChatService = (globalThis as any).aiChatService;
+            if (halfwayAiChatService && typeof halfwayAiChatService.sendPrivateMessage === "function") {
+              try {
+                const result = await halfwayAiChatService.sendPrivateMessage(bot, target.username, {
+                  situation: `You are halfway through the rescue mission. You have reached the target system (${target.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
+                  currentSystem: bot.system,
+                  targetSystem: target.system,
+                  jumps: undefined,
+                  playerFuelPct: target.fuelPct,
+                  fuelRefueled: undefined,
+                });
+                if (result.ok) {
+                  ctx.log(logCategory, `✓ Sent halfway message to ${target.username}`);
+                } else {
+                  ctx.log("warn", `Halfway message to ${target.username} failed: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `Halfway message failed: ${e}`);
               }
-            } catch (e) {
-              ctx.log("warn", `Halfway message failed: ${e}`);
             }
+          } else {
+            ctx.log(logCategory, `🔇 Private message disabled - skipping halfway message to ${target.username}`);
           }
         }
       }
@@ -3628,26 +3655,30 @@ if (travelSucceeded) {
       ctx.log(logCategory, `❌ Rescue of ${target.username} was NOT completed — no fuel delivered. Skipping bill and completion message.`);
 
       if (isMaydayTarget || isManualRescueTarget) {
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-          try {
-            const result = await aiChatService.sendPrivateMessage(bot, target.username, {
-              situation: `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`,
-              currentSystem: bot.system,
-              targetSystem: target.system,
-              jumps: undefined,
-              fuelRefueled: 0,
-              playerFuelPct: undefined,
-              credits: 0,
-            });
-            if (result.ok) {
-              ctx.log(logCategory, `📧 Notified ${target.username} that the rescue could not be completed (no charge)`);
-            } else {
-              ctx.log("warn", `Failed-rescue notice to ${target.username} failed: ${result.error}`);
+        if (!settings.disablePrivateMessages) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+            try {
+              const result = await aiChatService.sendPrivateMessage(bot, target.username, {
+                situation: `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`,
+                currentSystem: bot.system,
+                targetSystem: target.system,
+                jumps: undefined,
+                fuelRefueled: 0,
+                playerFuelPct: undefined,
+                credits: 0,
+              });
+              if (result.ok) {
+                ctx.log(logCategory, `📧 Notified ${target.username} that the rescue could not be completed (no charge)`);
+              } else {
+                ctx.log("warn", `Failed-rescue notice to ${target.username} failed: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `Failed to send failed-rescue notice: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `Failed to send failed-rescue notice: ${e}`);
           }
+        } else {
+          ctx.log(logCategory, `🔇 Private message disabled - skipping failed-rescue notice to ${target.username}`);
         }
       }
 
@@ -3782,7 +3813,8 @@ if (travelSucceeded) {
           jumpsToTarget,
           jumpsToTarget, // Estimate for return
           fuelDelivered,
-          activeSessionForBill.isMayday
+          activeSessionForBill.isMayday,
+          settings
         );
         
         // Update session with billing info
@@ -4523,27 +4555,31 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       if (nextMayday.poi && isWormholeEntranceOrExit(nextMayday.poi, nextMayday.system)) {
         ctx.log("mayday", `⚠️ Declining MAYDAY from ${nextMayday.sender} - target at wormhole POI "${nextMayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
         markMaydayDeclined(nextMayday.sender, nextMayday.system, nextMayday.poi);
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-          try {
-            await aiChatService.sendPrivateMessage(ctx.bot, nextMayday.sender, {
-              situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+        if (!settings.disablePrivateMessages) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+            try {
+              await aiChatService.sendPrivateMessage(ctx.bot, nextMayday.sender, {
+                situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${nextMayday.system}/${nextMayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-              currentSystem: ctx.bot.system,
-              targetSystem: nextMayday.system,
-              jumps: undefined,
-              fuelRefueled: undefined,
-              playerFuelPct: undefined,
-            });
-            ctx.log("mayday", `📧 Sent MAYDAY decline message to ${nextMayday.sender} (wormhole POI)`);
-          } catch (e) {
-            ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                currentSystem: ctx.bot.system,
+                targetSystem: nextMayday.system,
+                jumps: undefined,
+                fuelRefueled: undefined,
+                playerFuelPct: undefined,
+              });
+              ctx.log("mayday", `📧 Sent MAYDAY decline message to ${nextMayday.sender} (wormhole POI)`);
+            } catch (e) {
+              ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+            }
           }
+        } else {
+          ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${nextMayday.sender} (wormhole POI)`);
         }
         markMaydayHandled(nextMayday);
         continue;
@@ -4668,31 +4704,30 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     }
 
     // Send AI-generated "on my way" message via private chat
-    if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-      try {
-        const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-          situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel. You have accepted their MAYDAY and are en route to their location.
+    if (!settings.disablePrivateMessages) {
+      if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+        try {
+          const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+            situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel. You have accepted their MAYDAY and are en route to their location.
 
 IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a decline. The player's fuel level is ${mayday.fuelPct}% - they are in critical condition and need immediate help.`,
-          currentSystem: bot.system,
-          targetSystem: mayday.system,
-          jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
-          playerFuelPct: mayday.fuelPct,
-          fuelRefueled: undefined,
-        });
-        if (result.ok) {
-          ctx.log("mayday", `✓ Sent "on my way" private message to ${mayday.sender}`);
-        } else {
-          ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+            currentSystem: bot.system,
+            targetSystem: mayday.system,
+            jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
+            playerFuelPct: mayday.fuelPct,
+            fuelRefueled: undefined,
+          });
+          if (result.ok) {
+            ctx.log("mayday", `✓ Sent "on my way" private message to ${mayday.sender}`);
+          } else {
+            ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+          }
+        } catch (e) {
+          ctx.log("warn", `AI message failed: ${e}`);
         }
-      } catch (e) {
-        ctx.log("warn", `AI message failed: ${e}`);
       }
     } else {
-      // Fallback: simple hardcoded message
-      const etaMsg = jumpsToTarget > 0 ? `ETA: ${jumpsToTarget} jumps` : "Arriving shortly";
-      ctx.log("mayday", `Sending rescue confirmation to ${mayday.sender}`);
-      // Note: Would need private chat command here
+      ctx.log("mayday", `🔇 Private message disabled - skipping "on my way" message to ${mayday.sender}`);
     }
 
     // ── Navigate to target system ──
@@ -4718,26 +4753,28 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       }
 
       // Send halfway message to let player know we're on the way
-      if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-        try {
-          const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-            situation: `You are halfway through the rescue mission. You have reached the target system (${mayday.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
-            currentSystem: bot.system,
-            targetSystem: mayday.system,
-            jumps: undefined,
-            playerFuelPct: mayday.fuelPct,
-            fuelRefueled: undefined,
-          });
-          if (result.ok) {
-            ctx.log("mayday", `✓ Sent halfway message to ${mayday.sender}`);
-          } else {
-            ctx.log("warn", `Halfway message to ${mayday.sender} failed: ${result.error}`);
-            // Fallback: try sending a simple hardcoded message via game command if available
-            // Note: Private messaging via game commands requires target_id which we may not have
+      if (!settings.disablePrivateMessages) {
+        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+          try {
+            const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+              situation: `You are halfway through the rescue mission. You have reached the target system (${mayday.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
+              currentSystem: bot.system,
+              targetSystem: mayday.system,
+              jumps: undefined,
+              playerFuelPct: mayday.fuelPct,
+              fuelRefueled: undefined,
+            });
+            if (result.ok) {
+              ctx.log("mayday", `✓ Sent halfway message to ${mayday.sender}`);
+            } else {
+              ctx.log("warn", `Halfway message to ${mayday.sender} failed: ${result.error}`);
+            }
+          } catch (e) {
+            ctx.log("warn", `Halfway message failed: ${e}`);
           }
-        } catch (e) {
-          ctx.log("warn", `Halfway message failed: ${e}`);
         }
+      } else {
+        ctx.log("mayday", `🔇 Private message disabled - skipping halfway message to ${mayday.sender}`);
       }
     }
 
@@ -4890,27 +4927,29 @@ if (refuelResp.error) {
     }
 
     // Send AI-generated "rescue complete" message
-    if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-      try {
-        const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-          situation: fuelTransferred > 0
-            ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
-            : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
-          currentSystem: mayday.system,
-          targetSystem: mayday.system,
-          fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
-          playerFuelPct: undefined, // Don't pass player fuel - confuses LLM about whose fuel it is
-        });
-        if (result.ok) {
-          ctx.log("mayday", `✓ Sent "rescue complete" private message to ${mayday.sender}`);
-        } else {
-          ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+    if (!settings.disablePrivateMessages) {
+      if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+        try {
+          const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+            situation: fuelTransferred > 0
+              ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
+              : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
+            currentSystem: mayday.system,
+            targetSystem: mayday.system,
+            fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
+            playerFuelPct: undefined, // Don't pass player fuel - confuses LLM about whose fuel it is
+          });
+          if (result.ok) {
+            ctx.log("mayday", `✓ Sent "rescue complete" private message to ${mayday.sender}`);
+          } else {
+            ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+          }
+        } catch (e) {
+          ctx.log("warn", `AI completion message failed: ${e}`);
         }
-      } catch (e) {
-        ctx.log("warn", `AI completion message failed: ${e}`);
       }
     } else {
-      ctx.log("warn", "AI Chat service not available for rescue complete message");
+      ctx.log("mayday", `🔇 Private message disabled - skipping rescue complete message to ${mayday.sender}`);
     }
 
     // Mark MAYDAY as handled
@@ -5589,27 +5628,31 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
           // to the POI will fail. Decline early and inform the player we can't reach them.
           if (mayday.poi && isWormholeEntranceOrExit(mayday.poi, mayday.system)) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target at wormhole POI "${mayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system,
-                  targetSystem: mayday.system,
-                  jumps: undefined,
-                  fuelRefueled: undefined,
-                  playerFuelPct: undefined,
-                });
-                ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
-              } catch (e) {
-                ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                    currentSystem: ctx.bot.system,
+                    targetSystem: mayday.system,
+                    jumps: undefined,
+                    fuelRefueled: undefined,
+                    playerFuelPct: undefined,
+                  });
+                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
+                } catch (e) {
+                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                }
               }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (wormhole POI)`);
             }
             markMaydayHandled(mayday);
             continue;
@@ -5666,21 +5709,25 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
             markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: undefined,
-                });
-              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                    fuelRefueled: undefined, playerFuelPct: undefined,
+                  });
+                } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+              }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (blacklisted system)`);
             }
             markMaydayHandled(mayday);
             continue;
@@ -5711,21 +5758,25 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
             markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-              try {
-                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+            if (!settings.disablePrivateMessages) {
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
 
 REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
 
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: undefined,
-                });
-              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                    fuelRefueled: undefined, playerFuelPct: undefined,
+                  });
+                } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+              }
+            } else {
+              ctx.log("mayday", `🔇 Private message disabled - skipping decline message to ${mayday.sender} (no viable route)`);
             }
             markMaydayHandled(mayday);
             continue;
@@ -7295,29 +7346,33 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       if (isMaydayTarget || isManualRescueTarget) {
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-          try {
-            const situation = alreadyRescuedByOther
-              ? `You arrived to help but their fuel tank was already full — another rescuer reached them first. Let them know all is well, there's no charge, and they're good to go.`
-              : `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`;
-            const result = await aiChatService.sendPrivateMessage(bot, target.username, {
-              situation,
-              currentSystem: bot.system,
-              targetSystem: target.system,
-              jumps: undefined,
-              fuelRefueled: 0,
-              playerFuelPct: undefined,
-              credits: 0,
-            });
-            if (result.ok) {
-              ctx.log(logCategory, `📧 Notified ${target.username} (no charge)`);
-            } else {
-              ctx.log("warn", `No-charge notice to ${target.username} failed: ${result.error}`);
+        if (!settings.disablePrivateMessages) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+            try {
+              const situation = alreadyRescuedByOther
+                ? `You arrived to help but their fuel tank was already full — another rescuer reached them first. Let them know all is well, there's no charge, and they're good to go.`
+                : `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`;
+              const result = await aiChatService.sendPrivateMessage(bot, target.username, {
+                situation,
+                currentSystem: bot.system,
+                targetSystem: target.system,
+                jumps: undefined,
+                fuelRefueled: 0,
+                playerFuelPct: undefined,
+                credits: 0,
+              });
+              if (result.ok) {
+                ctx.log(logCategory, `📧 Notified ${target.username} (no charge)`);
+              } else {
+                ctx.log("warn", `No-charge notice to ${target.username} failed: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `Failed to send no-charge notice: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `Failed to send no-charge notice: ${e}`);
           }
+        } else {
+          ctx.log(logCategory, `🔇 Private message disabled - skipping no-charge notice to ${target.username}`);
         }
       }
 
@@ -7388,7 +7443,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           jumpsToTarget,
           jumpsToTarget,
           fuelDeliveredBill,
-          activeSessionForBill.isMayday
+          activeSessionForBill.isMayday,
+          settings
         );
 
         // Update session with billing info

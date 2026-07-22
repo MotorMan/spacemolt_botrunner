@@ -1418,6 +1418,7 @@ shipSpeed = 1;
                 this.homeBaseFuel = baseFuel;
                 this.homeBaseMaxFuel = baseMaxFuel;
                 this.homeBaseFuelPoi = homeStationId;
+                this.notifyStateChanged();
               }
             }
           }
@@ -1439,6 +1440,7 @@ shipSpeed = 1;
               this.homeBaseFuel = baseFuel;
               this.homeBaseMaxFuel = baseMaxFuel;
               this.homeBaseFuelPoi = homeStationId;
+              this.notifyStateChanged();
             }
           }
         }

@@ -992,7 +992,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // only run while docked) still works. This prevents the ship from getting stuck
   // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
   const wasDockedAtStart = bot.docked;
-  if (initialSettings.cloakOnStart && !bot.isCloaked) {
+  if (initialSettings.mode !== "station_protection" && initialSettings.cloakOnStart && !bot.isCloaked) {
     // Undock first if currently docked — the cloak command cannot enable while docked.
     if (bot.docked) {
       const undockResp = await bot.exec("undock");
@@ -1029,12 +1029,16 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     await repairShip(ctx);
     await tryRefuel(ctx, { skipApprovedCheck: true });
     await ensureHunterResupply(ctx);
-    await ensureUndocked(ctx);
+    if (initialSettings.mode !== "station_protection") {
+      await ensureUndocked(ctx);
+    }
     await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
   }
 
   // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
-  await useRepairKits(ctx);
+  if (initialSettings.mode !== "station_protection") {
+    await useRepairKits(ctx);
+  }
 
   if (initialSettings.mode === "roam_system") {
     yield* roamSystemRoutine(ctx);

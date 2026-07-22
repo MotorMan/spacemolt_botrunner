@@ -2429,8 +2429,26 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
     if (bot.isInBattle()) {
       ctx.log("combat", "Battle push received at station — engaging as hunter!");
       await stationProtectionFight(ctx, s);
-      // After the fight, return to the station and resume waiting.
-      ctx.log("info", "Station defense complete — returning to dock to resume protection.");
+      // After the fight, return to assigned protection station and resume waiting.
+      ctx.log("info", "Station defense complete — returning to assigned station to resume protection.");
+      const hs = s.homeStation || "";
+      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+      if (hsys && hpoi && (bot.system !== hsys || bot.poi !== hpoi)) {
+        ctx.log("travel", `Returning to protection station ${hpoi} in ${hsys}...`);
+        if (bot.system !== hsys) {
+          const safetyOpts = {
+            fuelThresholdPct: s.refuelThreshold,
+            hullThresholdPct: s.repairThreshold,
+            autoCloak: false,
+            skipBlacklist: true,
+            isCombatBot: true,
+            joinBattles: true,
+          };
+          await navigateToSystem(ctx, hsys, safetyOpts);
+        }
+        await bot.exec("travel", { target_poi: hpoi });
+        bot.poi = hpoi;
+      }
       const redocked = await dockAtStation(ctx);
       if (redocked) {
         if (bot.isCloaked) {

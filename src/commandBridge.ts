@@ -199,10 +199,13 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Facility (special: uses /tool/{action} pattern)
   'facility': 'spacemolt_facility',
 
-  // Battle
-  'battle': 'spacemolt_battle',
-  'get_battle_status': 'spacemolt_battle',
-  'reload': 'spacemolt_battle',
+   // Battle
+   'battle': 'spacemolt_battle',
+   'get_battle_status': 'spacemolt_battle',
+   'reload': 'spacemolt_battle',
+
+   // Observation
+   'subscribe_observation': 'spacemolt',
 
   // Salvage
   'get_wrecks': 'spacemolt_salvage',

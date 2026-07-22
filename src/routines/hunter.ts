@@ -79,6 +79,7 @@ import {
   useRepairKits,
 } from "./common.js";
 
+import type { Bot } from "../bot.js";
 import type { PirateTier, NearbyEntity } from "./battle.js";
 import {
   parseNearby,
@@ -93,6 +94,32 @@ import {
   fightJoinedBattle,
   getWeaponModules,
 } from "./battle.js";
+
+async function ensureObservationSubscribed(bot: Bot): Promise<void> {
+  if (bot.observationSession?.id) {
+    return;
+  }
+  await bot.subscribeToObservation(false);
+}
+
+async function resubscribeObservationAfterMove(bot: Bot): Promise<void> {
+  bot.clearObservationState();
+  await bot.subscribeToObservation(false);
+}
+
+async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isObservation: boolean }> {
+  if (bot.observationSession?.id && (bot.observationNearby.length > 0 || bot.observationSystemAgents.length > 0)) {
+    return { result: bot.getObservationResult(), isObservation: true };
+  }
+  const resp = await bot.exec("get_nearby");
+  return { result: resp.result, isObservation: false };
+}
+
+function getObservationDebugLine(bot: Bot): string {
+  const nearby = bot.observationNearby;
+  const nearbyNames = nearby.map(e => (e.username as string) || (e.player_id as string) || "?").join(", ");
+  return `observation[tick=${bot.observationTick}] nearby=${nearby.length} [${nearbyNames || "none"}] unknown_sig=${bot.observationUnknownSignature}`;
+}
 
 async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
@@ -829,15 +856,18 @@ async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnTyp
       continue;
     }
 
-    const nearbyResp = await bot.exec("get_nearby");
-    if (nearbyResp.error) {
+    await ensureObservationSubscribed(bot);
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (!nearbyData) {
+      ctx.log("error", `No observation/nearby data available for assist matching`);
       handled.add(key);
       continue;
     }
-    bot.trackNearbyPlayers(nearbyResp.result);
-    bot.trackWildlife(nearbyResp.result);
+    bot.trackNearbyPlayers(nearbyData);
+    bot.trackWildlife(nearbyData);
 
-    const entities = parseNearby(nearbyResp.result);
+    const entities = parseNearby(nearbyData);
     const match = entities.find(e =>
       (req.targetId && e.id === req.targetId) ||
       (req.targetName && e.name === req.targetName) ||
@@ -1178,6 +1208,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (patrolSystem && bot.system !== patrolSystem) {
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
       const arrived = await navigateToSystem(ctx, patrolSystem, safetyOpts);
+      if (arrived) {
+        await resubscribeObservationAfterMove(bot);
+      }
       if (!arrived) {
         const battleAfterNav = await getBattleStatus(ctx);
         if (battleAfterNav) {
@@ -1191,44 +1224,50 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       await fetchSecurityLevel(ctx, bot.system);
       const currentSec = mapStore.getSystem(bot.system)?.security_level;
 
-      if (!isHuntableSystem(currentSec)) {
-        ctx.log("travel", `${bot.system} is ${currentSec || "unknown"} security — searching for a huntable system...`);
+        if (!isHuntableSystem(currentSec)) {
+          ctx.log("travel", `${bot.system} is ${currentSec || "unknown"} security — searching for a huntable system...`);
 
-        const huntTarget = findNearestHuntableSystem(bot.system);
-        if (huntTarget) {
-          const sys = mapStore.getSystem(huntTarget);
-          ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) — navigating...`);
-          const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
-          if (!huntArrived) {
-            const battleAfterNav = await getBattleStatus(ctx);
-            if (battleAfterNav) {
-              ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
-              await handleNavigationBattleInterrupt(ctx, settings);
+          const huntTarget = findNearestHuntableSystem(bot.system);
+          if (huntTarget) {
+            const sys = mapStore.getSystem(huntTarget);
+            ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) — navigating...`);
+            const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
+            if (huntArrived) {
+              await resubscribeObservationAfterMove(bot);
             }
-          }
-        } else {
-          const conns = mapStore.getConnections(bot.system);
-          const unmapped = conns.find(c => !mapStore.getSystem(c.system_id)?.security_level);
-          const target = unmapped ?? conns[0];
-          if (target) {
-            ctx.log("travel", `No huntable system mapped yet — scouting ${target.system_name || target.system_id}...`);
-            const scoutArrived = await navigateToSystem(ctx, target.system_id, safetyOpts);
-            if (!scoutArrived) {
+            if (!huntArrived) {
               const battleAfterNav = await getBattleStatus(ctx);
               if (battleAfterNav) {
                 ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
                 await handleNavigationBattleInterrupt(ctx, settings);
               }
             }
-            await getSystemInfo(ctx);
-            await fetchSecurityLevel(ctx, bot.system);
           } else {
-            ctx.log("error", "No connected systems found — waiting 30s");
-            await ctx.sleep(30000);
-            continue;
+            const conns = mapStore.getConnections(bot.system);
+            const unmapped = conns.find(c => !mapStore.getSystem(c.system_id)?.security_level);
+            const target = unmapped ?? conns[0];
+            if (target) {
+              ctx.log("travel", `No huntable system mapped yet — scouting ${target.system_name || target.system_id}...`);
+              const scoutArrived = await navigateToSystem(ctx, target.system_id, safetyOpts);
+              if (scoutArrived) {
+                await resubscribeObservationAfterMove(bot);
+              }
+              if (!scoutArrived) {
+                const battleAfterNav = await getBattleStatus(ctx);
+                if (battleAfterNav) {
+                  ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+                  await handleNavigationBattleInterrupt(ctx, settings);
+                }
+              }
+              await getSystemInfo(ctx);
+              await fetchSecurityLevel(ctx, bot.system);
+            } else {
+              ctx.log("error", "No connected systems found — waiting 30s");
+              await ctx.sleep(30000);
+              continue;
+            }
           }
         }
-      }
     }
 
     if (bot.state !== "running") break;
@@ -1262,6 +1301,8 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     }
 
     ctx.log("info", `Patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
+
+    await ensureObservationSubscribed(bot);
 
     // ── Patrol loop — visit each non-station POI ──
     let patrolKills = 0;
@@ -1303,12 +1344,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           ctx.log("combat", `⚠️ Battle detected during travel failure (ID: ${battleStatus.battle_id})`);
           ctx.log("combat", `Battle participants: ${battleStatus.participants.map(p => p.username || p.player_id).join(", ")}`);
           
-          // Parse nearby entities to find the attacker
-          const nearbyResp = await bot.exec("get_nearby");
-          if (!nearbyResp.error) {
-            bot.trackNearbyPlayers(nearbyResp.result);
-            bot.trackWildlife(nearbyResp.result);
-            const entities = parseNearby(nearbyResp.result);
+        // Parse nearby entities to find the attacker
+        const nearbyResult = await getObservationOrNearby(bot);
+        const nearbyData = nearbyResult.result;
+        if (nearbyData) {
+          bot.trackNearbyPlayers(nearbyData);
+          bot.trackWildlife(nearbyData);
+          const entities = parseNearby(nearbyData);
             const threats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
             
             if (threats.length > 0) {
@@ -1339,22 +1381,30 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
       // Scan for targets
       yield "scan_for_targets";
-      const nearbyResp = await bot.exec("get_nearby");
-      if (nearbyResp.error) {
-        ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
+      await ensureObservationSubscribed(bot);
+      const nearbyResult = await getObservationOrNearby(bot);
+      const nearbyData = nearbyResult.result;
+      const isObservation = nearbyResult.isObservation;
+
+      if (!nearbyData) {
+        ctx.log("error", `No observation/nearby data at ${poi.name}`);
         continue;
       }
 
-      // Track player names and wildlife from nearby scan
-      bot.trackNearbyPlayers(nearbyResp.result);
-      bot.trackWildlife(nearbyResp.result);
+      if (isObservation) {
+        ctx.log("debug", `obs: ${getObservationDebugLine(bot)}`);
+      }
+
+      // Track player names and wildlife from observation or nearby scan
+      bot.trackNearbyPlayers(nearbyData);
+      bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
-      if (nearbyResp.notifications) {
-        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
+      if ((nearbyData as any).notifications) {
+        const notifs = Array.isArray((nearbyData as any).notifications) ? (nearbyData as any).notifications : [];
         for (const n of notifs) {
           const msg = (n as any)?.data?.message || (n as any)?.message || "";
           if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
@@ -1378,7 +1428,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
       }
 
-      const entities = parseNearby(nearbyResp.result);
+      const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
@@ -1753,6 +1803,8 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     ctx.log("info", `Patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
 
+    await ensureObservationSubscribed(bot);
+
     // ── Patrol loop — visit each non-station POI ──
     let patrolKills = 0;
     let abortPatrol = false;
@@ -1795,22 +1847,30 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       // Scan for targets
       yield "scan_for_targets";
-      const nearbyResp = await bot.exec("get_nearby");
-      if (nearbyResp.error) {
-        ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
+      await ensureObservationSubscribed(bot);
+      const obsResult = await getObservationOrNearby(bot);
+      const nearbyData = obsResult.result;
+      const isObservation = obsResult.isObservation;
+
+      if (!nearbyData) {
+        ctx.log("error", `No observation/nearby data at ${poi.name}`);
         continue;
       }
 
-      // Track player names and wildlife from nearby scan
-      bot.trackNearbyPlayers(nearbyResp.result);
-      bot.trackWildlife(nearbyResp.result);
+      if (isObservation) {
+        ctx.log("debug", `obs: ${getObservationDebugLine(bot)}`);
+      }
+
+      // Track player names and wildlife from observation or nearby scan
+      bot.trackNearbyPlayers(nearbyData);
+      bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
-      if (nearbyResp.notifications) {
-        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
+      if ((nearbyData as any).notifications) {
+        const notifs = Array.isArray((nearbyData as any).notifications) ? (nearbyData as any).notifications : [];
         for (const n of notifs) {
           const msg = (n as any)?.data?.message || (n as any)?.message || "";
           if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
@@ -1834,7 +1894,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
       }
 
-      const entities = parseNearby(nearbyResp.result);
+      const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
@@ -2185,26 +2245,34 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     // ── Wait and scan for targets ──
     ctx.log("info", `Waiting for targets at ${originalPoi}...`);
     yield "scan_for_targets";
-    const nearbyResp = await bot.exec("get_nearby");
-    if (nearbyResp.error) {
-      ctx.log("error", `get_nearby failed: ${nearbyResp.error.message}`);
+    await ensureObservationSubscribed(bot);
+    const obsResult = await getObservationOrNearby(bot);
+    const nearbyData = obsResult.result;
+    const isObservation = obsResult.isObservation;
+
+    if (!nearbyData) {
+      ctx.log("error", `No observation/nearby data at ${originalPoi}`);
       await ctx.sleep(5000);
       continue;
     }
 
-      // Track player names and wildlife from nearby scan
-      bot.trackNearbyPlayers(nearbyResp.result);
-      bot.trackWildlife(nearbyResp.result);
+    if (isObservation) {
+      ctx.log("debug", `obs: ${getObservationDebugLine(bot)}`);
+    }
 
-      // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+    // Track player names and wildlife from observation or nearby scan
+    bot.trackNearbyPlayers(nearbyData);
+    bot.trackWildlife(nearbyData);
 
-      // Immediate reaction to pirate scan notification (NPC only, not player scans)
-      if (nearbyResp.notifications) {
-        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
-        for (const n of notifs) {
-          const msg = (n as any)?.data?.message || (n as any)?.message || "";
-          if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
+    // Check if we got pulled into battle during scanning
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+
+    // Immediate reaction to pirate scan notification (NPC only, not player scans)
+    if ((nearbyData as any).notifications) {
+      const notifs = Array.isArray((nearbyData as any).notifications) ? (nearbyData as any).notifications : [];
+      for (const n of notifs) {
+        const msg = (n as any)?.data?.message || (n as any)?.message || "";
+        if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
             ctx.log("combat", "Pirate scan detected - immediate get_nearby + engage");
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
@@ -2225,7 +2293,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
       }
 
-      const entities = parseNearby(nearbyResp.result);
+      const entities = parseNearby(nearbyData);
     const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
     if (targets.length === 0) {
@@ -2618,10 +2686,12 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        const nearbyResp = await bot.exec("get_nearby");
-        if (nearbyResp.error) continue;
-        bot.trackNearbyPlayers(nearbyResp.result);
-        const entities = parseNearby(nearbyResp.result);
+        await ensureObservationSubscribed(bot);
+        const nearbyResult = await getObservationOrNearby(bot);
+        const nearbyData = nearbyResult.result;
+        if (!nearbyData) continue;
+        bot.trackNearbyPlayers(nearbyData);
+        const entities = parseNearby(nearbyData);
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -3013,10 +3083,12 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        const nearbyResp = await bot.exec("get_nearby");
-        if (nearbyResp.error) continue;
-        bot.trackNearbyPlayers(nearbyResp.result);
-        const entities = parseNearby(nearbyResp.result);
+        await ensureObservationSubscribed(bot);
+        const nearbyResult = await getObservationOrNearby(bot);
+        const nearbyData = nearbyResult.result;
+        if (!nearbyData) continue;
+        bot.trackNearbyPlayers(nearbyData);
+        const entities = parseNearby(nearbyData);
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -3167,10 +3239,12 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        const nearbyResp = await bot.exec("get_nearby");
-        if (nearbyResp.error) continue;
-        bot.trackNearbyPlayers(nearbyResp.result);
-        const entities = parseNearby(nearbyResp.result);
+        await ensureObservationSubscribed(bot);
+        const nearbyResult = await getObservationOrNearby(bot);
+        const nearbyData = nearbyResult.result;
+        if (!nearbyData) continue;
+        bot.trackNearbyPlayers(nearbyData);
+        const entities = parseNearby(nearbyData);
         const targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx);
@@ -3208,6 +3282,8 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 }
+
+
 
 
 

@@ -370,6 +370,15 @@ shipSpeed = 1;
     participants: Array<Record<string, unknown>>;
   } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
 
+  /** Track the last known observation subscription ID and its cached presence data.
+   *  This replaces polling get_nearby with the live observation feed. */
+  observationSession: { id: string; poi_id: string; system_id: string } | null = null;
+  observationNearby: Array<Record<string, unknown>> = [];
+  observationSystemAgents: Array<Record<string, unknown>> = [];
+  observationUnknownSignature = false;
+  observationActiveScan = false;
+  observationTick = 0;
+
   /** Set of queued crafting job IDs to prevent duplicate submissions. */
   private queuedCraftingJobs: Set<string> = new Set();
 
@@ -3187,18 +3196,158 @@ getSkillLevel(skillId: string): number {
    * for the rare case where an end/left event is missed entirely — it must never
    * be the primary mechanism, or the bot gets stuck locked out of movement.
    */
-  isInBattle(): boolean {
-    if (!this.currentBattle.inBattle) return false;
+   isInBattle(): boolean {
+     if (!this.currentBattle.inBattle) return false;
 
-    const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
-    // Use 120 second timeout instead of 60 to be more lenient during HTTP errors
-    if (timeSinceUpdate > 120000) {
-      // Battle state is stale and no end/left event ever arrived - clear it
-      this.clearBattleState("stale-timeout");
-      return false;
+     const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
+     // Use 120 second timeout instead of 60 to be more lenient during HTTP errors
+     if (timeSinceUpdate > 120000) {
+       // Battle state is stale and no end/left event ever arrived - clear it
+       this.clearBattleState("stale-timeout");
+       return false;
+     }
+
+     return true;
+   }
+
+  /**
+   * Subscribe to live observation updates (replaces polling get_nearby).
+   * Anchors a watch at the current POI/system and returns the initial snapshot.
+   * Subsequent updates arrive via observation_update push events.
+   */
+  async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
+    const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
+
+    if (resp.error) {
+      this.log("error", `subscribe_observation failed: ${resp.error.message}`);
+      return resp;
+    }
+    if (!resp.result || typeof resp.result !== "object") {
+      this.log("error", `subscribe_observation returned non-object result: ${JSON.stringify(resp.result)}`);
+      return resp;
     }
 
-    return true;
+    const sc = resp.result as Record<string, unknown>;
+    this.observationSession = {
+      id: "active",
+      poi_id: (sc.poi_id as string) || "",
+      system_id: (sc.system_id as string) || "",
+    };
+    this.observationNearby = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
+    this.observationSystemAgents = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
+    this.observationUnknownSignature = !!(sc.unknown_signature);
+    this.observationActiveScan = !!(sc.active_scan);
+    this.observationTick = 0;
+    this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
+    return resp;
+  }
+
+  /**
+   * Clear the cached observation state. Call after travel/jump since the
+   * watch ends automatically when you move.
+   */
+  clearObservationState(): void {
+    this.observationSession = null;
+    this.observationNearby = [];
+    this.observationSystemAgents = [];
+    this.observationUnknownSignature = false;
+    this.observationActiveScan = false;
+    this.observationTick = 0;
+  }
+
+  /**
+   * Return a synthetic get_nearby-shaped result built from the live
+   * observation cache, so existing parseNearby() logic keeps working.
+   */
+  getObservationResult(): Record<string, unknown> {
+    return {
+      nearby: this.observationNearby,
+      system_agents: this.observationSystemAgents,
+      players: this.observationNearby,
+      objects: this.observationNearby,
+      nearby_players: this.observationNearby,
+      ships: [],
+      pirates: [],
+      creatures: [],
+      empire_npcs: [],
+      unknown_signature: this.observationUnknownSignature,
+    };
+  }
+
+  /**
+   * Process an observation_update push event from the server and update
+   * the cached nearby / system_agent lists.
+   */
+  private handleObservationUpdate(data: Record<string, unknown>): void {
+    const poiId = (data.poi_id as string) || this.observationSession?.poi_id || "";
+    const systemId = (data.system_id as string) || this.observationSession?.system_id || "";
+    const tick = (data.tick as number) || 0;
+    const unknownSig = (data.unknown_signature as boolean) ?? this.observationUnknownSignature;
+
+    debugLogForBot(this.username, "bot:observation", `${this.username} observation_update tick:${tick} poi:${poiId} system:${systemId}`);
+
+    if (!this.observationSession) {
+      this.observationSession = { id: "", poi_id: poiId, system_id: systemId };
+    } else {
+      this.observationSession.poi_id = poiId;
+      this.observationSession.system_id = systemId;
+    }
+    this.observationTick = tick;
+    this.observationUnknownSignature = unknownSig;
+
+    const nearbyMap = new Map<string, Record<string, unknown>>();
+    for (const e of this.observationNearby) {
+      const key = (e.username as string) || (e.player_id as string) || "";
+      if (key) nearbyMap.set(key, e);
+    }
+    for (const e of this.observationSystemAgents) {
+      const key = (e.username as string) || (e.player_id as string) || "";
+      if (key) nearbyMap.set(key, e);
+    }
+
+    const departures: string[] = [];
+    if (Array.isArray(data.nearby_departed)) {
+      for (const pid of data.nearby_departed as string[]) {
+        nearbyMap.delete(pid);
+        departures.push(pid);
+      }
+    }
+    if (Array.isArray(data.system_departed)) {
+      for (const pid of data.system_departed as string[]) {
+        nearbyMap.delete(pid);
+        departures.push(pid);
+      }
+    }
+    if (departures.length > 0) {
+      debugLogForBot(this.username, "bot:observation", `${this.username} observation departed: ${departures.join(", ")}`);
+      this.log("observation", `Departed: ${departures.join(", ")}`);
+    }
+
+    if (Array.isArray(data.nearby_changed)) {
+      for (const e of data.nearby_changed as Array<Record<string, unknown>>) {
+        const key = (e.username as string) || (e.player_id as string) || "";
+        if (key) nearbyMap.set(key, e);
+      }
+    }
+    if (Array.isArray(data.system_changed)) {
+      for (const e of data.system_changed as Array<Record<string, unknown>>) {
+        const key = (e.username as string) || (e.player_id as string) || "";
+        if (key) nearbyMap.set(key, e);
+      }
+    }
+
+    this.observationNearby = Array.from(nearbyMap.values());
+    this.observationSystemAgents = this.observationNearby;
+
+    const cloakedResolved = Array.isArray(data.cloaked_resolved) ? (data.cloaked_resolved as Array<Record<string, unknown>>).length : 0;
+    const cloakedLost = Array.isArray(data.cloaked_lost) ? (data.cloaked_lost as string[]).length : 0;
+    if (cloakedResolved > 0 || cloakedLost > 0) {
+      debugLogForBot(this.username, "bot:observation", `${this.username} observation cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
+      this.log("observation", `Cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
+    }
+
+    debugLogForBot(this.username, "bot:observation", `${this.username} observation snapshot: nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
+    this.log("observation", `[tick ${tick}] nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
   }
 
   /**
@@ -3567,6 +3716,8 @@ this.currentBattle.lastUpdate = Date.now();
              debugLogForBot(this.username, "bot:battle", `${this.username} battle_alert: ${battleId} at station (${message})`);
            }
          }
+        } else if (msgType === "observation_update" && data && typeof data === "object") {
+         this.handleObservationUpdate(data as Record<string, unknown>);
         } else if ((msgType === "crafting_update" || type === "crafting_update") && data && typeof data === "object") {
           const d = data as Record<string, unknown>;
           const jobs = (d.jobs as Array<Record<string, unknown>>) || [];

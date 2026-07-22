@@ -3212,34 +3212,88 @@ getSkillLevel(skillId: string): number {
    }
 
   /**
+   * Return a snapshot of the library's observation cache. Call this instead of
+   * reaching into `account.observationCache` directly so we don't break if the
+   * library's internals change.
+   */
+  private libObservationState(): { subscribed: boolean; poiId: string; systemId: string; tick: number; nearby: Array<Record<string, unknown>>; systemAgents: Array<Record<string, unknown>>; unknownSignature: boolean; activeScan: boolean } {
+    try {
+      const acct = this.account as unknown as {
+        observationSubscribedState?: boolean;
+        subscribedObservationPoiId?: string;
+        observationActiveScanState?: boolean;
+        observationCache?: { current: () => { poi_id?: string; system_id?: string; tick?: number; nearby: Map<string, Record<string, unknown>>; system: Map<string, Record<string, unknown>>; unknownSignature: boolean; activeScan: boolean } | null };
+      } | null;
+      if (!acct) return { subscribed: false, poiId: "", systemId: "", tick: 0, nearby: [], systemAgents: [], unknownSignature: false, activeScan: false };
+      const subscribed = !!acct.observationSubscribedState;
+      const view = acct.observationCache?.current?.();
+      const poiId = view?.poi_id ?? acct.subscribedObservationPoiId ?? "";
+      const systemId = view?.system_id ?? "";
+      return {
+        subscribed,
+        poiId,
+        systemId,
+        tick: view?.tick ?? 0,
+        nearby: view ? Array.from(view.nearby.values()) : [],
+        systemAgents: view ? Array.from(view.system.values()) : [],
+        unknownSignature: view?.unknownSignature ?? false,
+        activeScan: view?.activeScan ?? !!acct.observationActiveScanState,
+      };
+    } catch {
+      return { subscribed: false, poiId: "", systemId: "", tick: 0, nearby: [], systemAgents: [], unknownSignature: false, activeScan: false };
+     }
+  }
+
+  /**
    * Subscribe to live observation updates (replaces polling get_nearby).
    * Anchors a watch at the current POI/system and returns the initial snapshot.
    * Subsequent updates arrive via observation_update push events.
    */
   async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
-    console.error(`[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) called`);
+    const libObs = this.libObservationState();
+    if (libObs.subscribed && !activeScan) {
+      console.error(`[${this.username}] >>> subscribeToObservation(library already active=true, porting cache)`);
+      this.observationSession = { id: "active", poi_id: libObs.poiId, system_id: libObs.systemId };
+      this.observationTick = libObs.tick;
+      this.observationUnknownSignature = libObs.unknownSignature;
+      this.observationActiveScan = libObs.activeScan;
+      this.observationNearby = libObs.nearby;
+      this.observationSystemAgents = libObs.systemAgents;
+      this.log("observation", `Library observation already active (poi=${libObs.poiId} nearby=${libObs.nearby.length}) — ported cache`);
+      return { result: { poi_id: libObs.poiId, system_id: libObs.systemId, nearby: libObs.nearby, system_agents: libObs.systemAgents, active_scan: libObs.activeScan, unknown_signature: libObs.unknownSignature }, error: undefined, notifications: [] };
+    }
+    if (libObs.subscribed && activeScan) {
+      console.error(`[${this.username}] >>> subscribeToObservation(library active=true, switching to activeScan)`);
+      await this.libExec("subscribe_observation", { active_scan: true });
+      const updated = this.libObservationState();
+      this.observationSession = { id: "active", poi_id: updated.poiId, system_id: updated.systemId };
+      this.observationTick = updated.tick;
+      this.observationUnknownSignature = updated.unknownSignature;
+      this.observationActiveScan = true;
+      this.observationNearby = updated.nearby;
+      this.observationSystemAgents = updated.systemAgents;
+      this.log("observation", `Observation active scan enabled (poi=${updated.poiId} nearby=${updated.nearby.length})`);
+      return { result: { poi_id: updated.poiId, system_id: updated.systemId, nearby: updated.nearby, system_agents: updated.systemAgents, active_scan: true, unknown_signature: updated.unknownSignature }, error: undefined, notifications: [] };
+    }
+    console.error(`[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
-    console.error(`[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
       this.log("error", `subscribe_observation failed: ${resp.error.message}`);
       return resp;
     }
-    if (!resp.result || typeof resp.result !== "object") {
-      this.log("error", `subscribe_observation returned non-object result: ${JSON.stringify(resp.result)}`);
-      return resp;
-    }
 
     const sc = resp.result as Record<string, unknown>;
+    const fresh = this.libObservationState();
     this.observationSession = {
       id: "active",
-      poi_id: (sc.poi_id as string) || "",
-      system_id: (sc.system_id as string) || "",
+      poi_id: (sc.poi_id as string) || fresh.poiId,
+      system_id: (sc.system_id as string) || fresh.systemId,
     };
-    this.observationNearby = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
-    this.observationSystemAgents = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
-    this.observationUnknownSignature = !!(sc.unknown_signature);
-    this.observationActiveScan = !!(sc.active_scan);
-    this.observationTick = 0;
+    this.observationNearby = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : fresh.nearby;
+    this.observationSystemAgents = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : fresh.systemAgents;
+    this.observationUnknownSignature = !!(sc.unknown_signature) || fresh.unknownSignature;
+    this.observationActiveScan = !!(sc.active_scan) || fresh.activeScan;
+    this.observationTick = fresh.tick;
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
     this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
     return resp;
@@ -3256,6 +3310,15 @@ getSkillLevel(skillId: string): number {
     this.observationUnknownSignature = false;
     this.observationActiveScan = false;
     this.observationTick = 0;
+    try {
+      const libObs = this.account as unknown as {
+        observationCache?: { clear: () => void };
+        observationSubscribedState?: boolean;
+      };
+      if (libObs?.observationCache?.clear) {
+        libObs.observationCache.clear();
+      }
+    } catch {}
   }
 
   /**

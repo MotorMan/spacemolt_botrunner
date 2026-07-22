@@ -2710,19 +2710,18 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       .filter(i => possibleAmmo.includes(i.itemId))
       .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
-    // Calculate ammo needed for this type
-    const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
-    const maxAmmoForType = weaponsUsingThisAmmo.length > 0
-      ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0))
-      : 0;
-    let ammoToGet: number;
-    if (maxAmmoForType > 50) {
-      ammoToGet = Math.max(0, 20 - currentAmmoForType);
-    } else if (maxAmmoForType > 0) {
-      ammoToGet = Math.max(0, 40 - currentAmmoForType);
-    } else {
-      ammoToGet = Math.max(0, 30 - currentAmmoForType);
-    }
+     // Calculate ammo needed for this type
+     const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
+     const totalAmmoCapacity = weaponsUsingThisAmmo.reduce((sum, w) => sum + (w.maxAmmo || 0), 0);
+     const maxAmmoForType = totalAmmoCapacity > 0 ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0)) : 0;
+     let ammoToGet: number;
+     if (maxAmmoForType > 50) {
+       ammoToGet = Math.max(0, Math.ceil(totalAmmoCapacity * 0.25) - currentAmmoForType);
+     } else if (maxAmmoForType > 0) {
+       ammoToGet = Math.max(0, Math.ceil(totalAmmoCapacity * 0.5) - currentAmmoForType);
+     } else {
+       ammoToGet = Math.max(0, 20 - currentAmmoForType);
+     }
 
     // Prefer currently loaded ammo if available
     let chosenAmmoId: string | null = null;

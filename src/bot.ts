@@ -1977,6 +1977,7 @@ const ews = this.hasEwsModule(modulesArray);
   }
 
   async refreshNearby(): Promise<ApiResponse> {
+    this.log("observation", `Refreshing nearby via get_nearby (fallback)`);
     if (this.account) return this.libExec("get_nearby", {});
     return this.libExec("get_nearby");
   }
@@ -3275,8 +3276,9 @@ getSkillLevel(skillId: string): number {
       this.log("observation", `Observation active scan enabled (poi=${updated.poiId} nearby=${updated.nearby.length})`);
       return { result: { poi_id: updated.poiId, system_id: updated.systemId, nearby: updated.nearby, system_agents: updated.systemAgents, active_scan: true, unknown_signature: updated.unknownSignature }, error: undefined, notifications: [] };
     }
-    console.error(`[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
+    this.log("observation", `[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
+    this.log("observation", `[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
       this.log("error", `subscribe_observation failed: ${resp.error.message}`);
       return resp;

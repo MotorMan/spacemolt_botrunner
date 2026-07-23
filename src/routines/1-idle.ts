@@ -43,8 +43,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
   // Initial observation subscription (passive)
   if (bot.account) {
     try {
-      await bot.subscribeToObservation(false);
-      ctx.log("info", "Subscribed to observation (passive)");
+      await bot.subscribeToObservation(true);
+      ctx.log("info", "Subscribed to observation (active)");
 
       // Set up listener for observation updates
       // @ts-ignore: account.on exists
@@ -107,8 +107,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
       // Attempt to resubscribe to observation for new location
       if (bot.account) {
         try {
-          await bot.subscribeToObservation(false);
-          ctx.log("info", `Subscribed to observation (passive) for new location: ${bot.system}/${bot.poi}`);
+await bot.subscribeToObservation(true);
+          ctx.log("info", `Subscribed to observation (active) for new location: ${bot.system}/${bot.poi}`);
 
           // Set up listener for observation updates
           // @ts-ignore: account.on exists

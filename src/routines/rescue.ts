@@ -130,49 +130,51 @@ ignoreBlacklist: boolean;
     dontRejectMaydaysInBlacklistSystems: boolean;
     disableFactionAnnouncements: boolean;
     disablePrivateMessages: boolean;
-  } {
-  const all = readSettings();
-  const r = all.rescue || {};
-  const ft = all.fuel_transfer || {};
-  const general = all.general || {};
-  return {
-    fuelThreshold: (r.fuelThreshold as number) || 10,
-    rescueFuelCells: (r.rescueFuelCells as number) || 10,
-    rescueCredits: (r.rescueCredits as number) || 500,
-    scanIntervalSec: (r.scanIntervalSec as number) || 30,
-    refuelThreshold: (r.refuelThreshold as number) || 60,
-    maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
-    maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
-    ghostThreshold: (r.ghostThreshold as number) || 3,
-    homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
-    homeStation: (r.homeStation as string) || '',
-    costPerJump: (r.costPerJump as number) || 50,
-    costPerFuel: (r.costPerFuel as number) || 2,
-    creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
-    creditTopOffMinThreshold: (r.creditTopOffMinThreshold as number) || 10000,
-    maydayPirateProximityThreshold: (r.maydayPirateProximityThreshold as number) || 5,
-    maydayPirateLockoutMinutes: (r.maydayPirateLockoutMinutes as number) || 30,
-    creditTopOffBot: (r.creditTopOffBot as string) || '',
-    fleetRescueBot: (r.fleetRescueBot as string) || '',
-    maydayRescueBot: (r.maydayRescueBot as string) || '',
-    // Enable/disable flags for each capability. Default to TRUE so existing
-    // configs (which only used the *_RescueBot assignment fields) keep working.
-    // Set any of these to false to completely disable that capability on every bot.
-    creditTopOffEnabled: (r.creditTopOffEnabled as boolean) ?? true,
-    fleetRescueEnabled: (r.fleetRescueEnabled as boolean) ?? true,
-    maydayRescueEnabled: (r.maydayRescueEnabled as boolean) ?? true,
-    premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
-    maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
-    ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
-    // When cloaked a ship cannot be ambushed, so (default ON) it may ignore
-    // detected pirates and not flee.
-    ignorePirateFleeWhenCloaked: (r.ignorePirateFleeWhenCloaked as boolean) ?? true,
-    enableCloak: (r.enableCloak as boolean) ?? false,
-    dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
-    disableFactionAnnouncements: (r.disableFactionAnnouncements as boolean) ?? false,
-    disablePrivateMessages: (r.disablePrivateMessages as boolean) ?? false,
-  };
-}
+} {
+    const all = readSettings();
+    const r = all.rescue || {};
+    const ft = all.fuel_transfer || {};
+    const general = all.general || {};
+    const parseBool = (value: unknown): boolean => {
+      if (typeof value === "boolean") return value;
+      if (typeof value === "string") {
+        return value.toLowerCase() === "true";
+      }
+      return false;
+    };
+    return {
+      fuelThreshold: (r.fuelThreshold as number) || 10,
+      rescueFuelCells: (r.rescueFuelCells as number) || 10,
+      rescueCredits: (r.rescueCredits as number) || 500,
+      scanIntervalSec: (r.scanIntervalSec as number) || 30,
+      refuelThreshold: (r.refuelThreshold as number) || 60,
+      maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
+      maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
+      ghostThreshold: (r.ghostThreshold as number) || 3,
+      homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
+      homeStation: (r.homeStation as string) || '',
+      costPerJump: (r.costPerJump as number) || 50,
+      costPerFuel: (r.costPerFuel as number) || 2,
+      creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
+      creditTopOffMinThreshold: (r.creditTopOffMinThreshold as number) || 10000,
+      maydayPirateProximityThreshold: (r.maydayPirateProximityThreshold as number) || 5,
+      maydayPirateLockoutMinutes: (r.maydayPirateLockoutMinutes as number) || 30,
+      creditTopOffBot: (r.creditTopOffBot as string) || '',
+      fleetRescueBot: (r.fleetRescueBot as string) || '',
+      maydayRescueBot: (r.maydayRescueBot as string) || '',
+      premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
+      maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
+      ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
+      ignorePirateFleeWhenCloaked: (r.ignorePirateFleeWhenCloaked as boolean) ?? true,
+      enableCloak: (r.enableCloak as boolean) ?? false,
+      dontRejectMaydaysInBlacklistSystems: (r.dontRejectMaydaysInBlacklistSystems as boolean) ?? false,
+      creditTopOffEnabled: (r.creditTopOffEnabled as boolean) ?? true,
+      fleetRescueEnabled: (r.fleetRescueEnabled as boolean) ?? true,
+      maydayRescueEnabled: (r.maydayRescueEnabled as boolean) ?? true,
+      disableFactionAnnouncements: parseBool(r.disableFactionAnnouncements),
+      disablePrivateMessages: parseBool(r.disablePrivateMessages),
+    };
+  }
 
 /**
  * Enable cloaking on this bot if the rescue settings request it (enableCloak).
@@ -6969,25 +6971,31 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               }
             }
 
-            // Send grumpy faction chat message about being ghosted
-            const aiChatService = (globalThis as any).aiChatService;
-            if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-              try {
-                const result = await aiChatService.sendFactionMessage(bot, {
-                  messageType: "rescue_no_show",
-                  targetName: target.username,
-                  isMayday: isMaydayTarget,
-                  isBot: !isMaydayTarget,
-                  currentSystem: bot.system,
-                  targetSystem: target.system,
-                  targetPoi: target.poi || undefined,
-                });
-                if (!result.ok) {
-                  ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+// Send grumpy faction chat message about being ghosted
+            if (!settings.disableFactionAnnouncements) {
+                const aiChatService = (globalThis as any).aiChatService;
+                if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+                    try {
+                        const result = await aiChatService.sendFactionMessage(bot, {
+                            messageType: "rescue_no_show",
+                            targetName: target.username,
+                            isMayday: isMaydayTarget,
+                            isBot: !isMaydayTarget,
+                            currentSystem: bot.system,
+                            targetSystem: target.system,
+                            targetPoi: target.poi || undefined,
+                        });
+                        if (!result.ok) {
+                            ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+                        } else {
+                            ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
+                        }
+                    } catch (e) {
+                        ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+                    }
                 }
-              } catch (e) {
-                ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
-              }
+            } else {
+                ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
             }
            }
           

@@ -3286,24 +3286,13 @@ this.log("observation", `[${this.username}] >>> subscribeToObservation(activeSca
       return resp;
     }
 
-    const sc = resp.result as Record<string, unknown>;
+const sc = resp.result as Record<string, unknown>;
+    this.log("observation", `[${this.username}] >>> subscribe_observation full response: ${JSON.stringify(sc)}`);
     const fresh = this.libObservationState();
 
-    // Determine nearby and systemAgents from response; if missing, fetch via get_nearby/get_system_agents
+    // Determine nearby and systemAgents from response; if missing, use empty arrays
     let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
     let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
-
-    if (nearby.length === 0 && systemAgents.length === 0) {
-      // fetch snapshot to populate nearby and system agents
-      const nearbyResp = await this.libExec("get_nearby", {});
-      const agentsResp = await this.libExec("get_system_agents", {});
-      if (!nearbyResp.error && nearbyResp.result && typeof nearbyResp.result === "object" && "nearby" in nearbyResp.result && Array.isArray(nearbyResp.result.nearby)) {
-        nearby = nearbyResp.result.nearby as Array<Record<string, unknown>>;
-      }
-      if (!agentsResp.error && agentsResp.result && typeof agentsResp.result === "object" && "system_agents" in agentsResp.result && Array.isArray(agentsResp.result.system_agents)) {
-        systemAgents = agentsResp.result.system_agents as Array<Record<string, unknown>>;
-      }
-    }
 
     // Update observation state
     this.observationSession = {
@@ -3320,16 +3309,8 @@ this.log("observation", `[${this.username}] >>> subscribeToObservation(activeSca
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
     this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
 
-// Return a successful response with the nearby and system_agents set (either from response or fetch)
-     return { 
-       result: { 
-         ...sc, 
-         nearby, 
-         systemAgents 
-       }, 
-       error: undefined, 
-       notifications: [] 
-     };
+    // Return the original response
+    return resp;
   }
 
   /**

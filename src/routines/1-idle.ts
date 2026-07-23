@@ -26,12 +26,17 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
   // Define the observation handler
   const handleObservation = (payload: any) => {
      ctx.log('info', 'Observation update received');
+     ctx.log('info', `Payload type: ${typeof payload}`);
      if (typeof payload === 'object' && payload !== null) {
        const payloadStr = JSON.stringify(payload).toLowerCase();
+       ctx.log('info', `Payload keys: ${Object.keys(payload).join(', ')}`);
+       ctx.log('info', `Payload: ${payloadStr.substring(0, 200)}${payloadStr.length > 200 ? '...' : ''}`);
        if (payloadStr.includes('pirate')) {
          ctx.log('info', '🚨 PIRATE DETECTED! 🚨');
-         ctx.log('info', `Payload: ${JSON.stringify(payload)}`);
+         ctx.log('info', `Full payload: ${JSON.stringify(payload)}`);
        }
+     } else {
+       ctx.log('info', `Payload: ${payload}`);
      }
    };
 

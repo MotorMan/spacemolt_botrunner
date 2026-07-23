@@ -4,8 +4,8 @@
  *
  * Every 30 seconds it performs a get_nearby (to keep the connection active)
  * and refreshes the bot's cargo + location so its dashboard/status stays
- * current. It takes no game actions and never moves the ship, so it is safe to
- * leave running on any idle bot.
+> current. It takes no game actions and never moves the ship, so it is safe to
+> leave running on any idle bot.
  *
  * Additionally, this routine subscribes to passive observation to receive live
  * updates about nearby objects, system agents, and signatures. It resubscribes
@@ -23,6 +23,18 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
   let lastObservationPoiId: string = bot.poi;
   let lastObservationSystemId: string = bot.system;
 
+  // Define the observation handler
+  const handleObservation = (payload: any) => {
+     ctx.log('info', 'Observation update received');
+     if (typeof payload === 'object' && payload !== null) {
+       const payloadStr = JSON.stringify(payload).toLowerCase();
+       if (payloadStr.includes('pirate')) {
+         ctx.log('info', '🚨 PIRATE DETECTED! 🚨');
+         ctx.log('info', `Payload: ${JSON.stringify(payload)}`);
+       }
+     }
+   };
+
   // Initial observation subscription (passive)
   if (bot.account) {
     try {
@@ -30,11 +42,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("info", "Subscribed to observation (passive)");
 
       // Set up listener for observation updates
-      const obsHandler = (payload: any) => {
-        ctx.log("info", `Observation update: ${JSON.stringify(payload)}`);
-      };
       // @ts-ignore: account.on exists
-      const off = bot.account.on("observation_update", obsHandler);
+      const off = bot.account.on("observation_update", handleObservation);
       observationUnsub = off;
       ctx.log("info", "Listening for observation updates");
     } catch (err) {
@@ -97,11 +106,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("info", `Subscribed to observation (passive) for new location: ${bot.system}/${bot.poi}`);
 
           // Set up listener for observation updates
-          const obsHandler = (payload: any) => {
-            ctx.log("info", `Observation update: ${JSON.stringify(payload)}`);
-          };
           // @ts-ignore: account.on exists
-          const off = bot.account.on("observation_update", obsHandler);
+          const off = bot.account.on("observation_update", handleObservation);
           observationUnsub = off;
           ctx.log("info", "Listening for observation updates");
 

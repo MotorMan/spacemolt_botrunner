@@ -102,16 +102,20 @@ export function parseNearby(result: unknown): NearbyEntity[] {
   const r = result as Record<string, unknown>;
   const entities: NearbyEntity[] = [];
 
-  let rawEntities: Array<Record<string, unknown>> = [];
-  if (Array.isArray(r)) {
-    rawEntities = r;
-  } else if (Array.isArray(r.entities)) {
-    rawEntities = r.entities as Array<Record<string, unknown>>;
-  } else if (Array.isArray(r.players) && r.players.length > 0) {
-    rawEntities = r.players as Array<Record<string, unknown>>;
-  } else if (Array.isArray(r.nearby)) {
-    rawEntities = r.nearby as Array<Record<string, unknown>>;
-  }
+let rawEntities: Array<Record<string, unknown>> = [];
+    if (Array.isArray(r)) {
+      rawEntities = r;
+    } else if (Array.isArray(r.entities)) {
+      rawEntities = r.entities as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.players) && r.players.length > 0) {
+      rawEntities = r.players as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.nearby)) {
+      rawEntities = r.nearby as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.pirates)) {
+      rawEntities = r.pirates as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.creatures)) {
+      rawEntities = r.creatures as Array<Record<string, unknown>>;
+    }
 
   for (const e of rawEntities) {
     const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";

@@ -3330,30 +3330,58 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
    * observation cache, so existing parseNearby() logic keeps working.
    */
 getObservationResult(): Record<string, unknown> {
-     const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
-     const pirates: Record<string, unknown>[] = [];
-     const creatures: Record<string, unknown>[] = [];
+const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
+    const pirates: Record<string, unknown>[] = [];
+    const creatures: Record<string, unknown>[] = [];
+    const empireNpcs: Record<string, unknown>[] = [];
+    const players: Record<string, unknown>[] = [];
+    
+    for (const entity of allNearby) {
+      // Check if it's a pirate first
+      if (isPirateTarget(entity as any, true, "boss")) {
+        pirates.push(entity);
+      } 
+      // Then check if it's a creature
+      else if (isCreatureTarget(entity as any, true)) {
+        creatures.push(entity);
+      } 
+      // Then check if it's an empire NPC based on name patterns
+      else {
+        const name = (entity as any).name || (entity as any).username || '';
+        const nameLower = name.toLowerCase();
+        const isEmpireNpc = 
+          nameLower.startsWith("[customs]") ||
+          nameLower.startsWith("[police]") ||
+          nameLower.startsWith("confederacy customs") ||
+          nameLower.includes("customs i -") ||
+          nameLower.includes("customs ii -") ||
+          nameLower.includes("customs iii -") ||
+          nameLower.includes("confederacy customs i -") ||
+          nameLower.includes("confederacy customs ii -") ||
+          nameLower.includes("pact border") ||
+          nameLower.includes("pact enforcer") ||
+          nameLower.includes("rim ranger");
+        
+        if (isEmpireNpc) {
+          empireNpcs.push(entity);
+        } else {
+          players.push(entity);
+        }
+      }
+    }
      
-     for (const entity of allNearby) {
-       if (isPirateTarget(entity as any, true, "boss")) {
-         pirates.push(entity);
-       } else if (isCreatureTarget(entity as any, true)) {
-         creatures.push(entity);
-       }
-     }
-     
-     return {
-       nearby: allNearby,
-       system_agents: this.observationSystemAgents,
-       players: this.observationNearby,
-       objects: this.observationNearby,
-       nearby_players: this.observationNearby,
-       ships: [],
-       pirates: pirates,
-       creatures: creatures,
-       empire_npcs: [],
-       unknown_signature: this.observationUnknownSignature,
-     };
+return {
+      nearby: allNearby,
+      system_agents: this.observationSystemAgents,
+      players: players,
+      objects: this.observationNearby,
+      nearby_players: this.observationNearby,
+      ships: [],
+      pirates: pirates,
+      creatures: creatures,
+      empire_npcs: empireNpcs,
+      unknown_signature: this.observationUnknownSignature,
+    };
    }
 
   /**

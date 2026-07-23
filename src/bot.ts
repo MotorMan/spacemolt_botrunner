@@ -3278,7 +3278,7 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
       this.log("observation", `Observation active scan enabled (poi=${updated.poiId} nearby=${updated.nearby.length})`);
       return { result: { poi_id: updated.poiId, system_id: updated.systemId, nearby: updated.nearby, system_agents: updated.systemAgents, active_scan: true, unknown_signature: updated.unknownSignature }, error: undefined, notifications: [] };
     }
-    this.log("observation", `[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
+this.log("observation", `[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
     this.log("observation", `[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
@@ -3288,19 +3288,48 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
 
     const sc = resp.result as Record<string, unknown>;
     const fresh = this.libObservationState();
+
+    // Determine nearby and systemAgents from response; if missing, fetch via get_nearby/get_system_agents
+    let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
+    let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
+
+    if (nearby.length === 0 && systemAgents.length === 0) {
+      // fetch snapshot to populate nearby and system agents
+      const nearbyResp = await this.libExec("get_nearby", {});
+      const agentsResp = await this.libExec("get_system_agents", {});
+      if (!nearbyResp.error && nearbyResp.result && typeof nearbyResp.result === "object" && "nearby" in nearbyResp.result && Array.isArray(nearbyResp.result.nearby)) {
+        nearby = nearbyResp.result.nearby as Array<Record<string, unknown>>;
+      }
+      if (!agentsResp.error && agentsResp.result && typeof agentsResp.result === "object" && "system_agents" in agentsResp.result && Array.isArray(agentsResp.result.system_agents)) {
+        systemAgents = agentsResp.result.system_agents as Array<Record<string, unknown>>;
+      }
+    }
+
+    // Update observation state
     this.observationSession = {
       id: "active",
       poi_id: (sc.poi_id as string) || fresh.poiId,
       system_id: (sc.system_id as string) || fresh.systemId,
     };
-    this.observationNearby = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : fresh.nearby;
-    this.observationSystemAgents = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : fresh.systemAgents;
-    this.observationUnknownSignature = !!(sc.unknown_signature) || fresh.unknownSignature;
-    this.observationActiveScan = !!(sc.active_scan) || fresh.activeScan;
-    this.observationTick = fresh.tick;
+    this.observationNearby = nearby;
+    this.observationSystemAgents = systemAgents;
+    this.observationUnknownSignature = !!sc.unknown_signature || fresh.unknownSignature;
+    this.observationActiveScan = !!sc.active_scan || fresh.activeScan;
+    this.observationTick = typeof sc.tick === 'number' ? sc.tick : fresh.tick;
+
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
     this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
-    return resp;
+
+// Return a successful response with the nearby and system_agents set (either from response or fetch)
+     return { 
+       result: { 
+         ...sc, 
+         nearby, 
+         systemAgents 
+       }, 
+       error: undefined, 
+       notifications: [] 
+     };
   }
 
   /**

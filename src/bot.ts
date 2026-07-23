@@ -3330,47 +3330,31 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
    * observation cache, so existing parseNearby() logic keeps working.
    */
 getObservationResult(): Record<string, unknown> {
-      const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
-      // Import the classification functions from battle module
-      // Note: We need to import these or access them somehow
-      // For now, we'll do basic classification based on common patterns
-      const pirates: Record<string, unknown>[] = [];
-      const creatures: Record<string, unknown>[] = [];
-      
-      for (const entity of allNearby) {
-        // Check if this entity looks like a pirate
-        const isPirate = 
-          !!(entity as any).pirate_id || 
-          ((entity as any).type?.toString().toLowerCase().includes('pirate') || 
-           ((entity as any).faction?.toString().toLowerCase().includes('pirate') ||
-            ((entity as any).name?.toString().toLowerCase().match(/(drifter|pirate|raider|outlaw|bandit|corsair|marauder|hostile|executioner|sentinel|prowler|apex|razor|striker|rampart|stalwart|bastion|onslaught|iron|strike)/))));
-        
-        // Check if this entity looks like a creature
-        const isCreature = 
-          !!(entity as any).creature_id ||
-          ((entity as any).type?.toString().toLowerCase() === 'creature') ||
-          !!(entity as any).isCreature;
-          
-        if (isPirate) {
-          pirates.push(entity);
-        } else if (isCreature) {
-          creatures.push(entity);
-        }
-      }
-      
-      return {
-        nearby: allNearby,
-        system_agents: this.observationSystemAgents,
-        players: this.observationNearby,
-        objects: this.observationNearby,
-        nearby_players: this.observationNearby,
-        ships: [],
-        pirates: pirates,
-        creatures: creatures,
-        empire_npcs: [],
-        unknown_signature: this.observationUnknownSignature,
-      };
-    }
+     const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
+     const pirates: Record<string, unknown>[] = [];
+     const creatures: Record<string, unknown>[] = [];
+     
+     for (const entity of allNearby) {
+       if (isPirateTarget(entity as any, true, "boss")) {
+         pirates.push(entity);
+       } else if (isCreatureTarget(entity as any, true)) {
+         creatures.push(entity);
+       }
+     }
+     
+     return {
+       nearby: allNearby,
+       system_agents: this.observationSystemAgents,
+       players: this.observationNearby,
+       objects: this.observationNearby,
+       nearby_players: this.observationNearby,
+       ships: [],
+       pirates: pirates,
+       creatures: creatures,
+       empire_npcs: [],
+       unknown_signature: this.observationUnknownSignature,
+     };
+   }
 
   /**
    * Process an observation_update push event from the server and update

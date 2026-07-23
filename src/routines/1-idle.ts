@@ -39,24 +39,23 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
        ctx.log('info', `Payload: ${payload}`);
      }
    };
-
-  // Initial observation subscription (passive)
-  if (bot.account) {
-    try {
-      await bot.subscribeToObservation(true);
-      ctx.log("info", "Subscribed to observation (active)");
-
-      // Set up listener for observation updates
-      // @ts-ignore: account.on exists
-      const off = bot.account.on("observation_update", handleObservation);
-      observationUnsub = off;
-      ctx.log("info", "Listening for observation updates");
-    } catch (err) {
-      ctx.log("error", `Failed to subscribe to observation: ${err}`);
-    }
-  } else {
-    ctx.log("warn", "Bot account not available, skipping observation subscription");
-  }
+// Set up listener for observation updates BEFORE subscribing so we catch initial update
+   if (bot.account) {
+     // Set up listener for observation updates
+     // @ts-ignore: account.on exists
+     const off = bot.account.on("observation_update", handleObservation);
+     observationUnsub = off;
+     ctx.log("info", "Listening for observation updates");
+     
+     try {
+       await bot.subscribeToObservation(false);
+       ctx.log("info", "Subscribed to observation (passive)");
+     } catch (err) {
+       ctx.log("error", `Failed to subscribe to observation: ${err}`);
+     }
+   } else {
+     ctx.log("warn", "Bot account not available, skipping observation subscription");
+   }
 
   while (bot.state === "running") {
     yield "anti_idle";
@@ -107,8 +106,8 @@ export const idleRoutine: Routine = async function* (ctx: RoutineContext) {
       // Attempt to resubscribe to observation for new location
       if (bot.account) {
         try {
-await bot.subscribeToObservation(true);
-          ctx.log("info", `Subscribed to observation (active) for new location: ${bot.system}/${bot.poi}`);
+await bot.subscribeToObservation(false);
+           ctx.log("info", `Subscribed to observation (passive) for new location: ${bot.system}/${bot.poi}`);
 
           // Set up listener for observation updates
           // @ts-ignore: account.on exists

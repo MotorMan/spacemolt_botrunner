@@ -95,31 +95,24 @@ import {
   getWeaponModules,
 } from "./battle.js";
 
-async function ensureObservationSubscribed(bot: Bot): Promise<void> {
-  if (bot.observationSession?.id) {
-    return;
-  }
-  await bot.subscribeToObservation(false);
-}
+
+
+async function ensureObservationSubscribed(): Promise<void> {
+      // Intentionally left empty - observation subscription replaced with polling
+    }
 
 async function resubscribeObservationAfterMove(bot: Bot): Promise<void> {
-  bot.clearObservationState();
-  await bot.subscribeToObservation(false);
-}
+     bot.clearObservationState();
+   }
 
 async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isObservation: boolean }> {
-  if (bot.observationSession?.id && (bot.observationNearby.length > 0 || bot.observationSystemAgents.length > 0)) {
-    return { result: bot.getObservationResult(), isObservation: true };
-  }
-  const resp = await bot.exec("get_nearby");
-  return { result: resp.result, isObservation: false };
-}
+     const resp = await bot.exec("get_nearby");
+     return { result: resp.result, isObservation: false };
+   }
 
 function getObservationDebugLine(bot: Bot): string {
-  const nearby = bot.observationNearby;
-  const nearbyNames = nearby.map(e => (e.username as string) || (e.player_id as string) || "?").join(", ");
-  return `observation[tick=${bot.observationTick}] nearby=${nearby.length} [${nearbyNames || "none"}] unknown_sig=${bot.observationUnknownSignature}`;
-}
+     return "observation: disabled (using polling)";
+   }
 
 async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
@@ -853,12 +846,12 @@ async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnTyp
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       handled.add(key);
-      continue;
-    }
+continue;
+     }
 
-    await ensureObservationSubscribed(bot);
-    const nearbyResult = await getObservationOrNearby(bot);
-    const nearbyData = nearbyResult.result;
+     await ensureObservationSubscribed();
+     const nearbyResult = await getObservationOrNearby(bot);
+     const nearbyData = nearbyResult.result;
     if (!nearbyData) {
       ctx.log("error", `No observation/nearby data available for assist matching`);
       handled.add(key);
@@ -1072,29 +1065,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
 
-  // Observation setup
-  let observationUnsub: (() => void) | null = null;
-  // Initial observation subscription (passive)
-  if (bot.account) {
-    try {
-      await bot.subscribeToObservation(false);
-      ctx.log("info", "Subscribed to observation (passive)");
-
-// Set up listener for observation updates
-       const obsHandler = (payload: any) => {
-         const formatted = formatObservationUpdate(payload);
-         ctx.log("info", `Observation update: ${formatted}`);
-       };
-      // @ts-ignore: account.on exists
-      const off = bot.account.on("observation_update", obsHandler);
-      observationUnsub = off;
-      ctx.log("info", "Listening for observation updates");
-    } catch (err) {
-      ctx.log("error", `Failed to subscribe to observation: ${err}`);
-    }
-  } else {
-    ctx.log("warn", "Bot account not available, skipping observation subscription");
-  }
+// Observation setup removed: using polling instead of subscription
 
   try {
     // Register the bot chat channel listener so allied hunters can pull us into
@@ -1182,17 +1153,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Default to roam_systems
     yield* roamSystemsRoutine(ctx);
-  } finally {
-    // Clean up observation subscription
-    if (observationUnsub) {
-      try {
-        observationUnsub();
-        ctx.log("info", "Unsubscribed from observation updates");
-      } catch (err) {
-        ctx.log("error", `Error unsubscribing from observation updates: ${err}`);
-      }
-    }
-  }
+} finally {
+     // Clean up observation subscription (replaced with polling)
+   }
 };
 
 // ── Roam Systems Routine (original behavior) ────────────────────
@@ -1401,7 +1364,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     ctx.log("info", `Patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
 
-    await ensureObservationSubscribed(bot);
+    await ensureObservationSubscribed();
 
     // ── Patrol loop — visit each non-station POI ──
     let patrolKills = 0;
@@ -1474,15 +1437,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
          continue;
        }
        bot.poi = poi.id;
-       // Clear observation state to clear stale data from previous location
-       bot.clearObservationState();
+// Clear observation state to clear stale data from previous location
+        bot.clearObservationState();
+        // observationCache.delete(bot); // removed
 
-       // Brief pause to ensure travel fully processed (especially for jumps between systems)
-       await ctx.sleep(1000);
+        // Brief pause to ensure travel fully processed (especially for jumps between systems)
+        await ctx.sleep(1000);
 
       // Scan for targets
       yield "scan_for_targets";
-      await ensureObservationSubscribed(bot);
+      await ensureObservationSubscribed();
       const nearbyResult = await getObservationOrNearby(bot);
       const nearbyData = nearbyResult.result;
       const isObservation = nearbyResult.isObservation;
@@ -1905,7 +1869,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     ctx.log("info", `Patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
 
-    await ensureObservationSubscribed(bot);
+    await ensureObservationSubscribed();
 
     // ── Patrol loop — visit each non-station POI ──
     let patrolKills = 0;
@@ -1943,15 +1907,16 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
          continue;
        }
        bot.poi = poi.id;
-       // Clear observation state to clear stale data from previous location
-       bot.clearObservationState();
+// Clear observation state to clear stale data from previous location
+        bot.clearObservationState();
+//        observationCache.delete(bot); // removed
 
-       // Brief pause to ensure travel fully processed
-       await ctx.sleep(1000);
+// Brief pause to ensure travel fully processed
+        await ctx.sleep(1000);
 
       // Scan for targets
       yield "scan_for_targets";
-      await ensureObservationSubscribed(bot);
+      await ensureObservationSubscribed();
       const obsResult = await getObservationOrNearby(bot);
       const nearbyData = obsResult.result;
       const isObservation = obsResult.isObservation;
@@ -2349,7 +2314,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     // ── Wait and scan for targets ──
     ctx.log("info", `Waiting for targets at ${originalPoi}...`);
     yield "scan_for_targets";
-    await ensureObservationSubscribed(bot);
+    await ensureObservationSubscribed();
     const obsResult = await getObservationOrNearby(bot);
     const nearbyData = obsResult.result;
     const isObservation = obsResult.isObservation;
@@ -2790,7 +2755,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        await ensureObservationSubscribed(bot);
+        await ensureObservationSubscribed();
         const nearbyResult = await getObservationOrNearby(bot);
         const nearbyData = nearbyResult.result;
         if (!nearbyData) continue;
@@ -3187,7 +3152,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        await ensureObservationSubscribed(bot);
+        await ensureObservationSubscribed();
         const nearbyResult = await getObservationOrNearby(bot);
         const nearbyData = nearbyResult.result;
         if (!nearbyData) continue;
@@ -3343,7 +3308,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         await bot.exec("travel", { target_poi: poi.id });
         bot.poi = poi.id;
         await ctx.sleep(500);
-        await ensureObservationSubscribed(bot);
+        await ensureObservationSubscribed();
         const nearbyResult = await getObservationOrNearby(bot);
         const nearbyData = nearbyResult.result;
         if (!nearbyData) continue;

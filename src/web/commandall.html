@@ -663,15 +663,25 @@
       // Collect all cargo items across bots for aggregated dropdown
       const allCargoItems = {};
 
-      for (const bot of activeBots) {
-        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-        caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
+      // Progress element for in-place updates
+      let progressEl = document.getElementById('ca-weapons-progress');
+      if (!progressEl) {
+        progressEl = document.createElement('div');
+        progressEl.id = 'ca-weapons-progress';
+        progressEl.style.cssText = 'font-size:12px;color:var(--text-dim);margin:5px 0';
+        document.getElementById('ca-weapon-reload-controls')?.insertBefore(progressEl, document.getElementById('ca-weapons-summary'));
+      }
+
+      for (let i = 0; i < activeBots.length; i++) {
+        const bot = activeBots[i];
+        const progress = document.createElement('span');
+        progress.textContent = `get_ship: ${i + 1}/${activeBots.length}`;
+        progress.style.color = 'var(--text-dim)';
+        progressEl.innerHTML = '';
+        progressEl.appendChild(progress);
 
         // First get ship data for weapons
         sendExec(bot.username, 'get_ship', {}, (result) => {
-          if (!result.ok || !result.data) {
-            caLog(`<span class="resp-err">${esc(bot.username)}: get_ship failed - ${esc(result.error || 'no data')}</span>`);
-          }
           const data = result.data || {};
           const modules = Array.isArray(data.modules) ? data.modules : [];
 
@@ -713,14 +723,9 @@
 
           // Now get cargo data
           sendExec(bot.username, 'get_cargo', {}, (cargoResult) => {
-            if (!cargoResult.ok || !cargoResult.data) {
-              caLog(`<span class="resp-err">${esc(bot.username)}: get_cargo failed - ${esc(cargoResult.error || 'no data')}</span>`);
-            }
             const cargoData = cargoResult.data || {};
             const shipCargo = Array.isArray(cargoData.cargo) ? cargoData.cargo : 
                               Array.isArray(cargoData.items) ? cargoData.items : [];
-
-            caLog(`<span class="resp-info">${esc(bot.username)}: cargo items=${shipCargo.length}, weapons=${weapons.length}</span>`);
 
             // Update cache with cargo
             caWeaponsCache[bot.username].cargo = shipCargo;
@@ -751,12 +756,12 @@
 
               if (ammoSelect) {
                 const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
-                caLog(`<span class="resp-info">Dropdown: ${sortedItems.length} items</span>`);
                 ammoSelect.innerHTML = '<option value="">Select item...</option>' +
                   sortedItems.map(([id, data]) => {
                     return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
                   }).join('');
               }
+              if (progressEl) progressEl.textContent = `✓ Loaded ${totalWeapons} weapons from ${activeBots.length} bots`;
             }
           });
         });
@@ -795,6 +800,16 @@
 
       let index = 0;
       let completedCount = 0;
+
+      // Progress element for in-place updates
+      let reloadProgressEl = document.getElementById('ca-reload-progress');
+      if (!reloadProgressEl) {
+        reloadProgressEl = document.createElement('div');
+        reloadProgressEl.id = 'ca-reload-progress';
+        reloadProgressEl.style.cssText = 'font-size:12px;color:var(--text-dim);margin:5px 0';
+        document.getElementById('ca-weapon-reload-controls')?.insertBefore(reloadProgressEl, document.getElementById('ca-weapons-summary'));
+      }
+
       function executeNext() {
         if (index >= weaponsToReload.length) return;
 
@@ -804,13 +819,15 @@
           ammo_item_id: ammoId,
         };
 
+        reloadProgressEl.textContent = `Reloading weapon ${index + 1}/${weaponsToReload.length} on ${bot.username}: ${weapon.name}`;
+
         sendExec(bot.username, 'reload', reloadParams, (result) => {
           const success = result.ok !== false && !result.error;
           const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
           caLog(`<span class="resp-bot">${esc(bot.username)}:</span> Reloaded "${esc(weapon.name)}": ${status}`);
           completedCount++;
           if (completedCount === weaponsToReload.length) {
-            caLog(`<span class="resp-ok">✓ All ${weaponsToReload.length} weapons reloaded successfully</span>`);
+            reloadProgressEl.textContent = `✓ All ${weaponsToReload.length} weapons reloaded successfully`;
           }
         });
 

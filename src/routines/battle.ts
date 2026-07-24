@@ -695,9 +695,14 @@ export async function engageTarget(
 
   if (!skipScan) {
     let scanResp = await bot.exec("scan", { target_id: target.id });
-    if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
-      ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
-      scanResp = await bot.exec("scan", { target_id: target.name });
+    if (scanResp.error) {
+      const errMsg = scanResp.error.message.toLowerCase();
+      if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
+        ctx.log("combat", `Scan skipped - already in battle with ${target.name}`);
+      } else if (errMsg.includes("invalid_target")) {
+        ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
+        scanResp = await bot.exec("scan", { target_id: target.name });
+      }
     }
 
     if (!scanResp.error && scanResp.result) {
@@ -781,30 +786,31 @@ export async function fightFreshBattle(
 
   ctx.log("combat", `🎯 Fighting fresh battle against ${target.name}...`);
 
-  // Initial setup - scan and attack
-  let scanResp = await bot.exec("scan", { target_id: target.id });
-  if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
-    ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
-    scanResp = await bot.exec("scan", { target_id: target.name });
-  }
-
-  if (!scanResp.error && scanResp.result) {
-    const s = scanResp.result as Record<string, unknown>;
-    const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
-    const faction = (s.faction as string) || target.faction || "unknown";
-    ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
-  }
-
   // A battle may already be active by the time we get here: engageTarget already
   // issued the attack, or the server pulled us in (COMBAT WARNING). Re-issuing the
   // attack command is redundant AND, under the newer server combat code, can hang /
   // time out for ~60s while we sit idle in the outer ring. If we're already in a
-  // battle, skip the attack and go straight into the combat loop (advance/engage).
+  // battle, skip the scan and attack and go straight into the combat loop (advance/engage).
   const preAttackStatus = await getBattleStatus(ctx);
   let battleActive = !!preAttackStatus;
   let attackErrMsg: string | null = null;
 
+  // Only scan and attack if we're not already in a battle
   if (!battleActive) {
+    // Initial setup - scan and attack
+    let scanResp = await bot.exec("scan", { target_id: target.id });
+    if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
+      ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
+      scanResp = await bot.exec("scan", { target_id: target.name });
+    }
+
+    if (!scanResp.error && scanResp.result) {
+      const s = scanResp.result as Record<string, unknown>;
+      const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
+      const faction = (s.faction as string) || target.faction || "unknown";
+      ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
+    }
+
     const atk = await bot.exec("attack", { target_id: target.id });
     if (atk.error) {
       const msg = atk.error.message.toLowerCase();

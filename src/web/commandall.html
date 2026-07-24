@@ -61,6 +61,8 @@
     let factionWithdrawSortOrder = 'alpha';
     let caGiftSendAllRunning = false;
     let caDepositAllRunning = false;
+    let caWeaponsCache = {};
+    let caSelectedAmmoType = '';
 
     // ── Command send queue for send-before-open or closed socket ──
     let wsSendQueue = [];
@@ -533,6 +535,25 @@
           <button class="sm" onclick="caExec('get_nearby')">Nearby All</button>
         </div>
 
+        <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+          <label style="color:var(--text-bright);font-weight:600">Mass Weapon Reload</label>
+        </div>
+
+        <div class="cmd-group">
+          <button class="sm" onclick="caLoadAllWeapons()" id="ca-load-weapons-btn">🔫 Load Weapons</button>
+        </div>
+
+        <div id="ca-weapon-reload-controls" style="display:none">
+          <div class="cmd-group">
+            <label>Selected Ammo</label>
+            <select id="ca-ammo-type-select">
+              <option value="">Select ammo type...</option>
+            </select>
+            <button class="primary sm" onclick="caMassReloadAll()">Reload All Weapons</button>
+          </div>
+          <div id="ca-weapons-summary" style="font-size:11px;color:var(--text-dim);margin-top:4px"></div>
+        </div>
+
         <div class="cmd-group">
           <label>Custom Command (All Bots)</label>
           <input type="text" id="ca-custom-cmd" placeholder="command" style="min-width:100px">
@@ -623,6 +644,149 @@
         }
       }
       caExec(cmd, params);
+    }
+
+    /** Load weapon module data for all bots */
+    function caLoadAllWeapons() {
+      const activeBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (activeBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to load weapons</span>');
+        return;
+      }
+
+      caLog('<span class="resp-cmd">Loading weapons from all bots...</span>');
+      caWeaponsCache = {};
+      let loadedCount = 0;
+
+      for (const bot of activeBots) {
+        const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+        caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
+
+        sendExec(bot.username, 'get_ship', {}, (result) => {
+          if (result.ok && result.data) {
+            const data = result.data;
+            const modules = Array.isArray(data.modules) ? data.modules : [];
+            const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
+
+            const weapons = modules
+              .filter((mod) => {
+                const modType = ((mod.type || mod.module_type || '') + '').toLowerCase();
+                const modId = ((mod.module_id || mod.mod_id || mod.id || '') + '').toLowerCase();
+                return modType.includes('weapon') || modType.includes('missile') ||
+                       modType.includes('launcher') || modType.includes('torpedo') ||
+                       modId.includes('weapon') || modId.includes('missile') || modId.includes('launcher');
+              })
+              .map((mod) => {
+                let ammoType = mod.ammo_type || null;
+                const modId = mod.module_id || mod.mod_id || mod.id || '';
+                if (!ammoType && modId) {
+                  const catalogModule = catalog.items?.[modId];
+                  if (catalogModule && catalogModule.ammo_type) {
+                    ammoType = catalogModule.ammo_type;
+                  }
+                }
+
+                let currentAmmo = mod.current_ammo;
+                let maxAmmo = mod.magazine_size || 0;
+
+                return {
+                  instanceId: mod.module_id || mod.instance_id || mod.weapon_instance_id || mod.id || '',
+                  typeId: modId,
+                  name: mod.name || modId || 'Unknown Weapon',
+                  currentAmmo: currentAmmo,
+                  maxAmmo: maxAmmo,
+                  ammoType: ammoType,
+                  loadedAmmoName: mod.loaded_ammo_name || null,
+                };
+              })
+              .filter((w) => w.instanceId);
+
+            caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
+            loadedCount++;
+
+            const ammoItems = shipCargo.filter((i) => {
+              const catalogItem = catalog.items?.[i.item_id];
+              return catalogItem?.effect?.type === 'ammo';
+            });
+
+            if (ammoItems.length > 0) {
+              const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.itemId))];
+              const ammoSelect = document.getElementById('ca-ammo-type-select');
+              if (ammoSelect) {
+                ammoSelect.innerHTML = '<option value="">Select ammo type...</option>' +
+                  uniqueAmmoTypes.map(id => {
+                    const item = ammoItems.find(a => a.itemId === id);
+                    return `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`;
+                  }).join('');
+              }
+            }
+
+            if (loadedCount === activeBots.length) {
+              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+              const controls = document.getElementById('ca-weapon-reload-controls');
+              const summary = document.getElementById('ca-weapons-summary');
+              if (controls) controls.style.display = 'block';
+              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
+            }
+          } else {
+            caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(result.error || 'unknown')}</span>`);
+          }
+        });
+      }
+    }
+
+    /** Mass reload all weapons on all bots with selected ammo type */
+    function caMassReloadAll() {
+      const ammoId = val('ca-ammo-type-select');
+      if (!ammoId) {
+        caLog('<span class="resp-err">Select an ammo type first</span>');
+        return;
+      }
+
+      const activeBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (activeBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to reload</span>');
+        return;
+      }
+
+      const weaponsToReload = [];
+      for (const bot of activeBots) {
+        const botWeapons = caWeaponsCache[bot.username]?.weapons || [];
+        for (const weapon of botWeapons) {
+          weaponsToReload.push({ bot, weapon });
+        }
+      }
+
+      if (weaponsToReload.length === 0) {
+        caLog('<span class="resp-warn">No weapons found to reload</span>');
+        return;
+      }
+
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      caLog(`<span class="resp-cmd">${ts} > FLEET: Reloading ${weaponsToReload.length} weapons with ${catalogName(ammoId)}</span>`);
+
+      let index = 0;
+      function executeNext() {
+        if (index >= weaponsToReload.length) return;
+
+        const { bot, weapon } = weaponsToReload[index];
+        const reloadParams = {
+          weapon_instance_id: weapon.instanceId,
+          ammo_item_id: ammoId,
+        };
+
+        sendExec(bot.username, 'reload', reloadParams, (result) => {
+          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          caLog(`<span class="resp-bot">${esc(bot.username)}:</span> Reloaded "${esc(weapon.name)}": ${status}`);
+        });
+
+        index++;
+        if (index < weaponsToReload.length) {
+          setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+        }
+      }
+
+      executeNext();
     }
 
     /** Get faction storage options for command-all faction withdraw dropdown */

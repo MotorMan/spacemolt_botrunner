@@ -280,6 +280,7 @@ const BACKUP_FILES = [
 class MapStore {
   private data: MapData;
   private dirty = false;
+  private mapGeneration = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
   // Guard so two async disk writes never overlap (which would race on the file).
@@ -413,6 +414,7 @@ class MapStore {
 
   private scheduleSave(): void {
     this.dirty = true;
+    this.mapGeneration++;
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
@@ -468,6 +470,10 @@ class MapStore {
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
       writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
     }
+  }
+
+  getMapGeneration(): number {
+    return this.mapGeneration;
   }
 
   private getTimestamp(): string {

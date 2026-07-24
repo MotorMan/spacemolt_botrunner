@@ -441,7 +441,18 @@ function setupBotLogging(bot: Bot): void {
   };
 }
 
+let lastStatusKey = "";
+
 function refreshStatusTable(): void {
+  const key = [...bots.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, b]) =>
+      `${b.username}:${b.state}:${b.routineName}:${b.credits}:${b.fuel}:${b.maxFuel}:${b.cargo}:${b.cargoMax}:${b.location}:${b.system}:${b.poi}:${b.docked}:${b.shipName}:${b.shipClass}:${b.tier}:${b.hull}:${b.maxHull}:${b.shield}:${b.maxShield}:${b.isCloaked}:${b.faction}:${b.inventory?.length ?? 0}:${b.storage?.length ?? 0}:${b.homeBaseFuel}`
+    )
+    .join("|");
+  if (key === lastStatusKey) return;
+  lastStatusKey = key;
+
   const statuses = [...bots.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, b]) => b.status());
@@ -2761,7 +2772,11 @@ async function main(): Promise<void> {
   }, 40 * 1000));
 
   // Periodic map data push (every 15s so dashboard stays current)
+  let lastMapGeneration = mapStore.getMapGeneration();
   intervals.push(setInterval(() => {
+    const generation = mapStore.getMapGeneration();
+    if (generation === lastMapGeneration) return;
+    lastMapGeneration = generation;
     server.updateMapData();
   }, 15000));
 

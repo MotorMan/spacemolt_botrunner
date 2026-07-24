@@ -841,6 +841,53 @@ export async function fightFreshBattle(
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 
+  // Ensure we're at engaged zone before entering combat loop
+  // (especially important when battle was already active and no advance was done)
+  const zoneOrder: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+  let ourZone = "outer";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const initStatus = await getBattleStatus(ctx);
+    if (!initStatus) {
+      ctx.log("combat", `✅ Battle ended during setup — ${target.name} eliminated!`);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
+    ourZone = initStatus.your_zone || "outer";
+    if (ourZone === "engaged") {
+      ctx.log("combat", `✅ Already at engaged zone`);
+      break;
+    }
+    const ourZoneNum = zoneOrder[ourZone] ?? 0;
+    const targetZoneNum = zoneOrder["engaged"];
+    if (ourZoneNum < targetZoneNum) {
+      ctx.log("combat", `↩️ Advancing from ${ourZone} to ${Object.keys(zoneOrder).find(k => zoneOrder[k] === ourZoneNum + 1) || "engaged"}...`);
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        const msg = advResp.error.message.toLowerCase();
+        if (msg.includes("no active battle") || msg.includes("not in battle")) {
+          // Bot not registered as engaged - need to attack target first
+          ctx.log("combat", `⚠️ Advance failed - not registered as engaged, attacking ${target.name}...`);
+          await attackTarget(ctx, target);
+          await ctx.sleep(2000);
+          // Check if battle ended after attack
+          const postAttackStatus = await getBattleStatus(ctx);
+          if (!postAttackStatus) {
+            ctx.log("combat", `✅ Battle ended after re-engaging - ${target.name} eliminated!`);
+            await checkAndPraiseMorgThar(ctx, true);
+            await recloakAfterBattle(ctx, cloakOnStart);
+            return true;
+          }
+          // Continue to next advance attempt
+          continue;
+        }
+        ctx.log("combat", `⚠️ Advance note: ${advResp.error.message}`);
+      }
+      await ctx.sleep(5000);
+    } else {
+      break;
+    }
+  }
+
   // Get initial battle status
   let status = await getBattleStatus(ctx);
   if (!status) {
@@ -942,16 +989,60 @@ export async function fightFreshBattle(
       await attackTarget(ctx, target);
       await bot.exec("battle", { action: "target", target_id: target.id });
       await bot.exec("battle", { action: "stance", stance: "fire" });
-      const ourZoneNow = status.your_zone || ourCurrentZone;
+      
+      // Refresh status to get current zone after stance change
+      const currentStatus = await getBattleStatus(ctx);
+      if (!currentStatus) {
+        ctx.log("combat", `✅ Battle ended during enemy tracking - ${target.name} eliminated!`);
+        await checkAndPraiseMorgThar(ctx, true);
+        await recloakAfterBattle(ctx, cloakOnStart);
+        return true;
+      }
+      
+      const ourZoneNow = currentStatus.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
+        ctx.log("combat", `↩️ Advancing from ${ourZoneNow} to engaged (enemy not in roster)`);
         const adv = await bot.exec("battle", { action: "advance" });
-        if (adv.error && /not in battle/.test(adv.error.message.toLowerCase())) {
-          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+        if (adv.error) {
+          const errMsg = adv.error.message.toLowerCase();
+          if (errMsg.includes("not in battle") || errMsg.includes("no active battle")) {
+            // Bot not registered as engaged - re-acquire enemy and attack
+            ctx.log("combat", `⚠️ Advance failed - not registered as engaged, re-acquiring enemy...`);
+            const nearbyEnemy = await acquireEnemyFromNearby(ctx, target.name, maxAttackTier, true);
+            if (nearbyEnemy) {
+              ctx.log("combat", `🎯 Re-acquired live enemy ${nearbyEnemy.name} - attacking...`);
+              target = nearbyEnemy;
+              await attackTarget(ctx, target);
+              await bot.exec("battle", { action: "target", target_id: target.id });
+              await ctx.sleep(2000);
+            } else {
+              ctx.log("combat", `✅ Battle ended - no enemy found for re-engagement`);
+              await checkAndPraiseMorgThar(ctx, true);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return true;
+            }
+          } else {
+            // Log other advance errors but continue trying
+            ctx.log("combat", `⚠️ Advance note: ${adv.error.message}`);
+          }
+        }
+        // Give server time to process advance, then check zone
+        await ctx.sleep(5000);
+        const postAdvStatus = await getBattleStatus(ctx);
+        if (!postAdvStatus) {
+          ctx.log("combat", `✅ Battle ended after advance - ${target.name} eliminated!`);
           await checkAndPraiseMorgThar(ctx, true);
+          await recloakAfterBattle(ctx, cloakOnStart);
           return true;
         }
+        // If still not at engaged, we need multiple advances - log and continue
+        if (postAdvStatus.your_zone !== "engaged") {
+          ctx.log("combat", `Still at ${postAdvStatus.your_zone} after advance - will try again next tick`);
+        }
+      } else {
+        ctx.log("combat", `✅ Already at engaged zone - battle should be progressing`);
       }
-      await ctx.sleep(10000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -982,8 +1073,35 @@ export async function fightFreshBattle(
 
     // Stay within 1 zone of enemy to maintain firing range
     const zoneDiff = ourZoneNum - enemyZoneNum;
-
-    if (zoneDiff > 1) {
+    
+    // Always advance if we're not at engaged zone (especially when enemy zone is unknown/outer)
+    if (ourCurrentZone !== "engaged") {
+      if (zoneDiff > 1) {
+        ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
+        const retResp = await bot.exec("battle", { action: "retreat" });
+        if (retResp.error) {
+          const errMsg = retResp.error.message.toLowerCase();
+          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+            ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
+            return true;
+          }
+          ctx.log("error", `Retreat failed: ${retResp.error.message}`);
+        }
+        await ctx.sleep(10000);
+      } else {
+        ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to engaged (zoneDiff=${zoneDiff}, enemyZone=${enemyZone})`);
+        const advResp = await bot.exec("battle", { action: "advance" });
+        if (advResp.error) {
+          const errMsg = advResp.error.message.toLowerCase();
+          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+            ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+            return true;
+          }
+          ctx.log("error", `Advance failed: ${advResp.error.message}`);
+        }
+        await ctx.sleep(10000);
+      }
+    } else if (zoneDiff > 1) {
       ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
       const retResp = await bot.exec("battle", { action: "retreat" });
       if (retResp.error) {

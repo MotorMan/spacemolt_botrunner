@@ -2895,9 +2895,6 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   let gotAnyAmmo = false;
   const desiredAmmoBoxes = hs.desiredAmmoBoxes ?? -1;
   let totalAmmoGotten = 0;
-  if (desiredAmmoBoxes === 0) {
-    ctx.log("trade", "Ammo resupply disabled (desiredAmmoBoxes=0)");
-  }
   for (const ammoType of weaponAmmoTypes) {
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
@@ -2933,8 +2930,6 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
          break;
        }
        ammoToGet = Math.min(ammoToGet, remaining);
-     } else if (desiredAmmoBoxes === 0) {
-       continue;
      }
 
     // Prefer currently loaded ammo if available
@@ -3072,27 +3067,31 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
 
   // 3. Military fuel cells — fill the rest (prefer faction storage)
-  const fuelCellSize = getItemSize("military_fuel_cell");
-  if (freeSpace >= fuelCellSize) {
-    const fuelQty = Math.floor(freeSpace / fuelCellSize);
-    if (allowBuying) {
-      const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
-      if (!fuelResp.error) {
-        ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
-      }
-    } else {
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: "military_fuel_cell",
-        quantity: fuelQty
-      });
-      if (!wResp.error) {
-        ctx.log("trade", `Withdrew ${fuelQty} military fuel cells from faction storage`);
+  if (!hs.disableResupply) {
+    const fuelCellSize = getItemSize("military_fuel_cell");
+    if (freeSpace >= fuelCellSize) {
+      const fuelQty = Math.floor(freeSpace / fuelCellSize);
+      if (allowBuying) {
+        const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
+        if (!fuelResp.error) {
+          ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+        }
       } else {
-        ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
+        const wResp = await bot.exec("storage", {
+          action: "withdraw",
+          target: "faction",
+          item_id: "military_fuel_cell",
+          quantity: fuelQty
+        });
+        if (!wResp.error) {
+          ctx.log("trade", `Withdrew ${fuelQty} military fuel cells from faction storage`);
+        } else {
+          ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
+        }
       }
     }
+  } else {
+    ctx.log("trade", "Skipping fuel cells (disableResupply enabled)");
   }
 }
 

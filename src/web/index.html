@@ -20025,14 +20025,16 @@ When responding:
       </div>
       <div class="faction-card" style="padding:0">${rows}</div>
     </div>
-    <div class="faction-section" style="margin-top:12px">
-      <div class="faction-section-title">Invite Player</div>
-      <div class="faction-invite-row">
-        <input type="text" id="faction-invite-name" placeholder="Player username or ID">
-        <button class="primary sm" onclick="factionInvite('${esc(username)}')">Invite</button>
+      <div class="faction-section" style="margin-top:12px">
+        <div class="faction-section-title">Invite Player</div>
+        <div class="faction-invite-row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input type="text" id="faction-invite-name" placeholder="Player username or ID" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px;flex:1;min-width:120px">
+          <button class="primary sm" onclick="factionInvite('${esc(username)}')">Invite</button>
+          <button id="factionInviteAllBtn" class="sm" style="font-size:11px;padding:3px 8px" onclick="inviteAllBots('${esc(username)}')">Invite All Bots</button>
+          <button id="factionStopInviteAllBtn" class="sm" style="font-size:11px;padding:3px 8px;background:var(--red);border:none;color:#fff;display:none" onclick="stopInviteAllQueue()">Stop Invite All</button>
+        </div>
+        ${renderQuickInviteButtons(username, members)}
       </div>
-      ${renderQuickInviteButtons(username, members)}
-    </div>
   `;
       }
 
@@ -20678,6 +20680,8 @@ When responding:
       // ── Set Members to Officer (queued, one mutation per tick) ──
       let memberPromoteQueue = null; // { username, targets: string[], index: number }
       const MEMBER_PROMOTE_COOLDOWN_MS = TICK_COOLDOWN_MS + 500;
+      let inviteAllQueue = null; // { username, targets: string[], index: number }
+      const INVITE_ALL_COOLDOWN_MS = 1000;
 
       function factionSetMembersToOfficer(username) {
         if (!factionData || !Array.isArray(factionData.members)) {
@@ -20772,6 +20776,109 @@ When responding:
         );
         memberPromoteQueue = null;
         updateMemberPromoteButton();
+      }
+
+      function inviteAllBots(username) {
+        if (!factionData || !Array.isArray(factionData.members)) {
+          appendLine("system", "No faction member data loaded yet.");
+          return;
+        }
+        const members = factionData.members || [];
+        const memberNames = new Set(
+          members.map((m) => m.username || m.name || ""),
+        );
+        const targets = bots.filter(
+          (b) => b.username !== username && !memberNames.has(b.username),
+        );
+        if (targets.length === 0) {
+          appendLine("system", "No bots to invite.");
+          return;
+        }
+        if (inviteAllQueue) {
+          appendLine(
+            "system",
+            "An invite-all queue is already running. Use Stop to cancel.",
+          );
+          return;
+        }
+        inviteAllQueue = {
+          username,
+          targets: targets.map((b) => b.username),
+          index: 0,
+        };
+        updateInviteAllButton();
+        appendLine(
+          "system",
+          `Starting invite-all for ${targets.length} bot(s)...`,
+        );
+        processInviteAllQueue();
+      }
+
+      function processInviteAllQueue() {
+        if (!inviteAllQueue) return;
+        const { targets, index, username } = inviteAllQueue;
+        if (index >= targets.length) {
+          appendLine(
+            "system",
+            `Finished inviting ${targets.length} bot(s).`,
+          );
+          inviteAllQueue = null;
+          updateInviteAllButton();
+          fetchFactionInfo(username);
+          return;
+        }
+        const target = targets[index];
+        sendExec(
+          username,
+          "faction_invite",
+          { player_id: target },
+          (result) => {
+            if (!inviteAllQueue) return;
+            if (result.ok) {
+              appendLine(
+                "system",
+                `Invited ${target} (${inviteAllQueue.index + 1}/${inviteAllQueue.targets.length})`,
+              );
+              setTimeout(() => factionAutoAccept(target), 2000);
+            } else {
+              appendLine(
+                "system",
+                `Invite ${target} failed: ${result.error || "unknown"}`,
+              );
+            }
+            inviteAllQueue.index++;
+            updateInviteAllButton();
+            setTimeout(processInviteAllQueue, INVITE_ALL_COOLDOWN_MS);
+          },
+        );
+      }
+
+      function stopInviteAllQueue() {
+        if (!inviteAllQueue) {
+          appendLine("system", "No invite-all queue is currently running.");
+          return;
+        }
+        appendLine(
+          "system",
+          `Stopped invite-all queue after ${inviteAllQueue.index}/${inviteAllQueue.targets.length} processed.`,
+        );
+        inviteAllQueue = null;
+        updateInviteAllButton();
+      }
+
+      function updateInviteAllButton() {
+        const btn = document.getElementById("factionInviteAllBtn");
+        const stopBtn = document.getElementById("factionStopInviteAllBtn");
+        if (!btn) return;
+        if (inviteAllQueue) {
+          btn.textContent = `Inviting All… ${inviteAllQueue.index}/${inviteAllQueue.targets.length}`;
+          btn.disabled = true;
+          if (stopBtn) stopBtn.style.display = "";
+        } else {
+          btn.textContent = "Invite All Bots";
+          btn.disabled = false;
+          if (stopBtn) stopBtn.style.display = "none";
+        }
       }
 
       function updateMemberPromoteButton() {

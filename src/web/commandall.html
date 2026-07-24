@@ -657,14 +657,15 @@
       caLog('<span class="resp-cmd">Loading weapons from all bots...</span>');
       caWeaponsCache = {};
       let loadedCount = 0;
+      let errorCount = 0;
 
       for (const bot of activeBots) {
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
         caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
 
         sendExec(bot.username, 'get_ship', {}, (result) => {
-          if (result.ok && result.data) {
-            const data = result.data;
+          if (result.ok && (result.result || result.data)) {
+            const data = result.result || result.data;
             const modules = Array.isArray(data.modules) ? data.modules : [];
             const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 
@@ -721,7 +722,7 @@
               }
             }
 
-            if (loadedCount === activeBots.length) {
+            if (loadedCount + errorCount === activeBots.length) {
               const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
               const controls = document.getElementById('ca-weapon-reload-controls');
               const summary = document.getElementById('ca-weapons-summary');
@@ -729,7 +730,15 @@
               if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
             }
           } else {
+            errorCount++;
             caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(result.error || 'unknown')}</span>`);
+            if (loadedCount + errorCount === activeBots.length) {
+              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+              const controls = document.getElementById('ca-weapon-reload-controls');
+              const summary = document.getElementById('ca-weapons-summary');
+              if (controls) controls.style.display = 'block';
+              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots (some bots failed)`;
+            }
           }
         });
       }

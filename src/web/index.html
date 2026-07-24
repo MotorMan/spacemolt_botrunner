@@ -28451,6 +28451,25 @@ ignoreBlacklist: document.getElementById(
     <h3>Hunter Settings</h3>
     <div class="settings-desc">Pirate hunter bots patrol low-security systems, engage NPC pirates for bounties and loot, and respond to faction combat alerts from allied bots.</div>
 
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:6px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Bulk Set Hunter Mode (All Bots)</div>
+        <div class="setting-hint">Change the current sub-routine for all configured bots at once. This overrides each bot's individual hunter mode setting.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="bulk-hunter-mode" style="flex:1">
+          <option value="roam_systems">Roam systems</option>
+          <option value="roam_system">Roam current system</option>
+          <option value="stationary">Stationary</option>
+          <option value="patrol_systems">Patrol specific systems</option>
+          <option value="cycle_patrols">Cycle patrols</option>
+          <option value="patrol_radius">Patrol radius</option>
+          <option value="station_protection">Station Protection</option>
+        </select>
+        <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
+      </div>
+    </div>
+
     <div class="setting-row">
       <div>
         <div class="setting-label">Patrol System</div>
@@ -28862,6 +28881,13 @@ ignoreBlacklist: document.getElementById(
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;
+      }
+
+      function bulkSetHunterMode() {
+        const sel = document.getElementById("bulk-hunter-mode");
+        if (!sel) return;
+        const mode = sel.value;
+        send({ type: "bulkSetHunterMode", mode });
       }
 
       // ── Hunter Patrol Systems (blacklist-style UI) ───────────────

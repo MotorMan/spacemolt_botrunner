@@ -38,7 +38,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring" | "bulkSetHunterMode";
   bot?: string;
   routine?: string;
   username?: string;
@@ -130,7 +130,7 @@ function loadSettings(): RoutineSettings {
   return {};
 }
 
-export { loadSettings };
+export { loadSettings, saveSettings };
 
 // The WebServer keeps an in-memory copy of settings (`this.settings`) that most
 // save paths write back to disk wholesale via `saveSettings(this.settings)`.

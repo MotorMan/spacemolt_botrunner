@@ -34,7 +34,7 @@ import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { flushStationFacilityCache } from "./stationFacilityCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
@@ -1138,6 +1138,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleAddClerkBots(action);
     case "setPerformanceMonitoring":
       return handleSetPerformanceMonitoring(action);
+    case "bulkSetHunterMode":
+      return handleBulkSetHunterMode(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -1285,6 +1287,26 @@ async function handleSetPerformanceMonitoring(action: WebAction): Promise<WebAct
   perf.setEnabled(enabled);
   server.logSystem(`Performance monitoring ${enabled ? "enabled" : "disabled"}`);
   return { ok: true, message: `performance monitoring ${enabled ? "enabled" : "disabled"}` };
+}
+
+async function handleBulkSetHunterMode(action: WebAction): Promise<WebActionResult> {
+  const mode = (action as any).mode as string;
+  if (!mode) return { ok: false, error: "Missing mode" };
+
+  const allBots = [...bots.values()];
+  if (allBots.length === 0) return { ok: true, message: "No bots to update" };
+
+  for (const bot of allBots) {
+    const existing = server.settings[bot.username] || {};
+    server.settings[bot.username] = { ...existing, hunterMode: mode };
+  }
+
+  if (!server.settings.hunter) server.settings.hunter = {};
+  server.settings.hunter.mode = mode;
+
+  saveSettings(server.settings);
+  server.logSystem(`Bulk set hunter mode to "${mode}" for ${allBots.length} bot(s)`);
+  return { ok: true, message: `Updated hunter mode to "${mode}" for ${allBots.length} bot(s)` };
 }
 
 async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {

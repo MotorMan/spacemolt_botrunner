@@ -716,6 +716,9 @@
           caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
           loadedCount++;
 
+          // Debug: log cargo structure
+          console.log(`Cargo for ${bot.username}:`, JSON.stringify(shipCargo.slice(0, 3)));
+
           // Build ammo items list - check both item_id and id fields for cargo items
           const ammoItems = shipCargo.filter((i) => {
             const itemId = i.item_id || i.id || '';
@@ -724,8 +727,9 @@
             const isAmmo = catalogItem?.effect?.type === 'ammo' || 
                            catalogItem?.ammo_type ||
                            catalogItem?.type === 'ammo';
-            // Fallback: check if item_id contains 'ammo' or 'cell' or 'round'
+            // Fallback: check if item_id contains 'ammo' or 'cell' or 'round' or 'pack'
             const idLooksLikeAmmo = itemId && (itemId.includes('ammo') || itemId.includes('cell') || itemId.includes('round') || itemId.includes('pack'));
+            console.log(`Checking cargo item ${itemId}:`, { catalogItem: !!catalogItem, isAmmo, idLooksLikeAmmo, item: i });
             return isAmmo || idLooksLikeAmmo;
           });
 
@@ -741,6 +745,8 @@
                 }).join('');
             }
           }
+
+          console.log(`Ammo items found for ${bot.username}:`, ammoItems.length, ammoItems.map(a => a.item_id || a.id));
 
           if (loadedCount + errorCount === activeBots.length) {
             const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);

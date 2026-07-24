@@ -716,19 +716,28 @@
           caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
           loadedCount++;
 
+          // Build ammo items list - check both item_id and id fields for cargo items
           const ammoItems = shipCargo.filter((i) => {
-            const catalogItem = catalog.items?.[i.item_id];
-            return catalogItem?.effect?.type === 'ammo';
+            const itemId = i.item_id || i.id || '';
+            const catalogItem = catalog.items?.[itemId];
+            // Check if it's ammo by effect.type or by checking if it has ammo_type
+            const isAmmo = catalogItem?.effect?.type === 'ammo' || 
+                           catalogItem?.ammo_type ||
+                           catalogItem?.type === 'ammo';
+            // Fallback: check if item_id contains 'ammo' or 'cell' or 'round'
+            const idLooksLikeAmmo = itemId && (itemId.includes('ammo') || itemId.includes('cell') || itemId.includes('round') || itemId.includes('pack'));
+            return isAmmo || idLooksLikeAmmo;
           });
 
           if (ammoItems.length > 0) {
-            const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.item_id))];
+            const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.item_id || a.id))];
             const ammoSelect = document.getElementById('ca-ammo-type-select');
             if (ammoSelect) {
               ammoSelect.innerHTML = '<option value="">Select ammo type...</option>' +
                 uniqueAmmoTypes.map(id => {
-                  const item = ammoItems.find(a => a.item_id === id);
-                  return `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`;
+                  const item = ammoItems.find(a => (a.item_id || a.id) === id);
+                  const name = item.name || catalog.items?.[id]?.name || id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                  return `<option value="${esc(id)}">${esc(name)} (${item.quantity})</option>`;
                 }).join('');
             }
           }

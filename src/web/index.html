@@ -28366,6 +28366,8 @@ ignoreBlacklist: document.getElementById(
         const desiredShieldCharges = h.desiredShieldCharges ?? 20;
         const desiredRepairKits = h.desiredRepairKits ?? 12;
         const desiredEmergencyWarpDevices = h.desiredEmergencyWarpDevices ?? 3;
+        const desiredAmmoBoxes = h.desiredAmmoBoxes ?? 0;
+        const disableResupply = h.disableResupply ?? false;
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
         const coordinateHunts = h.coordinateHunts !== false;
@@ -28636,6 +28638,25 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Desired Ammo Boxes</div>
+        <div class="setting-hint">Max number of ammo items to withdraw during resupply. Set to 0 to skip ammo, or leave empty to fill inventory based on weapon capacity.</div>
+      </div>
+      <input type="number" id="set-hunter-desiredAmmoBoxes" min="0" max="999" value="${desiredAmmoBoxes}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Disable All Resupply Items</div>
+        <div class="setting-hint">Skip withdrawing ammo, repair kits, shield charges, and emergency warp devices from storage. Best for suicide runs or creature hunting where you want to keep loot and not risk items on death.</div>
+      </div>
+      <select id="set-hunter-disableResupply">
+        <option value="false"${!disableResupply ? " selected" : ""}>Enabled (normal resupply)</option>
+        <option value="true"${disableResupply ? " selected" : ""}>Disabled (no items taken)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Attack Mode</div>
         <div class="setting-hint">Restrict attacks to NPC pirates only, or also engage hostile players.</div>
       </div>
@@ -28828,6 +28849,12 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-hunter-desiredEmergencyWarpDevices").value,
             ) || 3,
+          desiredAmmoBoxes:
+            parseInt(
+              document.getElementById("set-hunter-desiredAmmoBoxes").value,
+            ) || 0,
+          disableResupply:
+            document.getElementById("set-hunter-disableResupply").value === "true",
           onlyNPCs:
             document.getElementById("set-hunter-onlyNPCs").value === "true",
           huntCreatures:

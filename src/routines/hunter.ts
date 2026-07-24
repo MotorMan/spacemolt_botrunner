@@ -244,6 +244,8 @@ function getHunterSettings(username?: string): {
   desiredShieldCharges: number;
   desiredRepairKits: number;
   desiredEmergencyWarpDevices: number;
+  desiredAmmoBoxes: number;
+  disableResupply: boolean;
   pirateBaseSystem: string;
   patrolRadius: number;
   meatShield: boolean;
@@ -298,6 +300,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
     desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
+    desiredAmmoBoxes: (h.desiredAmmoBoxes as number) ?? -1,
+    disableResupply: (h.disableResupply as boolean) ?? false,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
     meatShield: (h.meatShield as boolean) ?? false,
@@ -2808,6 +2812,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   if (!bot.docked) return;
 
+  const hs = getHunterSettings(bot.username);
+
   // Buying is currently disabled — we only withdraw from faction storage
   const allowBuying = false;
 
@@ -2820,18 +2826,23 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   await bot.refreshLocation();
   await bot.refreshCargo();
 
-  // Deposit any extra loot (everything except ammo, fuel cells, repair kits) so user can see what was brought home
+  // Deposit any extra loot so user can see what was brought home.
+  // When disableResupply is enabled, deposit EVERYTHING so the bot undocks
+  // with an empty cargo hold (suicide / no-return runs).
   for (const item of [...bot.inventory]) {
-    const id = item.itemId.toLowerCase();
-    const isProtected =
-      id.includes("ammo") ||
-      id.includes("cell_pack") ||
-      id.includes("plasma") ||
-      id.includes("fuel_cell") ||
-      id.includes("repair_kit") ||
-      id.includes("shield_charge");
+    if (item.quantity <= 0) continue;
 
-    if (isProtected || item.quantity <= 0) continue;
+    if (!hs.disableResupply) {
+      const id = item.itemId.toLowerCase();
+      const isProtected =
+        id.includes("ammo") ||
+        id.includes("cell_pack") ||
+        id.includes("plasma") ||
+        id.includes("fuel_cell") ||
+        id.includes("repair_kit") ||
+        id.includes("shield_charge");
+      if (isProtected) continue;
+    }
 
     const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
     if (dResp.error) {
@@ -2840,6 +2851,11 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to storage`);
   }
   await bot.refreshCargo();
+
+  if (hs.disableResupply) {
+    ctx.log("trade", "Resupply disabled — skipping item restock");
+    return;
+  }
 
   let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
   if (freeSpace < 5) {
@@ -2878,6 +2894,11 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
 
   let gotAnyAmmo = false;
+  const desiredAmmoBoxes = hs.desiredAmmoBoxes ?? -1;
+  let totalAmmoGotten = 0;
+  if (desiredAmmoBoxes === 0) {
+    ctx.log("trade", "Ammo resupply disabled (desiredAmmoBoxes=0)");
+  }
   for (const ammoType of weaponAmmoTypes) {
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
@@ -2906,6 +2927,17 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
        ammoToGet = Math.max(0, 20 - currentAmmoForType);
      }
 
+     if (desiredAmmoBoxes > 0) {
+       const remaining = desiredAmmoBoxes - totalAmmoGotten;
+       if (remaining <= 0) {
+         ctx.log("trade", `Ammo cap reached (${desiredAmmoBoxes} boxes) — skipping remaining ammo types`);
+         break;
+       }
+       ammoToGet = Math.min(ammoToGet, remaining);
+     } else if (desiredAmmoBoxes === 0) {
+       continue;
+     }
+
     // Prefer currently loaded ammo if available
     let chosenAmmoId: string | null = null;
     const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
@@ -2928,7 +2960,10 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       // Honor a stop request — don't keep issuing withdraws after stop
       if (bot.state !== "running") return;
       const ammoSize = getItemSize(ammoId);
-      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      let actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (desiredAmmoBoxes > 0) {
+        actualQty = Math.min(actualQty, desiredAmmoBoxes - totalAmmoGotten);
+      }
       if (actualQty <= 0) {
         continue;
       }
@@ -2942,6 +2977,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       if (!wResp.error) {
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
+        totalAmmoGotten += actualQty;
         gotAnyAmmo = true;
         break;
       } else {
@@ -2954,7 +2990,6 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("trade", "No ammo withdrawn — skipping ammo resupply");
   }
 
-  const hs = getHunterSettings(bot.username);
   const desiredRepair = hs.desiredRepairKits ?? 12;
 
   // 2. Repair kits (~10) - try advanced first, then fallback to regular (top off only)

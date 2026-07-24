@@ -615,7 +615,8 @@
         const botTs = new Date().toLocaleTimeString('en-US', { hour12: false });
 
         sendExec(bot.username, command, params, (result) => {
-          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          const success = result.ok !== false && !result.error;
+          const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
           const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
           caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
         });
@@ -664,12 +665,23 @@
         caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
 
         sendExec(bot.username, 'get_ship', {}, (result) => {
-          if (result.ok && (result.result || result.data)) {
-            const data = result.result || result.data;
-            const modules = Array.isArray(data.modules) ? data.modules : [];
-            const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
+          const data = result.result || result.data;
+          if (!data) {
+            caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(result.error || 'no data in response')}</span>`);
+            errorCount++;
+            if (loadedCount + errorCount === activeBots.length) {
+              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+              const controls = document.getElementById('ca-weapon-reload-controls');
+              const summary = document.getElementById('ca-weapons-summary');
+              if (controls) controls.style.display = 'block';
+              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots (some bots failed)`;
+            }
+            return;
+          }
+const modules = Array.isArray(data.modules) ? data.modules : [];
+          const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 
-            const weapons = modules
+          const weapons = modules
               .filter((mod) => {
                 const modType = ((mod.type || mod.module_type || '') + '').toLowerCase();
                 const modId = ((mod.module_id || mod.mod_id || mod.id || '') + '').toLowerCase();
@@ -702,43 +714,32 @@
               })
               .filter((w) => w.instanceId);
 
-            caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
-            loadedCount++;
+          caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
+          loadedCount++;
 
-            const ammoItems = shipCargo.filter((i) => {
-              const catalogItem = catalog.items?.[i.item_id];
-              return catalogItem?.effect?.type === 'ammo';
-            });
+          const ammoItems = shipCargo.filter((i) => {
+            const catalogItem = catalog.items?.[i.item_id];
+            return catalogItem?.effect?.type === 'ammo';
+          });
 
-            if (ammoItems.length > 0) {
-              const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.itemId))];
-              const ammoSelect = document.getElementById('ca-ammo-type-select');
-              if (ammoSelect) {
-                ammoSelect.innerHTML = '<option value="">Select ammo type...</option>' +
-                  uniqueAmmoTypes.map(id => {
-                    const item = ammoItems.find(a => a.itemId === id);
-                    return `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`;
-                  }).join('');
-              }
+          if (ammoItems.length > 0) {
+            const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.itemId))];
+            const ammoSelect = document.getElementById('ca-ammo-type-select');
+            if (ammoSelect) {
+              ammoSelect.innerHTML = '<option value="">Select ammo type...</option>' +
+                uniqueAmmoTypes.map(id => {
+                  const item = ammoItems.find(a => a.itemId === id);
+                  return `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`;
+                }).join('');
             }
+          }
 
-            if (loadedCount + errorCount === activeBots.length) {
-              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
-              const controls = document.getElementById('ca-weapon-reload-controls');
-              const summary = document.getElementById('ca-weapons-summary');
-              if (controls) controls.style.display = 'block';
-              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
-            }
-          } else {
-            errorCount++;
-            caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(result.error || 'unknown')}</span>`);
-            if (loadedCount + errorCount === activeBots.length) {
-              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
-              const controls = document.getElementById('ca-weapon-reload-controls');
-              const summary = document.getElementById('ca-weapons-summary');
-              if (controls) controls.style.display = 'block';
-              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots (some bots failed)`;
-            }
+          if (loadedCount + errorCount === activeBots.length) {
+            const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+            const controls = document.getElementById('ca-weapon-reload-controls');
+            const summary = document.getElementById('ca-weapons-summary');
+            if (controls) controls.style.display = 'block';
+            if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
           }
         });
       }
@@ -785,7 +786,8 @@
         };
 
         sendExec(bot.username, 'reload', reloadParams, (result) => {
-          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          const success = result.ok !== false && !result.error;
+          const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
           caLog(`<span class="resp-bot">${esc(bot.username)}:</span> Reloaded "${esc(weapon.name)}": ${status}`);
         });
 

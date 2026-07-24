@@ -673,8 +673,22 @@
           const modules = Array.isArray(data.modules) ? data.modules : [];
           const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 
+          // Always aggregate cargo, even if modules are empty
+          for (const item of shipCargo) {
+            const itemId = item.item_id || item.id || '';
+            if (!itemId) continue;
+            if (!allCargoItems[itemId]) {
+              allCargoItems[itemId] = {
+                name: item.name || catalog.items?.[itemId]?.name || itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+                quantity: 0
+              };
+            }
+            allCargoItems[itemId].quantity += item.quantity || 0;
+          }
+
           if (modules.length === 0) {
             errorCount++;
+            loadedCount++;
             caLog(`<span class="resp-warn">${esc(bot.username)}: No modules found</span>`);
             if (loadedCount + errorCount === activeBots.length) {
               const controls = document.getElementById('ca-weapon-reload-controls');

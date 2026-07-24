@@ -28646,12 +28646,12 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Disable All Resupply Items</div>
-        <div class="setting-hint">Skip withdrawing ammo, repair kits, shield charges, and emergency warp devices from storage. Best for suicide runs or creature hunting where you want to keep loot and not risk items on death.</div>
+        <div class="setting-label">Skip Consumable Resupply</div>
+        <div class="setting-hint">Still reloads weapons, but skips withdrawing repair kits, shield charges, and emergency warp devices from storage. Deposits all loot before undocking so you don't lose items on death. Best for suicide runs or creature hunting where you want to keep credits/loot and minimize losses.</div>
       </div>
       <select id="set-hunter-disableResupply">
-        <option value="false"${!disableResupply ? " selected" : ""}>Enabled (normal resupply)</option>
-        <option value="true"${disableResupply ? " selected" : ""}>Disabled (no items taken)</option>
+        <option value="false"${!disableResupply ? " selected" : ""}>Normal (withdraw consumables)</option>
+        <option value="true"${disableResupply ? " selected" : ""}>Skip consumables only</option>
       </select>
     </div>
 

@@ -2853,8 +2853,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   await bot.refreshCargo();
 
   if (hs.disableResupply) {
-    ctx.log("trade", "Resupply disabled — skipping item restock");
-    return;
+    ctx.log("trade", "Resupply disabled — skipping repair kits, shield charges, and warp devices");
   }
 
   let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
@@ -2992,57 +2991,65 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   const desiredRepair = hs.desiredRepairKits ?? 12;
 
-  // 2. Repair kits (~10) - try advanced first, then fallback to regular (top off only)
-  const repairKits = ["advanced_repair_kit", "repair_kit"];
-  let gotRepairKits = false;
-  const repairToGet = Math.max(0, desiredRepair - currentRepair);
-  for (const kitId of repairKits) {
-    const kitSize = getItemSize(kitId);
-    const kitQty = Math.min(repairToGet, Math.floor(freeSpace / kitSize));
-    if (kitQty <= 0) continue;
+  if (!hs.disableResupply) {
+    // 2. Repair kits (~10) - try advanced first, then fallback to regular (top off only)
+    const repairKits = ["advanced_repair_kit", "repair_kit"];
+    let gotRepairKits = false;
+    const repairToGet = Math.max(0, desiredRepair - currentRepair);
+    for (const kitId of repairKits) {
+      const kitSize = getItemSize(kitId);
+      const kitQty = Math.min(repairToGet, Math.floor(freeSpace / kitSize));
+      if (kitQty <= 0) continue;
 
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: kitId,
-      quantity: kitQty
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Withdrew ${kitQty} ${kitId} from faction storage`);
-      freeSpace -= kitQty * kitSize;
-      gotRepairKits = true;
-      break;
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: kitId,
+        quantity: kitQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${kitQty} ${kitId} from faction storage`);
+        freeSpace -= kitQty * kitSize;
+        gotRepairKits = true;
+        break;
+      }
     }
-  }
-  if (!gotRepairKits) {
-    ctx.log("trade", "Repair kits: relying on faction storage");
+    if (!gotRepairKits) {
+      ctx.log("trade", "Repair kits: relying on faction storage");
+    }
+  } else {
+    ctx.log("trade", "Skipping repair kits (disableResupply enabled)");
   }
 
   const desiredShield = hs.desiredShieldCharges ?? 20;
 
-  const shieldIds = ["shield_charge"];
-  let gotShield = false;
-  const shieldToGet = Math.max(0, desiredShield - currentShield);
-  for (const shId of shieldIds) {
-    const shSize = getItemSize(shId);
-    const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
-    if (shQty <= 0) continue;
+  if (!hs.disableResupply) {
+    const shieldIds = ["shield_charge"];
+    let gotShield = false;
+    const shieldToGet = Math.max(0, desiredShield - currentShield);
+    for (const shId of shieldIds) {
+      const shSize = getItemSize(shId);
+      const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
+      if (shQty <= 0) continue;
 
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: shId,
-      quantity: shQty
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Withdrew ${shQty} ${shId} from faction storage`);
-      freeSpace -= shQty * shSize;
-      gotShield = true;
-      break;
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: shId,
+        quantity: shQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${shQty} ${shId} from faction storage`);
+        freeSpace -= shQty * shSize;
+        gotShield = true;
+        break;
+      }
     }
-  }
-  if (!gotShield) {
-    ctx.log("trade", "Shield charges: relying on faction storage");
+    if (!gotShield) {
+      ctx.log("trade", "Shield charges: relying on faction storage");
+    }
+  } else {
+    ctx.log("trade", "Skipping shield charges (disableResupply enabled)");
   }
 
   const desiredWarp = hs.desiredEmergencyWarpDevices ?? 3;
@@ -3050,7 +3057,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   const warpToGet = Math.max(0, desiredWarp - currentWarp);
-  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+  if (!hs.disableResupply && warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
     const wResp = await bot.exec("storage", {
       action: "withdraw",
       target: "faction",

@@ -660,19 +660,16 @@
       let loadedCount = 0;
       let errorCount = 0;
 
+      // Collect all cargo items across bots for aggregated dropdown
+      const allCargoItems = {};
+
       for (const bot of activeBots) {
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
         caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
 
         sendExec(bot.username, 'get_ship', {}, (result) => {
-          // Debug: log the full result structure
-          console.log(`Full result for ${bot.username}:`, JSON.stringify(result, null, 2).slice(0, 2000));
-          
           // get_ship returns { ship, modules, cargo } inside result.data (or result for V2 API)
           const data = result.data || result;
-          console.log(`Data for ${bot.username}:`, JSON.stringify(data).slice(0, 1000));
-          console.log(`Modules count: ${Array.isArray(data.modules) ? data.modules.length : 'not array'}`);
-          console.log(`Cargo count: ${Array.isArray(data.cargo) ? data.cargo.length : 'not array'}`);
           const modules = Array.isArray(data.modules) ? data.modules : [];
           const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 
@@ -722,44 +719,36 @@
           caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
           loadedCount++;
 
-          // Debug: log cargo structure
-          console.log(`Cargo for ${bot.username}:`, JSON.stringify(shipCargo.slice(0, 3)));
-
-          // Build ammo items list - check both item_id and id fields for cargo items
-          const ammoItems = shipCargo.filter((i) => {
-            const itemId = i.item_id || i.id || '';
-            const catalogItem = catalog.items?.[itemId];
-            // Check if it's ammo by effect.type or by checking if it has ammo_type
-            const isAmmo = catalogItem?.effect?.type === 'ammo' || 
-                           catalogItem?.ammo_type ||
-                           catalogItem?.type === 'ammo';
-            // Fallback: check if item_id contains 'ammo' or 'cell' or 'round' or 'pack'
-            const idLooksLikeAmmo = itemId && (itemId.includes('ammo') || itemId.includes('cell') || itemId.includes('round') || itemId.includes('pack'));
-            console.log(`Checking cargo item ${itemId}:`, { catalogItem: !!catalogItem, isAmmo, idLooksLikeAmmo, item: i });
-            return isAmmo || idLooksLikeAmmo;
-          });
-
-          if (ammoItems.length > 0) {
-            const uniqueAmmoTypes = [...new Set(ammoItems.map(a => a.item_id || a.id))];
-            const ammoSelect = document.getElementById('ca-ammo-type-select');
-            if (ammoSelect) {
-              ammoSelect.innerHTML = '<option value="">Select ammo type...</option>' +
-                uniqueAmmoTypes.map(id => {
-                  const item = ammoItems.find(a => (a.item_id || a.id) === id);
-                  const name = item.name || catalog.items?.[id]?.name || id.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-                  return `<option value="${esc(id)}">${esc(name)} (${item.quantity})</option>`;
-                }).join('');
+          // Aggregate cargo items across all bots
+          for (const item of shipCargo) {
+            const itemId = item.item_id || item.id || '';
+            if (!itemId) continue;
+            if (!allCargoItems[itemId]) {
+              allCargoItems[itemId] = {
+                name: item.name || catalog.items?.[itemId]?.name || itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+                quantity: 0
+              };
             }
+            allCargoItems[itemId].quantity += item.quantity || 0;
           }
-
-          console.log(`Ammo items found for ${bot.username}:`, ammoItems.length, ammoItems.map(a => a.item_id || a.id));
 
           if (loadedCount + errorCount === activeBots.length) {
             const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
             const controls = document.getElementById('ca-weapon-reload-controls');
             const summary = document.getElementById('ca-weapons-summary');
+            
             if (controls) controls.style.display = 'block';
             if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
+
+            // Populate dropdown with aggregated cargo items
+            const ammoSelect = document.getElementById('ca-ammo-type-select');
+            if (ammoSelect) {
+              const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
+              ammoSelect.innerHTML = '<option value="">Select item...</option>' +
+                sortedItems.map(([id, data]) => {
+                  return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
+                }).join('');
+            }
           }
         });
       }

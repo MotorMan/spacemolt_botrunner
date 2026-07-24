@@ -2209,6 +2209,72 @@
         if (wsManualClose) return;
         clearTimeout(wsConnectTimer);
 
+        // Client-side WS bandwidth tracking
+        const wsBytesByType = {};
+        let wsTotalBytes = 0;
+        let wsBytesTimer = null;
+        const trackWsBytes = (data) => {
+          const raw = typeof data === "string" ? data : JSON.stringify(data);
+          const len = new Blob([raw]).size;
+          wsTotalBytes += len;
+          let type = "unknown";
+          if (typeof data === "object" && data && data.type) type = data.type;
+          else if (typeof data === "string") {
+            try { type = JSON.parse(data).type || "raw"; } catch { type = "raw"; }
+          }
+          wsBytesByType[type] = (wsBytesByType[type] || 0) + len;
+        };
+        const logWsBytesSummary = () => {
+          if (wsTotalBytes === 0) return;
+          const lines = [
+            `[WS_BW_CLIENT] 10s: ${(wsTotalBytes / 1024 / 1024).toFixed(2)} MB`,
+          ];
+          const sorted = Object.entries(wsBytesByType).sort((a, b) => b[1] - a[1]);
+          for (const [type, bytes] of sorted) {
+            lines.push(`  ${type}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+          }
+          console.log(lines.join("\n"));
+          wsTotalBytes = 0;
+          for (const k in wsBytesByType) delete wsBytesByType[k];
+        };
+
+        // Lightweight HTTP bandwidth tracker (tracks all fetch() responses)
+        const httpBytesByUrl = {};
+        let httpTotalBytes = 0;
+        let httpBytesTimer = null;
+        const logHttpSummary = () => {
+          if (httpTotalBytes === 0) return;
+          const lines = [
+            `[HTTP_BW_CLIENT] 10s: ${(httpTotalBytes / 1024 / 1024).toFixed(2)} MB`,
+          ];
+          const sorted = Object.entries(httpBytesByUrl).sort((a, b) => b[1] - a[1]).slice(0, 10);
+          for (const [url, bytes] of sorted) {
+            lines.push(`  ${url}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+          }
+          console.log(lines.join("\n"));
+          httpTotalBytes = 0;
+          for (const k in httpBytesByUrl) delete httpBytesByUrl[k];
+        };
+        const _origFetch = window.fetch;
+        window.fetch = async function (...args) {
+          const url = args[0] instanceof Request ? args[0].url : (args[0] || "unknown");
+          const path = typeof url === "string" ? url.split("?")[0] : String(url);
+          try {
+            const res = await _origFetch.apply(window, args);
+            if (!res.ok) return res;
+            const clone = res.clone();
+            const textPromise = clone.text().then((text) => {
+              const len = new Blob([text]).size;
+              httpTotalBytes += len;
+              httpBytesByUrl[path] = (httpBytesByUrl[path] || 0) + len;
+              if (!httpBytesTimer) httpBytesTimer = setInterval(logHttpSummary, 10000);
+            }).catch(() => {});
+            return res;
+          } catch (e) {
+            return _origFetch.apply(window, args);
+          }
+        };
+
         // Build the WS URL defensively. In some embedded clients / reverse
         // proxies `location.host` can be empty or wrong, which makes
         // `new WebSocket()` throw and silently kills the connection forever.
@@ -2249,6 +2315,8 @@
           connDot.classList.add("connected");
           connText.textContent = "Connected";
           reconnectDelay = 1000;
+          clearInterval(wsBytesTimer);
+          wsBytesTimer = setInterval(logWsBytesSummary, 10000);
           // Heartbeat: prove the socket is alive in both directions.
           clearInterval(wsHeartbeatTimer);
           wsHeartbeatTimer = setInterval(() => {
@@ -2269,6 +2337,7 @@
           clearTimeout(wsInitTimer);
           clearInterval(wsHeartbeatTimer);
           clearInterval(wsWatchdogTimer);
+          clearInterval(wsBytesTimer);
           connDot.classList.remove("connected");
           connText.textContent = "Disconnected";
           if (wsManualClose) return;
@@ -2283,6 +2352,7 @@
         };
 
         ws.onmessage = (ev) => {
+          trackWsBytes(ev.data);
           let msg;
           try {
             msg = JSON.parse(ev.data);

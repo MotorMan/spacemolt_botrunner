@@ -507,6 +507,11 @@ export class WebServer {
   // Client sync state
   private syncMaster: ClientSyncMaster | null = null;
 
+  // Bandwidth tracking
+  private wsBytesByType = new Map<string, number>();
+  private wsTotalBytes = 0;
+  private wsBytesTimer: ReturnType<typeof setInterval> | null = null;
+
 constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
@@ -607,6 +612,38 @@ if (!this.settings.fuel_service) {
     this.seededOffline = new Map(seeded.map((b) => [b.username, b]));
     this.latestStatuses = seeded;
     this.applyInitialLogSettings();
+
+    this.wsBytesTimer = setInterval(() => this.logWsBytesSummary(), 10000);
+  }
+
+  private trackWsBytes(data: unknown): void {
+    const raw = JSON.stringify(data);
+    const len = Buffer.byteLength(raw, "utf8");
+    this.wsTotalBytes += len;
+    const type = (data as Record<string, unknown>)?.type;
+    if (typeof type === "string" && type) {
+      this.wsBytesByType.set(type, (this.wsBytesByType.get(type) || 0) + len);
+    }
+  }
+
+  private trackWsBytesRaw(jsonStr: string, fallbackType: string): void {
+    const len = Buffer.byteLength(jsonStr, "utf8");
+    this.wsTotalBytes += len;
+    this.wsBytesByType.set(fallbackType, (this.wsBytesByType.get(fallbackType) || 0) + len);
+  }
+
+  private logWsBytesSummary(): void {
+    if (this.wsTotalBytes === 0) return;
+    const lines: string[] = [
+      `[WS_BW] 10s summary: ${(this.wsTotalBytes / 1024 / 1024).toFixed(2)} MB total`,
+    ];
+    const sorted = [...this.wsBytesByType.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [type, bytes] of sorted) {
+      lines.push(`  ${type}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+    }
+    console.log(lines.join("\n"));
+    this.wsTotalBytes = 0;
+    this.wsBytesByType.clear();
   }
 
   applyInitialLogSettings(): void {
@@ -2536,7 +2573,7 @@ if (url.pathname === "/data/shipsForSale.json") {
               }
 
               // Send basic init data first (small)
-              ws.send(JSON.stringify({
+              const initPayload = {
                 type: "init",
                 bots: this.latestStatuses,
                 routines: this.routines,
@@ -2553,7 +2590,9 @@ if (url.pathname === "/data/shipsForSale.json") {
                 botLogs: botLogsObj,
                 flockSettings: loadFlockSettings(),
                 lastUsedRoutines: getAllLastUsedRoutines(),
-              }));
+              };
+              this.trackWsBytes(initPayload);
+              ws.send(JSON.stringify(initPayload));
 
               // Send large data separately to avoid blocking with JSON serialization.
               // These payloads are cached (built once, reused for every connection)
@@ -2562,14 +2601,17 @@ if (url.pathname === "/data/shipsForSale.json") {
                 try {
                   const mapJson = this.getMapDataMessage();
                   console.log(`Sending mapData, size: ${mapJson.length} chars`);
+                  this.trackWsBytesRaw(mapJson, "mapData");
                   ws.send(mapJson);
 
                   const catalogJson = this.getCatalogMessage();
                   console.log(`Sending catalog, size: ${catalogJson.length} chars`);
+                  this.trackWsBytesRaw(catalogJson, "catalog");
                   ws.send(catalogJson);
 
                   const statsJson = this.getStatsMessage();
                   console.log(`Sending statsDaily, size: ${statsJson.length} chars`);
+                  this.trackWsBytesRaw(statsJson, "statsDaily");
                   ws.send(statsJson);
                 } catch (err) {
                   console.warn('Failed to send large data:', err);
@@ -2591,6 +2633,7 @@ if (url.pathname === "/data/shipsForSale.json") {
             // keep it from being reaped); reply with a pong so the client's
             // data watchdog sees activity.
             if (raw && raw.type === "ping") {
+              this.trackWsBytes({ type: "pong" });
               try { ws.send(JSON.stringify({ type: "pong" })); } catch {}
               return;
             }
@@ -2603,13 +2646,13 @@ if (url.pathname === "/data/shipsForSale.json") {
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
-              // Include bot, command, and params fields in execResult for processing in frontend
               const responseData = { type: resType, action: data.type, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
+              this.trackWsBytes(responseData);
               ws.send(JSON.stringify(responseData));
             }
           } catch (err) {
             const rawData = JSON.parse(typeof msg === "string" ? msg : msg.toString());
-            ws.send(JSON.stringify({
+            const errorResponse = {
               type: isExec ? "execResult" : "actionResult",
               _seq: seq,
               bot: rawData.bot,
@@ -2617,7 +2660,9 @@ if (url.pathname === "/data/shipsForSale.json") {
               params: rawData.params,
               ok: false,
               error: err instanceof Error ? err.message : String(err),
-            }));
+            };
+            this.trackWsBytes(errorResponse);
+            ws.send(JSON.stringify(errorResponse));
           }
         },
 
@@ -2833,6 +2878,7 @@ if (url.pathname === "/data/shipsForSale.json") {
   }
 
   private broadcast(data: unknown): void {
+    this.trackWsBytes(data);
     const msg = JSON.stringify(data);
     for (const ws of this.clients) {
       try {

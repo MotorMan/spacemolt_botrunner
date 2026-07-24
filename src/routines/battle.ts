@@ -799,9 +799,15 @@ export async function fightFreshBattle(
   if (!battleActive) {
     // Initial setup - scan and attack
     let scanResp = await bot.exec("scan", { target_id: target.id });
-    if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
-      ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
-      scanResp = await bot.exec("scan", { target_id: target.name });
+    if (scanResp.error) {
+      const errMsg = scanResp.error.message.toLowerCase();
+      if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
+        ctx.log("combat", `⚔️ Scan revealed battle already active with ${target.name} — entering combat loop directly`);
+        battleActive = true;
+      } else if (errMsg.includes("invalid_target")) {
+        ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
+        scanResp = await bot.exec("scan", { target_id: target.name });
+      }
     }
 
     if (!scanResp.error && scanResp.result) {
@@ -811,16 +817,18 @@ export async function fightFreshBattle(
       ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
     }
 
-    const atk = await bot.exec("attack", { target_id: target.id });
-    if (atk.error) {
-      const msg = atk.error.message.toLowerCase();
-      if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
-        ctx.log("combat", `${target.name} is no longer available`);
-        return false;
+    if (!battleActive) {
+      const atk = await bot.exec("attack", { target_id: target.id });
+      if (atk.error) {
+        const msg = atk.error.message.toLowerCase();
+        if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+          ctx.log("combat", `${target.name} is no longer available`);
+          return false;
+        }
+        attackErrMsg = atk.error.message;
+      } else {
+        battleActive = true;
       }
-      attackErrMsg = atk.error.message;
-    } else {
-      battleActive = true;
     }
   }
 

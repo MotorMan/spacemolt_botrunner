@@ -994,6 +994,11 @@ shipSpeed = 1;
       if (command === "get_battle_status" && /no active battle|not_in_battle|not in (a )?battle/i.test(message)) {
         return { error: { code: "not_in_battle", message }, result: undefined, notifications: [] };
       }
+      // Scan commands fail with "in_battle" when the bot is already in combat.
+      // This is expected and should not be logged as a red error.
+      if (command === "scan" && /in_battle|in combat/i.test(message)) {
+        return { error: { code: "in_battle", message }, result: undefined, notifications: [] };
+      }
       this.log("error", `libExec ${command} failed: ${message}`);
       // Rate-limit / IP-block protection: the server temporarily bans an IP for
       // excessive command rate. If we blindly return the error, routines retry

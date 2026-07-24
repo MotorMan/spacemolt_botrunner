@@ -794,6 +794,7 @@
       caLog(`<span class="resp-cmd">${ts} > FLEET: Reloading ${weaponsToReload.length} weapons with ${catalogName(ammoId)}</span>`);
 
       let index = 0;
+      let completedCount = 0;
       function executeNext() {
         if (index >= weaponsToReload.length) return;
 
@@ -807,6 +808,10 @@
           const success = result.ok !== false && !result.error;
           const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
           caLog(`<span class="resp-bot">${esc(bot.username)}:</span> Reloaded "${esc(weapon.name)}": ${status}`);
+          completedCount++;
+          if (completedCount === weaponsToReload.length) {
+            caLog(`<span class="resp-ok">✓ All ${weaponsToReload.length} weapons reloaded successfully</span>`);
+          }
         });
 
         index++;

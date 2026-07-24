@@ -2839,7 +2839,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       const aiChatService = (globalThis as any).aiChatService;
-      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+      if (!settings.disablePrivateMessages && aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
         aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
           if (!result.ok) {
             ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
@@ -2847,6 +2847,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         }).catch((err: Error) => {
           ctx.log("warn", `Error sending en-route notification: ${err.message}`);
         });
+      } else if (settings.disablePrivateMessages) {
+        ctx.log("rescue", `🔇 Private message disabled - skipping en-route notification to ${target.username}`);
       }
     }
 
@@ -6201,7 +6203,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       const aiChatService = (globalThis as any).aiChatService;
-      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+      if (!settings.disablePrivateMessages && aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
         aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
           if (!result.ok) {
             ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
@@ -6209,6 +6211,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         }).catch((err: Error) => {
           ctx.log("warn", `Error sending en-route notification: ${err.message}`);
         });
+      } else if (settings.disablePrivateMessages) {
+        ctx.log("rescue", `🔇 Private message disabled - skipping en-route notification to ${target.username}`);
       }
     }
 

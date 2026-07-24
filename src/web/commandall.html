@@ -665,8 +665,14 @@
         caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
 
         sendExec(bot.username, 'get_ship', {}, (result) => {
+          // Debug: log the full result structure
+          console.log(`Full result for ${bot.username}:`, JSON.stringify(result, null, 2).slice(0, 2000));
+          
           // get_ship returns { ship, modules, cargo } inside result.data (or result for V2 API)
           const data = result.data || result;
+          console.log(`Data for ${bot.username}:`, JSON.stringify(data).slice(0, 1000));
+          console.log(`Modules count: ${Array.isArray(data.modules) ? data.modules.length : 'not array'}`);
+          console.log(`Cargo count: ${Array.isArray(data.cargo) ? data.cargo.length : 'not array'}`);
           const modules = Array.isArray(data.modules) ? data.modules : [];
           const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 

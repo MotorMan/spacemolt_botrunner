@@ -955,15 +955,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         // Remotely verify this station actually has items/credits
         const remote = await bot.viewStorage(target.stationId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const itemArray = (
-          Array.isArray(remote) ? remote :
-          Array.isArray(remote.items) ? remote.items :
-          Array.isArray(remote.storage) ? remote.storage :
-          []
-        ) as Array<Record<string, unknown>>;
-        const hasItems = itemArray.some(
-          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
-        );
+        const parsedItems = bot.parseItemList(remote);
+        const hasItems = parsedItems.some(i => i.quantity > 0);
 
         if (credits > 0 || hasItems) {
           target.hasCredits = credits > 0;
@@ -991,15 +984,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const remote = await bot.viewStorage(storageId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const itemArray = (
-          Array.isArray(remote) ? remote :
-          Array.isArray(remote.items) ? remote.items :
-          Array.isArray(remote.storage) ? remote.storage :
-          []
-        ) as Array<Record<string, unknown>>;
-        const hasItems = itemArray.some(
-          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
-        );
+        const parsedItems = bot.parseItemList(remote);
+        const hasItems = parsedItems.some(i => i.quantity > 0);
 
         if (credits > 0 || hasItems) {
           station.hasCredits = credits > 0;

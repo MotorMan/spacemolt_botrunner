@@ -2051,7 +2051,7 @@ const ews = this.hasEwsModule(modulesArray);
    }
 
   /** Parse an item list from API response, handling both item_id and resource_id formats. */
-  private parseItemList(result: unknown, preferField?: string): CargoItem[] {
+  public parseItemList(result: unknown, preferField?: string): CargoItem[] {
     if (!result || typeof result !== "object") return [];
 
     let r = result as Record<string, unknown>;
@@ -2064,7 +2064,7 @@ const ews = this.hasEwsModule(modulesArray);
     // Check structuredContent first (V2 API format)
     if (r.structuredContent && typeof r.structuredContent === "object") {
       const sc = r.structuredContent as Record<string, unknown>;
-      if (Array.isArray(sc.items)) {
+      if (Array.isArray(sc.items) || Array.isArray(sc.storage)) {
         r = sc;
       }
     }

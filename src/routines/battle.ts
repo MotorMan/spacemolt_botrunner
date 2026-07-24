@@ -1411,9 +1411,29 @@ export async function fightJoinedBattle(
       if (advResp.error) {
         const msg = advResp.error.message.toLowerCase();
         if (msg.includes("no active battle") || msg.includes("not in battle")) {
-          // We may not be registered as engaged yet — try re-attacking the enemy once.
-          if (currentTarget) await attackTarget(ctx, currentTarget);
-          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          // Bot not registered as engaged - need to ensure we're attacking the target
+          if (currentTarget) {
+            ctx.log("combat", `⚠️ Advance failed - not registered as engaged, ensuring attack on ${currentTarget.name}...`);
+            await attackTarget(ctx, currentTarget);
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            await ctx.sleep(5000);
+            // Check if battle is still active
+            const afterAttackStatus = await getBattleStatus(ctx);
+            if (!afterAttackStatus) {
+              ctx.log("combat", `✅ Battle ended after re-engaging - victory!`);
+              await checkAndPraiseMorgThar(ctx, true);
+              return true;
+            }
+            // If still in battle, re-check zone and try advance again
+            const recheckZone = afterAttackStatus.your_zone || "outer";
+            if (recheckZone === "engaged") {
+              ctx.log("combat", `✅ Now at engaged zone after re-engaging`);
+              break;
+            }
+            // Continue to next advance attempt
+            continue;
+          }
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle, no target) - victory!`);
           await checkAndPraiseMorgThar(ctx, true);
           return true;
         }

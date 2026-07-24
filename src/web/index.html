@@ -33037,6 +33037,35 @@ ignoreBlacklist: document.getElementById(
               "";
             const shipStoredInCarrier = storedInCarrierName.toLowerCase();
 
+            // Towing detection - ships stored in the active ship's own storage (target=self)
+            const isTowed =
+              typeof rawLocation === "string" &&
+              rawLocation.toLowerCase().includes("towed");
+            const towedByShipName = isTowed
+              ? rawLocation
+                  .replace(/^towed by\s*/i, "")
+                  .trim()
+                  .toLowerCase()
+              : "";
+            const isTowedByActive =
+              isTowed &&
+              towedByShipName &&
+              (towedByShipName === activeShipName ||
+                towedByShipName === activeShipCustomName ||
+                towedByShipName === effectiveActiveCustomName ||
+                towedByShipName === activeShipClassId ||
+                towedByShipName === activeShipClassName ||
+                (activeShipName && activeShipName.includes(towedByShipName)) ||
+                (activeShipCustomName && activeShipCustomName.includes(towedByShipName)) ||
+                (effectiveActiveCustomName && effectiveActiveCustomName.includes(towedByShipName)) ||
+                (activeShipClassId && activeShipClassId.includes(towedByShipName)) ||
+                (activeShipClassName && activeShipClassName.includes(towedByShipName)) ||
+                towedByShipName.includes(activeShipName) ||
+                towedByShipName.includes(activeShipCustomName) ||
+                towedByShipName.includes(effectiveActiveCustomName) ||
+                towedByShipName.includes(activeShipClassId) ||
+                towedByShipName.includes(activeShipClassName));
+
             // A ship is at the station if it's at the same location/system as the bot (docked at station)
             // shipSystemId is the system ID for ships (extracted from location or system field)
             // botSystem is the bot's system ID
@@ -33125,6 +33154,22 @@ ignoreBlacklist: document.getElementById(
               ((isLoadedOnCarrier && isUnloadFromActiveCarrier) ||
                 isStoredInThisCarrier);
 
+            const canUntow =
+              (isLoadedOnCarrier && isUnloadFromActiveCarrier) ||
+              (isTowed && isTowedByActive);
+
+            const shipTier = s.tier ?? s.ship_tier ?? null;
+            const activeShipTier = shipyardShipData?.ship?.tier ?? shipyardShipData?.tier ?? null;
+            const tierOk =
+              activeShipTier == null || shipTier == null || shipTier <= activeShipTier;
+            const canTow =
+              !isActive &&
+              !isBuilding &&
+              !isLoadedOnCarrier &&
+              !isTowed &&
+              isShipAtStation &&
+              tierOk;
+
             const botOptions = bots
               .filter((b) => b.username !== username)
               .map(
@@ -33150,6 +33195,12 @@ ignoreBlacklist: document.getElementById(
             const unloadBtn = canUnloadFromCarrier
               ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Unload from carrier">📤 Unload</button>`
               : "";
+            const untowBtn = canUntow
+              ? `<button class="sm" style="color:var(--cyan)" onclick="shipUntow('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Untow ship">🔓 Untow</button>`
+              : "";
+            const towBtn = canTow
+              ? `<button class="sm" style="color:var(--orange)" onclick="shipTow('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Tow ship">🔗 Tow</button>`
+              : "";
 
             const nameBtn = isActive
               ? `<button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>`
@@ -33168,7 +33219,7 @@ ignoreBlacklist: document.getElementById(
         </div>
         <div class="ssc-actions">
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ""}
-          ${loadBtn}${unloadBtn}
+           ${loadBtn}${towBtn}${unloadBtn}${untowBtn}
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${escJs(name)}')">Sell</button>` : ""}
           ${giftDropdown}${nameBtn}
         </div>
@@ -34068,6 +34119,68 @@ ignoreBlacklist: document.getElementById(
               appendLine(
                 "system",
                 `Unload ship failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      /** Tow a ship by depositing it into the active ship's own storage (target=self) */
+      function shipTow(username, shipId, shipName) {
+        if (!shipId) return;
+        if (
+          !confirm(
+            `Tow ${shipName || "this ship"}? This will attach it to the active ship.`,
+          )
+        )
+          return;
+
+        sendExec(
+          username,
+          "storage",
+          { action: "deposit", target: "self", item_id: shipId },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username} towed ${shipName || "ship"}`,
+              );
+              if (shipyardActivePanel === "fleet") fetchFleetList(username);
+            } else {
+              appendLine(
+                "system",
+                `Tow ship failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      /** Untow a ship by withdrawing it from the active ship's own storage (target=self) */
+      function shipUntow(username, shipId, shipName) {
+        if (!shipId) return;
+        if (
+          !confirm(
+            `Untow ${shipName || "this ship"}? This will release it at the current station.`,
+          )
+        )
+          return;
+
+        sendExec(
+          username,
+          "storage",
+          { action: "withdraw", target: "self", item_id: shipId },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username} untowed ${shipName || "ship"}`,
+              );
+              if (shipyardActivePanel === "fleet") fetchFleetList(username);
+            } else {
+              appendLine(
+                "system",
+                `Untow ship failed: ${result.error || "unknown"}`,
               );
             }
           },

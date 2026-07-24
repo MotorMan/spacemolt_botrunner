@@ -732,7 +732,17 @@
             }
           } else {
             errorCount++;
-            caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(result.error || 'unknown')}</span>`);
+            let errMsg = '';
+            if (typeof result.error === 'string') {
+              errMsg = result.error;
+            } else if (result.error) {
+              errMsg = result.error.message || JSON.stringify(result.error);
+            } else if (result.result) {
+              errMsg = 'Unknown error with result';
+            } else {
+              errMsg = 'Unknown error';
+            }
+            caLog(`<span class="resp-err">${esc(bot.username)}: Failed to load weapons - ${esc(errMsg)}</span>`);
             if (loadedCount + errorCount === activeBots.length) {
               const controls = document.getElementById('ca-weapon-reload-controls');
               if (controls) controls.style.display = 'block';

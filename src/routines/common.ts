@@ -2801,6 +2801,15 @@ export function parseWrecks(result: unknown): Wreck[] {
  * Prioritizes fuel cells, then loots everything if cargo space allows.
  * Returns number of items looted.
  */
+function shuffleArray<T>(arr: T[]): T[] {
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
 export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: boolean }): Promise<number> {
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
@@ -2824,7 +2833,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   let totalLooted = 0;
   const lootedItems: string[] = [];
 
-  for (const wreck of wrecks) {
+  for (const wreck of shuffleArray(wrecks)) {
     if (bot.state !== "running") break;
 
     // Check cargo space
@@ -2847,7 +2856,8 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       if (candidates.length === 0) continue;
     }
 
-    // Sort: fuel cells first, then everything else
+    // Randomize item order to reduce cross-bot collisions, then sort: fuel cells first, then everything else
+    candidates = shuffleArray(candidates);
     candidates.sort((a, b) => {
       const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
       const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
@@ -2944,7 +2954,7 @@ export async function fullSalvageWrecks(
   const lootedItems: string[] = [];
   const towedWrecks: { wreck_id: string; name: string; salvage_value: number }[] = [];
 
-  for (const wreck of wrecks) {
+  for (const wreck of shuffleArray(wrecks)) {
     if (bot.state !== "running") break;
 
     await bot.refreshCargo();
@@ -2970,6 +2980,7 @@ export async function fullSalvageWrecks(
         );
       }
 
+      candidates = shuffleArray(candidates);
       candidates.sort((a, b) => {
         const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
         const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;

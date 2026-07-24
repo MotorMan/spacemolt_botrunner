@@ -657,8 +657,8 @@
 
       caLog('<span class="resp-cmd">Loading weapons from all bots...</span>');
       caWeaponsCache = {};
-      let loadedCount = 0;
-      let errorCount = 0;
+      let weaponsLoaded = 0;
+      let cargoLoaded = 0;
 
       // Collect all cargo items across bots for aggregated dropdown
       const allCargoItems = {};
@@ -667,61 +667,13 @@
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
         caLog(`<span class="resp-info">${ts} > ${esc(bot.username)}: get_ship</span>`);
 
+        // First get ship data for weapons
         sendExec(bot.username, 'get_ship', {}, (result) => {
           if (!result.ok || !result.data) {
             caLog(`<span class="resp-err">${esc(bot.username)}: get_ship failed - ${esc(result.error || 'no data')}</span>`);
-            errorCount++;
-            loadedCount++;
-            if (loadedCount + errorCount === activeBots.length) {
-              const controls = document.getElementById('ca-weapon-reload-controls');
-              if (controls) controls.style.display = 'block';
-            }
-            return;
           }
-          const data = result.data;
+          const data = result.data || {};
           const modules = Array.isArray(data.modules) ? data.modules : [];
-          const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
-
-          caLog(`<span class="resp-info">${esc(bot.username)}: cargo items=${shipCargo.length}, modules=${modules.length}</span>`);
-
-          // Debug: log first few cargo items
-          if (shipCargo.length > 0) {
-            caLog(`<span class="resp-info">${esc(bot.username)}: sample cargo: ${JSON.stringify(shipCargo.slice(0, 3))}</span>`);
-          }
-
-          // Always aggregate cargo, even if modules are empty
-          for (const item of shipCargo) {
-            const itemId = item.item_id || item.id || '';
-            if (!itemId) continue;
-            if (!allCargoItems[itemId]) {
-              allCargoItems[itemId] = {
-                name: item.name || catalog.items?.[itemId]?.name || itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-                quantity: 0
-              };
-            }
-            allCargoItems[itemId].quantity += item.quantity || 0;
-          }
-
-          if (modules.length === 0) {
-            errorCount++;
-            loadedCount++;
-            caLog(`<span class="resp-warn">${esc(bot.username)}: No modules found</span>`);
-            if (loadedCount + errorCount === activeBots.length) {
-              const controls = document.getElementById('ca-weapon-reload-controls');
-              const summary = document.getElementById('ca-weapons-summary');
-              const ammoSelect = document.getElementById('ca-ammo-type-select');
-              if (controls) controls.style.display = 'block';
-              if (summary) summary.textContent = `Found 0 weapons across ${activeBots.length} bots (some may have no modules)`;
-              if (ammoSelect) {
-                const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
-                ammoSelect.innerHTML = '<option value="">Select item...</option>' +
-                  sortedItems.map(([id, data]) => {
-                    return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
-                  }).join('');
-              }
-            }
-            return;
-          }
 
           const weapons = modules
               .filter((mod) => {
@@ -756,29 +708,57 @@
               })
               .filter((w) => w.instanceId);
 
-          caWeaponsCache[bot.username] = { weapons, cargo: shipCargo };
-          loadedCount++;
+          caWeaponsCache[bot.username] = { weapons, cargo: [] };
+          weaponsLoaded++;
 
-          if (loadedCount + errorCount === activeBots.length) {
-            const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
-            const controls = document.getElementById('ca-weapon-reload-controls');
-            const summary = document.getElementById('ca-weapons-summary');
-            
-            if (controls) controls.style.display = 'block';
-            if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
-
-            // Populate dropdown with aggregated cargo items
-            const ammoSelect = document.getElementById('ca-ammo-type-select');
-            if (ammoSelect) {
-              const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
-              caLog(`<span class="resp-info">Dropdown: ${sortedItems.length} items</span>`);
-              ammoSelect.innerHTML = '<option value="">Select item...</option>' +
-                sortedItems.map(([id, data]) => {
-                  return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
-                }).join('');
+          // Now get cargo data
+          sendExec(bot.username, 'get_cargo', {}, (cargoResult) => {
+            if (!cargoResult.ok || !cargoResult.data) {
+              caLog(`<span class="resp-err">${esc(bot.username)}: get_cargo failed - ${esc(cargoResult.error || 'no data')}</span>`);
             }
-            caLog(`<span class="resp-ok">Loaded weapons from ${Object.keys(caWeaponsCache).length} bots</span>`);
-          }
+            const cargoData = cargoResult.data || {};
+            const shipCargo = Array.isArray(cargoData.cargo) ? cargoData.cargo : 
+                              Array.isArray(cargoData.items) ? cargoData.items : [];
+
+            caLog(`<span class="resp-info">${esc(bot.username)}: cargo items=${shipCargo.length}, weapons=${weapons.length}</span>`);
+
+            // Update cache with cargo
+            caWeaponsCache[bot.username].cargo = shipCargo;
+
+            // Aggregate cargo items across all bots
+            for (const item of shipCargo) {
+              const itemId = item.item_id || item.itemId || item.id || '';
+              if (!itemId) continue;
+              if (!allCargoItems[itemId]) {
+                allCargoItems[itemId] = {
+                  name: item.name || item.item_name || catalog.items?.[itemId]?.name || itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+                  quantity: 0
+                };
+              }
+              allCargoItems[itemId].quantity += item.quantity || item.qty || 0;
+            }
+
+            cargoLoaded++;
+
+            if (weaponsLoaded === activeBots.length && cargoLoaded === activeBots.length) {
+              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+              const controls = document.getElementById('ca-weapon-reload-controls');
+              const summary = document.getElementById('ca-weapons-summary');
+              const ammoSelect = document.getElementById('ca-ammo-type-select');
+              
+              if (controls) controls.style.display = 'block';
+              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
+
+              if (ammoSelect) {
+                const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
+                caLog(`<span class="resp-info">Dropdown: ${sortedItems.length} items</span>`);
+                ammoSelect.innerHTML = '<option value="">Select item...</option>' +
+                  sortedItems.map(([id, data]) => {
+                    return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
+                  }).join('');
+              }
+            }
+          });
         });
       }
     }

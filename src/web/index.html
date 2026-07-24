@@ -26023,7 +26023,6 @@ async function fetchPersonalFacilityTypes(username) {
       }
 
       function factionAutoAccept(username) {
-        // Check for pending invites on this bot and accept the first one
         sendExec(username, "faction_get_invites", undefined, (result) => {
           if (!result.ok || !result.data) return;
           const d = result.data;
@@ -26039,8 +26038,9 @@ async function fetchPersonalFacilityTypes(username) {
           sendExec(username, "join_faction", { faction_id: fid }, (jr) => {
             if (jr.ok) {
               appendLine("system", `${username} auto-accepted faction invite!`);
-              // Refresh the faction page if we're viewing it
-              if (factionSelectedBot) fetchFactionInfo(factionSelectedBot);
+              if (!inviteAllQueue && factionSelectedBot) {
+                fetchFactionInfo(factionSelectedBot);
+              }
             } else {
               appendLine(
                 "system",

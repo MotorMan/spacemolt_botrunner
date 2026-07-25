@@ -2064,7 +2064,10 @@ const ews = this.hasEwsModule(modulesArray);
     // Check structuredContent first (V2 API format)
     if (r.structuredContent && typeof r.structuredContent === "object") {
       const sc = r.structuredContent as Record<string, unknown>;
-      if (Array.isArray(sc.items) || Array.isArray(sc.storage)) {
+      const scHasTarget = preferField
+        ? Array.isArray((sc as Record<string, unknown>)[preferField as string]) && ((sc as Record<string, unknown>)[preferField as string] as Array<Record<string, unknown>>).length > 0
+        : (Array.isArray(sc.items) && sc.items.length > 0) || (Array.isArray(sc.storage) && sc.storage.length > 0);
+      if (scHasTarget) {
         r = sc;
       }
     }

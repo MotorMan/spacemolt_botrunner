@@ -816,6 +816,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
       skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
     };
+    ctx.log("info", `Cleanup settings: home=${settings.homeStation} (${settings.homeSystem}), focus=${settings.focusStationId || 'none'}, depositAllStorage=${settings.depositAllStorage}`);
 
     // ── Cloak: enable at startup/cycle start if configured ──
     await enableCloakAtDock(ctx, settings);

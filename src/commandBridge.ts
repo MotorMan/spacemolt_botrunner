@@ -341,8 +341,16 @@ export function extractLibResult(raw: unknown): unknown {
     }
     return d;
   }
-  if ("structuredContent" in r) {
-    return r.structuredContent;
+  if ("structuredContent" in r && r.structuredContent && typeof r.structuredContent === "object") {
+    const sc = r.structuredContent as Record<string, unknown>;
+    const hasData = Object.values(sc).some((v) => {
+      if (Array.isArray(v)) return v.length > 0;
+      if (v && typeof v === "object") return Object.keys(v).length > 0;
+      return v !== null && v !== undefined && v !== "";
+    });
+    if (hasData) {
+      return sc;
+    }
   }
   if ("details" in r && r.details) {
     return r.details;

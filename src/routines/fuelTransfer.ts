@@ -11,7 +11,6 @@ import {
   logFactionActivity,
   checkAndFleeFromBattle,
   getBattleStatus,
-  fleeFromBattle,
   getItemSize,
   maxItemsForCargo,
   type BattleState,
@@ -27,7 +26,6 @@ import {
 } from "./fuelTransferTracking.js";
 import { getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 
-const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell", "military_fuel_cell"];
 
 const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
 const factionStorageApiLastCalled: Map<string, number> = new Map();
@@ -111,10 +109,6 @@ async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
   return true;
 }
 
-function isFuelCellItem(itemId: string): boolean {
-  const lower = itemId.toLowerCase();
-  return FUEL_CELL_ITEM_ID_PREFIXES.some(p => lower.includes(p));
-}
 
 interface TransferStrategy {
   skip: boolean;
@@ -144,6 +138,8 @@ interface FuelTransportSettings {
   refuelThreshold: number;
   repairThreshold: number;
   autoCloak: boolean;
+  homeSystem?: string;
+  homeStation?: string;
 }
 
 function getActiveLoadouts(): FacilityTransferLoadout[] {
@@ -173,6 +169,8 @@ function getFuelTransportSettings(username?: string): FuelTransportSettings {
     refuelThreshold: (t.refuelThreshold as number) || 35,
     repairThreshold: (t.repairThreshold as number) || 40,
     autoCloak: (t.autoCloak as boolean) ?? false,
+    homeSystem: (botOverrides.homeSystem as string) || (general.factionStorageSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (general.factionStorageStation as string) || "",
   };
 }
 
@@ -353,9 +351,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
     autoCloak: settings.autoCloak,
   };
 
-  const general = readSettings().general || {};
-  const homeSystem = (general.factionStorageSystem as string) || "";
-  const homeStation = (general.factionStorageStation as string) || "";
+  const homeSystem = settings.homeSystem || "";
+  const homeStation = settings.homeStation || "";
 
   if (!homeSystem || !homeStation) {
     ctx.log("error", "Fuel Transport: General > Faction Storage Station must be set");
@@ -637,15 +634,10 @@ async function processItemTransfer(
   const itemSize = getItemSize(item.itemId);
   const maxCanCarry = Math.floor((bot.cargoMax || 825) / itemSize);
   
-  const isFuelCell = isFuelCellItem(item.itemId);
-  const toWithdraw = isFuelCell ? (needed >= maxCanCarry ? maxCanCarry : 0) : Math.min(needed, maxCanCarry);
+  const toWithdraw = Math.min(Math.max(0, needed), maxCanCarry);
 
   if (toWithdraw <= 0) {
-    if (isFuelCell) {
-      ctx.log("fuel", `${remoteStationId}: Waiting for full cargo load of ${item.itemName} (need ${needed}, max ${maxCanCarry})`);
-    } else {
-      ctx.log("warn", `Cannot carry any ${item.itemName} (size ${itemSize})`);
-    }
+    ctx.log("warn", `Cannot carry any ${item.itemName} (size ${itemSize})`);
     return null;
   }
 
@@ -750,8 +742,17 @@ async function processItemTransfer(
     return null;
   }
 
-  ctx.log("fuel", `Depositing ${cargoForDelivery}x ${item.itemName} to ${remoteStationId}...`);
-  const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, item.itemName, cargoForDelivery, remoteStationId);
+  const actualRemoteQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
+  const needNow = Math.max(0, item.targetQuantity - actualRemoteQty);
+  const toDeposit = Math.min(cargoForDelivery, needNow);
+
+  if (toDeposit <= 0) {
+    ctx.log("fuel", `${remoteStationId}: ${item.itemName} already at target (${actualRemoteQty}/${item.targetQuantity}) after transit — nothing to deposit`);
+    return null;
+  }
+
+  ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${item.itemName} to ${remoteStationId} (have ${cargoForDelivery}, need ${needNow})...`);
+  const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, item.itemName, toDeposit, remoteStationId);
 
   if (depositResult.success) {
     ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${item.itemName} to ${remoteStationId} via ${depositResult.mode}`);

@@ -307,6 +307,25 @@ table.bot-table tbody td:nth-child(8) {
 .bot-card-name-text .docked-indicator,
 .grid-bot-name .docked-indicator { margin-left: 4px; }
 
+/* ⚔️ Combat indicator appended to bot names when currently in battle */
+.combat-indicator {
+  color: #f44336;
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  animation: combat-pulse 1s ease-in-out infinite;
+  text-shadow: 0 0 4px rgba(244, 67, 54, 0.8);
+}
+.bot-card-name-text .combat-indicator,
+.grid-bot-name .combat-indicator { margin-left: 4px; }
+
+@keyframes combat-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.3); }
+}
+
 .state-badge {
   display: inline-block;
   font-size: 11px;

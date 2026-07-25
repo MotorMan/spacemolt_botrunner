@@ -92,6 +92,8 @@ export interface BotStatus {
    * Empty object = no bounties / unknown.
    */
   bounties: Record<string, number>;
+  inBattle?: boolean;
+  battleId?: string | null;
   /**
    * Transient flag set only for bot cards that have been rehydrated from the
    * persisted active-bot snapshot at client startup — i.e. bots that were
@@ -4672,6 +4674,8 @@ if (this.craftQueueTracker && jobId && recipeId) {
       isCloaked: this.isCloaked,
       hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,
       bounties: this.bounties,
+      inBattle: this.currentBattle.inBattle,
+      battleId: this.currentBattle.battleId,
     };
   }
 

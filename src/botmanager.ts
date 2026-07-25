@@ -447,7 +447,7 @@ function refreshStatusTable(): void {
   const key = [...bots.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, b]) =>
-      `${b.username}:${b.state}:${b.routineName}:${b.credits}:${b.fuel}:${b.maxFuel}:${b.cargo}:${b.cargoMax}:${b.location}:${b.system}:${b.poi}:${b.docked}:${b.shipName}:${b.shipClass}:${b.tier}:${b.hull}:${b.maxHull}:${b.shield}:${b.maxShield}:${b.isCloaked}:${b.faction}:${b.inventory?.length ?? 0}:${b.storage?.length ?? 0}:${b.homeBaseFuel}`
+      `${b.username}:${b.state}:${b.routineName}:${b.credits}:${b.fuel}:${b.maxFuel}:${b.cargo}:${b.cargoMax}:${b.location}:${b.system}:${b.poi}:${b.docked}:${b.shipName}:${b.shipClass}:${b.tier}:${b.hull}:${b.maxHull}:${b.shield}:${b.maxShield}:${b.isCloaked}:${b.faction}:${b.inventory?.length ?? 0}:${b.storage?.length ?? 0}:${b.homeBaseFuel}:${b.currentBattle.inBattle}:${b.currentBattle.battleId}`
     )
     .join("|");
   if (key === lastStatusKey) return;

@@ -2908,6 +2908,13 @@
         return "";
       }
 
+      function combatIndicator(bot) {
+        if (bot.inBattle) {
+          return `<span class="combat-indicator" title="⚔️ In combat${bot.battleId ? ` — battle ${esc(bot.battleId)}` : ""}">⚔️</span>`;
+        }
+        return "";
+      }
+
       function renderBots() {
         // If a routine dropdown in the dashboard table is focused/open, skip re-rendering
         // The browser's native dropdown closes when the element is removed from DOM
@@ -3035,7 +3042,7 @@
                   : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
             }
             return `<tr data-bot="${esc(bot.username)}">
-      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}</td>
+      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</td>
       <td class="ship-cell">${esc(bot.shipName || "-")}</td>
       <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
@@ -3277,7 +3284,7 @@
         return `
     <div class="grid-bot-card ${bot.offline ? 'ghost' : ''}" onclick="openProfile('${esc(bot.username)}')">
       <div class="grid-bot-header">
-        <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}</span>
+        <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</span>
         <span class="state-badge ${bot.offline ? 'state-offline' : 'state-' + bot.state}">${esc(stateLabel)}</span>
       </div>
       <div class="grid-bot-ship">${esc(bot.shipName || "-")}</div>
@@ -3526,7 +3533,7 @@
       <div class="bot-card-header">
         <div class="bot-card-name">
           <span class="bot-card-name-icon"></span>
-          <span class="bot-card-name-text ${bot.isCloaked ? 'cloaked' : ''}" title="${esc(bot.username)}">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}</span>
+          <span class="bot-card-name-text ${bot.isCloaked ? 'cloaked' : ''}" title="${esc(bot.username)}">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</span>
           <span class="bot-card-ship" title="${esc(bot.shipName || "")}">${esc(bot.shipName || "-")}</span>
         </div>
         <div class="bot-card-status">
@@ -31128,6 +31135,8 @@ ignoreBlacklist: document.getElementById(
         const useLoadouts = ft.useLoadouts ?? false;
         const selectedLoadout = ft.selectedLoadout ?? "";
         const autoCloak = ft.autoCloak ?? false;
+        const ftHomeSystem = ft.homeSystem || "";
+        const ftHomeStation = ft.homeStation || "";
 
         const general = settings.general || {};
         const generalSystem = general.factionStorageSystem || "";
@@ -31168,6 +31177,13 @@ ignoreBlacklist: document.getElementById(
         for (const { val, label, sysName } of stationList) {
           stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
         }
+
+        const ftHomeOptions = stationList
+          .map(({ val, label, sysName }) => {
+            const sel = val === ftHomeSystem + "|" + ftHomeStation ? " selected" : "";
+            return `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+          })
+          .join("");
 
         let botOpts = '<option value="">(select bot at home)</option>';
         for (const bot of [...bots].sort((a, b) =>
@@ -31248,9 +31264,21 @@ ignoreBlacklist: document.getElementById(
     <h3>Fuel Transport Settings</h3>
     <div class="settings-desc">Transfer items from home faction storage to remote stations to build and maintain fuel bunkers. Home base uses General > Faction Storage Station.</div>
 
-    <div style="padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);margin-bottom:12px">
-      <b>Home Base:</b> ${esc(generalLabel)}
-    </div>
+        <div style="padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);margin-bottom:12px">
+          <b>Home Base:</b> ${esc(generalLabel)}
+        </div>
+
+        <div style="padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);margin-bottom:12px">
+          <b>Fuel Transport Home Base:</b>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input type="text" id="set-ft-homeSystem" value="${esc(ftHomeSystem)}" placeholder="Home system (e.g. sol)" style="min-width:160px">
+            <select id="set-ft-homeStation" style="flex:1;min-width:160px">
+              <option value="">(use global faction storage station)</option>
+              ${ftHomeOptions}
+            </select>
+          </div>
+          <div style="font-size:10px;color:var(--dim);margin-top:6px">Leave station empty to fall back to General > Faction Storage Station.</div>
+        </div>
 
     <div style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏁 Remote Stations</div>
@@ -31459,6 +31487,12 @@ ignoreBlacklist: document.getElementById(
               document.getElementById("set-ft-repairThreshold")?.value,
             ) || 40,
           autoCloak: document.getElementById("set-ft-autoCloak")?.checked || false,
+          homeSystem:
+            (document.getElementById("set-ft-homeSystem")?.value || "").trim() ||
+            "",
+          homeStation:
+            (document.getElementById("set-ft-homeStation")?.value || "").trim() ||
+            "",
         };
         send({ type: "saveSettings", routine: "fuel_transport", settings: s });
         settings.fuel_transport = s;

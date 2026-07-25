@@ -409,8 +409,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  await ensureUndocked(ctx);
-
   const homeInfo = getHomeStationInfo(settings.homeSystem, settings.homeStation);
   if (!homeInfo) {
     ctx.log("error", `Cannot resolve home station "${settings.homeStation}" — aborting deposit`);
@@ -447,6 +445,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   const alreadyThere = bot.poi === targetPoiId;
 
   if (!alreadyThere) {
+    await ensureUndocked(ctx);
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
 
@@ -613,27 +612,9 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
     }
   }
   
-  await ensureUndocked(ctx);
-  
-  // Check storage at home station using view_storage with station_id
-  const storageResp = await bot.viewStorage(homeInfo.baseId);
-  const storageError = storageResp.error as { message?: string } | undefined;
-  if (storageError) {
-    ctx.log("warn", `Could not view home station storage: ${storageError.message}`);
-    return;
-  }
-  
-  const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
-  await bot.refreshStorage(homeInfo.baseId);
-  const hasItems = bot.storage.some(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
-  
-  if (storedCredits === 0 && !hasItems) {
-    ctx.log("info", "Home station storage is empty — nothing to clean");
-    return;
-  }
-  
-  // Travel to home station if not already there
+  // Travel to home station POI if not already there
   if (bot.poi !== homeInfo.poiId) {
+    await ensureUndocked(ctx);
     ctx.log("travel", `Traveling to home station ${homeInfo.poiId}...`);
     const tResp = await bot.exec("travel", { target_poi: homeInfo.poiId });
     if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
@@ -649,8 +630,18 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
     return;
   }
   
+  // Now docked at home station - check storage and deposit
   await bot.refreshStorage();
   await bot.refreshCargo();
+  
+  const storageResp = await bot.viewStorage();
+  const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
+  const hasItems = bot.storage.some(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+  
+  if (storedCredits === 0 && !hasItems) {
+    ctx.log("info", "Home station storage is empty — nothing to clean");
+    return;
+  }
   
   let depositedCount = 0;
   

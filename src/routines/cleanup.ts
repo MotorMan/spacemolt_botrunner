@@ -412,89 +412,28 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   }
 
   await ensureUndocked(ctx);
-  
+
+  const homeInfo = getHomeStationInfo(settings.homeSystem, settings.homeStation);
+  if (!homeInfo) {
+    ctx.log("error", `Cannot resolve home station "${settings.homeStation}" in ${settings.homeSystem} — aborting deposit`);
+    return;
+  }
+
   const { pois } = await getSystemInfo(ctx);
-  let targetStation = null;
-  
-  const currentStation = bot.poi ? pois.find(p => p.id === bot.poi || p.base_id === bot.poi) : null;
-  if (currentStation && isStationPoi(currentStation) && currentStation.id !== settings.focusStationId) {
-    ctx.log("info", `Already at home station (${currentStation.base_id || currentStation.id})`);
-    targetStation = currentStation;
-  }
-
-  if (settings.homeStation) {
-    targetStation = pois.find(p => 
-      isStationPoi(p) && 
-      (p.id === settings.homeStation || p.base_id === settings.homeStation || p.name?.toLowerCase().replace(/ /g, '_') === settings.homeStation.toLowerCase())
-    );
-    if (!targetStation) {
-      targetStation = pois.find(p => 
-        isStationPoi(p) && 
-        p.base_id && 
-        p.base_id.toLowerCase() === settings.homeStation.toLowerCase()
-      );
-    }
-    if (!targetStation) {
-      const normalizedHome = settings.homeStation.toLowerCase().replace(/_/g, ' ');
-      targetStation = pois.find(p => 
-        isStationPoi(p) && 
-        p.name && 
-        p.name.toLowerCase().includes(normalizedHome)
-      );
-    }
-  }
+  const targetStation = pois.find(p => 
+    isStationPoi(p) && 
+    (p.base_id === homeInfo.baseId || p.id === homeInfo.poiId || p.id === homeInfo.baseId)
+  );
 
   if (!targetStation) {
-    targetStation = pois.find(p =>
-      isStationPoi(p) &&
-      p.base_id !== settings.focusStationId &&
-      p.id !== settings.focusStationId
-    );
-    if (targetStation) {
-      ctx.log("info", `Using default station in ${settings.homeSystem}: ${targetStation.base_id || targetStation.name || targetStation.id}`);
-    }
-  }
-
-  if (!targetStation && currentStation && isStationPoi(currentStation)) {
-    targetStation = currentStation;
-    ctx.log("info", `Using current station as home: ${targetStation.base_id || targetStation.id}`);
-  }
-
-  if (!targetStation && settings.homeSystem !== "sol") {
-    ctx.log("warn", `No valid home station in ${settings.homeSystem} — falling back to sol system`);
-    const solSystem = "sol";
-    if (bot.system !== solSystem) {
-      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-      if (fueled) {
-        const arrived = await navigateToSystem(ctx, solSystem, safetyOpts);
-        if (!arrived) {
-          ctx.log("error", "Failed to reach sol system for fallback");
-          return;
-        }
-      } else {
-        ctx.log("error", "Cannot refuel to reach sol system");
-        return;
-      }
-    }
-    const { pois: solPois } = await getSystemInfo(ctx);
-    targetStation = solPois.find(p =>
-      isStationPoi(p) &&
-      p.base_id !== settings.focusStationId &&
-      p.id !== settings.focusStationId
-    );
-    if (targetStation) {
-      ctx.log("info", `Using fallback station in sol: ${targetStation.base_id || targetStation.name || targetStation.id}`);
-    }
-  }
-
-  if (!targetStation) {
-    ctx.log("error", `Could not find home station (focus: ${settings.focusStationId || 'none'}, current: ${bot.poi}). Configure factionStorageStation in settings.`);
+    ctx.log("error", `Home station ${homeInfo.baseId} not found in ${settings.homeSystem} — aborting deposit`);
     return;
   }
 
   const targetPoiId = targetStation.base_id || targetStation.id;
+  const alreadyThere = bot.poi === targetPoiId;
 
-  if (bot.poi !== targetPoiId) {
+  if (!alreadyThere) {
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
 
@@ -537,8 +476,14 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   const isAtHomeStation = targetStation && (
     targetStation.id === botPoiId || 
     targetStation.base_id === botPoiId ||
-    (targetStation as { poiId?: string }).poiId === botPoiId
+    targetStation.id === homeInfo.poiId ||
+    targetStation.base_id === homeInfo.baseId
   );
+
+  if (!isAtHomeStation) {
+    ctx.log("error", `Not at home station (at ${botPoiId}, expected ${homeInfo.baseId}) — aborting deposit`);
+    return;
+  }
 
   const deposited: string[] = [];
   const skipped: string[] = [];
@@ -555,6 +500,10 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   if (storageItemsToDeposit.length > 0 && isAtHomeStation) {
     ctx.log("trade", `At home station — depositing station storage to faction...`);
     for (const item of storageItemsToDeposit) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -579,6 +528,10 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   if (bot.inventory.some(i => i.quantity > 0)) {
     for (const item of [...bot.inventory]) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
@@ -701,6 +654,10 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   if (storageItemsToDeposit.length > 0) {
     ctx.log("trade", `Depositing home station storage to faction...`);
     for (const item of storageItemsToDeposit) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -724,6 +681,10 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   if (bot.inventory.some(i => i.quantity > 0)) {
     ctx.log("trade", `Depositing cargo to faction...`);
     for (const item of [...bot.inventory]) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;

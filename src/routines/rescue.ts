@@ -124,7 +124,13 @@ function getRescueSettings(): {
   maydayRescueEnabled: boolean;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
-ignoreBlacklist: boolean;
+  creditTopOffHomeSystem?: string;
+  creditTopOffHomeStation?: string;
+  fleetRescueHomeSystem?: string;
+  fleetRescueHomeStation?: string;
+  maydayRescueHomeSystem?: string;
+  maydayRescueHomeStation?: string;
+  ignoreBlacklist: boolean;
     ignorePirateFleeWhenCloaked: boolean;
     enableCloak: boolean;
     dontRejectMaydaysInBlacklistSystems: boolean;
@@ -164,6 +170,12 @@ ignoreBlacklist: boolean;
       maydayRescueBot: (r.maydayRescueBot as string) || '',
       premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
       maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
+      creditTopOffHomeSystem: (r.creditTopOffHomeSystem as string) || (r.homeSystem as string) || '',
+      creditTopOffHomeStation: (r.creditTopOffHomeStation as string) || (r.homeStation as string) || '',
+      fleetRescueHomeSystem: (r.fleetRescueHomeSystem as string) || (r.homeSystem as string) || '',
+      fleetRescueHomeStation: (r.fleetRescueHomeStation as string) || (r.homeStation as string) || '',
+      maydayRescueHomeSystem: (r.maydayRescueHomeSystem as string) || (r.homeSystem as string) || '',
+      maydayRescueHomeStation: (r.maydayRescueHomeStation as string) || (r.homeStation as string) || '',
       ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
       ignorePirateFleeWhenCloaked: (r.ignorePirateFleeWhenCloaked as boolean) ?? true,
       enableCloak: (r.enableCloak as boolean) ?? false,
@@ -175,6 +187,37 @@ ignoreBlacklist: boolean;
       disablePrivateMessages: parseBool(r.disablePrivateMessages),
     };
   }
+
+/**
+ * Resolve the home system and station for a given rescue type.
+ * Falls back to the global homeSystem/homeStation when no type-specific
+ * override is configured.
+ */
+function getHomeBaseForRescueType(
+  type: 'creditTopOff' | 'fleetRescue' | 'maydayRescue',
+  fallbackSystem: string,
+): { homeSystem: string; homeStation: string } {
+  const settings = getRescueSettings();
+  let homeSystem: string;
+  let homeStation: string;
+
+  switch (type) {
+    case 'creditTopOff':
+      homeSystem = settings.creditTopOffHomeSystem || settings.homeSystem || fallbackSystem;
+      homeStation = settings.creditTopOffHomeStation || settings.homeStation || '';
+      break;
+    case 'fleetRescue':
+      homeSystem = settings.fleetRescueHomeSystem || settings.homeSystem || fallbackSystem;
+      homeStation = settings.fleetRescueHomeStation || settings.homeStation || '';
+      break;
+    case 'maydayRescue':
+      homeSystem = settings.maydayRescueHomeSystem || settings.homeSystem || fallbackSystem;
+      homeStation = settings.maydayRescueHomeStation || settings.homeStation || '';
+      break;
+  }
+
+  return { homeSystem, homeStation };
+}
 
 /**
  * Enable cloaking on this bot if the rescue settings request it (enableCloak).
@@ -1457,6 +1500,7 @@ async function travelToHomeStationOrDockAnywhere(
   ctx: RoutineContext,
   settings: ReturnType<typeof getRescueSettings>,
   homeSystem: string,
+  homeStationOverride?: string,
   battleState?: BattleState,
 ): Promise<boolean> {
   const { bot } = ctx;
@@ -1467,10 +1511,11 @@ async function travelToHomeStationOrDockAnywhere(
     return true;
   }
 
+  const effectiveHomeStation = homeStationOverride || settings.homeStation;
   let targetStationId: string | null = null;
 
-  if (settings.homeStation) {
-    const [expectedSystem, stationId] = settings.homeStation.split("|");
+  if (effectiveHomeStation) {
+    const [expectedSystem, stationId] = effectiveHomeStation.split("|");
     if (expectedSystem === homeSystem && stationId) {
       targetStationId = stationId;
     }
@@ -1916,9 +1961,10 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
         return;
       }
 
-      // Check if we're at sol_central (or home system if configured)
+      // Check if we're at the credit top-off home system (or home system if configured)
       const settings = getRescueSettings();
-      const expectedSystem = settings.homeSystem || "sol_central";
+      const { homeSystem: creditHomeSystem } = getHomeBaseForRescueType('creditTopOff', bot.system);
+      const expectedSystem = creditHomeSystem || "sol_central";
 
       if (normalizeSystemName(bot.system) !== normalizeSystemName(expectedSystem)) {
         ctx.log("rescue", `💰 Skipping credit top-off — not at ${expectedSystem} (current: ${bot.system})`);
@@ -1987,7 +2033,7 @@ function stopCreditTopOffBackground(): void {
 
     await bot.refreshLocation();
     const settings = getRescueSettings();
-    const homeSystem = settings.homeSystem || bot.system;
+    const { homeSystem, homeStation } = getHomeBaseForRescueType('creditTopOff', bot.system);
 
     await enableRescueCloak(ctx, settings);
 
@@ -2011,7 +2057,7 @@ function stopCreditTopOffBackground(): void {
       return;
     }
 
-  if (settings.homeSystem) {
+  if (homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
     ctx.log("warn", "No home base configured — will use starting system as home");
@@ -2680,7 +2726,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
               // Travel to the configured home station (or nearest station if none is
               // configured) and dock so the bot is safe and refueled.
-              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -2706,7 +2752,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
               // Travel to the configured home station (or nearest station if none is
               // configured) and dock so the bot is safe and refueled.
-              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -3702,7 +3748,7 @@ if (travelSucceeded) {
         const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (arrived) {
-          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
         } else {
           ctx.log("error", `Failed to return to home system ${homeSystem} after failed rescue`);
         }
@@ -3726,7 +3772,7 @@ if (travelSucceeded) {
     // ── Return to home system/ station ──
     // Check if we need to return home: either in different system, or at home system but not at home station
     const atHomeSystem = normalizeSystemName(bot.system) === normalizeSystemName(homeSystem);
-    const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
+    const atHomeStation = homeStation && bot.poi === homeStation.split("|")[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
       if (needsToReturnHome && homeSystem) {
@@ -3750,7 +3796,7 @@ if (travelSucceeded) {
 
         // Travel to the configured home station (or nearest station if none is
         // configured) and dock so the bot is safe and refueled.
-        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
 
         // Update session state for return home
         if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -3968,7 +4014,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
    const { bot } = ctx;
 
    await bot.refreshLocation();
-  const homeSystem = bot.system;
+   const homeSystem = bot.system;
+   const homeStation = "";
 
   // Get parameters (passed from botmanager via action.params)
   const rescueParams = params || (bot as unknown as Record<string, unknown>).routineParams as ManualRescueParams | undefined;
@@ -4300,7 +4347,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     // ── Return to home system/ station ──
     // Check if we need to return home: either in different system, or at home system but not at home station
     const atHomeSystem = normalizeSystemName(bot.system) === normalizeSystemName(homeSystem);
-    const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
+    const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split("|")[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
       if (needsToReturnHome && homeSystem) {
@@ -4324,7 +4371,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
         // Travel to the configured home station (or nearest station if none is
         // configured) and dock so the bot is safe and refueled.
-        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
 
         continue;
       }
@@ -4390,7 +4437,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
   await bot.refreshLocation();
   const settings = getRescueSettings();
-  const homeSystem = settings.homeSystem || bot.system;
+  const { homeSystem, homeStation } = getHomeBaseForRescueType('maydayRescue', bot.system);
 
   await enableRescueCloak(ctx, settings);
 
@@ -4405,7 +4452,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     return;
   }
 
-  if (settings.homeSystem) {
+  if (homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
     ctx.log("warn", "No home base configured — will use starting system as home");
@@ -4967,7 +5014,7 @@ if (refuelResp.error) {
     // ── Return home ──
     // Check if we need to return home: either in different system, or at home system but not at home station
     const atHomeSystem = normalizeSystemName(bot.system) === normalizeSystemName(homeSystem);
-    const atHomeStation = settings.homeStation && bot.poi === settings.homeStation.split('|')[1];
+    const atHomeStation = homeStation && bot.poi === homeStation.split("|")[1];
     const needsToReturnHome = !homeSystem || !atHomeSystem || !atHomeStation;
     
       if (needsToReturnHome && homeSystem) {
@@ -4991,7 +5038,7 @@ if (refuelResp.error) {
 
         // Travel to the configured home station (or nearest station if none is
         // configured) and dock so the bot is safe and refueled.
-        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
 
         // Update session state for return home
         if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -5156,7 +5203,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
 
     await bot.refreshLocation();
     const settings = getRescueSettings();
-    const homeSystem = settings.homeSystem || bot.system;
+    const { homeSystem, homeStation } = getHomeBaseForRescueType('fleetRescue', bot.system);
 
     await enableRescueCloak(ctx, settings);
 
@@ -5191,7 +5238,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     ctx.log("coop", `📡 Registered cooperation handler for Bot Chat Channel coordination`);
   }
   
-  if (settings.homeSystem) {
+  if (homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
     ctx.log("warn", "No home base configured — will use starting system as home");
@@ -5905,7 +5952,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
               // Travel to the configured home station (or nearest station if none is
               // configured) and dock so the bot is safe and refueled.
-              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -5931,7 +5978,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
               // Travel to the configured home station (or nearest station if none is
               // configured) and dock so the bot is safe and refueled.
-              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+              await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -7407,7 +7454,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
         const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
         if (arrived) {
-          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, battleState);
+          await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
         } else {
           ctx.log("error", `Failed to return to home system ${homeSystem} after incomplete rescue`);
         }
@@ -7564,7 +7611,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         // Travel to the configured home station (or nearest station if none is
         // configured) and dock so the bot is safe and refueled.
-        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -7578,7 +7625,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // If not already docked, travel to the configured home station (or nearest
       // station if none is configured) and dock so the bot is safe and refueled.
       if (!bot.docked) {
-        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem);
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation);
       }
     }
 

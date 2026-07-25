@@ -16123,6 +16123,9 @@
         const ghostThreshold = r.ghostThreshold ?? 3;
         const homeSystem = r.homeSystem || "";
         const homeStation = r.homeStation || "";
+        const creditTopOffHomeStation = r.creditTopOffHomeStation || "";
+        const fleetRescueHomeStation = r.fleetRescueHomeStation || "";
+        const maydayRescueHomeStation = r.maydayRescueHomeStation || "";
         const costPerJump = r.costPerJump ?? 50;
         const costPerFuel = r.costPerFuel ?? 2;
         const creditTopOffAmount = r.creditTopOffAmount ?? 10000;
@@ -16209,9 +16212,29 @@
     </p>
 
     <div class="settings-group">
-      <label>Home Base (system + station)</label>
+      <label>Default Home Base (global fallback)</label>
       <select id="set-rescue-homeStation" style="width:100%;max-width:400px">${stationOpts.join("")}</select>
-      <small style="color:var(--dim)">Station the rescue bot returns to and docks at after missions. Choose a specific station, or leave as "(any station)" to use the system the bot started in and dock at the nearest station.</small>
+      <small style="color:var(--dim)">Used when no type-specific home base is set. Station the rescue bot returns to and docks at after missions. Choose a specific station, or leave as "(any station)" to use the system the bot started in and dock at the nearest station.</small>
+    </div>
+
+    <div class="settings-group" style="background:rgba(59,130,246,0.1);border-left:3px solid var(--accent);padding:12px;margin-bottom:16px">
+      <label style="color:var(--text-bright);font-weight:600;margin-bottom:8px;display:block">🏠 Per-Type Home Bases</label>
+      <small style="color:var(--dim);display:block;margin-bottom:12px">Each rescue type can use a different home station. Leave as "(any station)" to fall back to the default home base above. Set these when different rescue types are assigned to bots stationed at different locations.</small>
+
+      <div style="margin-bottom:12px">
+        <label style="display:block;margin-bottom:4px"><strong>Credit Top-Off Home Base</strong> <span style="color:var(--dim)">(where the credit bot operates from)</span></label>
+        <select id="set-rescue-creditTopOffHomeStation" style="width:100%;max-width:400px">${stationOpts.map((o) => o.replace(`value="${esc(creditTopOffHomeStation)}"`, `value="${esc(creditTopOffHomeStation)}" selected`)).join("")}</select>
+      </div>
+
+      <div style="margin-bottom:12px">
+        <label style="display:block;margin-bottom:4px"><strong>Fleet Rescue Home Base</strong> <span style="color:var(--dim)">(where the fleet rescue bot operates from)</span></label>
+        <select id="set-rescue-fleetRescueHomeStation" style="width:100%;max-width:400px">${stationOpts.map((o) => o.replace(`value="${esc(fleetRescueHomeStation)}"`, `value="${esc(fleetRescueHomeStation)}" selected`)).join("")}</select>
+      </div>
+
+      <div style="margin-bottom:0">
+        <label style="display:block;margin-bottom:4px"><strong>MAYDAY Rescue Home Base</strong> <span style="color:var(--dim)">(where the MAYDAY bot operates from)</span></label>
+        <select id="set-rescue-maydayRescueHomeStation" style="width:100%;max-width:400px">${stationOpts.map((o) => o.replace(`value="${esc(maydayRescueHomeStation)}"`, `value="${esc(maydayRescueHomeStation)}" selected`)).join("")}</select>
+      </div>
     </div>
 
     <div class="settings-group">
@@ -16424,6 +16447,12 @@
             document.getElementById("set-rescue-fleetRescueBot").value || "",
           maydayRescueBot:
             document.getElementById("set-rescue-maydayRescueBot").value || "",
+          creditTopOffHomeStation:
+            document.getElementById("set-rescue-creditTopOffHomeStation").value || "",
+          fleetRescueHomeStation:
+            document.getElementById("set-rescue-fleetRescueHomeStation").value || "",
+          maydayRescueHomeStation:
+            document.getElementById("set-rescue-maydayRescueHomeStation").value || "",
           ignoreBlacklist: document.getElementById(
             "set-rescue-ignoreBlacklist",
           ).checked,

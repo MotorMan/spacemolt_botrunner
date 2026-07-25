@@ -232,6 +232,19 @@ async function getRemoteFactionAllItems(bot: Bot, remoteStationId: string): Prom
   }
 }
 
+async function getHomeFactionQty(bot: Bot, homeStationId: string, itemId: string): Promise<number> {
+  try {
+    const resp = await bot.exec("view_faction_storage", { station_id: homeStationId });
+    if (resp.error || !resp.result) return 0;
+    const result = resp.result as Record<string, unknown>;
+    const items = Array.isArray(result.items) ? result.items : [];
+    const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
+    return found ? (found.quantity ?? found.qty ?? 0) : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function withdrawFromHomeFaction(
   ctx: RoutineContext,
   bot: Bot,
@@ -352,7 +365,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   };
 
   const homeSystem = settings.homeSystem || "";
-  const homeStation = settings.homeStation || "";
+  const homeStationRaw = settings.homeStation || "";
+  const homeStation = homeStationRaw.includes("|") ? homeStationRaw.split("|")[1] : homeStationRaw;
 
   if (!homeSystem || !homeStation) {
     ctx.log("error", "Fuel Transport: General > Faction Storage Station must be set");
@@ -694,9 +708,18 @@ async function processItemTransfer(
     }
 
     ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);
-    const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, withdrawQty, homeStation);
+    const homeAvailable = await getHomeFactionQty(bot, homeStation, item.itemId);
+    const cappedWithdrawQty = Math.min(withdrawQty, homeAvailable);
+    if (cappedWithdrawQty <= 0) {
+      ctx.log("warn", `${homeStation}: No ${item.itemName} in home faction storage — skipping`);
+      return null;
+    }
+    if (cappedWithdrawQty < withdrawQty) {
+      ctx.log("fuel", `${homeStation}: Capping ${item.itemName} withdraw to ${cappedWithdrawQty} (have ${homeAvailable} in storage)`);
+    }
+    const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, cappedWithdrawQty, homeStation);
     if (!wr.success) {
-      ctx.log("error", `Failed to withdraw ${withdrawQty}x ${item.itemName} from home`);
+      ctx.log("error", `Failed to withdraw ${cappedWithdrawQty}x ${item.itemName} from home`);
       return null;
     }
     ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} — departing`);

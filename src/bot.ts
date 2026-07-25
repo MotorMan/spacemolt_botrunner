@@ -2072,19 +2072,19 @@ const ews = this.hasEwsModule(modulesArray);
     // Determine which field to use based on preferField or auto-detect
     // preferField is used to prioritize a specific field (e.g., 'cargo' for get_cargo, 'storage' for view_storage)
     let items: Array<Record<string, unknown>>;
-    if (preferField && Array.isArray(r[preferField])) {
+    if (preferField && Array.isArray(r[preferField]) && (r[preferField] as Array<Record<string, unknown>>).length > 0) {
       items = r[preferField] as Array<Record<string, unknown>>;
     } else {
-      // Auto-detect: check multiple fields in order of priority
+      // Auto-detect: check multiple fields in order of priority, skipping empty arrays
       items = (
-        Array.isArray(r) ? r :
-        Array.isArray(r.cargo) ? r.cargo :
-        Array.isArray(r.storage) ? r.storage :
-        Array.isArray(r.items) ? r.items :
-        Array.isArray(r.stored_items) ? r.stored_items :
-        Array.isArray(r.faction_items) ? r.faction_items :
-        Array.isArray(r.faction_storage) ? r.faction_storage :
-        Array.isArray(r.data) ? r.data :
+        Array.isArray(r) && r.length > 0 ? r :
+        Array.isArray(r.cargo) && r.cargo.length > 0 ? r.cargo :
+        Array.isArray(r.storage) && r.storage.length > 0 ? r.storage :
+        Array.isArray(r.items) && r.items.length > 0 ? r.items :
+        Array.isArray(r.stored_items) && r.stored_items.length > 0 ? r.stored_items :
+        Array.isArray(r.faction_items) && r.faction_items.length > 0 ? r.faction_items :
+        Array.isArray(r.faction_storage) && r.faction_storage.length > 0 ? r.faction_storage :
+        Array.isArray(r.data) && r.data.length > 0 ? r.data :
         []
       ) as Array<Record<string, unknown>>;
     }

@@ -4615,6 +4615,11 @@ export async function checkAndFleeFromBattle(
   // battle" lock after the fight is actually over.
   if (ctx.bot.isInBattle()) {
     const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    const status = await getBattleStatus(ctx);
+    if (!status || !status.is_participant) {
+      ctx.bot.clearBattleState("stale-websocket-fallback");
+      return false;
+    }
     ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
     await fleeFromBattle(ctx, true, 35000);
     return true;

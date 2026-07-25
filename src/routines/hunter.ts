@@ -105,6 +105,10 @@ async function resubscribeObservationAfterMove(bot: Bot): Promise<void> {
      bot.clearObservationState();
    }
 
+function isStationEntity(e: NearbyEntity): boolean {
+  return e.type.toLowerCase() === "station";
+}
+
 async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isObservation: boolean }> {
      const resp = await bot.exec("get_nearby");
      return { result: resp.result, isObservation: false };
@@ -250,6 +254,7 @@ function getHunterSettings(username?: string): {
   patrolRadius: number;
   meatShield: boolean;
   stopOnDeath: boolean;
+  targetRandomly: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -304,9 +309,10 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     disableResupply: (h.disableResupply as boolean) ?? false,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
-    meatShield: (h.meatShield as boolean) ?? false,
-    stopOnDeath: (h.stopOnDeath as boolean) ?? false,
-  };
+  meatShield: (h.meatShield as boolean) ?? false,
+  stopOnDeath: (h.stopOnDeath as boolean) ?? false,
+  targetRandomly: (h.targetRandomly as boolean) ?? false,
+};
 }
 
 /** Persist hunter mode setting for a specific bot. */
@@ -1416,10 +1422,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
          if (nearbyData) {
            bot.trackNearbyPlayers(nearbyData);
            bot.trackWildlife(nearbyData);
-           const entities = parseNearby(nearbyData);
-             const threats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-             
-             if (threats.length > 0) {
+            const entities = parseNearby(nearbyData);
+              const nonStationThreats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e));
+              const stationThreats = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && isStationEntity(e));
+              const threats = [...nonStationThreats, ...stationThreats];
+              
+              if (threats.length > 0) {
                ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
                // Engage the threats
                for (const threat of threats) {
@@ -1511,8 +1519,34 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const allTargets = [...pirate_targets, ...creature_targets];
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
+      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
+      const stationTargets = allTargets.filter(e => isStationEntity(e));
+
+      let targetsToEngage: NearbyEntity[];
+      if (settings.targetRandomly) {
+        const shuffledNonStation = [...nonStationTargets];
+        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
+        }
+        const shuffledStation = [...stationTargets];
+        for (let i = shuffledStation.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
+        }
+        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
+      } else {
+        targetsToEngage = [...nonStationTargets, ...stationTargets];
+      }
+
+      if (targetsToEngage.length === 0) {
+        ctx.log("combat", `No targets at ${poi.name}`);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        continue;
+      }
+
       // Engage each target
-      for (const target of allTargets) {
+      for (const target of targetsToEngage) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();
@@ -1572,11 +1606,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             bot.trackNearbyPlayers(safetyCheckResp.result);
             bot.trackWildlife(safetyCheckResp.result);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
-            const newThreats = nearbyEntities.filter(e => 
-              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
-              e.id !== target.id &&
-              e.name !== target.name
-            );
+             const newThreats = nearbyEntities.filter(e => 
+               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+               !isStationEntity(e) &&
+               e.id !== target.id &&
+               e.name !== target.name
+             );
 
             if (newThreats.length > 0) {
               ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging instead of looting!`);
@@ -1981,8 +2016,34 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const allTargets = [...pirate_targets, ...creature_targets];
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
+      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
+      const stationTargets = allTargets.filter(e => isStationEntity(e));
+
+      let targetsToEngage: NearbyEntity[];
+      if (settings.targetRandomly) {
+        const shuffledNonStation = [...nonStationTargets];
+        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
+        }
+        const shuffledStation = [...stationTargets];
+        for (let i = shuffledStation.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
+        }
+        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
+      } else {
+        targetsToEngage = [...nonStationTargets, ...stationTargets];
+      }
+
+      if (targetsToEngage.length === 0) {
+        ctx.log("combat", `No targets at ${poi.name}`);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        continue;
+      }
+
       // Engage each target
-      for (const target of allTargets) {
+      for (const target of targetsToEngage) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();
@@ -2023,6 +2084,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             const nearbyEntities = parseNearby(safetyCheckResp.result);
             const newThreats = nearbyEntities.filter(e =>
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+              !isStationEntity(e) &&
               e.id !== target.id &&
               e.name !== target.name
             );
@@ -2340,19 +2402,19 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     // Check if we got pulled into battle during scanning
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
-    // Immediate reaction to pirate scan notification (NPC only, not player scans)
-    if ((nearbyData as any).notifications) {
-      const notifs = Array.isArray((nearbyData as any).notifications) ? (nearbyData as any).notifications : [];
-      for (const n of notifs) {
-        const msg = (n as any)?.data?.message || (n as any)?.message || "";
-        if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
+      // Immediate reaction to pirate scan notification (NPC only, not player scans)
+      if ((nearbyData as any).notifications) {
+        const notifs = Array.isArray((nearbyData as any).notifications) ? (nearbyData as any).notifications : [];
+        for (const n of notifs) {
+          const msg = (n as any)?.data?.message || (n as any)?.message || "";
+          if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
             ctx.log("combat", "Pirate scan detected - immediate get_nearby + engage");
             const scanNearby = await bot.exec("get_nearby");
             if (!scanNearby.error) {
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures) && !isStationEntity(e))];
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
@@ -2414,6 +2476,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           const nearbyEntities = parseNearby(safetyCheckResp.result);
           const newThreats = nearbyEntities.filter(e =>
             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+            !isStationEntity(e) &&
             e.id !== target.id &&
             e.name !== target.name
           );

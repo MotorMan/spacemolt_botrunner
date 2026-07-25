@@ -28845,20 +28845,31 @@ ignoreBlacklist: document.getElementById(
       </select>
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Disable Wreck Salvaging</div>
-        <div class="setting-hint">Disable looting wrecks after kills to prevent blocking pirate hunting in areas with many wrecks.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Wreck Salvaging</div>
+          <div class="setting-hint">Disable looting wrecks after kills to prevent blocking pirate hunting in areas with many wrecks.</div>
+        </div>
+        <select id="set-hunter-disableWreckSalvaging">
+          <option value="false"${!(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Enabled</option>
+          <option value="true"${(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Disabled</option>
+        </select>
       </div>
-      <select id="set-hunter-disableWreckSalvaging">
-        <option value="false"${!(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Enabled</option>
-        <option value="true"${(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Disabled</option>
-      </select>
-    </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Single Loop Mode</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Randomize Target Order</div>
+          <div class="setting-hint">Shuffle pirate/creature targets each scan so ships in the area take hits randomly instead of always focusing the same target first. Station targets are always picked last regardless.</div>
+        </div>
+        <select id="set-hunter-targetRandomly">
+          <option value="false"${!(h.targetRandomly ?? false) ? " selected" : ""}>Disabled (pirates first, stations last)</option>
+          <option value="true"${(h.targetRandomly ?? false) ? " selected" : ""}>Enabled (shuffle pirates, stations still last)</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Single Loop Mode</div>
         <div class="setting-hint">Do one full patrol then return to home station to restock. Disable to loop forever until out of supplies.</div>
       </div>
       <select id="set-hunter-singleLoop">
@@ -28992,6 +29003,9 @@ ignoreBlacklist: document.getElementById(
               .value === "true",
           disableWreckSalvaging:
             document.getElementById("set-hunter-disableWreckSalvaging")
+              .value === "true",
+          targetRandomly:
+            document.getElementById("set-hunter-targetRandomly")
               .value === "true",
           singleLoop:
             document.getElementById("set-hunter-singleLoop").value === "true",

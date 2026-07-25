@@ -60,7 +60,7 @@ function getCleanupSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
-    depositAllStorage: (t.depositAllStorage as boolean) ?? true,
+    depositAllStorage: (t.depositAllStorage as boolean) || true,
     enableCloak: (t.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (t.cloakIgnoreBlacklist as boolean) ?? false,
   };
@@ -543,13 +543,18 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   const deposited: string[] = [];
   const skipped: string[] = [];
 
-  if (settings.depositAllStorage && isAtHomeStation && bot.storage.length > 0) {
-    ctx.log("trade", `At home station — depositing all station storage to faction...`);
-    for (const item of [...bot.storage]) {
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+  // Deposit station storage: always deposit package:*; deposit everything else only when depositAllStorage is true
+  const storageItemsToDeposit = bot.storage.filter(item => {
+    if (item.quantity <= 0) return false;
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+    if (item.itemId.startsWith("package:")) return true;
+    return settings.depositAllStorage;
+  });
 
+  if (storageItemsToDeposit.length > 0 && isAtHomeStation) {
+    ctx.log("trade", `At home station — depositing station storage to faction...`);
+    for (const item of storageItemsToDeposit) {
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -577,6 +582,8 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+      if (!settings.depositAllStorage && !item.itemId.startsWith("package:")) continue;
 
       if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
 
@@ -651,8 +658,8 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   }
   
   const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
-  await bot.refreshStorage();
-  const hasItems = bot.storage.length > 0;
+  await bot.refreshStorage(homeInfo.baseId);
+  const hasItems = bot.storage.some(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
   
   if (storedCredits === 0 && !hasItems) {
     ctx.log("info", "Home station storage is empty — nothing to clean");
@@ -682,13 +689,18 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   let depositedCount = 0;
   
   // Deposit station storage (home station's storage) to faction
-  if (bot.storage.length > 0) {
+  // Always deposit package:* items; deposit everything else only when depositAllStorage is true
+  const storageItemsToDeposit = bot.storage.filter(item => {
+    if (item.quantity <= 0) return false;
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+    if (item.itemId.startsWith("package:")) return true;
+    return settings.depositAllStorage;
+  });
+
+  if (storageItemsToDeposit.length > 0) {
     ctx.log("trade", `Depositing home station storage to faction...`);
-    for (const item of [...bot.storage]) {
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      
+    for (const item of storageItemsToDeposit) {
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -696,7 +708,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
         quantity: item.quantity,
         source: "storage"
       });
-      
+
       if (!fResp.error) {
         depositedCount++;
         ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station storage`);
@@ -707,7 +719,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
       }
     }
   }
-  
+
   // Deposit cargo to faction
   if (bot.inventory.some(i => i.quantity > 0)) {
     ctx.log("trade", `Depositing cargo to faction...`);
@@ -715,7 +727,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      
+
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -723,7 +735,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
         quantity: item.quantity,
         source: "cargo"
       });
-      
+
       if (!fResp.error) {
         depositedCount++;
         ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station cargo`);
@@ -880,7 +892,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const hintEntries = parseStorageHints(hint);
 
     // Get all known stations for comparison
-    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId);
+    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId, false);
 
     // If we got hints, mark stations that have items
     const stationsWithStorage: StationTarget[] = [];

@@ -12520,9 +12520,6 @@
         const fightTier1Ships = general.fightTier1Ships ?? true;
         const maxTier0Ships = general.maxTier0Ships ?? 8;
         const hullFleeThreshold = general.hullFleeThreshold ?? 20;
-        const approvedFuelStations = Array.isArray(general.approvedFuelStations)
-          ? general.approvedFuelStations
-          : [];
 
         const tax = general.tax || {};
         const taxAutoPrepay = !!tax.autoPrepayOnStartup;
@@ -12614,14 +12611,13 @@
     </div>
 
 
-    <div class="setting-row">
+    <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:6px">
       <div>
         <div class="setting-label">Approved Fuel Stations</div>
-        <div class="setting-hint">Only buy fuel (credits) from these stations. Empty = allow all stations. Multi-select.</div>
+        <div class="setting-hint">Only buy fuel (credits) from these stations. Empty = allow all stations.</div>
       </div>
-      <select id="set-general-approvedFuel" multiple size="6" style="min-width:280px;max-width:400px">
-        ${stationOpts.replace(/<option value=""/, '<option value="">(any station)</option>')}
-      </select>
+      <input type="text" id="approvedFuelSearch" placeholder="🔍 Search stations..." oninput="filterApprovedFuelGrid()" style="width:100%;max-width:400px;padding:6px 8px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px" />
+      <div id="approvedFuelGrid" class="approved-fuel-grid"></div>
     </div>
 
     <div class="setting-row">
@@ -12845,17 +12841,12 @@
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
     `;
-        // Pre-select approved fuel stations
-        const approvedSel = document.getElementById("set-general-approvedFuel");
-        if (approvedSel) {
-          for (const opt of approvedSel.options) {
-            // Empty array means "any station" - preselect the "(any station)" option
-            const isSelected = (approvedFuelStations.length === 0 && opt.value === "") ||
-                               approvedFuelStations.includes(opt.value);
-            if (isSelected) opt.selected = true;
-          }
-        }
-        // Repopulate the player list on every (re)render. The panel template
+      const approvedFuelGridEl = document.getElementById("approvedFuelGrid");
+      if (approvedFuelGridEl) {
+        const searchEl = document.getElementById("approvedFuelSearch");
+        populateApprovedFuelGrid(approvedFuelGridEl, searchEl ? searchEl.value.toLowerCase() : "");
+      }
+      // Repopulate the player list on every (re)render. The panel template
         // ships an EMPTY #clerkPlayersList, so without this a background refresh
         // (mapData / catalogue push) would wipe the list and any in-progress
         // selection. Selection state comes from the persistent `clerkSelection`
@@ -12871,14 +12862,11 @@
         const [factionStorageSystem, factionStorageStation] = stationVal
           ? stationVal.split("|")
           : ["", ""];
-        const approvedSelect = document.getElementById(
-          "set-general-approvedFuel",
-        );
-        const approvedFuelStations = approvedSelect
-          ? Array.from(approvedSelect.selectedOptions)
-              .map((o) => o.value)
-              .filter((v) => v)
-          : [];
+        const approvedFuelStations = Array.from(
+          document.querySelectorAll("#approvedFuelGrid input[type='checkbox']:checked"),
+        )
+          .map((cb) => cb.value)
+          .filter((v) => v);
         const s = {
           port:
             parseInt(document.getElementById("set-general-port").value) || 3000,
@@ -12990,6 +12978,43 @@
           clerkSelection: { displayed: clerkDisplayed, checked: clerkChecked },
         });
         applyWindowTitle();
+      }
+
+      function populateApprovedFuelGrid(container, filterText) {
+        if (!container) return;
+        const approved = (settings.general && Array.isArray(settings.general.approvedFuelStations))
+          ? settings.general.approvedFuelStations
+          : [];
+        const stationList = [];
+        for (const [sysId, sys] of Object.entries(mapData)) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(
+              b.base_name || b.name || b.id || "",
+            ),
+          )) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const val = sysId + "|" + poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            const search = `${label} ${sysName}`.toLowerCase();
+            stationList.push({ val, label, sysName, search });
+          }
+        }
+        stationList.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        let html = "";
+        for (const s of stationList) {
+          if (filterText && !s.search.includes(filterText)) continue;
+          const checked = approved.includes(s.val);
+          html += `<label><input type="checkbox" value="${escHtml(s.val)}" ${checked ? 'checked' : ''}/> ${escHtml(s.label)} (${escHtml(s.sysName)})</label>`;
+        }
+        container.innerHTML = html || '<div style="font-size:12px;color:var(--text-dim);padding:8px">No matching stations</div>';
+      }
+      function filterApprovedFuelGrid() {
+        const container = document.getElementById("approvedFuelGrid");
+        const searchEl = document.getElementById("approvedFuelSearch");
+        populateApprovedFuelGrid(container, searchEl ? searchEl.value.toLowerCase() : "");
       }
 
       // ── Color-code mini-language for the app title ──────────────

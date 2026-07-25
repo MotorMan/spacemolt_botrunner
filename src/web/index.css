@@ -1288,6 +1288,37 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   display: none;
 }
 
+.approved-fuel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 3px 10px;
+  width: 100%;
+  max-width: 1400px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.approved-fuel-grid label {
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.approved-fuel-grid input[type="checkbox"] {
+  accent-color: var(--accent);
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+}
+
 /* ── Map page ───────────────────────────────────── */
 .map-layout {
   display: flex;

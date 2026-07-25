@@ -259,35 +259,33 @@ function isHomeStation(stationId: string, poiId: string, homeSystem: string, hom
   return false;
 }
 
-/** Get the home station's base_id and poi_id for storage operations. */
-function getHomeStationInfo(homeSystem: string, homeStation: string): { baseId: string; poiId: string } | null {
+/** Get the home station's base_id, poi_id, and system_id for storage operations. */
+function getHomeStationInfo(homeSystem: string, homeStation: string): { baseId: string; poiId: string; systemId: string } | null {
   if (!homeStation) return null;
-  
+
   const allSystems = mapStore.getAllSystems();
   const lowerHome = homeStation.toLowerCase();
-  
-  // First check mobile capitol
+
   const mcLocation = mapStore.getMobileCapitolLocation();
   if (mcLocation && (lowerHome.includes("mobile") || lowerHome.includes("frontier"))) {
-    return { baseId: "frontier_station", poiId: mcLocation.poiId };
+    return { baseId: "frontier_station", poiId: mcLocation.poiId, systemId: mcLocation.systemId };
   }
-  
-  // Check all systems
+
   for (const [sysId, sys] of Object.entries(allSystems)) {
     for (const poi of sys.pois) {
       const travelId = poi.base_id || poi.id;
       const normalizedHome = lowerHome.replace(/_/g, ' ');
-      
-      if (travelId.toLowerCase() === lowerHome || 
+
+      if (travelId.toLowerCase() === lowerHome ||
           poi.id.toLowerCase() === lowerHome ||
           (poi.base_name && poi.base_name.toLowerCase().includes(normalizedHome)) ||
           (poi.name && poi.name.toLowerCase().includes(normalizedHome)) ||
           (poi.id.toLowerCase().includes(lowerHome))) {
-        return { baseId: poi.base_id || poi.id, poiId: poi.id };
+        return { baseId: poi.base_id || poi.id, poiId: poi.id, systemId: sysId };
       }
     }
   }
-  
+
   return null;
 }
 
@@ -415,18 +413,33 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   const homeInfo = getHomeStationInfo(settings.homeSystem, settings.homeStation);
   if (!homeInfo) {
-    ctx.log("error", `Cannot resolve home station "${settings.homeStation}" in ${settings.homeSystem} — aborting deposit`);
+    ctx.log("error", `Cannot resolve home station "${settings.homeStation}" — aborting deposit`);
     return;
   }
 
+  if (bot.system !== homeInfo.systemId) {
+    await ensureUndocked(ctx);
+    const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+    if (!fueled) {
+      ctx.log("error", `Cannot refuel to reach ${homeInfo.systemId} — aborting deposit`);
+      return;
+    }
+    ctx.log("travel", `Returning to home system ${homeInfo.systemId} (resolved from station ${homeInfo.baseId})...`);
+    const arrived = await navigateToSystem(ctx, homeInfo.systemId, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Failed to reach ${homeInfo.systemId}`);
+      return;
+    }
+  }
+
   const { pois } = await getSystemInfo(ctx);
-  const targetStation = pois.find(p => 
-    isStationPoi(p) && 
+  const targetStation = pois.find(p =>
+    isStationPoi(p) &&
     (p.base_id === homeInfo.baseId || p.id === homeInfo.poiId || p.id === homeInfo.baseId)
   );
 
   if (!targetStation) {
-    ctx.log("error", `Home station ${homeInfo.baseId} not found in ${settings.homeSystem} — aborting deposit`);
+    ctx.log("error", `Home station ${homeInfo.baseId} not found in ${homeInfo.systemId} — aborting deposit`);
     return;
   }
 
@@ -583,14 +596,14 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   ctx.log("info", `Cleaning home station storage at ${settings.homeStation}...`);
   
   // Navigate to home system if needed
-  if (bot.system !== settings.homeSystem) {
+  if (bot.system !== homeInfo.systemId) {
     await ensureUndocked(ctx);
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot refuel to reach home system for home station cleanup");
       return;
     }
-    const arrived = await navigateToSystem(ctx, settings.homeSystem, {
+    const arrived = await navigateToSystem(ctx, homeInfo.systemId, {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     });

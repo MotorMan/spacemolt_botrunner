@@ -6848,6 +6848,22 @@
     </div>
 
     <div class="cmd-group">
+      <button class="sm" onclick="mcExec('battle',{action:'advance'})" style="color: var(--red)">Advance</button>
+      <button class="sm" onclick="mcExec('battle',{action:'retreat'})" style="color: var(--red)">Retreat</button>
+      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'fire'})" style="color: var(--red)">Stance Fire</button>
+      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'flee'})" style="color: var(--red)">Stance Flee</button>
+      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'brace'})" style="color: var(--red)">Stance Brace</button>
+      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Target</label>
+      <select id="mc-battle-target" style="min-width:120px"><option value="">-- Get targets first --</option></select>
+      <button class="sm" onclick="mcRefreshBattleTargets()" style="color: var(--red)">Get Targets</button>
+      <button class="sm" onclick="mcSetBattleTarget()" style="color: var(--red)">Target</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Custom</label>
       <input type="text" id="mc-custom-cmd" placeholder="command" style="min-width:100px">
       <input type="text" id="mc-custom-params" placeholder='{"key":"val"}' style="min-width:160px">
@@ -10417,6 +10433,67 @@
       function mcFleetStatus() {
         if (!profileBot) return;
         mcExec("fleet", { action: "status" });
+      }
+
+      function mcRefreshBattleTargets() {
+        if (!profileBot) return;
+        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+        logResponse(`<span class="resp-cmd">${ts} > get_battle_status</span>`);
+
+        const select = document.getElementById("mc-battle-target");
+        if (select) select.innerHTML = '<option value="">Loading...</option>';
+
+        sendExec(profileBot, "get_battle_status", {}, (result) => {
+          if (!result.ok || !result.data) {
+            logResponse(`<span class="resp-err">Failed to get battle status: ${esc(result.error || "unknown")}</span>`);
+            if (select) select.innerHTML = '<option value="">Error / Not in battle</option>';
+            return;
+          }
+
+          const data = result.data;
+          const mySideId = data.my_side_id || data.your_side_id;
+          const participants = data.participants || [];
+
+          const enemies = participants.filter(
+            (p) => p.side_id !== mySideId && !p.is_destroyed,
+          );
+
+          if (!select) return;
+
+          if (enemies.length === 0) {
+            select.innerHTML = '<option value="">No enemies visible</option>';
+            logResponse('<span class="resp-warn">No enemies found in battle</span>');
+            return;
+          }
+
+          select.innerHTML = enemies
+            .map(
+              (e) => {
+                const pid = e.player_id || e.id;
+                const name = e.username || e.name || "Unknown";
+                const ship = e.ship_class || "?";
+                return `<option value="${esc(pid)}">${esc(name)} (${esc(ship)})</option>`;
+              },
+            )
+            .join("");
+
+          logResponse(`<span class="resp-ok">Found ${enemies.length} enemy target(s)</span>`);
+        });
+      }
+
+      function mcSetBattleTarget() {
+        if (!profileBot) return;
+        const select = document.getElementById("mc-battle-target");
+        if (!select) return;
+        const targetId = select.value;
+        if (!targetId) {
+          logResponse('<span class="resp-err">Select a target first</span>');
+          return;
+        }
+
+        const targetName = select.options[select.selectedIndex]?.text || targetId;
+        logResponse(`<span class="resp-cmd">Targeting ${esc(targetName)}</span>`);
+        mcExec("battle", { action: "target", target_id: targetId });
       }
 
       // Send exec command and invoke callback with result

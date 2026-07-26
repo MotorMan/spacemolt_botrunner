@@ -27861,25 +27861,40 @@ async function fetchPersonalFacilityTypes(username) {
             return v.startsWith("bot:") ? "gift" : v;
           })(),
           cargoThreshold:
-            parseInt(
-              document.getElementById("set-miner-cargoThreshold").value,
-            ) || 80,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-cargoThreshold").value,
+              );
+              return Number.isNaN(v) ? 80 : v;
+            })(),
           refuelThreshold:
-            parseInt(
-              document.getElementById("set-miner-refuelThreshold").value,
-            ) || 50,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-refuelThreshold").value,
+              );
+              return Number.isNaN(v) ? 50 : v;
+            })(),
           repairThreshold:
-            parseInt(
-              document.getElementById("set-miner-repairThreshold").value,
-            ) || 40,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-repairThreshold").value,
+              );
+              return Number.isNaN(v) ? 40 : v;
+            })(),
           depletionTimeoutHours:
-            parseInt(
-              document.getElementById("set-miner-depletionTimeoutHours").value,
-            ) || 3,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-depletionTimeoutHours").value,
+              );
+              return Number.isNaN(v) ? 3 : v;
+            })(),
           deepSleepIntervalMin:
-            parseInt(
-              document.getElementById("set-miner-deepSleepIntervalMin").value,
-            ) || 30,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-deepSleepIntervalMin").value,
+              );
+              return Number.isNaN(v) ? 30 : v;
+            })(),
           ignoreDepletion: document.getElementById("set-miner-ignoreDepletion")
             .checked,
           noMidMiningRetarget: document.getElementById(
@@ -27895,11 +27910,19 @@ async function fetchPersonalFacilityTypes(username) {
             "set-miner-stayOutUntilFull",
           ).checked,
           maxJumps:
-            parseInt(document.getElementById("set-miner-maxJumps").value) || 10,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-maxJumps").value,
+              );
+              return Number.isNaN(v) ? 10 : v;
+            })(),
           minimumFuelCells:
-            parseInt(
-              document.getElementById("set-miner-minimumFuelCells").value,
-            ) || 20,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-minimumFuelCells").value,
+              );
+              return Number.isNaN(v) ? 20 : v;
+            })(),
           desiredEmergencyWarpDevices:
             (() => {
               const v = parseInt(
@@ -27934,7 +27957,12 @@ async function fetchPersonalFacilityTypes(username) {
             "set-miner-enableCoordination",
           ).checked,
           maxBotsPerSystem:
-            parseInt(document.getElementById("set-miner-maxBotsPerSystem").value) || 3,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-maxBotsPerSystem").value,
+              );
+              return Number.isNaN(v) ? 3 : v;
+            })(),
 
           // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
           // They are preserved from existing settings when saving from this page

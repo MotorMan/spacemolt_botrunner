@@ -27956,6 +27956,12 @@ async function fetchPersonalFacilityTypes(username) {
 
         send({ type: "saveSettings", routine: "miner", settings: s });
         settings.miner = s;
+        fetch("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ miner: s }),
+        }).catch(() => {});
+        window.saveMinerSettings = saveMinerSettings;
       }
 
       // ── Miner Quotas Settings ───────────────────────────────────────

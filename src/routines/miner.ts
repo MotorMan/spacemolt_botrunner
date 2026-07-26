@@ -1939,6 +1939,11 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
       continue;
     }
 
+    if (desiredAmmoBoxes === 0) {
+      ctx.log("trade", `Ammo withdrawal disabled (desiredAmmoBoxes=0) — skipping ${ammoType}`);
+      continue;
+    }
+
     const currentAmmoForType = bot.inventory
       .filter(i => possibleAmmo.includes(i.itemId))
       .reduce((sum, i) => sum + (i.quantity || 0), 0);

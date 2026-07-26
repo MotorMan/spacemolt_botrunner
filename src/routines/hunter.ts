@@ -2983,6 +2983,11 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       continue;
     }
 
+    if (desiredAmmoBoxes === 0) {
+      ctx.log("trade", `Ammo withdrawal disabled (desiredAmmoBoxes=0) — skipping ${ammoType}`);
+      continue;
+    }
+
     // Calculate current ammo count for this specific type
     const currentAmmoForType = bot.inventory
       .filter(i => possibleAmmo.includes(i.itemId))

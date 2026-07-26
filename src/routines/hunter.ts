@@ -818,6 +818,22 @@ function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: 
 }
 
 /**
+ * After a failed engagement, check if we actually retreated from a live battle
+ * (need to abort the patrol) or if the target just vanished / became untargetable
+ * (should skip it and keep patrolling).
+ */
+async function shouldAbortPatrolAfterEngage(ctx: RoutineContext, won: boolean, targetName: string): Promise<boolean> {
+  if (won) return false;
+  const inBattle = await getBattleStatus(ctx);
+  if (inBattle) {
+    ctx.log("combat", "Retreated — aborting patrol to dock and repair");
+    return true;
+  }
+  ctx.log("combat", `${targetName} unavailable — skipping and continuing patrol`);
+  return false;
+}
+
+/**
  * Drain pending coordination requests and join any battle for a target that is in
  * our current POI. Called from the routine's scan / battle-check cadence so the
  * actual fighting happens inside the generator (never from the event handler).
@@ -1430,14 +1446,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               if (threats.length > 0) {
                ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
                // Engage the threats
-               for (const threat of threats) {
-                 const won = await hunterEngage(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
-                 if (!won) {
-                   ctx.log("combat", "Retreated from threat — aborting patrol");
-                   abortPatrol = true;
-                   break;
-                 }
-               }
+                for (const threat of threats) {
+                  const won = await hunterEngage(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                  if (await shouldAbortPatrolAfterEngage(ctx, won, threat.name)) {
+                    abortPatrol = true;
+                    break;
+                  }
+                }
                if (abortPatrol) break;
              }
            }
@@ -1594,6 +1609,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         yield "engage";
         const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
+        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) {
+          abortPatrol = true;
+          break;
+        }
         if (won) {
           totalKills++;
           patrolKills++;
@@ -1620,14 +1639,14 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                 if (bot.state !== "running") break;
                 
                 const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                if (await shouldAbortPatrolAfterEngage(ctx, newWon, newThreat.name)) {
+                  abortPatrol = true;
+                  break;
+                }
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
                   ctx.log("combat", `Kill #${totalKills} (additional threat)`);
-                } else {
-                  ctx.log("combat", "Retreated from new threat — aborting patrol");
-                  abortPatrol = true;
-                  break;
                 }
               }
               
@@ -1658,10 +1677,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           }
           await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
-        } else {
-          ctx.log("combat", "Retreated — aborting patrol to dock and repair");
-          abortPatrol = true;
-          break;
         }
       }
     }
@@ -2070,6 +2085,10 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         yield "engage";
         const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
 
+        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) {
+          abortPatrol = true;
+          break;
+        }
         if (won) {
           totalKills++;
           patrolKills++;
@@ -2095,14 +2114,14 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
                 if (bot.state !== "running") break;
 
                 const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                if (await shouldAbortPatrolAfterEngage(ctx, newWon, newThreat.name)) {
+                  abortPatrol = true;
+                  break;
+                }
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
                   ctx.log("combat", `Kill #${totalKills} (additional threat)`);
-                } else {
-                  ctx.log("combat", "Retreated from new threat — aborting patrol");
-                  abortPatrol = true;
-                  break;
                 }
               }
 
@@ -2134,10 +2153,6 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
           await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
-        } else {
-          ctx.log("combat", "Retreated — aborting patrol to dock and repair");
-          abortPatrol = true;
-          break;
         }
       }
     }

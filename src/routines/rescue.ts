@@ -5262,8 +5262,38 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     const { bot } = ctx;
 
     await bot.refreshLocation();
+
+    // Determine this bot's primary rescue role so we can resolve the correct
+    // per-type home base. We check the explicit bot-assignment fields directly
+    // so a multi-role bot (e.g. credit+fleet) resolves to fleetRescue, and a
+    // single-role bot (e.g. mayday-only) resolves to maydayRescue.
     const settings = getRescueSettings();
-    const { homeSystem, homeStation } = getHomeBaseForRescueType('fleetRescue', bot.system);
+    const creditPrimary = settings.creditTopOffBot
+      ? bot.username === settings.creditTopOffBot
+      : false;
+    const fleetPrimary = settings.fleetRescueBot
+      ? bot.username === settings.fleetRescueBot
+      : false;
+    const maydayPrimary = settings.maydayRescueBot
+      ? bot.username === settings.maydayRescueBot
+      : false;
+
+    ctx.log("rescue", `Role detection: creditPrimary=${creditPrimary} fleetPrimary=${fleetPrimary} maydayPrimary=${maydayPrimary} | creditBot=${settings.creditTopOffBot} fleetBot=${settings.fleetRescueBot} maydayBot=${settings.maydayRescueBot} | self=${bot.username}`);
+
+    let homeBaseType: 'creditTopOff' | 'fleetRescue' | 'maydayRescue';
+    if (maydayPrimary && !fleetPrimary) {
+      homeBaseType = 'maydayRescue';
+    } else if (fleetPrimary && !maydayPrimary) {
+      homeBaseType = 'fleetRescue';
+    } else if (creditPrimary && !fleetPrimary && !maydayPrimary) {
+      homeBaseType = 'creditTopOff';
+    } else {
+      // Multi-role bot or no explicit assignment: default to fleetRescue home
+      // for backward compatibility (the generic rescueRoutine handles all types).
+      homeBaseType = 'fleetRescue';
+    }
+    const { homeSystem, homeStation } = getHomeBaseForRescueType(homeBaseType, bot.system);
+    ctx.log("rescue", `Rescue role: ${homeBaseType} | home: ${homeSystem || bot.system}${homeStation ? '/' + homeStation.split('|')[1] : ''}`);
 
     await enableRescueCloak(ctx, settings);
 

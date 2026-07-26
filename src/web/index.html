@@ -27901,21 +27901,33 @@ async function fetchPersonalFacilityTypes(username) {
               document.getElementById("set-miner-minimumFuelCells").value,
             ) || 20,
           desiredEmergencyWarpDevices:
-            parseInt(
-              document.getElementById("set-miner-desiredEmergencyWarpDevices").value,
-            ) || 3,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-desiredEmergencyWarpDevices").value,
+              );
+              return Number.isNaN(v) ? 3 : v;
+            })(),
           desiredShieldCharges:
-            parseInt(
-              document.getElementById("set-miner-desiredShieldCharges").value,
-            ) || 20,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-desiredShieldCharges").value,
+              );
+              return Number.isNaN(v) ? 20 : v;
+            })(),
           desiredRepairKits:
-            parseInt(
-              document.getElementById("set-miner-desiredRepairKits").value,
-            ) || 12,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-desiredRepairKits").value,
+              );
+              return Number.isNaN(v) ? 12 : v;
+            })(),
           desiredAmmoBoxes:
-            parseInt(
-              document.getElementById("set-miner-desiredAmmoBoxes").value,
-            ) || -1,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-desiredAmmoBoxes").value,
+              );
+              return Number.isNaN(v) ? -1 : v;
+            })(),
           disableResupply:
             document.getElementById("set-miner-disableResupply").value === "true",
           enableCoordination: document.getElementById(

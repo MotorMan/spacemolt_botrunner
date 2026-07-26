@@ -1125,6 +1125,49 @@ async function bulkDepositToDestination(
     }
   }
 
+  if (storageType === "faction" && lastErr) {
+    const factionCapErr = lastErr.toLowerCase().includes("storage_cap_exceeded") ||
+      lastErr.toLowerCase().includes("cap reached") ||
+      lastErr.toLowerCase().includes("too many") ||
+      lastErr.toLowerCase().includes("maximum") ||
+      lastErr.toLowerCase().includes("full");
+    if (factionCapErr) {
+      const undeposited = valid.filter((r) => (deposited.get(r.itemId) || 0) < r.quantity);
+      if (undeposited.length > 0) {
+        ctx.log("warn", `⚠️ Faction storage full — falling back ${undeposited.length} item type(s) to personal storage at destination`);
+        const personalBefore = new Map<string, number>();
+        await bot.refreshStorage();
+        for (const i of bot.storage) personalBefore.set(i.itemId, i.quantity);
+
+        let fallbackErr: string | undefined;
+        const fbChunks = chunkBulkItems(undeposited);
+        for (const chunk of fbChunks) {
+          const fbResp = await bot.exec("storage", {
+            action: "deposit",
+            target: "personal",
+            items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+          });
+          if (fbResp.error) {
+            fallbackErr = fbResp.error.message;
+            ctx.log("warn", `Bulk personal fallback chunk failed: ${fbResp.error.message}`);
+          }
+        }
+        await sleep(BULK_SETTLE_MS);
+        await bot.refreshStorage();
+        for (const i of bot.storage) {
+          const b = personalBefore.get(i.itemId) || 0;
+          const delta = i.quantity - b;
+          if (delta > 0) {
+            deposited.set(i.itemId, (deposited.get(i.itemId) || 0) + delta);
+          }
+        }
+        if (fallbackErr) {
+          ctx.log("warn", `⚠️ Personal fallback had errors: ${fallbackErr}`);
+        }
+      }
+    }
+  }
+
   if (lastErr && deposited.size === 0) {
     ctx.log("warn", `Bulk deposit failed: ${lastErr}`);
   }

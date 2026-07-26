@@ -480,6 +480,10 @@ async function getMinerSettings(username?: string): Promise<{
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
+  desiredShieldCharges: number;
+  desiredRepairKits: number;
+  desiredAmmoBoxes: number;
+  disableResupply: boolean;
  enableFighting: boolean;
  enableMissions: boolean;
 
@@ -592,6 +596,10 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     flockRole: parseFlockRole(botOverrides.flockRole) ?? "follower",
     flockGroups,
     desiredEmergencyWarpDevices: (m.desiredEmergencyWarpDevices as number) ?? 3,
+    desiredShieldCharges: (m.desiredShieldCharges as number) ?? 20,
+    desiredRepairKits: (m.desiredRepairKits as number) ?? 12,
+    desiredAmmoBoxes: (m.desiredAmmoBoxes as number) ?? -1,
+    disableResupply: (m.disableResupply as boolean) ?? false,
     enableFighting: (m.enableFighting as boolean) ?? false,
 
     // Deep sleep interval when no target is available anywhere in the map
@@ -1878,6 +1886,12 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     return;
   }
 
+  const settings = await getMinerSettings();
+
+  if (settings.disableResupply) {
+    ctx.log("trade", "Resupply disabled — skipping repair kits, shield charges, and warp devices");
+  }
+
   await bot.refreshLocation();
   await bot.refreshCargo();
 
@@ -1913,6 +1927,8 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
+  const desiredAmmoBoxes = settings.desiredAmmoBoxes ?? -1;
+  let totalAmmoGotten = 0;
   for (const ammoType of weaponAmmoTypes) {
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
@@ -1940,6 +1956,15 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
       ammoToGet = Math.max(0, 30 - currentAmmoForType);
     }
 
+    if (desiredAmmoBoxes > 0) {
+      const remaining = desiredAmmoBoxes - totalAmmoGotten;
+      if (remaining <= 0) {
+        ctx.log("trade", `Ammo cap reached (${desiredAmmoBoxes} boxes) — skipping remaining ammo types`);
+        break;
+      }
+      ammoToGet = Math.min(ammoToGet, remaining);
+    }
+
     let chosenAmmoId: string | null = null;
     const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
     if (loadedAmmo && loadedAmmo.loadedAmmoId) {
@@ -1959,7 +1984,10 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
       : possibleAmmo;
     for (const ammoId of ammoOrder) {
       const ammoSize = getItemSize(ammoId);
-      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      let actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (desiredAmmoBoxes > 0) {
+        actualQty = Math.min(actualQty, desiredAmmoBoxes - totalAmmoGotten);
+      }
       if (actualQty <= 0) {
         continue;
       }
@@ -1968,6 +1996,7 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
         await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: ammoId, quantity: actualQty });
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
+        totalAmmoGotten += actualQty;
         break;
       } catch (e) {
         ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${e}`);
@@ -1975,48 +2004,56 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  const desiredRepair = 12;
-  const repairToGet = Math.max(0, desiredRepair - currentRepair);
-  if (repairToGet > 0) {
-    const kitQty = Math.min(repairToGet, Math.floor(freeSpace / getItemSize("repair_kit")));
-    if (kitQty > 0) {
-      try {
-        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "advanced_repair_kit", quantity: kitQty });
-        ctx.log("trade", `Withdrew ${kitQty} advanced_repair_kit from faction storage`);
-        freeSpace -= kitQty * getItemSize("advanced_repair_kit");
-      } catch (e) {
-        ctx.log("trade", `Failed to withdraw advanced_repair_kit: ${e}`);
+  const desiredRepair = settings.desiredRepairKits ?? 12;
+
+  if (!settings.disableResupply) {
+    const repairToGet = Math.max(0, desiredRepair - currentRepair);
+    if (repairToGet > 0) {
+      const kitQty = Math.min(repairToGet, Math.floor(freeSpace / getItemSize("repair_kit")));
+      if (kitQty > 0) {
+        try {
+          await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "advanced_repair_kit", quantity: kitQty });
+          ctx.log("trade", `Withdrew ${kitQty} advanced_repair_kit from faction storage`);
+          freeSpace -= kitQty * getItemSize("advanced_repair_kit");
+        } catch (e) {
+          ctx.log("trade", `Failed to withdraw advanced_repair_kit: ${e}`);
+        }
       }
     }
   }
 
-  const desiredShield = 20;
-  const shieldToGet = Math.max(0, desiredShield - currentShield);
-  if (shieldToGet > 0 && freeSpace >= getItemSize("shield_charge")) {
-    const shQty = Math.min(shieldToGet, Math.floor(freeSpace / getItemSize("shield_charge")));
-    if (shQty > 0) {
-      try {
-        await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "shield_charge", quantity: shQty });
-        ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
-      } catch (e) {
-        ctx.log("trade", `Failed to withdraw shield_charge: ${e}`);
+  const desiredShield = settings.desiredShieldCharges ?? 20;
+
+  if (!settings.disableResupply) {
+    const shieldToGet = Math.max(0, desiredShield - currentShield);
+    if (shieldToGet > 0 && freeSpace >= getItemSize("shield_charge")) {
+      const shQty = Math.min(shieldToGet, Math.floor(freeSpace / getItemSize("shield_charge")));
+      if (shQty > 0) {
+        try {
+          await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "shield_charge", quantity: shQty });
+          ctx.log("trade", `Withdrew ${shQty} shield_charge from faction storage`);
+        } catch (e) {
+          ctx.log("trade", `Failed to withdraw shield_charge: ${e}`);
+        }
       }
     }
   }
 
-  const settings = await getMinerSettings();
   const desiredWarp = settings.desiredEmergencyWarpDevices ?? 3;
   const currentWarp = bot.inventory
     .filter(i => i.itemId.toLowerCase().includes("emergency_warp_device"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   const warpToGet = Math.max(0, desiredWarp - currentWarp);
-  if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
+
+  if (!settings.disableResupply) {
+    if (warpToGet > 0 && freeSpace >= getItemSize("emergency_warp_device")) {
       try {
         await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "emergency_warp_device", quantity: warpToGet });
         ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
       } catch (e) {
         ctx.log("trade", `Failed to withdraw emergency_warp_device: ${e}`);
       }
+    }
   }
 }
 

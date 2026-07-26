@@ -2283,10 +2283,15 @@ function stopCreditTopOffBackground(): void {
          bot.poi = target.poi;
 skipToReturnHome = true;
        }
-     }
+      }
 
-     // ── Check fleet status (only if not resuming and no manual rescue) ──
-     if (!recoveredSession && !manualRescueTarget) {
+      // Multi-bot refuel targets collected from fleet scan (declared outside the
+      // if-block so the post-refuel loop below can see them regardless of whether
+      // we were resuming a session or handling a manual rescue).
+      const additionalTargets: RescueTarget[] = [];
+
+      // ── Check fleet status (only if not resuming and no manual rescue) ──
+      if (!recoveredSession && !manualRescueTarget) {
        yield "scan_fleet";
        const fleet = ctx.getFleetStatus?.() || [];
        if (fleet.length === 0) {
@@ -2828,6 +2833,23 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       target = selectedTarget;
       if (!selectedFromQueue && !isMaydayTarget) {
         logCategory = "rescue";
+      }
+
+      // ── Multi-bot refuel: if multiple stranded bots are in the same system,
+      // refuel all of them in this trip instead of just one and going home.
+      if (target && targets.length > 1) {
+        const currentTarget = target;
+        const sameSystemBots = targets.filter(t =>
+          t.username !== currentTarget.username &&
+          normalizeSystemName(t.system || "") === normalizeSystemName(currentTarget.system || "")
+        );
+        if (sameSystemBots.length > 0) {
+          additionalTargets.push(...sameSystemBots);
+          ctx.log("rescue", `🛢️ Multi-bot refuel detected: ${sameSystemBots.length + 1} stranded bots in ${currentTarget.system} — will refuel all before returning home`);
+          for (const extra of sameSystemBots) {
+            ctx.log("rescue", `   • ${extra.username} at ${extra.fuelPct}% fuel`);
+          }
+        }
       }
     }
 
@@ -3688,6 +3710,44 @@ if (travelSucceeded) {
           } else {
             ctx.log("error", "No station found to acquire fuel cells");
           }
+        }
+      }
+    }
+
+    // ── Multi-bot refuel: refuel all additional stranded bots in the same system ──
+    if (rescueDelivered && additionalTargets.length > 0) {
+      ctx.log("rescue", `🛢️ Refueling ${additionalTargets.length} additional bot(s) in ${target.system}...`);
+
+      for (const extra of additionalTargets) {
+        if (bot.state !== "running") break;
+        if (bot.fuel <= 0) {
+          ctx.log("rescue", `⚠️ Out of fuel — skipping remaining additional targets`);
+          break;
+        }
+
+        ctx.log("rescue", `🔄 Refueling additional bot: ${extra.username} at ${extra.fuelPct}% fuel`);
+
+        const extraPlayerId = await findPlayerId(ctx, extra.username);
+        if (!extraPlayerId) {
+          ctx.log("warn", `Could not find player ID for ${extra.username} — skipping`);
+          continue;
+        }
+
+        const rescueSettings = getRescueSettings();
+        const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
+        const extraRefuelResp = await bot.exec("refuel", { target: extraPlayerId, quantity: maxDeliverable });
+
+        if (extraRefuelResp.error) {
+          ctx.log("warn", `Failed to refuel additional bot ${extra.username}: ${extraRefuelResp.error.message}`);
+          continue;
+        }
+
+        const extraResult = extraRefuelResp.result as Record<string, unknown> | undefined;
+        if (extraResult) {
+          const extraFuelDelta = Math.abs(extraResult.fuel as number || extraResult.quantity as number || 0);
+          ctx.log("rescue", `✓ Transferred ${extraFuelDelta} fuel to ${extra.username}`);
+        } else {
+          ctx.log("rescue", `✓ Refueled ${extra.username}`);
         }
       }
     }

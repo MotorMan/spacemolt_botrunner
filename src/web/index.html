@@ -16474,10 +16474,22 @@
             document.getElementById("set-rescue-maydayRescueBot").value || "",
           creditTopOffHomeStation:
             document.getElementById("set-rescue-creditTopOffHomeStation").value || "",
+          creditTopOffHomeSystem: (() => {
+            const v = document.getElementById("set-rescue-creditTopOffHomeStation").value || "";
+            return v ? v.split("|")[0] : "";
+          })(),
           fleetRescueHomeStation:
             document.getElementById("set-rescue-fleetRescueHomeStation").value || "",
+          fleetRescueHomeSystem: (() => {
+            const v = document.getElementById("set-rescue-fleetRescueHomeStation").value || "";
+            return v ? v.split("|")[0] : "";
+          })(),
           maydayRescueHomeStation:
             document.getElementById("set-rescue-maydayRescueHomeStation").value || "",
+          maydayRescueHomeSystem: (() => {
+            const v = document.getElementById("set-rescue-maydayRescueHomeStation").value || "";
+            return v ? v.split("|")[0] : "";
+          })(),
           ignoreBlacklist: document.getElementById(
             "set-rescue-ignoreBlacklist",
           ).checked,
@@ -26800,6 +26812,10 @@ async function fetchPersonalFacilityTypes(username) {
         const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
         const oreSecondary = depositFallback;
         const desiredEmergencyWarpDevices = m.desiredEmergencyWarpDevices ?? 3;
+        const desiredShieldCharges = m.desiredShieldCharges ?? 20;
+        const desiredRepairKits = m.desiredRepairKits ?? 12;
+        const desiredAmmoBoxes = m.desiredAmmoBoxes ?? -1;
+        const disableResupply = m.disableResupply ?? false;
 
         // Complete mineable-resource list from the catalogue, unioned with any
         // ores discovered from map scans. knownOres is only populated once POIs
@@ -27362,6 +27378,41 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Desired Shield Charges</div>
+          <div class="setting-hint">Target number of shield_charge items to keep in cargo after resupply. Miners use shields defensively during pirate encounters while traveling.</div>
+        </div>
+        <input type="number" id="set-miner-desiredShieldCharges" min="0" max="50" value="${m.desiredShieldCharges ?? 20}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Repair Kits</div>
+          <div class="setting-hint">Target number of repair kits (advanced_repair_kit preferred) to keep in cargo after resupply. For emergency hull repairs during travel through dangerous systems.</div>
+        </div>
+        <input type="number" id="set-miner-desiredRepairKits" min="0" max="30" value="${m.desiredRepairKits ?? 12}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Desired Ammo Boxes</div>
+          <div class="setting-hint">Optional cap on total ammo items withdrawn during miner resupply. Set to 0 or leave empty for default behavior (fill based on weapon capacity). Set a positive number to limit total ammo — useful for small starter ships with limited cargo. Default -1 = no cap.</div>
+        </div>
+        <input type="number" id="set-miner-desiredAmmoBoxes" min="-1" max="999" value="${m.desiredAmmoBoxes ?? -1}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Skip Consumable Resupply</div>
+          <div class="setting-hint">Still loads weapons with ammo, but skips withdrawing repair kits, shield charges, and emergency warp devices from storage. Useful for starter ships with very limited cargo space — only haul what you need to mine.</div>
+        </div>
+        <select id="set-miner-disableResupply">
+          <option value="false"${!(m.disableResupply) ? " selected" : ""}>Normal (withdraw consumables)</option>
+          <option value="true"${m.disableResupply ? " selected" : ""}>Skip consumables only (ammo only)</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Depletion Timeout (Hours)</div>
           <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
         </div>
@@ -27853,6 +27904,20 @@ async function fetchPersonalFacilityTypes(username) {
             parseInt(
               document.getElementById("set-miner-desiredEmergencyWarpDevices").value,
             ) || 3,
+          desiredShieldCharges:
+            parseInt(
+              document.getElementById("set-miner-desiredShieldCharges").value,
+            ) || 20,
+          desiredRepairKits:
+            parseInt(
+              document.getElementById("set-miner-desiredRepairKits").value,
+            ) || 12,
+          desiredAmmoBoxes:
+            parseInt(
+              document.getElementById("set-miner-desiredAmmoBoxes").value,
+            ) || -1,
+          disableResupply:
+            document.getElementById("set-miner-disableResupply").value === "true",
           enableCoordination: document.getElementById(
             "set-miner-enableCoordination",
           ).checked,

@@ -535,6 +535,21 @@
           <button class="sm" onclick="caExec('get_nearby')">Nearby All</button>
         </div>
 
+        <div class="cmd-group">
+          <button class="sm" onclick="caExec('battle',{action:'advance'})" style="color: var(--red)">Advance All</button>
+          <button class="sm" onclick="caExec('battle',{action:'retreat'})" style="color: var(--red)">Retreat All</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'fire'})" style="color: var(--red)">Stance Fire</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'flee'})" style="color: var(--red)">Stance Flee</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'brace'})" style="color: var(--red)">Stance Brace</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Target All</label>
+          <input type="text" id="ca-battle-target-id" placeholder="target_id" style="min-width:100px">
+          <button class="sm" onclick="caExec('battle',{action:'target',target_id:val('ca-battle-target-id')})" style="color: var(--red)">Target</button>
+        </div>
+
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Mass Weapon Reload</label>
         </div>

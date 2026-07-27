@@ -261,10 +261,9 @@ function buildCraftingTree(
 
   visited.add(goalRecipe.output_item_id);
 
-  // For multi-output recipes the meaningful "have" is against the LIMITING
-  // output (smallest per-run quantity), since every other output scales with
-  // runs and the limiter gates how many runs are actually useful.
   const limiter = lowestOutputItem(goalRecipe);
+  const limiterQty = limiter.quantity || 1;
+  const runsNeeded = Math.ceil(quantityToCraftInItems / limiterQty);
   const limiterId = limiter.item_id;
   const realHave = (baseCountFn || countItemFn)(limiterId);
   const totalHave = countItemFn(limiterId);
@@ -281,7 +280,7 @@ function buildCraftingTree(
   // Find prerequisites for each component
   // Calculate total components needed for all items
   for (const comp of goalRecipe.components) {
-    const totalCompNeeded = comp.quantity * quantityToCraftInItems;
+    const totalCompNeeded = comp.quantity * runsNeeded;
     const compHave = countItemFn(comp.item_id.toLowerCase());
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 

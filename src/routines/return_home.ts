@@ -110,7 +110,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const { bot } = ctx;
 
   const routineParams = (bot as unknown as Record<string, unknown>).routineParams as Record<string, unknown> | undefined;
-  const ignoreBlacklist = routineParams?.ignoreBlacklist !== false;
+  const ignoreBlacklist = routineParams?.ignoreBlacklist === true;
 
   // Wait for any pending action from previous routine to clear
   // This is especially important for emergency return home scenarios
@@ -163,8 +163,9 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
 
   // Enable cloaking if configured and module is available
-  if (enableCloak) {
-    await enableCloakingIfPossible(ctx);
+  let isCloaked = bot.isCloaked;
+  if (enableCloak && !isCloaked) {
+    isCloaked = await enableCloakingIfPossible(ctx);
   }
 
   // Battle check before starting return home
@@ -326,7 +327,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         arrived = await navigateToSystem(ctx, homeSystem, {
           fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
-          skipBlacklist: ignoreBlacklist,
+          skipBlacklist: ignoreBlacklist && isCloaked,
         });
 
         if (arrived) {

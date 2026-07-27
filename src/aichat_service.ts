@@ -2628,7 +2628,6 @@ Write a captain's log entry (personal journal) describing what you did during th
       if (!logResp.error) {
         this.logFn("ai_chat", `📔 Captain's log updated for ${bot.username}: "${logEntry.slice(0, 80)}${logEntry.length > 80 ? "…" : ""}"`);
         bot.log("captains_log", `📔 Log: ${logEntry}`);
-        saveDailyUpdates({ ...loadDailyUpdates(), lastCaptainLogUpdate: Date.now() });
         return true;
       }
 
@@ -2737,7 +2736,6 @@ Be creative but concise. Think like you're setting a social status that other pl
         if (!statusResp.error) {
           this.logFn("ai_chat", `✅ Status updated for ${bot.username}: "${status}"`);
           bot.log("status", `🎨 Status set: "${status}"`);
-          saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
           return true;
         }
 
@@ -2836,7 +2834,6 @@ No other text, formatting, or explanation.`;
       if (!colorResp.error) {
         this.logFn("ai_chat", `✅ Colors updated for ${bot.username}: primary=${primaryColor}, secondary=${secondaryColor}`);
         bot.log("status", `🎨 Colors set: ${primaryColor}, ${secondaryColor}`);
-        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
         return true;
       }
 
@@ -2860,63 +2857,125 @@ No other text, formatting, or explanation.`;
    * Run daily updates for all bots (status and/or colors based on settings).
    * Called from runLoop when intervals have elapsed.
    */
+  // Track daily update runs to prevent re-entry / concurrent queues.
+  private dailyUpdateRunning = false;
+  private readonly DAILY_UPDATE_MAX_MS = 5 * 60 * 1000; // safety cap
+
+  // Track consecutive failures per update type so we don't busy-loop LLM calls
+  // when something is permanently failing (auth, missing API, etc.).
+  private consecutiveFailures = new Map<string, number>();
+  private readonly MAX_CONSECUTIVE_FAILURES = 3;
+
   private async runDailyUpdates(): Promise<void> {
-    const settings = getAiChatSettings();
-    const now = Date.now();
-    const updates = loadDailyUpdates();
-
-    const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return;
-
-    // Check status update interval
-    if (settings.autoStatusUpdateEnabled && settings.autoStatusUpdateIntervalSec > 0) {
-      const statusIntervalMs = settings.autoStatusUpdateIntervalSec * 1000;
-      if (now - updates.lastStatusUpdate >= statusIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
-
-        // Update each bot's status
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.isConnected()) continue;
-          await this.generateAndSetBotStatus(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
-        }
-
-        // Record the attempt even on failure so the configured interval is honored
-        // (otherwise a permanently-failing update would retry every cycle).
-        saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
-      }
+    if (this.dailyUpdateRunning) {
+      return;
     }
+    this.dailyUpdateRunning = true;
+    const deadline = Date.now() + this.DAILY_UPDATE_MAX_MS;
+    try {
+      const settings = getAiChatSettings();
+      const now = Date.now();
+      let updates = loadDailyUpdates();
+      const bots = AiChatService.getBots();
+      if (!bots || bots.length === 0) return;
 
-    // Check color update interval
-    if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
-      const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
-      if (now - updates.lastColorUpdate >= colorIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
-
-        // Update each bot's colors
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.isConnected()) continue;
-          await this.generateAndSetBotColors(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
+      // Check status update interval
+      if (settings.autoStatusUpdateEnabled && settings.autoStatusUpdateIntervalSec > 0) {
+        const statusIntervalMs = settings.autoStatusUpdateIntervalSec * 1000;
+        if (now - updates.lastStatusUpdate >= statusIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
+          let statusSuccessCount = 0;
+          for (const bot of bots) {
+            if (Date.now() >= deadline) break;
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetBotStatus(bot);
+            if (ok) statusSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("status") || 0;
+          if (statusSuccessCount > 0) {
+            this.consecutiveFailures.set("status", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("status", fails + 1);
+            this.logFn("ai_chat", `⚠️ Status update failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("status", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastStatusUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("status", 0);
         }
-
-        // Record the attempt even on failure so the configured interval is honored.
-        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
       }
-    }
+      else {
+        this.consecutiveFailures.set("status", 0);
+      }
 
-    // Check captain's log interval
-    if (settings.autoCaptainLogEnabled && settings.autoCaptainLogIntervalSec > 0) {
-      const captainLogIntervalMs = settings.autoCaptainLogIntervalSec * 1000;
-      if (now - updates.lastCaptainLogUpdate >= captainLogIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
-
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.isConnected()) continue;
-          await this.generateAndSetCaptainLog(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
+      // Check color update interval
+      if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
+        const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
+        if (now - updates.lastColorUpdate >= colorIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
+          let colorSuccessCount = 0;
+          for (const bot of bots) {
+            if (Date.now() >= deadline) break;
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetBotColors(bot);
+            if (ok) colorSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("color") || 0;
+          if (colorSuccessCount > 0) {
+            this.consecutiveFailures.set("color", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("color", fails + 1);
+            this.logFn("ai_chat", `⚠️ Color update failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("color", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastColorUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("color", 0);
         }
       }
+      else {
+        this.consecutiveFailures.set("color", 0);
+      }
+
+      // Check captain's log interval
+      if (settings.autoCaptainLogEnabled && settings.autoCaptainLogIntervalSec > 0) {
+        const captainLogIntervalMs = settings.autoCaptainLogIntervalSec * 1000;
+        if (now - updates.lastCaptainLogUpdate >= captainLogIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
+          let logSuccessCount = 0;
+          for (const bot of bots) {
+            if (Date.now() >= deadline) break;
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetCaptainLog(bot);
+            if (ok) logSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("captainLog") || 0;
+          if (logSuccessCount > 0) {
+            this.consecutiveFailures.set("captainLog", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("captainLog", fails + 1);
+            this.logFn("ai_chat", `⚠️ Captain's log failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("captainLog", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastCaptainLogUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("captainLog", 0);
+        }
+      }
+      else {
+        this.consecutiveFailures.set("captainLog", 0);
+      }
+    } finally {
+      this.dailyUpdateRunning = false;
     }
   }
 }

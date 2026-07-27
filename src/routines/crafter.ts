@@ -186,6 +186,17 @@ export interface RecipeOutput {
   quantity: number;
 }
 
+function isFuelReserveItem(itemId: string): boolean {
+  return itemId.toLowerCase() === "fuel_reserve";
+}
+
+function outputsFuelReserve(recipe: Recipe): boolean {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return isFuelReserveItem(recipe.output_item_id);
+  }
+  return recipe.outputs.some(o => isFuelReserveItem(o.item_id));
+}
+
 export interface Recipe {
   recipe_id: string;
   name: string;
@@ -1245,10 +1256,28 @@ async function executeCraftingPlan(
       // here is what makes the planner think it needs to re-refine materials it
       // already has enough of (e.g. steel_plate). Target the crafting home base
       // station so a roaming crafter reads the right storage.
-      await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
+       await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
+
+       // Refresh home station fuel via get_base so fuel_reserve goals see the
+       // actual station fuel level after jobs complete between loop iterations.
+       const hasFuelReserveGoal = goalsToAchieve.some(g => {
+         const rId = recipeIdForGoal(g);
+         if (!rId) return false;
+         const r = recipeIndex.get(rId);
+         return !!r && outputsFuelReserve(r);
+       });
+        if (hasFuelReserveGoal && settings?.craftingHomeBase) {
+          const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+          if (!baseResp.error && baseResp.result) {
+           const baseObj = baseResp.result as Record<string, unknown>;
+           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+           bot.homeBaseFuel = (baseInner.fuel as number) || bot.homeBaseFuel || 0;
+           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) || bot.homeBaseMaxFuel || 0;
+         }
+       }
 
 
-     // Recompute which goals still need production using live stock + in-flight output.
+      // Recompute which goals still need production using live stock + in-flight output.
      const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
      for (const g of goalsToAchieve) {
        const recipeId = recipeIdForGoal(g);
@@ -1567,6 +1596,17 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "dock";
     await ensureDocked(ctx);
 
+    // Refresh home station fuel via get_base so fuel_reserve goals compare against accurate data.
+    if (settings.craftingHomeBase) {
+      const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+      if (!baseResp.error && baseResp.result) {
+        const baseObj = baseResp.result as Record<string, unknown>;
+        const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+        bot.homeBaseFuel = (baseInner.fuel as number) || bot.homeBaseFuel || 0;
+        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) || bot.homeBaseMaxFuel || 0;
+      }
+    }
+
     yield "fetch_recipes";
     const recipes = await fetchAllRecipes(ctx);
     if (recipes.length === 0) {
@@ -1636,6 +1676,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Read bot.factionStorage live (do NOT capture a snapshot const) so that
       // re-refreshing it mid-loop in executeCraftingPlan is reflected here.
       for (const i of (bot.factionStorage || [])) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+      if (isFuelReserveItem(lowerId)) {
+        total += (bot.homeBaseFuel || 0);
+      }
       return total;
     }
 

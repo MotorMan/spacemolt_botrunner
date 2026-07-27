@@ -286,11 +286,14 @@ function shouldOnlyCreditTopOff(botUsername: string): boolean {
  *   on fleet rescues just because the primary happens to be busy with one. It
  *   only steps in when there is a genuine surge: 2+ stranded fleet members that
  *   the single primary cannot service alone.
+ * - A bot that is exclusively assigned to MAYDAY rescue must NOT handle fleet
+ *   rescues, even as overflow.
  */
 function shouldHandleFleetRescue(botUsername: string, strandedCount: number): boolean {
   const settings = getRescueSettings();
   if (!settings.fleetRescueEnabled) return false;
   if (isPrimaryFleetRescueBot(botUsername)) return true;
+  if (isPrimaryMaydayRescueBot(botUsername)) return false;
   return strandedCount >= 2;
 }
 
@@ -302,11 +305,14 @@ function shouldHandleFleetRescue(botUsername: string, strandedCount: number): bo
  *   a MAYDAY just because the MAYDAY-primary is busy with one. It only steps in
  *   when there is a genuine surge: 2+ pending MAYDAYs, so the two bots can cover
  *   DIFFERENT calls (the per-MAYDAY claim lock prevents both taking the same one).
+ * - A bot that is exclusively assigned to fleet rescue must NOT handle MAYDAYs,
+ *   even as overflow.
  */
 function shouldHandleMaydayRescue(botUsername: string, pendingMaydayCount: number): boolean {
   const settings = getRescueSettings();
   if (!settings.maydayRescueEnabled) return false;
   if (isPrimaryMaydayRescueBot(botUsername)) return true;
+  if (isPrimaryFleetRescueBot(botUsername)) return false;
   return pendingMaydayCount >= 2;
 }
 

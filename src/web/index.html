@@ -22922,12 +22922,22 @@ When responding:
                 ${restricted ? `<span style="font-size:11px;color:var(--text-dim)">Private</span>` : `<span style="font-size:11px;color:${isPublic ? "var(--green)" : "var(--purple)"}">${isPublic ? "Public" : "Private"}</span>`}
                 <button class="sm" style="font-size:10px;padding:2px 6px" title="Rename facility" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">✏️</button>
               </div>
-              ${restricted ? "" : `
-              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                <span style="font-size:11px;color:var(--text-dim)">PPR:</span>
-                <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
-                <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
-              </div>`}
+               ${restricted ? "" : `
+               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                 <span style="font-size:11px;color:var(--text-dim)">PPR:</span>
+                 <input id="ff-price-${esc(facId)}" class="sm" type="number" min="0" step="0.25" value="${curPrice}" style="width:90px;font-size:11px" />
+                 <button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="factionSetFacilityPrice('${esc(username)}','${esc(facId)}')">Set Price</button>
+                 ${(() => {
+                   const myPrice = curPrice;
+                   const typeKey = fac.type || fac.facility_type || "";
+                   const competitors = (stationCompetitorPrices[typeKey] || []).filter(c => c.facilityId !== facId);
+                   if (competitors.length === 0) return "";
+                   const minComp = competitors.reduce((a, b) => a.price < b.price ? a : b);
+                   const color = minComp.price < myPrice ? "var(--red)" : minComp.price > myPrice ? "var(--green)" : "var(--text-dim)";
+                   const tooltip = competitors.map(c => `${c.name}: ${c.price}`).join("\n").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+                   return `<span style="font-size:11px;margin-left:4px;color:${color};cursor:help" title="${tooltip}">${minComp.price}</span>`;
+                 })()}
+               </div>`}
               ${(factionFacilityRenameOpen[facId]) ? `
               <div style="display:flex;gap:6px;margin-top:6px;align-items:center">
                 <input type="text" id="ff-rename-${esc(facId)}" value="${esc(fac.custom_name || name)}" placeholder="New facility name (3-32)" style="flex:1;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:11px" />
@@ -22945,7 +22955,7 @@ When responding:
 
                 container.innerHTML = renderCards();
 
-                // `list` returns faction_facilities WITH production (public + price).
+                // `list` returns all station facilities WITH production (public + price).
                 sendExec(
                   username,
                   "facility",
@@ -22953,23 +22963,34 @@ When responding:
                   (listResult) => {
                     if (listResult.ok && listResult.data) {
                       const ld = listResult.data;
-                      const src = Array.isArray(ld.faction_facilities)
-                        ? ld.faction_facilities
-                        : Array.isArray(ld.player_facilities)
-                          ? ld.player_facilities
-                          : Array.isArray(ld.facilities)
-                            ? ld.facilities
-                            : Array.isArray(ld)
-                              ? ld
-                              : [];
+                      const allLists = [
+                        ...(Array.isArray(ld.station_facilities) ? ld.station_facilities : []),
+                        ...(Array.isArray(ld.player_facilities) ? ld.player_facilities : []),
+                        ...(Array.isArray(ld.faction_facilities) ? ld.faction_facilities : []),
+                        ...(Array.isArray(ld.public_facilities) ? ld.public_facilities : []),
+                      ];
                       const prodMap = {};
-                      src.forEach((f) => {
+                      allLists.forEach((f) => {
                         if (f && f.facility_id && f.production)
                           prodMap[f.facility_id] = f.production;
                       });
                       facilities.forEach((fac) => {
                         const fid = fac.facility_id || fac.id;
                         if (fid && prodMap[fid]) fac.production = prodMap[fid];
+                      });
+                      stationCompetitorPrices = {};
+                      allLists.forEach((f) => {
+                        if (!f || !f.facility_id || !f.production) return;
+                        const price = f.production.output_price_per_unit ?? f.production.rental_fee_per_run;
+                        if (price == null || typeof price !== "number") return;
+                        const typeKey = f.type || f.facility_type || "";
+                        if (!typeKey) return;
+                        if (!stationCompetitorPrices[typeKey]) stationCompetitorPrices[typeKey] = [];
+                        stationCompetitorPrices[typeKey].push({
+                          facilityId: f.facility_id,
+                          name: f.name || f.facility_type || "",
+                          price,
+                        });
                       });
                     }
                     factionFacilitiesData = facilities;
@@ -23609,6 +23630,7 @@ When responding:
       let factionFacilityCategory = "faction";
       let factionFacilityPublic = {};
       let factionFacilityPrice = {};
+      let stationCompetitorPrices = {};
       let factionFacilityRenameOpen = {}; // facId -> bool
       let factionFacilitiesData = [];
       let factionQueueUsageData = null;

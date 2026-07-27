@@ -578,13 +578,14 @@ shipSpeed = 1;
         }
         const reconnected = await this.waitForFreshSocket();
         if (!reconnected) {
-          // Stopped or terminal close (the library gave up / connected
-          // elsewhere). Stop retrying; surface the error so the routine ends.
-          // The botmanager's terminal-close guard then prevents an auto-restart
-          // that would just fight the server forever.
           throw err;
         }
         this.log("system", `Reconnected — resending ${tool}/${action}`);
+        // After a recovery, many sendResilient callers share the same _recovery
+        // promise and all resume at once. Stagger each retry by a small random
+        // jitter so they don't simultaneously flood the server with a burst of
+        // identical commands and trip the rate limiter / IP ban.
+        await new Promise((r) => setTimeout(r, Math.random() * 200));
       }
     }
   }
@@ -1655,9 +1656,30 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     return this._loginPromise;
   }
 
-  /** True when this bot has a live library Account connection. */
+  /** True when this bot has a live library Account connection.
+   *  Checks both the library auth flag and the underlying WebSocket readyState
+   *  so a "silently dead" socket (authenticated stays true but ws is closed)
+   *  is treated as disconnected. */
   isConnected(): boolean {
-    return !!this.account?.authenticated;
+    const acct = this.account;
+    if (!acct || !acct.authenticated) return false;
+    const rs = (acct as unknown as { readyState?: number }).readyState;
+    if (rs !== undefined && rs !== 1) return false;
+    return true;
+  }
+
+  /** Return a side-effect-free connection-state snapshot. Does not send any
+   *  commands; just inspects the library Account's own state flags so routines
+   *  and the health monitor can decide whether to issue further commands
+   *  without risking a reconnection storm. */
+  getConnectionState(): "connected" | "reconnecting" | "disconnected" {
+    const acct = this.account;
+    if (!acct) return "disconnected";
+    if (!acct.authenticated) return "disconnected";
+    const rs = (acct as unknown as { readyState?: number }).readyState;
+    if (rs === 0) return "reconnecting";
+    if (rs === 2 || rs === 3) return "disconnected";
+    return "connected";
   }
 
   /** Internal login implementation */

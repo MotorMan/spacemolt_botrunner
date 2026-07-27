@@ -3,6 +3,7 @@
 // individual call sites migrate to the typed `account.commands` facade (P3).
 
 import type { Account } from "@spacemolt/lib";
+import { isConnectionError } from "./connection.js";
 
 export interface ApiSession {
   id: string;
@@ -444,6 +445,7 @@ export async function libExecute(
   account: Account,
   command: string,
   payload?: Record<string, unknown>,
+  retries = 2,
 ): Promise<ApiResponse> {
   // Transport-level auth is already handled by connectOwned()/clerk — no-op.
   if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
@@ -456,12 +458,25 @@ export async function libExecute(
 
   const { tool, action, body } = buildLibDispatch(command, payload);
 
-  try {
-    const res = await account.send(tool, action, body);
-    const result = extractLibResult(res);
-    return { result, error: undefined, notifications: [] };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await account.send(tool, action, body);
+      const result = extractLibResult(res);
+      return { result, error: undefined, notifications: [] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      lastErr = err instanceof Error ? err : new Error(message);
+      // Only retry transport-level connection drops; surface everything else.
+      if (!isConnectionError(message)) {
+        return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
+      }
+      if (attempt < retries) {
+        // Back off briefly before the next attempt so the library/transport
+        // can finish whatever reconnect it's doing.
+        await new Promise((r) => setTimeout(r, Math.min(1000 * (attempt + 1), 5000)));
+      }
+    }
   }
+  return { error: { code: "lib_error", message: lastErr?.message ?? "connection error" }, result: undefined, notifications: [] };
 }

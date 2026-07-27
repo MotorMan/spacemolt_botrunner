@@ -539,11 +539,13 @@ export function formatCraftingTree(node: CraftingNode, prefix: string = ""): str
   const lines: string[] = [];
 
   const limiter = lowestOutputItem(node.recipe);
+  const limiterQty = limiter.quantity || 1;
+  const runs = Math.ceil(node.quantityToCraft / limiterQty);
   const outStr = formatOutputs(node.recipe);
   const haveStr = node.quantityHave > 0 || node.quantityPending > 0
     ? ` (limiting ${limiter.name}: have ${node.quantityHave}${node.quantityPending > 0 ? `, ${node.quantityPending} pending` : ""})`
     : "";
-  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${node.quantityToCraft} runs -> ${outStr}${haveStr}`);
+  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${runs} runs -> ${outStr}${haveStr}`);
 
   for (const child of node.children) {
     lines.push(formatCraftingTree(child, prefix + "│  "));
@@ -561,8 +563,11 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
   }
 
   const outStr = plan.goalRecipe ? ` -> ${formatOutputs(plan.goalRecipe)}` : "";
+  const limiter = plan.goalRecipe ? lowestOutputItem(plan.goalRecipe) : null;
+  const limiterQty = limiter?.quantity || 1;
+  const runs = Math.ceil(plan.goalQuantity / limiterQty);
   const lines = [
-    `🎯 Goal: ${plan.goalQuantity} runs of ${plan.goalItem}${outStr}`,
+    `🎯 Goal: ${runs} runs of ${plan.goalItem}${outStr} (${plan.goalQuantity} items)`,
     `   Steps: ${plan.totalSteps} recipes to craft`,
   ];
 

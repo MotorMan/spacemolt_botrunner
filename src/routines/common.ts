@@ -4,6 +4,7 @@
  * Provides: docking, refueling, repairing, navigation, system parsing,
  * ore parsing, and safety checks.
  */
+import { combatDebugLog, combatDebugLogLine } from "../debug.js";
 import type { Bot, RoutineContext } from "../bot.js";
 import { isConnectionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
@@ -3791,6 +3792,12 @@ export function writeSettings(updates: Record<string, Record<string, unknown>>):
   writeFileSync(file, JSON.stringify(existing, null, 2) + "\n", "utf-8");
 }
 
+export function isCombatDebugEnabled(): boolean {
+  const all = readSettings();
+  const h = (all.hunter || {}) as Record<string, unknown>;
+  return (h.combatDebug as boolean) ?? false;
+}
+
 // ── Utilities ────────────────────────────────────────────────
 
 export function sleep(ms: number): Promise<void> {
@@ -4370,8 +4377,11 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
 
   const result = resp.result as Record<string, unknown>;
   if (result.error && (result.error as Record<string, unknown>).code === "not_in_battle") {
+    combatDebugLog(bot.username, "battle:get_status_not_in_battle", result);
     return null;
   }
+
+  combatDebugLog(bot.username, "battle:get_status", result);
 
   // Parse battle status
   const status: BattleStatus = {
@@ -4487,6 +4497,10 @@ export async function handleBattleNotifications(
 
   if (battleNotifications.length === 0) {
     return false;
+  }
+
+  if (isCombatDebugEnabled()) {
+    combatDebugLog(ctx.bot.username, "battle:notifications", notifications);
   }
 
   ctx.log("combat", `Processing ${battleNotifications.length} battle notification(s)...`);

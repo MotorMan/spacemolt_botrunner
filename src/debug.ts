@@ -29,6 +29,64 @@ if (!existsSync(OLD_ACTIVITY_LOGS_DIR)) {
 
 let debugEnabled = true;
 let activityEnabled = true;
+let combatDebugEnabled = false;
+
+export function setCombatDebugLog(on: boolean): void {
+  combatDebugEnabled = on;
+}
+
+export function getCombatDebugLog(): boolean {
+  return combatDebugEnabled;
+}
+
+export function shouldCombatDebugLog(botName: string): boolean {
+  return combatDebugEnabled;
+}
+
+/**
+ * Write raw combat JSON to data/logs/{botName}_combat_debug.log
+ * No filtering — dumps the entire object as-is for post-battle analysis.
+ */
+export function combatDebugLog(botName: string, source: string, data: unknown): void {
+  if (!shouldCombatDebugLog(botName)) return;
+  const timestamp = new Date().toISOString();
+  let line = `${timestamp} [${source}] `;
+  try {
+    line += JSON.stringify(data);
+  } catch {
+    line += "[unserializable]";
+  }
+  line += "\n";
+  try {
+    const botLogFile = join(LOGS_DIR, `${botName}_combat_debug.log`);
+    appendFileSync(botLogFile, line);
+  } catch {
+    // ignore write errors
+  }
+}
+
+/**
+ * Write raw combat JSON to data/logs/{botName}_combat_debug.log
+ * Auto-resolves botName from settings when only a username is provided.
+ */
+export function combatDebugLogForBot(username: string, source: string, data: unknown): void {
+  combatDebugLog(username, source, data);
+}
+
+/**
+ * Write a plain combat debug line to data/logs/{botName}_combat_debug.log
+ */
+export function combatDebugLogLine(botName: string, line: string): void {
+  if (!shouldCombatDebugLog(botName)) return;
+  const timestamp = new Date().toISOString();
+  const fullLine = `${timestamp} ${line}\n`;
+  try {
+    const botLogFile = join(LOGS_DIR, `${botName}_combat_debug.log`);
+    appendFileSync(botLogFile, fullLine);
+  } catch {
+    // ignore write errors
+  }
+}
 
 function shouldRotateLog(logPath: string): boolean {
   if (!existsSync(logPath)) return false;

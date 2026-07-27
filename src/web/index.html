@@ -28743,6 +28743,7 @@ ignoreBlacklist: document.getElementById(
         const ammoReloadPercentThreshold = h.ammoReloadPercentThreshold ?? 25;
         const meatShield = h.meatShield ?? false;
         const stopOnDeath = h.stopOnDeath ?? false;
+        const combatDebug = h.combatDebug ?? false;
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
         const tierOpts = tierOptions
@@ -29179,6 +29180,17 @@ ignoreBlacklist: document.getElementById(
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Combat Debug Log</div>
+        <div class="setting-hint">Log all raw battle JSON (push notifications, get_battle_status responses, and command results) to data/logs/combat_debug/{botName}_combat_debug.log. Uses no filtering — dumps everything for post-battle analysis. Toggle per-bot or leave disabled.</div>
+      </div>
+      <select id="set-hunter-combatDebug">
+        <option value="false"${!combatDebug ? " selected" : ""}>Disabled</option>
+        <option value="true"${combatDebug ? " selected" : ""}>Enabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -29270,6 +29282,8 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-meatShield").value === "true",
           stopOnDeath:
             document.getElementById("set-hunter-stopOnDeath").value === "true",
+          combatDebug:
+            document.getElementById("set-hunter-combatDebug").value === "true",
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols
             : [],

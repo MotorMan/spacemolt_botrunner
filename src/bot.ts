@@ -2,7 +2,8 @@ import { appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { type ApiResponse, COMMAND_TOOL_MAP, buildLibDispatch, extractLibResult } from "./commandBridge.js";
 import { log, logError, logNotifications } from "./ui.js";
-import { debugLogForBot } from "./debug.js";
+import { debugLogForBot, combatDebugLog } from "./debug.js";
+import { isCombatDebugEnabled } from "./routines/common.js";
 import { measureSend } from "./sendMetrics.js";
 import { perf } from "./perf.js";
 import { mapStore } from "./mapstore.js";
@@ -1323,6 +1324,20 @@ shipSpeed = 1;
       // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
       resp = await this.libExec(command, payload);
+
+      if (isCombatDebugEnabled() && (
+        command === "battle" || command === "scan" || command === "attack" ||
+        command === "get_battle_status" || command === "get_nearby" ||
+        command === "cloak"
+      )) {
+        combatDebugLog(this.username, `exec:${command}`, {
+          command,
+          payload,
+          result: resp.result,
+          error: resp.error,
+        });
+      }
+
       try {
 
         // (HTTP 502/524/full_login_required retry blocks were transport-level and
@@ -3529,6 +3544,17 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
       const notif = n as Record<string, unknown>;
       const type = notif.type as string | undefined;
       const msgType = notif.msg_type as string | undefined;
+
+      if (isCombatDebugEnabled()) {
+        const battleTypes = new Set([
+          "battle_update", "battle_started", "battle_ended", "battle_damage",
+          "battle_alert", "battle_joined", "battle_left"
+        ]);
+        const sourceKey = type ?? msgType ?? "unknown";
+        if (battleTypes.has(type || "") || battleTypes.has(msgType || "")) {
+          combatDebugLog(this.username, `push:${sourceKey}`, notif);
+        }
+      }
 
       // Chat messages - route to AI chat handler and display
       if (msgType === "chat_message") {

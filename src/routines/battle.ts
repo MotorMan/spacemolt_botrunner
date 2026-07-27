@@ -4,6 +4,7 @@ import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
+import { combatDebugLog } from "../debug.js";
 
 /**
  * Returns true if the given display name belongs to a known creature (wildlife).

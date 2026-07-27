@@ -40,6 +40,8 @@
  *   cloakOnStart    — stay cloaked until attack command, then re-cloak after battle (default: false)
  *   meatShield      — enter/continue battles even with no weapons/ammo instead of aborting to resupply (default: false)
  *   stopOnDeath     — stop the routine on death instead of respawning into a new hunt (default: false)
+ *   combatDebug     — log all raw battle JSON to data/logs/combat_debug/{botName}_combat_debug.log (default: false)
+ *   targetRandomly  — shuffle target order each scan (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -47,7 +49,8 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import { getSystemBlacklist } from "../web/server.js";
-import { writeSettings } from "./common.js";
+import { writeSettings, isCombatDebugEnabled } from "./common.js";
+import { combatDebugLog } from "../debug.js";
 import {
   findStation,
   isStationPoi,
@@ -255,6 +258,7 @@ function getHunterSettings(username?: string): {
   meatShield: boolean;
   stopOnDeath: boolean;
   targetRandomly: boolean;
+  combatDebug: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -312,6 +316,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   meatShield: (h.meatShield as boolean) ?? false,
   stopOnDeath: (h.stopOnDeath as boolean) ?? false,
   targetRandomly: (h.targetRandomly as boolean) ?? false,
+  combatDebug: (h.combatDebug as boolean) ?? false,
 };
 }
 
@@ -2444,16 +2449,18 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       }
 
       const entities = parseNearby(nearbyData);
-    const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+      const targets = [...pirate_targets, ...creature_targets];
 
-    if (targets.length === 0) {
-      ctx.log("combat", `No targets detected at ${originalPoi}`);
-      if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-      await ctx.sleep(5000); // Wait 30 seconds before next scan
-      continue;
-    }
+      if (targets.length === 0) {
+        ctx.log("combat", `No targets at ${originalPoi}`);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        await ctx.sleep(5000); // Wait 30 seconds before next scan
+        continue;
+      }
 
-    ctx.log("combat", `Found ${targets.length} target(s) at ${originalPoi}: ${targets.map(t => t.name).join(", ")}`);
+      ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${originalPoi}`);
 
 // Engage each target
       for (const target of targets) {
@@ -2843,7 +2850,9 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         if (!nearbyData) continue;
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
-        const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+        const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -3282,7 +3291,9 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         if (!nearbyData) continue;
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
-        const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+        const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -3438,7 +3449,9 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         if (!nearbyData) continue;
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
-        const targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
+        const pirate_targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
+        const creature_targets = entities.filter(e => isCreatureTarget(e, currentSettings.huntCreatures));
+        const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx);
           await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);

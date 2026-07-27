@@ -484,8 +484,8 @@ async function getMinerSettings(username?: string): Promise<{
   desiredRepairKits: number;
   desiredAmmoBoxes: number;
   disableResupply: boolean;
- enableFighting: boolean;
- enableMissions: boolean;
+  enableFighting: boolean;
+  enableMissions: boolean;
 
    // Deep sleep interval (minutes) used when NO viable mining target exists anywhere in the map.
    // Prevents the miner from hammering the server with repeated failed target searches.
@@ -4783,16 +4783,15 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         const nearbyResult = parseNearbyEntities(nearbyResp.structuredContent);
 
         if (nearbyResult.hasPlayers) {
-          // Check emergency fighting setting first
           if (settings.enableFighting) {
-            ctx.log("combat", "Emergency fighting ENABLED - engaging attacking players!");
+            ctx.log("combat", "Enable fighting ENABLED - engaging attackers!");
             battleState.inBattle = true;
             battleState.isFleeing = false;
             await engageInBattle(ctx);
             await ctx.sleep(30000);
             continue;
           }
-          
+
           const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
           if (shouldFight) {
             ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
@@ -4802,10 +4801,17 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             await ctx.sleep(30000);
             continue;
           }
+        } else if (settings.enableFighting) {
+          ctx.log("combat", "No players detected but fighting is enabled - engaging!");
+          battleState.inBattle = true;
+          battleState.isFleeing = false;
+          await engageInBattle(ctx);
+          await ctx.sleep(30000);
+          continue;
         }
       }
 
-      // Default: flee if we can't determine attackers or shouldn't fight
+      // Default: flee if we can't determine attackers
       ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via WebSocket - fled, will retry mining");
@@ -4825,9 +4831,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         const nearbyResult2 = parseNearbyEntities(nearbyResp2.structuredContent);
 
         if (nearbyResult2.hasPlayers) {
-          // Check emergency fighting setting first
           if (settings.enableFighting) {
-            ctx.log("combat", "Emergency fighting ENABLED - engaging attacking players!");
+            ctx.log("combat", "Enable fighting ENABLED - engaging attackers!");
             battleState.inBattle = true;
             battleState.battleId = directBattleStatus.battle_id;
             battleState.isFleeing = false;
@@ -4835,7 +4840,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             await ctx.sleep(30000);
             continue;
           }
-          
+
           const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);
           if (shouldFight2) {
             ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
@@ -4846,10 +4851,18 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             await ctx.sleep(30000);
             continue;
           }
+        } else if (settings.enableFighting) {
+          ctx.log("combat", "No players detected but fighting is enabled - engaging!");
+          battleState.inBattle = true;
+          battleState.battleId = directBattleStatus.battle_id;
+          battleState.isFleeing = false;
+          await engageInBattle(ctx);
+          await ctx.sleep(30000);
+          continue;
         }
       }
 
-      // Default: flee if we can't determine attackers or shouldn't fight
+      // Default: flee if we can't determine attackers
       ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via status check - fled, will retry mining");

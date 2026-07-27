@@ -26915,6 +26915,8 @@ async function fetchPersonalFacilityTypes(username) {
         const desiredRepairKits = m.desiredRepairKits ?? 12;
         const desiredAmmoBoxes = m.desiredAmmoBoxes ?? -1;
         const disableResupply = m.disableResupply ?? false;
+        const enableFighting = m.enableFighting ?? false;
+        const enableMissions = m.enableMissions ?? true;
 
         // Complete mineable-resource list from the catalogue, unioned with any
         // ores discovered from map scans. knownOres is only populated once POIs
@@ -27563,6 +27565,33 @@ async function fetchPersonalFacilityTypes(username) {
       </div>
 
       <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+        <div class="setting-label" style="margin-bottom:8px">⚔️ Combat</div>
+        <div class="setting-hint" style="margin-bottom:12px">Control how miners respond to battles and what they engage.</div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Enable Fighting</div>
+            <div class="setting-hint">When enabled, miners will engage in combat instead of fleeing when attacked. With sufficient weapons and pack coordination, miners can take on most threats.</div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="set-miner-enableFighting"${m.enableFighting ? " checked" : ""} />
+            <span>Enable fighting</span>
+          </label>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Enable Missions</div>
+            <div class="setting-hint">When enabled, miners will accept and complete mining missions at stations.</div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px">
+            <input type="checkbox" id="set-miner-enableMissions"${m.enableMissions !== false ? " checked" : ""} />
+            <span>Enable missions</span>
+          </label>
+        </div>
+      </div>
+
+      <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
         <div class="setting-label" style="margin-bottom:8px">🤝 Miner Coordination</div>
         <div class="setting-hint" style="margin-bottom:12px">Prevents multiple miners from crowding the same system. Bots announce targets via bot chat and coordinate to spread out.</div>
         
@@ -28052,6 +28081,12 @@ async function fetchPersonalFacilityTypes(username) {
             })(),
           disableResupply:
             document.getElementById("set-miner-disableResupply").value === "true",
+          enableFighting: document.getElementById(
+            "set-miner-enableFighting",
+          ).checked,
+          enableMissions: document.getElementById(
+            "set-miner-enableMissions",
+          ).checked,
           enableCoordination: document.getElementById(
             "set-miner-enableCoordination",
           ).checked,

@@ -29,9 +29,10 @@
  *   repairThreshold — hull % to abort patrol and dock (default: 30)
  *   fleeThreshold   — hull % to flee an active fight (default: 20)
  *   shieldRechargePct — post-battle shield % to top up to with shield_charge items (default: 80)
- *   desiredShieldCharges — how many shield_charge the bot tries to keep stocked (default: 20)
- *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
- *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
+  *   desiredShieldCharges — how many shield_charge the bot tries to keep stocked (default: 20)
+  *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
+  *   desiredFuelCells     — how many fuel cells the bot tries to keep stocked (-1 = fill cargo, default: -1)
+  *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
  *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
  *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
@@ -250,6 +251,7 @@ function getHunterSettings(username?: string): {
   homeStation: string;
   desiredShieldCharges: number;
   desiredRepairKits: number;
+  desiredFuelCells: number;
   desiredEmergencyWarpDevices: number;
   desiredAmmoBoxes: number;
   disableResupply: boolean;
@@ -308,6 +310,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
+    desiredFuelCells: (h.desiredFuelCells as number) ?? -1,
     desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     desiredAmmoBoxes: (h.desiredAmmoBoxes as number) ?? -1,
     disableResupply: (h.disableResupply as boolean) ?? false,
@@ -3162,7 +3165,14 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   if (!hs.disableResupply) {
     const fuelCellSize = getItemSize("military_fuel_cell");
     if (freeSpace >= fuelCellSize) {
-      const fuelQty = Math.floor(freeSpace / fuelCellSize);
+      const desiredFuel = hs.desiredFuelCells ?? -1;
+      let fuelQty: number;
+      if (desiredFuel >= 0) {
+        fuelQty = Math.max(0, desiredFuel - currentFuel);
+        fuelQty = Math.min(fuelQty, Math.floor(freeSpace / fuelCellSize));
+      } else {
+        fuelQty = Math.floor(freeSpace / fuelCellSize);
+      }
       if (allowBuying) {
         const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
         if (!fuelResp.error) {

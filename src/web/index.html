@@ -28743,6 +28743,7 @@ ignoreBlacklist: document.getElementById(
         const shieldRechargePct = h.shieldRechargePct ?? 80;
         const desiredShieldCharges = h.desiredShieldCharges ?? 20;
         const desiredRepairKits = h.desiredRepairKits ?? 12;
+        const desiredFuelCells = h.desiredFuelCells ?? -1;
         const desiredEmergencyWarpDevices = h.desiredEmergencyWarpDevices ?? 3;
         const desiredAmmoBoxes = h.desiredAmmoBoxes ?? 0;
         const disableResupply = h.disableResupply ?? false;
@@ -29009,6 +29010,14 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Desired Fuel Cells</div>
+        <div class="setting-hint">Target number of military_fuel_cell items to keep in cargo after resupply. Set to -1 to fill the entire cargo hold (default behavior). Set to 0 to skip fuel cell resupply entirely.</div>
+      </div>
+      <input type="number" id="set-hunter-desiredFuelCells" min="-1" max="1000" value="${desiredFuelCells}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Desired Emergency Warp Devices</div>
         <div class="setting-hint">Target number of emergency_warp_device items to keep in cargo for emergency escapes.</div>
       </div>
@@ -29246,6 +29255,10 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-hunter-desiredRepairKits").value,
             ) || 12,
+          desiredFuelCells:
+            parseInt(
+              document.getElementById("set-hunter-desiredFuelCells").value,
+            ) || -1,
           desiredEmergencyWarpDevices:
             parseInt(
               document.getElementById("set-hunter-desiredEmergencyWarpDevices").value,

@@ -2239,41 +2239,44 @@
         };
 
         // Lightweight HTTP bandwidth tracker (tracks all fetch() responses)
-        const httpBytesByUrl = {};
-        let httpTotalBytes = 0;
-        let httpBytesTimer = null;
-        const logHttpSummary = () => {
-          if (httpTotalBytes === 0) return;
-          const lines = [
-            `[HTTP_BW_CLIENT] 10s: ${(httpTotalBytes / 1024 / 1024).toFixed(2)} MB`,
-          ];
-          const sorted = Object.entries(httpBytesByUrl).sort((a, b) => b[1] - a[1]).slice(0, 10);
-          for (const [url, bytes] of sorted) {
-            lines.push(`  ${url}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
-          }
-          console.log(lines.join("\n"));
-          httpTotalBytes = 0;
-          for (const k in httpBytesByUrl) delete httpBytesByUrl[k];
-        };
-        const _origFetch = window.fetch;
-        window.fetch = async function (...args) {
-          const url = args[0] instanceof Request ? args[0].url : (args[0] || "unknown");
-          const path = typeof url === "string" ? url.split("?")[0] : String(url);
-          try {
-            const res = await _origFetch.apply(window, args);
-            if (!res.ok) return res;
-            const clone = res.clone();
-            const textPromise = clone.text().then((text) => {
-              const len = new Blob([text]).size;
-              httpTotalBytes += len;
-              httpBytesByUrl[path] = (httpBytesByUrl[path] || 0) + len;
-              if (!httpBytesTimer) httpBytesTimer = setInterval(logHttpSummary, 10000);
-            }).catch(() => {});
-            return res;
-          } catch (e) {
-            return _origFetch.apply(window, args);
-          }
-        };
+        if (!window.__httpBytesTrackerInstalled) {
+          window.__httpBytesTrackerInstalled = true;
+          const httpBytesByUrl = {};
+          let httpTotalBytes = 0;
+          let httpBytesTimer = null;
+          const logHttpSummary = () => {
+            if (httpTotalBytes === 0) return;
+            const lines = [
+              `[HTTP_BW_CLIENT] 10s: ${(httpTotalBytes / 1024 / 1024).toFixed(2)} MB`,
+            ];
+            const sorted = Object.entries(httpBytesByUrl).sort((a, b) => b[1] - a[1]).slice(0, 10);
+            for (const [url, bytes] of sorted) {
+              lines.push(`  ${url}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+            }
+            console.log(lines.join("\n"));
+            httpTotalBytes = 0;
+            for (const k in httpBytesByUrl) delete httpBytesByUrl[k];
+          };
+          const _origFetch = window.fetch;
+          window.fetch = async function (...args) {
+            const url = args[0] instanceof Request ? args[0].url : (args[0] || "unknown");
+            const path = typeof url === "string" ? url.split("?")[0] : String(url);
+            try {
+              const res = await _origFetch.apply(window, args);
+              if (!res.ok) return res;
+              const clone = res.clone();
+              const textPromise = clone.text().then((text) => {
+                const len = new Blob([text]).size;
+                httpTotalBytes += len;
+                httpBytesByUrl[path] = (httpBytesByUrl[path] || 0) + len;
+                if (!httpBytesTimer) httpBytesTimer = setInterval(logHttpSummary, 10000);
+              }).catch(() => {});
+              return res;
+            } catch (e) {
+              return _origFetch.apply(window, args);
+            }
+          };
+        }
 
         // Build the WS URL defensively. In some embedded clients / reverse
         // proxies `location.host` can be empty or wrong, which makes

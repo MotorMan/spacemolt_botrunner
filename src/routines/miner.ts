@@ -2330,6 +2330,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (settings0.enableCloak && bot.docked && !bot.isCloaked) {
       ctx.log("mining", "Manually undocking before cloaking to control state...");
       await bot.commands.spacemolt.undock();
+      bot.docked = false;
       await ctx.sleep(500);
       await bot.refreshShip();
     }

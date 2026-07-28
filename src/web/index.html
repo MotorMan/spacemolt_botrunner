@@ -33368,6 +33368,28 @@ ignoreBlacklist: document.getElementById(
             const botLocation = botObj?.location || "";
             const botSystem = botObj?.system || "";
 
+            function normalizeStationName(loc) {
+              if (!loc) return "";
+              let s = String(loc).replace(/^stored at\s+/i, "").trim();
+              if (s.includes(" - ")) s = s.split(" - ").pop().trim();
+              return s.toLowerCase();
+            }
+
+            const currentStationName = botObj?.docked
+              ? normalizeStationName(
+                  botObj?.poi
+                    ? resolveLocation(botSystem, botObj.poi)
+                    : botLocation
+                )
+              : "";
+
+            const shipStationName = normalizeStationName(rawLocation);
+            const isAtCurrentStation =
+              !isLoadedOnCarrier &&
+              currentStationName &&
+              shipStationName &&
+              currentStationName === shipStationName;
+
             const activeShip = shipyardShipData?.ship || shipyardShipData || {};
             const activeShipName = (
               activeShip?.name ||
@@ -33602,7 +33624,7 @@ ignoreBlacklist: document.getElementById(
             html += `<div class="shipyard-ship-card">
         <div style="flex:1">
           <div class="ssc-name">${esc(name)}${shipIdDisplay}${!customName && cls && name !== baseName ? ` <span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ""} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ""}${buildBadge}${etaHtml}</div>
-          <div class="ssc-detail">${esc(loc)}${storedInCarrierDisplay ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(storedInCarrierDisplay)}</span>` : ""}${isLoadedOnCarrier ? ` <span style="color:var(--yellow);font-size:10px">📥 Loaded on: ${esc(loadedCarrierName)}</span>` : ""}</div>
+          <div class="ssc-detail" style="color:${isAtCurrentStation ? 'var(--green)' : ''}">${esc(loc)}${storedInCarrierDisplay ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(storedInCarrierDisplay)}</span>` : ""}${isLoadedOnCarrier ? ` <span style="color:var(--yellow);font-size:10px">📥 Loaded on: ${esc(loadedCarrierName)}</span>` : ""}</div>
           ${statsHtml}
         </div>
         <div class="ssc-actions">

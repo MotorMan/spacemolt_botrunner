@@ -876,6 +876,7 @@ export async function queueCraftJob(
   // (lowestOutputItem().quantity); otherwise runs are mis-sized against the
   // first output and the smaller secondary outputs never get produced.
   outputPerRun: number = 0,
+  rawCountItemFn?: (itemId: string) => number,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -897,7 +898,7 @@ export async function queueCraftJob(
      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
    }
 
-   const maxCraftable = calculateMaxCraftable(recipe, countItemFn);
+    const maxCraftable = calculateMaxCraftable(recipe, rawCountItemFn || countItemFn);
    const runs = Math.min(originalRuns, maxCraftable);
 
    if (runs <= 0) {
@@ -1129,6 +1130,7 @@ async function queueAllRecipesOnce(
     availableFn: (itemId: string) => number,
     ownFacilityMap: OwnFacilityMap,
     settings: CrafterSettings,
+    rawCountItemFn: (itemId: string) => number,
 ): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
     const { bot } = ctx;
     const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
@@ -1160,7 +1162,7 @@ async function queueAllRecipesOnce(
       }
 
        const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
-       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun);
+        const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun, rawCountItemFn);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
            ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
@@ -1325,7 +1327,7 @@ async function executeCraftingPlan(
      }
 
       const effectiveSettings = settings || await getCrafterSettings();
-      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings);
+      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!);
 
       // Progress is being made if we queued something this pass, or if the queue
       // still has jobs producing sub-materials we're waiting on.
@@ -1468,7 +1470,7 @@ async function craftFromCategories(
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (outputs: ${formatOutputs(target)}; category: ${target.category})`);
     const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap);
+     const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap, 0, countItemForCraft);
     if (!queueResult.success) {
       if (queueResult.error && queueResult.error.includes("aborted")) {
         ctx.log("warn", `Crafting halted: ${queueResult.error}`);

@@ -580,10 +580,11 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
           markFailed(order.orderId, "no facility");
           continue;
         }
-        const result = await queueCraftJob(
-          ctx, order.recipeId, order.quantity, bot, bot.craftQueueTracker!,
-          countFactionItemFn, recipes, venue, crafterSettings, ownFacilityMap,
-        );
+         const result = await queueCraftJob(
+           ctx, order.recipeId, order.quantity, bot, bot.craftQueueTracker!,
+           countFactionItemFn, recipes, venue, crafterSettings, ownFacilityMap,
+           0, countFactionItemFn,
+         );
         if (result.success) {
           markCrafting(order.orderId);
           ctx.log("craft", `Queued craft order ${order.orderId}: ${order.quantity}x ${recipe.output_name}`);

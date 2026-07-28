@@ -2302,6 +2302,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
               state.pickupStation = nextPickup.poi;
               state.pickupSystem = nextPickup.system;
               state.roundsWithoutPassengers = 0;
+              state.needsTravel = true;
               state.status = "idle";
               saveTransportState(state);
               await ctx.sleep(5000);

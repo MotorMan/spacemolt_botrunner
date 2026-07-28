@@ -122,6 +122,15 @@ function getObservationDebugLine(bot: Bot): string {
      return "observation: disabled (using polling)";
    }
 
+const RAINBOW_LEVIATHAN_NAME = "Rainbow Leviathan";
+
+function prioritizeRainbowLeviathan(creatures: NearbyEntity[]): NearbyEntity[] {
+  if (!creatures.length) return creatures;
+  const prioritized = creatures.filter(e => e.name === RAINBOW_LEVIATHAN_NAME);
+  const rest = creatures.filter(e => e.name !== RAINBOW_LEVIATHAN_NAME);
+  return [...prioritized, ...rest];
+}
+
 async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
@@ -261,6 +270,7 @@ function getHunterSettings(username?: string): {
   stopOnDeath: boolean;
   targetRandomly: boolean;
   combatDebug: boolean;
+  maxCreaturesPerScan: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -320,6 +330,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   stopOnDeath: (h.stopOnDeath as boolean) ?? false,
   targetRandomly: (h.targetRandomly as boolean) ?? false,
   combatDebug: (h.combatDebug as boolean) ?? false,
+  maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
 };
 }
 
@@ -1531,7 +1542,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
 
       if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2028,7 +2039,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
 
       if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2453,7 +2464,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       const entities = parseNearby(nearbyData);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
       const targets = [...pirate_targets, ...creature_targets];
 
       if (targets.length === 0) {
@@ -2854,7 +2865,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -3302,7 +3313,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = entities.filter(e => isCreatureTarget(e, settings.huntCreatures));
+        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -3460,7 +3471,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
-        const creature_targets = entities.filter(e => isCreatureTarget(e, currentSettings.huntCreatures));
+        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, currentSettings.huntCreatures)).slice(0, currentSettings.maxCreaturesPerScan));
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx);

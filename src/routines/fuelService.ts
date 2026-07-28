@@ -478,7 +478,7 @@ async function craftItemAtHome(
   }
 
   ctx.log("craft", `Crafting ${actualRuns} runs of ${recipe.recipe_id} at home...`);
-  const resp = await bot.exec("craft", { id: recipe.recipe_id, quantity: actualRuns, preset: "fast" });
+  const resp = await bot.exec("craft", { id: recipe.recipe_id, quantity: actualRuns * (recipe.output_quantity || 1), preset: "fast" });
   return !resp.error;
 }
 

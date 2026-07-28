@@ -704,11 +704,12 @@ export async function resolveFinalVenue(
   runs: number,
   v: ResolvedVenue,
   settings: CrafterSettings,
+  primaryOutputQty: number = 1,
 ): Promise<FinalVenue> {
   const { log } = ctx;
 
   const dryRun = async (preset?: string, facilityId?: string) => {
-    const payload: Record<string, unknown> = { id: recipeId, quantity: runs, dry_run: true };
+    const payload: Record<string, unknown> = { id: recipeId, quantity: runs * primaryOutputQty, dry_run: true };
     if (preset) payload.preset = preset;
     if (facilityId) payload.facility_id = facilityId;
     let r = await bot.exec("craft", payload);
@@ -878,35 +879,41 @@ export async function queueCraftJob(
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
-  const recipe = recipes?.find(r => r.recipe_id === recipeId);
-  // Prefer the explicitly-passed limiting output quantity; fall back to the
-  // recipe's first output for single-output recipes.
-  const outputQty = outputPerRun > 0
-    ? outputPerRun
-    : (recipe?.output_quantity || 1);
-  const originalRuns = Math.ceil(quantity / outputQty);
+   const recipe = recipes?.find(r => r.recipe_id === recipeId);
+   // Prefer the explicitly-passed limiting output quantity; fall back to the
+   // recipe's first output for single-output recipes.
+   const outputQty = outputPerRun > 0
+     ? outputPerRun
+     : (recipe?.output_quantity || 1);
+   const originalRuns = Math.ceil(quantity / outputQty);
 
-  if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-  }
+   if (tracker.hasPendingJob(recipeId, originalRuns)) {
+     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+   }
 
-  const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
-  tracker.syncWithServer(serverJobs);
-  if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-  }
+   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
+   tracker.syncWithServer(serverJobs);
+   if (tracker.hasPendingJob(recipeId, originalRuns)) {
+     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+   }
 
-  const maxCraftable = calculateMaxCraftable(recipe, countItemFn);
-  const runs = Math.min(originalRuns, maxCraftable);
+   const maxCraftable = calculateMaxCraftable(recipe, countItemFn);
+   const runs = Math.min(originalRuns, maxCraftable);
 
-  if (runs <= 0) {
-    log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
-    return { success: false, error: "insufficient_inputs" };
-  }
+   if (runs <= 0) {
+     log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
+     return { success: false, error: "insufficient_inputs" };
+   }
 
-  if (runs < originalRuns) {
-    log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
-  }
+   if (runs < originalRuns) {
+     log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
+   }
+
+   // The craft command's `quantity` is the TOTAL OUTPUT of the PRIMARY output,
+   // not a run count. Convert runs -> output units so the server sizes the job
+   // correctly, especially for recipes with high per-run output (e.g. 200x).
+   const primaryOutputQty = recipe?.output_quantity || 1;
+   const craftCommandQuantity = runs * primaryOutputQty;
 
   // Notify (once per recipe per run) when we wanted our own facility but lack one.
   if (venue.missingFacility) {
@@ -936,14 +943,14 @@ export async function queueCraftJob(
       missingFacility: false,
     };
 
-    const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, chunk.runs, chunkVenue, settings);
+    const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, chunk.runs, chunkVenue, settings, primaryOutputQty);
     if (finalVenue.blocked) {
       firstError = firstError || "external_facility_blocked";
       continue;
     }
 
     log("craft", `Queueing ${chunk.runs} runs of ${recipeId} (${finalVenue.label})...`);
-    const craftPayload: Record<string, unknown> = { id: recipeId, quantity: chunk.runs };
+    const craftPayload: Record<string, unknown> = { id: recipeId, quantity: craftCommandQuantity };
     if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
     if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
 

@@ -1280,8 +1280,8 @@ async function executeCraftingPlan(
           if (!baseResp.error && baseResp.result) {
            const baseObj = baseResp.result as Record<string, unknown>;
            const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-           bot.homeBaseFuel = (baseInner.fuel as number) || bot.homeBaseFuel || 0;
-           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) || bot.homeBaseMaxFuel || 0;
+            bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+            bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
          }
        }
 
@@ -1611,8 +1611,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!baseResp.error && baseResp.result) {
         const baseObj = baseResp.result as Record<string, unknown>;
         const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-        bot.homeBaseFuel = (baseInner.fuel as number) || bot.homeBaseFuel || 0;
-        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) || bot.homeBaseMaxFuel || 0;
+        bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
       }
     }
 

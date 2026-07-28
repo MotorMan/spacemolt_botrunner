@@ -80,6 +80,7 @@ function getReturnHomeSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   enableCloak: boolean;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const globalDefaults = all.return_home || {};
@@ -90,6 +91,7 @@ function getReturnHomeSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
     refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
     enableCloak: (botOverrides.enableCloak as boolean) ?? (globalDefaults.enableCloak as boolean) ?? true,
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (globalDefaults.ignoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -110,7 +112,6 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const { bot } = ctx;
 
   const routineParams = (bot as unknown as Record<string, unknown>).routineParams as Record<string, unknown> | undefined;
-  const ignoreBlacklist = routineParams?.ignoreBlacklist === true;
 
   // Wait for any pending action from previous routine to clear
   // This is especially important for emergency return home scenarios
@@ -154,6 +155,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeStation = settings.homeStation;
   const refuelThreshold = settings.refuelThreshold;
   const enableCloak = settings.enableCloak;
+  const ignoreBlacklist = routineParams?.ignoreBlacklist === true || settings.ignoreBlacklist === true;
 
   if (!homeSystem) {
     ctx.log("error", "No home system configured — cannot return home");

@@ -13600,6 +13600,14 @@
       <input type="number" id="set-returnhome-refuelThreshold" min="0" value="${refuelThreshold}" style="width:80px" />
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore blacklist while cloaked</div>
+        <div class="setting-hint">When enabled, return home can pass through blacklisted systems while cloaked. Safe because cloaked ships cannot be attacked.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-returnhome-ignoreBlacklist"${returnHome.ignoreBlacklist ? " checked" : ""}> Ignore blacklist</label>
+    </div>
+
     ${perBotHtml}
 
     <div class="setting-section">
@@ -13640,7 +13648,10 @@
           parseInt(
             document.getElementById("set-returnhome-refuelThreshold").value,
           ) || 50;
-        const s = { homeSystem, homeStation, refuelThreshold };
+        const ignoreBlacklist = document.getElementById(
+          "set-returnhome-ignoreBlacklist",
+        ).checked;
+        const s = { homeSystem, homeStation, refuelThreshold, ignoreBlacklist };
         send({ type: "saveSettings", routine: "return_home", settings: s });
         settings.return_home = Object.assign(settings.return_home || {}, s);
       }

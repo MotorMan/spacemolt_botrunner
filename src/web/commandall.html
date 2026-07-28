@@ -271,6 +271,7 @@
     // ═══════════════════════════════════════════════════════════════════════════
 
     const COMMAND_ALL_DELAY_MS = 100; // .1 second delay between each bot command
+    const BULK_MAX_ITEMS = 100; // max items per bulk storage request (server limit)
 
     /** Render the Command All controls panel */
     function renderCommandAllControls() {
@@ -1078,53 +1079,100 @@
         return;
       }
 
-      // Include all bots: running OR idle
       const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
       if (allBots.length === 0) {
         caLog('<span class="resp-warn">No bots available to command</span>');
         return;
       }
 
-      // Build per-bot queues
-      const botQueues = {};
-      let totalItems = 0;
-      for (const bot of allBots) {
-        const queue = caBuildDepositQueue(bot, mode);
-        if (queue && queue.items.length > 0) {
-          botQueues[bot.username] = queue.items;
-          totalItems += queue.items.length;
+      const buildAndStart = (factionItems) => {
+        const botQueues = {};
+        let totalItems = 0;
+        for (const bot of allBots) {
+          const queue = caBuildDepositQueue(bot, mode, factionItems);
+          if (queue && queue.items.length > 0) {
+            botQueues[bot.username] = queue;
+            totalItems += queue.items.length;
+          }
         }
-      }
 
-      if (totalItems === 0) {
-        caLog('<span class="resp-err">No items to deposit in fleet</span>');
+        if (totalItems === 0) {
+          caLog('<span class="resp-err">No items to deposit in fleet</span>');
+          return;
+        }
+
+        caDepositAllRunning = true;
+        caLog(`<span class="resp-cmd">Starting Fleet Deposit All: ${mode} (${totalItems} items across ${Object.keys(botQueues).length} bots)</span>`);
+        caUpdateDepositQueueStatus();
+
+        for (const botUsername in botQueues) {
+          const bot = allBots.find(b => b.username === botUsername);
+          caProcessBotDepositQueue(bot, botQueues[botUsername]);
+        }
+      };
+
+      if (mode === 'faction_to_station') {
+        caLog('<span class="resp-warn">Loading faction storage first, please wait...</span>');
+        const bot = allBots.find(b => b.state === 'running' || b.state === 'idle');
+        if (!bot) {
+          caLog('<span class="resp-err">No idle or running bot to fetch faction storage</span>');
+          return;
+        }
+        sendExec(bot.username, 'view_faction_storage', undefined, (result) => {
+          if (result.ok && result.data) {
+            const items = result.data.items || result.data.storage || [];
+            commandAllFactionStorage = items.map(item => ({
+              itemId: item.item_id || item.itemId,
+              quantity: item.quantity || item.count || 1,
+            }));
+            caLog(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
+          } else {
+            commandAllFactionStorage = [];
+            caLog(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
+          }
+          buildAndStart(commandAllFactionStorage);
+        });
         return;
       }
 
-      caDepositAllRunning = true;
-      caLog(`<span class="resp-cmd">Starting Fleet Deposit All: ${mode} (${totalItems} items across ${Object.keys(botQueues).length} bots)</span>`);
-      caUpdateDepositQueueStatus();
+      buildAndStart(null);
+    }
 
-      // Start processing each bot's queue in parallel
-      for (const botUsername in botQueues) {
-        const bot = allBots.find(b => b.username === botUsername);
-        caProcessBotDepositQueue(bot, botQueues[botUsername]);
+    /** Translate a queue chunk into the unified `storage` command params
+     *  for a bulk request. The `storage` command moves every item in its
+     *  `items` array in ONE tick. */
+    function caBulkStorageParams(items) {
+      const first = items[0];
+      if (first.command === 'withdraw_items') {
+        return { items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })) };
       }
+      const params = {
+        action: first.action === 'withdraw' ? 'withdraw' : 'deposit',
+        items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })),
+      };
+      if (first.action === 'withdraw') {
+        params.source = first.source === 'faction' ? 'faction' : 'storage';
+        params.target = 'self';
+      } else {
+        params.target = first.target === 'faction' ? 'faction' : 'self';
+        if (first.source) params.source = first.source;
+      }
+      return params;
     }
 
     /** Build deposit queue for a bot based on mode */
-    function caBuildDepositQueue(bot, mode) {
+    function caBuildDepositQueue(bot, mode, factionItems) {
       const cargo = bot.inventory || [];
       const storage = bot.storage || [];
-
       const items = [];
+      let command = 'storage';
 
       if (mode === 'cargo_to_station') {
         for (const item of cargo) {
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'cargo' });
+            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'cargo', action: 'deposit' });
           }
         }
       } else if (mode === 'cargo_to_faction') {
@@ -1132,7 +1180,7 @@
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' });
+            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'cargo', action: 'deposit' });
           }
         }
       } else if (mode === 'station_to_faction') {
@@ -1140,71 +1188,64 @@
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage' });
+            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage', action: 'deposit' });
           }
         }
       } else if (mode === 'station_to_cargo') {
+        command = 'withdraw_items';
         for (const item of storage) {
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'storage', action: 'withdraw' });
+            items.push({ item_id: itemId, quantity: qty, source: 'storage', action: 'withdraw', command: 'withdraw_items' });
           }
         }
       } else if (mode === 'faction_to_station') {
-        // This would need faction storage data, but for now assume not implemented or handle differently
-        // For simplicity, skip or note that faction withdrawal is handled separately
-        caLog(`<span class="resp-warn">Faction to Station not implemented in Command All</span>`);
-        return null;
+        const fItems = factionItems || [];
+        for (const item of fItems) {
+          const itemId = item.itemId || item.item_id;
+          const qty = item.quantity || item.count || 1;
+          if (qty > 0 && itemId) {
+            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'faction', action: 'deposit' });
+          }
+        }
       }
 
-      return { items };
+      return { mode, command, items, index: 0 };
     }
 
-    /** Process a single bot's deposit queue sequentially */
+    /** Process a single bot's deposit queue sequentially in bulk */
     function caProcessBotDepositQueue(bot, queue) {
-      if (!caDepositAllRunning || queue.length === 0) return;
+      if (!caDepositAllRunning || !queue || queue.items.length === 0) {
+        caCheckDepositQueuesComplete();
+        return;
+      }
 
       let index = 0;
 
       function sendNext() {
-        if (!caDepositAllRunning || index >= queue.length) {
+        if (!caDepositAllRunning || index >= queue.items.length) {
           caCheckDepositQueuesComplete();
           return;
         }
 
-        const item = queue[index];
+        const chunk = queue.items.slice(index, index + BULK_MAX_ITEMS);
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const verb = item.action === 'withdraw' ? 'withdrawing' : 'depositing';
-        const targetDesc = item.target === 'faction' ? 'faction' : item.action === 'withdraw' ? 'cargo' : 'station';
-        caLog(`<span class="resp-cmd">${ts} > ${esc(bot.username)} ${verb} ${item.quantity}x ${item.item_id} to ${targetDesc}</span>`);
+        const verb = chunk[0].action === 'withdraw' ? 'withdrawing' : 'depositing';
+        const targetDesc = chunk[0].target === 'faction' ? 'faction' : chunk[0].action === 'withdraw' ? 'cargo' : 'station';
+        caLog(`<span class="resp-cmd">${ts} > ${esc(bot.username)} ${verb} ${chunk.length} item(s) in bulk (${index + 1}-${index + chunk.length}/${queue.items.length}) to ${targetDesc}</span>`);
 
-        let command;
-        const params = {
-          item_id: item.item_id,
-          quantity: item.quantity,
-        };
-
-        if (item.action === 'withdraw') {
-          command = 'withdraw_items';
-          params.source = item.source;
-        } else {
-          command = 'deposit_items';
-          params.source = item.source;
-          if (item.target === 'faction') {
-            params.target = item.target;
-          }
-        }
-
-        sendExec(bot.username, command, params, (result) => {
+        const params = caBulkStorageParams(chunk);
+        const moveCommand = queue.command || 'storage';
+        sendExec(bot.username, moveCommand, params, (result) => {
           if (result.ok) {
             caLog(`<span class="resp-ok">${esc(bot.username)}: OK</span>`);
           } else {
             caLog(`<span class="resp-err">${esc(bot.username)}: Failed: ${esc(result.error || 'unknown')}</span>`);
           }
 
-          index++;
-          setTimeout(sendNext, 10000);
+          index += chunk.length;
+          setTimeout(sendNext, 1000);
         });
       }
 

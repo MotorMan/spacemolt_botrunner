@@ -466,11 +466,11 @@ interface TransportPassenger {
   citizenId: string;
   name: string;
   accommodationClass: "economy" | "business" | "first";
-  citizenship: string;
+  citizenship?: string;
   destination: string;
   destinationName: string;
   destinationSystem?: string;
-  fare: number;
+  fare?: number;
   bio: string;
   routeData: unknown;
   loadedAt: string;
@@ -530,6 +530,7 @@ interface StationPassenger {
   destination_name: string;
   destination_system?: string;
   bio?: string;
+  estimated_fare?: number;
 }
 
 interface StationPassengersResponse {
@@ -542,11 +543,11 @@ interface AboardPassenger {
   citizen_id: string;
   name: string;
   class: string;
-  citizenship: string;
+  citizenship?: string;
   destination: string;
   destination_name: string;
   destination_system?: string;
-  fare: number;
+  fare?: number;
   bio: string;
   ticks_remaining: number;
   route_data?: unknown;
@@ -980,17 +981,17 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
     return undefined;
   };
   const berthsRaw = inner.berths && typeof inner.berths === "object" ? (inner.berths as Record<string, unknown>) : null;
-  const berthsUsedRaw = inner.berths_used && typeof inner.berths_used === "object" ? (inner.berths_used as Record<string, unknown>) : null;
-  const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
-  const economy = hasBerths
-    ? num(berthsRaw!.economy) ?? 0
-    : (num(inner.economy_berths) ?? num(inner.economyBerths) ?? num(inner.economy) ?? 0);
-  const business = hasBerths
-    ? num(berthsRaw!.business) ?? 0
-    : (num(inner.business_berths) ?? num(inner.businessBerths) ?? num(inner.business) ?? 0);
-  const first = hasBerths
-    ? num(berthsRaw!.first) ?? 0
-    : (num(inner.first_berths) ?? num(inner.firstBerths) ?? num(inner.first) ?? 0);
+  const extractBerthCount = (val: unknown): number => {
+    if (typeof val === "number") return val;
+    if (val && typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      return num(obj.total) ?? num(obj.free) ?? 0;
+    }
+    return 0;
+  };
+  const economy = berthsRaw ? extractBerthCount(berthsRaw.economy) : 0;
+  const business = berthsRaw ? extractBerthCount(berthsRaw.business) : 0;
+  const first = berthsRaw ? extractBerthCount(berthsRaw.first) : 0;
   for (let i = 0; i < passengers.length; i++) {
     const p = passengers[i];
     if (typeof p === "object" && p !== null) {
@@ -998,16 +999,15 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
       if (po.destination_system === undefined && po.destinationSystem !== undefined) {
         po.destination_system = po.destinationSystem;
       }
+      if (po.fare === undefined && po.base_fare !== undefined) {
+        po.fare = po.base_fare;
+      }
     }
   }
   return {
     passengers,
     berths: { economy, business, first },
-    berths_used: {
-      economy: num(berthsUsedRaw?.economy) ?? 0,
-      business: num(berthsUsedRaw?.business) ?? 0,
-      first: num(berthsUsedRaw?.first) ?? 0,
-    },
+    berths_used: { economy: 0, business: 0, first: 0 },
   };
 }
 
@@ -1313,7 +1313,7 @@ for (const p of pois) {
           const poiId = (p.id || p.poi_id || p.name || "") as string;
           if (!poiId) continue;
           if (blockPirateStations && isPirateStation(poiId)) continue;
-          const pResp = await bot.exec("list_station_passengers", { station: poiId });
+          const pResp = await bot.exec("list_station_passengers");
          if (pResp.error || !pResp.result) continue;
          const pData = parseStationPassengers(pResp.result);
          if (pData && pData.count > 0) {
@@ -2212,7 +2212,7 @@ if (state && state.status !== "idle") {
         }
         
         if (loadedThisLeg > 0) {
-          const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
+          const loadResp = await bot.exec("load_passenger", { id: leg.poi });
           if (loadResp.error) {
             ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
           }
@@ -2427,11 +2427,11 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           citizenId: p.citizen_id || p.name,
           name: p.name,
           accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
-          citizenship: p.citizenship,
+          citizenship: p.citizenship || "",
           destination: p.destination,
           destinationName: p.destination_name,
           destinationSystem: (p as any).destinationSystem || p.destination_system,
-          fare: p.fare,
+          fare: p.fare || 0,
           bio: p.bio,
           loadedAt: new Date().toISOString(),
           status: "boarded",
@@ -2444,12 +2444,12 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         citizenId: p.citizen_id || p.name,
         name: p.name,
         accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
-        citizenship: p.citizenship,
+        citizenship: p.citizenship || "",
         destination: p.destination,
         destinationName: p.destination_name,
         destinationSystem: (p as any).destinationSystem || p.destination_system,
-        fare: p.fare,
-        bio: p.bio,
+        fare: p.fare || 0,
+        bio: p.bio || "",
         routeData: p.route_data || null,
         loadedAt: new Date().toISOString(),
         status: "boarded",
@@ -2706,7 +2706,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
           citizenId,
           name: p.name,
           accommodationClass: p.accommodationClass,
-          citizenship: p.citizenship,
+          citizenship: p.citizenship || "",
           destination: p.destination,
           destinationName: p.destinationName,
           destinationSystem: p.destinationSystem,

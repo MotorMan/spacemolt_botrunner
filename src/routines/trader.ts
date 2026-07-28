@@ -266,7 +266,7 @@ interface AboardPassenger {
 
 async function getPassengersAtStation(ctx: RoutineContext, stationId: string, systemId: string): Promise<StationPassenger[]> {
   const { bot } = ctx;
-  const resp = await bot.exec("list_station_passengers", { station: stationId });
+  const resp = await bot.exec("list_station_passengers");
   if (resp.error || !resp.result) return [];
 
   const result = resp.result as Record<string, unknown>;
@@ -2940,7 +2940,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               
               if (passengersToLoad.length > 0) {
                 ctx.log("trade", `Found ${passengersToLoad.length} passengers going to ${currentRoute.destPoiName} - loading...`);
-                const loadResp = await bot.exec("load_passenger", { destination: currentRoute.destPoi });
+                const loadResp = await bot.exec("load_passenger", { id: currentRoute.destPoi });
                 if (!loadResp.error) {
                   await ctx.sleep(11000);
                   // Verify passengers loaded

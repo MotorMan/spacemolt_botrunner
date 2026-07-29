@@ -33410,12 +33410,12 @@ ignoreBlacklist: document.getElementById(
 
             function namesMatch(a, b) {
               if (!a || !b) return false;
-              const na = String(a)
+              let na = String(a)
                 .toLowerCase()
                 .replace(/^stored at\s+/i, "")
                 .replace(/^loaded on\s*carrier\s*/i, "")
                 .trim();
-              const nb = String(b)
+              let nb = String(b)
                 .toLowerCase()
                 .replace(/^stored at\s+/i, "")
                 .replace(/^loaded on\s*carrier\s*/i, "")
@@ -33423,6 +33423,17 @@ ignoreBlacklist: document.getElementById(
               if (!na || !nb) return false;
               if (na === nb) return true;
               if (na.includes(nb) || nb.includes(na)) return true;
+
+              const stripSuffix = (s) =>
+                s
+                  .replace(/\b(station|dock|outpost|terminal|depot|base|port|harbor|landing)\b/gi, "")
+                  .trim();
+              na = stripSuffix(na);
+              nb = stripSuffix(nb);
+              if (!na || !nb) return false;
+              if (na === nb) return true;
+              if (na.includes(nb) || nb.includes(na)) return true;
+
               const wa = na.split(/\s+/).filter(Boolean);
               const wb = nb.split(/\s+/).filter(Boolean);
               if (!wa.length || !wb.length) return false;
@@ -33455,13 +33466,57 @@ ignoreBlacklist: document.getElementById(
 
             const shipStationName = normalizeStationName(rawLocation);
 
+            const normalizedBotLocation = botLocation
+              .toLowerCase()
+              .replace(/^stored at\s+/i, "")
+              .replace(/^loaded on\s*carrier\s*/i, "")
+              .replace(/_/g, " ")
+              .trim();
+            const normalizedShipLocation = rawLocation
+              .toLowerCase()
+              .replace(/^stored at\s+/i, "")
+              .replace(/^loaded on\s*carrier\s*/i, "")
+              .replace(/_/g, " ")
+              .trim();
+            const directMatch =
+              normalizedBotLocation &&
+              normalizedShipLocation &&
+              (normalizedBotLocation.includes(normalizedShipLocation) ||
+                normalizedShipLocation.includes(normalizedBotLocation));
+            const alphaOnlyBot = normalizedBotLocation.replace(/[^a-z0-9]/g, "");
+            const alphaOnlyShip = normalizedShipLocation.replace(/[^a-z0-9]/g, "");
+            const alphaMatch =
+              alphaOnlyBot &&
+              alphaOnlyShip &&
+              (alphaOnlyBot.includes(alphaOnlyShip) ||
+                alphaOnlyShip.includes(alphaOnlyBot));
+
             const isAtCurrentStation =
               !isLoadedOnCarrier &&
               ((shipSystemId &&
                 botSystem &&
                 shipSystemId.toLowerCase() === botSystem.toLowerCase()) ||
                 namesMatch(loc, botLocation) ||
-                namesMatch(shipStationName, currentStationName));
+                namesMatch(shipStationName, currentStationName) ||
+                directMatch ||
+                alphaMatch);
+
+            if (shipSystemId || botSystem || rawLocation || botLocation) {
+              console.log(
+                "[fleet-match]",
+                esc(username),
+                "| ship:",
+                esc(rawLocation),
+                "| shipSystemId:",
+                shipSystemId,
+                "| botSystem:",
+                botSystem,
+                "| botLocation:",
+                botLocation,
+                "| isAtCurrentStation:",
+                isAtCurrentStation,
+              );
+            }
 
             const activeShip = shipyardShipData?.ship || shipyardShipData || {};
             const activeShipName = (

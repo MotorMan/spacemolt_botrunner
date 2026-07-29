@@ -1446,11 +1446,11 @@ shipSpeed = 1;
               (baseObj.poi_id as string) ||
               "";
             if (poiId === homeStationId || baseId === homeStationId) {
-              const baseFuel = (baseObj.fuel as number) || 0;
-              const baseMaxFuel = (baseObj.max_fuel as number) || 0;
-              if (baseFuel > 0 || baseMaxFuel > 0) {
-                this.homeBaseFuel = baseFuel;
-                this.homeBaseMaxFuel = baseMaxFuel;
+              const baseFuel = baseObj.fuel as number | undefined;
+              const baseMaxFuel = baseObj.max_fuel as number | undefined;
+              if (typeof baseFuel === "number") this.homeBaseFuel = baseFuel;
+              if (typeof baseMaxFuel === "number") this.homeBaseMaxFuel = baseMaxFuel;
+              if (typeof baseFuel === "number" || typeof baseMaxFuel === "number") {
                 this.homeBaseFuelPoi = homeStationId;
                 this.notifyStateChanged();
               }
@@ -1468,11 +1468,11 @@ shipSpeed = 1;
           const homeStationId =
             ((loadSettings().general as Record<string, unknown>)?.factionStorageStation as string) || "";
           if (homeStationId && baseId === homeStationId) {
-            const baseFuel = (baseObj.fuel as number) || 0;
-            const baseMaxFuel = (baseObj.max_fuel as number) || 0;
-            if (baseFuel > 0 || baseMaxFuel > 0) {
-              this.homeBaseFuel = baseFuel;
-              this.homeBaseMaxFuel = baseMaxFuel;
+            const baseFuel = baseObj.fuel as number | undefined;
+            const baseMaxFuel = baseObj.max_fuel as number | undefined;
+            if (typeof baseFuel === "number") this.homeBaseFuel = baseFuel;
+            if (typeof baseMaxFuel === "number") this.homeBaseMaxFuel = baseMaxFuel;
+            if (typeof baseFuel === "number" || typeof baseMaxFuel === "number") {
               this.homeBaseFuelPoi = homeStationId;
               this.notifyStateChanged();
             }

@@ -1076,6 +1076,7 @@ async function waitForAllCompletions(
    tracker: CraftQueueTracker,
    bot: any,
    recipes: Recipe[],
+   settings?: CrafterSettings | null,
 ): Promise<string[]> {
    const { log } = ctx;
    const crafted: string[] = [];
@@ -1085,20 +1086,33 @@ async function waitForAllCompletions(
      recipeNames.set(r.recipe_id, r.name);
    }
 
-    let lastSync = 0;
-    let lastStatusReport = Date.now();
-    let remainingItems = [...initialQueuedItems];
+     let lastSync = 0;
+     let lastStatusReport = Date.now();
+     let lastBaseCheck = 0;
+     const BASE_CHECK_COOLDOWN = 60000;
+     let remainingItems = [...initialQueuedItems];
 
-    while (bot.state === "running" && remainingItems.length > 0) {
-      await ctx.sleep(5000);
+     while (bot.state === "running" && remainingItems.length > 0) {
+       await ctx.sleep(5000);
 
-      const now = Date.now();
-      if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-        const serverJobs = await checkCraftingQueue(bot, recipes);
-        tracker.syncWithServer(serverJobs);
-        tracker.save();
-        lastSync = now;
-      }
+       const now = Date.now();
+       if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
+         const serverJobs = await checkCraftingQueue(bot, recipes);
+         tracker.syncWithServer(serverJobs);
+         tracker.save();
+         lastSync = now;
+       }
+
+       if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
+         const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+         if (!baseResp.error && baseResp.result) {
+           const baseObj = baseResp.result as Record<string, unknown>;
+           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+           bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+         }
+         lastBaseCheck = now;
+       }
 
       const stillQueued: typeof remainingItems = [];
       for (const item of remainingItems) {
@@ -1267,23 +1281,27 @@ async function executeCraftingPlan(
       // station so a roaming crafter reads the right storage.
        await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
 
-       // Refresh home station fuel via get_base so fuel_reserve goals see the
-       // actual station fuel level after jobs complete between loop iterations.
-       const hasFuelReserveGoal = goalsToAchieve.some(g => {
-         const rId = recipeIdForGoal(g);
-         if (!rId) return false;
-         const r = recipeIndex.get(rId);
-         return !!r && outputsFuelReserve(r);
-       });
-        if (hasFuelReserveGoal && settings?.craftingHomeBase) {
+        // Refresh home station fuel via get_base every pass so fuel_reserve
+        // goals always see the actual station fuel level after jobs complete
+        // between loop iterations. Do this unconditionally when a home base is
+        // configured — it is the only source of truth for base.fuel and the
+        // crafter cannot recover from a stale value.
+        if (settings?.craftingHomeBase) {
           const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
           if (!baseResp.error && baseResp.result) {
-           const baseObj = baseResp.result as Record<string, unknown>;
-           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-            bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-            bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-         }
-       }
+            const baseObj = baseResp.result as Record<string, unknown>;
+            const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+            const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+            const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+            if (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel) {
+              ctx.log("craft", `[get_base] ${settings.craftingHomeBase}: fuel=${newFuel}/${newMaxFuel}`);
+            }
+            bot.homeBaseFuel = newFuel;
+            bot.homeBaseMaxFuel = newMaxFuel;
+          } else if (baseResp.error) {
+            ctx.log("warn", `[get_base] failed for ${settings.craftingHomeBase}: ${baseResp.error.message}`);
+          }
+        }
 
 
       // Recompute which goals still need production using live stock + in-flight output.
@@ -1363,7 +1381,7 @@ async function executeCraftingPlan(
      return { recipeId, quantity: target, outputQty };
    }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
 
-   const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes);
+    const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
    crafted.push(...completed);
 
    for (const g of goalsToAchieve) {

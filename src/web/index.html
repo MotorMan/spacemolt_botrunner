@@ -33280,18 +33280,40 @@ ignoreBlacklist: document.getElementById(
             // For ships, location might be "System - Station" format or "loaded on carrier..." format
             // We need to extract the system ID for comparison
             let shipSystemId = "";
-            if (
+            if (s.system && !s.system.toLowerCase().includes("loaded on")) {
+              shipSystemId =
+                Object.keys(mapData).find(
+                  (key) => mapData[key]?.name === s.system,
+                ) || s.system;
+            } else if (
               rawLocation &&
               !rawLocation.toLowerCase().includes("loaded on")
             ) {
-              // If it's a system name like "Jita - Station", try to find the system ID
-              const systemName = rawLocation.split(" - ")[0];
-              shipSystemId =
-                Object.keys(mapData).find(
-                  (key) => mapData[key]?.name === systemName,
-                ) || systemName;
+              if (rawLocation.includes(" - ")) {
+                const systemName = rawLocation.split(" - ")[0];
+                shipSystemId =
+                  Object.keys(mapData).find(
+                    (key) => mapData[key]?.name === systemName,
+                  ) || systemName;
+              } else {
+                const lower = rawLocation
+                  .toLowerCase()
+                  .replace(/^stored at\s+/i, "")
+                  .trim();
+                for (const [sysId, sys] of Object.entries(mapData)) {
+                  for (const poi of (sys.pois || [])) {
+                    const poiName = (poi.name || poi.id || "").toLowerCase();
+                    if (poiName === lower) {
+                      shipSystemId = sysId;
+                      break;
+                    }
+                  }
+                  if (shipSystemId) break;
+                }
+                if (!shipSystemId) shipSystemId = rawLocation;
+              }
             } else {
-              shipSystemId = rawLocation; // Keep as-is for loaded ships (will be "loaded on carrier...")
+              shipSystemId = rawLocation;
             }
             const loc = resolveLocation(rawLocation) || rawLocation;
             const isActive = id === activeShipId || s.active || s.is_active;

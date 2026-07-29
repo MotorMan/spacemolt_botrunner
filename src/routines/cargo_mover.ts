@@ -255,7 +255,7 @@ function isThisBotsTransitCargo(
   settings: CargoMoverSettings,
 ): boolean {
   const lower = itemId.toLowerCase();
-  if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+  if (isBulkSkipItem(itemId)) return false;
 
   const effectiveDest = settings.destinationStation;
   const isConfigured = settings.items.some((ci) => {
@@ -927,8 +927,7 @@ async function bulkStationToFaction(
   const candidates = bot.storage.filter((i) => {
     if (i.quantity <= 0) return false;
     if (excludeFuel) {
-      const lower = i.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+      if (isBulkSkipItem(i.itemId)) return false;
     }
     if (isPackageItem(i.itemId)) return false;
     return true;
@@ -1705,8 +1704,7 @@ async function runBulkMovePhase(
     ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full (orphan cargo present: ${bulkHasOrphanCargo}) — emptying to storage before loading`);
     for (const item of [...bot.inventory]) {
       if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      if (isBulkSkipItem(item.itemId)) continue;
       const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (!dResp.error) {
         ctx.log("cargo", `🧹 Bulk startup: emptied ${item.quantity}x ${item.name} to faction storage`);
@@ -2068,9 +2066,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // we're already at the destination — the cargo is (or was) dropped there.
       await bot.refreshCargo();
       const hasCargo = bot.inventory.some((item) => {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-        return gSettings.items.some((ci) => ci.itemId === item.itemId);
+      if (isBulkSkipItem(item.itemId)) return false;
+      return gSettings.items.some((ci) => ci.itemId === item.itemId);
       });
 
       if (hasCargo && gDestSystem && !botIsAtStation(bot, gSettings.destinationStation)) {
@@ -2359,10 +2356,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     if (bot.docked && bot.inventory.length > 0 && cargoFullness >= 0.9) {
       ctx.log("cargo", `🧹 Startup: hold is ${Math.round(cargoFullness * 100)}% full — emptying cargo to storage before loading`);
       const startupClear = bot.inventory.filter(item => {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-        // When the hold is full we dump everything (transit flags don't matter —
-        // a full hold must be cleared to make progress).
+        if (isBulkSkipItem(item.itemId)) return false;
         return true;
       });
       for (const item of startupClear) {
@@ -2776,9 +2770,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshCargo();
     if (bot.inventory.length > 0) {
       const itemsToClear = bot.inventory.filter(item => {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-        // Never clear cargo this bot is actually supposed to be transporting.
+        if (isBulkSkipItem(item.itemId)) return false;
         return !isThisBotsTransitCargo(item.itemId, bot.username, settings);
       });
       if (itemsToClear.length > 0) {

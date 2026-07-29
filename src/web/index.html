@@ -2497,14 +2497,6 @@
                 updateChatBotSelect();
                 // Update the home-station fuel from the live bots[] snapshot.
                 refreshHomeStationFuel();
-                if (
-                  shipyardMode === "bots" &&
-                  shipyardSelectedBot &&
-                  shipyardActivePanel === "fleet" &&
-                  shipyardFleetData
-                ) {
-                  renderFleetInline(shipyardSelectedBot, shipyardFleetData);
-                }
                 // Update skills data for live updates (when debug logging is disabled)
                 if (skillsLoaded && skillsData && skillsData.bots) {
                   for (const bot of bots) {
@@ -33500,23 +33492,6 @@ ignoreBlacklist: document.getElementById(
                 namesMatch(shipStationName, currentStationName) ||
                 directMatch ||
                 alphaMatch);
-
-            if (shipSystemId || botSystem || rawLocation || botLocation) {
-              console.log(
-                "[fleet-match]",
-                esc(username),
-                "| ship:",
-                esc(rawLocation),
-                "| shipSystemId:",
-                shipSystemId,
-                "| botSystem:",
-                botSystem,
-                "| botLocation:",
-                botLocation,
-                "| isAtCurrentStation:",
-                isAtCurrentStation,
-              );
-            }
 
             const activeShip = shipyardShipData?.ship || shipyardShipData || {};
             const activeShipName = (

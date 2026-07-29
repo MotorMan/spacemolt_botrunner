@@ -2497,6 +2497,14 @@
                 updateChatBotSelect();
                 // Update the home-station fuel from the live bots[] snapshot.
                 refreshHomeStationFuel();
+                if (
+                  shipyardMode === "bots" &&
+                  shipyardSelectedBot &&
+                  shipyardActivePanel === "fleet" &&
+                  shipyardFleetData
+                ) {
+                  renderFleetInline(shipyardSelectedBot, shipyardFleetData);
+                }
                 // Update skills data for live updates (when debug logging is disabled)
                 if (skillsLoaded && skillsData && skillsData.bots) {
                   for (const bot of bots) {
@@ -33288,6 +33296,33 @@ ignoreBlacklist: document.getElementById(
             const loc = resolveLocation(rawLocation) || rawLocation;
             const isActive = id === activeShipId || s.active || s.is_active;
 
+            function namesMatch(a, b) {
+              if (!a || !b) return false;
+              const na = String(a)
+                .toLowerCase()
+                .replace(/^stored at\s+/i, "")
+                .replace(/^loaded on\s*carrier\s*/i, "")
+                .trim();
+              const nb = String(b)
+                .toLowerCase()
+                .replace(/^stored at\s+/i, "")
+                .replace(/^loaded on\s*carrier\s*/i, "")
+                .trim();
+              if (!na || !nb) return false;
+              if (na === nb) return true;
+              if (na.includes(nb) || nb.includes(na)) return true;
+              const wa = na.split(/\s+/).filter(Boolean);
+              const wb = nb.split(/\s+/).filter(Boolean);
+              if (!wa.length || !wb.length) return false;
+              const [shorter, longer] =
+                wa.length <= wb.length ? [wa, wb] : [wb, wa];
+              const allMatch = shorter.every((w) =>
+                longer.some((lw) => lw.startsWith(w) || w.startsWith(lw)),
+              );
+              if (!allMatch) return false;
+              return shorter.length / longer.length >= 0.5;
+            }
+
             // Parse stats — API returns "71/100" string format or numeric fields
             function parseStat(val) {
               if (val == null) return null;
@@ -33368,6 +33403,33 @@ ignoreBlacklist: document.getElementById(
             const botLocation = botObj?.location || "";
             const botSystem = botObj?.system || "";
 
+            function namesMatch(a, b) {
+              if (!a || !b) return false;
+              const na = String(a)
+                .toLowerCase()
+                .replace(/^stored at\s+/i, "")
+                .replace(/^loaded on\s*carrier\s*/i, "")
+                .trim();
+              const nb = String(b)
+                .toLowerCase()
+                .replace(/^stored at\s+/i, "")
+                .replace(/^loaded on\s*carrier\s*/i, "")
+                .trim();
+              if (!na || !nb) return false;
+              if (na === nb) return true;
+              if (na.includes(nb) || nb.includes(na)) return true;
+              const wa = na.split(/\s+/).filter(Boolean);
+              const wb = nb.split(/\s+/).filter(Boolean);
+              if (!wa.length || !wb.length) return false;
+              const [shorter, longer] =
+                wa.length <= wb.length ? [wa, wb] : [wb, wa];
+              const allMatch = shorter.every((w) =>
+                longer.some((lw) => lw.startsWith(w) || w.startsWith(lw)),
+              );
+              if (!allMatch) return false;
+              return shorter.length / longer.length >= 0.5;
+            }
+
             function normalizeStationName(loc) {
               if (!loc) return "";
               let s = String(loc)
@@ -33376,22 +33438,6 @@ ignoreBlacklist: document.getElementById(
                 .trim();
               if (s.includes(" - ")) s = s.split(" - ").pop().trim();
               return s.toLowerCase().replace(/_/g, " ");
-            }
-
-            function stationNamesMatch(a, b) {
-              if (!a || !b) return false;
-              if (a === b) return true;
-              if (a.includes(b) || b.includes(a)) return true;
-              const wordsA = a.split(/\s+/).filter(Boolean);
-              const wordsB = b.split(/\s+/).filter(Boolean);
-              if (!wordsA.length || !wordsB.length) return false;
-              const [shorter, longer] =
-                wordsA.length <= wordsB.length ? [wordsA, wordsB] : [wordsB, wordsA];
-              const allMatch = shorter.every(
-                (w) => longer.some((lw) => lw.startsWith(w) || w.startsWith(lw)),
-              );
-              if (!allMatch) return false;
-              return shorter.length / longer.length >= 0.5;
             }
 
             const currentStationName = botObj
@@ -33403,11 +33449,14 @@ ignoreBlacklist: document.getElementById(
               : "";
 
             const shipStationName = normalizeStationName(rawLocation);
+
             const isAtCurrentStation =
               !isLoadedOnCarrier &&
-              currentStationName &&
-              shipStationName &&
-              stationNamesMatch(currentStationName, shipStationName);
+              ((shipSystemId &&
+                botSystem &&
+                shipSystemId.toLowerCase() === botSystem.toLowerCase()) ||
+                namesMatch(loc, botLocation) ||
+                namesMatch(shipStationName, currentStationName));
 
             const activeShip = shipyardShipData?.ship || shipyardShipData || {};
             const activeShipName = (

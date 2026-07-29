@@ -333,14 +333,6 @@ function isHazardousItem(itemId: string): boolean {
   return item?.hazardous === true;
 }
 
-/** Dynamically-generated packages (`package:*`). They are NOT in the local
- *  catalog and we must NOT inspect them (each inspect is a rate-limited network
- *  command that gets us banned in bulk), so we never load or move them. Their
- *  cargo size is the fixed PACKAGE_CARGO_SIZE constant from common.ts. */
-function isPackageItem(itemId: string): boolean {
-  return itemId.startsWith("package:");
-}
-
 /** Operational cells that must NEVER be deposited at the destination — they
  *  power the ship itself (premium cells, energy cells). Regular `fuel_cell` is
  *  treated as ordinary cargo and delivered normally; `military_fuel_cell` is
@@ -929,7 +921,6 @@ async function bulkStationToFaction(
     if (excludeFuel) {
       if (isBulkSkipItem(i.itemId)) return false;
     }
-    if (isPackageItem(i.itemId)) return false;
     return true;
   });
   if (candidates.length === 0) return 0;
@@ -1236,13 +1227,6 @@ function findMoveJobs(
   ctx.log("cargo", `findMoveJobs: bot.storage has ${bot.storage.length} items, bot.factionStorage has ${bot.factionStorage.length} items`);
 
    for (const configItem of settings.items) {
-    // Packages are dynamically generated, not in the catalog, and must never be
-    // loaded (no inspect, fixed size) — skip them entirely from planning.
-    if (isPackageItem(configItem.itemId)) {
-      ctx.log("cargo", `  ${configItem.itemName}: skipping package:* (not cargo-mover eligible)`);
-      continue;
-    }
-
     // Skip hazardous items unless the bot has lead-lined cargo hold modules.
     if (isHazardousItem(configItem.itemId) && bot.hasLeadLinedCargoHold === false) {
       ctx.log("cargo", `  ${configItem.itemName}: skipping hazardous item (no lead-lined cargo module)`);
@@ -1554,13 +1538,9 @@ function planBulkItems(
 ): Array<{ itemId: string; itemName: string; quantity: number }> {
 const { bot } = ctx;
    let candidates = sourceItems.filter((i) => {
-     if (!i.itemId || i.quantity <= 0) return false;
-     if (isBulkSkipItem(i.itemId)) return false;
-     // Never load dynamically-generated packages — they're not in the catalog
-     // and inspecting them to learn their size would spam rate-limited commands
-     // and get us banned. They're blocked from the cargo mover entirely.
-     if (isPackageItem(i.itemId)) return false;
-// Skip hazardous items unless the bot has lead-lined cargo hold modules.
+      if (!i.itemId || i.quantity <= 0) return false;
+      if (isBulkSkipItem(i.itemId)) return false;
+      // Skip hazardous items unless the bot has lead-lined cargo hold modules.
       if (isHazardousItem(i.itemId) && bot.hasLeadLinedCargoHold === false) {
         ctx.log("cargo", `  ⏭️ Skipping ${i.name}: hazardous item (no lead-lined cargo module)`);
         return false;
@@ -1691,14 +1671,14 @@ async function runBulkMovePhase(
   await bot.refreshCargo();
   const bulkFullness = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 1;
   // In bulk mode EVERY item is re-loaded from faction storage anyway, so any
-  // non-fuel / non-package cargo left in the hold (a prior interrupted run, a
-  // hold that's full-but-under-90% on a large ship, etc.) must be dumped before
-  // planning — otherwise the load loop sees no free space and bails with
-  // "could not load anything". The >=0.9 heuristic alone misses the under-90%
-  // case on big holds, which is exactly how a bot gets stuck hauling a full
-  // cargo it can't unload. Dump whenever orphaned cargo is present.
+  // non-fuel cargo left in the hold (a prior interrupted run, a hold that's
+  // full-but-under-90% on a large ship, etc.) must be dumped before planning —
+  // otherwise the load loop sees no free space and bails with "could not load
+  // anything". The >=0.9 heuristic alone misses the under-90% case on big
+  // holds, which is exactly how a bot gets stuck hauling a full cargo it can't
+  // unload. Dump whenever orphaned cargo is present.
   const bulkHasOrphanCargo = bot.inventory.some(
-    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && !isPackageItem(i.itemId),
+    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId),
   );
   if (bot.inventory.length > 0 && (bulkFullness >= 0.9 || bulkHasOrphanCargo)) {
     ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full (orphan cargo present: ${bulkHasOrphanCargo}) — emptying to storage before loading`);
@@ -1739,9 +1719,8 @@ async function runBulkMovePhase(
   }
 
   // ── Plan what to move ─────────────────────────────────────
-  // Pre-inspect any packages in source storage so their true cargo size is
-  // known before planning — packages are not in the catalog and default to
-  // size 1, which causes massive overbooking of cargo space.
+  // Packages resolve to the fixed PACKAGE_CARGO_SIZE via getItemSize, so no
+  // pre-inspection is needed.
   const planned = planBulkItems(ctx, bot.factionStorage, settings, destHas);
   if (planned.length === 0) {
     if (settings.bulkSeedMode) {
@@ -1789,8 +1768,8 @@ async function runBulkMovePhase(
     const freeSpace = Math.max(0, cargoMax - cargoUsed);
     if (freeSpace <= 0) break;
 
-    // Package IDs are excluded from `planned` (blocked entirely) and resolve to
-    // the fixed PACKAGE_CARGO_SIZE, so no inspect/network call is ever needed.
+    // Package IDs resolve to the fixed PACKAGE_CARGO_SIZE, so no inspect/network
+    // call is ever needed.
     //
     // CRITICAL: allocate the hold GREEDILY across items so the TOTAL weight moved
     // this pass never exceeds freeSpace. The previous code computed `maxFit =
@@ -1859,7 +1838,6 @@ async function runBulkMovePhase(
     .filter((item) => {
       if (item.quantity <= 0) return false;
       if (isBulkSkipItem(item.itemId)) return false;
-      if (isPackageItem(item.itemId)) return false;
       return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells) > 0;
     })
     .map((item) => ({
@@ -2235,7 +2213,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           location: `${bot.system}/${bot.poi}`,
         });
         await bot.refreshCargo();
-        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && !isPackageItem(i.itemId))) {
+        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId))) {
           await deliverCargoAboard(ctx, gSettings);
         }
         for (const item of gSettings.items) {
@@ -2817,10 +2795,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshStatus();
 
     // NOTE: items resolve their cargo size from the LOCAL catalog (catalog.json)
-    // via getItemSize — no network call. Packages (`package:*`) are blocked from
-    // loading entirely and use a fixed size, so there is nothing to pre-inspect
-    // and we must never issue `inspect` commands (they're rate-limited and would
-    // get us banned in bulk).
+    // via getItemSize — no network call. Packages (`package:*`) use the fixed
+    // PACKAGE_CARGO_SIZE and are now eligible to move.
     // Re-find jobs now that storage is updated with cleared items
     let jobs = findMoveJobs(ctx, settings, sourceSystem, destSystem);
     if (jobs.length === 0) {

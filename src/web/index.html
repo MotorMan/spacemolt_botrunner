@@ -33296,33 +33296,6 @@ ignoreBlacklist: document.getElementById(
             const loc = resolveLocation(rawLocation) || rawLocation;
             const isActive = id === activeShipId || s.active || s.is_active;
 
-            function namesMatch(a, b) {
-              if (!a || !b) return false;
-              const na = String(a)
-                .toLowerCase()
-                .replace(/^stored at\s+/i, "")
-                .replace(/^loaded on\s*carrier\s*/i, "")
-                .trim();
-              const nb = String(b)
-                .toLowerCase()
-                .replace(/^stored at\s+/i, "")
-                .replace(/^loaded on\s*carrier\s*/i, "")
-                .trim();
-              if (!na || !nb) return false;
-              if (na === nb) return true;
-              if (na.includes(nb) || nb.includes(na)) return true;
-              const wa = na.split(/\s+/).filter(Boolean);
-              const wb = nb.split(/\s+/).filter(Boolean);
-              if (!wa.length || !wb.length) return false;
-              const [shorter, longer] =
-                wa.length <= wb.length ? [wa, wb] : [wb, wa];
-              const allMatch = shorter.every((w) =>
-                longer.some((lw) => lw.startsWith(w) || w.startsWith(lw)),
-              );
-              if (!allMatch) return false;
-              return shorter.length / longer.length >= 0.5;
-            }
-
             // Parse stats — API returns "71/100" string format or numeric fields
             function parseStat(val) {
               if (val == null) return null;
@@ -33400,8 +33373,18 @@ ignoreBlacklist: document.getElementById(
               : "";
 
             const botObj = bots.find((b) => b.username === username);
-            const botLocation = botObj?.location || "";
-            const botSystem = botObj?.system || "";
+            const statusLocation = shipyardShipData?.location || shipyardShipData?.player || {};
+            const statusSystem = statusLocation.system_id || shipyardShipData?.system || "";
+            const statusPoi =
+              statusLocation.poi_id ||
+              statusLocation.current_poi ||
+              statusLocation.poi ||
+              "";
+            const statusResolvedLocation = statusPoi
+              ? resolveLocation(statusSystem, statusPoi)
+              : statusLocation.system_name || "";
+            const botLocation = botObj?.location || statusResolvedLocation;
+            const botSystem = botObj?.system || statusSystem;
 
             function namesMatch(a, b) {
               if (!a || !b) return false;
@@ -33424,7 +33407,7 @@ ignoreBlacklist: document.getElementById(
               const [shorter, longer] =
                 wa.length <= wb.length ? [wa, wb] : [wb, wa];
               const allMatch = shorter.every((w) =>
-                longer.some((lw) => lw.startsWith(w) || w.startsWith(lw)),
+                longer.some((lw) => lw.includes(w) || w.includes(lw)),
               );
               if (!allMatch) return false;
               return shorter.length / longer.length >= 0.5;

@@ -13608,6 +13608,14 @@
       <label class="checkbox-label"><input type="checkbox" id="set-returnhome-ignoreBlacklist"${returnHome.ignoreBlacklist ? " checked" : ""}> Ignore blacklist</label>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Decloak before docking</div>
+        <div class="setting-hint">When enabled, the bot will decloak just before docking at the destination station. Useful if docking while cloaked causes issues.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-returnhome-decloakBeforeDock"${returnHome.decloakBeforeDock ? " checked" : ""}> Decloak before docking</label>
+    </div>
+
     ${perBotHtml}
 
     <div class="setting-section">
@@ -13651,7 +13659,10 @@
         const ignoreBlacklist = document.getElementById(
           "set-returnhome-ignoreBlacklist",
         ).checked;
-        const s = { homeSystem, homeStation, refuelThreshold, ignoreBlacklist };
+        const decloakBeforeDock = document.getElementById(
+          "set-returnhome-decloakBeforeDock",
+        ).checked;
+        const s = { homeSystem, homeStation, refuelThreshold, ignoreBlacklist, decloakBeforeDock };
         send({ type: "saveSettings", routine: "return_home", settings: s });
         settings.return_home = Object.assign(settings.return_home || {}, s);
       }

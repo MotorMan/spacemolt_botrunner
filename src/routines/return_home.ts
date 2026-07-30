@@ -80,6 +80,7 @@ function getReturnHomeSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   enableCloak: boolean;
+  decloakBeforeDock: boolean;
   ignoreBlacklist: boolean;
 } {
   const all = readSettings();
@@ -91,6 +92,7 @@ function getReturnHomeSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
     refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
     enableCloak: (botOverrides.enableCloak as boolean) ?? (globalDefaults.enableCloak as boolean) ?? true,
+    decloakBeforeDock: (botOverrides.decloakBeforeDock as boolean) ?? (globalDefaults.decloakBeforeDock as boolean) ?? false,
     ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (globalDefaults.ignoreBlacklist as boolean) ?? false,
   };
 }
@@ -155,6 +157,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeStation = settings.homeStation;
   const refuelThreshold = settings.refuelThreshold;
   const enableCloak = settings.enableCloak;
+  const decloakBeforeDock = settings.decloakBeforeDock;
   const ignoreBlacklist = routineParams?.ignoreBlacklist === true || settings.ignoreBlacklist === true;
 
   if (!homeSystem) {
@@ -409,6 +412,17 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     if (bot.poi !== targetStation.id) {
       ctx.log("error", `Travel to station failed: not at target ${targetStation.id} (currently at ${bot.poi})`);
       return; // Cancel routine
+    }
+  }
+
+  // Decloak before docking if configured
+  if (decloakBeforeDock && bot.isCloaked) {
+    ctx.log("travel", "Decloaking before docking at destination station...");
+    const decloakResp = await bot.exec("cloak", { enable: false });
+    if (decloakResp.error) {
+      ctx.log("warn", `Failed to decloak before docking: ${decloakResp.error.message}`);
+    } else {
+      ctx.log("travel", "Decloaked successfully before docking");
     }
   }
 

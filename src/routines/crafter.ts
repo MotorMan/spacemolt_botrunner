@@ -1161,13 +1161,13 @@ async function queueAllRecipesOnce(
       const limiter = lowestOutputItem(item.recipe);
       const outputPerRun = limiter.quantity || 1;
       const progress = tracker.getProgress(item.recipe.recipe_id);
-      const queuedRuns = progress.queued;
+      const pendingRuns = progress.remaining;
       const completedRuns = progress.completed;
 
       // item.quantityToCraft is expressed in the recipe's first-output items;
       // convert to the limiting-output frame so the run count is correct.
       const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
-      const remainingRuns = Math.ceil((targetLimiterItems - completedRuns * outputPerRun - queuedRuns * outputPerRun) / outputPerRun);
+      const remainingRuns = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
       const runsToQueue = Math.max(0, remainingRuns);
       if (runsToQueue <= 0) {
         const actualQueued = progress.queued;
@@ -1310,9 +1310,9 @@ async function executeCraftingPlan(
        const recipeId = recipeIdForGoal(g);
        if (!recipeId) continue;
        const liveStock = countItemFn!(g.itemId.toLowerCase());
-       const prog = tracker.getProgress(recipeId);
-       const queuedOutput = prog.queued * outputQtyOf(recipeId);
-       if (liveStock + queuedOutput < g.limit) {
+        const prog = tracker.getProgress(recipeId);
+        const queuedOutput = prog.remaining * outputQtyOf(recipeId);
+        if (liveStock + queuedOutput < g.limit) {
          remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
        }
      }
@@ -1376,9 +1376,9 @@ async function executeCraftingPlan(
      const recipeId = recipeIdForGoal(g);
      if (!recipeId) return null;
      const outputQty = outputQtyOf(recipeId);
-     const prog = tracker.getProgress(recipeId);
-     const target = prog.queued * outputQty;
-     return { recipeId, quantity: target, outputQty };
+      const prog = tracker.getProgress(recipeId);
+      const target = prog.remaining * outputQty;
+      return { recipeId, quantity: target, outputQty };
    }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
 
     const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
@@ -1764,16 +1764,16 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
       const currentStock = countItem(limiter.item_id);
       const progress = tracker.getProgress(recipe.recipe_id);
-      const queuedRuns = progress.queued;
-      const queuedItems = queuedRuns * (limiter.quantity || 1);
-      const stockIncludingQueue = currentStock + queuedItems;
+      const pendingRuns = progress.remaining;
+      const pendingItems = pendingRuns * (limiter.quantity || 1);
+      const stockIncludingQueue = currentStock + pendingItems;
       const needed = limitRuns * (limiter.quantity || 1) - stockIncludingQueue;
       if (needed <= 0) {
-        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} of limiting output ${limiter.name} (outputs: ${formatOutputs(recipe)}; plus ${queuedItems} in queue)`);
+        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} of limiting output ${limiter.name} (outputs: ${formatOutputs(recipe)}; plus ${pendingItems} pending)`);
         continue;
       }
 
-      ctx.log("craft", `Goal: ${limitRuns} runs of ${recipe.name} -> ${formatOutputs(recipe)} (limiting: ${limiter.quantity}x ${limiter.name}, have ${currentStock}/${limit}, plus ${queuedItems} queued)`);
+      ctx.log("craft", `Goal: ${limitRuns} runs of ${recipe.name} -> ${formatOutputs(recipe)} (limiting: ${limiter.quantity}x ${limiter.name}, have ${currentStock}/${limit}, plus ${pendingItems} pending)`);
       // Track the goal by the limiting output item so every produced item
       // (including the secondary ones) is actually requested and counted.
       goalItems.push({ itemId: limiter.item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });

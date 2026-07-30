@@ -139,6 +139,7 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
         }
       } else {
         const job = this.jobs.get(serverJob.jobId)!;
+        job.quantity = serverJob.quantity;
         job.completed = serverJob.runsDone;
         job.deposited = serverJob.runsDone;
         job.runsRemaining = serverJob.runsRemaining;

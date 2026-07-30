@@ -710,14 +710,18 @@ if (!this.settings.fuel_service) {
     if (diskJson !== memJson) {
       this.settings = diskSettings;
       activeSettings = this.settings;
+      const dead: ServerWebSocket<WSData>[] = [];
       for (const ws of this.clients) {
         try {
           ws.send(JSON.stringify({
             type: "settings_updated",
             settings: this.settings,
           }));
-        } catch { /* ignore dead connections */ }
+        } catch {
+          dead.push(ws);
+        }
       }
+      for (const ws of dead) this.clients.delete(ws);
     }
   }
 
@@ -2880,13 +2884,15 @@ if (url.pathname === "/data/shipsForSale.json") {
   private broadcast(data: unknown): void {
     this.trackWsBytes(data);
     const msg = JSON.stringify(data);
+    const dead: ServerWebSocket<WSData>[] = [];
     for (const ws of this.clients) {
       try {
         ws.send(msg);
       } catch {
-        this.clients.delete(ws);
+        dead.push(ws);
       }
     }
+    for (const ws of dead) this.clients.delete(ws);
   }
 
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {

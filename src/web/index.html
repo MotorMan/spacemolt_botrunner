@@ -2199,7 +2199,34 @@
         }
       }
 
-      function connect() {
+      // WebSocket bandwidth tracking (declared once; not recreated per reconnect)
+      let wsBytesByType = {};
+      let wsTotalBytes = 0;
+      let wsBytesTimer = null;
+      function trackWsBytes(data) {
+        const raw = typeof data === "string" ? data : JSON.stringify(data);
+        const len = new Blob([raw]).size;
+        wsTotalBytes += len;
+        let type = "unknown";
+        if (data && typeof data === "object" && data.type) type = data.type;
+        else if (typeof data === "string") {
+          try { type = JSON.parse(data).type || "raw"; } catch { type = "raw"; }
+        }
+        wsBytesByType[type] = (wsBytesByType[type] || 0) + len;
+      }
+      function logWsBytesSummary() {
+        if (wsTotalBytes === 0) return;
+        const lines = ["[WS_BW_CLIENT] 10s: " + (wsTotalBytes / 1024 / 1024).toFixed(2) + " MB"];
+        const sorted = Object.entries(wsBytesByType).sort(function(a, b) { return b[1] - a[1]; });
+        for (const [type, bytes] of sorted) {
+          lines.push("  " + type + ": " + (bytes / 1024 / 1024).toFixed(2) + " MB");
+        }
+        console.log(lines.join("\n"));
+        wsTotalBytes = 0;
+        for (const k in wsBytesByType) delete wsBytesByType[k];
+      }
+
+            function connect() {
         // Periodically refresh remote (client-sync) bots for the dropdowns.
         if (!window.__remoteBotsTimer) {
           window.__remoteBotsTimer = setInterval(fetchRemoteBots, 15000);
@@ -2209,34 +2236,7 @@
         if (wsManualClose) return;
         clearTimeout(wsConnectTimer);
 
-        // Client-side WS bandwidth tracking
-        const wsBytesByType = {};
-        let wsTotalBytes = 0;
-        let wsBytesTimer = null;
-        const trackWsBytes = (data) => {
-          const raw = typeof data === "string" ? data : JSON.stringify(data);
-          const len = new Blob([raw]).size;
-          wsTotalBytes += len;
-          let type = "unknown";
-          if (typeof data === "object" && data && data.type) type = data.type;
-          else if (typeof data === "string") {
-            try { type = JSON.parse(data).type || "raw"; } catch { type = "raw"; }
-          }
-          wsBytesByType[type] = (wsBytesByType[type] || 0) + len;
-        };
-        const logWsBytesSummary = () => {
-          if (wsTotalBytes === 0) return;
-          const lines = [
-            `[WS_BW_CLIENT] 10s: ${(wsTotalBytes / 1024 / 1024).toFixed(2)} MB`,
-          ];
-          const sorted = Object.entries(wsBytesByType).sort((a, b) => b[1] - a[1]);
-          for (const [type, bytes] of sorted) {
-            lines.push(`  ${type}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
-          }
-          console.log(lines.join("\n"));
-          wsTotalBytes = 0;
-          for (const k in wsBytesByType) delete wsBytesByType[k];
-        };
+
 
         // Lightweight HTTP bandwidth tracker (tracks all fetch() responses)
         if (!window.__httpBytesTrackerInstalled) {

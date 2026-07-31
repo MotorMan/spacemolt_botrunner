@@ -1853,6 +1853,37 @@ async function runBulkMovePhase(
       settings.destinationBotName,
     );
     ctx.log("cargo", `📦 Bulk move delivered ${deposited.size} item type(s) to destination in one action`);
+
+    // ── POST-BULK CARGO CHECK ─────────────────────────────────
+    // The bulk deposit can silently leave items in cargo when the destination
+    // cannot accept them (e.g. faction storage full, cap errors). Without a
+    // check here those items ride back to source, get re-loaded on the next
+    // pass, and end up in an endless loop. Re-read cargo and push anything
+    // still aboard into station (personal) storage at the destination so it
+    // is cleaned up and available for future runs.
+    await bot.refreshCargo();
+    const remainingInCargo = bot.inventory.filter((item) => {
+      if (item.quantity <= 0) return false;
+      if (isBulkSkipItem(item.itemId)) return false;
+      const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+      return depositQty > 0;
+    });
+    if (remainingInCargo.length > 0) {
+      ctx.log("warn", `⚠️ Post-bulk check: ${remainingInCargo.length} item type(s) still in cargo after deposit attempt — cleaning up via station storage`);
+      const strandedItems = remainingInCargo.map((i) => `${i.quantity}x ${i.itemId}`).join(", ");
+      logCargoActivity(bot.username, "deposit_failed", `${remainingInCargo.length} item type(s) stranded in cargo after bulk deposit — moving to station storage: ${strandedItems}`);
+      for (const item of remainingInCargo) {
+        const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells);
+        if (depositQty <= 0) continue;
+        const stationResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: depositQty });
+        if (!stationResp.error) {
+          ctx.log("cargo", `🧹 Cleanup: deposited ${depositQty}x ${item.name} to station storage`);
+        } else {
+          ctx.log("error", `Cleanup deposit to station storage failed for ${item.name}: ${stationResp.error.message}`);
+        }
+      }
+      await bot.refreshCargo();
+    }
   }
 
   // ── Recover any orphaned station-storage items back to faction ───────

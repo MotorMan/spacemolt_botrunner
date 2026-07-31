@@ -32330,6 +32330,14 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Blacklisted station IDs</div>
+        <div class="setting-hint">Comma-separated list of station IDs the bot should not route to or board passengers for. Use this for player stations that reject docking.</div>
+      </div>
+      <textarea id="set-civilian_transport-blockedStationIds" rows="3" style="width:100%;font-family:monospace;font-size:12px;padding:6px">${esc(String((ct.blockedStationIds || []).join(", ")))}</textarea>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Passenger loading priority</div>
         <div class="setting-hint">Prioritize loading higher-class passengers first. "off" loads passengers in API order.</div>
       </div>
@@ -32416,6 +32424,13 @@ ignoreBlacklist: document.getElementById(
         const blockPirateStations =
           document.getElementById("set-civilian_transport-blockPirateStations")
             ?.checked ?? true;
+        const blockedStationIdsRaw =
+          document.getElementById("set-civilian_transport-blockedStationIds")
+            ?.value || "";
+        const blockedStationIds = blockedStationIdsRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
         const passengerPriority =
           document.getElementById("set-civilian_transport-passengerPriority")
             ?.value || "off";
@@ -32458,6 +32473,7 @@ ignoreBlacklist: document.getElementById(
         s.maxBusiness = maxBusiness;
         s.maxFirst = maxFirst;
         s.blockPirateStations = blockPirateStations;
+        s.blockedStationIds = blockedStationIds;
         s.passengerPriority = passengerPriority;
         s.allowFirstClass = allowFirstClass;
         s.allowBusinessClass = allowBusinessClass;

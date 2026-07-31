@@ -185,6 +185,12 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
   return false;
 }
 
+function isBlockedStation(stationId: string): boolean {
+  const settings = getCivilianTransportSettings();
+  const lower = stationId.toLowerCase();
+  return settings.blockedStationIds.some(id => id.toLowerCase() === lower);
+}
+
 const fs = require("fs");
 const path = require("path");
 
@@ -202,6 +208,15 @@ interface RouteResult {
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
+  const settings = getCivilianTransportSettings();
+  if (settings.blockPirateStations && isPirateStation(destinationId)) {
+    ctx.log("transport", `resolveDestination: REJECTING pirate destination ${destinationId}`);
+    return null;
+  }
+  if (isBlockedStation(destinationId)) {
+    ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${destinationId}`);
+    return null;
+  }
   if (isMobileStation(destinationId)) {
     ctx.log("transport", `resolveDestination: ${destinationId} is mobile, using find_route directly`);
     const routeResp = await bot.exec("find_route", { target: destinationId });
@@ -571,6 +586,7 @@ interface CivilianTransportSettings {
   maxBusiness: number;
   maxFirst: number;
   blockPirateStations: boolean;
+  blockedStationIds: string[];
   passengerPriority: "first" | "business" | "economy" | "off";
   allowFirstClass: boolean;
   allowBusinessClass: boolean;
@@ -599,6 +615,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     maxBusiness: Number((t.maxBusiness as number) ?? 0),
     maxFirst: Number((t.maxFirst as number) ?? 0),
     blockPirateStations: (t.blockPirateStations as boolean) ?? true,
+    blockedStationIds: Array.isArray((t.blockedStationIds as any)) ? (t.blockedStationIds as string[]) : [],
     passengerPriority: ((t.passengerPriority as string) === "first" || (t.passengerPriority as string) === "business" || (t.passengerPriority as string) === "economy")
       ? (t.passengerPriority as "first" | "business" | "economy" | "off")
       : "off",
@@ -2041,6 +2058,10 @@ if (state && state.status !== "idle") {
         const cls = p.class.toLowerCase();
         if (settings.blockPirateStations && isPirateStation(p.destination)) {
           if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
+          continue;
+        }
+        if (isBlockedStation(p.destination)) {
+          ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
           continue;
         }
         if (cls === "first" && !settings.allowFirstClass) {

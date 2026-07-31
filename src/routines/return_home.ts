@@ -167,6 +167,36 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
 
+  // If already at the destination, handle cloak/dock BEFORE re-enabling cloak
+  await bot.refreshLocation();
+  if (bot.system === homeSystem) {
+    if (homeStation && bot.poi === homeStation) {
+      if (bot.isCloaked && decloakBeforeDock) {
+        ctx.log("travel", "Already at home station but cloaked — decloaking before docking...");
+        const decloakResp = await bot.exec("cloak", { enable: false });
+        if (decloakResp.error) {
+          ctx.log("warn", `Failed to decloak before docking: ${decloakResp.error.message}`);
+        } else {
+          ctx.log("travel", "Decloaked successfully before docking");
+        }
+      }
+      if (!bot.docked) {
+        ctx.log("travel", "At home station but not docked — docking now...");
+        const docked = await ensureDocked(ctx, true);
+        if (!docked) {
+          ctx.log("error", "Failed to dock at home station — routine cancelled");
+          return;
+        }
+      }
+      ctx.log("travel", "Already at home station — routine complete");
+      return;
+    }
+    if (!homeStation && bot.docked) {
+      ctx.log("travel", "Already docked in home system — routine complete");
+      return;
+    }
+  }
+
   // Enable cloaking if configured and module is available
   let isCloaked = bot.isCloaked;
   if (enableCloak && !isCloaked) {

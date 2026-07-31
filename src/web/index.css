@@ -663,6 +663,8 @@ button.danger { background: #da3633; border-color: #f85149; color: #fff; }
 button.danger:hover { background: #f85149; }
 button.warning { background: #a371f7; border-color: #a371f7; color: #fff; }
 button.warning:hover { background: #b98cff; }
+button.warning-cargo { background: var(--cyan); border-color: var(--cyan); color: #fff; }
+button.warning-cargo:hover { background: #4de0d0; }
 button.sm { padding: 3px 10px; font-size: 11px; }
 
 /* ── Log panels ─────────────────────────────────── */

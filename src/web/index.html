@@ -3040,9 +3040,11 @@
         <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
             } else if (bot.state === "running") {
               actions =
-                (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
+                bot.routine === "civilian_transport"
                   ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-                  : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
+                  : bot.routine === "cargo_mover"
+                    ? `<button class="warning-cargo sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+                    : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
             }
             return `<tr data-bot="${esc(bot.username)}">
       <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</td>
@@ -3317,12 +3319,14 @@
         `
             : bot.state === "running"
               ? `
-          ${
-            (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
-              ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-              : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-          }
-        `
+            ${
+              bot.routine === "civilian_transport"
+                ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+                : bot.routine === "cargo_mover"
+                  ? `<button class="warning-cargo sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+                  : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+            }
+          `
               : ""
         }
       </div>
@@ -3586,9 +3590,11 @@
         ${
           bot.offline || bot.state !== "running"
             ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">${bot.offline ? 'Early Login' : 'Start'}</button>`
-            : (bot.routine === "civilian_transport" || bot.routine === "cargo_mover")
+            : bot.routine === "civilian_transport"
               ? `<button class="sm warning" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-              : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+              : bot.routine === "cargo_mover"
+                ? `<button class="sm warning-cargo" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+                : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
         }
         <button class="sm" onclick="event.stopPropagation();openProfile('${esc(bot.username)}')">Details</button>
       </div>
@@ -4664,10 +4670,11 @@
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
       <button class="danger sm" onclick="removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕ Remove</button>`;
         } else if (bot.state === "running") {
-          const isCivilianTransport = (bot.routine === "civilian_transport" || bot.routine === "cargo_mover");
-          actions = isCivilianTransport
+          actions = bot.routine === "civilian_transport"
             ? `<button class="warning sm" onclick="stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop Now</button>`
-            : `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
+            : bot.routine === "cargo_mover"
+              ? `<button class="warning-cargo sm" onclick="stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop Now</button>`
+              : `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
         }
 
         // Per-bot target ore selector (visible when miner is selected or running)

@@ -10539,6 +10539,19 @@
         }
       }
 
+      function sendExecAsync(botName, command, params) {
+        return new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            reject(new Error(`Timeout: ${command} did not respond`));
+          }, 120000);
+          sendExec(botName, command, params, (result) => {
+            clearTimeout(timeout);
+            if (result.ok) resolve(result);
+            else reject(new Error(result.error || "unknown"));
+          });
+        });
+      }
+
       function handleExecResult(msg) {
         // Try to match callback
         if (msg._seq && execCallbacks[msg._seq]) {
@@ -22619,22 +22632,51 @@ When responding:
       }
 
       function stationRepairFacility(username, facilityId) {
-        sendExec(
-          username,
-          "facility",
-          { action: "repair", facility_id: facilityId },
-          (result) => {
-            if (result.ok) {
-              appendLine("system", `${username}: Station facility repair initiated`);
-              fetchStationFacilities(username);
-            } else {
-              appendLine(
-                "system",
-                `Repair failed: ${result.error || "unknown"}`,
-              );
-            }
-          },
+        const doRepair = async () => {
+          try {
+            await sendExecAsync(username, "facility", { action: "repair", facility_id: facilityId });
+            appendLine("system", `${username}: Station facility repair initiated`);
+            fetchStationFacilities(username);
+          } catch (err) {
+            appendLine("system", `Repair failed: ${err.message || "unknown"}`);
+          }
+        };
+
+        const fac = (stationFacilitiesData || []).find(
+          (f) => (f.facility_id || f.id) === facilityId,
         );
+        const typeId = fac?.type || fac?.facility_type || "";
+        const catEntry = typeId ? getCatalogFacility(typeId) : null;
+        const buildMats = catEntry?.build_materials || [];
+
+        if (buildMats.length === 0) {
+          doRepair();
+          return;
+        }
+
+        const needed = buildMats
+          .map((m) => ({
+            item_id: m.item_id,
+            quantity: Math.ceil((m.quantity || 0) * 0.3),
+          }))
+          .filter((m) => m.quantity > 0);
+
+        (async () => {
+          try {
+            for (const item of needed) {
+              await sendExecAsync(username, "storage", {
+                action: "deposit",
+                target: "self",
+                source: "faction",
+                item_id: item.item_id,
+                quantity: item.quantity,
+              });
+            }
+            await doRepair();
+          } catch (err) {
+            appendLine("system", `Repair prep failed: ${err.message || "unknown"}`);
+          }
+        })();
       }
 
       function toggleStationFacilityRename(username, facilityId, currentName) {
@@ -23360,22 +23402,51 @@ When responding:
       }
 
       function factionRepairFacility(username, facilityId) {
-        sendExec(
-          username,
-          "facility",
-          { action: "repair", facility_id: facilityId },
-          (result) => {
-            if (result.ok) {
-              appendLine("system", `${username}: Facility repair initiated`);
-              fetchFactionFacilities(username);
-            } else {
-              appendLine(
-                "system",
-                `Repair failed: ${result.error || "unknown"}`,
-              );
-            }
-          },
+        const doRepair = async () => {
+          try {
+            await sendExecAsync(username, "facility", { action: "repair", facility_id: facilityId });
+            appendLine("system", `${username}: Facility repair initiated`);
+            fetchFactionFacilities(username);
+          } catch (err) {
+            appendLine("system", `Repair failed: ${err.message || "unknown"}`);
+          }
+        };
+
+        const fac = (factionFacilitiesData || []).find(
+          (f) => (f.facility_id || f.id) === facilityId,
         );
+        const typeId = fac?.type || fac?.facility_type || "";
+        const catEntry = typeId ? getCatalogFacility(typeId) : null;
+        const buildMats = catEntry?.build_materials || [];
+
+        if (buildMats.length === 0) {
+          doRepair();
+          return;
+        }
+
+        const needed = buildMats
+          .map((m) => ({
+            item_id: m.item_id,
+            quantity: Math.ceil((m.quantity || 0) * 0.3),
+          }))
+          .filter((m) => m.quantity > 0);
+
+        (async () => {
+          try {
+            for (const item of needed) {
+              await sendExecAsync(username, "storage", {
+                action: "deposit",
+                target: "self",
+                source: "faction",
+                item_id: item.item_id,
+                quantity: item.quantity,
+              });
+            }
+            await doRepair();
+          } catch (err) {
+            appendLine("system", `Repair prep failed: ${err.message || "unknown"}`);
+          }
+        })();
       }
 
       function toggleFactionFacilityRename(username, facilityId) {

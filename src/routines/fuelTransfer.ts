@@ -542,9 +542,16 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       await tryRefuel(ctx);
       await repairShip(ctx);
 
-      if (bot.system === homeSystem && bot.poi !== homeStation) {
+      if (bot.poi !== homeStation) {
         await ensureUndocked(ctx);
         if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+        if (bot.system !== homeSystem) {
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived || bot.state !== "running") {
+            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+            await ctx.sleep(30000); continue;
+          }
+        }
         const tResp = await bot.exec("travel", { target_poi: homeStation });
         if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
           ctx.log("warn", `Return to home station after services failed: ${tResp.error.message}`);
@@ -783,27 +790,6 @@ async function processItemTransfer(
           await ctx.sleep(30000); return null;
         }
         bot.docked = true;
-      }
-
-      await tryRefuel(ctx);
-      await repairShip(ctx);
-
-      if (bot.system === homeSystem && bot.poi !== homeStation) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-        const tResp = await bot.exec("travel", { target_poi: homeStation });
-        if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("warn", `Return to home station after services failed: ${tResp.error.message}`);
-          await ctx.sleep(30000);
-          return null;
-        }
-        bot.poi = homeStation;
-        if (!bot.docked) {
-          const dockResp = await bot.exec("dock");
-          if (!dockResp.error || dockResp.error.message.includes("already")) {
-            bot.docked = true;
-          }
-        }
       }
     }
 

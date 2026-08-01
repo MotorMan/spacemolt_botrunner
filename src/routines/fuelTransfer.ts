@@ -436,6 +436,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       await enableCloakingIfPossible(ctx);
     }
 
+    await bot.refreshStatus();
     if (!bot.docked || bot.poi !== homeStation || bot.system !== homeSystem) {
       yield "go_home";
       ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation}...`);
@@ -706,6 +707,7 @@ async function processItemTransfer(
       await repairShip(ctx);
     }
 
+    await bot.refreshStatus();
     if (!bot.docked) {
       const dockResp = await bot.exec("dock");
       if (dockResp.error && !dockResp.error.message.includes("already")) {

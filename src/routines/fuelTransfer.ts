@@ -13,6 +13,7 @@ import {
   getBattleStatus,
   getItemSize,
   maxItemsForCargo,
+  cargoUsedFromInventory,
   type BattleState,
 } from "./common.js";
 import {
@@ -29,6 +30,8 @@ import { getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 
 const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
 const factionStorageApiLastCalled: Map<string, number> = new Map();
+const TRANSFER_FAILURE_COOLDOWN_MS = 60000;
+const lastTransferFailure = new Map<string, number>();
 
 async function getRemoteFactionAllItemsRateLimited(bot: Bot, remoteStationId: string): Promise<Record<string, number>> {
   const cache = getFactionStorageCacheByStationOnly(remoteStationId);
@@ -252,7 +255,9 @@ async function withdrawFromHomeFaction(
   qty: number,
   homeStationId: string
 ): Promise<{ success: boolean; withdrawnQty: number }> {
-  const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+  await bot.refreshCargo();
+  const usedCargo = cargoUsedFromInventory(bot);
+  const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
   const withdrawQty = Math.min(qty, maxItemsForCargo(freeSpace, itemId));
   if (withdrawQty <= 0) return { success: false, withdrawnQty: 0 };
 
@@ -627,6 +632,13 @@ async function processItemTransfer(
   processedLoadouts: Set<string>
 ): Promise<{ deposited: boolean; itemId: string; qty: number } | null> {
   if (bot.state !== "running") return null;
+
+  const failureKey = `${remoteStationId}:${item.itemId}`;
+  const lastFailure = lastTransferFailure.get(failureKey) || 0;
+  if (Date.now() - lastFailure < TRANSFER_FAILURE_COOLDOWN_MS) {
+    return null;
+  }
+
   const { cachedQty, currentQty, hasCache } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
   if (bot.state !== "running") return null;
 
@@ -645,24 +657,24 @@ async function processItemTransfer(
   const needed = item.targetQuantity - currentQty;
   ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — need ${needed}`);
 
-  const itemSize = getItemSize(item.itemId);
-  const maxCanCarry = Math.floor((bot.cargoMax || 825) / itemSize);
-  
-  const toWithdraw = Math.min(Math.max(0, needed), maxCanCarry);
-
-  if (toWithdraw <= 0) {
-    ctx.log("warn", `Cannot carry any ${item.itemName} (size ${itemSize})`);
-    return null;
-  }
-
   await bot.refreshCargo();
   const currentCargoForItem = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
   const alreadyHave = currentCargoForItem;
 
-  let withdrawQty = toWithdraw - alreadyHave;
-  if (withdrawQty <= 0) {
+  if (alreadyHave >= needed) {
     ctx.log("fuel", `Already have ${alreadyHave}x ${item.itemName} in cargo — delivering`);
   } else {
+    const usedCargo = cargoUsedFromInventory(bot);
+    const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
+    const itemSize = getItemSize(item.itemId);
+    const maxCanCarry = maxItemsForCargo(freeSpace, item.itemId);
+    let withdrawQty = Math.min(needed - alreadyHave, maxCanCarry);
+
+    if (withdrawQty <= 0) {
+      ctx.log("warn", `Cannot carry any ${item.itemName} (free space ${freeSpace}, size ${itemSize})`);
+      return null;
+    }
+
     if (bot.system !== homeSystem || bot.poi !== homeStation) {
       ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation} for withdraw...`);
       if (bot.system !== homeSystem) {
@@ -730,6 +742,7 @@ async function processItemTransfer(
     const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, cappedWithdrawQty, homeStation);
     if (!wr.success) {
       ctx.log("error", `Failed to withdraw ${cappedWithdrawQty}x ${item.itemName} from home`);
+      lastTransferFailure.set(failureKey, Date.now());
       return null;
     }
     ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} — departing`);
@@ -789,8 +802,10 @@ async function processItemTransfer(
 
   if (depositResult.success) {
     ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${item.itemName} to ${remoteStationId} via ${depositResult.mode}`);
+    lastTransferFailure.delete(failureKey);
   } else {
     ctx.log("error", `Could not deposit ${item.itemName} to ${remoteStationId}`);
+    lastTransferFailure.set(failureKey, Date.now());
   }
 
   await bot.refreshCargo();

@@ -262,7 +262,6 @@ async function withdrawFromHomeFaction(
     target: "faction",
     item_id: itemId,
     quantity: withdrawQty,
-    station_id: homeStationId,
   });
   if (resp.error) {
     ctx.log("error", `Withdraw failed: ${resp.error.message}`);
@@ -705,6 +704,15 @@ async function processItemTransfer(
 
       await tryRefuel(ctx);
       await repairShip(ctx);
+    }
+
+    if (!bot.docked) {
+      const dockResp = await bot.exec("dock");
+      if (dockResp.error && !dockResp.error.message.includes("already")) {
+        ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
+        await ctx.sleep(30000); return null;
+      }
+      bot.docked = true;
     }
 
     ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);

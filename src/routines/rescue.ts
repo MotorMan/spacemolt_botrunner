@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
 import { getLastFleetRoster, getLastFleetPullError } from "../botmanager.js";
-import { updateFactionStorageCache, getFactionStorageCache, type FactionStorageEntry } from "../factionStorageCache.js";
+import { updateFactionStorageCache, getFactionStorageCache } from "../factionStorageCache.js";
 import {
   findStation,
   getSystemInfo,
@@ -5368,71 +5368,55 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     }
 
     // ── Start background remote faction-station fuel monitor (non-blocking) ──
-    // Iterates ALL faction stations one at a time, reading each station's full
-    // faction storage (including the faction fuel facility's current level) via
-    // view_faction_storage. This works REMOTELY — no docking required — so the
-    // rescue bot keeps an accurate, up-to-date picture of every station's faction
-    // fuel reserve/capacity. One station is polled per minute (~stations ≈ full
-    // scan time in minutes). NOTE: this is purely a storage/fuel-level read;
-    // the fuel service's facility job monitoring is a separate, at-station concern.
+    // Uses the new `faction_info` endpoint which returns fuel_bunkers for ALL
+    // stations in a single call, replacing the old per-station view_faction_storage polling.
     const allFactionStations: string[] = getAllStationsForEmpires(Object.keys(EMPIRE_STATIONS));
-    let remoteStationIndex = 0;
 
     if (allFactionStations.length > 0) {
-      ctx.log("rescue", `📡 Starting remote faction-station fuel monitor for ${allFactionStations.length} stations (1 per minute via view_faction_storage)`);
+      ctx.log("rescue", `📡 Starting remote faction-station fuel monitor for ${allFactionStations.length} stations (via faction_info)`);
 
       (async () => {
         while (bot.state === "running") {
           try {
-            const stationRef = allFactionStations[remoteStationIndex];
-            // Resolve to the plain hex POI id the server expects for station_id.
-            // Player faction bases are hex ids, so a "system|poi" reference or
-            // friendly name must be collapsed to the POI id or the remote read
-            // fails with "Station not found".
-            const stationId = mapStore.resolveStationTarget(stationRef);
-
-            // Read the REMOTE station's faction storage from anywhere — docking not needed.
-            const storageResp = await bot.exec("view_faction_storage", { station_id: stationId });
-            if (!storageResp.error && storageResp.result) {
-              const result = storageResp.result as Record<string, unknown>;
-              const reserve = (result.faction_fuel_reserve as number) || 0;
-              const capacity = (result.faction_fuel_capacity as number) || 0;
-              // IMPORTANT: view_faction_storage returns the BOT's own faction data, so the
-              // cache must be written under the bot's actual faction (bot.faction). Do NOT
-              // trust result.faction_name / result.faction_id from the response — those
-              // reflect the station's controlling faction and are unreliable, producing
-              // mislabeled cache files (e.g. "solarian--station.json") instead of the
-              // correct "Busy Being Dead--station.json".
+            const infoResp = await bot.exec("faction_info", {});
+            if (!infoResp.error && infoResp.result) {
+              const data = infoResp.result as Record<string, unknown>;
+              const fuelBunkers = (data.fuel_bunkers as Array<Record<string, unknown>>) || [];
               const factionName = bot.faction || "";
 
-              // Preserve existing cached item entries; only refresh the fuel facility levels
-              // so a partial read never wipes the item list.
-              const existing = getFactionStorageCache(factionName, stationId);
-              const rawItems = (result.items as Array<Record<string, unknown>>) || [];
-              const entries: FactionStorageEntry[] = rawItems.map((i) => ({
-                itemId: (i.item_id as string) || (i.id as string) || "",
-                quantity: (i.quantity as number) || 0,
-                name: (i.name as string) || (i.item_id as string) || (i.id as string) || "",
-              }));
+              let updated = 0;
+              for (const bunker of fuelBunkers) {
+                const baseId = bunker.base_id as string;
+                const reserve = (bunker.fuel_reserve as number) || 0;
+                const capacity = (bunker.fuel_capacity as number) || 0;
 
-              updateFactionStorageCache(
-                factionName,
-                entries.length > 0 ? entries : (existing?.entries || []),
-                stationId,
-                reserve,
-                capacity,
-              );
-
-              ctx.log("rescue", `📡 Remote ${stationId}: faction fuel facility = ${reserve}/${capacity} (${entries.length} item types)`);
-            } else if (storageResp.error) {
-              ctx.log("warn", `📡 Failed to read faction storage at remote station ${stationId}: ${storageResp.error.message}`);
+                for (const stationRef of allFactionStations) {
+                  if (mapStore.sameStation(baseId, stationRef)) {
+                    const stationId = mapStore.resolveStationTarget(stationRef);
+                    const existing = getFactionStorageCache(factionName, stationId);
+                    updateFactionStorageCache(
+                      factionName,
+                      existing?.entries || [],
+                      stationId,
+                      reserve,
+                      capacity,
+                    );
+                    ctx.log("rescue", `📡 Remote ${stationRef}: faction fuel facility = ${reserve}/${capacity}`);
+                    updated++;
+                    break;
+                  }
+                }
+              }
+              if (updated > 0) {
+                ctx.log("rescue", `📡 faction_info refresh: updated ${updated}/${allFactionStations.length} stations`);
+              }
+            } else if (infoResp.error) {
+              ctx.log("warn", `📡 faction_info failed: ${infoResp.error.message}`);
             }
           } catch (e) {
             ctx.log("warn", `📡 Error in remote faction-station fuel monitor: ${e}`);
           }
 
-          remoteStationIndex = (remoteStationIndex + 1) % allFactionStations.length;
-          // ~1 minute between station reads
           await new Promise((resolve) => setTimeout(resolve, 60000));
         }
       })();

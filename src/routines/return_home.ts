@@ -168,7 +168,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
 
   // If already at the destination, handle cloak/dock BEFORE re-enabling cloak
-  await bot.refreshLocation();
+  await bot.refreshStatus();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
       if (bot.isCloaked && decloakBeforeDock) {
@@ -210,7 +210,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Check if already at home
-  await bot.refreshLocation();
+  await bot.refreshStatus();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
       ctx.log("travel", "Already at home station — checking dock/repair status...");
@@ -337,6 +337,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
 
   // Navigate to home system with retry logic for API timeouts
   yield "navigate";
+  await bot.refreshStatus();
   if (bot.system !== homeSystem) {
     ctx.log("travel", `Navigating to ${homeSystem}...`);
 

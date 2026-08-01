@@ -552,11 +552,10 @@ export function parseOreFromCargoDelta(
  */
 export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true, minBalance: number = 0): Promise<boolean> {
   const { bot } = ctx;
-  if (bot.docked) return true;
-
-  // Refresh location first to ensure we have the latest docked state
-  await bot.refreshLocation();
-  if (bot.docked) return true;
+  if (bot.docked) {
+    await bot.refreshStatus();
+    if (bot.docked) return true;
+  }
 
   const { pois } = await getSystemInfo(ctx);
   const station = findStation(pois);

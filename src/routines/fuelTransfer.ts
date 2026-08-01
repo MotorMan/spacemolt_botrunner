@@ -275,12 +275,18 @@ async function withdrawFromHomeFaction(
 
   for (let attempt = 0; attempt < 5; attempt++) {
     await ctx.sleep(1000);
-    await bot.refreshCargo();
     const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
     const withdrawn = Math.max(0, afterQty - beforeQty);
     if (withdrawn > 0) {
       return { success: true, withdrawnQty: withdrawn };
     }
+  }
+
+  await bot.refreshCargo();
+  const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+  const withdrawn = Math.max(0, afterQty - beforeQty);
+  if (withdrawn > 0) {
+    return { success: true, withdrawnQty: withdrawn };
   }
 
   ctx.log("warn", `Withdraw returned success but no items in cargo (${itemId}) — may be cached`);
@@ -300,7 +306,6 @@ async function depositToRemoteStation(
   if (!factionResp.error) {
     for (let attempt = 0; attempt < 5; attempt++) {
       await ctx.sleep(1000);
-      await bot.refreshCargo();
       const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
       const deposited = Math.max(0, beforeQty - afterQty);
       if (deposited > 0) {
@@ -308,6 +313,14 @@ async function depositToRemoteStation(
         updateFactionStorageFromDeposit(remoteStationId, bot.faction || "", itemId, deposited, itemName);
         return { success: true, depositedQty: deposited, mode: "faction" };
       }
+    }
+    await bot.refreshCargo();
+    const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+    const deposited = Math.max(0, beforeQty - afterQty);
+    if (deposited > 0) {
+      logFactionActivity(ctx, "deposit", `Deposited ${deposited}x ${itemId} to ${remoteStationId} (fuel transport)`);
+      updateFactionStorageFromDeposit(remoteStationId, bot.faction || "", itemId, deposited, itemName);
+      return { success: true, depositedQty: deposited, mode: "faction" };
     }
     ctx.log("warn", `Faction deposit reported success but cargo unchanged for ${itemId}`);
   }
@@ -317,13 +330,19 @@ async function depositToRemoteStation(
   if (!personalResp.error) {
     for (let attempt = 0; attempt < 5; attempt++) {
       await ctx.sleep(1000);
-      await bot.refreshCargo();
       const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
       const deposited = Math.max(0, beforeQty - afterQty);
       if (deposited > 0) {
         ctx.log("cargo", `Deposited to personal storage at ${remoteStationId}: ${deposited}x ${itemId}`);
         return { success: true, depositedQty: deposited, mode: "personal" };
       }
+    }
+    await bot.refreshCargo();
+    const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+    const deposited = Math.max(0, beforeQty - afterQty);
+    if (deposited > 0) {
+      ctx.log("cargo", `Deposited to personal storage at ${remoteStationId}: ${deposited}x ${itemId}`);
+      return { success: true, depositedQty: deposited, mode: "personal" };
     }
     ctx.log("warn", `Personal deposit reported success but cargo unchanged for ${itemId}`);
   } else {
@@ -657,7 +676,6 @@ async function processItemTransfer(
   const needed = item.targetQuantity - currentQty;
   ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — need ${needed}`);
 
-  await bot.refreshCargo();
   const currentCargoForItem = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
   const alreadyHave = currentCargoForItem;
 
@@ -748,7 +766,7 @@ async function processItemTransfer(
     ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} — departing`);
   }
 
-  const cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
+  let cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
   if (cargoQty <= 0) {
     ctx.log("error", `No ${item.itemName} in cargo after withdraw — skipping`);
     return null;
@@ -781,23 +799,22 @@ async function processItemTransfer(
   }
   bot.docked = true;
 
-  await bot.refreshCargo();
-  const cargoForDelivery = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
-  if (cargoForDelivery <= 0) {
+  cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
+  if (cargoQty <= 0) {
     ctx.log("error", `No ${item.itemName} in cargo to deposit`);
     return null;
   }
 
   const actualRemoteQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
   const needNow = Math.max(0, item.targetQuantity - actualRemoteQty);
-  const toDeposit = Math.min(cargoForDelivery, needNow);
+  const toDeposit = Math.min(cargoQty, needNow);
 
   if (toDeposit <= 0) {
     ctx.log("fuel", `${remoteStationId}: ${item.itemName} already at target (${actualRemoteQty}/${item.targetQuantity}) after transit — nothing to deposit`);
     return null;
   }
 
-  ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${item.itemName} to ${remoteStationId} (have ${cargoForDelivery}, need ${needNow})...`);
+  ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${item.itemName} to ${remoteStationId} (have ${cargoQty}, need ${needNow})...`);
   const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, item.itemName, toDeposit, remoteStationId);
 
   if (depositResult.success) {
@@ -808,7 +825,6 @@ async function processItemTransfer(
     lastTransferFailure.set(failureKey, Date.now());
   }
 
-  await bot.refreshCargo();
   if (!bot.docked) bot.docked = false;
   
   return depositResult.success ? { deposited: true, itemId: item.itemId, qty: depositResult.depositedQty } : null;

@@ -2226,56 +2226,16 @@
         for (const k in wsBytesByType) delete wsBytesByType[k];
       }
 
-            function connect() {
+      function connect() {
+        if (wsManualClose) return;
+        clearTimeout(wsConnectTimer);
+
+        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+
         // Periodically refresh remote (client-sync) bots for the dropdowns.
         if (!window.__remoteBotsTimer) {
           window.__remoteBotsTimer = setInterval(fetchRemoteBots, 15000);
           fetchRemoteBots();
-        }
-
-        if (wsManualClose) return;
-        clearTimeout(wsConnectTimer);
-
-
-
-        // Lightweight HTTP bandwidth tracker (tracks all fetch() responses)
-        if (!window.__httpBytesTrackerInstalled) {
-          window.__httpBytesTrackerInstalled = true;
-          const httpBytesByUrl = {};
-          let httpTotalBytes = 0;
-          let httpBytesTimer = null;
-          const logHttpSummary = () => {
-            if (httpTotalBytes === 0) return;
-            const lines = [
-              `[HTTP_BW_CLIENT] 10s: ${(httpTotalBytes / 1024 / 1024).toFixed(2)} MB`,
-            ];
-            const sorted = Object.entries(httpBytesByUrl).sort((a, b) => b[1] - a[1]).slice(0, 10);
-            for (const [url, bytes] of sorted) {
-              lines.push(`  ${url}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
-            }
-            console.log(lines.join("\n"));
-            httpTotalBytes = 0;
-            for (const k in httpBytesByUrl) delete httpBytesByUrl[k];
-          };
-          const _origFetch = window.fetch;
-          window.fetch = async function (...args) {
-            const url = args[0] instanceof Request ? args[0].url : (args[0] || "unknown");
-            const path = typeof url === "string" ? url.split("?")[0] : String(url);
-            try {
-              const res = await _origFetch.apply(window, args);
-              if (!res.ok) return res;
-              const clone = res.clone();
-              const textPromise = clone.text().then((text) => {
-                const len = new Blob([text]).size;
-                httpTotalBytes += len;
-                httpBytesByUrl[path] = (httpBytesByUrl[path] || 0) + len;
-                if (!httpBytesTimer) httpBytesTimer = setInterval(logHttpSummary, 10000);
-              }).catch(() => {});
-              return res;
-            } catch (e) {
-              return _origFetch.apply(window, args);
-            }
-          };
         }
 
         // Build the WS URL defensively. In some embedded clients / reverse
@@ -2287,17 +2247,19 @@
           host = (location.hostname || "localhost") + (location.port ? ":" + location.port : "");
         }
         let url;
+        let _ws;
         try {
           url = `${proto}//${host}/ws`;
-          ws = new WebSocket(url);
+          _ws = new WebSocket(url);
         } catch (err) {
           console.warn("WebSocket constructor failed, retrying in 1s:", err);
           connDot.classList.remove("connected");
           connText.textContent = "Disconnected";
+          ws = null;
           wsConnectTimer = setTimeout(connect, 1000);
           return;
         }
-
+        ws = _ws;
         wsLastMsg = Date.now();
 
         // Establish watchdog: if the socket never opens (server still starting
@@ -2306,14 +2268,14 @@
         // it is never blank while we keep retrying. We NEVER give up.
         clearTimeout(wsInitTimer);
         wsInitTimer = setTimeout(() => {
-          if (!ws || ws.readyState !== WebSocket.OPEN) {
+          if (!_ws || _ws.readyState !== WebSocket.OPEN) {
             console.warn("WebSocket not open after 4s — REST fallback + reconnect");
             try { fetchInitialData(); } catch (e) { console.warn("REST fallback failed:", e); }
-            try { ws && ws.close(); } catch {}
+            try { _ws && _ws.close(); } catch {}
           }
         }, 4000);
 
-        ws.onopen = () => {
+        _ws.onopen = () => {
           clearTimeout(wsInitTimer);
           connDot.classList.add("connected");
           connText.textContent = "Connected";
@@ -2323,38 +2285,41 @@
           // Heartbeat: prove the socket is alive in both directions.
           clearInterval(wsHeartbeatTimer);
           wsHeartbeatTimer = setInterval(() => {
-            try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" })); } catch {}
+            try { if (_ws && _ws.readyState === WebSocket.OPEN) _ws.send(JSON.stringify({ type: "ping" })); } catch {}
           }, 15000);
           // Data watchdog: a socket that stops delivering data is dead even if
           // the browser still reports it OPEN. Force a reconnect.
           clearInterval(wsWatchdogTimer);
           wsWatchdogTimer = setInterval(() => {
-            if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+            if (_ws && _ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
               console.warn("WebSocket silent for 30s, forcing reconnect");
-              try { ws.close(); } catch {}
+              try { _ws.close(); } catch {}
             }
           }, 5000);
         };
 
-        ws.onclose = () => {
+        _ws.onclose = () => {
           clearTimeout(wsInitTimer);
           clearInterval(wsHeartbeatTimer);
           clearInterval(wsWatchdogTimer);
           clearInterval(wsBytesTimer);
           connDot.classList.remove("connected");
           connText.textContent = "Disconnected";
+          ws = null;
           if (wsManualClose) return;
           // Retry on a short fixed cadence — forever. No exponential backoff
           // that can strand a client whose first attempt landed during startup.
           wsConnectTimer = setTimeout(connect, 1000);
         };
 
-        ws.onerror = () => {
+        _ws.onerror = () => {
           // Some browsers skip onclose after onerror — force the reconnect path.
-          try { ws && ws.close(); } catch {}
+          if (_ws.readyState !== WebSocket.CLOSED) {
+            try { _ws.close(); } catch {}
+          }
         };
 
-        ws.onmessage = (ev) => {
+        _ws.onmessage = (ev) => {
           trackWsBytes(ev.data);
           let msg;
           try {
@@ -22632,51 +22597,22 @@ When responding:
       }
 
       function stationRepairFacility(username, facilityId) {
-        const doRepair = async () => {
-          try {
-            await sendExecAsync(username, "facility", { action: "repair", facility_id: facilityId });
-            appendLine("system", `${username}: Station facility repair initiated`);
-            fetchStationFacilities(username);
-          } catch (err) {
-            appendLine("system", `Repair failed: ${err.message || "unknown"}`);
-          }
-        };
-
-        const fac = (stationFacilitiesData || []).find(
-          (f) => (f.facility_id || f.id) === facilityId,
-        );
-        const typeId = fac?.type || fac?.facility_type || "";
-        const catEntry = typeId ? getCatalogFacility(typeId) : null;
-        const buildMats = catEntry?.build_materials || [];
-
-        if (buildMats.length === 0) {
-          doRepair();
-          return;
-        }
-
-        const needed = buildMats
-          .map((m) => ({
-            item_id: m.item_id,
-            quantity: Math.ceil((m.quantity || 0) * 0.3),
-          }))
-          .filter((m) => m.quantity > 0);
-
-        (async () => {
-          try {
-            for (const item of needed) {
-              await sendExecAsync(username, "storage", {
-                action: "deposit",
-                target: "self",
-                source: "faction",
-                item_id: item.item_id,
-                quantity: item.quantity,
-              });
+        sendExec(
+          username,
+          "facility",
+          { action: "repair", facility_id: facilityId },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: Station facility repair initiated`);
+              fetchStationFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `Repair failed: ${result.error || "unknown"}`,
+              );
             }
-            await doRepair();
-          } catch (err) {
-            appendLine("system", `Repair prep failed: ${err.message || "unknown"}`);
-          }
-        })();
+          },
+        );
       }
 
       function toggleStationFacilityRename(username, facilityId, currentName) {

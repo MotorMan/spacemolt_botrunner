@@ -1258,7 +1258,7 @@ shipSpeed = 1;
    * game-server bandwidth.
    */
   private isTradeRoutine(): boolean {
-    return this._routine === "explorer" || this._routine === "trader";
+    return this._routine === "explorer" || this._routine === "trader" || this._routine === "market";
   }
 
   /**

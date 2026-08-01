@@ -248,6 +248,41 @@ async function getHomeFactionQty(bot: Bot, homeStationId: string, itemId: string
   }
 }
 
+async function withdrawFromHomePersonalStorage(
+  ctx: RoutineContext,
+  bot: Bot,
+  itemId: string,
+  qty: number
+): Promise<{ success: boolean; withdrawnQty: number }> {
+  await bot.refreshStorage();
+  const inStorage = bot.storage.find((i) => i.itemId === itemId);
+  const available = inStorage?.quantity || 0;
+  const withdrawQty = Math.min(qty, available);
+  if (withdrawQty <= 0) return { success: false, withdrawnQty: 0 };
+
+  const beforeQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+  const resp = await bot.exec("withdraw_items", { item_id: itemId, quantity: withdrawQty });
+  if (resp.error) {
+    ctx.log("error", `Personal storage withdraw failed: ${resp.error.message}`);
+    return { success: false, withdrawnQty: 0 };
+  }
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await ctx.sleep(1000);
+    const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+    const withdrawn = Math.max(0, afterQty - beforeQty);
+    if (withdrawn > 0) return { success: true, withdrawnQty: withdrawn };
+  }
+
+  await bot.refreshCargo();
+  const afterQty = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+  const withdrawn = Math.max(0, afterQty - beforeQty);
+  if (withdrawn > 0) return { success: true, withdrawnQty: withdrawn };
+
+  ctx.log("warn", `Personal storage withdraw returned success but no items in cargo (${itemId}) — may be cached`);
+  return { success: false, withdrawnQty: 0 };
+}
+
 async function withdrawFromHomeFaction(
   ctx: RoutineContext,
   bot: Bot,
@@ -506,6 +541,23 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
       await tryRefuel(ctx);
       await repairShip(ctx);
+
+      if (bot.system === homeSystem && bot.poi !== homeStation) {
+        await ensureUndocked(ctx);
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+        const tResp = await bot.exec("travel", { target_poi: homeStation });
+        if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("warn", `Return to home station after services failed: ${tResp.error.message}`);
+        } else {
+          bot.poi = homeStation;
+        }
+        if (!bot.docked) {
+          const dockResp = await bot.exec("dock");
+          if (!dockResp.error || dockResp.error.message.includes("already")) {
+            bot.docked = true;
+          }
+        }
+      }
     }
 
     let allAtTarget = true;
@@ -735,6 +787,24 @@ async function processItemTransfer(
 
       await tryRefuel(ctx);
       await repairShip(ctx);
+
+      if (bot.system === homeSystem && bot.poi !== homeStation) {
+        await ensureUndocked(ctx);
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
+        const tResp = await bot.exec("travel", { target_poi: homeStation });
+        if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("warn", `Return to home station after services failed: ${tResp.error.message}`);
+          await ctx.sleep(30000);
+          return null;
+        }
+        bot.poi = homeStation;
+        if (!bot.docked) {
+          const dockResp = await bot.exec("dock");
+          if (!dockResp.error || dockResp.error.message.includes("already")) {
+            bot.docked = true;
+          }
+        }
+      }
     }
 
     await bot.refreshStatus();
@@ -747,23 +817,53 @@ async function processItemTransfer(
       bot.docked = true;
     }
 
-    ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);
-    const homeAvailable = await getHomeFactionQty(bot, homeStation, item.itemId);
-    const cappedWithdrawQty = Math.min(withdrawQty, homeAvailable);
-    if (cappedWithdrawQty <= 0) {
-      ctx.log("warn", `${homeStation}: No ${item.itemName} in home faction storage — skipping`);
+    let cappedWithdrawQty = 0;
+    let source = "faction";
+
+    const personalAvailable = (bot.storage.find((i) => i.itemId === item.itemId)?.quantity || 0);
+    if (personalAvailable > 0) {
+      const personalCap = Math.min(withdrawQty, personalAvailable);
+      ctx.log("fuel", `Found ${personalAvailable}x ${item.itemName} in personal storage — trying to withdraw ${personalCap}x...`);
+      const pw = await withdrawFromHomePersonalStorage(ctx, bot, item.itemId, personalCap);
+      if (pw.success && pw.withdrawnQty > 0) {
+        cappedWithdrawQty = pw.withdrawnQty;
+        source = "personal";
+      }
+    }
+
+    if (cappedWithdrawQty === 0) {
+      ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);
+      const homeAvailable = await getHomeFactionQty(bot, homeStation, item.itemId);
+      const factionCap = Math.min(withdrawQty, homeAvailable);
+      if (factionCap > 0) {
+        cappedWithdrawQty = factionCap;
+        source = "faction";
+      }
+    }
+
+    if (cappedWithdrawQty === 0) {
+      ctx.log("warn", `${homeStation}: No ${item.itemName} in personal or faction storage — skipping`);
       return null;
     }
+
     if (cappedWithdrawQty < withdrawQty) {
-      ctx.log("fuel", `${homeStation}: Capping ${item.itemName} withdraw to ${cappedWithdrawQty} (have ${homeAvailable} in storage)`);
+      ctx.log("fuel", `${homeStation}: Capping ${item.itemName} withdraw to ${cappedWithdrawQty} (${source} storage)`);
     }
-    const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, cappedWithdrawQty, homeStation);
+
+    let wr: { success: boolean; withdrawnQty: number };
+    if (source === "personal") {
+      wr = await withdrawFromHomePersonalStorage(ctx, bot, item.itemId, cappedWithdrawQty);
+    } else {
+      wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, cappedWithdrawQty, homeStation);
+    }
+
     if (!wr.success) {
-      ctx.log("error", `Failed to withdraw ${cappedWithdrawQty}x ${item.itemName} from home`);
+      ctx.log("error", `Failed to withdraw ${cappedWithdrawQty}x ${item.itemName} from ${source} storage`);
       lastTransferFailure.set(failureKey, Date.now());
       return null;
     }
-    ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} — departing`);
+
+    ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} from ${source} storage — departing`);
   }
 
   let cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;

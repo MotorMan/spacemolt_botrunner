@@ -22976,11 +22976,12 @@ When responding:
                 <button class="primary sm" onclick="factionFacilityRenameSave('${esc(username)}','${esc(facId)}')">Save</button>
                 <button class="sm" onclick="toggleFactionFacilityRename('${esc(username)}','${esc(facId)}')">×</button>
               </div>` : ""}` : ``}
-              <div style="display:flex;gap:4px;margin-left:auto">
-                ${canTransfer && !restricted ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
-                <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
-                ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
-               </div>
+               <div style="display:flex;gap:4px;margin-left:auto">
+                 ${canTransfer && !restricted ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
+                 <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
+                 ${(fac.damaged || fac.status === "damaged") ? `<button class="sm danger" style="font-size:10px;padding:2px 6px" onclick="factionRepairFacility('${esc(username)}','${esc(facId)}')">Repair</button>` : ""}
+                 ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
+                </div>
         </div>`;
                   })
                   .join("");
@@ -23332,6 +23333,25 @@ When responding:
               appendLine(
                 "system",
                 `Toggle failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      function factionRepairFacility(username, facilityId) {
+        sendExec(
+          username,
+          "facility",
+          { action: "repair", facility_id: facilityId },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: Facility repair initiated`);
+              fetchFactionFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `Repair failed: ${result.error || "unknown"}`,
               );
             }
           },

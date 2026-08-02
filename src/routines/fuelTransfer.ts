@@ -26,6 +26,22 @@ import {
   type FacilityTransferLoadout,
 } from "./fuelTransferTracking.js";
 import { getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
+import {
+  cleanupStaleLocks as cleanupFtStaleLocks,
+  cleanupStaleInTransit as cleanupFtStaleInTransit,
+  getAvailableDeliveryQuantity,
+  getBotClaimedQuantity,
+  getBotItemLock,
+  getBotLocks,
+  getInTransitQuantity as getFtInTransitQuantity,
+  acquireDeliveryLock,
+  updateDeliveredQuantity,
+  releaseDeliveryLock,
+  addInTransitItems as addFtInTransitItems,
+  removeInTransitItems as removeFtInTransitItems,
+  resetCoordinationTracking as resetFtCoordinationTracking,
+  resetInTransitData as resetFtInTransitData,
+} from "./fuelTransferCoordination.js";
 
 
 const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
@@ -403,17 +419,32 @@ async function depositCargoAtHome(
     
     ctx.log("cargo", `Depositing ${qty}x ${itemId} at home station ${homeStationId}...`);
     const factionResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity: qty, station_id: homeStationId });
+    let deposited = false;
     if (!factionResp.error) {
       ctx.log("cargo", `Deposited ${qty}x ${itemId} to home faction storage`);
-      continue;
+      deposited = true;
     }
     
-    ctx.log("warn", `Home faction deposit failed for ${itemId}: ${factionResp.error?.message} — trying personal storage`);
-    const personalResp = await bot.exec("deposit_items", { item_id: itemId, quantity: qty, station_id: homeStationId });
-    if (!personalResp.error) {
-      ctx.log("cargo", `Deposited ${qty}x ${itemId} to home personal storage`);
-    } else {
-      ctx.log("error", `Home deposit failed for ${itemId}: ${personalResp.error?.message}`);
+    if (!deposited) {
+      ctx.log("warn", `Home faction deposit failed for ${itemId}: ${factionResp.error?.message} — trying personal storage`);
+      const personalResp = await bot.exec("deposit_items", { item_id: itemId, quantity: qty, station_id: homeStationId });
+      if (!personalResp.error) {
+        ctx.log("cargo", `Deposited ${qty}x ${itemId} to home personal storage`);
+        deposited = true;
+      } else {
+        ctx.log("error", `Home deposit failed for ${itemId}: ${personalResp.error?.message}`);
+      }
+    }
+
+    if (deposited) {
+      const botLocks = getBotLocks(bot.username);
+      for (const lock of botLocks) {
+        if (lock.itemId === itemId && lock.isActive) {
+          releaseDeliveryLock(bot.username, itemId, lock.remoteStationId, "cargo_deposited_at_home");
+          ctx.log("fuel", `Co-op: Released lock for ${itemId} to ${lock.remoteStationId} (cargo deposited at home instead)`);
+          removeFtInTransitItems(bot.username, lock.remoteStationId, [{ itemId: itemId, quantity: qty }]);
+        }
+      }
     }
   }
   
@@ -475,6 +506,15 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   }
 
   ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
+
+  const cleanedLocks = cleanupFtStaleLocks();
+  if (cleanedLocks > 0) {
+    ctx.log("fuel", `Cleaned up ${cleanedLocks} stale co-op locks`);
+  }
+  const cleanedTransit = cleanupFtStaleInTransit();
+  if (cleanedTransit > 0) {
+    ctx.log("fuel", `Cleaned up ${cleanedTransit} stale in-transit entries`);
+  }
 
   if (settings.autoCloak) {
     await enableCloakingIfPossible(ctx);
@@ -574,7 +614,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       }
     }
 
-    await tryRefuel(ctx);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
     await repairShip(ctx);
     await depositCargoAtHome(ctx, bot, homeStation);
 
@@ -749,19 +789,59 @@ async function processItemTransfer(
   const currentCargoForItem = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
   const alreadyHave = currentCargoForItem;
 
+  const botUsername = bot.username;
+
   if (alreadyHave >= needed) {
     ctx.log("fuel", `Already have ${alreadyHave}x ${item.itemName} in cargo — delivering`);
+    const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, needed, botUsername);
+    const claimQty = Math.min(needed, coOpAvailable, alreadyHave);
+    if (claimQty <= 0 && coOpAvailable < needed) {
+      ctx.log("fuel", `Co-op: ${needed - coOpAvailable}x ${item.itemName} already claimed/in-transit by other bots — skipping`);
+      return null;
+    }
+    acquireDeliveryLock({
+      botUsername,
+      itemId: item.itemId,
+      itemName: item.itemName,
+      quantity: claimQty,
+      remoteStationId,
+    });
+    addFtInTransitItems(botUsername, remoteStationId, [
+      { itemId: item.itemId, itemName: item.itemName, quantity: claimQty },
+    ]);
+    ctx.log("fuel", `Co-op: Tracked ${claimQty}x ${item.itemName} in-transit to ${remoteStationId}`);
   } else {
     const usedCargo = cargoUsedFromInventory(bot);
     const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
     const itemSize = getItemSize(item.itemId);
     const maxCanCarry = maxItemsForCargo(freeSpace, item.itemId);
-    let withdrawQty = Math.min(needed - alreadyHave, maxCanCarry);
+    const baseWithdrawQty = Math.min(needed - alreadyHave, maxCanCarry);
+
+    const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, needed, botUsername);
+    const inTransitOther = getFtInTransitQuantity(item.itemId, remoteStationId, botUsername);
+    const effectiveAvailable = Math.max(0, coOpAvailable - inTransitOther);
+    let withdrawQty = Math.min(baseWithdrawQty, effectiveAvailable);
 
     if (withdrawQty <= 0) {
-      ctx.log("warn", `Cannot carry any ${item.itemName} (free space ${freeSpace}, size ${itemSize})`);
+      if (effectiveAvailable <= 0 && baseWithdrawQty > 0) {
+        ctx.log("fuel", `Co-op: ${needed}x ${item.itemName} fully claimed/in-transit by other bots — skipping`);
+      } else {
+        ctx.log("warn", `Cannot carry any ${item.itemName} (free space ${freeSpace}, size ${itemSize})`);
+      }
       return null;
     }
+
+    if (withdrawQty < baseWithdrawQty) {
+      ctx.log("fuel", `Co-op: Capping ${item.itemName} withdraw to ${withdrawQty} of ${baseWithdrawQty} (others handling rest)`);
+    }
+
+    acquireDeliveryLock({
+      botUsername,
+      itemId: item.itemId,
+      itemName: item.itemName,
+      quantity: withdrawQty,
+      remoteStationId,
+    });
 
     if (bot.system !== homeSystem || bot.poi !== homeStation) {
       ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation} for withdraw...`);
@@ -861,6 +941,11 @@ async function processItemTransfer(
     }
 
     ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} from ${source} storage — departing`);
+
+    addFtInTransitItems(botUsername, remoteStationId, [
+      { itemId: item.itemId, itemName: item.itemName, quantity: wr.withdrawnQty },
+    ]);
+    ctx.log("fuel", `Co-op: Tracked ${wr.withdrawnQty}x ${item.itemName} in-transit to ${remoteStationId}`);
   }
 
   let cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
@@ -917,6 +1002,16 @@ async function processItemTransfer(
   if (depositResult.success) {
     ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${item.itemName} to ${remoteStationId} via ${depositResult.mode}`);
     lastTransferFailure.delete(failureKey);
+
+    updateDeliveredQuantity(botUsername, item.itemId, remoteStationId, depositResult.depositedQty);
+    removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: item.itemId, quantity: depositResult.depositedQty }]);
+    ctx.log("fuel", `Co-op: Updated delivered count and cleared in-transit for ${depositResult.depositedQty}x ${item.itemName}`);
+
+    const remainingLock = getBotItemLock(botUsername, item.itemId, remoteStationId);
+    if (remainingLock && remainingLock.deliveredQuantity >= remainingLock.lockedQuantity) {
+      releaseDeliveryLock(botUsername, item.itemId, remoteStationId, "completed");
+      ctx.log("fuel", `Co-op: Released lock for ${item.itemName} to ${remoteStationId} (delivery complete)`);
+    }
   } else {
     ctx.log("error", `Could not deposit ${item.itemName} to ${remoteStationId}`);
     lastTransferFailure.set(failureKey, Date.now());

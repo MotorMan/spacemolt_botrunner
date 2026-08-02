@@ -2230,7 +2230,13 @@
         if (wsManualClose) return;
         clearTimeout(wsConnectTimer);
 
-        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
+        if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING)) {
+          return;
+        }
+
+        if (ws && ws.readyState === WebSocket.CLOSED) {
+          ws = null;
+        }
 
         // Periodically refresh remote (client-sync) bots for the dropdowns.
         if (!window.__remoteBotsTimer) {
@@ -2313,6 +2319,7 @@
         };
 
         _ws.onerror = () => {
+          ws = null;
           // Some browsers skip onclose after onerror — force the reconnect path.
           if (_ws.readyState !== WebSocket.CLOSED) {
             try { _ws.close(); } catch {}

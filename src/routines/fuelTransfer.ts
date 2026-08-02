@@ -572,36 +572,11 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
         }
         bot.docked = true;
       }
-
-      await tryRefuel(ctx);
-      await repairShip(ctx);
-
-      if (bot.poi !== homeStation) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        if (bot.system !== homeSystem) {
-          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-          if (!arrived || bot.state !== "running") {
-            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-            await ctx.sleep(30000); continue;
-          }
-        }
-        const tResp = await bot.exec("travel", { target_poi: homeStation });
-        if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("warn", `Return to home station after services failed: ${tResp.error.message}`);
-        } else {
-          bot.poi = homeStation;
-        }
-        if (!bot.docked) {
-          const dockResp = await bot.exec("dock");
-          if (!dockResp.error || dockResp.error.message.includes("already")) {
-            bot.docked = true;
-          }
-        }
-      }
-
-      await depositCargoAtHome(ctx, bot, homeStation);
     }
+
+    await tryRefuel(ctx);
+    await repairShip(ctx);
+    await depositCargoAtHome(ctx, bot, homeStation);
 
     let allAtTarget = true;
     const stationsToService: { station: string; system: string }[] = [];

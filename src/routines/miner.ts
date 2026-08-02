@@ -2363,6 +2363,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       } catch { /* dock failed */ }
     }
 
+    // CRITICAL FIX: Refuel after re-docking (the earlier tryRefuel at line 2351 ran while
+    // the bot was undocked/cloaked and could not actually refuel). Now that we're back
+    // docked, attempt refuel again so the miner doesn't leave home base with empty tanks.
+    if (bot.docked) {
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+    }
+
     if (bot.docked) {
       const weapons = await getWeaponModules(ctx);
       if (weapons.length > 0) {
@@ -3032,6 +3039,8 @@ if (shouldAbandon) {
         await ctx.sleep(5000);
         continue;
       }
+      ctx.log("mining", "Cargo deposited — refueling before next cycle");
+      await tryRefuel(ctx, { skipApprovedCheck: true });
       ctx.log("mining", "Cargo deposited — session complete");
       await completeMiningSession(bot.username);
       recoveredSession = null;
@@ -4122,6 +4131,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           await ctx.sleep(5000);
           continue;
         }
+        ctx.log("mining", "Cargo deposited — refueling before next cycle");
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         ctx.log("mining", "Cargo deposited — restarting mining cycle");
         continue;
       }
@@ -4506,6 +4517,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 await ctx.sleep(5000);
                 continue;
               }
+              ctx.log("mining", "Cargo deposited — refueling before next cycle");
+              await tryRefuel(ctx, { skipApprovedCheck: true });
               ctx.log("mining", "Cargo deposited — restarting mining cycle");
               continue;
             }
@@ -4526,6 +4539,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
               await ensureDocked(ctx);
               await dumpCargo(ctx, settings);
+              await tryRefuel(ctx, { skipApprovedCheck: true });
               continue;
             }
             let isValid = false;
@@ -4551,6 +4565,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
                 await ensureDocked(ctx);
                 await dumpCargo(ctx, settings);
+                await tryRefuel(ctx, { skipApprovedCheck: true });
                 continue;
               }
             } else {
@@ -4560,6 +4575,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
               await ensureDocked(ctx);
               await dumpCargo(ctx, settings);
+              await tryRefuel(ctx, { skipApprovedCheck: true });
               continue;
             }
           } else {
@@ -4577,6 +4593,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
+            await tryRefuel(ctx, { skipApprovedCheck: true });
             continue;
           }
         } else {
@@ -4594,6 +4611,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
           await ensureDocked(ctx);
           await dumpCargo(ctx, settings);
+          await tryRefuel(ctx, { skipApprovedCheck: true });
           continue;
         }
       }
@@ -4652,6 +4670,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         await ctx.sleep(5000);
         continue;
       }
+      ctx.log("mining", "Cargo deposited — refueling before next cycle");
+      await tryRefuel(ctx, { skipApprovedCheck: true });
       ctx.log("mining", "Cargo deposited — restarting mining cycle");
       continue;
     }
@@ -5389,6 +5409,8 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       await ctx.sleep(5000);
                       continue;
                     }
+                    ctx.log("mining", "Cargo deposited — refueling before next cycle");
+                    await tryRefuel(ctx, { skipApprovedCheck: true });
                     ctx.log("mining", "Cargo deposited — restarting mining cycle");
                     continue;
                   }
@@ -5623,6 +5645,8 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                             await ctx.sleep(5000);
                             continue;
                           }
+                          ctx.log("mining", "Cargo deposited — refueling before next cycle");
+                          await tryRefuel(ctx, { skipApprovedCheck: true });
                           ctx.log("mining", "Cargo deposited — restarting mining cycle");
                           continue;
                         }

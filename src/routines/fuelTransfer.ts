@@ -665,8 +665,16 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           
           const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
           for (const [itemId, targetQty] of loadoutItems) {
+            const currentQty = stationQtyCache[itemId] || 0;
             const itemSize = getItemSize(itemId);
-            neededItems.push({ itemId, itemName: itemId, needed: targetQty, itemSize });
+            
+            const forceFullForItem = Array.from(loadoutItemMap.get(itemId)!).some(loadoutName => {
+              const loadout = activeLoadouts.find(l => l.name === loadoutName);
+              return loadout?.forceFullDelivery || false;
+            });
+            
+            const need = forceFullForItem ? targetQty : Math.max(0, targetQty - currentQty);
+            neededItems.push({ itemId, itemName: itemId, needed: need, itemSize });
           }
           
           if (neededItems.length > 0) {

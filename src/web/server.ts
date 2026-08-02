@@ -8,7 +8,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
-import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, setLoadoutForceFullDelivery, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
@@ -2261,7 +2261,7 @@ if (url.pathname === "/data/shipsForSale.json") {
 
           // POST /api/facility-transfer-loadouts - Save a facility transfer loadout
           if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "POST") {
-            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }> };
+            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }>; forceFullDelivery?: boolean };
             if (!body?.name || !Array.isArray(body.items)) {
               return Response.json({ error: "Missing name or items" }, { status: 400 });
             }
@@ -2269,8 +2269,9 @@ if (url.pathname === "/data/shipsForSale.json") {
               name: body.name,
               items: body.items,
               createdAt: new Date().toISOString(),
+              forceFullDelivery: body.forceFullDelivery ?? false,
             };
-            saveFacilityTransferLoadout(body.name, { items: body.items });
+            saveFacilityTransferLoadout(body.name, { items: body.items, forceFullDelivery: body.forceFullDelivery ?? false });
             return Response.json({ ok: true, name: body.name });
           }
 
@@ -2290,6 +2291,14 @@ if (url.pathname === "/data/shipsForSale.json") {
             const body = await req.json() as { active: boolean };
             setLoadoutActive(name, body.active);
             return Response.json({ ok: true, name, active: body.active });
+          }
+
+          // PATCH /api/facility-transfer-loadouts/:name/force-full-delivery - Set loadout force full delivery state
+          if (url.pathname.match(/^\/api\/facility-transfer-loadouts\/[^/]+\/force-full-delivery$/) && req.method === "PATCH") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length, -"/force-full-delivery".length));
+            const body = await req.json() as { forceFullDelivery: boolean };
+            setLoadoutForceFullDelivery(name, body.forceFullDelivery);
+            return Response.json({ ok: true, name, forceFullDelivery: body.forceFullDelivery });
           }
 
           // GET /api/facility-transfer-completions?station=X - Get completions for a station

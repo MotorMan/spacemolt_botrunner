@@ -347,6 +347,7 @@ export interface FacilityTransferLoadout {
   items: FacilityTransferLoadoutItem[];
   createdAt: string;
   active?: boolean;
+  forceFullDelivery?: boolean;
 }
 
 const LOADOUTS_FILE = join(DATA_DIR, "facilityTransferLoadouts.json");
@@ -372,6 +373,7 @@ export function saveFacilityTransferLoadout(name: string, loadout: Omit<Facility
       items: loadout.items,
       createdAt: new Date().toISOString(),
       active: loadout.active ?? false,
+      forceFullDelivery: loadout.forceFullDelivery ?? false,
     };
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
@@ -409,6 +411,19 @@ export function setLoadoutActive(name: string, active: boolean): void {
     }
   } catch (err) {
     console.error("Error setting loadout active:", err);
+  }
+}
+
+export function setLoadoutForceFullDelivery(name: string, forceFullDelivery: boolean): void {
+  try {
+    const loadouts = loadFacilityTransferLoadouts();
+    if (name in loadouts) {
+      loadouts[name].forceFullDelivery = forceFullDelivery;
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+    }
+  } catch (err) {
+    console.error("Error setting loadout force full delivery:", err);
   }
 }
 

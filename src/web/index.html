@@ -31623,9 +31623,12 @@ ignoreBlacklist: document.getElementById(
           .map((name) => {
             const loadout = ftLoadouts[name];
             const isActive = loadout?.active || false;
+            const forceFullDelivery = loadout?.forceFullDelivery || false;
             return `<label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:12px">
       <input type="checkbox" ${isActive ? "checked" : ""} onchange="setFuelTransferLoadoutActive('${esc(name)}', this.checked)">
       <span>${esc(name)}</span>
+      <input type="checkbox" ${forceFullDelivery ? "checked" : ""} onchange="setFuelTransferLoadoutForceFullDelivery('${esc(name)}', this.checked)" title="Force full delivery (ignore current station levels)">
+      <span style="color:var(--text-dim);font-size:11px">Full</span>
     </label>`;
           })
           .join("");
@@ -32120,6 +32123,25 @@ ignoreBlacklist: document.getElementById(
           }
         } catch (e) {
           console.warn(`Failed to set loadout active: ${e.message}`);
+        }
+      }
+
+      async function setFuelTransferLoadoutForceFullDelivery(name, forceFullDelivery) {
+        try {
+          const response = await fetch(
+            `/api/facility-transfer-loadouts/${encodeURIComponent(name)}/force-full-delivery`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ forceFullDelivery }),
+            },
+          );
+          if (response.ok) {
+            await loadFuelTransferLoadouts();
+            rerenderCurrentSettings();
+          }
+        } catch (e) {
+          console.warn(`Failed to set loadout force full delivery: ${e.message}`);
         }
       }
 

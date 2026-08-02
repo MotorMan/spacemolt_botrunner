@@ -386,6 +386,40 @@ async function depositToRemoteStation(
   return { success: false, depositedQty: 0, mode: "failed" };
 }
 
+async function depositCargoAtHome(
+  ctx: RoutineContext,
+  bot: Bot,
+  homeStationId: string
+): Promise<void> {
+  await bot.refreshCargo();
+  const items = bot.inventory.filter((i) => (i.quantity || 0) > 0);
+  
+  for (const item of items) {
+    if (bot.state !== "running") return;
+    
+    const itemId = item.itemId;
+    const qty = item.quantity || 0;
+    if (qty <= 0) continue;
+    
+    ctx.log("cargo", `Depositing ${qty}x ${itemId} at home station ${homeStationId}...`);
+    const factionResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity: qty, station_id: homeStationId });
+    if (!factionResp.error) {
+      ctx.log("cargo", `Deposited ${qty}x ${itemId} to home faction storage`);
+      continue;
+    }
+    
+    ctx.log("warn", `Home faction deposit failed for ${itemId}: ${factionResp.error?.message} — trying personal storage`);
+    const personalResp = await bot.exec("deposit_items", { item_id: itemId, quantity: qty, station_id: homeStationId });
+    if (!personalResp.error) {
+      ctx.log("cargo", `Deposited ${qty}x ${itemId} to home personal storage`);
+    } else {
+      ctx.log("error", `Home deposit failed for ${itemId}: ${personalResp.error?.message}`);
+    }
+  }
+  
+  await bot.refreshCargo();
+}
+
 export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
@@ -565,6 +599,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
         }
       }
+
+      await depositCargoAtHome(ctx, bot, homeStation);
     }
 
     let allAtTarget = true;
@@ -893,10 +929,10 @@ async function processItemTransfer(
 
   const actualRemoteQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
   const needNow = Math.max(0, item.targetQuantity - actualRemoteQty);
-  const toDeposit = Math.min(cargoQty, needNow);
+  const toDeposit = cargoQty;
 
   if (toDeposit <= 0) {
-    ctx.log("fuel", `${remoteStationId}: ${item.itemName} already at target (${actualRemoteQty}/${item.targetQuantity}) after transit — nothing to deposit`);
+    ctx.log("fuel", `${remoteStationId}: No ${item.itemName} in cargo to deposit`);
     return null;
   }
 

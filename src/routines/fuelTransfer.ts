@@ -659,7 +659,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
         }
 
-        if (loadoutItems.size > 0) {
+        if (loadoutItems.size > 0 && applicableLoadouts.length > 0) {
           allAtTarget = false;
           const deliveredItems: { itemId: string; quantity: number }[] = [];
           

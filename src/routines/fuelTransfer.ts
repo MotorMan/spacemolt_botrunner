@@ -681,6 +681,13 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           for (const [itemId, targetQty] of loadoutItems) {
             if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
             const item = settings.items.find(i => i.itemId === itemId) || { itemId, itemName: itemId, targetQuantity: targetQty };
+            
+            const coOpAvailable = getAvailableDeliveryQuantity(itemId, remoteStationId, targetQty, bot.username);
+            if (coOpAvailable <= 0) {
+              ctx.log("fuel", `Co-op: ${itemId} fully claimed by other bots — skipping loadout item`);
+              continue;
+            }
+            
             const result = await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
             if (result) deliveredItems.push({ itemId: result.itemId, quantity: result.qty });
           }
@@ -731,6 +738,12 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
         const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
         ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
         if (strategy.skip) continue;
+
+        const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, item.targetQuantity - currentQty, bot.username);
+        if (coOpAvailable <= 0) {
+          ctx.log("fuel", `Co-op: ${item.itemName} fully claimed by other bots — skipping`);
+          continue;
+        }
 
         allAtTarget = false;
         await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
@@ -833,6 +846,8 @@ async function processItemTransfer(
 
     if (withdrawQty < baseWithdrawQty) {
       ctx.log("fuel", `Co-op: Capping ${item.itemName} withdraw to ${withdrawQty} of ${baseWithdrawQty} (others handling rest)`);
+    } else if (coOpAvailable < needed) {
+      ctx.log("fuel", `Co-op: ${item.itemName} co-op available ${coOpAvailable} of ${needed} needed (others handling ${needed - coOpAvailable})`);
     }
 
     acquireDeliveryLock({

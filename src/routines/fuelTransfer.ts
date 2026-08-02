@@ -637,7 +637,6 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       const remoteStationId = extractStationId(station);
       
       const loadoutItems: Map<string, number> = new Map();
-      const applicableLoadouts: string[] = [];
       const loadoutItemMap: Map<string, Set<string>> = new Map();
       
       const stationQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
@@ -651,58 +650,35 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
             continue;
           }
 
-          loadoutItemMap.set(loadout.name, new Set());
           for (const item of loadout.items) {
             const existing = loadoutItems.get(item.itemId) || 0;
             loadoutItems.set(item.itemId, existing + item.targetQuantity);
-          }
-        }
-        
-        for (const [itemId, totalTarget] of loadoutItems) {
-          const currentQty = stationQtyCache[itemId] || 0;
-          ctx.log("fuel", `Checking ${itemId}: current=${currentQty}, totalTarget=${totalTarget}`);
-          if (currentQty < totalTarget) {
-            for (const loadout of activeLoadouts) {
-              if (isStationCompletedForLoadout(remoteStationId, loadout.name)) continue;
-              const hasItem = loadout.items.some(i => i.itemId === itemId);
-              if (hasItem && !loadoutItemMap.get(loadout.name)!.has(itemId)) {
-                loadoutItemMap.get(loadout.name)!.add(itemId);
-                if (!applicableLoadouts.includes(loadout.name)) {
-                  applicableLoadouts.push(loadout.name);
-                }
-              }
+            if (!loadoutItemMap.has(item.itemId)) {
+              loadoutItemMap.set(item.itemId, new Set());
             }
+            loadoutItemMap.get(item.itemId)!.add(loadout.name);
           }
         }
 
-        if (loadoutItems.size > 0 && applicableLoadouts.length > 0) {
+        if (loadoutItems.size > 0) {
           allAtTarget = false;
           
           const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
           for (const [itemId, targetQty] of loadoutItems) {
-            const currentQty = stationQtyCache[itemId] || 0;
-            if (currentQty >= targetQty) continue;
-            const need = targetQty - currentQty;
             const itemSize = getItemSize(itemId);
-            neededItems.push({ itemId, itemName: itemId, needed: need, itemSize });
+            neededItems.push({ itemId, itemName: itemId, needed: targetQty, itemSize });
           }
           
           if (neededItems.length > 0) {
             const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
             if (batchResult) {
               const deliveredItems = batchResult.filter(r => r.deposited).map(r => ({ itemId: r.itemId, quantity: r.qty }));
-              if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
+              if (deliveredItems.length > 0) {
                 const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
                 if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-                for (const loadoutName of applicableLoadouts) {
-                  const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
-                  if (loadoutItemIds.size === 0) continue;
-                  const loadoutDeliveredItems = deliveredItems.filter(i => loadoutItemIds.has(i.itemId));
-                  if (loadoutDeliveredItems.length === 0) continue;
-                  
-                  const loadout = activeLoadouts.find(l => l.name === loadoutName);
-                  if (!loadout) continue;
-                  
+                for (const loadout of activeLoadouts) {
+                  if (isStationCompletedForLoadout(remoteStationId, loadout.name)) continue;
+
                   let allItemsAtTarget = true;
                   for (const item of loadout.items) {
                     const currentQty = freshQtyCache[item.itemId] || 0;
@@ -714,8 +690,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
                   }
                   
                   if (allItemsAtTarget) {
-                    ctx.log("fuel", `${loadoutName}: ALL ITEMS AT TARGET - saving completion`);
-                    saveStationCompletion(remoteStationId, loadoutName, loadoutDeliveredItems);
+                    ctx.log("fuel", `${loadout.name}: ALL ITEMS AT TARGET - saving completion`);
+                    saveStationCompletion(remoteStationId, loadout.name, []);
                   }
                 }
               }

@@ -941,6 +941,12 @@ async function deliverBatchToStation(
   }
   ctx.log("fuel", `Co-op: Tracked ${actualLoad.reduce((s, p) => s + p.qty, 0)} units in-transit to ${remoteStationId}`);
 
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPct < safetyOpts.fuelThresholdPct) {
+    ctx.log("fuel", `Fuel low (${fuelPct}%) before departure — refueling...`);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
+  }
+
   ctx.log("fuel", `Heading to ${destSystem} with ${actualLoad.length} item types...`);
   if (bot.system !== destSystem) {
     const arrived = await navigateToSystem(ctx, destSystem, safetyOpts);
@@ -1013,6 +1019,15 @@ async function deliverBatchToStation(
       ctx.log("error", `Could not deposit ${plan.itemName} to ${remoteStationId}`);
       results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
     }
+  }
+
+  const fuelPctAfter = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPctAfter < safetyOpts.fuelThresholdPct) {
+    ctx.log("fuel", `Fuel low (${fuelPctAfter}%) after delivery — refueling at ${remoteStationId} before return...`);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
+    await bot.refreshShip();
+    const postRefuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("fuel", `Refueled at ${remoteStationId} — fuel now ${postRefuelPct}%`);
   }
 
   if (!bot.docked) bot.docked = false;

@@ -834,14 +834,15 @@ async function deliverBatchToStation(
   }
 
   const loadPlan: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
+  let plannedUsage = 0;
   
   for (const needed of neededItems) {
     if (bot.state !== "running") break;
     
     const usedCargo = cargoUsedFromInventory(bot);
-    const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
+    const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo - plannedUsage);
     if (freeSpace <= 0) {
-      ctx.log("fuel", `Cargo full — stopping load at ${loadPlan.length} items`);
+      ctx.log("fuel", `Cargo full — stopping load at ${loadPlan.length} items (planned ${plannedUsage} units)`);
       break;
     }
     
@@ -875,6 +876,7 @@ async function deliverBatchToStation(
     });
     
     loadPlan.push({ itemId: needed.itemId, itemName: needed.itemName, qty: takeQty, source: "faction" });
+    plannedUsage += takeQty * needed.itemSize;
   }
 
   if (loadPlan.length === 0) {
@@ -884,8 +886,30 @@ async function deliverBatchToStation(
 
   ctx.log("fuel", `Batch loading ${loadPlan.length} item types (${loadPlan.reduce((s, i) => s + i.qty, 0)} total units) at home...`);
   
+  const actualLoad: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
+  
   for (const plan of loadPlan) {
     if (bot.state !== "running") break;
+    
+    await bot.refreshCargo();
+    const usedCargoNow = cargoUsedFromInventory(bot);
+    const freeSpaceNow = Math.max(0, (bot.cargoMax || 825) - usedCargoNow);
+    if (freeSpaceNow <= 0) {
+      ctx.log("fuel", `Cargo full after loading ${actualLoad.length} items — stopping`);
+      break;
+    }
+    
+    const itemSize = getItemSize(plan.itemId);
+    const maxFitNow = maxItemsForCargo(freeSpaceNow, plan.itemId);
+    const adjustedQty = Math.min(plan.qty, maxFitNow);
+    if (adjustedQty <= 0) {
+      ctx.log("fuel", `No room for ${plan.itemName} (need ${plan.qty}, only ${freeSpaceNow} space) — skipping`);
+      continue;
+    }
+    if (adjustedQty < plan.qty) {
+      ctx.log("fuel", `Capping ${plan.itemName} to ${adjustedQty} (cargo limit, was ${plan.qty})`);
+    }
+    plan.qty = adjustedQty;
     
     const personalAvailable = (bot.storage.find((i) => i.itemId === plan.itemId)?.quantity || 0);
     if (personalAvailable > 0) {
@@ -895,6 +919,7 @@ async function deliverBatchToStation(
       if (pw.success && pw.withdrawnQty > 0) {
         plan.qty = pw.withdrawnQty;
         plan.source = "personal";
+        actualLoad.push({ ...plan });
         ctx.log("fuel", `Withdrew ${pw.withdrawnQty}x ${plan.itemName} from personal storage`);
         continue;
       }
@@ -924,11 +949,10 @@ async function deliverBatchToStation(
       plan.qty = 0;
     } else {
       plan.qty = wr.withdrawnQty;
+      actualLoad.push({ ...plan });
       ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${plan.itemName} from ${plan.source} storage`);
     }
   }
-
-  const actualLoad = loadPlan.filter(p => p.qty > 0);
   if (actualLoad.length === 0) {
     ctx.log("warn", "Nothing actually loaded — skipping trip");
     return results;

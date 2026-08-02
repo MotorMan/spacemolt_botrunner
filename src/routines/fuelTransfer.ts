@@ -676,47 +676,47 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
         if (loadoutItems.size > 0 && applicableLoadouts.length > 0) {
           allAtTarget = false;
-          const deliveredItems: { itemId: string; quantity: number }[] = [];
           
+          const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
           for (const [itemId, targetQty] of loadoutItems) {
-            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-            const item = settings.items.find(i => i.itemId === itemId) || { itemId, itemName: itemId, targetQuantity: targetQty };
-            
-            const coOpAvailable = getAvailableDeliveryQuantity(itemId, remoteStationId, targetQty, bot.username);
-            if (coOpAvailable <= 0) {
-              ctx.log("fuel", `Co-op: ${itemId} fully claimed by other bots — skipping loadout item`);
-              continue;
-            }
-            
-            const result = await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
-            if (result) deliveredItems.push({ itemId: result.itemId, quantity: result.qty });
+            const currentQty = stationQtyCache[itemId] || 0;
+            if (currentQty >= targetQty) continue;
+            const need = targetQty - currentQty;
+            const itemSize = getItemSize(itemId);
+            neededItems.push({ itemId, itemName: itemId, needed: need, itemSize });
           }
-
-          if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
-            const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
-            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-            for (const loadoutName of applicableLoadouts) {
-              const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
-              if (loadoutItemIds.size === 0) continue;
-              const loadoutDeliveredItems = deliveredItems.filter(i => loadoutItemIds.has(i.itemId));
-              if (loadoutDeliveredItems.length === 0) continue;
-              
-              const loadout = activeLoadouts.find(l => l.name === loadoutName);
-              if (!loadout) continue;
-              
-              let allItemsAtTarget = true;
-              for (const item of loadout.items) {
-                const currentQty = freshQtyCache[item.itemId] || 0;
-                if (currentQty < item.targetQuantity) {
-                  allItemsAtTarget = false;
-                  ctx.log("fuel", `${item.itemId}: ${currentQty}/${item.targetQuantity} - not at target`);
-                  break;
+          
+          if (neededItems.length > 0) {
+            const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
+            if (batchResult) {
+              const deliveredItems = batchResult.filter(r => r.deposited).map(r => ({ itemId: r.itemId, quantity: r.qty }));
+              if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
+                const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
+                if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+                for (const loadoutName of applicableLoadouts) {
+                  const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
+                  if (loadoutItemIds.size === 0) continue;
+                  const loadoutDeliveredItems = deliveredItems.filter(i => loadoutItemIds.has(i.itemId));
+                  if (loadoutDeliveredItems.length === 0) continue;
+                  
+                  const loadout = activeLoadouts.find(l => l.name === loadoutName);
+                  if (!loadout) continue;
+                  
+                  let allItemsAtTarget = true;
+                  for (const item of loadout.items) {
+                    const currentQty = freshQtyCache[item.itemId] || 0;
+                    if (currentQty < item.targetQuantity) {
+                      allItemsAtTarget = false;
+                      ctx.log("fuel", `${item.itemId}: ${currentQty}/${item.targetQuantity} - not at target`);
+                      break;
+                    }
+                  }
+                  
+                  if (allItemsAtTarget) {
+                    ctx.log("fuel", `${loadoutName}: ALL ITEMS AT TARGET - saving completion`);
+                    saveStationCompletion(remoteStationId, loadoutName, loadoutDeliveredItems);
+                  }
                 }
-              }
-              
-              if (allItemsAtTarget) {
-                ctx.log("fuel", `${loadoutName}: ALL ITEMS AT TARGET - saving completion`);
-                saveStationCompletion(remoteStationId, loadoutName, loadoutDeliveredItems);
               }
             }
           }
@@ -724,6 +724,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       }
 
       const processedItemIds = new Set(loadoutItems.keys());
+      const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
       for (const item of settings.items) {
         if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
         if (processedItemIds.has(item.itemId)) continue;
@@ -745,8 +746,14 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           continue;
         }
 
+        const need = item.targetQuantity - currentQty;
+        const itemSize = getItemSize(item.itemId);
+        neededItems.push({ itemId: item.itemId, itemName: item.itemName, needed: need, itemSize });
+      }
+      
+      if (neededItems.length > 0) {
         allAtTarget = false;
-        await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
+        const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
       }
     }
 
@@ -762,220 +769,189 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
   }
 };
 
-async function processItemTransfer(
+async function deliverBatchToStation(
   ctx: RoutineContext,
   bot: Bot,
-  item: FuelTransportItem,
+  neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }>,
   remoteStationId: string,
   destSystem: string,
   homeSystem: string,
   homeStation: string,
-  safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number },
-  processedLoadouts: Set<string>
-): Promise<{ deposited: boolean; itemId: string; qty: number } | null> {
-  if (bot.state !== "running") return null;
-
-  const failureKey = `${remoteStationId}:${item.itemId}`;
-  const lastFailure = lastTransferFailure.get(failureKey) || 0;
-  if (Date.now() - lastFailure < TRANSFER_FAILURE_COOLDOWN_MS) {
-    return null;
-  }
-
-  const { cachedQty, currentQty, hasCache } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
-  if (bot.state !== "running") return null;
-
-  if (currentQty >= item.targetQuantity) {
-    ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
-    return null;
-  }
-
-  const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
-  ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
-
-  if (strategy.skip) {
-    return null;
-  }
-
-  const needed = item.targetQuantity - currentQty;
-  ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — need ${needed}`);
-
-  const currentCargoForItem = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
-  const alreadyHave = currentCargoForItem;
-
+  safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number }
+): Promise<Array<{ deposited: boolean; itemId: string; qty: number }>> {
+  const results: Array<{ deposited: boolean; itemId: string; qty: number }> = [];
   const botUsername = bot.username;
 
-  if (alreadyHave >= needed) {
-    ctx.log("fuel", `Already have ${alreadyHave}x ${item.itemName} in cargo — delivering`);
-    const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, needed, botUsername);
-    const claimQty = Math.min(needed, coOpAvailable, alreadyHave);
-    if (claimQty <= 0 && coOpAvailable < needed) {
-      ctx.log("fuel", `Co-op: ${needed - coOpAvailable}x ${item.itemName} already claimed/in-transit by other bots — skipping`);
-      return null;
-    }
-    acquireDeliveryLock({
-      botUsername,
-      itemId: item.itemId,
-      itemName: item.itemName,
-      quantity: claimQty,
-      remoteStationId,
-    });
-    addFtInTransitItems(botUsername, remoteStationId, [
-      { itemId: item.itemId, itemName: item.itemName, quantity: claimQty },
-    ]);
-    ctx.log("fuel", `Co-op: Tracked ${claimQty}x ${item.itemName} in-transit to ${remoteStationId}`);
-  } else {
-    const usedCargo = cargoUsedFromInventory(bot);
-    const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
-    const itemSize = getItemSize(item.itemId);
-    const maxCanCarry = maxItemsForCargo(freeSpace, item.itemId);
-    const baseWithdrawQty = Math.min(needed - alreadyHave, maxCanCarry);
-
-    const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, needed, botUsername);
-    const inTransitOther = getFtInTransitQuantity(item.itemId, remoteStationId, botUsername);
-    const effectiveAvailable = Math.max(0, coOpAvailable - inTransitOther);
-    let withdrawQty = Math.min(baseWithdrawQty, effectiveAvailable);
-
-    if (withdrawQty <= 0) {
-      if (effectiveAvailable <= 0 && baseWithdrawQty > 0) {
-        ctx.log("fuel", `Co-op: ${needed}x ${item.itemName} fully claimed/in-transit by other bots — skipping`);
-      } else {
-        ctx.log("warn", `Cannot carry any ${item.itemName} (free space ${freeSpace}, size ${itemSize})`);
+  if (bot.system !== homeSystem || bot.poi !== homeStation) {
+    ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation} for batch withdraw...`);
+    if (bot.system !== homeSystem) {
+      await ensureUndocked(ctx);
+      if (bot.state !== "running") return results;
+      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (!fueled) { await ctx.sleep(30000); return results; }
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived || bot.state !== "running") {
+        if (bot.state !== "running") return results;
+        await ctx.sleep(30000); return results;
       }
-      return null;
+      ctx.log("fuel", `Arrived at home system ${homeSystem}`);
     }
 
-    if (withdrawQty < baseWithdrawQty) {
-      ctx.log("fuel", `Co-op: Capping ${item.itemName} withdraw to ${withdrawQty} of ${baseWithdrawQty} (others handling rest)`);
-    } else if (coOpAvailable < needed) {
-      ctx.log("fuel", `Co-op: ${item.itemName} co-op available ${coOpAvailable} of ${needed} needed (others handling ${needed - coOpAvailable})`);
-    }
-
-    acquireDeliveryLock({
-      botUsername,
-      itemId: item.itemId,
-      itemName: item.itemName,
-      quantity: withdrawQty,
-      remoteStationId,
-    });
-
-    if (bot.system !== homeSystem || bot.poi !== homeStation) {
-      ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation} for withdraw...`);
-      if (bot.system !== homeSystem) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-        if (!fueled) { await ctx.sleep(30000); return null; }
-        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-        if (!arrived || bot.state !== "running") {
-          if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-          await ctx.sleep(30000); return null;
-        }
-        ctx.log("fuel", `Arrived at home system ${homeSystem}`);
+    if (bot.poi !== homeStation) {
+      await ensureUndocked(ctx);
+      if (bot.state !== "running") return results;
+      const tResp = await bot.exec("travel", { target_poi: homeStation });
+      if (bot.state !== "running") return results;
+      if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+        ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+        await ctx.sleep(30000); return results;
       }
-
+      await bot.refreshStatus();
       if (bot.poi !== homeStation) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-        const tResp = await bot.exec("travel", { target_poi: homeStation });
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-        if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
-          await ctx.sleep(30000); return null;
-        }
-        await bot.refreshStatus();
-        if (bot.poi !== homeStation) {
-          ctx.log("error", `Travel to home station failed: not at target`);
-          await ctx.sleep(30000); return null;
-        }
-      }
-
-      if (!bot.docked) {
-        const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.includes("already")) {
-          ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
-          await ctx.sleep(30000); return null;
-        }
-        bot.docked = true;
+        ctx.log("error", `Travel to home station failed: not at target`);
+        await ctx.sleep(30000); return results;
       }
     }
 
-    await bot.refreshStatus();
     if (!bot.docked) {
       const dockResp = await bot.exec("dock");
       if (dockResp.error && !dockResp.error.message.includes("already")) {
         ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
-        await ctx.sleep(30000); return null;
+        await ctx.sleep(30000); return results;
       }
       bot.docked = true;
     }
+  }
 
-    let cappedWithdrawQty = 0;
-    let source = "faction";
+  await bot.refreshStatus();
+  if (!bot.docked) {
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.includes("already")) {
+      ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
+      await ctx.sleep(30000); return results;
+    }
+    bot.docked = true;
+  }
 
-    const personalAvailable = (bot.storage.find((i) => i.itemId === item.itemId)?.quantity || 0);
+  const loadPlan: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
+  
+  for (const needed of neededItems) {
+    if (bot.state !== "running") break;
+    
+    const usedCargo = cargoUsedFromInventory(bot);
+    const freeSpace = Math.max(0, (bot.cargoMax || 825) - usedCargo);
+    if (freeSpace <= 0) {
+      ctx.log("fuel", `Cargo full — stopping load at ${loadPlan.length} items`);
+      break;
+    }
+    
+    const maxCanCarry = maxItemsForCargo(freeSpace, needed.itemId);
+    if (maxCanCarry <= 0) continue;
+    
+    const coOpAvailable = getAvailableDeliveryQuantity(needed.itemId, remoteStationId, needed.needed, botUsername);
+    const inTransitOther = getFtInTransitQuantity(needed.itemId, remoteStationId, botUsername);
+    const effectiveAvailable = Math.max(0, coOpAvailable - inTransitOther);
+    const takeQty = Math.min(needed.needed, maxCanCarry, effectiveAvailable);
+    
+    if (takeQty <= 0) {
+      if (effectiveAvailable <= 0 && needed.needed > 0) {
+        ctx.log("fuel", `Co-op: ${needed.itemName} fully claimed/in-transit by other bots — skipping`);
+      }
+      continue;
+    }
+    
+    if (takeQty < needed.needed) {
+      ctx.log("fuel", `Co-op: Capping ${needed.itemName} batch load to ${takeQty} of ${needed.needed} (others handling rest)`);
+    } else if (coOpAvailable < needed.needed) {
+      ctx.log("fuel", `Co-op: ${needed.itemName} batch co-op available ${coOpAvailable} of ${needed.needed} needed`);
+    }
+    
+    acquireDeliveryLock({
+      botUsername,
+      itemId: needed.itemId,
+      itemName: needed.itemName,
+      quantity: takeQty,
+      remoteStationId,
+    });
+    
+    loadPlan.push({ itemId: needed.itemId, itemName: needed.itemName, qty: takeQty, source: "faction" });
+  }
+
+  if (loadPlan.length === 0) {
+    ctx.log("fuel", "No items to load after co-op/cargo checks — skipping trip");
+    return results;
+  }
+
+  ctx.log("fuel", `Batch loading ${loadPlan.length} item types (${loadPlan.reduce((s, i) => s + i.qty, 0)} total units) at home...`);
+  
+  for (const plan of loadPlan) {
+    if (bot.state !== "running") break;
+    
+    const personalAvailable = (bot.storage.find((i) => i.itemId === plan.itemId)?.quantity || 0);
     if (personalAvailable > 0) {
-      const personalCap = Math.min(withdrawQty, personalAvailable);
-      ctx.log("fuel", `Found ${personalAvailable}x ${item.itemName} in personal storage — trying to withdraw ${personalCap}x...`);
-      const pw = await withdrawFromHomePersonalStorage(ctx, bot, item.itemId, personalCap);
+      const personalCap = Math.min(plan.qty, personalAvailable);
+      ctx.log("fuel", `Found ${personalAvailable}x ${plan.itemName} in personal storage — trying to withdraw ${personalCap}x...`);
+      const pw = await withdrawFromHomePersonalStorage(ctx, bot, plan.itemId, personalCap);
       if (pw.success && pw.withdrawnQty > 0) {
-        cappedWithdrawQty = pw.withdrawnQty;
-        source = "personal";
+        plan.qty = pw.withdrawnQty;
+        plan.source = "personal";
+        ctx.log("fuel", `Withdrew ${pw.withdrawnQty}x ${plan.itemName} from personal storage`);
+        continue;
       }
     }
-
-    if (cappedWithdrawQty === 0) {
-      ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);
-      const homeAvailable = await getHomeFactionQty(bot, homeStation, item.itemId);
-      const factionCap = Math.min(withdrawQty, homeAvailable);
-      if (factionCap > 0) {
-        cappedWithdrawQty = factionCap;
-        source = "faction";
-      }
-    }
-
-    if (cappedWithdrawQty === 0) {
-      ctx.log("warn", `${homeStation}: No ${item.itemName} in personal or faction storage — skipping`);
-      return null;
-    }
-
-    if (cappedWithdrawQty < withdrawQty) {
-      ctx.log("fuel", `${homeStation}: Capping ${item.itemName} withdraw to ${cappedWithdrawQty} (${source} storage)`);
-    }
-
-    let wr: { success: boolean; withdrawnQty: number };
-    if (source === "personal") {
-      wr = await withdrawFromHomePersonalStorage(ctx, bot, item.itemId, cappedWithdrawQty);
+    
+    ctx.log("fuel", `Withdrawing ${plan.qty}x ${plan.itemName} from home faction storage...`);
+    const homeAvailable = await getHomeFactionQty(bot, homeStation, plan.itemId);
+    const factionCap = Math.min(plan.qty, homeAvailable);
+    if (factionCap > 0) {
+      plan.qty = factionCap;
+      plan.source = "faction";
     } else {
-      wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, cappedWithdrawQty, homeStation);
+      ctx.log("warn", `${homeStation}: No ${plan.itemName} in faction storage (wanted ${plan.qty})`);
+      plan.qty = 0;
+      continue;
     }
-
+    
+    let wr: { success: boolean; withdrawnQty: number };
+    if (plan.source === "personal") {
+      wr = await withdrawFromHomePersonalStorage(ctx, bot, plan.itemId, plan.qty);
+    } else {
+      wr = await withdrawFromHomeFaction(ctx, bot, plan.itemId, plan.qty, homeStation);
+    }
+    
     if (!wr.success) {
-      ctx.log("error", `Failed to withdraw ${cappedWithdrawQty}x ${item.itemName} from ${source} storage`);
-      lastTransferFailure.set(failureKey, Date.now());
-      return null;
+      ctx.log("error", `Failed to withdraw ${plan.qty}x ${plan.itemName} from ${plan.source} storage`);
+      plan.qty = 0;
+    } else {
+      plan.qty = wr.withdrawnQty;
+      ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${plan.itemName} from ${plan.source} storage`);
     }
+  }
 
-    ctx.log("fuel", `Withdrew ${wr.withdrawnQty}x ${item.itemName} from ${source} storage — departing`);
+  const actualLoad = loadPlan.filter(p => p.qty > 0);
+  if (actualLoad.length === 0) {
+    ctx.log("warn", "Nothing actually loaded — skipping trip");
+    return results;
+  }
 
+  for (const plan of actualLoad) {
     addFtInTransitItems(botUsername, remoteStationId, [
-      { itemId: item.itemId, itemName: item.itemName, quantity: wr.withdrawnQty },
+      { itemId: plan.itemId, itemName: plan.itemName, quantity: plan.qty },
     ]);
-    ctx.log("fuel", `Co-op: Tracked ${wr.withdrawnQty}x ${item.itemName} in-transit to ${remoteStationId}`);
   }
+  ctx.log("fuel", `Co-op: Tracked ${actualLoad.reduce((s, p) => s + p.qty, 0)} units in-transit to ${remoteStationId}`);
 
-  let cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
-  if (cargoQty <= 0) {
-    ctx.log("error", `No ${item.itemName} in cargo after withdraw — skipping`);
-    return null;
-  }
-
-  ctx.log("fuel", `Heading to ${destSystem}...`);
+  ctx.log("fuel", `Heading to ${destSystem} with ${actualLoad.length} item types...`);
   if (bot.system !== destSystem) {
     const arrived = await navigateToSystem(ctx, destSystem, safetyOpts);
     if (!arrived || bot.state !== "running") {
-      if (bot.state !== "running") { ctx.log("system", "Stopping"); return null; }
-      ctx.log("error", `Failed to reach ${destSystem}`);
-      await ctx.sleep(30000); return null;
+      ctx.log("error", `Failed to reach ${destSystem} — returning items to co-op tracking`);
+      for (const plan of actualLoad) {
+        removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+        releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "navigation_failed");
+      }
+      await ctx.sleep(30000);
+      return results;
     }
     ctx.log("fuel", `Arrived at ${destSystem}`);
   }
@@ -984,58 +960,66 @@ async function processItemTransfer(
     const tResp = await bot.exec("travel", { target_poi: remoteStationId });
     if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
       ctx.log("error", `Travel to ${remoteStationId} failed: ${tResp.error.message}`);
-      await ctx.sleep(30000); return null;
+      for (const plan of actualLoad) {
+        removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+        releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "navigation_failed");
+      }
+      await ctx.sleep(30000);
+      return results;
     }
     if (!tResp.error) bot.poi = remoteStationId;
   }
 
   const dockResp = await bot.exec("dock");
   if (dockResp.error && !dockResp.error.message.includes("already")) {
-    ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-    await ctx.sleep(30000); return null;
+    ctx.log("error", `Dock at ${remoteStationId} failed: ${dockResp.error.message}`);
+    for (const plan of actualLoad) {
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "dock_failed");
+    }
+    await ctx.sleep(30000);
+    return results;
   }
   bot.docked = true;
 
-  cargoQty = bot.inventory.find((i) => i.itemId === item.itemId)?.quantity || 0;
-  if (cargoQty <= 0) {
-    ctx.log("error", `No ${item.itemName} in cargo to deposit`);
-    return null;
-  }
-
-  const actualRemoteQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
-  const needNow = Math.max(0, item.targetQuantity - actualRemoteQty);
-  const toDeposit = cargoQty;
-
-  if (toDeposit <= 0) {
-    ctx.log("fuel", `${remoteStationId}: No ${item.itemName} in cargo to deposit`);
-    return null;
-  }
-
-  ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${item.itemName} to ${remoteStationId} (have ${cargoQty}, need ${needNow})...`);
-  const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, item.itemName, toDeposit, remoteStationId);
-
-  if (depositResult.success) {
-    ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${item.itemName} to ${remoteStationId} via ${depositResult.mode}`);
-    lastTransferFailure.delete(failureKey);
-
-    updateDeliveredQuantity(botUsername, item.itemId, remoteStationId, depositResult.depositedQty);
-    removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: item.itemId, quantity: depositResult.depositedQty }]);
-    ctx.log("fuel", `Co-op: Updated delivered count and cleared in-transit for ${depositResult.depositedQty}x ${item.itemName}`);
-
-    const remainingLock = getBotItemLock(botUsername, item.itemId, remoteStationId);
-    if (remainingLock && remainingLock.deliveredQuantity >= remainingLock.lockedQuantity) {
-      releaseDeliveryLock(botUsername, item.itemId, remoteStationId, "completed");
-      ctx.log("fuel", `Co-op: Released lock for ${item.itemName} to ${remoteStationId} (delivery complete)`);
+  await bot.refreshCargo();
+  for (const plan of actualLoad) {
+    if (bot.state !== "running") break;
+    
+    const cargoQty = bot.inventory.find((i) => i.itemId === plan.itemId)?.quantity || 0;
+    if (cargoQty <= 0) {
+      ctx.log("error", `No ${plan.itemName} in cargo to deposit (expected ${plan.qty})`);
+      results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
+      continue;
     }
-  } else {
-    ctx.log("error", `Could not deposit ${item.itemName} to ${remoteStationId}`);
-    lastTransferFailure.set(failureKey, Date.now());
+
+    const toDeposit = cargoQty;
+    ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${plan.itemName}...`);
+    const depositResult = await depositToRemoteStation(ctx, bot, plan.itemId, plan.itemName, toDeposit, remoteStationId);
+
+    if (depositResult.success) {
+      ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${plan.itemName} to ${remoteStationId} via ${depositResult.mode}`);
+      results.push({ deposited: true, itemId: plan.itemId, qty: depositResult.depositedQty });
+      
+      updateDeliveredQuantity(botUsername, plan.itemId, remoteStationId, depositResult.depositedQty);
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: depositResult.depositedQty }]);
+      
+      const remainingLock = getBotItemLock(botUsername, plan.itemId, remoteStationId);
+      if (remainingLock && remainingLock.deliveredQuantity >= remainingLock.lockedQuantity) {
+        releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "completed");
+        ctx.log("fuel", `Co-op: Released lock for ${plan.itemName} to ${remoteStationId} (delivery complete)`);
+      }
+    } else {
+      ctx.log("error", `Could not deposit ${plan.itemName} to ${remoteStationId}`);
+      results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
+    }
   }
 
   if (!bot.docked) bot.docked = false;
   
-  return depositResult.success ? { deposited: true, itemId: item.itemId, qty: depositResult.depositedQty } : null;
+  return results;
 }
+
 
 async function getItemStatus(
   ctx: RoutineContext,

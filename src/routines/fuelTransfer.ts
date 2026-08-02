@@ -487,9 +487,10 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
     autoCloak: settings.autoCloak,
   };
 
-  const homeSystem = settings.homeSystem || "";
   const homeStationRaw = settings.homeStation || "";
   const homeStation = homeStationRaw.includes("|") ? homeStationRaw.split("|")[1] : homeStationRaw;
+  const resolvedHomeSystem = resolveStationSystem(homeStation);
+  const homeSystem = resolvedHomeSystem || settings.homeSystem || "";
 
   if (!homeSystem || !homeStation) {
     ctx.log("error", "Fuel Transport: General > Faction Storage Station must be set");

@@ -31817,7 +31817,7 @@ ignoreBlacklist: document.getElementById(
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button class="sm" onclick="resetFuelTransferLoadoutCompletions()">🔄 Reset Loadout Status</button>
-        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clear completion tracking for selected loadout</span>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">If no loadout selected, resets all. Otherwise resets selected loadout.</span>
       </div>
     </div>
 
@@ -32317,8 +32317,31 @@ ignoreBlacklist: document.getElementById(
       async function resetFuelTransferLoadoutCompletions() {
         const select = document.getElementById("ft-loadout-select");
         const name = select?.value;
-        if (!name) {
-          alert("Please select a loadout to reset.");
+        const resetAll = !name;
+
+        if (resetAll) {
+          if (
+            !confirm(
+              "Are you sure you want to reset ALL loadout completions? This will allow bots to re-check and re-deliver to all stations for every loadout.",
+            )
+          )
+            return;
+
+          try {
+            const response = await fetch(
+              `/api/facility-transfer-completions`,
+              { method: "DELETE" },
+            );
+
+            if (response.ok) {
+              alert("Reset completion status for all loadouts");
+            } else {
+              const error = await response.json();
+              alert(`Failed to reset: ${error.error || "Unknown error"}`);
+            }
+          } catch (e) {
+            alert(`Failed to reset: ${e.message}`);
+          }
           return;
         }
 
@@ -32888,8 +32911,31 @@ ignoreBlacklist: document.getElementById(
       async function resetFuelTransferLoadoutCompletions() {
         const select = document.getElementById("ft-loadout-select");
         const name = select?.value;
-        if (!name) {
-          alert("Please select a loadout to reset.");
+        const resetAll = !name;
+
+        if (resetAll) {
+          if (
+            !confirm(
+              "Are you sure you want to reset ALL loadout completions? This will allow bots to re-check and re-deliver to all stations for every loadout.",
+            )
+          )
+            return;
+
+          try {
+            const response = await fetch(
+              `/api/facility-transfer-completions`,
+              { method: "DELETE" },
+            );
+
+            if (response.ok) {
+              alert("Reset completion status for all loadouts");
+            } else {
+              const error = await response.json();
+              alert(`Failed to reset: ${error.error || "Unknown error"}`);
+            }
+          } catch (e) {
+            alert(`Failed to reset: ${e.message}`);
+          }
           return;
         }
 

@@ -116,6 +116,8 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Market commands
   'view_market': 'spacemolt_market',
   'view_orders': 'spacemolt_market',
+  'subscribe_market': 'spacemolt_market',
+  'unsubscribe_market': 'spacemolt_market',
   'create_buy_order': 'spacemolt_market',
   'create_sell_order': 'spacemolt_market',
   'cancel_order': 'spacemolt_market',

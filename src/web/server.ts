@@ -1151,7 +1151,7 @@ if (!this.settings.fuel_service) {
             return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
-if (url.pathname === "/data/shipsForSale.json") {
+        if (url.pathname === "/data/shipsForSale.json") {
           const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
           if (existsSync(shipsForSalePath)) {
             return new Response(readFileSync(shipsForSalePath, "utf-8"), {
@@ -1161,6 +1161,18 @@ if (url.pathname === "/data/shipsForSale.json") {
             });
           } else {
             return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/marketDetails.json") {
+          const marketDetailsPath = join(DATA_DIR, "marketDetails.json");
+          if (existsSync(marketDetailsPath)) {
+            return new Response(readFileSync(marketDetailsPath, "utf-8"), {
+              headers: {
+                "Content-Type": "application/json",
+              },
+            });
+          } else {
+            return Response.json({ error: "Market details file not found" }, { status: 404 });
           }
         }
         if (url.pathname === "/data/rawMissions.json") {

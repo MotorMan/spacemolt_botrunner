@@ -156,8 +156,6 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      ctx.log("debug", `subscribe_market raw result: ${JSON.stringify(subResp.result)}`);
-
       let snapshot = subResp.result as Record<string, unknown> | undefined;
       if (
         snapshot &&

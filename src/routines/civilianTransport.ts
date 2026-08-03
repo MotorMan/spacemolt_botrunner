@@ -911,9 +911,28 @@ export async function unloadPassengersToLounge(
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
   await bot.refreshCargo();
+  await bot.refreshShip();
 
   const cargoFree = (bot.cargoMax || 0) - (bot.cargo || 0);
   if (cargoFree <= 0) {
+    return;
+  }
+
+  if ((bot.maxFuel || 0) > 0 && (bot.fuel / bot.maxFuel) >= 0.9) {
+    return;
+  }
+
+  const cellFuelValues: Record<string, number> = {
+    military_fuel_cell: 100,
+    premium_fuel_cell: 50,
+    fuel_cell: 20,
+  };
+
+  const existingCellFuel = bot.inventory
+    .filter(i => cellFuelValues[i.itemId])
+    .reduce((sum, i) => sum + (i.quantity * (cellFuelValues[i.itemId] || 0)), 0);
+
+  if (existingCellFuel >= (bot.maxFuel || 0) - (bot.fuel || 0)) {
     return;
   }
 

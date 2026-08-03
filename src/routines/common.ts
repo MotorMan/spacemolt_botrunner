@@ -934,6 +934,8 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
 
   const fuelNeeded = Math.max(0, bot.maxFuel - bot.fuel);
 
+  if (bot.fuel >= bot.maxFuel * 0.9) return false;
+
   let sourced = 0;
   for (const { id } of FUEL_CELL_RANK) {
     const have = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
@@ -986,7 +988,9 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
       const { pois } = await getSystemInfo(ctx);
       const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
       if (stationHasMarket(station)) {
-        const buyQty = Math.max(1, Math.min(maxFuelCellsForCargo(ctx, id), pullLimit));
+        const maxCanFit = maxFuelCellsForCargo(ctx, id);
+        if (maxCanFit <= 0) continue;
+        const buyQty = Math.min(maxCanFit, pullLimit);
         if (buyQty > 0) {
           const buyResp = await bot.exec("buy", { item_id: id, quantity: buyQty });
           if (!buyResp.error) {

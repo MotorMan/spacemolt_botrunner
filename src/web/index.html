@@ -31664,6 +31664,21 @@ ignoreBlacklist: document.getElementById(
           .join("");
         const hasLoadouts = Object.keys(ftLoadouts).length > 0;
 
+        const grandTotalByItem = {};
+        let grandTotalQty = 0;
+        for (const loadout of Object.values(ftLoadouts)) {
+          if (loadout?.active) {
+            for (const item of loadout.items || []) {
+              if (!grandTotalByItem[item.itemId]) {
+                grandTotalByItem[item.itemId] = { itemName: item.itemName || item.itemId, qty: 0 };
+              }
+              grandTotalByItem[item.itemId].qty += item.targetQuantity;
+              grandTotalQty += item.targetQuantity;
+            }
+          }
+        }
+        const grandTotalTypes = Object.keys(grandTotalByItem).length;
+
         const stationsList =
           stations.length > 0
             ? stations
@@ -31787,6 +31802,18 @@ ignoreBlacklist: document.getElementById(
       <div style="font-weight:600;margin-bottom:4px;color:var(--text-bright)">Active Loadouts:</div>
       <div style="font-size:11px;color:var(--dim)">
         ${loadoutOptions || '<div style="color:var(--dim);font-size:11px">No loadouts created yet. Create one, then enable it to use for facility construction.</div>'}
+      </div>
+      <div style="margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:4px;background:var(--bg)">
+        <div style="font-weight:600;margin-bottom:6px;color:var(--text-bright)">📊 Grand Total (Active Loadouts)</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px">
+          ${grandTotalTypes} item type(s) | ${grandTotalQty.toLocaleString()} total units across all active loadouts
+        </div>
+        ${grandTotalTypes > 0 ? Object.entries(grandTotalByItem).map(([itemId, data]) =>
+          `<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:12px">
+            <span>${esc(data.itemName)}</span>
+            <span style="color:var(--accent)">${data.qty.toLocaleString()}</span>
+          </div>`
+        ).join('') : '<div style="color:var(--dim);font-size:11px">No active loadouts</div>'}
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button class="sm" onclick="resetFuelTransferLoadoutCompletions()">🔄 Reset Loadout Status</button>

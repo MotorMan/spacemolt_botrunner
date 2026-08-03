@@ -1402,6 +1402,7 @@
       let mobileCapitol = null;
       let reconnectDelay = 1000;
       let mapData = {};
+      let marketDetails = { items: [] };
       let activeSettingsTab = "general";
       let mapLoading = false;
       let profileBot = null;
@@ -2129,6 +2130,7 @@
             routinesRes,
             flockRes,
             mapRes,
+            marketDetailsRes,
             statsRes,
             catalogRes,
             mainLogsRes,
@@ -2142,6 +2144,9 @@
               .then((r) => r.json())
               .catch(() => ({ flockGroups: [], assignments: {} })),
             fetch("/data/map.json").then((r) => r.json()),
+            fetch("/data/marketDetails.json")
+              .then((r) => r.json())
+              .catch(() => ({ items: [] })),
             fetch("/api/stats").then((r) => r.json()),
             fetch("/api/catalog").then((r) => r.json()),
             fetch("/api/logs/main").then((r) => r.json()),
@@ -2156,6 +2161,7 @@
           applyWindowTitle();
           flockSettings = flockRes || { flockGroups: [], assignments: {} };
           lastUsedRoutines = lastUsedRoutinesRes || {};
+          marketDetails = marketDetailsRes || { items: [] };
           // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
           if (
             Object.keys(lastUsedRoutines).length === 0 &&
@@ -2395,15 +2401,21 @@
                 loadTaxesDataAndRender();
               }
               break;
-            case "mapData":
-              mapData = msg.data.systems || msg.data || {};
-              renderMapStats();
-              // Refresh the open settings tab so newly-registered stations
-              // (e.g. from a just-connected bot) show up in the pickers.
-              if (document.getElementById("page-settings")?.classList.contains("active")) {
-                scheduleSettingsPanelRefresh();
-              }
-              break;
+             case "mapData":
+               mapData = msg.data.systems || msg.data || {};
+               fetch("/data/marketDetails.json")
+                 .then((r) => r.json())
+                 .then((data) => {
+                   marketDetails = data || { items: [] };
+                 })
+                 .catch(() => {});
+               renderMapStats();
+               // Refresh the open settings tab so newly-registered stations
+               // (e.g. from a just-connected bot) show up in the pickers.
+               if (document.getElementById("page-settings")?.classList.contains("active")) {
+                 scheduleSettingsPanelRefresh();
+               }
+               break;
             case "catalog":
               catalog = msg.data;
               // Ore/gas/ice quota pickers are sourced from the catalogue. Only
@@ -2709,33 +2721,41 @@
             case "execResult":
               handleExecResult(msg);
               break;
-            case "mapUpdate":
-              if (msg.mapData) mapData = msg.mapData;
-              knownOres = msg.knownOres || knownOres;
-              // Re-render map tab if it's active
-              if (
-                document
-                  .getElementById("page-map")
-                  ?.classList.contains("active")
-              ) {
-                renderMapPage();
-              }
-              // Re-render market tab if it's active
-              if (
-                document
-                  .getElementById("page-market")
-                  ?.classList.contains("active")
-              ) {
-                renderMarketTable();
-              }
-              // Re-render missions tab if it's active
-              if (
-                document
-                  .getElementById("page-missions")
-                  ?.classList.contains("active")
-              ) {
-                renderMissionsFromMap();
-              }
+             case "mapUpdate":
+               if (msg.mapData) mapData = msg.mapData;
+               knownOres = msg.knownOres || knownOres;
+               // Refresh market details from disk so the market overview reflects
+               // the latest subscription / view_market snapshots.
+               fetch("/data/marketDetails.json")
+                 .then((r) => r.json())
+                 .then((data) => {
+                   marketDetails = data || { items: [] };
+                 })
+                 .catch(() => {});
+               // Re-render map tab if it's active
+               if (
+                 document
+                   .getElementById("page-map")
+                   ?.classList.contains("active")
+               ) {
+                 renderMapPage();
+               }
+               // Re-render market tab if it's active
+               if (
+                 document
+                   .getElementById("page-market")
+                   ?.classList.contains("active")
+               ) {
+                 renderMarketTable();
+               }
+               // Re-render missions tab if it's active
+               if (
+                 document
+                   .getElementById("page-missions")
+                   ?.classList.contains("active")
+               ) {
+                 renderMissionsFromMap();
+               }
               // Re-render the open settings tab when map data changes so
               // newly-registered stations show up in the pickers. The debounced
               // refresh skips re-rendering while the user is actively editing a
@@ -11043,7 +11063,15 @@
       let marketSortAsc = false;
 
       function renderMarketPage() {
-        renderMarketTable();
+        fetch("/data/marketDetails.json")
+          .then((r) => r.json())
+          .then((data) => {
+            marketDetails = data || { items: [] };
+          })
+          .catch(() => {})
+          .finally(() => {
+            renderMarketTable();
+          });
       }
 
       function sortMarketBy(key) {
@@ -11122,49 +11150,50 @@
             globalFactionStorage.length,
           );
 
-          // Build itemMap from mapData
+          // Build itemMap from marketDetails (flat items array)
           const itemMap = new Map(); // itemId -> { name, stations: [] }
-          for (const [sysId, sys] of Object.entries(mapData)) {
-            const sysName = sys.name || sysId;
-            for (const poi of sys.pois || []) {
-              const stationName = poi.name || poi.id;
-              if (poi.market && Array.isArray(poi.market)) {
-                for (const m of poi.market) {
-                  const itemId = m.item_id;
-                  if (!itemId) continue;
-                  if (!itemMap.has(itemId)) {
-                    itemMap.set(itemId, {
-                      name: m.item_name || itemId,
-                      stations: [],
-                    });
-                  }
-                  const entry = itemMap.get(itemId);
-                  // Correct API mapping:
-                  // m.best_buy = highest price station pays (they buy from players) = SELL price to us
-                  // m.best_sell = lowest price station charges (they sell to players) = BUY price from us
-                  // m.buy_quantity = total demand (sum of all buy orders at various prices)
-                  // m.sell_quantity = total supply (sum of all sell orders at various prices)
-                  entry.stations.push({
-                    sysName,
-                    stationName,
-                    sellPrice: m.best_buy != null ? m.best_buy : null, // station buys from us
-                    buyPrice: m.best_sell != null ? m.best_sell : null, // station sells to us
-                    demand: m.buy_quantity || 0, // total quantity wanted by station
-                    supply: m.sell_quantity || 0, // total quantity station has for sale
-                    updated: m.last_updated || null,
-                  });
-                }
-              }
-            }
-          }
-
-          // Count unique stations with market data
           const stationSet = new Set();
-          for (const [sysId, sys] of Object.entries(mapData)) {
-            for (const poi of sys.pois || []) {
-              if (poi.market && poi.market.length > 0)
-                stationSet.add(`${sysId}:${poi.id}`);
+          const items = marketDetails.items || [];
+          
+          for (const m of items) {
+            const itemId = m.itemId;
+            if (!itemId) continue;
+            
+            const buyOrders = Array.isArray(m.buyOrders) ? m.buyOrders : [];
+            const sellOrders = Array.isArray(m.sellOrders) ? m.sellOrders : [];
+            
+            // best_sell = highest buy order price (station buys from us)
+            const bestSell = buyOrders.length > 0 ? Math.max(...buyOrders.map(o => o.price)) : null;
+            const demand = buyOrders.reduce((sum, o) => sum + (o.quantity || 0), 0);
+            
+            // best_buy = lowest sell order price (station sells to us)
+            const bestBuy = sellOrders.length > 0 ? Math.min(...sellOrders.map(o => o.price)) : null;
+            const supply = sellOrders.reduce((sum, o) => sum + (o.quantity || 0), 0);
+            
+            if (bestSell === null || demand <= 0) continue;
+            
+            const sysName = m.systemId || "";
+            const stationName = m.stationName || m.stationPoiId || "";
+            const stationKey = `${m.systemId || ""}:${m.stationPoiId || ""}`;
+            stationSet.add(stationKey);
+            
+            if (!itemMap.has(itemId)) {
+              itemMap.set(itemId, {
+                name: m.itemName || itemId,
+                stations: [],
+              });
             }
+            
+            const entry = itemMap.get(itemId);
+            entry.stations.push({
+              sysName,
+              stationName,
+              sellPrice: bestSell,
+              buyPrice: bestBuy,
+              demand,
+              supply,
+              updated: m.lastUpdated || null,
+            });
           }
 
           // Prepare rows with search filter
@@ -11264,9 +11293,10 @@
             });
           }
 
+          const uniqueSystems = new Set(items.map(m => m.systemId).filter(Boolean));
           // Update stats
           if (statsEl) {
-            statsEl.textContent = `${rows.length} items across ${stationSet.size} stations in ${Object.keys(mapData).length} systems`;
+            statsEl.textContent = `${rows.length} items across ${stationSet.size} stations in ${uniqueSystems.size} systems`;
           }
 
           if (rows.length === 0) {

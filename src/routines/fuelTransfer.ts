@@ -818,6 +818,8 @@ async function deliverBatchToStation(
     bot.docked = true;
   }
 
+  await tryRefuel(ctx, { skipApprovedCheck: true });
+
   const loadPlan: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
   let plannedUsage = 0;
   

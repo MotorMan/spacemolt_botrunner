@@ -762,7 +762,6 @@ class MapStore {
 
     poi.market = [...existingMarket.values()];
     poi.last_updated = now();
-    this.scheduleSave();
   }
 
   /** Remove an item from a station's cached market data (e.g. when buy fails with item_not_available). */
@@ -773,7 +772,10 @@ class MapStore {
     if (!poi) return;
     const before = poi.market.length;
     poi.market = poi.market.filter((m) => m.item_id !== itemId);
-    if (poi.market.length < before) this.scheduleSave();
+    if (poi.market.length < before) {
+      // Intentionally no scheduleSave() here — market data is persisted
+      // exclusively through marketDetails.json, not map.json.
+    }
   }
 
   /** Reduce cached market quantities when a bot commits to a trade route.

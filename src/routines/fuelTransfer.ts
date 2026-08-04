@@ -874,7 +874,7 @@ async function deliverBatchToStation(
   const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
   if (bot.state !== "running") return results;
 
-  const verifiedPlan: typeof loadPlan = [];
+  const verifiedPlan: Array<{ itemId: string; itemName: string; qty: number; source: string; targetQty?: number }> = [];
   for (const plan of loadPlan) {
     const currentQty = freshQtyCache[plan.itemId] || 0;
     const neededInfo = neededItems.find(n => n.itemId === plan.itemId);
@@ -885,7 +885,7 @@ async function deliverBatchToStation(
       removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
       continue;
     }
-    verifiedPlan.push(plan);
+    verifiedPlan.push({ ...plan, targetQty });
   }
 
   if (verifiedPlan.length === 0) {
@@ -896,7 +896,7 @@ async function deliverBatchToStation(
   const finalPlan = verifiedPlan;
   ctx.log("fuel", `Batch loading ${finalPlan.length} item types (${finalPlan.reduce((s, i) => s + i.qty, 0)} total units) at home...`);
   
-  const actualLoad: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
+  const actualLoad: Array<{ itemId: string; itemName: string; qty: number; source: string; targetQty?: number }> = [];
   
   for (const plan of finalPlan) {
     if (bot.state !== "running") break;
@@ -969,6 +969,15 @@ async function deliverBatchToStation(
   }
 
   for (const plan of actualLoad) {
+    const lock = getBotItemLock(botUsername, plan.itemId, remoteStationId);
+    if (lock && plan.qty < lock.lockedQuantity) {
+      const diff = lock.lockedQuantity - plan.qty;
+      lock.lockedQuantity = plan.qty;
+      ctx.log("fuel", `Adjusted lock for ${plan.itemName} from ${lock.lockedQuantity + diff} to ${plan.qty} (${diff} capacity released)`);
+    }
+  }
+
+  for (const plan of actualLoad) {
     addFtInTransitItems(botUsername, remoteStationId, [
       { itemId: plan.itemId, itemName: plan.itemName, quantity: plan.qty },
     ]);
@@ -1029,25 +1038,45 @@ async function deliverBatchToStation(
     const cargoQty = bot.inventory.find((i) => i.itemId === plan.itemId)?.quantity || 0;
     if (cargoQty <= 0) {
       ctx.log("error", `No ${plan.itemName} in cargo to deposit (expected ${plan.qty})`);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "cargo_missing");
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
       results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
       continue;
     }
 
-    const toDeposit = cargoQty;
-    ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${plan.itemName}...`);
+    const currentStationQty = await getRemoteFactionQty(bot, remoteStationId, plan.itemId);
+    const targetQty = plan.targetQty || plan.qty;
+    const remainingNeed = Math.max(0, targetQty - currentStationQty);
+    
+    if (remainingNeed <= 0) {
+      ctx.log("fuel", `${remoteStationId}: ${plan.itemName} already at target (${currentStationQty}/${targetQty}) — skipping deposit, releasing lock`);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "already_at_target");
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+      results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
+      continue;
+    }
+    
+    const toDeposit = Math.min(cargoQty, plan.qty, remainingNeed);
+    ctx.log("fuel", `${remoteStationId}: Depositing ${toDeposit}x ${plan.itemName} (need ${remainingNeed}, have ${cargoQty})...`);
     const depositResult = await depositToRemoteStation(ctx, bot, plan.itemId, plan.itemName, toDeposit, remoteStationId);
 
     if (depositResult.success) {
-      ctx.log("fuel", `Deposited ${depositResult.depositedQty}x ${plan.itemName} to ${remoteStationId} via ${depositResult.mode}`);
-      results.push({ deposited: true, itemId: plan.itemId, qty: depositResult.depositedQty });
+      const actualDeposited = depositResult.depositedQty;
+      if (actualDeposited > remainingNeed) {
+        ctx.log("warn", `Deposited ${actualDeposited} but only ${remainingNeed} needed — possible overshoot`);
+      }
+      results.push({ deposited: true, itemId: plan.itemId, qty: actualDeposited });
       
-      updateDeliveredQuantity(botUsername, plan.itemId, remoteStationId, depositResult.depositedQty);
-      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: depositResult.depositedQty }]);
+      updateDeliveredQuantity(botUsername, plan.itemId, remoteStationId, actualDeposited);
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: actualDeposited }]);
       
       const remainingLock = getBotItemLock(botUsername, plan.itemId, remoteStationId);
-      if (remainingLock && remainingLock.deliveredQuantity >= remainingLock.lockedQuantity) {
-        releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "completed");
-        ctx.log("fuel", `Co-op: Released lock for ${plan.itemName} to ${remoteStationId} (delivery complete)`);
+      if (remainingLock) {
+        remainingLock.lockedQuantity = remainingLock.deliveredQuantity;
+        if (remainingLock.deliveredQuantity >= remainingLock.lockedQuantity) {
+          releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "completed");
+          ctx.log("fuel", `Co-op: Released lock for ${plan.itemName} to ${remoteStationId} (delivery complete)`);
+        }
       }
     } else {
       ctx.log("error", `Could not deposit ${plan.itemName} to ${remoteStationId}`);

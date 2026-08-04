@@ -943,6 +943,8 @@ async function deliverBatchToStation(
       plan.source = "faction";
     } else {
       ctx.log("warn", `${homeStation}: No ${plan.itemName} in faction storage (wanted ${plan.qty})`);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "home_storage_empty");
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
       plan.qty = 0;
       continue;
     }
@@ -956,6 +958,8 @@ async function deliverBatchToStation(
     
     if (!wr.success) {
       ctx.log("error", `Failed to withdraw ${plan.qty}x ${plan.itemName} from ${plan.source} storage`);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "withdraw_failed");
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
       plan.qty = 0;
     } else {
       plan.qty = wr.withdrawnQty;

@@ -16,6 +16,96 @@ const DATA_DIR = join(process.cwd(), "data");
 const COORDINATION_FILE = join(DATA_DIR, "fuelTransferCoordination.json");
 const IN_TRANSIT_FILE = join(DATA_DIR, "fuelTransferInTransit.json");
 
+const coordinationMutexes = new Map<string, Promise<unknown>>();
+
+async function withCoordinationMutex<T>(key: string, fn: () => T | Promise<T>): Promise<T> {
+  const previous = coordinationMutexes.get(key) || Promise.resolve();
+  const next = previous.then(() => fn(), () => fn()) as Promise<T>;
+  coordinationMutexes.set(key, next);
+  try {
+    return await next;
+  } finally {
+    const current = coordinationMutexes.get(key);
+    if (current === next) {
+      coordinationMutexes.delete(key);
+    }
+  }
+}
+
+let coordinationMemory: FtCoordinationData | null = null;
+let inTransitMemory: FtInTransitData | null = null;
+
+function loadCoordinationFromDisk(): FtCoordinationData {
+  try {
+    if (existsSync(COORDINATION_FILE)) {
+      const data = JSON.parse(readFileSync(COORDINATION_FILE, "utf-8"));
+      return {
+        _info: data._info || "Fuel transport coordination data",
+        activeLocks: data.activeLocks || {},
+        lockHistory: Array.isArray(data.lockHistory) ? data.lockHistory : [],
+      };
+    }
+  } catch (err) {
+    console.warn("Could not load fuelTransferCoordination.json:", err);
+  }
+  return {
+    _info: "Fuel transport coordination data",
+    activeLocks: {},
+    lockHistory: [],
+  };
+}
+
+function loadInTransitFromDisk(): FtInTransitData {
+  try {
+    if (existsSync(IN_TRANSIT_FILE)) {
+      const data = JSON.parse(readFileSync(IN_TRANSIT_FILE, "utf-8"));
+      return {
+        _info: data._info || "Fuel transport in-transit tracking",
+        inTransitItems: Array.isArray(data.inTransitItems) ? data.inTransitItems : [],
+        lastUpdated: data.lastUpdated || new Date().toISOString(),
+      };
+    }
+  } catch (err) {
+    console.warn("Could not load fuelTransferInTransit.json:", err);
+  }
+  return {
+    _info: "Fuel transport in-transit tracking",
+    inTransitItems: [],
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+function getCoordinationData(): FtCoordinationData {
+  if (!coordinationMemory) {
+    coordinationMemory = loadCoordinationFromDisk();
+  }
+  return coordinationMemory;
+}
+
+function getInTransitData(): FtInTransitData {
+  if (!inTransitMemory) {
+    inTransitMemory = loadInTransitFromDisk();
+  }
+  return inTransitMemory;
+}
+
+export function flushCoordinationData(): void {
+  if (coordinationMemory) {
+    saveCoordinationData(coordinationMemory);
+  }
+}
+
+export function flushInTransitData(): void {
+  if (inTransitMemory) {
+    saveInTransitData(inTransitMemory);
+  }
+}
+
+export function flushAllCoordinationData(): void {
+  flushCoordinationData();
+  flushInTransitData();
+}
+
 /** Represents a delivery lock for a specific item to a specific remote station. */
 export interface FtQuantityLock {
   lockedBy: string;
@@ -54,26 +144,6 @@ function lockKey(itemId: string, remoteStationId: string, botUsername: string): 
   return `${itemId}:${remoteStationId}:${botUsername}`;
 }
 
-export function loadCoordinationData(): FtCoordinationData {
-  try {
-    if (existsSync(COORDINATION_FILE)) {
-      const data = JSON.parse(readFileSync(COORDINATION_FILE, "utf-8"));
-      return {
-        _info: data._info || "Fuel transport coordination data",
-        activeLocks: data.activeLocks || {},
-        lockHistory: Array.isArray(data.lockHistory) ? data.lockHistory : [],
-      };
-    }
-  } catch (err) {
-    console.warn("Could not load fuelTransferCoordination.json:", err);
-  }
-  return {
-    _info: "Fuel transport coordination data",
-    activeLocks: {},
-    lockHistory: [],
-  };
-}
-
 export function saveCoordinationData(data: FtCoordinationData): void {
   try {
     if (!existsSync(DATA_DIR)) {
@@ -85,22 +155,34 @@ export function saveCoordinationData(data: FtCoordinationData): void {
   }
 }
 
+export function saveInTransitData(data: FtInTransitData): void {
+  try {
+    if (!existsSync(DATA_DIR)) {
+      mkdirSync(DATA_DIR, { recursive: true });
+    }
+    data.lastUpdated = new Date().toISOString();
+    writeFileSync(IN_TRANSIT_FILE, JSON.stringify(data, null, 2) + "\n");
+  } catch (err) {
+    console.error("Error saving fuelTransferInTransit.json:", err);
+  }
+}
+
 export function getItemLocks(itemId: string, remoteStationId: string): FtQuantityLock[] {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   return Object.values(data.activeLocks).filter(
     lock => lock.itemId === itemId && lock.remoteStationId === remoteStationId && lock.isActive
   );
 }
 
 export function getBotItemLock(botUsername: string, itemId: string, remoteStationId: string): FtQuantityLock | null {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   const key = lockKey(itemId, remoteStationId, botUsername);
   const lock = data.activeLocks[key];
   return (lock && lock.isActive) ? lock : null;
 }
 
 export function getBotLocks(botUsername: string): FtQuantityLock[] {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   return Object.values(data.activeLocks).filter(
     lock => lock.lockedBy === botUsername && lock.isActive
   );
@@ -135,7 +217,7 @@ export function acquireDeliveryLock(params: {
   quantity: number;
   remoteStationId: string;
 }): { success: boolean; message: string; lock?: FtQuantityLock } {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   const key = lockKey(params.itemId, params.remoteStationId, params.botUsername);
   const now = new Date().toISOString();
 
@@ -143,7 +225,6 @@ export function acquireDeliveryLock(params: {
   if (existingLock && existingLock.isActive) {
     existingLock.lastActivity = now;
     existingLock.lockedQuantity = params.quantity;
-    saveCoordinationData(data);
     return { success: true, message: "Updated existing lock", lock: existingLock };
   }
 
@@ -160,8 +241,60 @@ export function acquireDeliveryLock(params: {
   };
 
   data.activeLocks[key] = lock;
-  saveCoordinationData(data);
   return { success: true, message: "Acquired new lock", lock };
+}
+
+export async function acquireDeliveryLockAtomic(params: {
+  botUsername: string;
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  remoteStationId: string;
+  totalNeed: number;
+}): Promise<{ success: boolean; lockedQty: number; message: string }> {
+  return withCoordinationMutex(`lock:${params.itemId}:${params.remoteStationId}`, () => {
+    const coordData = getCoordinationData();
+    const inTransitData = getInTransitData();
+    const key = lockKey(params.itemId, params.remoteStationId, params.botUsername);
+    const now = new Date().toISOString();
+
+    const totalLockedRemaining = Object.values(coordData.activeLocks)
+      .filter(lock => lock.itemId === params.itemId && lock.remoteStationId === params.remoteStationId && lock.isActive)
+      .reduce((sum, lock) => sum + Math.max(0, lock.lockedQuantity - lock.deliveredQuantity), 0);
+
+    const totalInTransitOther = inTransitData.inTransitItems
+      .filter(entry => entry.itemId === params.itemId && entry.remoteStationId === params.remoteStationId && entry.botUsername !== params.botUsername)
+      .reduce((sum, entry) => sum + entry.quantity, 0);
+
+    const available = Math.max(0, params.totalNeed - totalLockedRemaining - totalInTransitOther);
+    const actualQty = Math.min(params.quantity, available);
+
+    if (actualQty <= 0) {
+      return { success: false, lockedQty: 0, message: `No capacity available (need ${params.totalNeed}, locked ${totalLockedRemaining}, in-transit ${totalInTransitOther})` };
+    }
+
+    const existingLock = coordData.activeLocks[key];
+    if (existingLock && existingLock.isActive) {
+      existingLock.lastActivity = now;
+      existingLock.lockedQuantity = actualQty;
+      return { success: true, lockedQty: actualQty, message: `Updated existing lock to ${actualQty}` };
+    }
+
+    const lock: FtQuantityLock = {
+      lockedBy: params.botUsername,
+      itemId: params.itemId,
+      itemName: params.itemName,
+      remoteStationId: params.remoteStationId,
+      lockedQuantity: actualQty,
+      deliveredQuantity: 0,
+      lockedAt: now,
+      lastActivity: now,
+      isActive: true,
+    };
+
+    coordData.activeLocks[key] = lock;
+    return { success: true, lockedQty: actualQty, message: `Acquired new lock for ${actualQty}` };
+  });
 }
 
 export function updateDeliveredQuantity(
@@ -170,7 +303,7 @@ export function updateDeliveredQuantity(
   remoteStationId: string,
   deliveredQty: number
 ): boolean {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   const key = lockKey(itemId, remoteStationId, botUsername);
   const lock = data.activeLocks[key];
 
@@ -178,7 +311,6 @@ export function updateDeliveredQuantity(
 
   lock.deliveredQuantity += deliveredQty;
   lock.lastActivity = new Date().toISOString();
-  saveCoordinationData(data);
   return true;
 }
 
@@ -188,7 +320,7 @@ export function releaseDeliveryLock(
   remoteStationId: string,
   reason: string = "completed"
 ): boolean {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   const key = lockKey(itemId, remoteStationId, botUsername);
   const lock = data.activeLocks[key];
 
@@ -206,12 +338,11 @@ export function releaseDeliveryLock(
   }
 
   lock.isActive = false;
-  saveCoordinationData(data);
   return true;
 }
 
 export function cleanupStaleLocks(): number {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   const now = Date.now();
   const staleThresholdMs = 15 * 60 * 1000;
   let cleaned = 0;
@@ -239,14 +370,13 @@ export function cleanupStaleLocks(): number {
     if (data.lockHistory.length > 200) {
       data.lockHistory = data.lockHistory.slice(0, 200);
     }
-    saveCoordinationData(data);
   }
 
   return cleaned;
 }
 
 export function resetCoordinationTracking(): { clearedLocks: number } {
-  const data = loadCoordinationData();
+  const data = getCoordinationData();
   let clearedLocks = 0;
 
   for (const [key, lock] of Object.entries(data.activeLocks)) {
@@ -266,40 +396,11 @@ export function resetCoordinationTracking(): { clearedLocks: number } {
     data.lockHistory = data.lockHistory.slice(0, 200);
   }
 
-  saveCoordinationData(data);
   return { clearedLocks };
 }
 
 export function loadInTransitData(): FtInTransitData {
-  try {
-    if (existsSync(IN_TRANSIT_FILE)) {
-      const data = JSON.parse(readFileSync(IN_TRANSIT_FILE, "utf-8"));
-      return {
-        _info: data._info || "Fuel transport in-transit tracking",
-        inTransitItems: Array.isArray(data.inTransitItems) ? data.inTransitItems : [],
-        lastUpdated: data.lastUpdated || new Date().toISOString(),
-      };
-    }
-  } catch (err) {
-    console.warn("Could not load fuelTransferInTransit.json:", err);
-  }
-  return {
-    _info: "Fuel transport in-transit tracking",
-    inTransitItems: [],
-    lastUpdated: new Date().toISOString(),
-  };
-}
-
-export function saveInTransitData(data: FtInTransitData): void {
-  try {
-    if (!existsSync(DATA_DIR)) {
-      mkdirSync(DATA_DIR, { recursive: true });
-    }
-    data.lastUpdated = new Date().toISOString();
-    writeFileSync(IN_TRANSIT_FILE, JSON.stringify(data, null, 2) + "\n");
-  } catch (err) {
-    console.error("Error saving fuelTransferInTransit.json:", err);
-  }
+  return getInTransitData();
 }
 
 export function addInTransitItems(
@@ -307,7 +408,7 @@ export function addInTransitItems(
   remoteStationId: string,
   items: Array<{ itemId: string; itemName: string; quantity: number }>
 ): void {
-  const data = loadInTransitData();
+  const data = getInTransitData();
   const now = new Date().toISOString();
 
   for (const item of items) {
@@ -331,8 +432,6 @@ export function addInTransitItems(
       });
     }
   }
-
-  saveInTransitData(data);
 }
 
 export function removeInTransitItems(
@@ -340,7 +439,7 @@ export function removeInTransitItems(
   remoteStationId: string,
   items: Array<{ itemId: string; quantity: number }>
 ): void {
-  const data = loadInTransitData();
+  const data = getInTransitData();
   let changed = false;
 
   for (const item of items) {
@@ -365,14 +464,10 @@ export function removeInTransitItems(
 
     data.inTransitItems = data.inTransitItems.filter(entry => entry.quantity > 0);
   }
-
-  if (changed) {
-    saveInTransitData(data);
-  }
 }
 
 export function getInTransitQuantity(itemId: string, remoteStationId: string, excludeBot?: string): number {
-  const data = loadInTransitData();
+  const data = getInTransitData();
   return data.inTransitItems
     .filter(entry => !excludeBot || entry.botUsername !== excludeBot)
     .filter(entry => entry.itemId === itemId && entry.remoteStationId === remoteStationId)
@@ -380,7 +475,7 @@ export function getInTransitQuantity(itemId: string, remoteStationId: string, ex
 }
 
 export function cleanupStaleInTransit(): number {
-  const data = loadInTransitData();
+  const data = getInTransitData();
   const now = Date.now();
   const staleThresholdMs = 24 * 60 * 60 * 1000;
   let cleaned = 0;
@@ -397,17 +492,15 @@ export function cleanupStaleInTransit(): number {
 
   if (cleaned > 0) {
     data.inTransitItems = filtered;
-    saveInTransitData(data);
   }
 
   return cleaned;
 }
 
 export function resetInTransitData(): { clearedEntries: number } {
-  const data = loadInTransitData();
+  const data = getInTransitData();
   const clearedEntries = data.inTransitItems.length;
   data.inTransitItems = [];
-  saveInTransitData(data);
   return { clearedEntries };
 }
 
@@ -429,8 +522,8 @@ export function getFleetFtSummary(): {
     quantity: number;
   }>;
 } {
-  const coordData = loadCoordinationData();
-  const transitData = loadInTransitData();
+  const coordData = getCoordinationData();
+  const transitData = getInTransitData();
   const activeLocks = Object.values(coordData.activeLocks).filter(lock => lock.isActive);
   const uniqueBots = new Set(activeLocks.map(lock => lock.lockedBy));
 
@@ -452,4 +545,28 @@ export function getFleetFtSummary(): {
       quantity: entry.quantity,
     })),
   };
+}
+
+const FLUSH_INTERVAL_MS = 2 * 60 * 1000;
+let flushInterval: ReturnType<typeof setInterval> | null = null;
+
+function startFlushInterval(): void {
+  if (flushInterval) return;
+  flushInterval = setInterval(() => {
+    flushAllCoordinationData();
+  }, FLUSH_INTERVAL_MS);
+}
+
+function stopFlushInterval(): void {
+  if (flushInterval) {
+    clearInterval(flushInterval);
+    flushInterval = null;
+  }
+}
+
+startFlushInterval();
+
+export function shutdownCoordination(): void {
+  stopFlushInterval();
+  flushAllCoordinationData();
 }

@@ -35,6 +35,7 @@ import {
   getBotLocks,
   getInTransitQuantity as getFtInTransitQuantity,
   acquireDeliveryLock,
+  acquireDeliveryLockAtomic,
   updateDeliveredQuantity,
   releaseDeliveryLock,
   addInTransitItems as addFtInTransitItems,
@@ -454,310 +455,314 @@ async function depositCargoAtHome(
 export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  while (bot.state !== "running") {
-    await ctx.sleep(2000);
-  }
+  try {
+    while (bot.state !== "running") {
+      await ctx.sleep(2000);
+    }
 
-  const alive = await detectAndRecoverFromDeath(ctx);
-  if (!alive) {
-    await ctx.sleep(30000);
-    yield "death_recovery";
-    return;
-  }
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) {
+      await ctx.sleep(30000);
+      yield "death_recovery";
+      return;
+    }
 
-  const battleState: BattleState = {
-    inBattle: false,
-    battleId: null,
-    battleStartTick: null,
-    lastHitTick: null,
-    isFleeing: false,
-    lastFleeTime: undefined,
-  };
-
-  if (await checkAndFleeFromBattle(ctx, "fuel_transport")) {
-    await ctx.sleep(5000);
-    yield "battle_flee";
-  }
-
-  await bot.refreshStatus();
-  const settings = getFuelTransportSettings(bot.username);
-  const safetyOpts = {
-    fuelThresholdPct: settings.refuelThreshold,
-    hullThresholdPct: settings.repairThreshold,
-    autoCloak: settings.autoCloak,
-  };
-
-  const homeStationRaw = settings.homeStation || "";
-  const homeStation = homeStationRaw.includes("|") ? homeStationRaw.split("|")[1] : homeStationRaw;
-  const resolvedHomeSystem = resolveStationSystem(homeStation);
-  const homeSystem = resolvedHomeSystem || settings.homeSystem || "";
-
-  if (!homeSystem || !homeStation) {
-    ctx.log("error", "Fuel Transport: General > Faction Storage Station must be set");
-    yield "config_error";
-    await ctx.sleep(60000);
-    return;
-  }
-
-  if (settings.stations.length === 0) {
-    ctx.log("warn", "Fuel Transport: No remote stations configured");
-    yield "no_stations";
-    await ctx.sleep(60000);
-    return;
-  }
-
-  ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
-
-  const cleanedLocks = cleanupFtStaleLocks();
-  if (cleanedLocks > 0) {
-    ctx.log("fuel", `Cleaned up ${cleanedLocks} stale co-op locks`);
-  }
-  const cleanedTransit = cleanupFtStaleInTransit();
-  if (cleanedTransit > 0) {
-    ctx.log("fuel", `Cleaned up ${cleanedTransit} stale in-transit entries`);
-  }
-
-  if (settings.autoCloak) {
-    await enableCloakingIfPossible(ctx);
-  }
-
-  const activeLoadouts = getActiveLoadouts();
-  const useLoadoutMode = activeLoadouts.length > 0;
-  if (useLoadoutMode) {
-    ctx.log("fuel", `Loadout mode enabled: ${activeLoadouts.length} active loadout(s)`);
-  } else if (settings.items.length === 0) {
-    ctx.log("warn", "Fuel Transport: No items configured");
-    yield "no_items";
-    await ctx.sleep(60000);
-    return;
-  }
-
-  while (bot.state === "running") {
-    yield "cycle_start";
-    
-    if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+      lastFleeTime: undefined,
+    };
 
     if (await checkAndFleeFromBattle(ctx, "fuel_transport")) {
-      yield "battle_flee";
       await ctx.sleep(5000);
-      continue;
-    }
-
-    if (bot.isInBattle()) {
-      const now = Date.now();
-      if (!battleState.lastFleeTime || now - battleState.lastFleeTime > 10000) {
-        ctx.log("combat", "PERIODIC CHECK: IN BATTLE! - fleeing!");
-        await bot.exec("battle", { action: "stance", stance: "flee" });
-        battleState.lastFleeTime = now;
-      }
-      const bs = await getBattleStatus(ctx);
-      if (!bs || !bs.is_participant) {
-        battleState.lastFleeTime = undefined;
-      }
-      await ctx.sleep(2000);
-      continue;
-    }
-
-    const aliveNow = await detectAndRecoverFromDeath(ctx);
-    if (!aliveNow) {
-      yield "death_recovery";
-      await ctx.sleep(30000);
-      continue;
-    }
-
-    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
-      ctx.log("fuel", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
-      await enableCloakingIfPossible(ctx);
+      yield "battle_flee";
     }
 
     await bot.refreshStatus();
-    if (!bot.docked || bot.poi !== homeStation || bot.system !== homeSystem) {
-      yield "go_home";
-      ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation}...`);
+    const settings = getFuelTransportSettings(bot.username);
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+    };
 
-      if (bot.system !== homeSystem) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-        if (!fueled) { await ctx.sleep(30000); continue; }
-        const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-        if (!arrived || bot.state !== "running") {
-          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-          await ctx.sleep(30000); continue;
-        }
-        ctx.log("fuel", `Arrived at home system ${homeSystem}`);
-      }
+    const homeStationRaw = settings.homeStation || "";
+    const homeStation = homeStationRaw.includes("|") ? homeStationRaw.split("|")[1] : homeStationRaw;
+    const resolvedHomeSystem = resolveStationSystem(homeStation);
+    const homeSystem = resolvedHomeSystem || settings.homeSystem || "";
 
-      if (bot.poi !== homeStation) {
-        await ensureUndocked(ctx);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        const tResp = await bot.exec("travel", { target_poi: homeStation });
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        if (tResp.error) {
-          const errMsg = tResp.error.message.toLowerCase();
-          if (!errMsg.includes("already")) {
-            ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
-            await ctx.sleep(30000); continue;
-          }
-        } else {
-          bot.poi = homeStation;
-        }
-      }
-
-      if (!bot.docked) {
-        yield "dock_home";
-        const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.includes("already")) {
-          ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
-          await ctx.sleep(30000); continue;
-        }
-        bot.docked = true;
-      }
+    if (!homeSystem || !homeStation) {
+      ctx.log("error", "Fuel Transport: General > Faction Storage Station must be set");
+      yield "config_error";
+      await ctx.sleep(60000);
+      return;
     }
 
-    await tryRefuel(ctx, { skipApprovedCheck: true });
-    await repairShip(ctx);
-    await depositCargoAtHome(ctx, bot, homeStation);
+    if (settings.stations.length === 0) {
+      ctx.log("warn", "Fuel Transport: No remote stations configured");
+      yield "no_stations";
+      await ctx.sleep(60000);
+      return;
+    }
 
-    let allAtTarget = true;
-    const stationsToService: { station: string; system: string }[] = [];
+    ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
 
-    for (const station of settings.stations) {
-      const sys = resolveStationSystem(station);
-      if (!sys) {
-        ctx.log("error", `Unknown station: ${station}`);
+    const cleanedLocks = cleanupFtStaleLocks();
+    if (cleanedLocks > 0) {
+      ctx.log("fuel", `Cleaned up ${cleanedLocks} stale co-op locks`);
+    }
+    const cleanedTransit = cleanupFtStaleInTransit();
+    if (cleanedTransit > 0) {
+      ctx.log("fuel", `Cleaned up ${cleanedTransit} stale in-transit entries`);
+    }
+
+    if (settings.autoCloak) {
+      await enableCloakingIfPossible(ctx);
+    }
+
+    const activeLoadouts = getActiveLoadouts();
+    const useLoadoutMode = activeLoadouts.length > 0;
+    if (useLoadoutMode) {
+      ctx.log("fuel", `Loadout mode enabled: ${activeLoadouts.length} active loadout(s)`);
+    } else if (settings.items.length === 0) {
+      ctx.log("warn", "Fuel Transport: No items configured");
+      yield "no_items";
+      await ctx.sleep(60000);
+      return;
+    }
+
+    while (bot.state === "running") {
+      yield "cycle_start";
+      
+      if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+
+      if (await checkAndFleeFromBattle(ctx, "fuel_transport")) {
+        yield "battle_flee";
+        await ctx.sleep(5000);
         continue;
       }
-      stationsToService.push({ station, system: sys });
-    }
 
-    for (const { station, system: destSystem } of stationsToService) {
-      if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-      
-      const remoteStationId = extractStationId(station);
-      
-      const loadoutItems: Map<string, number> = new Map();
-      const loadoutItemMap: Map<string, Set<string>> = new Map();
-      
-      const stationQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
-      if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-      ctx.log("fuel", `Viewed faction storage at ${remoteStationId}: ${Object.keys(stationQtyCache).length} items found`);
+      if (bot.isInBattle()) {
+        const now = Date.now();
+        if (!battleState.lastFleeTime || now - battleState.lastFleeTime > 10000) {
+          ctx.log("combat", "PERIODIC CHECK: IN BATTLE! - fleeing!");
+          await bot.exec("battle", { action: "stance", stance: "flee" });
+          battleState.lastFleeTime = now;
+        }
+        const bs = await getBattleStatus(ctx);
+        if (!bs || !bs.is_participant) {
+          battleState.lastFleeTime = undefined;
+        }
+        await ctx.sleep(2000);
+        continue;
+      }
 
-      if (useLoadoutMode) {
-        for (const loadout of activeLoadouts) {
-          if (isStationCompletedForLoadout(remoteStationId, loadout.name)) {
-            ctx.log("fuel", `${remoteStationId}: Already completed for loadout "${loadout.name}" — skipping`);
-            continue;
+      const aliveNow = await detectAndRecoverFromDeath(ctx);
+      if (!aliveNow) {
+        yield "death_recovery";
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
+        ctx.log("fuel", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+        await enableCloakingIfPossible(ctx);
+      }
+
+      await bot.refreshStatus();
+      if (!bot.docked || bot.poi !== homeStation || bot.system !== homeSystem) {
+        yield "go_home";
+        ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation}...`);
+
+        if (bot.system !== homeSystem) {
+          await ensureUndocked(ctx);
+          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+          if (!fueled) { await ctx.sleep(30000); continue; }
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived || bot.state !== "running") {
+            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+            await ctx.sleep(30000); continue;
           }
+          ctx.log("fuel", `Arrived at home system ${homeSystem}`);
+        }
 
-          for (const item of loadout.items) {
-            const existing = loadoutItems.get(item.itemId) || 0;
-            loadoutItems.set(item.itemId, existing + item.targetQuantity);
-            if (!loadoutItemMap.has(item.itemId)) {
-              loadoutItemMap.set(item.itemId, new Set());
+        if (bot.poi !== homeStation) {
+          await ensureUndocked(ctx);
+          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+          const tResp = await bot.exec("travel", { target_poi: homeStation });
+          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+          if (tResp.error) {
+            const errMsg = tResp.error.message.toLowerCase();
+            if (!errMsg.includes("already")) {
+              ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+              await ctx.sleep(30000); continue;
             }
-            loadoutItemMap.get(item.itemId)!.add(loadout.name);
+          } else {
+            bot.poi = homeStation;
           }
         }
 
-        if (loadoutItems.size > 0) {
-          allAtTarget = false;
-          
-          const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
-          for (const [itemId, targetQty] of loadoutItems) {
-            const currentQty = stationQtyCache[itemId] || 0;
-            const itemSize = getItemSize(itemId);
-            
-            const forceFullForItem = Array.from(loadoutItemMap.get(itemId)!).some(loadoutName => {
-              const loadout = activeLoadouts.find(l => l.name === loadoutName);
-              return loadout?.forceFullDelivery || false;
-            });
-            
-            const need = forceFullForItem ? targetQty : Math.max(0, targetQty - currentQty);
-            neededItems.push({ itemId, itemName: itemId, needed: need, itemSize });
+        if (!bot.docked) {
+          yield "dock_home";
+          const dockResp = await bot.exec("dock");
+          if (dockResp.error && !dockResp.error.message.includes("already")) {
+            ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
+            await ctx.sleep(30000); continue;
           }
-          
-          if (neededItems.length > 0) {
-            const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
-            if (batchResult) {
-              const deliveredItems = batchResult.filter(r => r.deposited).map(r => ({ itemId: r.itemId, quantity: r.qty }));
-              if (deliveredItems.length > 0) {
-                const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
-                if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-                for (const loadout of activeLoadouts) {
-                  if (isStationCompletedForLoadout(remoteStationId, loadout.name)) continue;
+          bot.docked = true;
+        }
+      }
 
-                  let allItemsAtTarget = true;
-                  for (const item of loadout.items) {
-                    const currentQty = freshQtyCache[item.itemId] || 0;
-                    if (currentQty < item.targetQuantity) {
-                      allItemsAtTarget = false;
-                      ctx.log("fuel", `${item.itemId}: ${currentQty}/${item.targetQuantity} - not at target`);
-                      break;
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      await repairShip(ctx);
+      await depositCargoAtHome(ctx, bot, homeStation);
+
+      let allAtTarget = true;
+      const stationsToService: { station: string; system: string }[] = [];
+
+      for (const station of settings.stations) {
+        const sys = resolveStationSystem(station);
+        if (!sys) {
+          ctx.log("error", `Unknown station: ${station}`);
+          continue;
+        }
+        stationsToService.push({ station, system: sys });
+      }
+
+      for (const { station, system: destSystem } of stationsToService) {
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+        
+        const remoteStationId = extractStationId(station);
+        
+        const loadoutItems: Map<string, number> = new Map();
+        const loadoutItemMap: Map<string, Set<string>> = new Map();
+        
+        const stationQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+        ctx.log("fuel", `Viewed faction storage at ${remoteStationId}: ${Object.keys(stationQtyCache).length} items found`);
+
+        if (useLoadoutMode) {
+          for (const loadout of activeLoadouts) {
+            if (isStationCompletedForLoadout(remoteStationId, loadout.name)) {
+              ctx.log("fuel", `${remoteStationId}: Already completed for loadout "${loadout.name}" — skipping`);
+              continue;
+            }
+
+            for (const item of loadout.items) {
+              const existing = loadoutItems.get(item.itemId) || 0;
+              loadoutItems.set(item.itemId, existing + item.targetQuantity);
+              if (!loadoutItemMap.has(item.itemId)) {
+                loadoutItemMap.set(item.itemId, new Set());
+              }
+              loadoutItemMap.get(item.itemId)!.add(loadout.name);
+            }
+          }
+
+          if (loadoutItems.size > 0) {
+            allAtTarget = false;
+            
+            const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number; targetQty?: number }> = [];
+            for (const [itemId, targetQty] of loadoutItems) {
+              const currentQty = stationQtyCache[itemId] || 0;
+              const itemSize = getItemSize(itemId);
+              
+              const forceFullForItem = Array.from(loadoutItemMap.get(itemId)!).some(loadoutName => {
+                const loadout = activeLoadouts.find(l => l.name === loadoutName);
+                return loadout?.forceFullDelivery || false;
+              });
+              
+              const need = forceFullForItem ? targetQty : Math.max(0, targetQty - currentQty);
+              neededItems.push({ itemId, itemName: itemId, needed: need, itemSize, targetQty });
+            }
+            
+            if (neededItems.length > 0) {
+              const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
+              if (batchResult) {
+                const deliveredItems = batchResult.filter(r => r.deposited).map(r => ({ itemId: r.itemId, quantity: r.qty }));
+                if (deliveredItems.length > 0) {
+                  const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
+                  if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+                  for (const loadout of activeLoadouts) {
+                    if (isStationCompletedForLoadout(remoteStationId, loadout.name)) continue;
+
+                    let allItemsAtTarget = true;
+                    for (const item of loadout.items) {
+                      const currentQty = freshQtyCache[item.itemId] || 0;
+                      if (currentQty < item.targetQuantity) {
+                        allItemsAtTarget = false;
+                        ctx.log("fuel", `${item.itemId}: ${currentQty}/${item.targetQuantity} - not at target`);
+                        break;
+                      }
                     }
-                  }
-                  
-                  if (allItemsAtTarget) {
-                    ctx.log("fuel", `${loadout.name}: ALL ITEMS AT TARGET - saving completion`);
-                    saveStationCompletion(remoteStationId, loadout.name, []);
+                    
+                    if (allItemsAtTarget) {
+                      ctx.log("fuel", `${loadout.name}: ALL ITEMS AT TARGET - saving completion`);
+                      saveStationCompletion(remoteStationId, loadout.name, []);
+                    }
                   }
                 }
               }
             }
           }
         }
-      }
 
-      const processedItemIds = new Set(loadoutItems.keys());
-      const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }> = [];
-      for (const item of settings.items) {
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        if (processedItemIds.has(item.itemId)) continue;
+        const processedItemIds = new Set(loadoutItems.keys());
+        const neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number; targetQty?: number }> = [];
+        for (const item of settings.items) {
+          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+          if (processedItemIds.has(item.itemId)) continue;
+          
+          const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
+          if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+          if (currentQty >= item.targetQuantity) {
+            ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
+            continue;
+          }
+
+          const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
+          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
+          if (strategy.skip) continue;
+
+          const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, item.targetQuantity - currentQty, bot.username);
+          if (coOpAvailable <= 0) {
+            ctx.log("fuel", `Co-op: ${item.itemName} fully claimed by other bots — skipping`);
+            continue;
+          }
+
+          const need = item.targetQuantity - currentQty;
+          const itemSize = getItemSize(item.itemId);
+          neededItems.push({ itemId: item.itemId, itemName: item.itemName, needed: need, itemSize, targetQty: item.targetQuantity });
+        }
         
-        const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
-        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-        if (currentQty >= item.targetQuantity) {
-          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
-          continue;
+        if (neededItems.length > 0) {
+          allAtTarget = false;
+          const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
         }
-
-        const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
-        ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
-        if (strategy.skip) continue;
-
-        const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, item.targetQuantity - currentQty, bot.username);
-        if (coOpAvailable <= 0) {
-          ctx.log("fuel", `Co-op: ${item.itemName} fully claimed by other bots — skipping`);
-          continue;
-        }
-
-        const need = item.targetQuantity - currentQty;
-        const itemSize = getItemSize(item.itemId);
-        neededItems.push({ itemId: item.itemId, itemName: item.itemName, needed: need, itemSize });
       }
-      
-      if (neededItems.length > 0) {
-        allAtTarget = false;
-        const batchResult = await deliverBatchToStation(ctx, bot, neededItems, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts);
+
+      if (allAtTarget) {
+        ctx.log("fuel", `All stations at target quantities — maintenance pause`);
+        yield "maintenance";
+        await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        await ctx.sleep(300000);
+        continue;
       }
-    }
 
-    if (allAtTarget) {
-      ctx.log("fuel", `All stations at target quantities — maintenance pause`);
-      yield "maintenance";
-      await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-      await ctx.sleep(300000);
-      continue;
+      await ctx.sleep(5000);
     }
-
-    await ctx.sleep(5000);
+  } finally {
+    import("./fuelTransferCoordination.js").then(m => m.shutdownCoordination()).catch(() => {});
   }
 };
 
 async function deliverBatchToStation(
   ctx: RoutineContext,
   bot: Bot,
-  neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number }>,
+  neededItems: Array<{ itemId: string; itemName: string; needed: number; itemSize: number; targetQty?: number }>,
   remoteStationId: string,
   destSystem: string,
   homeSystem: string,
@@ -836,31 +841,26 @@ async function deliverBatchToStation(
     const maxCanCarry = maxItemsForCargo(freeSpace, needed.itemId);
     if (maxCanCarry <= 0) continue;
     
-    const coOpAvailable = getAvailableDeliveryQuantity(needed.itemId, remoteStationId, needed.needed, botUsername);
-    const inTransitOther = getFtInTransitQuantity(needed.itemId, remoteStationId, botUsername);
-    const effectiveAvailable = Math.max(0, coOpAvailable - inTransitOther);
-    const takeQty = Math.min(needed.needed, maxCanCarry, effectiveAvailable);
+    const requestedQty = Math.min(needed.needed, maxCanCarry);
     
-    if (takeQty <= 0) {
-      if (effectiveAvailable <= 0 && needed.needed > 0) {
-        ctx.log("fuel", `Co-op: ${needed.itemName} fully claimed/in-transit by other bots — skipping`);
-      }
-      continue;
-    }
-    
-    if (takeQty < needed.needed) {
-      ctx.log("fuel", `Co-op: Capping ${needed.itemName} batch load to ${takeQty} of ${needed.needed} (others handling rest)`);
-    } else if (coOpAvailable < needed.needed) {
-      ctx.log("fuel", `Co-op: ${needed.itemName} batch co-op available ${coOpAvailable} of ${needed.needed} needed`);
-    }
-    
-    acquireDeliveryLock({
+    const lockResult = await acquireDeliveryLockAtomic({
       botUsername,
       itemId: needed.itemId,
       itemName: needed.itemName,
-      quantity: takeQty,
+      quantity: requestedQty,
       remoteStationId,
+      totalNeed: needed.needed,
     });
+
+    if (!lockResult.success) {
+      ctx.log("fuel", `Co-op: ${needed.itemName} ${lockResult.message} — skipping`);
+      continue;
+    }
+
+    const takeQty = lockResult.lockedQty;
+    if (takeQty < needed.needed) {
+      ctx.log("fuel", `Co-op: Capping ${needed.itemName} batch load to ${takeQty} of ${needed.needed} (others handling rest)`);
+    }
     
     loadPlan.push({ itemId: needed.itemId, itemName: needed.itemName, qty: takeQty, source: "faction" });
     plannedUsage += takeQty * needed.itemSize;
@@ -871,11 +871,34 @@ async function deliverBatchToStation(
     return results;
   }
 
-  ctx.log("fuel", `Batch loading ${loadPlan.length} item types (${loadPlan.reduce((s, i) => s + i.qty, 0)} total units) at home...`);
+  const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
+  if (bot.state !== "running") return results;
+
+  const verifiedPlan: typeof loadPlan = [];
+  for (const plan of loadPlan) {
+    const currentQty = freshQtyCache[plan.itemId] || 0;
+    const neededInfo = neededItems.find(n => n.itemId === plan.itemId);
+    const targetQty = neededInfo?.targetQty ?? neededInfo?.needed ?? 0;
+    if (targetQty > 0 && currentQty >= targetQty) {
+      ctx.log("fuel", `Re-verify: ${remoteStationId} already has ${currentQty}/${targetQty} ${plan.itemName} — releasing lock and skipping`);
+      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "already_at_target");
+      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+      continue;
+    }
+    verifiedPlan.push(plan);
+  }
+
+  if (verifiedPlan.length === 0) {
+    ctx.log("fuel", "All planned items already at target after re-verify — skipping trip");
+    return results;
+  }
+
+  const finalPlan = verifiedPlan;
+  ctx.log("fuel", `Batch loading ${finalPlan.length} item types (${finalPlan.reduce((s, i) => s + i.qty, 0)} total units) at home...`);
   
   const actualLoad: Array<{ itemId: string; itemName: string; qty: number; source: string }> = [];
   
-  for (const plan of loadPlan) {
+  for (const plan of finalPlan) {
     if (bot.state !== "running") break;
     
     await bot.refreshCargo();

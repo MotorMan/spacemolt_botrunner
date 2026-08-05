@@ -1,4 +1,4 @@
-export type BotSyncMode = "disabled" | "master" | "slave" | "light";
+export type BotSyncMode = "disabled" | "master" | "slave" | "light" | "market";
 
 export interface SyncSettings {
   enabled: boolean;
@@ -45,6 +45,10 @@ export interface RegisteredClient {
    * shares bot names/statuses + the non-API bot chat channel and never takes
    * part in the heavy two-way file sync. */
   light?: boolean;
+  /** True when this client has fresh market data available for remote queries.
+   * Set by the market-mode slave when its local marketDetails.json is being
+   * actively updated by a running market routine. */
+  hasMarketData?: boolean;
   /** Number of bot statuses this client last pushed (0 means it's connected
    * but contributed no bots — usually because none of its bots are currently
    * game-connected at push time). Surfaced in the master's client list so a
@@ -155,4 +159,47 @@ export type SyncEventType =
 export interface SyncHookContext {
   enabled: boolean;
   pushToMaster?: (type: SyncEventType, payload: Record<string, unknown>) => Promise<void>;
+}
+
+/** A low-bandwidth market data query: one client asks another (via the master)
+ *  for the best deal on a given item, and the data-holding client computes it
+ *  locally and returns only the winning station + price + quantity. */
+export interface MarketQueryRequest {
+  /** Item id to search for (e.g. "ore::iron"). */
+  itemId: string;
+  /** Maximum acceptable price per unit (buy queries) or minimum acceptable
+   *  price per unit (sell queries). Omit for no price filter. */
+  maxPrice?: number;
+  /** Minimum quantity required. Omit for no quantity filter. */
+  minQuantity?: number;
+  /** Requester's current system id, used to estimate travel distance. */
+  requesterSystemId?: string;
+  /** Requester's current location string, if different from system id. */
+  requesterLocation?: string;
+  /** Type of trade: "buy" to find cheapest sell orders, "sell" to find
+   *  highest buy orders. Defaults to "buy". */
+  tradeType?: "buy" | "sell";
+}
+
+/** A single market deal result returned by the data-holding client. */
+export interface MarketQueryResponse {
+  ok: boolean;
+  stationName: string;
+  systemId: string;
+  stationPoiId: string;
+  price: number;
+  quantity: number;
+  /** Estimated number of jumps from requesterSystemId, if calculable. */
+  distance?: number;
+  /** Error message if ok is false. */
+  error?: string;
+}
+
+/** Wrapper for a market query result: an array of matching deals (typically
+ *  just the best one, sorted by price). */
+export interface MarketQueryResult {
+  ok: boolean;
+  results: MarketQueryResponse[];
+  /** Optional error when the whole query could not be served. */
+  error?: string;
 }

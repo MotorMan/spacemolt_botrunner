@@ -26,6 +26,9 @@ import type {
   CatalogVersionResponse,
   CatalogSyncState,
   CatalogSyncStateClient,
+  MarketQueryRequest,
+  MarketQueryResponse,
+  MarketQueryResult,
 } from "./client_sync_types.js";
 
 export type {
@@ -41,6 +44,9 @@ export type {
   CatalogVersionResponse,
   CatalogSyncState,
   CatalogSyncStateClient,
+  MarketQueryRequest,
+  MarketQueryResponse,
+  MarketQueryResult,
 } from "./client_sync_types.js";
 
 function generateApiKey(): string {
@@ -491,6 +497,50 @@ export class ClientSyncMaster {
 
   public marketUpdate(_payload: MarketPayload): boolean {
     return true;
+  }
+
+  public setMarketDataAvailability(clientId: string, hasMarketData: boolean): boolean {
+    const client = this.clients.get(clientId);
+    if (!client) return false;
+    client.hasMarketData = hasMarketData;
+    this.touch(clientId);
+    return true;
+  }
+
+  public async handleMarketQuery(query: MarketQueryRequest, requestingClientId?: string): Promise<MarketQueryResult> {
+    const marketClients: { clientId: string; client: RegisteredClient }[] = [];
+    for (const [cid, c] of this.clients) {
+      if (c.hasMarketData && c.selfUrl) {
+        marketClients.push({ clientId: cid, client: c });
+      }
+    }
+    if (marketClients.length === 0) {
+      return { ok: false, results: [], error: "No client with market data available" };
+    }
+    if (marketClients.length > 1) {
+      this.log(`Market query forwarded to first of ${marketClients.length} market clients`);
+    }
+    const target = marketClients[0];
+    const targetUrl = target.client.selfUrl as string;
+    try {
+      const result = await Promise.race([
+        peerRequest(targetUrl, "/api/client-sync/market-query-handler", this.apiKey, this.password || "", undefined, query),
+        new Promise<MarketQueryResult>((resolve) => setTimeout(() => resolve({ ok: false, results: [], error: "Market client timed out" }), 10000)),
+      ]) as MarketQueryResult;
+      return result;
+    } catch {
+      return { ok: false, results: [], error: `Failed to reach market client ${target.clientId}` };
+    }
+  }
+
+  public getMarketClients(): Array<{ clientId: string; label: string; lastSeen: number }> {
+    const out: Array<{ clientId: string; label: string; lastSeen: number }> = [];
+    for (const [cid, c] of this.clients) {
+      if (c.hasMarketData) {
+        out.push({ clientId: cid, label: c.label, lastSeen: c.lastSeen });
+      }
+    }
+    return out;
   }
 
   public coordinationSync(_payload: CoordinationPayload): boolean {

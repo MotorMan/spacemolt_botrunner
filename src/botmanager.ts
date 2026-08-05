@@ -50,6 +50,7 @@ import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
 import { ClientSyncLightSlave } from "./client_sync_light_slave.js";
+import { ClientSyncMarketSlave } from "./client_sync_market_slave.js";
 import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
 import { perf, snapshotAndReset as perfSnapshotAndReset, setActivePlayers as perfSetActivePlayers } from "./perf.js";
 import { ensureInsured } from "./routines/common.js";
@@ -256,6 +257,7 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
   const master = (globalThis as { syncMaster?: import("./client_sync_master.js").ClientSyncMaster }).syncMaster;
   const slave = (globalThis as { syncSlave?: import("./client_sync_slave.js").ClientSyncSlave }).syncSlave;
   const light = (globalThis as { syncLight?: import("./client_sync_light_slave.js").ClientSyncLightSlave }).syncLight;
+  const market = (globalThis as { syncMarket?: import("./client_sync_market_slave.js").ClientSyncMarketSlave }).syncMarket;
   let pullError: string | null = null;
   try {
     if (master) {
@@ -1269,6 +1271,26 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
         syncLight.stop();
         delete (globalThis as any).syncLight;
         server.logSystem(`Client sync light stopped`);
+      }
+    }
+
+    // Market sync client: lightweight connect that additionally supports low-BW
+    // market data queries. No file sync.
+    const syncMarket = (globalThis as any).syncMarket as ClientSyncMarketSlave | undefined;
+    if (newSettings.enabled && newSettings.mode === "market" && newSettings.masterUrl) {
+      if (syncMarket) {
+        syncMarket.updateSettings(newSettings);
+      } else {
+        const newMarket = new ClientSyncMarketSlave(newSettings);
+        newMarket.start();
+        (globalThis as any).syncMarket = newMarket;
+        server.logSystem(`Client sync market started`);
+      }
+    } else {
+      if (syncMarket) {
+        syncMarket.stop();
+        delete (globalThis as any).syncMarket;
+        server.logSystem(`Client sync market stopped`);
       }
     }
 
@@ -2411,6 +2433,12 @@ async function main(): Promise<void> {
       syncLight.start();
       (globalThis as any).syncLight = syncLight;
       server.logSystem(`Client sync light enabled, connecting to ${clientSyncSettings.masterUrl}`);
+    }
+    if (clientSyncSettings.enabled && clientSyncSettings.mode === "market" && clientSyncSettings.masterUrl) {
+      const syncMarket = new ClientSyncMarketSlave(clientSyncSettings);
+      syncMarket.start();
+      (globalThis as any).syncMarket = syncMarket;
+      server.logSystem(`Client sync market enabled, connecting to ${clientSyncSettings.masterUrl}`);
     }
   }
 

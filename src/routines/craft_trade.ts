@@ -62,6 +62,7 @@ import {
   countOpenOrdersForTrader,
   type CraftOrder,
 } from "./craftTradeOrders.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -86,6 +87,7 @@ interface CraftTradeSettings {
   maxConcurrentOrders: number;
   orderTimeoutMin: number;
   minMarginPct: number;
+  useRemoteMarketQuery: boolean;
 }
 
 function getCraftTradeSettings(username?: string): CraftTradeSettings {
@@ -124,6 +126,7 @@ function getCraftTradeSettings(username?: string): CraftTradeSettings {
     maxConcurrentOrders: (t.maxConcurrentOrders as number) || 3,
     orderTimeoutMin: (t.orderTimeoutMin as number) || 360,
     minMarginPct: (t.minMarginPct as number) || 10,
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -163,6 +166,7 @@ function buildTraderSettingsShim(s: CraftTradeSettings): Parameters<typeof findT
     minProfitPerUnit: s.minProfitPerUnit,
     fuelCostPerJump: s.fuelCostPerJump,
     maxCargoValue: s.maxCargoValue,
+    useRemoteMarketQuery: s.useRemoteMarketQuery,
   } as unknown as Parameters<typeof findTradeOpportunities>[0];
 }
 
@@ -227,7 +231,9 @@ async function* traderLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGen
       if (entry) {
         // Craftable — request a build order.
         const recipe = entry.recipe;
-        const estCost = estimateCraftCost(recipe);
+        const estCost = s.useRemoteMarketQuery !== false
+          ? await estimateCraftCostWithRemote(recipe, bot.system)
+          : estimateCraftCost(recipe);
         const expectedRevenue = route.sellPrice * route.buyQty;
         if (route.totalProfit <= 0) continue;
         if (expectedRevenue < estCost * (1 + s.minMarginPct / 100)) {
@@ -301,6 +307,26 @@ function estimateCraftCost(recipe: Recipe): number {
   for (const comp of recipe.components) {
     const market = getItemMarketCost(comp.item_id);
     cost += (market > 0 ? market : 0) * comp.quantity;
+  }
+  return cost;
+}
+
+/** Try to get component costs from remote market data for craft cost estimation. */
+export async function estimateCraftCostWithRemote(recipe: Recipe, currentSystemId?: string): Promise<number> {
+  let cost = 0;
+  for (const comp of recipe.components) {
+    const localCost = getItemMarketCost(comp.item_id);
+    let remoteCost = 0;
+    try {
+      const result = await queryRemoteMarket({ itemId: comp.item_id, tradeType: "buy", requesterSystemId: currentSystemId });
+      if (result.ok && result.results.length > 0) {
+        remoteCost = result.results[0].price;
+      }
+    } catch {
+      // Non-fatal: use local cost
+    }
+    const usedCost = remoteCost > 0 ? remoteCost : localCost;
+    cost += (usedCost > 0 ? usedCost : 0) * comp.quantity;
   }
   return cost;
 }

@@ -16787,6 +16787,17 @@
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Use Remote Market Query</div>
+        <div class="setting-hint">When enabled (default), query other connected clients for fresh market data instead of relying solely on local cached data. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
+      </div>
+      <select id="set-trader-useRemoteMarketQuery">
+        <option value="true" ${t.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
+        <option value="false" ${t.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Min Profit Per Unit (credits)</div>
         <div class="setting-hint">Only run trade routes where per-item profit exceeds this amount after fuel costs.</div>
       </div>
@@ -16899,6 +16910,8 @@
             document.getElementById("set-trader-debugLogging").value === "true",
           depositProfitsToFaction:
             document.getElementById("set-trader-depositProfitsToFaction").value === "true",
+          useRemoteMarketQuery:
+            document.getElementById("set-trader-useRemoteMarketQuery").value === "true",
         };
         send({ type: "saveSettings", routine: "trader", settings: s });
         settings.trader = s;
@@ -17158,6 +17171,17 @@
       </div>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Use Remote Market Query</div>
+        <div class="setting-hint">When enabled (default), query other connected clients for fresh market sell prices instead of relying solely on local cached data. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
+      </div>
+      <select id="set-faction_trader-useRemoteMarketQuery">
+        <option value="true" ${t.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
+        <option value="false" ${t.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="secondary" onclick="resetAllFactionTradeSold()">↺ Reset All Sold Counts</button>
       <button class="primary" onclick="saveFactionTraderSettings()">Save Settings</button>
@@ -17365,6 +17389,8 @@
           disableCreditDeposit:
             document.getElementById("set-faction_trader-disableCreditDeposit")
               .value === "true",
+          useRemoteMarketQuery:
+            document.getElementById("set-faction_trader-useRemoteMarketQuery").value === "true",
         };
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;
@@ -17563,6 +17589,16 @@
         </div>
         <div id="trade-buyer-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
       </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Use Remote Market Query</div>
+        <div class="setting-hint">When enabled (default), query other connected clients for fresh sell prices instead of relying solely on local cached data. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
+      </div>
+      <select id="set-trade_buyer-useRemoteMarketQuery">
+        <option value="true" ${t.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
+        <option value="false" ${t.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
+      </select>
     </div>
 
     <div class="settings-save-bar">
@@ -17758,6 +17794,8 @@
             "true",
           buyItems: buyItems,
           maxPrices: maxPrices,
+          useRemoteMarketQuery:
+            document.getElementById("set-trade_buyer-useRemoteMarketQuery").value === "true",
         };
         send({ type: "saveSettings", routine: "trade_buyer", settings: s });
         settings.trade_buyer = s;
@@ -17943,6 +17981,17 @@
       <input type="number" id="set-craft_trade-minMarginPct" min="0" value="${minMarginPct}" style="width:80px" />
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Use Remote Market Query</div>
+        <div class="setting-hint">When enabled (default), query other connected clients for fresh component prices when estimating craft costs. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
+      </div>
+      <select id="set-craft_trade-useRemoteMarketQuery">
+        <option value="true" ${ct.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
+        <option value="false" ${ct.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveCraftTradeSettings()">Save Settings</button>
     </div>
@@ -17979,6 +18028,7 @@
           maxConcurrentOrders: num("set-craft_trade-maxConcurrentOrders", 3),
           orderTimeoutMin: num("set-craft_trade-orderTimeoutMin", 360),
           minMarginPct: num("set-craft_trade-minMarginPct", 10),
+          useRemoteMarketQuery: document.getElementById("set-craft_trade-useRemoteMarketQuery")?.value === "true",
         };
         send({ type: "saveSettings", routine: "craft_trade", settings: s });
         settings.craft_trade = s;
@@ -18113,6 +18163,17 @@
       <input type="number" id="set-fc-maxFuelCellsPerStation" min="1" max="100000" value="${maxFuelCellsPerStation}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Use Remote Market Query</div>
+        <div class="setting-hint">When enabled (default), query other connected clients for fresh fuel cell prices when local view_market fails. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
+      </div>
+      <select id="set-fc-useRemoteMarketQuery">
+        <option value="true" ${fc.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
+        <option value="false" ${fc.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveFuelCellSellerSettings()">Save Settings</button>
     </div>
@@ -18178,6 +18239,8 @@
             parseInt(
               document.getElementById("set-fc-maxFuelCellsPerStation").value,
             ) || 20000,
+          useRemoteMarketQuery:
+            document.getElementById("set-fc-useRemoteMarketQuery")?.value === "true",
         };
         send({
           type: "saveSettings",

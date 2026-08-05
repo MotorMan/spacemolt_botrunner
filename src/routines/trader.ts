@@ -59,6 +59,7 @@ import {
   getAllUnsoldItems,
   type UnsoldItem,
 } from "./unsoldItems.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 // ── CSV Logging ─────────────────────────────────────────────────
 
@@ -516,6 +517,7 @@ function getTraderSettings(username?: string): {
   enablePassengerTransport: boolean;
   passengerFareEstimate: number;
   depositProfitsToFaction: boolean;
+  useRemoteMarketQuery: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -539,6 +541,7 @@ function getTraderSettings(username?: string): {
     enablePassengerTransport: (t.enablePassengerTransport as boolean) ?? true,
     passengerFareEstimate: (t.passengerFareEstimate as number) ?? 5000,
     depositProfitsToFaction: (t.depositProfitsToFaction as boolean) ?? true,
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -862,12 +865,11 @@ export function findTradeOpportunities(
 }
 
 /** Find the cheapest known market sell price for an item (replacement/acquisition cost). */
-export function getItemMarketCost(itemId: string): number {
+export function getItemMarketCost(itemId: string, settings?: { useRemoteMarketQuery?: boolean }, currentSystemId?: string): number {
   const stop = perf.isEnabled() ? perf.startSpan("trader.getItemMarketCost") : null;
   let cheapest = Infinity;
   const systems = mapStore.getAllSystems();
   for (const sys of Object.values(systems)) {
-    // Skip pirate systems
     if (isPirateSystem(sys.id)) continue;
     for (const poi of sys.pois) {
       for (const m of poi.market) {
@@ -878,7 +880,23 @@ export function getItemMarketCost(itemId: string): number {
     }
   }
   stop?.end();
-  return cheapest === Infinity ? 0 : cheapest;
+  if (cheapest === Infinity) return 0;
+  return cheapest;
+}
+
+/** Try to get market cost from a remote client via the sync master.
+ *  Returns the cheapest remote sell price, or 0 if no remote data is available. */
+export async function getRemoteItemMarketCost(itemId: string, currentSystemId?: string): Promise<number> {
+  try {
+    const result = await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystemId });
+    if (result.ok && result.results.length > 0) {
+      const cheapest = result.results.reduce((min, r) => r.price < min ? r.price : min, Infinity);
+      return cheapest === Infinity ? 0 : cheapest;
+    }
+  } catch {
+    // Non-fatal: fall back to local data
+  }
+  return 0;
 }
 
 /**
@@ -2206,6 +2224,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
       const spreadCount = mapStore.findPriceSpreads().length;
       cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
+
+      // Remote market query: augment local data with fresh prices from other
+      // connected clients if enabled. Low-bandwidth (~200 bytes per query).
+      if (settings.useRemoteMarketQuery !== false) {
+        const uniqueItems = new Set<string>();
+        for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
+        if (uniqueItems.size > 0) {
+          const remoteCheapest = new Map<string, number>();
+          const remoteQueries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
+            const cost = await getRemoteItemMarketCost(itemId, bot.system);
+            if (cost > 0) remoteCheapest.set(itemId, cost);
+          });
+          await Promise.all(remoteQueries);
+          if (remoteCheapest.size > 0) {
+            ctx.log("trade", `[RemoteMarket] Augmented local data with ${remoteCheapest.size} remote item(s)`);
+          }
+        }
+      }
+
       marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
         settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined);
       unsoldRoutes = findUnsoldItemRoutes(ctx, settings, bot.system, cargoCapacity);
@@ -3648,6 +3685,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     const nextCargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - nextFuelWeight);
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
+
+    // Remote market query: augment local data before next route scan
+    if (settings.useRemoteMarketQuery !== false) {
+      const uniqueItems = new Set<string>();
+      for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
+      if (uniqueItems.size > 0) {
+        const remoteQueries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
+          await getRemoteItemMarketCost(itemId, bot.system);
+        });
+        await Promise.all(remoteQueries);
+      }
+    }
+
     const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 

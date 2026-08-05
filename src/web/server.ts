@@ -11,9 +11,9 @@ import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, setLoadoutForceFullDelivery, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
-import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
+import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse, type MarketQueryRequest, type MarketQueryResult, type MarketQueryResponse } from "../client_sync_master.js";
 import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
-import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
+import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn } from "../client_sync_hooks.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
 import { reconcileDeliveredWithDestination, getCargoMoverSettings } from "../routines/cargo_mover.js";
@@ -131,6 +131,102 @@ function loadSettings(): RoutineSettings {
 }
 
 export { loadSettings, saveSettings };
+
+// ── Market query handler ───────────────────────────────────
+// Called by the sync master (via peerRequest) when a trader on another client
+// wants to know the best deal for an item. Reads local marketDetails.json,
+// computes the best match, and returns a tiny response (~200 bytes) instead
+// of transferring the full file (5MB+).
+
+interface MarketDetailsData {
+  lastSaved: string;
+  items: Array<{
+    systemId: string;
+    stationPoiId: string;
+    stationName: string;
+    itemId: string;
+    itemName: string;
+    buyOrders: Array<{ price: number; quantity: number }>;
+    sellOrders: Array<{ price: number; quantity: number }>;
+    lastUpdated: string;
+  }>;
+}
+
+function loadMarketDetails(): MarketDetailsData {
+  const path = join(process.cwd(), "data", "marketDetails.json");
+  if (!existsSync(path)) return { lastSaved: "", items: [] };
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as MarketDetailsData;
+  } catch {
+    return { lastSaved: "", items: [] };
+  }
+}
+
+export async function handleMarketQueryHandler(query: MarketQueryRequest): Promise<MarketQueryResult> {
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy" } = query;
+  if (!itemId) {
+    return { ok: false, results: [], error: "itemId required" };
+  }
+
+  const data = loadMarketDetails();
+  const matches = data.items.filter((item) => {
+    if (item.itemId !== itemId) return false;
+    const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
+    if (!orders || orders.length === 0) return false;
+    if (typeof maxPrice === "number") {
+      const comparator = tradeType === "sell" ? (p: number) => p >= maxPrice : (p: number) => p <= maxPrice;
+      if (!orders.some((o) => comparator(o.price))) return false;
+    }
+    return true;
+  });
+
+  const results: MarketQueryResponse[] = [];
+  for (const item of matches) {
+    const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
+    let filtered = orders.filter((o) => o.quantity >= minQuantity);
+    if (typeof maxPrice === "number") {
+      const comparator = tradeType === "sell" ? (p: number) => p >= maxPrice : (p: number) => p <= maxPrice;
+      filtered = filtered.filter((o) => comparator(o.price));
+    }
+    if (filtered.length === 0) continue;
+    filtered.sort((a, b) => tradeType === "sell" ? b.price - a.price : a.price - b.price);
+    const best = filtered[0];
+    let distance: number | undefined;
+    if (typeof requesterSystemId === "string" && requesterSystemId !== item.systemId) {
+      distance = estimateSystemDistance(requesterSystemId, item.systemId);
+    }
+    results.push({
+      ok: true,
+      stationName: item.stationName,
+      systemId: item.systemId,
+      stationPoiId: item.stationPoiId,
+      price: best.price,
+      quantity: best.quantity,
+      distance,
+    });
+  }
+
+  results.sort((a, b) => tradeType === "sell" ? b.price - a.price : a.price - b.price);
+  return { ok: results.length > 0, results: results.slice(0, 10), error: results.length === 0 ? "No matching orders found" : undefined };
+}
+
+function estimateSystemDistance(fromSystem: string, toSystem: string): number {
+  try {
+    const systems = mapStore.getAllSystems();
+    const from = Object.values(systems).find((s) => s.id === fromSystem);
+    const to = Object.values(systems).find((s) => s.id === toSystem);
+    if (!from || !to) return 0;
+    const fromPos = from.position as Record<string, number> | undefined;
+    const toPos = to.position as Record<string, number> | undefined;
+    if (!fromPos || !toPos) return 0;
+    const dx = (fromPos.x || 0) - (toPos.x || 0);
+    const dy = (fromPos.y || 0) - (toPos.y || 0);
+    const dz = (fromPos.z || 0) - (toPos.z || 0);
+    return Math.max(1, Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) / 10));
+  } catch {
+    return 0;
+  }
+}
 
 // The WebServer keeps an in-memory copy of settings (`this.settings`) that most
 // save paths write back to disk wholesale via `saveSettings(this.settings)`.
@@ -1794,6 +1890,25 @@ if (!this.settings.fuel_service) {
           }
           if (url.pathname === "/api/client-sync/catalog-sync-state" && req.method === "GET") {
             return Response.json(this.syncMaster?.getCatalogSyncState() ?? {}, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-data-status" && req.method === "POST") {
+            const body = await req.json() as { clientId?: string; hasMarketData?: boolean };
+            const cid = body.clientId || req.headers.get("x-client-id") || "";
+            const ok = this.syncMaster?.setMarketDataAvailability(cid, !!body.hasMarketData);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-query" && req.method === "POST") {
+            if (!this.syncMaster || this.syncMaster.getMode() !== "master") {
+              return Response.json({ ok: false, error: "Not in master mode" }, { headers: cors });
+            }
+            const body = await req.json() as MarketQueryRequest;
+            const result = await this.syncMaster.handleMarketQuery(body);
+            return Response.json(result, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-query-handler" && req.method === "POST") {
+            const body = await req.json() as MarketQueryRequest;
+            const result = await handleMarketQueryHandler(body);
+            return Response.json(result, { headers: cors });
           }
           if (url.pathname.startsWith("/api/client-sync/clients/") && req.method === "DELETE") {
             const id = decodeURIComponent(url.pathname.slice("/api/client-sync/clients/".length));

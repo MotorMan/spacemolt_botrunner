@@ -51,6 +51,7 @@ import {
   getBattleStatus,
   fleeFromBattle,
 } from "./common.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -84,6 +85,7 @@ function getFactionTraderSettings(username?: string): {
   sellAllItems: boolean;
   creditsToHold: number;
   disableCreditDeposit: boolean;
+  useRemoteMarketQuery: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -137,6 +139,7 @@ function getFactionTraderSettings(username?: string): {
     sellAllItems: (t.sellAllItems as boolean) || false,
     creditsToHold: (t.creditsToHold as number) || 10000,
     disableCreditDeposit: (t.disableCreditDeposit as boolean) || false,
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -1227,6 +1230,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     
     await bot.refreshStatus();
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
+
+    // Remote market query: augment local buy demand with fresh prices
+    if (settings.useRemoteMarketQuery !== false) {
+      const allBuys = mapStore.getAllBuyDemand();
+      const uniqueItems = new Set(allBuys.map(b => b.itemId));
+      if (uniqueItems.size > 0) {
+        const queries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
+          await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
+        });
+        await Promise.all(queries);
+        ctx.log("trade", `[RemoteMarket] Faction trader: queried remote market for ${Math.min(uniqueItems.size, 20)} item(s)`);
+      }
+    }
+
     const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode);
 
     // Station priority: put routes whose destination is the home station first

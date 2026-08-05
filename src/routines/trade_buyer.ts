@@ -40,6 +40,7 @@ import {
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
@@ -61,6 +62,7 @@ function getTradeBuyerSettings(username?: string): {
   autoCloak: boolean;
   minQuantityToBuy: number;
   maxPrices: Record<string, number>;
+  useRemoteMarketQuery: boolean;
 } {
   const all = readSettings();
   // Read from trade_buyer settings (not trader)
@@ -78,6 +80,7 @@ function getTradeBuyerSettings(username?: string): {
     autoCloak: (t.autoCloak as boolean) ?? false,
     minQuantityToBuy: (t.minQuantityToBuy as number) || 10,
     maxPrices: (t.maxPrices as Record<string, number>) || {},
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -661,6 +664,15 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
     }
     const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
+
+    // Remote market query: augment local sell listings with fresh prices
+    if (settings.useRemoteMarketQuery !== false && settings.buyItems.length > 0) {
+      const queries = settings.buyItems.slice(0, 20).map(async (itemId) => {
+        await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: bot.system });
+      });
+      await Promise.all(queries);
+      ctx.log("trade", `[RemoteMarket] Trade buyer: queried remote market for ${Math.min(settings.buyItems.length, 20)} item(s)`);
+    }
 
     routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity);
 

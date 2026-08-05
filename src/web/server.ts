@@ -447,6 +447,13 @@ export function clearStoppedState(botUsername: string): void {
   }
 }
 
+/** Whether customs stopping and lockouts are globally disabled (Settings → General). */
+export function isCustomsDisabled(): boolean {
+  const settings = loadSettings();
+  const general = (settings.general as Record<string, unknown>) || {};
+  return general.disableCustoms === true;
+}
+
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
   const settings = loadSettings();

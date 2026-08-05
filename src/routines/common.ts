@@ -11,7 +11,7 @@ import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type I
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, isCustomsDisabled } from "../web/server.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
@@ -5033,6 +5033,13 @@ export async function checkCustomsInspection(
   chatMessages: string[];
 }> {
   const { bot } = ctx;
+
+  // If customs stopping/lockouts are globally disabled (Settings → General),
+  // skip the inspection entirely so bots never get stopped or locked out.
+  if (isCustomsDisabled()) {
+    ctx.log("customs", "Customs stopping disabled in settings - skipping inspection");
+    return { wasStopped: false, outcome: "none", chatMessages: [] };
+  }
 
   // Use targetSystem if provided, otherwise fall back to bot.system
   const systemToCheck = targetSystem || bot.system;

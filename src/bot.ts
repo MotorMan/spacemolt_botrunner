@@ -19,7 +19,7 @@ import { logSkills } from "./skillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
-import { loadSettings, saveStoppedState, saveLastUsedRoutine } from "./web/server.js";
+import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
@@ -3668,7 +3668,7 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
               senderLower.includes("customs ii -") ||
               senderLower.includes("customs iii -");
 
-            if (isFromCustoms) {
+            if (isFromCustoms && !isCustomsDisabled()) {
               // This is a customs message - process it
               const customsDetection = detectCustomsMessage(content);
               if (customsDetection.type !== "none") {

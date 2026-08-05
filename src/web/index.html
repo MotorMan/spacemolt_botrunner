@@ -12889,6 +12889,14 @@
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Disable Customs Stopping &amp; Lockouts</div>
+          <div class="setting-hint">Completely disable the customs inspection hold that stops bots and locks them out of travel in empire systems. Useful when the customs handling is misbehaving.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableCustoms" ${general.disableCustoms ? "checked" : ""} />
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Periodic Refresh Interval</div>
           <div class="setting-hint">How often to refresh ship/location data for bots that are running routines. Set to 0 to disable periodic refresh (bots still refresh when they start routines).</div>
         </div>
@@ -13025,6 +13033,9 @@
           ).checked,
           disableRateLimiting: document.getElementById(
             "set-general-disableRateLimiting",
+          ).checked,
+          disableCustoms: document.getElementById(
+            "set-general-disableCustoms",
           ).checked,
           periodicRefreshSec:
             parseInt(

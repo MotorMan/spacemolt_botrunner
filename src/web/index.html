@@ -16939,6 +16939,8 @@
         const sellAllItems = t.sellAllItems ?? false;
         const creditsToHold = t.creditsToHold ?? 10000;
         const disableCreditDeposit = t.disableCreditDeposit ?? false;
+        const autoCloak = t.autoCloak ?? true;
+        const ignorePiratesWhenCloaked = t.ignorePiratesWhenCloaked ?? true;
 
         // Category trade settings with defaults
         const categoryTrade = t.categoryTrade || [];
@@ -17114,6 +17116,28 @@
       <select id="set-faction_trader-disableCreditDeposit">
         <option value="false" ${!disableCreditDeposit ? "selected" : ""}>Disabled</option>
         <option value="true" ${disableCreditDeposit ? "selected" : ""}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Cloak</div>
+        <div class="setting-hint">When enabled (default), the bot activates its cloaking module while traveling and in transit so it cannot be ambushed. Disable to run uncloaked.</div>
+      </div>
+      <select id="set-faction_trader-autoCloak">
+        <option value="true" ${autoCloak ? "selected" : ""}>Enabled</option>
+        <option value="false" ${!autoCloak ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Pirates When Cloaked</div>
+        <div class="setting-hint">When enabled (default), a cloaked bot ignores nearby pirates (a cloaked ship cannot be ambushed). Only applies while cloaked.</div>
+      </div>
+      <select id="set-faction_trader-ignorePiratesWhenCloaked">
+        <option value="true" ${ignorePiratesWhenCloaked ? "selected" : ""}>Enabled</option>
+        <option value="false" ${!ignorePiratesWhenCloaked ? "selected" : ""}>Disabled</option>
       </select>
     </div>
 
@@ -17399,6 +17423,12 @@
             ) || 10000,
           disableCreditDeposit:
             document.getElementById("set-faction_trader-disableCreditDeposit")
+              .value === "true",
+          autoCloak:
+            document.getElementById("set-faction_trader-autoCloak")
+              .value === "true",
+          ignorePiratesWhenCloaked:
+            document.getElementById("set-faction_trader-ignorePiratesWhenCloaked")
               .value === "true",
           useRemoteMarketQuery:
             document.getElementById("set-faction_trader-useRemoteMarketQuery").value === "true",

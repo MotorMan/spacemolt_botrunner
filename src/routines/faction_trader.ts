@@ -86,6 +86,8 @@ function getFactionTraderSettings(username?: string): {
   creditsToHold: number;
   disableCreditDeposit: boolean;
   useRemoteMarketQuery: boolean;
+  autoCloak: boolean;
+  ignorePiratesWhenCloaked: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -140,6 +142,8 @@ function getFactionTraderSettings(username?: string): {
     creditsToHold: (t.creditsToHold as number) || 10000,
     disableCreditDeposit: (t.disableCreditDeposit as boolean) || false,
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
+    autoCloak: (t.autoCloak as boolean) ?? true,
+    ignorePiratesWhenCloaked: (t.ignorePiratesWhenCloaked as boolean) ?? true,
   };
 }
 
@@ -487,6 +491,62 @@ export function getHomeStationPoi(homeStation: string): string {
   return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
 }
 
+/**
+ * Detect whether the bot's ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * Once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("trade", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx);
+  if (!hasCloak) {
+    ctx.log("trade", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("trade", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("trade", "Cloaking enabled successfully");
+  return true;
+}
+
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number = 50): { jumps: number; cost: number } {
   const blacklist = getSystemBlacklist();
@@ -743,6 +803,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
   await bot.refreshStatus();
   const startSystem = bot.system;
 
+  // ── Cloaking setup (one-time at routine start) ──
+  // Only cloak now if already undocked. If docked, the bot must stay docked for
+  // the docked-only phases; navigateToSystem() will cloak it before travel.
+  const startSettings = getFactionTraderSettings(bot.username);
+  if (startSettings.autoCloak && !bot.docked) {
+    await enableCloakingIfPossible(ctx);
+  }
+
   // Persistent battle state across cycles
   const battleState: BattleState = {
     inBattle: false,
@@ -855,9 +923,24 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     const settings = getFactionTraderSettings(bot.username);
+
+    // ── Cloak status check (every cycle when autoCloak enabled) ──
+    // Re-verify cloaking status and re-enable if needed — but ONLY while undocked.
+    // Cloaking undocks the ship, so re-enabling while docked would break the
+    // docked-only operations below (storage, market, etc.) because ensureDocked()
+    // short-circuits on a stale docked flag. navigateToSystem() re-cloaks before
+    // each jump, so do NOT cloak here when already docked.
+    if (settings.autoCloak && !bot.isCloaked && !bot.docked && bot.fuel > 0) {
+      ctx.log("trade", "Cloak status check: bot undocked and not cloaked — re-enabling cloak");
+      await enableCloakingIfPossible(ctx);
+    }
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+      ignoreBlacklistWhenCloaked: settings.autoCloak,
     };
     let recoveredSessionHandled = false;
     let route: FactionSellRoute | null = null;
@@ -1214,6 +1297,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               await navigateToSystem(ctx, homeSystem, {
                 fuelThresholdPct: settings.refuelThreshold,
                 hullThresholdPct: settings.repairThreshold,
+                autoCloak: settings.autoCloak,
+                ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+                ignoreBlacklistWhenCloaked: settings.autoCloak,
               });
             }
           }
@@ -1381,6 +1467,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               await navigateToSystem(ctx, homeSystem, {
                 fuelThresholdPct: settings.refuelThreshold,
                 hullThresholdPct: settings.repairThreshold,
+                autoCloak: settings.autoCloak,
+                ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+                ignoreBlacklistWhenCloaked: settings.autoCloak,
               });
             }
           }

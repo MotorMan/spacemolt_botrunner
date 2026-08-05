@@ -51,6 +51,7 @@ import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
 import { ClientSyncLightSlave } from "./client_sync_light_slave.js";
 import { ClientSyncMarketSlave } from "./client_sync_market_slave.js";
+import { setMarketQueryFn } from "./client_sync_hooks.js";
 import { snapshotAndReset, setActivePlayers } from "./sendMetrics.js";
 import { perf, snapshotAndReset as perfSnapshotAndReset, setActivePlayers as perfSetActivePlayers } from "./perf.js";
 import { ensureInsured } from "./routines/common.js";
@@ -1264,6 +1265,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
         const newLight = new ClientSyncLightSlave(newSettings);
         newLight.start();
         (globalThis as any).syncLight = newLight;
+        setMarketQueryFn((query) => newLight.queryRemoteMarket(query));
         server.logSystem(`Client sync light started`);
       }
     } else {
@@ -1284,6 +1286,7 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
         const newMarket = new ClientSyncMarketSlave(newSettings);
         newMarket.start();
         (globalThis as any).syncMarket = newMarket;
+        setMarketQueryFn((query) => newMarket.queryRemoteMarket(query));
         server.logSystem(`Client sync market started`);
       }
     } else {
@@ -2432,12 +2435,14 @@ async function main(): Promise<void> {
       const syncLight = new ClientSyncLightSlave(clientSyncSettings);
       syncLight.start();
       (globalThis as any).syncLight = syncLight;
+      setMarketQueryFn((query) => syncLight.queryRemoteMarket(query));
       server.logSystem(`Client sync light enabled, connecting to ${clientSyncSettings.masterUrl}`);
     }
     if (clientSyncSettings.enabled && clientSyncSettings.mode === "market" && clientSyncSettings.masterUrl) {
       const syncMarket = new ClientSyncMarketSlave(clientSyncSettings);
       syncMarket.start();
       (globalThis as any).syncMarket = syncMarket;
+      setMarketQueryFn((query) => syncMarket.queryRemoteMarket(query));
       server.logSystem(`Client sync market enabled, connecting to ${clientSyncSettings.masterUrl}`);
     }
   }

@@ -1,4 +1,4 @@
-import { type SyncSettings } from "./client_sync_types.js";
+import { type SyncSettings, type MarketQueryRequest, type MarketQueryResult } from "./client_sync_types.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 
 /**
@@ -47,6 +47,10 @@ export class ClientSyncLightSlave {
   /** Last time we ran the catalog-sync step (throttled to avoid spamming the
    *  master with version reports every poll cycle). */
   private lastCatalogSync = 0;
+  /** Whether this node can serve market data queries. Light clients always keep
+   *  a local marketDetails.json for the shared game universe, so they can answer
+   *  remote market queries even though they don't do file-level market sync. */
+  private hasMarketData = true;
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -79,8 +83,37 @@ export class ClientSyncLightSlave {
     return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError, connectionState: this.connectionState, lastConnectAttempt: this.lastConnectAttempt };
   }
 
+  /** Whether this node currently can serve market data queries. */
+  public getHasMarketData(): boolean {
+    return this.hasMarketData;
+  }
+
+  /** Manually set the market data flag (kept for parity with the market slave). */
+  public setHasMarketData(value: boolean): void {
+    this.hasMarketData = value;
+  }
+
   public updateSettings(s: SyncSettings): void {
     this.settings = s;
+  }
+
+  /**
+   * Send a market data query to the master, which routes it to the client that
+   * has the freshest market data (advertised via syncMarketAvailability). This
+   * lets light clients answer low-bandwidth market queries without the heavy
+   * file sync — same contract as ClientSyncMarketSlave.queryRemoteMarket.
+   */
+  public async queryRemoteMarket(query: MarketQueryRequest): Promise<MarketQueryResult> {
+    if (!this.clientId) {
+      return { ok: false, results: [], error: "Not connected to master" };
+    }
+    try {
+      const result = await this.request<MarketQueryResult>("/api/client-sync/market-query", { method: "POST" }, query);
+      return result;
+    } catch (err) {
+      this.logError(`Market query failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, results: [], error: err instanceof Error ? err.message : String(err) };
+    }
   }
 
   private log(msg: string): void {
@@ -428,6 +461,10 @@ export class ClientSyncLightSlave {
       // rest of us — so we don't all hammer the (rate-limited) endpoint and end
       // up on stale versions.
       await this.syncCatalog();
+      // Advertise that we can serve market data queries. Light clients always
+      // keep a local marketDetails.json, so the master knows it can route
+      // market queries to us (low-bandwidth, no file sync required).
+      await this.syncMarketAvailability();
       this.lastSync = Date.now();
       this.lastError = null;
     } catch (err) {
@@ -438,6 +475,25 @@ export class ClientSyncLightSlave {
       // pushing. Only registration failure / rejected push drops the id.
       if (!this.clientId) this.connectionState = 'disconnected';
       this.logError(`Sync failed: ${this.lastError}`);
+    }
+  }
+
+  /**
+   * Tell the master whether we currently have market data to share. Light
+   * clients always keep a local marketDetails.json for the shared game
+   * universe, so we advertise `hasMarketData` unconditionally — this is what
+   * lets the master route low-bandwidth market queries to us.
+   */
+  private async syncMarketAvailability(): Promise<void> {
+    if (!this.clientId) return;
+    try {
+      await this.request("/api/client-sync/market-data-status", { method: "POST" }, {
+        clientId: this.clientId,
+        hasMarketData: this.hasMarketData,
+      });
+    } catch {
+      // Non-fatal: master will simply stop routing market queries to us until
+      // the next successful cycle.
     }
   }
 }

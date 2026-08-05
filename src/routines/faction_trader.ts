@@ -545,6 +545,7 @@ function findFactionSellRoutes(
   currentSystem: string,
   cargoCapacity: number,
   personalMode: boolean = false,
+  extraBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [],
 ): FactionSellRoute[] {
   const { bot } = ctx;
   const routes: FactionSellRoute[] = [];
@@ -553,8 +554,11 @@ function findFactionSellRoutes(
   const storage = personalMode ? bot.storage : bot.factionStorage;
   if (storage.length === 0) return routes;
 
-  const allBuys = mapStore.getAllBuyDemand();
-  if (allBuys.length === 0) return routes;
+  let allBuys = mapStore.getAllBuyDemand();
+  if (allBuys.length === 0 && extraBuyDemand.length === 0) return routes;
+  if (extraBuyDemand.length > 0) {
+    allBuys = [...allBuys, ...extraBuyDemand];
+  }
 
   const homeSystem = settings.homeSystem || currentSystem;
   const costPerJump = settings.fuelCostPerJump;
@@ -1231,20 +1235,41 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await bot.refreshStatus();
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
 
-    // Remote market query: augment local buy demand with fresh prices
+    // Remote market query: augment local buy demand with fresh prices from
+    // other connected clients. Each remote buy order becomes an extra buyer.
+    let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
     if (settings.useRemoteMarketQuery !== false) {
-      const allBuys = mapStore.getAllBuyDemand();
-      const uniqueItems = new Set(allBuys.map(b => b.itemId));
-      if (uniqueItems.size > 0) {
-        const queries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
-          await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
-        });
-        await Promise.all(queries);
-        ctx.log("trade", `[RemoteMarket] Faction trader: queried remote market for ${Math.min(uniqueItems.size, 20)} item(s)`);
+      const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
+      const uniqueItems = Array.from(new Set(storageItems)).slice(0, 20);
+      if (uniqueItems.length > 0) {
+        const results = await Promise.all(uniqueItems.map(async (itemId) => {
+          try {
+            const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
+            if (!res.ok || res.results.length === 0) return null;
+            const r = res.results[0];
+            return {
+              itemId,
+              itemName: itemId,
+              systemId: r.systemId,
+              poiId: r.stationPoiId,
+              poiName: r.stationName,
+              price: r.price,
+              quantity: r.quantity,
+            };
+          } catch {
+            return null;
+          }
+        }));
+        remoteBuyDemand = results.filter(Boolean) as typeof remoteBuyDemand;
+        if (remoteBuyDemand.length > 0) {
+          ctx.log("trade", `[RemoteMarket] Faction trader: found ${remoteBuyDemand.length} remote buyer(s) from connected clients`);
+        } else {
+          ctx.log("trade", `[RemoteMarket] Faction trader: no remote buyers for ${uniqueItems.length} item(s)`);
+        }
       }
     }
 
-    const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode);
+    const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode, remoteBuyDemand);
 
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group

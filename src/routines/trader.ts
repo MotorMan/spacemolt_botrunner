@@ -743,6 +743,97 @@ export interface TradeRoute {
 
 // ── Trade route discovery ────────────────────────────────────
 
+/** The shape of a price spread used by findTradeOpportunities. */
+type PriceSpread = {
+  itemId: string; itemName: string;
+  sourceSystem: string; sourcePoi: string; sourcePoiName: string; buyAt: number; buyQty: number;
+  destSystem: string; destPoi: string; destPoiName: string; sellAt: number; sellQty: number;
+  spread: number;
+};
+
+/**
+ * Query every other connected client (via the sync master) for the cheapest
+ * place to BUY each item in `items`, and return them as synthetic price spreads
+ * that can be merged into the local mapStore spreads. For each remote sell
+ * station we pair it with the best LOCAL buy listing (so the route stays
+ * "current location → remote buy → local sell", keeping travel sane).
+ *
+ * Returns [] when remote queries are disabled, fail, or find nothing, so callers
+ * can safely append the result to their local spreads.
+ */
+async function collectRemoteSpreads(
+  items: string[],
+  currentSystem: string,
+  debugLog?: (msg: string) => void,
+): Promise<PriceSpread[]> {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.collectRemoteSpreads") : null;
+  const out: PriceSpread[] = [];
+  if (items.length === 0) { stop?.end(); return out; }
+
+  const results = await Promise.all(items.map(async (itemId) => {
+    try {
+      const res = await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystem });
+      if (!res.ok || res.results.length === 0) return null;
+      // Reconstruct a lean spread object from the remote response
+      const r = res.results[0];
+      return {
+        itemId,
+        itemName: itemId,
+        remoteSystem: r.systemId,
+        remotePoi: r.stationPoiId,
+        remotePoiName: r.stationName,
+        remotePrice: r.price,
+        remoteQty: r.quantity,
+      };
+    } catch {
+      return null;
+    }
+  }));
+
+  const hits = results.filter(Boolean) as Array<{
+    itemId: string; itemName: string;
+    remoteSystem: string; remotePoi: string; remotePoiName: string;
+    remotePrice: number; remoteQty: number;
+  }>;
+
+  if (hits.length === 0) { stop?.end(); return out; }
+
+  // Pair each remote buy source with the best local sell listing for the item.
+  const localBuys = mapStore.getAllBuyDemand();
+  for (const hit of hits) {
+    // Only use remote deals whose source station is actually reachable in our
+    // local map — otherwise estimateFuelCost() returns 999-jump penalties and
+    // the route is unexecutable.
+    const srcSys = mapStore.getSystem(hit.remoteSystem);
+    if (!srcSys || !srcSys.pois.find(p => p.id === hit.remotePoi)) continue;
+    if (!mapStore.findRoute(currentSystem, hit.remoteSystem, getSystemBlacklist())) continue;
+
+    const dests = localBuys
+      .filter(b => b.itemId === hit.itemId && b.price > hit.remotePrice && b.quantity > 0)
+      .sort((a, b) => b.price - a.price);
+    if (dests.length === 0) continue;
+    const dest = dests[0];
+    out.push({
+      itemId: hit.itemId,
+      itemName: hit.itemName,
+      sourceSystem: hit.remoteSystem,
+      sourcePoi: hit.remotePoi,
+      sourcePoiName: hit.remotePoiName,
+      buyAt: hit.remotePrice,
+      buyQty: hit.remoteQty,
+      destSystem: dest.systemId,
+      destPoi: dest.poiId,
+      destPoiName: dest.poiName,
+      sellAt: dest.price,
+      sellQty: dest.quantity,
+      spread: dest.price - hit.remotePrice,
+    });
+  }
+  debugLog?.(`collectRemoteSpreads: ${out.length} remote-augmented route(s) from ${hits.length} client(s)`);
+  stop?.end();
+  return out;
+}
+
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
   const blacklist = getSystemBlacklist();
@@ -761,6 +852,7 @@ export function findTradeOpportunities(
   cargoCapacity: number = 999,
   marketInsights: Array<Record<string, unknown>> = [],
   debugLog?: (msg: string) => void,
+  remoteSpreads: PriceSpread[] = [],
 ): TradeRoute[] {
   const stop = perf.isEnabled() ? perf.startSpan("trader.findTradeOpportunities") : null;
   // Extract oversupply items to filter out bad sell destinations
@@ -774,7 +866,10 @@ export function findTradeOpportunities(
       oversupplyItems.add(insight.item_id);
     }
   }
-  const spreads = mapStore.findPriceSpreads();
+  const spreads = [...mapStore.findPriceSpreads(), ...remoteSpreads];
+  if (remoteSpreads.length > 0) {
+    debugLog?.(`findTradeOpportunities: merged ${remoteSpreads.length} remote spread(s) into ${spreads.length} total`);
+  }
   const routes: TradeRoute[] = [];
 
   // Process market insights first (higher priority)
@@ -2238,24 +2333,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Remote market query: augment local data with fresh prices from other
       // connected clients if enabled. Low-bandwidth (~200 bytes per query).
+      let remoteSpreads: PriceSpread[] = [];
       if (settings.useRemoteMarketQuery !== false) {
         const uniqueItems = new Set<string>();
         for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
         if (uniqueItems.size > 0) {
-          const remoteCheapest = new Map<string, number>();
-          const remoteQueries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
-            const cost = await getRemoteItemMarketCost(itemId, bot.system);
-            if (cost > 0) remoteCheapest.set(itemId, cost);
-          });
-          await Promise.all(remoteQueries);
-          if (remoteCheapest.size > 0) {
-            ctx.log("trade", `[RemoteMarket] Augmented local data with ${remoteCheapest.size} remote item(s)`);
+          remoteSpreads = await collectRemoteSpreads(
+            Array.from(uniqueItems).slice(0, 20),
+            bot.system,
+            settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+          );
+          if (remoteSpreads.length === 0) {
+            ctx.log("trade", `[RemoteMarket] No remote deals found for ${Math.min(uniqueItems.size, 20)} item(s)`);
           }
         }
       }
 
       marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
-        settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined);
+        settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+        remoteSpreads);
       unsoldRoutes = findUnsoldItemRoutes(ctx, settings, bot.system, cargoCapacity);
       ctx.log("trade", `findCargoSellRoutes found ${cargoRoutes.length} routes`);
       ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${spreadCount} spreads`);
@@ -3672,18 +3768,23 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
 
     // Remote market query: augment local data before next route scan
+    let nextRemoteSpreads: PriceSpread[] = [];
     if (settings.useRemoteMarketQuery !== false) {
       const uniqueItems = new Set<string>();
       for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
       if (uniqueItems.size > 0) {
-        const remoteQueries = Array.from(uniqueItems).slice(0, 20).map(async (itemId) => {
-          await getRemoteItemMarketCost(itemId, bot.system);
-        });
-        await Promise.all(remoteQueries);
+        nextRemoteSpreads = await collectRemoteSpreads(
+          Array.from(uniqueItems).slice(0, 20),
+          bot.system,
+          settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+        );
+        if (nextRemoteSpreads.length === 0) {
+          ctx.log("trade", `[RemoteMarket] No remote deals found for next-scan ${Math.min(uniqueItems.size, 20)} item(s)`);
+        }
       }
     }
 
-    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights);
+    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights, undefined, nextRemoteSpreads);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     // ── Deposit excess credits to faction storage ──

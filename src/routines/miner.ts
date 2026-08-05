@@ -1435,8 +1435,10 @@ export function pickTargetFromQuotas(
   factionStorage: Array<{ itemId: string; quantity: number }>,
   miningType: "ore" | "gas" | "ice" | "radioactive",
   mapStore: any,
-  totalMiningPower: number = 0
+  totalMiningPower: number = 0,
+  jettisonOres: string[] = [],
 ): string {
+  const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
@@ -1444,7 +1446,7 @@ export function pickTargetFromQuotas(
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
-      // Check if this ore has viable locations (not filtered out by power constraints)
+      if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
         if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
@@ -1456,13 +1458,15 @@ export function pickTargetFromQuotas(
     }
   }
 
-  // CRITICAL FIX: Also include ores with no deficit for cycling when all quotas are met
+  // CRITICAL FIX: Only include over-quota ores for cycling if they are NOT over the quota limit
+  // and NOT on the jettison list. Mining an ore that's already over quota is pure waste.
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
-      // Check if this ore has viable locations (not filtered out by power constraints)
+      if (current > target) continue;
+      if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
         if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
@@ -1511,6 +1515,7 @@ export function findFirstAvailableQuotaTarget(
     const targets = Array.isArray(excludeTargets) ? excludeTargets : [excludeTargets];
     targets.forEach(t => excludeSet.add(t));
   }
+  const jettisonSet = new Set((settings.jettisonOres || []).map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
@@ -1519,17 +1524,21 @@ export function findFirstAvailableQuotaTarget(
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
+      if (jettisonSet.has(resourceId.toLowerCase())) continue;
       entries.push({ resourceId, deficit, current, target });
     }
   }
 
   // Also include ores with no deficit but still in quotas (for cycling when all quotas are met)
+  // But ONLY if they are NOT over quota and NOT on the jettison list
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     if (excludeSet.has(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
+      if (current > target) continue;
+      if (jettisonSet.has(resourceId.toLowerCase())) continue;
       entries.push({ resourceId, deficit, current, target });
     }
   }
@@ -1611,40 +1620,40 @@ function pickTargetFromQuotasOrClosest(
   totalMiningPower: number = 0,
   settings?: Awaited<ReturnType<typeof getMinerSettings>>,
   botUsername?: string,
+  jettisonOres: string[] = [],
 ): { target: string; hasDeficit: boolean } {
+  const jettisonSet = new Set(jettisonOres.map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number; hasViableLocations: boolean }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
-    
-    // Check if this ore has viable locations using the same filters as the main location search
-    // This prevents picking targets that will fail when actually searching for POIs
+
+    if (jettisonSet.has(resourceId.toLowerCase())) continue;
+    if (current > target) continue;
+
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
     const hasViableLocations = rawLocations.some((loc: any) => {
-      // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
       const hasScanData = loc.minutesSinceScan !== Infinity;
       const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
       if (isLowRemainingWithUnknownPower) {
         return false;
       }
-      
-      // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+
       if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
         return false;
       }
-      
-      // Coordination: reject systems that are already at max bot capacity
+
       if (settings && settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
         if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
           return false;
         }
       }
-      
+
       return true;
     });
-    
+
     entries.push({ resourceId, deficit, current, target, hasViableLocations });
   }
 
@@ -2849,7 +2858,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
        if (bot.docked && bot.system === homeSystem) {
-          const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username);
+           const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, settings.jettisonOres);
          quotaTargetResource = quotaResult.target;
          quotaHasDeficit = quotaResult.hasDeficit;
          if (quotaResult.target) {
@@ -2865,7 +2874,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
          }
 } else {
           // Original behavior when not at home
-          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower);
+          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings.jettisonOres);
           if (quotaTargetResource) {
             ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           } else {
@@ -6779,7 +6788,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
            if (!newTarget) {
              ctx.log("mining", `Global target not available — checking quotas...`);
              await bot.refreshFactionStorage();
-             const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower);
+              const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings.jettisonOres);
 
             if (newQuotaTarget) {
               // Find locations for the new quota target

@@ -505,6 +505,7 @@ function getTraderSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
+  homeStation: string;
   tradeItems: string[];
   autoInsure: boolean;
   stationPriority: boolean;
@@ -529,6 +530,7 @@ function getTraderSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
     tradeItems: Array.isArray(t.tradeItems) ? (t.tradeItems as string[]) : [],
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
@@ -546,6 +548,15 @@ function getTraderSettings(username?: string): {
 }
 
 // ── Trade Session Recovery ──────────────────────────────────
+
+/**
+ * Normalize a configured home station value to a bare POI id.
+ * Settings may store it as "system|poi" (e.g. "sol|sol_central") or just "poi".
+ */
+function getHomeStationPoi(homeStation: string): string {
+  if (!homeStation) return "";
+  return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+}
 
 /**
  * Check for and recover an incomplete trade session.
@@ -3515,30 +3526,45 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // If still unsold, deposit at faction storage
+    // If still unsold, deposit at the bot's configured home base
     if (remaining > 0) {
       yield "store_unsold";
-      
-      // Check if we've recovered our investment
+
+      // Whether we recovered our investment only affects logging — the storage
+      // destination is always the configured home base, never a hardcoded system.
       const totalRevenue = sellRevenue + extraRevenue;
-      const isProfitable = totalRevenue >= investedCredits;
-      if (!isProfitable && investedCredits > 0 && homeSystem) {
-        // Unprofitable trade — return home and deposit to faction storage
-        ctx.log("trade", `${remaining}x ${route.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${homeSystem} to deposit`);
-        
-        // Navigate to home system
-        if (bot.system !== homeSystem) {
-          await ensureUndocked(ctx);
-          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
-          if (fueled) {
-            await navigateToSystem(ctx, homeSystem, { ...safetyOpts, noJettison: true });
-          }
+      const unprofitable = totalRevenue < investedCredits && investedCredits > 0;
+      const depositSystem = homeSystem || bot.system;
+      const configuredHomePoi = getHomeStationPoi(settings.homeStation);
+
+      if (unprofitable) {
+        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${depositSystem} to deposit`);
+      } else {
+        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — storing at home base (${depositSystem})`);
+      }
+
+      // Navigate to the home system
+      if (bot.system !== depositSystem) {
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+        if (fueled) {
+          await navigateToSystem(ctx, depositSystem, { ...safetyOpts, noJettison: true });
         }
-        
-        // Find station at home
+      }
+
+      if (bot.system !== depositSystem) {
+        // Never made it home — keep the cargo instead of dumping it in a random system
+        ctx.log("trade", `Could not reach home system ${depositSystem} — keeping ${remaining}x ${route!.itemName} in cargo for next cycle`);
+      } else {
+        // Prefer the explicitly configured home station, else any station in the home system
         const { pois: homePois } = await getSystemInfo(ctx);
-        const homeStation = findStation(homePois);
-        if (homeStation) {
+        const homeStation =
+          (configuredHomePoi ? homePois.find(p => p.id === configuredHomePoi) : undefined) || findStation(homePois);
+
+        if (!homeStation) {
+          ctx.log("trade", `No station found in home system ${depositSystem} — keeping ${remaining}x ${route!.itemName} in cargo`);
+        } else {
+          let atHomeStation = true;
           if (bot.poi !== homeStation.id) {
             await ensureUndocked(ctx);
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
@@ -3547,90 +3573,49 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               await ctx.sleep(2000);
               continue;
             }
-            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
               const errMsg = travelResp.error.message.toLowerCase();
+              // CRITICAL: Check for battle interrupt error
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
                 await ctx.sleep(5000);
                 continue;
               }
-            }
-            bot.poi = homeStation.id;
-          }
-          await ensureDocked(ctx);
-
-          // Deposit unsold items
-          await bot.refreshCargo();
-          remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          if (remaining > 0) {
-            await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
-            ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
-            logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
-            addUnsoldItem({
-              itemId: route!.itemId,
-              itemName: route!.itemName,
-              boughtPrice: route!.buyPrice,
-              quantity: remaining,
-              storageSystem: homeSystem,
-              storagePoi: homeStation.id,
-              depositedAt: new Date().toISOString(),
-              botUsername: bot.username,
-            });
-          }
-        }
-      } else {
-        // Profitable or break-even — deposit at Sol Central as before
-        const SOL_CENTRAL = "sol_central";
-        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — storing at Sol Central`);
-
-        // Navigate to Sol Central if needed
-        const solSystem = "sol";
-        if (bot.system !== solSystem) {
-          await ensureUndocked(ctx);
-          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
-          if (fueled) {
-            await navigateToSystem(ctx, solSystem, { ...safetyOpts, noJettison: true });
-          }
-        }
-
-        if (bot.poi !== SOL_CENTRAL) {
-          await ensureUndocked(ctx);
-          const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
-          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-            ctx.log("combat", "Battle detected during travel — fleeing!");
-            await ctx.sleep(2000);
-            continue;
-          }
-          // CRITICAL: Check for battle interrupt error
-          if (travelResp.error) {
-            const errMsg = travelResp.error.message.toLowerCase();
-            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await ctx.sleep(5000);
-              continue;
+              // Any other travel failure: don't fake our position, just keep the cargo
+              ctx.log("trade", `Travel to ${homeStation.name} failed (${travelResp.error.message}) — keeping ${remaining}x ${route!.itemName} in cargo`);
+              atHomeStation = false;
+            } else {
+              bot.poi = homeStation.id;
             }
           }
-          bot.poi = SOL_CENTRAL;
-        }
 
-        await ensureDocked(ctx);
-        await bot.refreshCargo();
-        remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-        if (remaining > 0) {
-          await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
-          ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to Sol Central storage`);
-          addUnsoldItem({
-            itemId: route!.itemId,
-            itemName: route!.itemName,
-            boughtPrice: route!.buyPrice,
-            quantity: remaining,
-            storageSystem: solSystem,
-            storagePoi: SOL_CENTRAL,
-            depositedAt: new Date().toISOString(),
-            botUsername: bot.username,
-          });
+          if (atHomeStation) {
+            await ensureDocked(ctx);
+            await bot.refreshCargo();
+            remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+            if (remaining > 0) {
+              const depResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
+              if (depResp.error) {
+                ctx.log("trade", `Failed to deposit ${remaining}x ${route!.itemName} at ${homeStation.name}: ${depResp.error.message}`);
+              } else {
+                ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name}${unprofitable ? " (will sell when prices improve)" : ""}`);
+                if (unprofitable) {
+                  logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
+                }
+                addUnsoldItem({
+                  itemId: route!.itemId,
+                  itemName: route!.itemName,
+                  boughtPrice: route!.buyPrice,
+                  quantity: remaining,
+                  storageSystem: depositSystem,
+                  storagePoi: homeStation.id,
+                  depositedAt: new Date().toISOString(),
+                  botUsername: bot.username,
+                });
+              }
+            }
+          }
         }
       }
     }

@@ -11,7 +11,7 @@ import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type I
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist, isCustomsDisabled } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist, isCustomsDisabled } from "../web/server.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
@@ -39,6 +39,16 @@ export function markStationDenied(stationId: string): void {
 /** True if a station previously denied us docking access. */
 export function isStationDenied(stationId: string): boolean {
   return stationId ? deniedStations.has(stationId.toLowerCase()) : false;
+}
+
+/** Combine the runtime-denied station set with the configured station blacklist
+ *  (Settings → General → stationBlacklist). Returns a lowercased set of POI ids
+ *  (and "system|poiId" keys) that must never be treated as a usable station. */
+export function buildDeniedStationSet(extra?: Set<string>): Set<string> {
+  const denied = new Set<string>(deniedStations);
+  for (const s of getStationBlacklist()) denied.add(s.toLowerCase());
+  if (extra) for (const s of extra) denied.add(s.toLowerCase());
+  return denied;
 }
 
 /** Build the approved-fuel-station lookup set from settings (matches isApprovedFuelStation). */
@@ -268,14 +278,19 @@ export function stationHasMarket(poi: SystemPOI | undefined): boolean {
   return s?.market === true;
 }
 
-/** Find the first station POI in a list. Optionally filter by required service. */
+/** Find the first station POI in a list. Optionally filter by required service.
+ *  Skips POIs on the manual station blacklist (Settings → General → stationBlacklist),
+ *  since faction-owned deployable outposts cannot be distinguished from stations
+ *  automatically and must be excluded manually. */
 export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices, excludePirates: boolean = true): SystemPOI | null {
+  const blacklist = new Set(getStationBlacklist().map(s => s.toLowerCase()));
+  const isBlacklisted = (p: SystemPOI) => blacklist.size > 0 && blacklist.has(p.id.toLowerCase());
   if (requiredService) {
     // Prefer station with the required service
-    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
+    const withService = pois.find(p => isStationPoi(p) && !isBlacklisted(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
     if (withService) return withService;
   }
-  return pois.find(p => isStationPoi(p) && !(excludePirates && isPirateSystem(p.id))) || null;
+  return pois.find(p => isStationPoi(p) && !isBlacklisted(p) && !(excludePirates && isPirateSystem(p.id))) || null;
 }
 
 /** Check if a station POI is known to lack a specific service. */
@@ -592,9 +607,11 @@ export async function ensureDocked(
   }
 
   const { pois } = await getSystemInfo(ctx);
-  const station = findStation(pois, undefined, true) && !isStationDenied(findStation(pois, undefined, true)?.id ?? "")
-    ? findStation(pois, undefined, true)
-    : pois.find(p => isStationPoi(p) && !isStationDenied(p.id)) ?? null;
+  const stationBlacklist = buildDeniedStationSet();
+  const candidate = findStation(pois, undefined, true);
+  const station = candidate && !isStationDenied(candidate.id) && !stationBlacklist.has(candidate.id.toLowerCase())
+    ? candidate
+    : pois.find(p => isStationPoi(p) && !isStationDenied(p.id) && !stationBlacklist.has(p.id.toLowerCase())) ?? null;
 
   if (station) {
     if (bot.poi !== station.id) {
@@ -641,7 +658,7 @@ export async function ensureDocked(
   ctx.log("system", "No usable station in current system — searching for nearest station...");
   const blacklist = getSystemBlacklist();
   const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedStations);
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, buildDeniedStationSet());
   if (!nearest) {
     ctx.log("error", "No known approved station in mapped systems — cannot dock");
     return false;
@@ -1880,7 +1897,7 @@ if (looted > 0) {
   const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
   const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
 
-  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedStations);
+  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, buildDeniedStationSet());
   if (!nearest) {
     ctx.log("error", "No approved refuel station reachable");
     return false;

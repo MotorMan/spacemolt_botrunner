@@ -8,7 +8,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { clearFactionStorageCache } from "../factionStorageCache.js";
 import {
   ensureDocked,
@@ -218,10 +218,12 @@ export function isValidDestination(ctx: RoutineContext, systemId: string, poiId:
     ctx.log("error", `Destination POI ${poiId} not found in system ${systemId}`);
     return false;
   }
-  // Outposts cannot host a trade market — any buy demand attributed to one is
-  // bogus and would send the bot flying there only for the "buyer" to vanish.
-  if ((poi.type || "").toLowerCase() === "outpost") {
-    ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is an outpost — outposts have no market, rejecting as buyer`);
+  // Faction-owned deployable outposts cannot host a trade market and can never
+  // be docked by outsiders, so a buy demand attributed to one is bogus. They
+  // cannot be told apart from stations automatically (they are not typed
+  // "outpost"), so they must be listed in the station blacklist instead.
+  if (getStationBlacklist().some(b => b.toLowerCase() === poiId.toLowerCase() || b.toLowerCase() === `${systemId}|${poiId}`.toLowerCase())) {
+    ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is a blacklisted station/outpost — rejecting as buyer`);
     return false;
   }
   // Check for either has_base OR base_id (some stations have base_id but not has_base)

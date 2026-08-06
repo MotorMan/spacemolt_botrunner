@@ -314,8 +314,8 @@ function getHomeStation(homeSystem: string): { id: string; name: string } | null
     return { id: station.id, name: station.name };
   }
 
-  // Fallback to any station
-  const anyStation = system.pois.find(p => p.type === "station" || p.has_base);
+  // Fallback to any station (outposts excluded — never dockable by non-faction members)
+  const anyStation = findStation(compatiblePois, undefined, false);
   if (anyStation) {
     return { id: anyStation.id, name: anyStation.name };
   }

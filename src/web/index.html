@@ -17552,6 +17552,7 @@
         const refuelThreshold = t.refuelThreshold ?? 50;
         const repairThreshold = t.repairThreshold ?? 40;
         const minQuantityToBuy = t.minQuantityToBuy ?? 10;
+        const maxMarketAgeHours = t.maxMarketAgeHours ?? 24;
         const autoInsure = t.autoInsure !== false;
         const autoCloak = t.autoCloak ?? false;
         const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
@@ -17745,6 +17746,14 @@
         <option value="true" ${t.useRemoteMarketQuery !== false ? "selected" : ""}>Enabled</option>
         <option value="false" ${t.useRemoteMarketQuery === false ? "selected" : ""}>Disabled</option>
       </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Market Data Age (hours)</div>
+        <div class="setting-hint">Ignore sell listings that haven't been confirmed by the market routine (or an explorer) within this many hours. Old listings are usually gone, and chasing one costs a full round trip. Set 0 to accept data of any age. Default: 24.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-maxMarketAgeHours" min="0" max="8760" value="${maxMarketAgeHours}">
     </div>
 
     <div class="settings-save-bar">
@@ -17942,6 +17951,12 @@
           maxPrices: maxPrices,
           useRemoteMarketQuery:
             document.getElementById("set-trade_buyer-useRemoteMarketQuery").value === "true",
+          maxMarketAgeHours: (() => {
+            const raw = parseInt(
+              document.getElementById("set-trade_buyer-maxMarketAgeHours").value,
+            );
+            return Number.isFinite(raw) && raw >= 0 ? raw : 24;
+          })(),
         };
         send({ type: "saveSettings", routine: "trade_buyer", settings: s });
         settings.trade_buyer = s;

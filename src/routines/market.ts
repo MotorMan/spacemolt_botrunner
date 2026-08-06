@@ -1,6 +1,11 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { marketStreamStore } from "../marketstreamstore.js";
-import { noteMarketRoutineActive, noteMarketRoutineStopped } from "../market_local_source.js";
+import { mapStore } from "../mapstore.js";
+import {
+  noteMarketRoutineActive,
+  noteMarketRoutineStopped,
+  noteLocalMarketObservation,
+} from "../market_local_source.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -63,6 +68,12 @@ function saveItemsToMarketDetails(
 ): void {
   const marketDetails = loadMarketDetails();
   let detailsUpdated = false;
+  const observations: Array<{
+    itemId: string;
+    itemName: string;
+    buyOrders: MarketOrderDetail[];
+    sellOrders: MarketOrderDetail[];
+  }> = [];
 
   for (const item of items) {
     const itemId = (item.item_id as string) || (item.id as string) || "";
@@ -100,11 +111,16 @@ function saveItemsToMarketDetails(
       marketDetails.items.push(marketItemDetail);
     }
 
+    observations.push({ itemId, itemName, buyOrders, sellOrders });
     detailsUpdated = true;
   }
 
   if (detailsUpdated) {
     saveMarketDetails(marketDetails);
+    // Publish to the in-memory overlay too, so routines in this process see
+    // these prices immediately instead of waiting for the (throttled) re-parse
+    // of the 10MB marketDetails.json.
+    noteLocalMarketObservation(systemId, stationPoiId, stationName, observations);
   }
 }
 
@@ -126,12 +142,18 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
     marketUpdateCb = null;
   }
 
-  function subscribeMarketUpdates(baseId: string) {
+  function subscribeMarketUpdates(baseId: string, systemId: string, poiId: string, stationName: string) {
     unsubscribeMarketUpdates();
     const cb = (entry: import("../marketstreamstore.js").MarketStreamEntry | null) => {
       if (!entry || !entry.items.length) return;
       try {
-        saveItemsToMarketDetails(bot.system, baseId, baseId, entry.items as Array<Record<string, unknown>>);
+        // Record against the POI we are actually docked at, captured at
+        // subscribe time. Using `baseId` as the station POI id (as this used to)
+        // wrote entries under an id that does not exist in the galaxy map for
+        // every station whose base id differs from its POI id (e.g. Sol Central
+        // / confederacy_central_command), producing market rows no routine
+        // could ever travel to.
+        saveItemsToMarketDetails(systemId, poiId, stationName, entry.items as Array<Record<string, unknown>>);
       } catch {
         /* ignore marketDetails errors from push updates */
       }
@@ -187,14 +209,22 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
         if (baseId && items.length > 0) {
           marketStreamStore.update(baseId, 0, items as any);
 
+          // Friendly station name, matching what the explorer writes, so both
+          // producers key marketDetails.json the same way.
+          const mappedPoi = mapStore.getSystem(bot.system)?.pois.find((p) => p.id === bot.poi);
+          const stationName = mappedPoi?.name
+            || (snapshot.base_name as string)
+            || (snapshot.station_name as string)
+            || bot.poi;
+
           try {
-            saveItemsToMarketDetails(bot.system, bot.poi, baseId, items);
+            saveItemsToMarketDetails(bot.system, bot.poi, stationName, items);
             ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
           } catch {
             /* ignore marketDetails errors */
           }
 
-          subscribeMarketUpdates(baseId);
+          subscribeMarketUpdates(baseId, bot.system, bot.poi, stationName);
           currentBaseId = baseId;
 
           ctx.log("info", `Market subscription active: ${items.length} items at ${baseId}`);

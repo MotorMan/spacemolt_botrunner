@@ -22,6 +22,7 @@ import {
   readSettings,
   logFactionActivity,
   isPirateSystem,
+  buildDeniedStationSet,
   type BaseServices,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -40,7 +41,7 @@ import {
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
-import { queryRemoteMarket } from "../client_sync_hooks.js";
+import { queryRemoteMarket, resolveMarketSource } from "../client_sync_hooks.js";
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
@@ -63,11 +64,13 @@ function getTradeBuyerSettings(username?: string): {
   minQuantityToBuy: number;
   maxPrices: Record<string, number>;
   useRemoteMarketQuery: boolean;
+  maxMarketAgeHours: number;
 } {
   const all = readSettings();
   // Read from trade_buyer settings (not trader)
   const t = all.trade_buyer || {};
   const botOverrides = username ? (all[username] || {}) : {};
+  const rawAge = t.maxMarketAgeHours;
   return {
     maxSpendPerItem: (t.maxSpendPerItem as number) || 5000,
     maxTotalSpend: (t.maxTotalSpend as number) || 0,
@@ -81,6 +84,9 @@ function getTradeBuyerSettings(username?: string): {
     minQuantityToBuy: (t.minQuantityToBuy as number) || 10,
     maxPrices: (t.maxPrices as Record<string, number>) || {},
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
+    // 0 = accept market data of any age (old behaviour). Default 24h: anything
+    // older is a ghost listing that will almost certainly fail on arrival.
+    maxMarketAgeHours: typeof rawAge === "number" && rawAge >= 0 ? rawAge : 24,
   };
 }
 
@@ -178,6 +184,250 @@ interface BuyRoute {
   totalCost: number;
 }
 
+/** A "this item is for sale here" observation, normalised across data sources. */
+interface SellListing {
+  itemId: string;
+  itemName: string;
+  systemId: string;
+  poiId: string;
+  poiName: string;
+  price: number;
+  quantity: number;
+  /** Age of the observation in ms, or null when the source didn't say. */
+  ageMs: number | null;
+  /** `market` = market routine data (marketDetails.json / live observations),
+   *  `map`    = the galaxy map's cached market rows. */
+  origin: "market" | "map";
+}
+
+const HOUR_MS = 3_600_000;
+
+// ── Failure memory ───────────────────────────────────────────
+//
+// A station that just refused to sell us an item must not be re-picked on the
+// very next 60s re-scan. The old routine only remembered failures for the
+// current cycle, so a ghost listing produced the same doomed round-trip over
+// and over.
+
+const RECENT_FAILURE_TTL_MS = 30 * 60 * 1000;
+const recentBuyFailures = new Map<string, number>();
+
+function failureKey(systemId: string, poiId: string, itemId: string): string {
+  return `${systemId}:${poiId}:${itemId}`.toLowerCase();
+}
+
+function noteBuyFailure(systemId: string, poiId: string, itemId: string): void {
+  recentBuyFailures.set(failureKey(systemId, poiId, itemId), Date.now());
+}
+
+function isRecentBuyFailure(systemId: string, poiId: string, itemId: string): boolean {
+  const key = failureKey(systemId, poiId, itemId);
+  const at = recentBuyFailures.get(key);
+  if (at === undefined) return false;
+  if (Date.now() - at > RECENT_FAILURE_TTL_MS) {
+    recentBuyFailures.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// ── Station validation ───────────────────────────────────────
+
+/** Blacklist lookups hit settings on every call, and route scanning resolves
+ *  thousands of listings, so cache them for the duration of a scan. */
+const BLACKLIST_CACHE_MS = 10_000;
+let blacklistCache: { at: number; systems: Set<string>; stations: Set<string> } | null = null;
+
+function getBlacklists(): { systems: Set<string>; stations: Set<string> } {
+  const now = Date.now();
+  if (blacklistCache && now - blacklistCache.at < BLACKLIST_CACHE_MS) return blacklistCache;
+  blacklistCache = {
+    at: now,
+    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    // Already folds in Settings → General → stationBlacklist plus any station
+    // that denied us docking this session.
+    stations: buildDeniedStationSet(),
+  };
+  return blacklistCache;
+}
+
+/**
+ * Resolve a market listing's location to a station the bot can actually dock at.
+ *
+ * The galaxy map carries market rows for POIs that have no base at all — ice
+ * fields, planets, asteroid belts — left over from older scans or seeded data.
+ * A route to one of those is unexecutable: the bot flies out, `ensureDocked()`
+ * quietly diverts it to the nearest real station, and the buy then fails
+ * against a market that never listed the item (exactly the
+ * "Kuiper Ice Fields → Sol Central → item_not_available" loop).
+ *
+ * Every listing must therefore prove it points at a dockable, non-pirate,
+ * non-blacklisted station before it is allowed to become a route.
+ */
+function resolveBuyStation(
+  systemId: string,
+  poiId: string,
+  fallbackName: string,
+): { systemId: string; poiId: string; poiName: string } | null {
+  if (!systemId || !poiId) return null;
+  if (isPirateSystem(systemId)) return null;
+  const { systems: systemBlacklist, stations: stationBlacklist } = getBlacklists();
+  if (systemBlacklist.has(systemId.toLowerCase())) return null;
+
+  const system = mapStore.getSystem(systemId);
+  if (!system) return null;
+
+  let poi = system.pois.find(p => p.id === poiId);
+  if (!poi) {
+    // Market data may name the station by base id / friendly name instead of
+    // POI id; resolve it against the map before giving up.
+    const resolved = mapStore.resolveStationIdentity(`${systemId}|${poiId}`);
+    if (resolved.matched && resolved.systemId === systemId && resolved.poiId) {
+      poi = system.pois.find(p => p.id === resolved.poiId);
+    }
+  }
+
+  // The mobile capital moves; only its currently tracked location is real.
+  if (!poi && poiId === "mobile_capital") {
+    const loc = mapStore.getMobileCapitolLocation();
+    if (!loc || loc.systemId !== systemId) return null;
+    return { systemId, poiId: loc.poiId || "mobile_capital", poiName: fallbackName || "Mobile Capital" };
+  }
+
+  if (!poi) return null;
+  // No base = nothing to dock with = nothing to buy from. Matches isStationPoi().
+  if (!(poi.has_base || poi.base_id || (poi.type || "").toLowerCase() === "station")) return null;
+  if (stationBlacklist.has(poi.id.toLowerCase())) return null;
+  if (stationBlacklist.has(`${systemId}|${poi.id}`.toLowerCase())) return null;
+
+  return { systemId, poiId: poi.id, poiName: poi.name || fallbackName || poi.id };
+}
+
+// ── Market data sourcing ─────────────────────────────────────
+
+function parseAgeMs(iso: string | undefined | null): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Date.now() - t);
+}
+
+function describeAge(ageMs: number | null): string {
+  if (ageMs === null) return "age unknown";
+  if (ageMs < 60_000) return `${Math.round(ageMs / 1000)}s old`;
+  if (ageMs < HOUR_MS) return `${Math.round(ageMs / 60_000)}min old`;
+  if (ageMs < 48 * HOUR_MS) return `${Math.round(ageMs / HOUR_MS)}h old`;
+  return `${Math.round(ageMs / (24 * HOUR_MS))}d old`;
+}
+
+/**
+ * Ask the market routine's data (this client's `data/marketDetails.json` plus
+ * its live in-memory observations, or a connected market client) where each
+ * wanted item is actually on sale right now.
+ *
+ * This is the authoritative source. The galaxy map's market cache is only a
+ * last-resort backfill: it is written opportunistically by every routine that
+ * happens to dock somewhere, it keeps rows for POIs that are not stations, and
+ * entries there can be months old.
+ */
+async function collectMarketListings(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTradeBuyerSettings>,
+  currentSystem: string,
+): Promise<SellListing[]> {
+  const out: SellListing[] = [];
+  if (settings.buyItems.length === 0) return out;
+
+  const source = await resolveMarketSource();
+  if (source.mode === "none") {
+    ctx.log("trade", `[Market] No market data source: ${source.reason}`);
+    return out;
+  }
+  ctx.log("trade", `[${source.label}] ${source.reason}`);
+
+  const wanted = settings.buyItems.slice(0, 20);
+  const perItem = await Promise.all(wanted.map(async (itemId) => {
+    try {
+      return { itemId, res: await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystem }) };
+    } catch (err) {
+      ctx.log("trade", `[${source.label}] Query failed for ${itemId}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }));
+
+  let rejectedStations = 0;
+  for (const entry of perItem) {
+    if (!entry || !entry.res.ok) continue;
+    for (const r of entry.res.results) {
+      if (!(r.price > 0) || !(r.quantity > 0)) continue;
+      const station = resolveBuyStation(r.systemId, r.stationPoiId, r.stationName);
+      if (!station) {
+        rejectedStations++;
+        continue;
+      }
+      out.push({
+        itemId: entry.itemId,
+        itemName: r.itemName || catalogStore.resolveItemName(entry.itemId) || entry.itemId,
+        systemId: station.systemId,
+        poiId: station.poiId,
+        poiName: station.poiName,
+        price: r.price,
+        quantity: r.quantity,
+        ageMs: parseAgeMs(r.lastUpdated),
+        origin: "market",
+      });
+    }
+  }
+
+  ctx.log(
+    "trade",
+    `[${source.label}] ${out.length} live sell listing(s) for ${wanted.length} item(s)` +
+    (rejectedStations > 0 ? ` (${rejectedStations} skipped: not a dockable station in our map)` : ""),
+  );
+  return out;
+}
+
+/** Sell listings from the galaxy map cache — station-filtered, used as backfill. */
+function collectMapListings(ctx: RoutineContext, settings: ReturnType<typeof getTradeBuyerSettings>): SellListing[] {
+  const wanted = new Set(settings.buyItems.map(i => i.toLowerCase()));
+  if (wanted.size === 0) return [];
+
+  const out: SellListing[] = [];
+  let nonStationRows = 0;
+
+  for (const [sysId, sys] of Object.entries(mapStore.getAllSystems())) {
+    if (isPirateSystem(sysId)) continue;
+    for (const poi of sys.pois) {
+      let stationChecked: ReturnType<typeof resolveBuyStation> | undefined;
+      for (const m of poi.market) {
+        if (!wanted.has(m.item_id.toLowerCase())) continue;
+        if (m.best_sell === null || m.best_sell <= 0 || m.sell_quantity <= 0) continue;
+        if (stationChecked === undefined) stationChecked = resolveBuyStation(sysId, poi.id, poi.name);
+        if (!stationChecked) {
+          nonStationRows++;
+          continue;
+        }
+        out.push({
+          itemId: m.item_id,
+          itemName: m.item_name || m.item_id,
+          systemId: stationChecked.systemId,
+          poiId: stationChecked.poiId,
+          poiName: stationChecked.poiName,
+          price: m.best_sell,
+          quantity: m.sell_quantity,
+          ageMs: parseAgeMs(m.last_updated),
+          origin: "map",
+        });
+      }
+    }
+  }
+
+  if (nonStationRows > 0) {
+    ctx.log("trade", `[MapCache] Ignored ${nonStationRows} cached sell row(s) at POIs with no dockable station`);
+  }
+  return out;
+}
+
 // ── Buy route discovery ────────────────────────────────────
 
 /** Estimate fuel cost between two systems using mapStore route data. */
@@ -190,75 +440,112 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
-/** Find the cheapest known market sell prices for items. */
+/**
+ * Find the cheapest place to buy each wanted item.
+ *
+ * `marketListings` (from the market routine) is authoritative; map-cache rows
+ * for the same station/item are discarded in its favour so a months-old cached
+ * price can never outbid a live one.
+ */
 function findCheapestSellers(
   ctx: RoutineContext,
   settings: ReturnType<typeof getTradeBuyerSettings>,
   currentSystem: string,
   cargoCapacity: number = 999,
+  marketListings: SellListing[] = [],
 ): BuyRoute[] {
   const routes: BuyRoute[] = [];
 
-  // Collect all sell listings from mapStore (where we can buy from NPC market)
-  const sellListings: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
-
-  for (const [sysId, sys] of Object.entries(mapStore.getAllSystems())) {
-    // Skip pirate systems
-    if (isPirateSystem(sysId)) continue;
-    for (const poi of sys.pois) {
-      for (const m of poi.market) {
-        if (m.best_sell !== null && m.best_sell > 0 && m.sell_quantity > 0) {
-          sellListings.push({
-            itemId: m.item_id,
-            itemName: m.item_name,
-            systemId: sysId,
-            poiId: poi.id,
-            poiName: poi.name,
-            price: m.best_sell,
-            quantity: m.sell_quantity,
-          });
-        }
-      }
-    }
+  if (settings.buyItems.length === 0) {
+    ctx.log("trade", "No items selected in \"Items to Buy\" — nothing to scan for");
+    return routes;
   }
 
-  ctx.log("trade", `Scanning ${sellListings.length} sell listings for items: ${settings.buyItems.join(", ") || "(none)"}`);
+  // Merge sources, one row per station+item, market data always wins.
+  const merged = new Map<string, SellListing>();
+  for (const l of collectMapListings(ctx, settings)) {
+    merged.set(`${l.systemId}/${l.poiId}/${l.itemId}`, l);
+  }
+  let overridden = 0;
+  for (const l of marketListings) {
+    const key = `${l.systemId}/${l.poiId}/${l.itemId}`;
+    if (merged.has(key)) overridden++;
+    merged.set(key, l);
+  }
+  const sellListings = [...merged.values()];
+
+  const fromMarket = sellListings.filter(l => l.origin === "market").length;
+  ctx.log(
+    "trade",
+    `Scanning ${sellListings.length} dockable sell listing(s) — ${fromMarket} from the market routine` +
+    `, ${sellListings.length - fromMarket} from the map cache` +
+    (overridden > 0 ? ` (${overridden} stale cache row(s) replaced by live data)` : ""),
+  );
   ctx.log("trade", `Max prices config: ${JSON.stringify(settings.maxPrices || {})}`);
 
+  const maxAgeMs = settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours * HOUR_MS : 0;
+
   // Group by item to find cheapest sources
-  const itemSellers = new Map<string, typeof sellListings>();
+  const itemSellers = new Map<string, SellListing[]>();
   for (const seller of sellListings) {
     const existing = itemSellers.get(seller.itemId) || [];
     existing.push(seller);
     itemSellers.set(seller.itemId, existing);
   }
 
-  ctx.log("trade", `Found ${itemSellers.size} unique items for sale in cache`);
+  for (const buyItem of settings.buyItems) {
+    const itemId = buyItem;
+    const sellers = itemSellers.get(itemId)
+      // Fall back to a case-insensitive lookup for legacy config entries.
+      || [...itemSellers.entries()].find(([k]) => k.toLowerCase() === itemId.toLowerCase())?.[1];
 
-  // For each item, find the cheapest seller
-  for (const [itemId, sellers] of itemSellers.entries()) {
-    // Filter by allowed items - MUST be explicitly selected in buyItems list
-    if (settings.buyItems.length === 0) {
-      // No items selected - skip this item (don't buy anything if nothing is configured)
+    if (!sellers || sellers.length === 0) {
+      ctx.log("trade", `>>> ${itemId}: no station is selling this in any known market data`);
       continue;
     }
-    
-    // Check if this item is in the buy list (exact match)
-    const match = settings.buyItems.some(t =>
-      t.toLowerCase() === itemId.toLowerCase()
-    );
-    if (!match) continue;
 
     ctx.log("trade", `>>> Found matching item: ${itemId} (${sellers.length} sellers)`);
 
-    // Check max price for this item
+    // Freshness gate — a listing nobody has confirmed for weeks is a ghost, and
+    // chasing it costs a full round trip plus fuel.
     let candidates = sellers;
+    if (maxAgeMs > 0) {
+      const fresh = candidates.filter(s => s.ageMs !== null && s.ageMs <= maxAgeMs);
+      if (fresh.length === 0) {
+        const best = candidates.reduce<number | null>(
+          (acc, s) => (s.ageMs === null ? acc : acc === null ? s.ageMs : Math.min(acc, s.ageMs)),
+          null,
+        );
+        ctx.log(
+          "trade",
+          `>>> ${itemId}: REJECTED all ${candidates.length} seller(s) — market data older than ` +
+          `${settings.maxMarketAgeHours}h (freshest is ${describeAge(best)}). Run the market routine at those ` +
+          `stations, or raise "Max Market Data Age" (0 = accept any age)`,
+        );
+        continue;
+      }
+      if (fresh.length < candidates.length) {
+        ctx.log("trade", `>>> ${itemId}: dropped ${candidates.length - fresh.length} seller(s) with market data older than ${settings.maxMarketAgeHours}h`);
+      }
+      candidates = fresh;
+    }
+
+    // Recently-failed stations are skipped so a bad listing can't produce the
+    // same doomed round trip every 60s.
+    const notRecentlyFailed = candidates.filter(s => !isRecentBuyFailure(s.systemId, s.poiId, s.itemId));
+    if (notRecentlyFailed.length < candidates.length) {
+      ctx.log("trade", `>>> ${itemId}: skipping ${candidates.length - notRecentlyFailed.length} station(s) that recently refused this buy`);
+    }
+    candidates = notRecentlyFailed;
+    if (candidates.length === 0) continue;
+
+    // Check max price for this item
     const maxPrice = settings.maxPrices?.[itemId];
     if (maxPrice !== undefined && maxPrice > 0) {
       // Filter out sellers that are above the max price
-      const filteredSellers = sellers.filter(s => s.price <= maxPrice);
+      const filteredSellers = candidates.filter(s => s.price <= maxPrice);
       if (filteredSellers.length === 0) {
-        const cheapest = Math.min(...sellers.map(s => s.price));
+        const cheapest = Math.min(...candidates.map(s => s.price));
         ctx.log("trade", `>>> ${itemId}: No sellers at or below max price ${maxPrice}cr (cheapest available: ${cheapest}cr)`);
         continue;
       } // No sellers at acceptable price
@@ -281,7 +568,7 @@ function findCheapestSellers(
     }
 
     for (const seller of candidates.slice(0, 3)) { // Top 3 cheapest per item
-      const where = `${seller.poiName} (${seller.systemId}) @ ${seller.price}cr`;
+      const where = `${seller.poiName} (${seller.systemId}) @ ${seller.price}cr [${seller.origin}, ${describeAge(seller.ageMs)}]`;
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, seller.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) {
         ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — no route from ${currentSystem} (unreachable or blacklisted)`);
@@ -434,7 +721,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // Refresh settings each cycle
     settings = getTradeBuyerSettings(bot.username);
 
-    ctx.log("trade", `Settings loaded: homeSystem=${settings.homeSystem || "(not set)"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}`);
+    ctx.log("trade", `Settings loaded: homeSystem=${settings.homeSystem || "(not set)"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}, maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -641,16 +928,18 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
     const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
 
-    // Remote market query: augment local sell listings with fresh prices
-    if (settings.useRemoteMarketQuery !== false && settings.buyItems.length > 0) {
-      const queries = settings.buyItems.slice(0, 20).map(async (itemId) => {
-        await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: bot.system });
-      });
-      await Promise.all(queries);
-      ctx.log("trade", `[RemoteMarket] Trade buyer: queried remote market for ${Math.min(settings.buyItems.length, 20)} item(s)`);
+    // Market routine data (data/marketDetails.json + its live in-memory
+    // observations, or a connected market client) is the authoritative source
+    // for what is actually on sale where. The galaxy map cache is only used to
+    // backfill stations the market routine has never visited.
+    let marketListings: SellListing[] = [];
+    if (settings.useRemoteMarketQuery !== false) {
+      marketListings = await collectMarketListings(ctx, settings, bot.system);
+    } else {
+      ctx.log("trade", "Market query disabled in settings — falling back to the galaxy map cache only");
     }
 
-    routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity);
+    routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity, marketListings);
 
     // Update routes with home station info
     routes = routes.map(r => ({
@@ -673,7 +962,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         "trade",
         `No buy routes passed the filters (see REJECTED lines above) — ` +
         `buyItems=[${settings.buyItems.join(", ") || "(none)"}], spend budget=${budget > 0 ? budget + "cr" : "unlimited"}, ` +
-        `minQty=${Math.max(1, settings.minQuantityToBuy)}, cargo=${cargoCapacity}. Waiting 60s before re-scanning`,
+        `minQty=${Math.max(1, settings.minQuantityToBuy)}, cargo=${cargoCapacity}, ` +
+        `maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}. Waiting 60s before re-scanning`,
       );
       await ctx.sleep(60000);
       continue;
@@ -842,6 +1132,30 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         await ensureDocked(ctx);
         bot.docked = true;
 
+        // ── Confirm we are standing where the route said to buy ──
+        // `ensureDocked()` silently diverts to the nearest usable station when
+        // the target POI turns out to have no base. Everything after this point
+        // (fuel top-up, estimate_purchase, buy) is written for the ROUTE's
+        // station, so buying at whatever station we happened to land on is
+        // always wrong — it is what produced the
+        // "flew to an ice field, docked at Sol Central, item_not_available" loop.
+        await bot.refreshLocation();
+        const atRightSystem = bot.system.toLowerCase() === candidate.sourceSystem.toLowerCase();
+        const atRightStation = atRightSystem && !!bot.poi && mapStore.sameStation(bot.poi, candidate.sourcePoi);
+        if (!atRightStation) {
+          failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+          // The listing pointed at somewhere we cannot dock — drop it from the
+          // map cache so it cannot be re-picked on the next scan.
+          mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+          ctx.log(
+            "error",
+            `Expected to dock at ${candidate.sourcePoiName} (${candidate.sourceSystem}) but ended up at ` +
+            `${bot.poi || "?"} (${bot.system}) — that listing has no dockable station. Dropping it and trying next route`,
+          );
+          continue;
+        }
+
         // Withdraw credits from storage
         await bot.refreshStorage();
         const storageResp = await bot.exec("view_storage");
@@ -861,6 +1175,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         const estResp = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
         if (estResp.error) {
           failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (stale data) — trying next route`);
           continue;
@@ -981,6 +1296,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         }
         if (buyResp.error) {
           failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           if (buyResp.error.message.includes("item_not_available") || buyResp.error.message.includes("not_available")) {
             mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           }

@@ -970,9 +970,351 @@ const FUEL_CELL_RANK: { id: string; fuel: number }[] = [
   { id: "fuel_cell", fuel: 20 },
 ];
 
+/**
+ * Fuel restored by ONE unit of `itemId`, or 0 when the item is not a fuel cell.
+ *
+ * Catalog-driven (`effect.type === "fuel"`) so any future cell type is picked up
+ * automatically, with the three known cells as a fallback for the window before
+ * the catalog has loaded.
+ *
+ * Routines used to sniff fuel with `itemId.includes("fuel")`, which is wrong in
+ * both directions:
+ *   - it counts `fusion_fuel_rod`, `reactor_fuel_assembly`, `fuel_tank`… as fuel,
+ *     so those cargo items were never delivered and inflated the "we have fuel"
+ *     count;
+ *   - it treats every cell as interchangeable, so 3x military_fuel_cell (300
+ *     fuel) looked identical to 3x fuel_cell (60 fuel) and the bot went shopping
+ *     for 20-fuel cells at 20k–50k credits each while sitting on 300 free fuel.
+ */
+export function getFuelCellFuelValue(itemId: string): number {
+  if (!itemId) return 0;
+  const item = catalogStore.getItem(itemId);
+  const effect = item?.effect as { type?: string; amount?: number } | undefined;
+  if (effect?.type === "fuel" && typeof effect.amount === "number" && effect.amount > 0) {
+    return effect.amount;
+  }
+  return FUEL_CELL_RANK.find((f) => f.id === itemId.toLowerCase())?.fuel ?? 0;
+}
+
+/** True only for items the `refuel` command can actually burn. */
+export function isFuelCellItem(itemId: string): boolean {
+  return getFuelCellFuelValue(itemId) > 0;
+}
+
 function isFuelCellItemId(id: string): boolean {
-  const lower = (id || "").toLowerCase();
-  return lower === "military_fuel_cell" || lower === "premium_fuel_cell" || lower === "fuel_cell";
+  return isFuelCellItem(id);
+}
+
+export interface CargoFuelCells {
+  /** Number of cells (all types) aboard. */
+  cells: number;
+  /** What those cells are worth in TANK FUEL — the number that actually matters. */
+  fuel: number;
+  /** Cargo weight they occupy. */
+  cargoUsed: number;
+  byItem: Array<{ itemId: string; name: string; quantity: number; fuelEach: number; fuel: number }>;
+  /** e.g. "3x Military Fuel Cell (300 fuel)" */
+  summary: string;
+}
+
+/** The fuel-cell reserve currently in cargo, measured in FUEL rather than in
+ *  cell count. Always prefer this over counting inventory entries. */
+export function getCargoFuelCells(bot: Bot): CargoFuelCells {
+  const byItem: CargoFuelCells["byItem"] = [];
+  let cells = 0;
+  let fuel = 0;
+  let cargoUsed = 0;
+  for (const item of bot.inventory) {
+    const fuelEach = getFuelCellFuelValue(item.itemId);
+    if (fuelEach <= 0 || item.quantity <= 0) continue;
+    cells += item.quantity;
+    fuel += item.quantity * fuelEach;
+    cargoUsed += item.quantity * getItemSize(item.itemId);
+    byItem.push({
+      itemId: item.itemId,
+      name: item.name || item.itemId,
+      quantity: item.quantity,
+      fuelEach,
+      fuel: item.quantity * fuelEach,
+    });
+  }
+  byItem.sort((a, b) => b.fuelEach - a.fuelEach);
+  const summary = byItem.length > 0
+    ? byItem.map((b) => `${b.quantity}x ${b.name} (${b.fuel} fuel)`).join(", ")
+    : "none";
+  return { cells, fuel, cargoUsed, byItem, summary };
+}
+
+/**
+ * Credits we are willing to pay per POINT of tank fuel when buying cells.
+ * Catalog base values are ~2.2cr/fuel (fuel_cell 43cr/20), ~2.4 (premium),
+ * ~3.9 (military), so 25cr/fuel is a ~10x-over-base ceiling that still blocks
+ * the player-driven 20 000–50 000cr-per-fuel_cell listings outright.
+ */
+export const DEFAULT_MAX_CREDITS_PER_FUEL = 25;
+
+export interface FuelCellReserveOptions {
+  /** How much TANK FUEL the cargo reserve must be able to deliver. */
+  fuelNeeded: number;
+  /** Short description for the log, e.g. "27-jump route home". */
+  reason?: string;
+  /** Allow buying cells from the docked station's market (default true). */
+  allowBuy?: boolean;
+  /** Price ceiling per point of fuel. Defaults to DEFAULT_MAX_CREDITS_PER_FUEL. */
+  maxCreditsPerFuel?: number;
+  /** Hard cap on total credits spent on cells this call. 0 / omitted = no cap. */
+  maxSpend?: number;
+}
+
+export interface FuelCellReserveResult {
+  /** Reserve is at (or above) the requested fuel. */
+  ok: boolean;
+  /** Fuel aboard in cells after sourcing. */
+  fuel: number;
+  cells: number;
+  /** Credits spent buying cells (0 when everything came from storage). */
+  spent: number;
+}
+
+/**
+ * Make sure the ship carries at least `fuelNeeded` worth of fuel CELLS, sourcing
+ * them in the only sane order: what we already carry → faction storage (free) →
+ * station storage (free) → a price-capped market buy as a last resort.
+ *
+ * Denser cells are preferred everywhere (military 100 fuel / 3 space beats plain
+ * 20 fuel / 1 space per unit of cargo), and a buy is only attempted after
+ * `estimate_purchase` confirms the station really is selling — so a ghost
+ * listing produces a quiet skip instead of a red `item_not_available`.
+ */
+export async function ensureFuelCellReserve(
+  ctx: RoutineContext,
+  opts: FuelCellReserveOptions,
+): Promise<FuelCellReserveResult> {
+  const { bot } = ctx;
+  const reason = opts.reason ? ` for ${opts.reason}` : "";
+  const maxPerFuel = opts.maxCreditsPerFuel && opts.maxCreditsPerFuel > 0
+    ? opts.maxCreditsPerFuel
+    : DEFAULT_MAX_CREDITS_PER_FUEL;
+
+  await bot.refreshCargo();
+  let have = getCargoFuelCells(bot);
+  const need = Math.max(0, Math.ceil(opts.fuelNeeded));
+
+  if (need <= 0 || have.fuel >= need) {
+    if (have.cells > 0) {
+      ctx.log("system", `Fuel reserve OK${reason}: carrying ${have.summary} = ${have.fuel} fuel (need ${need})`);
+    }
+    return { ok: true, fuel: have.fuel, cells: have.cells, spent: 0 };
+  }
+
+  ctx.log(
+    "system",
+    `Fuel reserve short${reason}: carrying ${have.summary} = ${have.fuel} fuel, need ${need} — sourcing ${need - have.fuel} more`,
+  );
+
+  let spent = 0;
+
+  // Densest cells first: more fuel per unit of cargo left for actual trade goods.
+  const ranked = [...FUEL_CELL_RANK].sort((a, b) => b.fuel - a.fuel);
+
+  /** Cells of `id` still required to close the gap, limited by free cargo. */
+  const cellsWanted = (id: string, fuelEach: number): number => {
+    const deficit = need - have.fuel;
+    if (deficit <= 0) return 0;
+    const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
+    return Math.max(0, Math.min(Math.ceil(deficit / fuelEach), maxItemsForCargo(freeWeight, id)));
+  };
+
+  // ── 1) Free cells already sitting in faction storage ──
+  try {
+    await bot.refreshFactionStorage(false, undefined, true);
+  } catch { /* storage unavailable — fall through to the other sources */ }
+  for (const { id } of ranked) {
+    const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+    const want = cellsWanted(id, fuelEach);
+    if (want <= 0) continue;
+    const stock = bot.factionStorage.find((i) => i.itemId === id)?.quantity || 0;
+    if (stock <= 0) continue;
+    const qty = Math.min(stock, want);
+    const direct = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: id, quantity: qty });
+    let got = false;
+    if (!direct.error) {
+      got = true;
+    } else {
+      // Older two-step path: faction -> station storage -> cargo.
+      const move = await bot.exec("storage", { action: "deposit", target: "self", item_id: id, quantity: qty, source: "faction" });
+      if (!move.error) {
+        const w = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+        got = !w.error;
+      }
+    }
+    if (got) {
+      await bot.refreshCargo();
+      have = getCargoFuelCells(bot);
+      ctx.log("system", `Pulled ${qty}x ${id} from faction storage (free) — reserve now ${have.fuel} fuel`);
+    }
+    if (have.fuel >= need) break;
+  }
+
+  // ── 2) Free cells in this station's personal storage ──
+  if (have.fuel < need && bot.docked) {
+    try {
+      await bot.refreshStorage();
+    } catch { /* not docked / no storage here */ }
+    for (const { id } of ranked) {
+      const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+      const want = cellsWanted(id, fuelEach);
+      if (want <= 0) continue;
+      const stock = bot.storage.find((i) => i.itemId === id)?.quantity || 0;
+      if (stock <= 0) continue;
+      const qty = Math.min(stock, want);
+      const w = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+      if (!w.error) {
+        await bot.refreshCargo();
+        have = getCargoFuelCells(bot);
+        ctx.log("system", `Pulled ${qty}x ${id} from station storage (free) — reserve now ${have.fuel} fuel`);
+      }
+      if (have.fuel >= need) break;
+    }
+  }
+
+  // ── 3) Buy, but only at a sane price ──
+  if (have.fuel < need && opts.allowBuy !== false && bot.docked) {
+    let hasMarket = true;
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      hasMarket = stationHasMarket(station);
+    } catch { /* unknown — let estimate_purchase decide */ }
+
+    if (!hasMarket) {
+      ctx.log("system", `No market at this station — cannot top up the fuel reserve here (${have.fuel}/${need} fuel)`);
+    } else {
+      for (const { id } of ranked) {
+        const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+        let want = cellsWanted(id, fuelEach);
+        if (want <= 0) continue;
+
+        // Ask BEFORE buying: a ghost listing then costs a log line, not a red error.
+        const est = await bot.exec("estimate_purchase", { item_id: id, quantity: want });
+        if (est.error) continue;
+        const e = (est.result || {}) as Record<string, unknown>;
+        const available = Math.max(0, Number(e.available ?? e.available_quantity ?? 0) || 0);
+        if (available <= 0) {
+          ctx.log("system", `No one is selling ${id} here — skipping`);
+          continue;
+        }
+        want = Math.min(want, available);
+        const cost = Number(e.total_cost ?? e.subtotal ?? 0) || 0;
+        const perUnit = cost > 0 ? cost / want : 0;
+        const perFuel = perUnit / fuelEach;
+        if (perFuel > maxPerFuel) {
+          ctx.log(
+            "trade",
+            `Refusing to buy ${id} at ${Math.round(perUnit)}cr each (${perFuel.toFixed(1)}cr per fuel, cap ${maxPerFuel}) — ` +
+            `military cells are free at home`,
+          );
+          continue;
+        }
+        const budget = opts.maxSpend && opts.maxSpend > 0 ? Math.min(opts.maxSpend - spent, bot.credits) : bot.credits;
+        if (perUnit > 0 && budget < perUnit) continue;
+        if (perUnit > 0) want = Math.min(want, Math.floor(budget / perUnit));
+        if (want <= 0) continue;
+
+        const creditsBefore = bot.credits;
+        const buy = await bot.exec("buy", { item_id: id, quantity: want });
+        if (buy.error) continue;
+        await bot.refreshStatus();
+        await bot.refreshCargo();
+        have = getCargoFuelCells(bot);
+        spent += Math.max(0, creditsBefore - bot.credits);
+        ctx.log("trade", `Bought ${want}x ${id} at ~${Math.round(perUnit)}cr each — reserve now ${have.fuel} fuel`);
+        if (have.fuel >= need) break;
+      }
+    }
+  }
+
+  const ok = have.fuel >= need;
+  if (!ok) {
+    ctx.log(
+      "system",
+      `Fuel reserve still short${reason}: ${have.fuel}/${need} fuel (${have.summary}) — continuing, the tank plus station refuelling may cover it`,
+    );
+  }
+  return { ok, fuel: have.fuel, cells: have.cells, spent };
+}
+
+/**
+ * Ask the server what a route actually costs in fuel. `find_route` is the only
+ * source that knows this ship's fuel burn, so it beats every "jumps × guess"
+ * estimate. Returns null when the route can't be resolved.
+ */
+export async function estimateRouteFuel(
+  ctx: RoutineContext,
+  targetSystem: string,
+): Promise<{ jumps: number; estimatedFuel: number; fuelAvailable: number; fuelPerJump: number } | null> {
+  if (!targetSystem) return null;
+  try {
+    const resp = await ctx.bot.exec("find_route", { target_system: targetSystem });
+    if (resp.error) return null;
+    const r = (resp.result || {}) as Record<string, unknown>;
+    if (r.found === false) return null;
+    const estimatedFuel = Number(r.estimated_fuel ?? 0) || 0;
+    if (estimatedFuel <= 0) return null;
+    return {
+      jumps: Number(r.total_jumps ?? 0) || 0,
+      estimatedFuel,
+      fuelAvailable: Number(r.fuel_available ?? ctx.bot.fuel) || 0,
+      fuelPerJump: Number(r.fuel_per_jump ?? 0) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface PurchaseEstimate {
+  /** Units the station can actually deliver right now. */
+  available: number;
+  /** Units of the request nobody can fill. */
+  unfilled: number;
+  totalCost: number;
+  message: string;
+  /** Who we would be buying from, when the server says. */
+  counterparties: string[];
+}
+
+/**
+ * Normalised view of an `estimate_purchase` reply.
+ *
+ * This is the only pre-flight check that talks to the live order book, and —
+ * critically — it does NOT return an error when nobody is selling: it answers
+ * `{ available: 0, unfilled: <asked>, fills: [] }` plus a message. Routines that
+ * tested only `resp.error` therefore treated a seller-less station as a good
+ * one, and the failure only surfaced on the `buy`, after the whole flight.
+ *
+ * `fills[].counterparty` is captured too: when the only orders in the book are
+ * our own the server refuses the trade with "No one is selling …", and the
+ * counterparty list is the one clue that explains why a listing we can plainly
+ * see is still unbuyable.
+ */
+export function readPurchaseEstimate(raw: unknown): PurchaseEstimate {
+  const e = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const num = (v: unknown): number => {
+    const n = typeof v === "string" ? parseFloat(v) : (v as number);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const fills = Array.isArray(e.fills) ? (e.fills as Array<Record<string, unknown>>) : [];
+  const counterparties = [
+    ...new Set(fills.map((f) => String(f.counterparty || f.source || "")).filter(Boolean)),
+  ];
+  return {
+    // `available` is the authoritative field; the others are legacy/defensive.
+    available: Math.max(0, num(e.available ?? e.available_quantity ?? e.max_quantity ?? 0)),
+    unfilled: Math.max(0, num(e.unfilled)),
+    totalCost: num(e.total_cost ?? e.subtotal),
+    message: typeof e.message === "string" ? e.message : "",
+    counterparties,
+  };
 }
 
 /** True when the bot is docked at its configured home system. Used to decide

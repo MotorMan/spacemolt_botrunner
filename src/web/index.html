@@ -17555,6 +17555,8 @@
         const minQuantityToBuy = t.minQuantityToBuy ?? 10;
         const maxBuyQuantity = t.maxBuyQuantity ?? 0;
         const maxMarketAgeHours = t.maxMarketAgeHours ?? 24;
+        const maxFuelCreditsPerFuel = t.maxFuelCreditsPerFuel ?? 25;
+        const homeFuelReserve = t.homeFuelReserve ?? 0;
         const autoInsure = t.autoInsure !== false;
         const autoCloak = t.autoCloak ?? false;
         const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
@@ -17715,6 +17717,22 @@
         <div class="setting-hint">Estimated fuel cost per system jump, used for route calculations.</div>
       </div>
       <input type="number" id="set-trade_buyer-fuelCostPerJump" min="0" max="1000" value="${fuelCostPerJump}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Credits Per Fuel (fuel cells)</div>
+        <div class="setting-hint">Price ceiling when the bot has to buy fuel cells, expressed per point of tank fuel. A plain <code>fuel_cell</code> gives 20 fuel, <code>military_fuel_cell</code> gives 100, so 25 allows 500cr / 2500cr respectively. Cells are always pulled free from faction storage first; this only stops the bot paying player-market prices (20 000cr+ per cell) while free military cells sit at home.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-maxFuelCreditsPerFuel" min="1" max="10000" value="${maxFuelCreditsPerFuel}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Fuel Reserve (fuel)</div>
+        <div class="setting-hint">Fuel worth of cells to load before leaving home, where <code>military_fuel_cell</code> is free from faction storage. Measured in tank fuel, not cell count: 200 = 2 military cells. 0 = auto (2x the ship's tank).</div>
+      </div>
+      <input type="number" id="set-trade_buyer-homeFuelReserve" min="0" max="100000" value="${homeFuelReserve}">
     </div>
 
     <div class="setting-row">
@@ -18005,6 +18023,19 @@
             parseInt(
               document.getElementById("set-trade_buyer-fuelCostPerJump").value,
             ) || 50,
+          maxFuelCreditsPerFuel: Math.max(
+            1,
+            parseInt(
+              document.getElementById("set-trade_buyer-maxFuelCreditsPerFuel")
+                ?.value,
+            ) || 25,
+          ),
+          homeFuelReserve: Math.max(
+            0,
+            parseInt(
+              document.getElementById("set-trade_buyer-homeFuelReserve")?.value,
+            ) || 0,
+          ),
           refuelThreshold:
             parseInt(
               document.getElementById("set-trade_buyer-refuelThreshold").value,

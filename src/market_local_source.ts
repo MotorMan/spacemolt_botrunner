@@ -199,6 +199,40 @@ export function clearLocalMarketOverlay(): void {
   overlay.clear();
 }
 
+/**
+ * Record that a station proved it is NOT selling an item, even though our market
+ * data says it is.
+ *
+ * The order book we publish is only as good as the last observation, and a
+ * listing can be unbuyable while still being visible: it was filled between the
+ * scan and our arrival, or every order in it is one of our own (the server then
+ * answers "No one is selling X at this station"). Without this, the offending
+ * row stays in the overlay/index at ~30s of age and every routine that reads it
+ * keeps planning the same doomed round trip.
+ *
+ * Clears the sell side for that station+item in both the live overlay and the
+ * in-memory file index. The next real observation from a market bot restores it.
+ */
+export function noteLocalMarketUnavailable(systemId: string, stationPoiId: string, itemId: string): void {
+  if (!systemId || !stationPoiId || !itemId) return;
+  const stationKey = `${systemId}/${stationPoiId}`;
+
+  const byStation = overlay.get(itemId);
+  const live = byStation?.get(stationKey);
+  if (live && live.sellOrders.length > 0) {
+    byStation!.set(stationKey, { ...live, sellOrders: [] });
+  }
+
+  const indexed = index?.byItem.get(itemId);
+  if (indexed) {
+    for (const entry of indexed) {
+      if (entry.systemId === systemId && entry.stationPoiId === stationPoiId && entry.sellOrders.length > 0) {
+        entry.sellOrders = [];
+      }
+    }
+  }
+}
+
 /** How many item/station observations the live overlay currently holds. */
 export function getLocalMarketOverlaySize(): { items: number; entries: number } {
   let entries = 0;

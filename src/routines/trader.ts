@@ -34,6 +34,11 @@ import {
   checkBattleAfterCommand,
   getBattleStatus,
   fleeFromBattle,
+  isFuelCellItem,
+  getCargoFuelCells,
+  ensureFuelCellReserve,
+  estimateRouteFuel,
+  readPurchaseEstimate,
   type BattleState,
 } from "./common.js";
 import {
@@ -63,6 +68,7 @@ import {
   type UnsoldItem,
 } from "./unsoldItems.js";
 import { queryRemoteMarket, getMarketSourceInfo, resolveMarketSource } from "../client_sync_hooks.js";
+import { noteLocalMarketUnavailable } from "../market_local_source.js";
 
 // ── CSV Logging ─────────────────────────────────────────────────
 
@@ -332,6 +338,8 @@ function parseListPassengers(result: unknown): { passengers: AboardPassenger[]; 
 const TRADER_WORKING_BALANCE = 200_000;
 /** Buffer above working balance before depositing excess to faction storage. */
 const TRADER_DEPOSIT_THRESHOLD = 210_000;
+/** Fuel per jump assumed only when `find_route` can't tell us the real number. */
+const TRADER_FALLBACK_FUEL_PER_JUMP = 10;
 
 /**
  * Check if the bot can afford a trade route, including potential withdrawal from storage.
@@ -2999,87 +3007,65 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Verify item is actually available via estimate_purchase
+      // Verify item is actually available via estimate_purchase.
+      // NOTE: this command answers `available: 0` (no error!) when nobody is
+      // selling, so the number has to be read — checking `.error` alone let
+      // ghost listings through and the buy then failed at the far end.
       yield "verify_availability";
       const estResp = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
-      if (estResp.error) {
+      const estParsed = readPurchaseEstimate(estResp.result);
+      if (estResp.error || estParsed.available <= 0) {
         failedSources.add(sourceKey);
         mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
-        ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (stale data) — trying next route`);
+        noteLocalMarketUnavailable(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+        const why = estResp.error
+          ? estResp.error.message
+          : `market reports 0 available${estParsed.message ? ` (${estParsed.message})` : ""}`;
+        ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName}: ${why} — trying next route`);
         releaseTradeLock(bot.username, candidate.itemId, "aborted:item_not_available");
         pendingLockItemId = null;
         pendingLockReleased = true;
         continue;
       }
 
-      // Emergency fuel reserve — ship starts fully fueled, ensureFueled docks at
-      // stations along the route. Cells are only for systems with no station.
-      // ~1 cell per 4 jumps is plenty, min 3, max 10% of cargo.
-      const maxFuelSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
-      const RESERVE_FUEL_CELLS = Math.min(Math.max(3, Math.ceil(candidate.jumps / 4)), maxFuelSlots);
-
-      // Clear cargo: keep fuel cells + trade item, deposit everything else
+      // Clear cargo: keep fuel cells + trade item, deposit everything else.
+      //
+      // Fuel cells are NEVER deposited here. They are the emergency reserve, they
+      // are free out of faction storage at home, and dumping them at a remote
+      // station used to strand the ship with a "3 cells" count that ignored the
+      // fact that a military cell carries 100 fuel and a plain one carries 20.
       await bot.refreshCargo();
       const depositSummary: string[] = [];
       for (const item of [...bot.inventory]) {
         if (item.itemId === candidate.itemId) continue; // keep the item we're about to buy
-        const lower = item.itemId.toLowerCase();
-        const isFuel = lower.includes("fuel") || lower.includes("energy_cell");
-        if (isFuel) {
-          const excess = item.quantity - RESERVE_FUEL_CELLS;
-          if (excess > 0) {
-            //await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
-            await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
-            depositSummary.push(`${excess}x ${item.name}`);
-          }
-        } else {
-          //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-          await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
-          depositSummary.push(`${item.quantity}x ${item.name}`);
-        }
+        if (isFuelCellItem(item.itemId)) continue;      // keep the fuel reserve
+        //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
+        depositSummary.push(`${item.quantity}x ${item.name}`);
       }
       if (depositSummary.length > 0) {
         ctx.log("trade", `Cleared cargo: ${depositSummary.join(", ")}`);
       }
 
-      // Ensure we have enough fuel cells for the route + return home (exact calc)
+      // ── Emergency fuel reserve for the trip home, in FUEL, not cell count ──
+      // The ship starts fueled and ensureFueled docks at stations along the way;
+      // cells only have to cover systems with no station. `find_route` knows this
+      // ship's real burn, so ask it instead of guessing "1 cell per 4 jumps".
       await bot.refreshCargo();
       await bot.refreshLocation();
-      let fuelInCargo = 0;
-      for (const item of bot.inventory) {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-      }
-      let needed = RESERVE_FUEL_CELLS;
-      try {
-        const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
-        if (r?.estimated_fuel && r?.fuel_available) {
-          const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
-          needed = Math.ceil(deficit / 20); // regular fuel_cell = 20 fuel
-          ctx.log("trade", `Exact return fuel: need ${needed} cells (${deficit} fuel deficit)`);
-        }
-      } catch {}
-      if (fuelInCargo < needed) {
-        const isAtHome = homeSystem && bot.system === homeSystem;
-        let stillNeeded = needed - fuelInCargo;
-        if (isAtHome) {
-          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-          if (!prem.error) stillNeeded = Math.max(0, stillNeeded - 50);
-          if (stillNeeded > 0) {
-            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
-            if (!reg.error) stillNeeded = 0;
-          }
-          if (stillNeeded <= 0) ctx.log("trade", `Withdrew fuel cells from faction storage`);
-        }
-        if (stillNeeded > 0) {
-          const freeSpace = getFreeSpace(bot);
-          const buyQty = Math.min(Math.ceil(stillNeeded / 20), maxItemsForCargo(freeSpace, "fuel_cell"));
-          if (buyQty > 0) {
-            ctx.log("trade", `Buying ${buyQty} fuel cells for return trip (last resort)`);
-            await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
-          }
-        }
-      }
+      const routeHome = await estimateRouteFuel(ctx, homeSystem);
+      const tripFuelHome = routeHome?.estimatedFuel ?? candidate.jumps * TRADER_FALLBACK_FUEL_PER_JUMP;
+      const tankFuelHome = routeHome?.fuelAvailable ?? bot.fuel;
+      const carriedCells = getCargoFuelCells(bot);
+      ctx.log(
+        "trade",
+        `Return fuel: route needs ~${Math.round(tripFuelHome)}, tank has ${tankFuelHome}, cargo cells hold ${carriedCells.fuel} (${carriedCells.summary})`,
+      );
+      await ensureFuelCellReserve(ctx, {
+        // 25% margin for reroutes around blacklists / blocked gates.
+        fuelNeeded: Math.max(0, Math.ceil(tripFuelHome * 1.25) - tankFuelHome),
+        reason: `return to ${homeSystem || "home"}`,
+      });
 
       // Check if we already have the trade item in cargo (kept during clear)
       await bot.refreshCargo();

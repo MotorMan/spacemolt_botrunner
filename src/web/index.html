@@ -16946,6 +16946,7 @@
         const afterburnerFuelBuffer = t.afterburnerFuelBuffer ?? 2;
         const afterburnerMinFuelCells = t.afterburnerMinFuelCells ?? 10;
         const afterburnerMinJumps = t.afterburnerMinJumps ?? 1;
+        const afterburnerMinFillRatio = t.afterburnerMinFillRatio ?? 0.5;
 
         // Category trade settings with defaults
         const categoryTrade = t.categoryTrade || [];
@@ -17269,6 +17270,14 @@
       </div>
       <input type="number" id="set-faction_trader-afterburnerMinJumps" min="0" max="50" value="${afterburnerMinJumps}">
     </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Cargo Fill (boosted)</div>
+        <div class="setting-hint">When a trip runs boosted, only accept a deal that fills at least this fraction of the cargo hold (0.5 = half). Below that the speed boost burns fuel for a loss, so the bot waits for a fatter deal. 0 disables the gate.</div>
+      </div>
+      <input type="number" id="set-faction_trader-afterburnerMinFillRatio" min="0" max="1" step="0.05" value="${afterburnerMinFillRatio}">
+    </div>
     </div>
 
     <div class="settings-save-bar">
@@ -17516,6 +17525,17 @@
               document.getElementById("set-faction_trader-afterburnerMinJumps")
                 .value,
             ) || 0,
+          ),
+          afterburnerMinFillRatio: Math.max(
+            0,
+            Math.min(
+              1,
+              parseFloat(
+                document.getElementById(
+                  "set-faction_trader-afterburnerMinFillRatio",
+                ).value,
+              ) || 0,
+            ),
           ),
         };
         send({ type: "saveSettings", routine: "faction_trader", settings: s });

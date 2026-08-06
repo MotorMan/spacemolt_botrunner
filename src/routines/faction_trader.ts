@@ -87,6 +87,8 @@ const DEFAULT_AFTERBURNER_JUMPS_PER_FUEL = 1;
 const DEFAULT_AFTERBURNER_FUEL_BUFFER = 2;
 const DEFAULT_AFTERBURNER_MIN_FUEL_CELLS = 10;
 const DEFAULT_AFTERBURNER_MIN_JUMPS = 1;
+/** A boosted trip must fill at least this fraction of the cargo hold to be worth the fuel. 0 disables the gate. */
+const DEFAULT_AFTERBURNER_MIN_FILL_RATIO = 0.5;
 
 function getFactionTraderSettings(username?: string): {
   homeSystem: string;
@@ -109,6 +111,7 @@ function getFactionTraderSettings(username?: string): {
   afterburnerFuelBuffer: number;
   afterburnerMinFuelCells: number;
   afterburnerMinJumps: number;
+  afterburnerMinFillRatio: number;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -180,6 +183,8 @@ function getFactionTraderSettings(username?: string): {
       (t.afterburnerMinFuelCells as number) ?? DEFAULT_AFTERBURNER_MIN_FUEL_CELLS,
     afterburnerMinJumps:
       (t.afterburnerMinJumps as number) ?? DEFAULT_AFTERBURNER_MIN_JUMPS,
+    afterburnerMinFillRatio:
+      (t.afterburnerMinFillRatio as number) ?? DEFAULT_AFTERBURNER_MIN_FILL_RATIO,
   };
 }
 
@@ -1627,8 +1632,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // Use existing route if recovered session is being handled, otherwise pick the best found route
     if (!recoveredSessionHandled) {
       ctx.log("trade", `Found ${foundRoutes.length} routes, selecting best available`);
-      
-      // Iterate through found routes to find one with an available lock
+
+      // Detect the afterburner module once (cached 5 min in afterburner.ts) so
+      // we can apply the boosted-trip minimum-fill gate below without spamming
+      // get_ship for every candidate route.
+      const abModule = await detectAfterburnerModule(ctx);
+      const minFillRatio = settings.afterburnerMinFillRatio;
+
+      // Iterate through found routes to find one with an available lock that
+      // also satisfies the afterburner minimum-fill rule.
       for (const candidateRoute of foundRoutes) {
         // Verify destination is still valid
         if (!isValidDestination(ctx, candidateRoute.destSystem, candidateRoute.destPoi)) {
@@ -1644,13 +1656,36 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           continue;
         }
 
+        // Afterburner fill gate: a boosted trip must actually use the cargo, or
+        // the speed boost burns expensive fuel for a loss. When the module is
+        // fitted (or forced on) and this route would run boosted, only accept it
+        // if the trade goods fill at least `minFillRatio` of the hold — otherwise
+        // wait for a fatter deal.
+        if (minFillRatio > 0) {
+          const plan = planAfterburnerTrip(abModule, {
+            mode: settings.afterburnerMode,
+            roundTripJumps: candidateRoute.roundTripJumps,
+            jumpsPerFuel: settings.afterburnerJumpsPerFuel,
+            fuelBuffer: settings.afterburnerFuelBuffer,
+            minMilitaryFuelCells: settings.afterburnerMinFuelCells,
+            minJumpsToBoost: settings.afterburnerMinJumps,
+          });
+          if (plan.boost) {
+            const fill = cargoCapacity > 0 ? candidateRoute.sellQty / cargoCapacity : 1;
+            if (fill < minFillRatio) {
+              ctx.log("trade", `Skipping ${candidateRoute.itemName} → ${candidateRoute.destPoiName}: boosted trip fills only ${Math.round(fill * 100)}% of cargo (min ${Math.round(minFillRatio * 100)}%)`);
+              continue;
+            }
+          }
+        }
+
         route = candidateRoute;
         ctx.log("trade", `Selected route: ${route.itemName} (${Math.round(route.totalProfit)}cr profit)`);
         break;
       }
-      
+
       if (!route) {
-        ctx.log("trade", "All found routes have locked buy orders — waiting 60s");
+        ctx.log("trade", "No eligible route this cycle — every boosted candidate fills less than the minimum or buy orders are locked; waiting 60s for a fatter deal");
         await ctx.sleep(60000);
         continue;
       }

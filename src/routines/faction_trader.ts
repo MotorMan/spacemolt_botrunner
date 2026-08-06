@@ -932,6 +932,65 @@ function findFactionSellRoutes(
   return routes;
 }
 
+// ── Faction membership detection ─────────────────────────────
+
+/**
+ * The server phrases "you have no faction" in several different ways
+ * ("You must be in a faction to ...", "not_in_faction", "You are not in a
+ * faction", ...). Matching them in one place matters: a missed match silently
+ * flips the whole routine into the wrong storage mode for a full cycle.
+ */
+const NOT_IN_FACTION_RE = /not[\s_]?in[\s_]?(a[\s_])?faction|must be in a faction|not a member of (a |any )?faction/i;
+
+/**
+ * Decide whether this cycle trades out of faction storage or personal storage.
+ *
+ * Faction membership is a property of the PLAYER, not of where the ship happens
+ * to be parked, and `get_status` already carries `faction_id` — so being
+ * undocked is never evidence of "not in a faction".
+ *
+ * The previous implementation assumed personal mode whenever the bot was not
+ * docked yet, and the post-dock re-check only ever *reassigned* that flag when
+ * the storage probe returned an error. A successful probe left the stale
+ * assumption untouched, so a bot restarted in open space stayed in "PERSONAL
+ * MODE" for the entire cycle — ignoring a full faction storage, finding nothing
+ * to sell, and flying home for no reason.
+ */
+async function detectFactionMode(
+  ctx: RoutineContext,
+): Promise<{ personalMode: boolean; factionError: string | null; probed: boolean }> {
+  const { bot } = ctx;
+
+  // get_status is authoritative and works while undocked. Only re-poll when we
+  // have no cached membership so a genuinely factionless bot doesn't spam it.
+  if (!bot.faction) await bot.refreshStatus();
+
+  if (bot.docked) {
+    // Docked: probe faction storage too. It confirms membership AND surfaces
+    // "this station has no faction storage", which the caller handles
+    // separately by heading home.
+    const factionResp = await bot.exec("storage", { action: "view", target: "faction" });
+    if (!factionResp.error) {
+      const result = (factionResp.result ?? {}) as Record<string, unknown>;
+      const factionId = result.faction_id as string | undefined;
+      if (factionId && !bot.faction) bot.faction = factionId;
+      return { personalMode: false, factionError: null, probed: true };
+    }
+    const message = factionResp.error.message || "";
+    if (factionResp.error.code === "not_in_faction" || NOT_IN_FACTION_RE.test(message)) {
+      return { personalMode: true, factionError: message, probed: true };
+    }
+    // Any other failure (no faction storage at this station, rate limit,
+    // transport hiccup) says nothing about membership — keep what get_status
+    // told us rather than silently downgrading to personal storage.
+    return { personalMode: !bot.faction, factionError: message, probed: true };
+  }
+
+  // Undocked: no storage probe is possible, so get_status is all we have and
+  // the caller must re-check once it has docked.
+  return { personalMode: !bot.faction, factionError: null, probed: false };
+}
+
 // ── Main routine ─────────────────────────────────────────────
 
 export const factionTraderRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -1021,30 +1080,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     // ── Detect faction membership early ──
-    // Check if bot is in a faction by attempting to view faction storage
-    // Distinguish between "not in faction" and "no faction storage at this station"
-    let personalMode = false;
-    let factionError: string | null = null;
-    if (bot.docked) {
-      //const factionResp = await bot.exec("view_storage", { target: "faction" });
-      const factionResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human!
-      if (!factionResp.error) {
-        // Set faction if not set
-        const result = factionResp.result as any;
-        if (result.faction_id && !bot.faction) {
-          bot.faction = result.faction_id;
-        }
-      }
-      if (factionResp.error) {
-        factionError = factionResp.error.message || "";
-        // Only use personal mode if bot is truly not in a faction
-        personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");
-      }
-    } else {
-      // Not docked - can't check faction storage yet, assume personal mode
-      // Will re-check after docking
-      personalMode = true;
-    }
+    // Membership comes from get_status (works undocked); when docked we also
+    // probe faction storage so `factionError` can distinguish "not in a
+    // faction" from "this station holds no faction storage".
+    const initialMode = await detectFactionMode(ctx);
+    let personalMode = initialMode.personalMode;
+    let factionError: string | null = initialMode.factionError;
+    /** True once the docked faction-storage probe has run for this station. */
+    let factionModeProbed = initialMode.probed;
 
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);
@@ -1103,6 +1146,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     let recoveredSessionHandled = false;
     let route: FactionSellRoute | null = null;
     let withdrawQty = 0;
+    /** Cargo is already loaded with sellable goods — sell that before planning anything new. */
+    let pendingCargoRecovery = false;
 
     // ── Always prioritize pending cargo or active session on restart ──
     // This prevents using stale cached storage data when we're not at home.
@@ -1116,6 +1161,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       clearFactionStorageCache();
       bot.factionStorage = [];
       recoveredSessionHandled = false;
+      // Emptying bot.factionStorage used to be the only thing stopping the
+      // storage planner from starting a brand new trade on top of a full hold.
+      // That "worked" only while the bot was wrongly stuck in personal mode;
+      // with faction mode correctly detected away from home, the planner would
+      // happily pick a route out of the home hub's storage and then fail to
+      // withdraw anything at the station we're actually docked at. Selling what
+      // we're already carrying comes first — always.
+      pendingCargoRecovery = true;
     }
 
     // ── Handle recovered session ──
@@ -1349,29 +1402,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       yield "dock";
       await ensureDocked(ctx);
 
-      // Re-check faction membership after docking (if we started undocked)
-      if (!bot.docked) {
-        // Docking failed, keep personalMode assumption
-      } else if (personalMode) {
-        // We assumed personal mode because we were undocked - now re-check
-        //const factionResp = await bot.exec("view_storage", { target: "faction" });
-        const factionResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human! should view faction storage.
-        if (!factionResp.error) {
-          // Set faction if not set
-          const result = factionResp.result as any;
-          if (result.faction_id && !bot.faction) {
-            bot.faction = result.faction_id;
-          }
+      // Re-check faction membership now that we're docked: only here can the
+      // probe also report whether THIS station holds faction storage. Skipped
+      // when the cycle already started docked (same station, same answer).
+      // Both values are always reassigned — the old code only updated them when
+      // the probe failed, so a successful probe left a stale personal-mode
+      // assumption in place for the rest of the cycle.
+      if (bot.docked && !factionModeProbed) {
+        const recheck = await detectFactionMode(ctx);
+        if (recheck.personalMode !== personalMode) {
+          ctx.log("trade", recheck.personalMode
+            ? `PERSONAL MODE: Bot is not in a faction, using personal storage`
+            : `FACTION MODE: faction membership confirmed after docking, using faction storage`);
         }
-        if (factionResp.error) {
-          factionError = factionResp.error.message || "";
-          personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");
-        } else {
-          factionError = null;
-        }
-        ctx.log("trade", personalMode
-          ? `PERSONAL MODE: Bot is not in a faction, using personal storage`
-          : `FACTION MODE: Bot is in a faction, using faction storage`);
+        personalMode = recheck.personalMode;
+        factionError = recheck.factionError;
+        factionModeProbed = recheck.probed;
       }
 
       // ── Maintenance ──
@@ -1443,8 +1489,30 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await ensureDocked(ctx);
     }
 
+    // Last chance to settle the storage mode before we act on it. Recovery
+    // paths skip the dock phase entirely, so a cycle that began undocked can
+    // reach this point with nothing but the get_status guess — and picking the
+    // wrong storage here is what sends a faction bot home empty-handed.
+    if (bot.docked && !factionModeProbed) {
+      const recheck = await detectFactionMode(ctx);
+      if (recheck.personalMode !== personalMode) {
+        ctx.log("trade", recheck.personalMode
+          ? `PERSONAL MODE: Bot is not in a faction, using personal storage`
+          : `FACTION MODE: faction membership confirmed after docking, using faction storage`);
+      }
+      personalMode = recheck.personalMode;
+      factionError = recheck.factionError;
+      factionModeProbed = recheck.probed;
+    }
+
     // Refresh storage based on mode
-    if (personalMode) {
+    if (pendingCargoRecovery) {
+      // Nothing to plan out of storage: the hold is already loaded and the only
+      // job this cycle is finding it a buyer. Skipping the read also skips the
+      // "no faction storage at this station — head home" detour below, which
+      // must never outrank selling cargo we are already carrying.
+      ctx.log("trade", `${personalMode ? "PERSONAL" : "FACTION"} MODE: cargo recovery — selling the loaded hold before touching storage`);
+    } else if (personalMode) {
       await bot.refreshStorage();
       ctx.log("trade", `PERSONAL MODE: Bot is not in a faction, using personal storage`);
     } else {
@@ -1497,7 +1565,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
     if (settings.useRemoteMarketQuery !== false) {
       const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
-      const uniqueItems = Array.from(new Set(storageItems)).slice(0, 20);
+      // When recovering a loaded hold the storage list is irrelevant — the
+      // items that need a buyer are the ones already in cargo. map.json can be
+      // minutes behind the real market (and is still syncing right after a
+      // restart), which is exactly how a full hold ends up "no buyers found".
+      const cargoItems = pendingCargoRecovery ? pendingCargo.map(i => i.itemId) : [];
+      const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
       const marketSource = await resolveMarketSource();
       if (uniqueItems.length > 0 && marketSource.mode === "none") {
         ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
@@ -1531,7 +1604,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       }
     }
 
-    const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode, remoteBuyDemand);
+    // A hold that still contains goods always outranks a new trade: withdrawing
+    // more items at a station we only stopped at by accident either overfills
+    // the hold or fails outright (faction storage is per-station).
+    const foundRoutes = pendingCargoRecovery
+      ? []
+      : findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode, remoteBuyDemand);
 
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group
@@ -1558,8 +1636,11 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       
       if (nonFuelCargo.length > 0) {
         ctx.log("trade", `Found ${nonFuelCargo.length} item(s) in cargo — finding buyers for recovery`);
-        // Find best buyers for cargo items
-        const allBuys = mapStore.getAllBuyDemand();
+        // Find best buyers for cargo items. Include the market-source demand:
+        // map.json alone is often stale or incompletely synced right after a
+        // restart, and a hold full of goods must not be written off as
+        // "unsellable" just because the local map hasn't caught up yet.
+        const allBuys = [...mapStore.getAllBuyDemand(), ...remoteBuyDemand];
         const cargoRoutes: FactionSellRoute[] = [];
         const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
         
@@ -1567,25 +1648,33 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const itemConfig = settings.tradeItems.find(t => t.itemId === item.itemId);
           const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
 
-          const buyers = allBuys
+          const knownBuyers = allBuys
             .filter(b => b.itemId === item.itemId && b.price > 0 && b.quantity > 0)
-            .filter(b => itemMinSellPrice === 0 || b.price >= itemMinSellPrice)
             .sort((a, b) => b.price - a.price);
+          const buyers = knownBuyers.filter(b => itemMinSellPrice === 0 || b.price >= itemMinSellPrice);
 
           if (buyers.length === 0) {
+            // Say WHY there is no buyer: "market has nobody buying this" and
+            // "the price is too low" are very different problems, and so is
+            // "we know of no buy orders at all" (stale/unsynced market data).
+            const best = knownBuyers[0];
+            const known = best
+              ? `best of ${knownBuyers.length} known buy order(s): ${best.price}cr at ${best.poiName} (${best.systemId})`
+              : `no buy orders known for this item — market data may be stale or still syncing`;
             if (itemMinSellPrice > 0) {
-              ctx.log("trade", `No buyers meet min price (${itemMinSellPrice}cr) for ${item.quantity}x ${item.name} in cargo`);
+              ctx.log("trade", `No buyers meet min price (${itemMinSellPrice}cr) for ${item.quantity}x ${item.name} in cargo — ${known}`);
             } else {
-              ctx.log("trade", `No buyers found for ${item.quantity}x ${item.name} in cargo`);
+              ctx.log("trade", `No buyers found for ${item.quantity}x ${item.name} in cargo — ${known}`);
             }
             continue;
           }
 
-          const bestBuyer = buyers[0];
-
-          // Verify destination is a valid station with a market
-          if (!isValidDestination(ctx, bestBuyer.systemId, bestBuyer.poiId)) {
-            ctx.log("trade", `Skipping ${bestBuyer.poiName} (${bestBuyer.poiId}) in ${bestBuyer.systemId}: invalid destination`);
+          // Walk the buyers in price order instead of giving up on the item as
+          // soon as the single best buyer turns out to be blacklisted/unknown.
+          // Capped so a run of rejects can't spam the log with red errors.
+          const bestBuyer = buyers.slice(0, 10).find(b => isValidDestination(ctx, b.systemId, b.poiId));
+          if (!bestBuyer) {
+            ctx.log("trade", `No valid destination among the top ${Math.min(buyers.length, 10)} of ${buyers.length} buyer(s) for ${item.quantity}x ${item.name} in cargo`);
             continue;
           }
 
@@ -1634,7 +1723,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
       const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
         if (!atHome) {
-          ctx.log("trade", `No ${storageType} storage items to sell — returning home to check ${storageType} storage`);
+          ctx.log("trade", pendingCargoRecovery
+            ? `No buyer for the cargo we're carrying — returning home to stow it in ${storageType} storage`
+            : `No ${storageType} storage items to sell — returning home to check ${storageType} storage`);
           yield "return_home";
           if (homeSystem && bot.system !== homeSystem) {
             await ensureUndocked(ctx);

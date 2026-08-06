@@ -16941,6 +16941,11 @@
         const disableCreditDeposit = t.disableCreditDeposit ?? false;
         const autoCloak = t.autoCloak ?? true;
         const ignorePiratesWhenCloaked = t.ignorePiratesWhenCloaked ?? true;
+        const afterburnerMode = t.afterburnerMode ?? "auto";
+        const afterburnerJumpsPerFuel = t.afterburnerJumpsPerFuel ?? 1;
+        const afterburnerFuelBuffer = t.afterburnerFuelBuffer ?? 2;
+        const afterburnerMinFuelCells = t.afterburnerMinFuelCells ?? 10;
+        const afterburnerMinJumps = t.afterburnerMinJumps ?? 1;
 
         // Category trade settings with defaults
         const categoryTrade = t.categoryTrade || [];
@@ -17217,6 +17222,55 @@
       </select>
     </div>
 
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🔥 Afterburner Boost</div>
+      <div class="setting-hint" style="margin-bottom:12px">Burns <code>afterburner_fuel</code> before each jump for a +100% speed buff (3 ticks). A Speed 3 hull becomes Speed 6, cutting jump time from ~40s to ~10s (~20s including the tick spent using the item). Only enough fuel for the planned round trip is withdrawn. Boosted jumps burn far more ship fuel, so the bot also loads extra military fuel cells.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Afterburner Mode</div>
+        <div class="setting-hint"><b>Auto (recommended)</b>: only boost when an Afterburner module is detected on the ship and it is not already Speed 6 — safe to enable fleet-wide. <b>Always</b>: boost every cross-system trade regardless of fitting. <b>Never</b>: disabled.</div>
+      </div>
+      <select id="set-faction_trader-afterburnerMode">
+        <option value="auto" ${afterburnerMode === "auto" ? "selected" : ""}>Auto (detect module)</option>
+        <option value="always" ${afterburnerMode === "always" ? "selected" : ""}>Always</option>
+        <option value="never" ${afterburnerMode === "never" ? "selected" : ""}>Never</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Jumps Per Afterburner Fuel</div>
+        <div class="setting-hint">How many jumps one unit is expected to cover. The buff lasts 3 ticks and a boosted jump takes 1 tick, so 1 (burn one per jump) is safest and 2 rides a single buff across two jumps to halve fuel use.</div>
+      </div>
+      <input type="number" id="set-faction_trader-afterburnerJumpsPerFuel" min="1" max="3" value="${afterburnerJumpsPerFuel}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Afterburner Fuel Buffer</div>
+        <div class="setting-hint">Spare units withdrawn on top of the round-trip requirement, covering reroutes and jump retries. Leftovers are deposited back on return.</div>
+      </div>
+      <input type="number" id="set-faction_trader-afterburnerFuelBuffer" min="0" max="50" value="${afterburnerFuelBuffer}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Military Fuel Cells (boosted trips)</div>
+        <div class="setting-hint">Minimum <code>military_fuel_cell</code> count loaded before a boosted run, to cover the much higher fuel burn at Speed 6. Sized up automatically for long routes (round-trip jumps + 2).</div>
+      </div>
+      <input type="number" id="set-faction_trader-afterburnerMinFuelCells" min="0" max="200" value="${afterburnerMinFuelCells}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Jumps To Boost</div>
+        <div class="setting-hint">Skip the boost on round trips shorter than this many jumps, so short hops do not waste afterburner fuel. 0 = always boost.</div>
+      </div>
+      <input type="number" id="set-faction_trader-afterburnerMinJumps" min="0" max="50" value="${afterburnerMinJumps}">
+    </div>
+    </div>
+
     <div class="settings-save-bar">
       <button class="secondary" onclick="resetAllFactionTradeSold()">↺ Reset All Sold Counts</button>
       <button class="primary" onclick="saveFactionTraderSettings()">Save Settings</button>
@@ -17432,6 +17486,37 @@
               .value === "true",
           useRemoteMarketQuery:
             document.getElementById("set-faction_trader-useRemoteMarketQuery").value === "true",
+          afterburnerMode: document.getElementById(
+            "set-faction_trader-afterburnerMode",
+          ).value,
+          afterburnerJumpsPerFuel:
+            parseInt(
+              document.getElementById(
+                "set-faction_trader-afterburnerJumpsPerFuel",
+              ).value,
+            ) || 1,
+          afterburnerFuelBuffer: Math.max(
+            0,
+            parseInt(
+              document.getElementById("set-faction_trader-afterburnerFuelBuffer")
+                .value,
+            ) || 0,
+          ),
+          afterburnerMinFuelCells: Math.max(
+            0,
+            parseInt(
+              document.getElementById(
+                "set-faction_trader-afterburnerMinFuelCells",
+              ).value,
+            ) || 0,
+          ),
+          afterburnerMinJumps: Math.max(
+            0,
+            parseInt(
+              document.getElementById("set-faction_trader-afterburnerMinJumps")
+                .value,
+            ) || 0,
+          ),
         };
         send({ type: "saveSettings", routine: "faction_trader", settings: s });
         settings.faction_trader = s;

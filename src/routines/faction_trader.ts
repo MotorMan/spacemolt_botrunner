@@ -51,6 +51,16 @@ import {
   getBattleStatus,
   fleeFromBattle,
 } from "./common.js";
+import {
+  AfterburnerBooster,
+  type AfterburnerMode,
+  type AfterburnerTripPlan,
+  detectAfterburnerModule,
+  isAfterburnerFuelItem,
+  parseAfterburnerMode,
+  planAfterburnerTrip,
+  stockAfterburnerConsumables,
+} from "./afterburner.js";
 import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -72,6 +82,12 @@ const DEFAULT_CATEGORY_SELL_PERCENT = 50;
 const DEFAULT_CATEGORY_PRICE_PERCENT = 25;
 const FACTION_TRADER_DEFAULT_MIN_PRICE = 969696;
 
+/** Defaults for the afterburner boost (see routines/afterburner.ts). */
+const DEFAULT_AFTERBURNER_JUMPS_PER_FUEL = 1;
+const DEFAULT_AFTERBURNER_FUEL_BUFFER = 2;
+const DEFAULT_AFTERBURNER_MIN_FUEL_CELLS = 10;
+const DEFAULT_AFTERBURNER_MIN_JUMPS = 1;
+
 function getFactionTraderSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
@@ -88,6 +104,11 @@ function getFactionTraderSettings(username?: string): {
   useRemoteMarketQuery: boolean;
   autoCloak: boolean;
   ignorePiratesWhenCloaked: boolean;
+  afterburnerMode: AfterburnerMode;
+  afterburnerJumpsPerFuel: number;
+  afterburnerFuelBuffer: number;
+  afterburnerMinFuelCells: number;
+  afterburnerMinJumps: number;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -144,6 +165,21 @@ function getFactionTraderSettings(username?: string): {
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
     autoCloak: (t.autoCloak as boolean) ?? true,
     ignorePiratesWhenCloaked: (t.ignorePiratesWhenCloaked as boolean) ?? true,
+    // Afterburner boost — per-bot override wins so a fleet can mix boosted and
+    // unboosted hulls without splitting the shared faction_trader profile.
+    afterburnerMode: parseAfterburnerMode(
+      botOverrides.afterburnerMode ?? t.afterburnerMode ?? "auto",
+    ),
+    afterburnerJumpsPerFuel:
+      (botOverrides.afterburnerJumpsPerFuel as number)
+      || (t.afterburnerJumpsPerFuel as number)
+      || DEFAULT_AFTERBURNER_JUMPS_PER_FUEL,
+    afterburnerFuelBuffer:
+      (t.afterburnerFuelBuffer as number) ?? DEFAULT_AFTERBURNER_FUEL_BUFFER,
+    afterburnerMinFuelCells:
+      (t.afterburnerMinFuelCells as number) ?? DEFAULT_AFTERBURNER_MIN_FUEL_CELLS,
+    afterburnerMinJumps:
+      (t.afterburnerMinJumps as number) ?? DEFAULT_AFTERBURNER_MIN_JUMPS,
   };
 }
 
@@ -547,6 +583,69 @@ async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
   return true;
 }
 
+// ── Afterburner boost ────────────────────────────────────────
+
+/**
+ * Decide whether this trip runs boosted, and how many consumables it needs.
+ *
+ * Detection-first: unless the mode is forced to "always"/"never" the bot only
+ * boosts when an afterburner utility module is actually fitted, so a shared
+ * faction_trader profile can be enabled fleet-wide without breaking traders
+ * that have no module (or already fly Speed 6 hulls).
+ */
+async function planTripAfterburner(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getFactionTraderSettings>,
+  roundTripJumps: number,
+): Promise<AfterburnerTripPlan> {
+  const module = await detectAfterburnerModule(ctx);
+  const plan = planAfterburnerTrip(module, {
+    mode: settings.afterburnerMode,
+    roundTripJumps,
+    jumpsPerFuel: settings.afterburnerJumpsPerFuel,
+    fuelBuffer: settings.afterburnerFuelBuffer,
+    minMilitaryFuelCells: settings.afterburnerMinFuelCells,
+    minJumpsToBoost: settings.afterburnerMinJumps,
+  });
+
+  if (plan.boost) {
+    ctx.log(
+      "trade",
+      `Afterburner boost ON — ${plan.reason}; needs ${plan.fuelUnitsNeeded}x afterburner fuel ` +
+      `and ${plan.militaryFuelCellsNeeded}x military fuel cells for ${roundTripJumps} round-trip jump(s)`,
+    );
+  } else {
+    ctx.log("trade", `Afterburner boost off — ${plan.reason}`);
+  }
+  return plan;
+}
+
+/**
+ * Build the booster for a leg using whatever afterburner fuel is already in
+ * cargo. Used when resuming an interrupted session away from home, where we
+ * cannot withdraw anything.
+ */
+async function boosterFromCargo(
+  ctx: RoutineContext,
+  plan: AfterburnerTripPlan,
+): Promise<AfterburnerBooster | null> {
+  const { bot } = ctx;
+  if (!plan.boost) return null;
+
+  await bot.refreshCargo();
+  const units = bot.inventory.find(i => isAfterburnerFuelItem(i.itemId))?.quantity ?? 0;
+  if (units <= 0) {
+    ctx.log("trade", "Afterburner boost off — no afterburner fuel in cargo for this leg");
+    return null;
+  }
+  ctx.log("trade", `Afterburner boost ON — ${units}x afterburner fuel already in cargo`);
+  return new AfterburnerBooster(ctx, {
+    enabled: true,
+    jumpsPerFuel: plan.jumpsPerFuel,
+    unitsInCargo: units,
+  });
+}
+
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number = 50): { jumps: number; cost: number } {
   const blacklist = getSystemBlacklist();
@@ -935,12 +1034,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await enableCloakingIfPossible(ctx);
     }
 
+    // ── Afterburner boost ──
+    // `abBooster` is created once the trip is planned (see below) and burns one
+    // afterburner_fuel before each jump, doubling ship speed. Every
+    // navigateToSystem() call in this routine goes through `safetyOpts`, so the
+    // hook below covers the outbound leg, the return leg and every recovery path.
+    let abBooster: AfterburnerBooster | null = null;
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
       ignoreBlacklistWhenCloaked: settings.autoCloak,
+      onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+        if (abBooster) await abBooster.beforeJump(nextSystem, jumpNumber);
+      },
     };
     let recoveredSessionHandled = false;
     let route: FactionSellRoute | null = null;
@@ -993,6 +1102,11 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         };
       withdrawQty = recoveredSession.quantityBought;
       recoveredSessionHandled = true;
+
+      // Afterburner: resuming away from home, so we can only use whatever
+      // afterburner fuel is still in cargo from the interrupted run.
+      const recoveryAbPlan = await planTripAfterburner(ctx, settings, route.roundTripJumps);
+      abBooster = await boosterFromCargo(ctx, recoveryAbPlan);
 
       // Skip dock/maintenance and go straight to travel
       await ensureUndocked(ctx);
@@ -1107,6 +1221,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             };
             withdrawQty = cargoQty;
             recoveredSessionHandled = true;
+
+            // Afterburner: reuse whatever afterburner fuel survived the interruption.
+            const buyingAbPlan = await planTripAfterburner(ctx, settings, route.roundTripJumps);
+            abBooster = await boosterFromCargo(ctx, buyingAbPlan);
 
             // Skip dock/maintenance and go straight to travel
             await ensureUndocked(ctx);
@@ -1990,19 +2108,50 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const isCargoRecovery = !!(existingCargoItem && existingCargoItem.quantity > 0);
       let qty = 0; // Declare at higher scope for session creation
 
+      // ── Afterburner plan for this round trip ──
+      // Planned BEFORE the cargo purge so the purge knows how much afterburner
+      // fuel and how many military fuel cells to keep aboard.
+      const abPlan = await planTripAfterburner(ctx, settings, route!.roundTripJumps);
+
       // For cargo recovery, skip clearing cargo and withdrawal - items are already in cargo
       if (!isCargoRecovery) {
         // Clear ALL cargo to make room — keep only fuel cells needed for the round trip
         await bot.refreshCargo();
         if (bot.inventory.length > 0) {
-          const fuelReserve = Math.max(3, route!.roundTripJumps + 2); // round trip + buffer
+          // Boosted jumps burn far more fuel (afterburner_ii is -60% fuel
+          // efficiency and fuel cost scales with speed), so a boosted run keeps
+          // a much deeper fuel-cell reserve.
+          const fuelReserve = abPlan.boost
+            ? Math.max(abPlan.militaryFuelCellsNeeded, route!.roundTripJumps + 2)
+            : Math.max(3, route!.roundTripJumps + 2); // round trip + buffer
+          // afterburner_fuel is a consumable, NOT a fuel cell — it must be
+          // reserved separately or it eats into the fuel-cell allowance (its
+          // item id contains "fuel", which the generic check below matches).
+          const abFuelReserve = abPlan.boost ? abPlan.fuelUnitsNeeded : 0;
           let fuelKept = 0;
+          let abFuelKept = 0;
           const deposited: string[] = [];
           for (const item of [...bot.inventory]) {
             if (item.quantity <= 0) continue;
             const lower = item.itemId.toLowerCase();
-            const isFuel = lower.includes("fuel") || lower.includes("energy_cell");
-            if (isFuel) {
+            const isAbFuel = isAfterburnerFuelItem(item.itemId);
+            const isFuel = !isAbFuel && (lower.includes("fuel") || lower.includes("energy_cell"));
+            if (isAbFuel) {
+              const keep = Math.min(item.quantity, Math.max(0, abFuelReserve - abFuelKept));
+              abFuelKept += keep;
+              const excess = item.quantity - keep;
+              if (excess <= 0) continue;
+              let dResp;
+              if (personalMode) {
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess });
+              } else {
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: excess });
+                if (dResp.error) {
+                  dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess });
+                }
+              }
+              deposited.push(`${excess}x ${item.name}`);
+            } else if (isFuel) {
               const keep = Math.min(item.quantity, Math.max(0, fuelReserve - fuelKept));
               fuelKept += keep;
               const excess = item.quantity - keep;
@@ -2040,11 +2189,28 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
           if (deposited.length > 0) {
             const storageType = personalMode ? "personal storage" : "storage";
-            ctx.log("trade", `Cleared cargo: ${deposited.join(", ")} → ${storageType} (kept ${fuelKept} fuel cells)`);
+            const abNote = abFuelKept > 0 ? `, ${abFuelKept} afterburner fuel` : "";
+            ctx.log("trade", `Cleared cargo: ${deposited.join(", ")} → ${storageType} (kept ${fuelKept} fuel cells${abNote})`);
           }
         }
         await bot.refreshCargo();
         await bot.refreshStatus();
+
+        // ── Stock afterburner consumables before loading trade goods ──
+        // Done first so the boost fuel and the deeper fuel-cell reserve are
+        // guaranteed a slot; the trade item then fills whatever remains.
+        if (abPlan.boost) {
+          const stocked = await stockAfterburnerConsumables(ctx, abPlan, { personalMode });
+          if (stocked.afterburnerFuel > 0) {
+            abBooster = new AfterburnerBooster(ctx, {
+              enabled: true,
+              jumpsPerFuel: abPlan.jumpsPerFuel,
+              unitsInCargo: stocked.afterburnerFuel,
+            });
+          }
+          await bot.refreshCargo();
+          await bot.refreshStatus();
+        }
 
         const freeSpace = getFreeSpace(bot);
         qty = Math.min(route!.sellQty, route!.availableQty, maxItemsForCargo(freeSpace, route!.itemId));
@@ -2099,6 +2265,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         }
         qty = inCargo.quantity;
         ctx.log("trade", `Cargo recovery: ${qty}x ${route!.itemName} in cargo — proceeding to destination`);
+        // Cargo recovery may be running from a non-home station where nothing
+        // can be withdrawn — boost with whatever afterburner fuel is aboard.
+        abBooster = await boosterFromCargo(ctx, abPlan);
       }
 
       // Create trade session for crash recovery
@@ -2408,6 +2577,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // Maintenance between runs
     yield "post_trade_maintenance";
+    if (abBooster && abBooster.usedUnits > 0) {
+      ctx.log("trade", `Afterburner run complete: ${abBooster.summary()}`);
+    }
     await ensureDocked(ctx);
     await tryRefuel(ctx);
     await repairShip(ctx);

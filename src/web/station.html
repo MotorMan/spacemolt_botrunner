@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ORBITAL_NET — Station Monitors</title>
+<link rel="stylesheet" href="/station.css" />
+</head>
+<body>
+<div class="atmos-bg"></div>
+<div class="grid-overlay"></div>
+
+<!-- Top bar -->
+<nav class="topbar">
+  <div class="brand">ORBITAL_NET_v4.0</div>
+  <div class="topbar-right">
+    <div class="counter-chip"><span class="pip pip-ok"></span><span id="cnt-ok">0 OK</span></div>
+    <div class="counter-chip"><span class="pip pip-alert"></span><span id="cnt-alert">0 ALERT</span></div>
+    <div class="counter-chip"><span class="pip pip-nodata"></span><span id="cnt-nodata">0 NO-DATA</span></div>
+    <button class="ghost-btn" id="refresh-btn" style="width:auto;padding:6px 14px;">REFRESH</button>
+    <button class="ghost-btn" id="rearrange-btn" style="width:auto;padding:6px 14px;">REARRANGE</button>
+    <button class="ghost-btn" id="settings-btn" style="width:auto;padding:6px 14px;">SETTINGS</button>
+  </div>
+</nav>
+
+<!-- Side rail -->
+<aside class="rail">
+  <div class="rail-section">
+    <nav class="rail-nav">
+      <a class="rail-link active" href="/">HUB Stations</a>
+      <a class="rail-link" href="#" id="rail-settings">Settings</a>
+    </nav>
+  </div>
+  <div class="rail-spacer"></div>
+  <div class="rail-footer">
+    <button class="ghost-btn" id="refresh-btn-2">REFRESH_SYSTEMS</button>
+  </div>
+</aside>
+
+<!-- Main workspace (grid mode) -->
+<main class="workspace scanline" id="workspace">
+  <div id="grid-view">
+    <header class="workspace-head">
+      <div>
+        <h1 class="page-title">STATION MONITORS</h1>
+        <p class="page-sub">Live telemetry for active orbital assets.</p>
+      </div>
+      <div id="faction-counters" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+    </header>
+    <div class="grid" id="station-grid"></div>
+  </div>
+
+  <div id="detail-view" style="display:none;">
+    <div class="detail-wrap">
+      <a class="back-link" href="/">← BACK TO MONITORS</a>
+      <h1 class="page-title" id="detail-name" style="margin:16px 0;">STATION</h1>
+      <p class="page-sub">Full per-station detail is coming soon. Raw last snapshot below.</p>
+      <pre class="snap" id="detail-json">Loading…</pre>
+    </div>
+  </div>
+</main>
+
+<!-- Settings drawer -->
+<div class="overlay" id="settings-overlay">
+  <div class="drawer">
+    <div class="drawer-head">
+      <span>STATION CONFIG</span>
+      <button class="close-x" id="settings-close">×</button>
+    </div>
+    <div class="drawer-body">
+      <div class="field">
+        <label>Poll Interval (sec, min 15)</label>
+        <input class="term-input" type="number" id="poll-interval" min="15" value="60" />
+      </div>
+      <div id="rows-editor" style="display:flex;flex-direction:column;gap:12px;"></div>
+      <button class="small-btn" id="add-row">+ ADD ROW</button>
+    </div>
+    <div class="drawer-foot">
+      <button class="small-btn danger" id="settings-cancel">CANCEL</button>
+      <button class="primary-btn" id="settings-save">SAVE</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const isDetail = location.pathname.startsWith("/station/");
+  const detailId = isDetail ? decodeURIComponent(location.pathname.slice("/station/".length)) : null;
+
+  // ── state ──
+  let config = { version: 1, pollIntervalSec: 60, rows: [] };
+  let views = new Map();   // id -> StationView
+  let order = [];          // ids in display order
+  let bots = [];           // discovered bot names
+  let rearrangeMode = false;
+
+  // ── helpers ──
+  function num(v, fb) { fb = fb || 0; return (typeof v === "number" && isFinite(v)) ? v : fb; }
+  function kfmt(n) {
+    n = num(n);
+    if (n >= 1000) {
+      const k = n / 1000;
+      return (k >= 10 ? Math.round(k) : Math.round(k * 10) / 10) + "k";
+    }
+    return String(Math.round(n));
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  function segClass(r) { return r > 0.5 ? "on-g" : (r >= 0.1 ? "on-a" : "on-r"); }
+
+  function bar(label, value, max) {
+    if (!max || max <= 0) {
+      return `<div class="bar-row"><div class="bar-label"><span>${label}</span><span class="bar-value">—</span></div></div>`;
+    }
+    const ratio = Math.max(0, Math.min(1, value / max));
+    const filled = Math.max(0, Math.min(10, Math.round(ratio * 10)));
+    let segs = "";
+    for (let i = 0; i < 10; i++) {
+      const on = i < filled;
+      segs += `<div class="${on ? "bar-seg " + segClass(ratio) : "bar-seg"}"></div>`;
+    }
+    return `<div class="bar-row">
+      <div class="bar-label"><span>${label}</span><span class="bar-value">${kfmt(value)}/${kfmt(max)}</span></div>
+      <div class="bar-track">${segs}</div>
+    </div>`;
+  }
+
+  function cell(k, v, vclass, sub) {
+    return `<div class="data-cell"><div class="k">${k}</div><div class="v ${vclass || ""}">${v}</div>${sub ? `<div class="k">${sub}</div>` : ""}</div>`;
+  }
+
+  function computeAlert(v) {
+    const c = v.condition || {};
+    if (num(c.satisfaction_pct) < 100) return true;
+    const p = v.power || {};
+    const supply = num(p.supply);
+    if (supply > 0 && num(p.current_draw) / supply >= 1) return true;
+    const b = v.base || {};
+    if (num(b.hull) < num(b.max_hull)) return true;
+    if (num(b.max_fuel) > 0 && num(b.fuel) < num(b.max_fuel) * 0.1) return true;
+    if (b.wrecked === true) return true;
+    return false;
+  }
+
+  function classify(v) {
+    if (v.state === "NO_BOT" || v.state === "UNCONFIGURED") return "nodata";
+    if (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE") return "alert";
+    return computeAlert(v) ? "alert" : "ok";
+  }
+
+  function ageText(fetchedAt) {
+    if (!fetchedAt) return "never";
+    const s = Math.max(0, Math.round((Date.now() - fetchedAt) / 1000));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    return Math.round(s / 3600) + "h ago";
+  }
+
+  // ── card render ──
+  function cardHTML(v) {
+    const base = v.base || {};
+    const cond = v.condition || {};
+    const ls = v.lifeSupport || {};
+    const p = v.power || {};
+
+    const name = v.label || v.stationName || v.stationId || v.bot || "UNNAMED";
+    const condText = (cond.condition ? String(cond.condition).toUpperCase() : "") || v.state;
+    let badgeCls = "badge-ok";
+    if (v.state !== "OK" || computeAlert(v)) {
+      badgeCls = (condText === "CRITICAL" || v.state === "MISMATCH" || v.state === "UNDOCKED" || v.state === "STALE" || v.state === "NO_BOT") ? "badge-crit" : "badge-warn";
+    }
+
+    const maxFuel = num(base.max_fuel);
+    const maxHull = num(base.max_hull);
+    const maxShield = num(base.max_shield);
+
+    let bars = "";
+    bars += bar("FUEL", num(base.fuel), maxFuel);
+    bars += bar("HULL", num(base.hull), maxHull);
+    if (maxShield > 0) bars += bar("SHIELD", num(base.shield), maxShield);
+
+    // power cell
+    const supply = num(p.supply);
+    let powerCellHTML;
+    if (supply <= 0) {
+      powerCellHTML = cell("POWER", "—", "neutral");
+    } else {
+      const pct = Math.round(num(p.current_draw) / supply * 100);
+      powerCellHTML = cell("POWER", pct + "%", pct >= 100 ? "bad" : "good", kfmt(p.current_draw) + "/" + kfmt(supply));
+    }
+
+    const wpnDps = num(base.weapon_dps);
+    const wpnHTML = wpnDps > 0 ? cell("WPN_DPS", kfmt(wpnDps), "bad") : cell("WPN_DPS", "—", "neutral");
+
+    const satPct = num(cond.satisfaction_pct);
+    const satHTML = cell("SATISFACTION", satPct + "%", satPct === 100 ? "good" : "bad");
+
+    const lsDemand = num(ls.demand), lsSupply = num(ls.supply);
+    const lsHTML = cell("LIFE_SUPP", lsDemand + "/" + lsSupply, "neutral", "slots");
+
+    const alert = classify(v) === "alert";
+    const dimmed = (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE" || v.state === "NO_BOT");
+    const classes = ["card"];
+    if (alert) classes.push("alert");
+    if (dimmed) classes.push("dimmed");
+    if (rearrangeMode) classes.push("draggable");
+
+    let chip = "";
+    if (v.state !== "OK") {
+      const neutral = v.state === "UNCONFIGURED";
+      const label = v.state === "STALE" ? "STALE " + ageText(v.fetchedAt) : v.state;
+      chip = `<span class="state-chip ${neutral ? "neutral" : ""}">${esc(label)}</span>`;
+    }
+
+    const fee = base.market_fee_bps != null ? (base.market_fee_bps + "bps") : "—";
+    const satFoot = satPct + "%";
+
+    const href = v.stationId ? `/station/${encodeURIComponent(v.stationId)}` : "#";
+
+    return `<a class="${classes.join(" ")}" href="${href}" data-id="${esc(v.id)}" ${rearrangeMode ? 'draggable="true"' : ""}>
+      <div class="card-head">
+        <span class="card-name">${esc(name)}</span>
+        <span class="card-badge ${badgeCls}">${esc(condText)}</span>
+      </div>
+      <div class="card-body">
+        ${chip}
+        <div class="bar-row-wrap">${bars}</div>
+        <div class="data-grid">
+          ${cell("ARMOR", num(base.armor) ? kfmt(base.armor) : "—", "neutral")}
+          ${wpnHTML}
+          ${powerCellHTML}
+          ${lsHTML}
+        </div>
+        <div class="card-foot">
+          <div>SAT: <span class="${satPct === 100 ? "" : ""}" style="color:${satPct === 100 ? "var(--secondary-fixed-dim)" : "var(--error)"}">${satFoot}</span></div>
+          <div>FEE: <span style="color:var(--tertiary-fixed-dim)">${fee}</span></div>
+        </div>
+        <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);text-align:right;">updated ${ageText(v.fetchedAt)}</div>
+      </div>
+    </a>`;
+  }
+
+  function renderGrid() {
+    if (isDetail) return;
+    const grid = document.getElementById("station-grid");
+    const ids = order.filter((id) => views.has(id));
+    // include any views not in order (safety)
+    for (const id of views.keys()) if (!ids.includes(id)) ids.push(id);
+
+    if (ids.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No stations configured. Open <b>SETTINGS</b> to add a station row and press <b>DETECT</b> on a docked bot.</div>`;
+    } else {
+      grid.innerHTML = ids.map((id) => cardHTML(views.get(id))).join("");
+    }
+    attachDnD();
+    updateCounters();
+  }
+
+  function updateCounters() {
+    let ok = 0, alert = 0, nodata = 0;
+    const fac = {};
+    for (const v of views.values()) {
+      const c = classify(v);
+      if (c === "ok") ok++; else if (c === "alert") alert++; else nodata++;
+      const f = v.faction || "UNASSIGNED";
+      if (!fac[f]) fac[f] = { ok: 0, alert: 0, nodata: 0 };
+      fac[f][c]++;
+    }
+    document.getElementById("cnt-ok").textContent = ok + " OK";
+    document.getElementById("cnt-alert").textContent = alert + " ALERT";
+    document.getElementById("cnt-nodata").textContent = nodata + " NO-DATA";
+
+    const fc = document.getElementById("faction-counters");
+    fc.innerHTML = Object.keys(fac).map((f) => {
+      const d = fac[f];
+      return `<div class="counter-chip"><span class="pip pip-ok"></span><span style="font-size:11px;">${esc(f)}: ${d.ok} / ${d.alert}</span></div>`;
+    }).join("");
+  }
+
+  // ── data application ──
+  function applyStations(stations) {
+    views = new Map();
+    for (const s of stations) views.set(s.id, s);
+    order = stations.map((s) => s.id);
+    renderGrid();
+  }
+  function applyStation(v) {
+    views.set(v.id, v);
+    if (!order.includes(v.id)) order.push(v.id);
+    renderGrid();
+  }
+  function applyConfig(cfg) {
+    config = cfg;
+    const pi = document.getElementById("poll-interval");
+    if (pi) pi.value = cfg.pollIntervalSec;
+    renderSettingsRows();
+  }
+
+  // ── WebSocket ──
+  let ws = null, wsConnectTimer = null, wsInitTimer = null, wsHeartbeat = null, wsSilenceTimer = null, wsManualClose = false;
+  let wsLastMsg = 0;
+
+  function connectWebSocket() {
+    if (wsManualClose) return;
+    clearTimeout(wsConnectTimer);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    let host = location.host;
+    if (!host) host = (location.hostname || "localhost") + (location.port ? ":" + location.port : "");
+    try {
+      ws = new WebSocket(`${proto}//${host}/ws`);
+    } catch (err) {
+      wsConnectTimer = setTimeout(connectWebSocket, 1000);
+      return;
+    }
+    wsLastMsg = Date.now();
+    clearTimeout(wsInitTimer);
+    wsInitTimer = setTimeout(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { ws && ws.close(); } catch (e) {} }
+    }, 4000);
+    ws.onopen = () => {
+      clearTimeout(wsInitTimer);
+      clearInterval(wsHeartbeat);
+      wsHeartbeat = setInterval(() => { try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" })); } catch (e) {} }, 15000);
+      clearInterval(wsSilenceTimer);
+      wsSilenceTimer = setInterval(() => {
+        if (Date.now() - wsLastMsg > 45000) { try { ws && ws.close(); } catch (e) {} }
+      }, 10000);
+    };
+    ws.onmessage = (ev) => {
+      wsLastMsg = Date.now();
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === "init") {
+        if (msg.config) applyConfig(msg.config);
+        if (msg.stations) applyStations(msg.stations);
+      } else if (msg.type === "stations") {
+        if (msg.stations) applyStations(msg.stations);
+      } else if (msg.type === "station") {
+        if (msg.station) applyStation(msg.station);
+      } else if (msg.type === "config") {
+        if (msg.config) applyConfig(msg.config);
+      } else if (msg.type === "pong") {
+        // heartbeat ack
+      }
+    };
+    ws.onclose = () => {
+      clearInterval(wsHeartbeat); clearInterval(wsSilenceTimer);
+      if (!wsManualClose) wsConnectTimer = setTimeout(connectWebSocket, 1500);
+    };
+    ws.onerror = () => { try { ws && ws.close(); } catch (e) {} };
+  }
+
+  // ── REST fallback (initial load if WS slow) ──
+  async function bootstrap() {
+    try {
+      const [cfgR, stR, botsR] = await Promise.all([
+        fetch("/api/config").then((r) => r.json()),
+        fetch("/api/stations").then((r) => r.json()),
+        fetch("/api/bots").then((r) => r.json()),
+      ]);
+      config = cfgR;
+      bots = botsR.bots || [];
+      const pi = document.getElementById("poll-interval");
+      if (pi) pi.value = cfgR.pollIntervalSec;
+      applyStations(stR.stations || []);
+      renderSettingsRows();
+    } catch (e) { /* WS will fill in */ }
+  }
+
+  // ── refresh ──
+  function doRefresh() {
+    fetch("/api/refresh", { method: "POST" }).catch(() => {});
+  }
+  document.getElementById("refresh-btn").onclick = doRefresh;
+  document.getElementById("refresh-btn-2").onclick = doRefresh;
+
+  // ── rearrange ──
+  const rearrangeBtn = document.getElementById("rearrange-btn");
+  rearrangeBtn.onclick = () => {
+    rearrangeMode = !rearrangeMode;
+    rearrangeBtn.style.background = rearrangeMode ? "var(--primary-fixed-dim)" : "transparent";
+    rearrangeBtn.style.color = rearrangeMode ? "var(--on-primary-container)" : "var(--primary-fixed-dim)";
+    document.getElementById("workspace").classList.toggle("rearrange", rearrangeMode);
+    if (!rearrangeMode) persistOrder();
+    renderGrid();
+  };
+
+  function persistOrder() {
+    const newRows = order
+      .map((id) => config.rows.find((r) => r.id === id))
+      .filter(Boolean);
+    // keep any rows not currently displayed
+    for (const r of config.rows) if (!order.includes(r.id)) newRows.push(r);
+    saveConfig(newRows, config.pollIntervalSec);
+  }
+
+  function attachDnD() {
+    if (!rearrangeMode) return;
+    const cards = document.querySelectorAll("#station-grid .card");
+    cards.forEach((card) => {
+      card.addEventListener("dragstart", (e) => {
+        card.classList.add("dragging");
+        e.dataTransfer.setData("text/plain", card.getAttribute("data-id"));
+      });
+      card.addEventListener("dragend", () => card.classList.remove("dragging"));
+      card.addEventListener("dragover", (e) => { e.preventDefault(); card.classList.add("drag-over"); });
+      card.addEventListener("dragleave", () => card.classList.remove("drag-over"));
+      card.addEventListener("drop", (e) => {
+        e.preventDefault();
+        card.classList.remove("drag-over");
+        const dragId = e.dataTransfer.getData("text/plain");
+        const targetId = card.getAttribute("data-id");
+        if (!dragId || dragId === targetId) return;
+        const from = order.indexOf(dragId);
+        const to = order.indexOf(targetId);
+        if (from < 0 || to < 0) return;
+        order.splice(from, 1);
+        order.splice(to, 0, dragId);
+        renderGrid();
+      });
+    });
+  }
+
+  // ── settings drawer ──
+  const overlay = document.getElementById("settings-overlay");
+  function openSettings() {
+    bootstrap().then(() => { overlay.classList.add("open"); });
+  }
+  function closeSettings() { overlay.classList.remove("open"); }
+  document.getElementById("settings-btn").onclick = openSettings;
+  document.getElementById("rail-settings").onclick = (e) => { e.preventDefault(); openSettings(); };
+  document.getElementById("settings-close").onclick = closeSettings;
+  document.getElementById("settings-cancel").onclick = closeSettings;
+
+  function renderSettingsRows() {
+    const pi = document.getElementById("poll-interval");
+    if (pi) pi.value = config.pollIntervalSec;
+    const editor = document.getElementById("rows-editor");
+    editor.innerHTML = "";
+    config.rows.forEach((row, idx) => {
+      const div = document.createElement("div");
+      div.className = "row-card" + (row.bot && !bots.includes(row.bot) ? " stale-bot" : "");
+      const botOptions = [row.bot, ...bots].filter(Boolean).filter((b, i, a) => a.indexOf(b) === i)
+        .map((b) => `<option value="${esc(b)}" ${b === row.bot ? "selected" : ""}>${esc(b)}${bots.includes(b) ? "" : " (offline)"}</option>`).join("");
+      div.innerHTML = `
+        <div class="row-head">
+          <span class="row-title">ROW ${idx + 1}${row.bot && !bots.includes(row.bot) ? " — BOT OFFLINE" : ""}</span>
+          <button class="small-btn danger" data-act="remove">REMOVE</button>
+        </div>
+        <div class="field">
+          <label>BOT</label>
+          <select data-field="bot">${botOptions}</select>
+        </div>
+        <div class="row-grid">
+          <div class="field">
+            <label>STATION ID</label>
+            <input class="term-input" data-field="stationId" value="${esc(row.stationId)}" placeholder="run Detect" readonly />
+          </div>
+          <div class="field">
+            <label>STATION NAME</label>
+            <input class="term-input" data-field="stationName" value="${esc(row.stationName)}" readonly />
+          </div>
+        </div>
+        <div class="field">
+          <label>LABEL (optional)</label>
+          <input class="term-input" data-field="label" value="${esc(row.label)}" placeholder="override card title" />
+        </div>
+        <div class="row-actions">
+          <button class="small-btn detect" data-act="detect">DETECT</button>
+          <span data-field="detect-msg" style="font-size:11px;color:var(--secondary-fixed-dim);align-self:center;"></span>
+        </div>`;
+      div.querySelector('[data-act="remove"]').onclick = () => {
+        config.rows = config.rows.filter((r) => r.id !== row.id);
+        renderSettingsRows();
+      };
+      div.querySelector('[data-act="detect"]').onclick = async (e) => {
+        const btn = e.target;
+        const msgEl = div.querySelector('[data-field="detect-msg"]');
+        const botName = div.querySelector('[data-field="bot"]').value;
+        if (!botName) { msgEl.textContent = "select a bot"; msgEl.style.color = "var(--error)"; return; }
+        btn.disabled = true; msgEl.textContent = "detecting…"; msgEl.style.color = "var(--on-surface-variant)";
+        try {
+          const r = await fetch("/api/detect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bot: botName }) });
+          const j = await r.json();
+          if (!r.ok) { msgEl.textContent = j.error || "failed"; msgEl.style.color = "var(--error)"; }
+          else {
+            row.bot = botName;
+            row.stationId = j.stationId;
+            row.stationName = j.stationName;
+            msgEl.textContent = "ok: " + j.stationName;
+            msgEl.style.color = "var(--secondary-fixed-dim)";
+            renderSettingsRows();
+          }
+        } catch (err) { msgEl.textContent = "error"; msgEl.style.color = "var(--error)"; }
+        finally { btn.disabled = false; }
+      };
+      editor.appendChild(div);
+    });
+  }
+
+  document.getElementById("add-row").onclick = () => {
+    const id = "row_" + (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+    config.rows.push({ id, bot: "", stationId: "", stationName: "", label: "" });
+    renderSettingsRows();
+  };
+
+  function saveConfig(rows, pollIntervalSec) {
+    return fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows, pollIntervalSec }),
+    }).then((r) => r.json()).then((j) => {
+      if (j.error) throw new Error(j.error);
+      config = j;
+      return j;
+    });
+  }
+
+  document.getElementById("settings-save").onclick = async () => {
+    const pi = document.getElementById("poll-interval");
+    const pollIntervalSec = Math.max(15, parseInt(pi.value, 10) || 60);
+    // read edited rows from DOM
+    const rows = [];
+    document.querySelectorAll("#rows-editor .row-card").forEach((div) => {
+      const get = (f) => div.querySelector(`[data-field="${f}"]`).value;
+      const id = div.querySelector('[data-act="remove"]') && div.dataset.id;
+      // recover original id via config order (simpler: keep config row objects, update fields)
+      rows.push({
+        id: div.dataset.id,
+        bot: get("bot"),
+        stationId: get("stationId"),
+        stationName: get("stationName"),
+        label: get("label"),
+      });
+    });
+    // ensure ids present: map back to config rows
+    const finalRows = config.rows.map((orig) => {
+      const edited = rows.find((r) => r.id === orig.id) || {};
+      return { ...orig, ...edited };
+    });
+    try {
+      await saveConfig(finalRows, pollIntervalSec);
+      closeSettings();
+    } catch (e) {
+      alert("Save failed: " + (e.message || e));
+    }
+  };
+
+  // attach row ids to DOM for save mapping
+  const origRender = renderSettingsRows;
+  renderSettingsRows = function () {
+    origRender();
+    document.querySelectorAll("#rows-editor .row-card").forEach((div, i) => {
+      div.dataset.id = config.rows[i] ? config.rows[i].id : "";
+    });
+  };
+
+  // ── detail view ──
+  async function loadDetail() {
+    document.getElementById("grid-view").style.display = "none";
+    document.getElementById("detail-view").style.display = "block";
+    try {
+      const r = await fetch("/api/station/" + encodeURIComponent(detailId));
+      const j = await r.json();
+      if (!r.ok) {
+        document.getElementById("detail-name").textContent = "STATION NOT FOUND";
+        document.getElementById("detail-json").textContent = j.error || "No snapshot available yet.";
+        return;
+      }
+      document.getElementById("detail-name").textContent = j.snapshot.stationName || detailId;
+      document.getElementById("detail-json").textContent = JSON.stringify(j.snapshot, null, 2);
+    } catch (e) {
+      document.getElementById("detail-json").textContent = "Failed to load: " + e;
+    }
+  }
+
+  // ── boot ──
+  if (isDetail) {
+    loadDetail();
+  } else {
+    bootstrap();
+    setInterval(() => { if (!isDetail) renderGrid(); }, 5000);
+  }
+  connectWebSocket();
+})();
+</script>
+</body>
+</html>

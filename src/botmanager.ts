@@ -37,6 +37,7 @@ import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { flushStationFacilityCache } from "./stationFacilityCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings, saveSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
+import { StationWebServer } from "./web/stationserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
@@ -70,6 +71,7 @@ const SESSIONS_DIR = join(BASE_DIR, "sessions");
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
 let chatServer: ChatWebServer;
+let stationServer: StationWebServer;
 let aiChatService: AiChatService | null = null;
 
 /**
@@ -2398,6 +2400,13 @@ async function main(): Promise<void> {
   chatServer = new ChatWebServer(chatPort);
   chatServer.start();
 
+  const stationPort = parseInt(
+    process.env.STATION_PORT || String(Number(settings.general?.port || 3000) + 2000),
+    10,
+  );
+  stationServer = new StationWebServer(stationPort);
+  stationServer.start();
+
   // Initialize client sync slave if configured
   const csSettings = settings.clientSync as Record<string, unknown> | undefined;
   if (csSettings) {
@@ -2919,7 +2928,8 @@ async function main(): Promise<void> {
     });
     server.stop();
     chatServer?.stop();
-    
+    stationServer?.stop();
+
     // If restarting due to mass session loss, clear all session files
     // This forces fresh logins on restart, avoiding the invalid session loop
     // But only if the setting allows it (default: true for backward compatibility)

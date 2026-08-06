@@ -551,18 +551,22 @@ function getTraderSettings(username?: string): {
     depositProfitsToFaction: (t.depositProfitsToFaction as boolean) ?? true,
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
     grabMilitaryFuelCells: (t.grabMilitaryFuelCells as boolean) ?? true,
-    militaryFuelCellMin: (t.militaryFuelCellMin as number) ?? 3,
-    militaryFuelCellTarget: (t.militaryFuelCellTarget as number) ?? 15,
+    // Low-water mark: when the in-cargo military_fuel_cell reserve drops to this
+    // many (or fewer) while away from home, the bot heads home to restock.
+    militaryFuelCellMin: (t.militaryFuelCellMin as number) ?? 1,
+    // Full load to carry: a 130-cargo trader keeps 6 (=18 cargo) as a free,
+    // high-density emergency fuel reserve (100 fuel / 3 space each).
+    militaryFuelCellTarget: (t.militaryFuelCellTarget as number) ?? 6,
   };
 }
 
 /**
  * Quick-mode fuel safety: whenever docked at the HOME station, make sure the bot
- * is carrying a healthy stock of military_fuel_cell. These are free at home and
+ * is carrying a full load of military_fuel_cell. These are free at home and
  * vastly superior to plain fuel_cell (100 fuel / 3 space vs 20 fuel / 1 space),
  * so we never want to be caught buying expensive plain fuel_cells at a remote
- * station. Grabs at least `militaryFuelCellMin` (default 3) and tops up toward
- * `militaryFuelCellTarget` (cargo-space permitting).
+ * station. Tops up to `militaryFuelCellTarget` (default 6 = 18 cargo on a 130
+ * hull — a full tank's worth) when cargo space permits.
  *
  * Source order at home: faction storage (free) → station storage (free) → market buy.
  */
@@ -585,19 +589,15 @@ async function stockpileMilitaryFuelCells(
   await bot.refreshStorage();
 
   const current = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
-  const min = Math.max(1, settings.militaryFuelCellMin);
-  // A trader lives or dies by free cargo space — keep the reserve small. Don't
-  // hoard the full tank-worth of cells (default target 15 = 45 cargo on a 130
-  // hull). Trade routines want at most a few cells as an emergency reserve.
-  const reserveCap = Math.max(min, Math.min(settings.militaryFuelCellTarget, min + 2));
-  // Already at/above reserve cap — nothing to do.
-  if (current >= reserveCap) return;
+  // Full load of military fuel cells: a 130-cargo trader carries 6 (=18 cargo)
+  // as a free, high-density emergency fuel reserve. Nothing to do if already full.
+  const target = Math.max(1, settings.militaryFuelCellTarget);
+  if (current >= target) return;
 
   const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
   const maxFit = maxItemsForCargo(freeWeight, MIL);
   if (maxFit <= 0) return;
 
-  const target = Math.min(reserveCap, Math.max(min, maxFit));
   let need = Math.min(target - current, maxFit);
   if (need <= 0) return;
 
@@ -649,7 +649,7 @@ async function stockpileMilitaryFuelCells(
 
   const got = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
   if (got !== current) {
-    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (min ${min}, reserve cap ${reserveCap})`);
+    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (target ${target})`);
   }
 }
 
@@ -1961,6 +1961,40 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
       ignoreBlacklistWhenCloaked: settings.autoCloak,
     };
+
+    // ── Low military fuel cell reserve → return home to restock ──
+    // Military fuel cells are a free, high-density emergency fuel reserve
+    // (100 fuel / 3 cargo). When the reserve runs down while out trading, the
+    // bot would otherwise have to buy expensive plain fuel_cells at remote
+    // stations. If we're not mid-delivery (no active session) and the in-cargo
+    // reserve drops to `militaryFuelCellMin` or fewer, head home and top back
+    // up to a full load instead of starting another trade run.
+    if (settings.grabMilitaryFuelCells && !activeSession) {
+      const homePoi = getHomeStationPoi(settings.homeStation);
+      const atHome = !!homeSystem && bot.system === homeSystem &&
+        (homePoi === "" || bot.poi === homePoi);
+      if (!atHome) {
+        await bot.refreshCargo();
+        const milCells = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity ?? 0;
+        if (milCells <= settings.militaryFuelCellMin) {
+          ctx.log("trade", `Low military_fuel_cell reserve (${milCells} ≤ ${settings.militaryFuelCellMin}) — returning home to restock`);
+          const ok = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (ok) {
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              await bot.exec("travel", { target_poi: homeStation.id });
+              bot.poi = homeStation.id;
+              await ensureDocked(ctx);
+            }
+          }
+          // Loop back — stockpileMilitaryFuelCells() refills the load at home.
+          await ctx.sleep(2000);
+          continue;
+        }
+      }
+    }
+
     let extraRevenue = 0;
     let recoveredSessionHandled = false; // Track if we've handled a recovered session
     let recoveredSessionAtDestination = false; // Track if recovered session already arrived at dest and docked

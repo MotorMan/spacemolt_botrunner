@@ -191,6 +191,12 @@ export interface MarketQueryResponse {
   quantity: number;
   /** Estimated number of jumps from requesterSystemId, if calculable. */
   distance?: number;
+  /** Display name of the item, as recorded by the market routine. */
+  itemName?: string;
+  /** ISO timestamp of when the answering client last observed this station's
+   *  market for this item. Callers use it to reject stale deals instead of
+   *  flying across the galaxy for a listing that expired weeks ago. */
+  lastUpdated?: string;
   /** Error message if ok is false. */
   error?: string;
 }

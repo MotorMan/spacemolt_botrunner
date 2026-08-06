@@ -60,6 +60,7 @@ interface LocalMarketItem {
   systemId: string;
   stationPoiId: string;
   stationName: string;
+  itemName: string;
   buyOrders: MarketOrderDetail[];
   sellOrders: MarketOrderDetail[];
   lastUpdated: string;
@@ -123,6 +124,87 @@ let lastLoadError: string | null = null;
 let lastStatAt = 0;
 let lastStat: LocalMarketFileInfo = { exists: false, ageMs: null, sizeBytes: 0, mtimeMs: 0 };
 let evictTimer: ReturnType<typeof setInterval> | null = null;
+
+// ── Live in-memory overlay ────────────────────────────────────────────────
+// The market routine writes every observation to marketDetails.json, but the
+// parsed index above is only refreshed every INDEX_MIN_REFRESH_MS (the file is
+// 10MB+). That means a query could be answered with data up to ~30s older than
+// what the market routine literally just saw. The routine therefore also feeds
+// each observation straight into this overlay, which is consulted BEFORE the
+// file index — so "the market routine's memory" is always the freshest answer
+// and the file is the durable backing store.
+
+/** itemId -> "systemId/poiId" -> freshest observation. */
+const overlay = new Map<string, Map<string, LocalMarketItem>>();
+/** Overlay entries older than this are ignored (the file index covers them). */
+const OVERLAY_TTL_MS = 30 * 60 * 1000;
+let overlayLastPrune = 0;
+
+export interface LocalMarketObservation {
+  itemId: string;
+  itemName?: string;
+  buyOrders: MarketOrderDetail[];
+  sellOrders: MarketOrderDetail[];
+}
+
+/**
+ * Record a live market observation from the `market` routine running in this
+ * process. Consulted ahead of the parsed marketDetails.json index so routines
+ * always see the newest prices, even between file re-parses.
+ */
+export function noteLocalMarketObservation(
+  systemId: string,
+  stationPoiId: string,
+  stationName: string,
+  items: LocalMarketObservation[],
+): void {
+  if (!systemId || !stationPoiId || items.length === 0) return;
+  const stationKey = `${systemId}/${stationPoiId}`;
+  const stamp = new Date().toISOString();
+  for (const item of items) {
+    if (!item.itemId) continue;
+    let byStation = overlay.get(item.itemId);
+    if (!byStation) {
+      byStation = new Map();
+      overlay.set(item.itemId, byStation);
+    }
+    byStation.set(stationKey, {
+      systemId,
+      stationPoiId,
+      stationName: stationName || stationPoiId,
+      itemName: item.itemName || item.itemId,
+      buyOrders: item.buyOrders || [],
+      sellOrders: item.sellOrders || [],
+      lastUpdated: stamp,
+    });
+  }
+  pruneOverlay();
+}
+
+function pruneOverlay(): void {
+  const now = Date.now();
+  if (now - overlayLastPrune < 60_000) return;
+  overlayLastPrune = now;
+  for (const [itemId, byStation] of overlay) {
+    for (const [key, entry] of byStation) {
+      const age = now - Date.parse(entry.lastUpdated);
+      if (!Number.isFinite(age) || age > OVERLAY_TTL_MS) byStation.delete(key);
+    }
+    if (byStation.size === 0) overlay.delete(itemId);
+  }
+}
+
+/** Drop every live observation (used by tests / manual refresh). */
+export function clearLocalMarketOverlay(): void {
+  overlay.clear();
+}
+
+/** How many item/station observations the live overlay currently holds. */
+export function getLocalMarketOverlaySize(): { items: number; entries: number } {
+  let entries = 0;
+  for (const byStation of overlay.values()) entries += byStation.size;
+  return { items: overlay.size, entries };
+}
 
 /** Bots running the `market` routine in THIS process -> last heartbeat time.
  *  Registered by the market routine itself (see routines/market.ts) so this
@@ -203,15 +285,18 @@ export function getLocalMarketRoutineBots(): string[] {
 export function getLocalMarketStatus(): LocalMarketStatus {
   const info = getLocalMarketFileInfo();
   const bots = getLocalMarketRoutineBots();
+  const live = getLocalMarketOverlaySize();
   return {
     ...info,
     // "usable" deliberately does NOT require freshness: stale local data still
-    // beats no data at all when there is no remote client to ask.
-    usable: info.exists && info.sizeBytes > 2,
-    fresh: info.exists && info.ageMs !== null && info.ageMs < LOCAL_MARKET_STALE_MS,
+    // beats no data at all when there is no remote client to ask. Live
+    // observations from a locally running market routine count too, so a fresh
+    // install answers queries before the first marketDetails.json write.
+    usable: (info.exists && info.sizeBytes > 2) || live.entries > 0,
+    fresh: (info.exists && info.ageMs !== null && info.ageMs < LOCAL_MARKET_STALE_MS) || live.entries > 0,
     marketRoutineRunning: bots.length > 0,
     marketRoutineBots: bots,
-    indexedEntries: index?.itemCount ?? 0,
+    indexedEntries: (index?.itemCount ?? 0) + live.entries,
     indexedStations: index?.stationCount ?? 0,
     indexAgeMs: index ? Date.now() - index.builtAt : null,
     loadError: lastLoadError,
@@ -244,6 +329,7 @@ function buildIndex(raw: RawMarketDetails, mtimeMs: number, sizeBytes: number): 
       systemId: String(entry.systemId || ""),
       stationPoiId: String(entry.stationPoiId || ""),
       stationName: String(entry.stationName || entry.stationPoiId || ""),
+      itemName: String(entry.itemName || itemId),
       buyOrders: Array.isArray(entry.buyOrders) ? entry.buyOrders : [],
       sellOrders: Array.isArray(entry.sellOrders) ? entry.sellOrders : [],
       lastUpdated: String(entry.lastUpdated || raw.lastSaved || ""),
@@ -327,7 +413,9 @@ async function estimateSystemDistance(fromSystem: string, toSystem: string): Pro
 }
 
 /**
- * Answer a market query from this node's own `data/marketDetails.json`.
+ * Answer a market query from this node's own market data: the live in-memory
+ * observations pushed by a locally running `market` routine first, then
+ * `data/marketDetails.json` for every station the routine isn't parked at.
  *
  * Identical contract (and identical ranking rules) to the remote
  * `/api/client-sync/market-query-handler` path — "buy" returns the cheapest
@@ -342,21 +430,30 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
   }
 
   const idx = await getIndex();
-  if (!idx) {
+  const live = overlay.get(itemId);
+  if (!idx && (!live || live.size === 0)) {
     const why = lastLoadError
       ? `local market file unreadable: ${lastLoadError}`
       : "No local market data (data/marketDetails.json missing)";
     return { ok: false, results: [], error: why, source: "local" };
   }
 
-  const entries = idx.byItem.get(itemId);
-  if (!entries || entries.length === 0) {
+  // Merge: one entry per station, with a live observation always overriding the
+  // (possibly minutes-old) parsed file entry for the same station.
+  const byStation = new Map<string, LocalMarketItem>();
+  for (const item of idx?.byItem.get(itemId) || []) {
+    byStation.set(`${item.systemId}/${item.stationPoiId}`, item);
+  }
+  if (live) {
+    for (const [key, item] of live) byStation.set(key, item);
+  }
+  if (byStation.size === 0) {
     return { ok: false, results: [], error: "No matching orders found", source: "local" };
   }
 
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
-  for (const item of entries) {
+  for (const item of byStation.values()) {
     const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
     if (!orders || orders.length === 0) continue;
     let filtered = orders.filter((o) => o.quantity >= minQuantity);
@@ -376,6 +473,8 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
       price: best.price,
       quantity: best.quantity,
       distance,
+      itemName: item.itemName,
+      lastUpdated: item.lastUpdated,
     });
   }
 

@@ -17546,12 +17546,14 @@
       function renderTradeBuyerSettings(panel) {
         const t = settings.trade_buyer || {};
         const homeSystem = t.homeSystem ?? "";
+        const homeStation = t.homeStation ?? "";
         const maxSpendPerItem = t.maxSpendPerItem ?? 5000;
         const maxTotalSpend = t.maxTotalSpend ?? 0;
         const fuelCostPerJump = t.fuelCostPerJump ?? 50;
         const refuelThreshold = t.refuelThreshold ?? 50;
         const repairThreshold = t.repairThreshold ?? 40;
         const minQuantityToBuy = t.minQuantityToBuy ?? 10;
+        const maxBuyQuantity = t.maxBuyQuantity ?? 0;
         const maxMarketAgeHours = t.maxMarketAgeHours ?? 24;
         const autoInsure = t.autoInsure !== false;
         const autoCloak = t.autoCloak ?? false;
@@ -17572,6 +17574,29 @@
         if (homeSystem && !knownSystems.find((s) => s.id === homeSystem)) {
           homeOpts.push(
             `<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`,
+          );
+        }
+
+        // Build home station dropdown for the selected home system. Empty means
+        // "auto-pick a market station in the home system" (legacy behaviour).
+        const stationOpts = [
+          `<option value=""${homeStation ? "" : " selected"}>(auto — first market station in home system)</option>`,
+        ];
+        let homeStationKnown = false;
+        if (homeSystem && mapData[homeSystem]) {
+          for (const poi of mapData[homeSystem].pois || []) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const sel = poi.id === homeStation ? " selected" : "";
+            if (sel) homeStationKnown = true;
+            const label = poi.base_name || poi.name || poi.id;
+            stationOpts.push(
+              `<option value="${esc(poi.id)}"${sel}>${esc(label)}</option>`,
+            );
+          }
+        }
+        if (homeStation && !homeStationKnown) {
+          stationOpts.push(
+            `<option value="${esc(homeStation)}" selected>${esc(homeStation)} (not in map cache)</option>`,
           );
         }
 
@@ -17641,7 +17666,15 @@
         <div class="setting-label">Home System</div>
         <div class="setting-hint">Required. The system where items will be deposited to faction storage.</div>
       </div>
-      <select id="set-trade_buyer-homeSystem" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${homeOpts.join("")}</select>
+      <select id="set-trade_buyer-homeSystem" onchange="updateTradeBuyerHomeStations()" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${homeOpts.join("")}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station</div>
+        <div class="setting-hint">The exact station to deposit at. Leave on "auto" to use the first market station in the home system. A per-bot home station (Bots tab) overrides this.</div>
+      </div>
+      <select id="set-trade_buyer-homeStation" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${stationOpts.join("")}</select>
     </div>
 
     <div class="setting-row">
@@ -17666,6 +17699,14 @@
         <div class="setting-hint">Minimum quantity threshold for a buy route to be considered worthwhile.</div>
       </div>
       <input type="number" id="set-trade_buyer-minQuantityToBuy" min="1" max="10000" value="${minQuantityToBuy}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Buy Quantity</div>
+        <div class="setting-hint">Upper limit on how many of an item are bought per trip (0 = unlimited). Set a min=1 to catch tiny deals without the bot draining a whole station into one haul.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-maxBuyQuantity" min="0" max="100000" value="${maxBuyQuantity}">
     </div>
 
     <div class="setting-row">
@@ -17883,6 +17924,28 @@
         rerenderCurrentSettings();
       }
 
+      function updateTradeBuyerHomeStations() {
+        const homeSystem = document.getElementById(
+          "set-trade_buyer-homeSystem",
+        )?.value;
+        const stationSelect = document.getElementById(
+          "set-trade_buyer-homeStation",
+        );
+        if (!stationSelect) return;
+
+        const opts = [
+          '<option value="" selected>(auto — first market station in home system)</option>',
+        ];
+        if (homeSystem && mapData[homeSystem]) {
+          for (const poi of mapData[homeSystem].pois || []) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const label = poi.base_name || poi.name || poi.id;
+            opts.push(`<option value="${esc(poi.id)}">${esc(label)}</option>`);
+          }
+        }
+        stationSelect.innerHTML = opts.join("");
+      }
+
       function saveTradeBuyerSettings() {
         // Collect selected items and their max prices from rendered inputs
         const buyItems = [];
@@ -17917,6 +17980,9 @@
           homeSystem: document
             .getElementById("set-trade_buyer-homeSystem")
             .value.trim(),
+          homeStation: (
+            document.getElementById("set-trade_buyer-homeStation")?.value || ""
+          ).trim(),
           maxSpendPerItem:
             parseInt(
               document.getElementById("set-trade_buyer-maxSpendPerItem").value,
@@ -17929,6 +17995,12 @@
             parseInt(
               document.getElementById("set-trade_buyer-minQuantityToBuy").value,
             ) || 10,
+          maxBuyQuantity: Math.max(
+            0,
+            parseInt(
+              document.getElementById("set-trade_buyer-maxBuyQuantity").value,
+            ) || 0,
+          ),
           fuelCostPerJump:
             parseInt(
               document.getElementById("set-trade_buyer-fuelCostPerJump").value,
@@ -27244,6 +27316,7 @@ async function fetchPersonalFacilityTypes(username) {
         const deepCoreJettisonOres = m.deepCoreJettisonOres || [];
         const radioactiveJettisonOres = m.radioactiveJettisonOres || [];
         const jettisonGas = m.jettisonGas || [];
+        const jettisonIce = m.jettisonIce || [];
         const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
         const ignoreDepletion = m.ignoreDepletion ?? false;
         const maxJumps = m.maxJumps ?? 10;
@@ -27770,6 +27843,22 @@ async function fetchPersonalFacilityTypes(username) {
       </div>
     </div>
 
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">❄️ Ice Jettison List</div>
+      <div class="setting-hint" style="margin-bottom:12px">Ice items listed here will be jettisoned when ice mining. Useful for clearing low-value ice when faction storage is full (e.g., jettison water_ice when you only want nitrogen_ice).</div>
+      <table id="ice-jettison-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;font-size:12px">Ice to Jettison</th>
+          <th style="text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${buildJettisonRows(jettisonIce, iceOres)}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ice-jettison-add-ore" style="flex:1">${buildJettisonOreOpts(iceOres)}</select>
+        <button class="secondary" onclick="addIceJettisonOre()">Add</button>
+      </div>
+    </div>
+
 	<div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
@@ -28249,6 +28338,37 @@ async function fetchPersonalFacilityTypes(username) {
         oreSelect.value = "";
       }
 
+      function addIceJettisonOre() {
+        const oreSelect = document.getElementById("ice-jettison-add-ore");
+        if (!oreSelect) return;
+        const oreId = oreSelect.value;
+        if (!oreId) return;
+
+        const existing = document.querySelector(
+          `#ice-jettison-table tr[data-ore-id="${oreId}"]`,
+        );
+        if (existing) return;
+
+        const iceOresList = allMiningOres.filter((o) => {
+          const n = o.name.toLowerCase();
+          return (
+            n.includes("ice") ||
+            n.includes("frost") ||
+            n.includes("cryo") ||
+            n.includes("water")
+          );
+        });
+        const oreName = iceOresList.find((o) => o.item_id === oreId)?.name || oreId;
+        const tbody = document.querySelector("#ice-jettison-table tbody");
+        const tr = document.createElement("tr");
+        tr.dataset.oreId = oreId;
+        tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+        tbody.appendChild(tr);
+        oreSelect.value = "";
+      }
+
       function saveMinerSettings() {
         const collectJettisonOres = () => {
           const ores = [];
@@ -28287,6 +28407,17 @@ async function fetchPersonalFacilityTypes(username) {
           const ores = [];
           for (const row of document.querySelectorAll(
             "#gas-jettison-table tbody tr",
+          )) {
+            const oreId = row.dataset.oreId;
+            if (oreId) ores.push(oreId);
+          }
+          return ores;
+        };
+
+        const collectIceJettisonOres = () => {
+          const ores = [];
+          for (const row of document.querySelectorAll(
+            "#ice-jettison-table tbody tr",
           )) {
             const oreId = row.dataset.oreId;
             if (oreId) ores.push(oreId);
@@ -28444,6 +28575,7 @@ async function fetchPersonalFacilityTypes(username) {
           deepCoreJettisonOres: collectDeepCoreJettisonOres(),
           radioactiveJettisonOres: collectRadioactiveJettisonOres(),
           jettisonGas: collectGasJettisonOres(),
+          jettisonIce: collectIceJettisonOres(),
         };
 
         // Preserve existing quotas when saving from main miner settings

@@ -471,6 +471,7 @@ async function getMinerSettings(username?: string): Promise<{
   deepCoreJettisonOres: string[]; // Ore IDs to jettison when mining deep core (hidden POIs)
   radioactiveJettisonOres: string[]; // Ore IDs to jettison when mining radioactive ores
   jettisonGas: string[]; // Gas IDs to jettison when gas harvesting
+  jettisonIce: string[]; // Ice IDs to jettison when ice mining
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
@@ -580,6 +581,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     deepCoreJettisonOres: (m.deepCoreJettisonOres as string[]) || [],
     radioactiveJettisonOres: (m.radioactiveJettisonOres as string[]) || [],
     jettisonGas: (m.jettisonGas as string[]) || [],
+    jettisonIce: (m.jettisonIce as string[]) || [],
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
@@ -612,6 +614,22 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
 }
 
 // ── Bot chat handler for escort queries ───────────────────────
+
+/**
+ * Return the appropriate jettison list for the given mining type.
+ * Ice mining uses jettisonIce, gas uses jettisonGas, radioactive uses
+ * radioactiveJettisonOres, otherwise the standard jettisonOres list.
+ * (Deep core mining is handled separately via deepCoreJettisonOres at runtime.)
+ */
+export function getJettisonListForMiningType(
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+): string[] {
+  if (miningType === "gas") return settings.jettisonGas || [];
+  if (miningType === "ice") return settings.jettisonIce || [];
+  if (miningType === "radioactive") return settings.radioactiveJettisonOres || [];
+  return settings.jettisonOres || [];
+}
 
 /** Detect mining type from ship modules. Uses cached modules if provided for resilience. */
 async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | "radioactive" | null> {
@@ -1515,7 +1533,7 @@ export function findFirstAvailableQuotaTarget(
     const targets = Array.isArray(excludeTargets) ? excludeTargets : [excludeTargets];
     targets.forEach(t => excludeSet.add(t));
   }
-  const jettisonSet = new Set((settings.jettisonOres || []).map(o => o.toLowerCase()));
+  const jettisonSet = new Set(getJettisonListForMiningType(settings, miningType).map(o => o.toLowerCase()));
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
@@ -2858,7 +2876,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
        if (bot.docked && bot.system === homeSystem) {
-           const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, settings.jettisonOres);
+           const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings, bot.username, getJettisonListForMiningType(settings, miningType));
          quotaTargetResource = quotaResult.target;
          quotaHasDeficit = quotaResult.hasDeficit;
          if (quotaResult.target) {
@@ -2874,7 +2892,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
          }
 } else {
           // Original behavior when not at home
-          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings.jettisonOres);
+          quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType));
           if (quotaTargetResource) {
             ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           } else {
@@ -4198,14 +4216,17 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 
     if (bot.state !== "running") break;
 
-    // ── Determine active jettison list (gas, deep core, or regular) ──
+    // ── Determine active jettison list (gas, ice, deep core, or regular) ──
     const isDeepCoreMining = effectiveTarget && isDeepCoreOre(effectiveTarget);
     const isGasMining = miningType === "gas";
+    const isIceMining = miningType === "ice";
     const activeJettisonList = isGasMining && settings.jettisonGas.length > 0
       ? settings.jettisonGas
-      : isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
-        ? settings.deepCoreJettisonOres
-        : settings.jettisonOres;
+      : isIceMining && settings.jettisonIce.length > 0
+        ? settings.jettisonIce
+        : isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
+          ? settings.deepCoreJettisonOres
+          : settings.jettisonOres;
 
     // ── Find mining POI and station in current system ──
     // Survey for hidden POIs if radioactive mining with capability
@@ -6788,7 +6809,7 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
            if (!newTarget) {
              ctx.log("mining", `Global target not available — checking quotas...`);
              await bot.refreshFactionStorage();
-              const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, settings.jettisonOres);
+              const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType, mapStore, totalMiningPower, getJettisonListForMiningType(settings, miningType));
 
             if (newQuotaTarget) {
               // Find locations for the new quota target

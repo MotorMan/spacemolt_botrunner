@@ -58,10 +58,12 @@ function getTradeBuyerSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
+  homeStation: string;
   buyItems: string[];
   autoInsure: boolean;
   autoCloak: boolean;
   minQuantityToBuy: number;
+  maxBuyQuantity: number;
   maxPrices: Record<string, number>;
   useRemoteMarketQuery: boolean;
   maxMarketAgeHours: number;
@@ -78,10 +80,18 @@ function getTradeBuyerSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
+    // Explicit home station wins over "any station in the home system". The
+    // per-bot override is checked first so a single bot can be pointed at a
+    // different station than the rest of the fleet.
+    homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
     buyItems: Array.isArray(t.buyItems) ? (t.buyItems as string[]) : [],
     autoInsure: (t.autoInsure as boolean) !== false,
     autoCloak: (t.autoCloak as boolean) ?? false,
     minQuantityToBuy: (t.minQuantityToBuy as number) || 10,
+    // 0 = unlimited. Upper bound on how many of an item are bought per trip,
+    // independent of cargo/budget. Lets you grab tiny deals (min=1) without the
+    // bot draining a whole station into one over-long haul.
+    maxBuyQuantity: (t.maxBuyQuantity as number) || 0,
     maxPrices: (t.maxPrices as Record<string, number>) || {},
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
     // 0 = accept market data of any age (old behaviour). Default 24h: anything
@@ -111,7 +121,7 @@ function getSpendBudget(settings: ReturnType<typeof getTradeBuyerSettings>): num
 async function recoverBuySession(
   ctx: RoutineContext,
   session: TradeSession,
-  settings: ReturnType<typeof getTradeBuyerSettings>,
+  homeSystem: string,
 ): Promise<TradeSession | null> {
   const { bot } = ctx;
 
@@ -146,7 +156,6 @@ async function recoverBuySession(
   // Check if we're at the destination (home station)
   if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
     // Verify we're heading to a valid home station
-    const homeSystem = settings.homeSystem;
     if (!homeSystem) {
       ctx.log("error", "No home system configured — cannot recover session");
       await failTradeSession(session.botUsername, "No home system configured");
@@ -577,6 +586,16 @@ function findCheapestSellers(
 
       // Budget limits HOW MANY we buy — it must never silently discard the route
       let buyQty = Math.min(seller.quantity, cargoFits);
+      if (settings.maxBuyQuantity > 0) {
+        if (settings.maxBuyQuantity < minQty) {
+          ctx.log(
+            "trade",
+            `>>> ${itemId}: REJECTED ${where} — max buy quantity ${settings.maxBuyQuantity} is below min quantity ${minQty}; raise "Max Buy Quantity"`,
+          );
+          continue;
+        }
+        buyQty = Math.min(buyQty, settings.maxBuyQuantity);
+      }
       if (budget > 0) {
         const affordable = Math.floor(budget / seller.price);
         if (affordable < minQty) {
@@ -659,6 +678,61 @@ function getHomeStation(homeSystem: string): { id: string; name: string } | null
   return null;
 }
 
+/**
+ * Resolve where "home" actually is for this bot.
+ *
+ * Precedence:
+ *   1. An explicit `homeStation` setting (per-bot override first, then the
+ *      routine's own setting). Every format the UI writes is accepted:
+ *      "system|poi", a bare POI id/hex, a base id, or a station name.
+ *   2. Otherwise auto-pick a market station inside `homeSystem`.
+ *
+ * The system of an explicitly configured station is authoritative — without
+ * this, configuring a home station outside the (often stale) `homeSystem` value
+ * silently sent the bot back to whatever station the home system happened to
+ * resolve to, e.g. flying to Sol Central after Arneb had been configured.
+ */
+function resolveHomeStation(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTradeBuyerSettings>,
+): { id: string; name: string; systemId: string } | null {
+  const raw = (settings.homeStation || "").trim();
+  let systemId = (settings.homeSystem || "").trim();
+
+  if (raw) {
+    const resolved = mapStore.resolveStationIdentity(raw);
+
+    if (resolved.systemId) {
+      if (systemId && resolved.systemId !== systemId) {
+        ctx.log(
+          "trade",
+          `Home station "${raw}" lives in ${resolved.systemId} — using that instead of homeSystem=${systemId}`,
+        );
+      }
+      systemId = resolved.systemId;
+    }
+
+    if (resolved.poiId) {
+      if (!systemId) {
+        ctx.log("error", `Home station "${raw}" is not in the galaxy map and no home system is set — cannot resolve home`);
+        return null;
+      }
+      if (!resolved.matched) {
+        ctx.log("trade", `Home station "${raw}" is not in the galaxy map yet — using it as-is in ${systemId}`);
+      }
+      return { id: resolved.poiId, name: resolved.poiName || resolved.poiId, systemId };
+    }
+    // `raw` named a bare system (or nothing usable) — fall through and auto-pick
+    // a station inside it.
+  }
+
+  if (!systemId) return null;
+
+  const auto = getHomeStation(systemId);
+  if (!auto) return null;
+  return { id: auto.id, name: auto.name, systemId };
+}
+
 // ── Missions ─────────────────────────────────────────────────
 //
 // INTENTIONALLY NOT IMPLEMENTED. The trade buyer never accepts, completes or
@@ -702,26 +776,40 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   // Load settings
   let settings = getTradeBuyerSettings(bot.username);
 
-  // Validate home system is configured
-  if (!settings.homeSystem) {
-    ctx.log("error", "No home system configured for trade buyer — please set homeSystem in settings");
+  // Validate a home destination is configured. The station itself is resolved
+  // once per cycle below so editing the setting takes effect without a restart.
+  if (!settings.homeSystem && !settings.homeStation) {
+    ctx.log("error", "No home configured for trade buyer — please set a home station (or at least a home system) in settings");
     await ctx.sleep(60000);
     return;
   }
 
-  // Get home station info
-  const homeStation = getHomeStation(settings.homeSystem);
-  if (!homeStation) {
-    ctx.log("error", `Cannot find station in home system ${settings.homeSystem}`);
-    await ctx.sleep(60000);
-    return;
-  }
+  let lastHomeKey = "";
 
   while (bot.state === "running") {
     // Refresh settings each cycle
     settings = getTradeBuyerSettings(bot.username);
 
-    ctx.log("trade", `Settings loaded: homeSystem=${settings.homeSystem || "(not set)"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}, maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}`);
+    // Re-resolve home every cycle — a settings change must not require a restart.
+    const home = resolveHomeStation(ctx, settings);
+    if (!home) {
+      ctx.log(
+        "error",
+        `Cannot resolve a home station (homeStation=${settings.homeStation || "(not set)"}, homeSystem=${settings.homeSystem || "(not set)"}) — check settings`,
+      );
+      await ctx.sleep(60000);
+      continue;
+    }
+    const homeStation = { id: home.id, name: home.name };
+    const homeSystemId = home.systemId;
+
+    const homeKey = `${homeSystemId}/${homeStation.id}`;
+    if (lastHomeKey && lastHomeKey !== homeKey) {
+      ctx.log("trade", `Home station changed to ${homeStation.name} (${homeSystemId}) — future deliveries go there`);
+    }
+    lastHomeKey = homeKey;
+
+    ctx.log("trade", `Settings loaded: home=${homeStation.name} (${homeSystemId})${settings.homeStation ? " [configured]" : " [auto-picked from home system]"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}, maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -780,7 +868,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;
     if (activeSession) {
-      recoveredSession = await recoverBuySession(ctx, activeSession, settings);
+      recoveredSession = await recoverBuySession(ctx, activeSession, homeSystemId);
       if (recoveredSession) {
         ctx.log("trade", `Resuming buy session: ${recoveredSession.itemName} (${recoveredSession.state})`);
       }
@@ -812,7 +900,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         sourcePoiName: recoveredSession.sourcePoiName,
         buyPrice: recoveredSession.buyPricePerUnit,
         buyQty: recoveredSession.quantityBought,
-        destSystem: settings.homeSystem,
+        destSystem: homeSystemId,
         destPoi: homeStation.id,
         destPoiName: homeStation.name,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
@@ -829,8 +917,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         continue;
       }
 
-      ctx.log("travel", `Resuming route to home...`);
-      const arrived = await navigateToSystem(ctx, settings.homeSystem, {
+      ctx.log("travel", `Resuming route to home (${homeStation.name} in ${homeSystemId})...`);
+      const arrived = await navigateToSystem(ctx, homeSystemId, {
         ...safetyOpts,
         noJettison: true,
         onJump: async (jumpNum) => {
@@ -850,9 +938,11 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
 
       await updateTradeSession(bot.username, { state: "at_destination" });
-      bot.system = settings.homeSystem;
+      bot.system = homeSystemId;
 
-      if (bot.poi !== homeStation.id) {
+      // `bot.poi` may report the friendly name while the config holds the hex id
+      // (or vice versa) — compare through the map so we don't re-travel in place.
+      if (!mapStore.sameStation(bot.poi, homeStation.id)) {
         ctx.log("travel", `Traveling to ${homeStation.name}...`);
         await bot.exec("travel", { target_poi: homeStation.id });
         bot.poi = homeStation.id;
@@ -941,9 +1031,11 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity, marketListings);
 
-    // Update routes with home station info
+    // Update routes with home station info (the resolved station is
+    // authoritative — findCheapestSellers only fills a placeholder)
     routes = routes.map(r => ({
       ...r,
+      destSystem: homeSystemId,
       destPoi: homeStation.id,
       destPoiName: homeStation.name,
     }));
@@ -993,7 +1085,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         sourcePoiName: recoveredSession.sourcePoiName,
         buyPrice: recoveredSession.buyPricePerUnit,
         buyQty: recoveredSession.quantityBought,
-        destSystem: settings.homeSystem,
+        destSystem: homeSystemId,
         destPoi: homeStation.id,
         destPoiName: homeStation.name,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
@@ -1003,7 +1095,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       buyQty = recoveredSession.quantityBought;
       totalSpent = recoveredSession.investedCredits;
 
-      if (bot.system === settings.homeSystem) {
+      if (bot.system === homeSystemId) {
         await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
         await updateTradeSession(bot.username, { state: "in_transit" });
@@ -1314,6 +1406,93 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         totalSpent = actualSpent;
         ctx.log("trade", `Purchased ${actualInCargo}x ${candidate.itemName} for ${actualSpent}cr (${actualSpent > 0 ? Math.round(actualSpent / Math.max(actualInCargo, 1)) : candidate.buyPrice}cr/ea)`);
 
+        // ── Exhaust the sell order in one visit ──
+        // Multi-item sell orders cap each order item (e.g. max 1/order), so the
+        // first buy only chips away at it. Loop re-buys at the same station until
+        // the order is gone, the per-trip max is hit, cargo is full, or credits
+        // run out — instead of flying home and making wasteful return trips.
+        const maxQ = settings.maxBuyQuantity > 0 ? settings.maxBuyQuantity : Infinity;
+        let purchased = actualInCargo;
+        let spent = actualSpent;
+        let safety = 0;
+        while (purchased < maxQ) {
+          if (bot.state !== "running") break;
+          if (++safety > 100) {
+            ctx.log("trade", `Safety stop after 100 re-buys at ${candidate.sourcePoiName}`);
+            break;
+          }
+          // Battle can break out mid-drain — bail with what we have.
+          const rb = await getBattleStatus(ctx);
+          if (rb && rb.is_participant) {
+            ctx.log("combat", "Battle detected while draining order — fleeing with cargo");
+            battleState.inBattle = true;
+            battleState.battleId = rb.battle_id;
+            await fleeFromBattle(ctx, true, 35000);
+            break;
+          }
+
+          await bot.refreshStatus();
+          await bot.refreshCargo();
+          const freeSpaceRe = getFreeSpace(bot);
+          const fitsRe = maxItemsForCargo(freeSpaceRe, candidate.itemId);
+          if (fitsRe <= 0) {
+            ctx.log("trade", `Cargo full after ${purchased}x — stopping drain`);
+            break;
+          }
+
+          const estRe = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
+          if (estRe.error) {
+            ctx.log("trade", `Order exhausted at ${candidate.sourcePoiName} (${purchased}x total)`);
+            break;
+          }
+          let avail = 0;
+          if (estRe.result && typeof estRe.result === "object") {
+            const est = estRe.result as Record<string, unknown>;
+            avail = (est.available_quantity as number) || (est.available as number) || (est.max_quantity as number) || 0;
+          }
+          if (avail <= 0) {
+            ctx.log("trade", `No more ${candidate.itemName} at ${candidate.sourcePoiName} — drained ${purchased}x`);
+            break;
+          }
+
+          let reQty = Math.min(avail, fitsRe, maxQ - purchased);
+          const tripBudgetRe = getSpendBudget(settings);
+          if (tripBudgetRe > 0) reQty = Math.min(reQty, Math.floor(tripBudgetRe / candidate.buyPrice));
+          if (reQty > 0) reQty = Math.min(reQty, Math.floor(bot.credits / candidate.buyPrice));
+          if (reQty <= 0) {
+            ctx.log("trade", `Cannot afford more ${candidate.itemName} (credits/full) — stopping drain at ${purchased}x`);
+            break;
+          }
+
+          const creditsBeforeRe = bot.credits;
+          const reResp = await bot.exec("buy", { item_id: candidate.itemId, quantity: reQty });
+          if (reResp.error) {
+            if (reResp.error.message.includes("item_not_available") || reResp.error.message.includes("not_available")) {
+              ctx.log("trade", `Order exhausted at ${candidate.sourcePoiName} (${purchased}x total)`);
+            } else {
+              ctx.log("error", `Re-buy failed: ${reResp.error.message} — stopping drain`);
+            }
+            if (reResp.error.message.includes("item_not_available") || reResp.error.message.includes("not_available")) {
+              mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+            }
+            break;
+          }
+          await bot.refreshStatus();
+          await bot.refreshCargo();
+          const haveNow = bot.inventory.find(i => i.itemId === candidate.itemId)?.quantity ?? 0;
+          const reGot = Math.max(0, haveNow - purchased);
+          if (reGot <= 0) {
+            ctx.log("trade", `Re-buy returned 0 ${candidate.itemName} — order likely drained (${purchased}x total)`);
+            break;
+          }
+          purchased += reGot;
+          spent += Math.max(0, creditsBeforeRe - bot.credits);
+          ctx.log("trade", `Drained ${reGot}x more (${purchased}x total, ${spent}cr spent)`);
+        }
+
+        buyQty = purchased;
+        totalSpent = spent;
+
         // Start trade session tracking
         const session = createTradeSession({
           botUsername: bot.username,
@@ -1332,7 +1511,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         mapStore.reserveTradeQuantity(
           candidate.sourceSystem, candidate.sourcePoi,
-          settings.homeSystem, homeStation.id,
+          homeSystemId, homeStation.id,
           candidate.itemId, buyQty,
         );
         break;
@@ -1377,8 +1556,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
 
-    if (bot.system !== settings.homeSystem) {
-      ctx.log("travel", `Heading home to ${homeStation.name}...`);
+    if (bot.system !== homeSystemId) {
+      ctx.log("travel", `Heading home to ${homeStation.name} (${homeSystemId})...`);
 
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
@@ -1388,7 +1567,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         });
       }
 
-      const arrived2 = await navigateToSystem(ctx, settings.homeSystem, {
+      const arrived2 = await navigateToSystem(ctx, homeSystemId, {
         ...cargoSafetyOpts,
         onJump: async (jumpNum) => {
           if (jumpNum % 3 !== 0) return true;
@@ -1441,7 +1620,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
     
-    if (bot.poi !== homeStation.id) {
+    if (!mapStore.sameStation(bot.poi, homeStation.id)) {
       ctx.log("travel", `Traveling to ${homeStation.name}...`);
       const t2Resp = await bot.exec("travel", { target_poi: homeStation.id });
       // Check for battle notifications after travel

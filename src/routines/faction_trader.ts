@@ -218,6 +218,12 @@ export function isValidDestination(ctx: RoutineContext, systemId: string, poiId:
     ctx.log("error", `Destination POI ${poiId} not found in system ${systemId}`);
     return false;
   }
+  // Outposts cannot host a trade market — any buy demand attributed to one is
+  // bogus and would send the bot flying there only for the "buyer" to vanish.
+  if ((poi.type || "").toLowerCase() === "outpost") {
+    ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is an outpost — outposts have no market, rejecting as buyer`);
+    return false;
+  }
   // Check for either has_base OR base_id (some stations have base_id but not has_base)
   if (!poi.has_base && !poi.base_id) {
     ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is not a valid station (no dock)`);
@@ -2479,6 +2485,23 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             );
             if (!destBuyer || destBuyer.quantity <= 0) {
               ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer gone at ${route!.destPoiName} — aborting`);
+              // Flip this run to return-to-origin right now so we head home with
+              // the cargo instead of parking at the nearest random (possibly
+              // undockable) station. The bot must put it back where it got it.
+              const sess = getActiveSession(bot.username);
+              if (sess) {
+                const originSystem = sess.sourceSystem || settings.homeSystem;
+                const originPoi = sess.sourcePoi || getHomeStationPoi(settings.homeStation);
+                const originName = sess.sourcePoiName || originPoi || originSystem;
+                releaseBuyOrderLock(bot.username, sess.itemId, sess.destPoi, sess.sellPricePerUnit, "buyer_gone_returning_to_origin");
+                await updateTradeSession(bot.username, {
+                  destSystem: originSystem,
+                  destPoi: originPoi,
+                  destPoiName: originName,
+                  returnToSource: true,
+                  notes: (sess.notes || "") + ` | Buyer gone mid-route — returning to ${originName}`,
+                });
+              }
               return false;
             }
             ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${destBuyer.price}cr × ${destBuyer.quantity} at dest)`);
@@ -2488,13 +2511,37 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         if (!arrived) {
           ctx.log("error", "Failed to reach destination — will retry on next cycle");
 
+          // If the buyer vanished mid-route we already flipped this session to
+          // return-to-origin (see onJump above). In that case go HOME directly —
+          // do NOT use ensureDocked's "nearest station" fallback, which would
+          // strand the cargo at a random, possibly undockable station.
+          const session = getActiveSession(bot.username);
+          if (session?.returnToSource) {
+            ctx.log("travel", `Buyer gone — returning cargo to origin (${session.sourcePoiName || session.sourceSystem || "home"}) instead of parking at a random station`);
+            const homeSystem = settings.homeSystem || startSystem;
+            const homeStationPoi = getHomeStationPoi(settings.homeStation) || null;
+            if (homeSystem && bot.system !== homeSystem) {
+              await ensureUndocked(ctx);
+              const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+              if (homeFueled) {
+                await navigateToSystem(ctx, homeSystem, { ...safetyOpts });
+              }
+            }
+            if (homeStationPoi && bot.poi !== homeStationPoi) {
+              await ensureUndocked(ctx);
+              const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+              if (!tResp.error || tResp.error.message.includes("already")) bot.poi = homeStationPoi;
+            }
+            await ctx.sleep(5000);
+            continue;
+          }
+
           // CRITICAL: Do NOT fail the session or sell cargo prematurely!
           // Network issues, server hiccups, and temporary disconnections are common.
           // The session remains active and will be recovered on the next cycle.
           // The bot will retry the jump with exponential backoff in navigateToSystem().
 
           // Update session state to reflect we're still in transit
-          const session = getActiveSession(bot.username);
           if (session) {
             await updateTradeSession(bot.username, {
               state: "in_transit",

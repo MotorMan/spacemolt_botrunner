@@ -1368,9 +1368,10 @@ class MapStore {
   /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems).
    *  If approvedSet is provided, only stations whose poiId or "system|poiId" is in the set are considered.
    *  Returns { systemId, poiId, poiName, hops } or null. */
-  findNearestStationSystem(fromSystemId: string, blacklist?: string[], approvedSet?: Set<string>): { systemId: string; poiId: string; poiName: string; hops: number } | null {
+  findNearestStationSystem(fromSystemId: string, blacklist?: string[], approvedSet?: Set<string>, deniedSet?: Set<string>): { systemId: string; poiId: string; poiName: string; hops: number } | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    const denied = deniedSet && deniedSet.size > 0 ? new Set(Array.from(deniedSet).map(s => s.toLowerCase())) : null;
 
     const isApproved = (sysId: string, poiId: string): boolean => {
       if (!approvedSet || approvedSet.size === 0) return true;
@@ -1379,11 +1380,18 @@ class MapStore {
       return false;
     };
 
+    const isDenied = (sysId: string, poiId: string): boolean => {
+      if (!denied) return false;
+      if (denied.has(poiId.toLowerCase())) return true;
+      if (denied.has(`${sysId}|${poiId}`.toLowerCase())) return true;
+      return false;
+    };
+
     // Check current system first (but skip if it's a pirate or blacklisted system)
     if (!this.isPirateSystem(fromSystemId) && !blacklistSet.has(fromSystemId.toLowerCase())) {
       const sys = this.data.systems[fromSystemId];
       if (sys) {
-        const localStation = sys.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(fromSystemId, p.id));
+        const localStation = sys.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(fromSystemId, p.id) && !isDenied(fromSystemId, p.id));
         if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
       }
     }
@@ -1405,7 +1413,7 @@ class MapStore {
         visited.add(nextId);
 
         const nextSys = this.data.systems[nextId];
-        const station = nextSys?.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(nextId, p.id));
+        const station = nextSys?.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(nextId, p.id) && !isDenied(nextId, p.id));
         if (station) {
           return { systemId: nextId, poiId: station.id, poiName: station.name, hops: current.hops + 1 };
         }

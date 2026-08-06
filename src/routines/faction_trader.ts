@@ -1029,14 +1029,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const settings = getFactionTraderSettings(bot.username);
 
     // ── Cloak status check (every cycle when autoCloak enabled) ──
-    // Re-verify cloaking status and re-enable if needed — but ONLY while undocked.
-    // Cloaking undocks the ship, so re-enabling while docked would break the
-    // docked-only operations below (storage, market, etc.) because ensureDocked()
-    // short-circuits on a stale docked flag. navigateToSystem() re-cloaks before
-    // each jump, so do NOT cloak here when already docked.
-    if (settings.autoCloak && !bot.isCloaked && !bot.docked && bot.fuel > 0) {
-      ctx.log("trade", "Cloak status check: bot undocked and not cloaked — re-enabling cloak");
-      await enableCloakingIfPossible(ctx);
+    // A customs patrol or combat can force the cloak down while bot.isCloaked is
+    // still cached as true, so actually re-read the ship state before trusting
+    // the cache. Re-enable when needed — but ONLY while undocked, because
+    // cloaking undocks the ship and re-enabling while docked would break the
+    // docked-only operations below (storage, market, etc.) via a stale docked
+    // flag. navigateToSystem() also re-cloaks before each jump, so while docked
+    // we intentionally leave the cloak alone.
+    if (settings.autoCloak && !bot.docked && bot.fuel > 0) {
+      await bot.refreshStatus();
+      if (!bot.isCloaked) {
+        ctx.log("trade", "Cloak status check: bot undocked and not cloaked — re-enabling cloak");
+        await enableCloakingIfPossible(ctx);
+      }
     }
 
     // ── Afterburner boost ──
@@ -1053,6 +1058,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
       ignoreBlacklistWhenCloaked: settings.autoCloak,
       onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+        // Keep the cloak up across every jump: a force-drop mid-route must not
+        // leave the ship exposed. enableCloakingIfPossible() is a no-op when
+        // already cloaked, so this is safe to call before each jump.
+        if (settings.autoCloak && !bot.isCloaked && !bot.docked) {
+          await enableCloakingIfPossible(ctx);
+        }
         if (abBooster) await abBooster.beforeJump(nextSystem, jumpNumber);
       },
     };

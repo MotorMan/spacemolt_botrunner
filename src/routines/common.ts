@@ -3504,7 +3504,9 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
   const sys = mapStore.getSystem(bot.system);
   if (!sys || !isDangerousSystem(sys.security_level)) return false;
 
-  const resp = await bot.exec("cloak");
+  // IMPORTANT: always pass { enable: true }. A bare `cloak` command TOGGLES the
+  // cloak, so calling it again (e.g. when bot.isCloaked is stale) flips it OFF.
+  const resp = await bot.exec("cloak", { enable: true });
   if (!resp.error) {
     bot.isCloaked = true;
     ctx.log("system", `Cloaked in ${bot.system} (${sys.security_level})`);

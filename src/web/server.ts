@@ -392,6 +392,24 @@ export function getSystemBlacklist(): string[] {
   return [];
 }
 
+/** Get the global station blacklist from settings. These are POI ids (or
+ *  "system|poiId" keys) that must never be treated as a usable station —
+ *  e.g. outposts the bot cannot dock at because they can never be set public. */
+export function getStationBlacklist(): string[] {
+  const settings = loadSettings();
+  const raw = (settings.station_blacklist as any)
+           || (settings.stationBlacklist as any)
+           || [];
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object' && Array.isArray(raw.station_blacklist)) {
+    return raw.station_blacklist;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.stationBlacklist)) {
+    return raw.stationBlacklist;
+  }
+  return [];
+}
+
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   const { writeFileSync } = require("fs");

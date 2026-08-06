@@ -84,6 +84,17 @@ function getTradeBuyerSettings(username?: string): {
   };
 }
 
+/**
+ * Effective credit budget for a single buy trip.
+ * `maxSpendPerItem` caps spend on one item type, `maxTotalSpend` caps the whole
+ * run — since a trip buys exactly one item type, the tighter of the two applies.
+ * Returns 0 when both are unlimited.
+ */
+function getSpendBudget(settings: ReturnType<typeof getTradeBuyerSettings>): number {
+  const caps = [settings.maxSpendPerItem, settings.maxTotalSpend].filter(v => typeof v === "number" && v > 0);
+  return caps.length > 0 ? Math.min(...caps) : 0;
+}
+
 // ── Trade Session Recovery ──────────────────────────────────
 
 /**
@@ -241,6 +252,7 @@ function findCheapestSellers(
     ctx.log("trade", `>>> Found matching item: ${itemId} (${sellers.length} sellers)`);
 
     // Check max price for this item
+    let candidates = sellers;
     const maxPrice = settings.maxPrices?.[itemId];
     if (maxPrice !== undefined && maxPrice > 0) {
       // Filter out sellers that are above the max price
@@ -250,26 +262,56 @@ function findCheapestSellers(
         ctx.log("trade", `>>> ${itemId}: No sellers at or below max price ${maxPrice}cr (cheapest available: ${cheapest}cr)`);
         continue;
       } // No sellers at acceptable price
-      sellers.length = 0;
-      sellers.push(...filteredSellers);
-      ctx.log("trade", `>>> ${itemId}: Filtered to ${sellers.length} sellers at or below ${maxPrice}cr`);
+      candidates = filteredSellers;
+      ctx.log("trade", `>>> ${itemId}: Filtered to ${candidates.length} sellers at or below ${maxPrice}cr`);
     }
 
     // Sort by price ascending (cheapest first)
-    sellers.sort((a, b) => a.price - b.price);
+    candidates = [...candidates].sort((a, b) => a.price - b.price);
 
-    for (const seller of sellers.slice(0, 3)) { // Top 3 cheapest per item
+    const itemSize = getItemSize(itemId);
+    const cargoFits = maxItemsForCargo(cargoCapacity, itemId);
+    const budget = getSpendBudget(settings);
+    const minQty = Math.max(1, settings.minQuantityToBuy);
+
+    // Cargo is a hard, seller-independent limit — report it once and move on
+    if (cargoFits < minQty) {
+      ctx.log("trade", `>>> ${itemId}: REJECTED — cargo holds only ${cargoFits}x (capacity ${cargoCapacity}, item size ${itemSize}), need at least ${minQty}x (minQuantityToBuy)`);
+      continue;
+    }
+
+    for (const seller of candidates.slice(0, 3)) { // Top 3 cheapest per item
+      const where = `${seller.poiName} (${seller.systemId}) @ ${seller.price}cr`;
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, seller.systemId, settings.fuelCostPerJump);
-      if (jumps >= 999) continue;
+      if (jumps >= 999) {
+        ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — no route from ${currentSystem} (unreachable or blacklisted)`);
+        continue;
+      }
 
-      const buyQty = Math.min(seller.quantity, maxItemsForCargo(cargoCapacity, itemId));
-      if (buyQty < settings.minQuantityToBuy) continue;
+      // Budget limits HOW MANY we buy — it must never silently discard the route
+      let buyQty = Math.min(seller.quantity, cargoFits);
+      if (budget > 0) {
+        const affordable = Math.floor(budget / seller.price);
+        if (affordable < minQty) {
+          ctx.log(
+            "trade",
+            `>>> ${itemId}: REJECTED ${where} — spend budget ${budget}cr only affords ${affordable}x (need ${minQty}x). ` +
+            `Raise "Max Spend Per Item"${settings.maxTotalSpend > 0 && settings.maxTotalSpend <= settings.maxSpendPerItem ? ` / "Max Total Spend"` : ""} to at least ${seller.price * minQty}cr`,
+          );
+          continue;
+        }
+        buyQty = Math.min(buyQty, affordable);
+      }
+
+      if (buyQty < minQty) {
+        ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — only ${buyQty}x obtainable (stock ${seller.quantity}, cargo fits ${cargoFits}), need ${minQty}x`);
+        continue;
+      }
 
       // Calculate total cost including fuel
       const itemCost = seller.price * buyQty;
-      if (settings.maxSpendPerItem > 0 && itemCost > settings.maxSpendPerItem) continue;
-
       const totalCost = itemCost + fuelCost;
+      ctx.log("trade", `>>> ${itemId}: ACCEPTED ${where} — ${buyQty}x for ${itemCost}cr + ${fuelCost}cr fuel (${jumps} jumps)`);
 
       routes.push({
         itemId: seller.itemId,
@@ -288,8 +330,15 @@ function findCheapestSellers(
     }
   }
 
-  // Sort by total cost ascending (cheapest to acquire first)
-  routes.sort((a, b) => a.totalCost - b.totalCost);
+  // Sort by effective cost per unit (item price + amortized fuel), then prefer
+  // the larger haul. Sorting by raw total cost would rank a 2x purchase above a
+  // cheaper-per-unit 20x purchase, which is wrong for a stockpiling routine.
+  routes.sort((a, b) => {
+    const aPer = a.totalCost / Math.max(1, a.buyQty);
+    const bPer = b.totalCost / Math.max(1, b.buyQty);
+    if (aPer !== bPer) return aPer - bPer;
+    return b.buyQty - a.buyQty;
+  });
   return routes;
 }
 
@@ -324,83 +373,14 @@ function getHomeStation(homeSystem: string): { id: string; name: string } | null
 }
 
 // ── Missions ─────────────────────────────────────────────────
-
-/**
- * Complete any active missions that are ready, then accept new market/trade
- * missions at the current station (up to 2 per visit, respecting the 5-mission cap).
- * Must be docked.
- */
-async function tryMissions(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  if (!bot.docked) return;
-
-  // Try to complete active missions
-  const activeResp = await bot.exec("get_active_missions");
-  let activeMissionCount = 0;
-  if (!activeResp.error && activeResp.result) {
-    const ar = activeResp.result as Record<string, unknown>;
-    const active = (
-      Array.isArray(ar.missions) ? ar.missions :
-      Array.isArray(ar) ? ar :
-      []
-    ) as Array<Record<string, unknown>>;
-    activeMissionCount = active.length;
-
-    for (const mission of active) {
-      const missionId = (mission.mission_id as string) || (mission.id as string) || "";
-      if (!missionId) continue;
-      const status = ((mission.status as string) || "").toLowerCase();
-      if (status === "incomplete" || status === "in_progress") continue;
-      const completeResp = await bot.exec("complete_mission", { mission_id: missionId });
-      if (completeResp.error) {
-        if (completeResp.error.code === "mission_incomplete") continue;
-      }
-      if (!completeResp.error && completeResp.result) {
-        const cr = completeResp.result as Record<string, unknown>;
-        const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
-        ctx.log("trade", `Mission complete! +${earned}cr`);
-        activeMissionCount--;
-        await bot.refreshStatus();
-      }
-    }
-  }
-
-  // Accept new market/trade missions (cap at 5 total active)
-  if (activeMissionCount >= 5) return;
-
-  const availResp = await bot.exec("get_missions");
-  if (availResp.error || !availResp.result) return;
-
-  const vr = availResp.result as Record<string, unknown>;
-  const available = (
-    Array.isArray(vr.missions) ? vr.missions :
-    Array.isArray(vr) ? vr :
-    []
-  ) as Array<Record<string, unknown>>;
-
-  let accepted = 0;
-  for (const mission of available) {
-    if (activeMissionCount + accepted >= 5 || accepted >= 2) break;
-
-    const missionId = (mission.mission_id as string) || (mission.id as string) || "";
-    const type = ((mission.type as string) || "").toLowerCase();
-    const title = ((mission.title as string) || "").toLowerCase();
-
-    const isTradeRelated =
-      type === "market_participation" || type === "trade" || type === "delivery" ||
-      type === "procurement" ||
-      title.includes("market") || title.includes("trade") ||
-      title.includes("buy") || title.includes("purchase") || title.includes("deliver");
-
-    if (!isTradeRelated || !missionId) continue;
-
-    const acceptResp = await bot.exec("accept_mission", { mission_id: missionId });
-    if (!acceptResp.error) {
-      ctx.log("trade", `Accepted mission: ${(mission.title as string) || missionId}`);
-      accepted++;
-    }
-  }
-}
+//
+// INTENTIONALLY NOT IMPLEMENTED. The trade buyer never accepts, completes or
+// tracks missions. It exists purely to buy items cheaply and stockpile them in
+// faction storage. Mission handling previously lived here and was harmful:
+// every station visit burned rate-limited `get_missions` / `accept_mission`
+// calls, and once the 5-mission cap was hit it spammed `too_many_missions`
+// errors for ~10s per attempt while blocking the buy loop.
+// Do not re-add mission logic to this routine.
 
 // ── Trade Buyer routine ─────────────────────────────────────
 
@@ -524,7 +504,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
     };
-    let extraSpent = 0;
     let route: BuyRoute | null = null;
     let buyQty = 0;
     let totalSpent = 0;
@@ -599,9 +578,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // ── Ensure docked (also records market data) ──
     yield "dock";
     await ensureDocked(ctx);
-    if (bot.docked) {
-      await tryMissions(ctx);
-    }
 
     // ── Fuel + hull check + mods ──
     yield "maintenance";
@@ -692,7 +668,13 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     if (routes.length === 0 && !recoveredSession) {
-      ctx.log("trade", "No profitable buy opportunities found — waiting 60s before re-scanning");
+      const budget = getSpendBudget(settings);
+      ctx.log(
+        "trade",
+        `No buy routes passed the filters (see REJECTED lines above) — ` +
+        `buyItems=[${settings.buyItems.join(", ") || "(none)"}], spend budget=${budget > 0 ? budget + "cr" : "unlimited"}, ` +
+        `minQty=${Math.max(1, settings.minQuantityToBuy)}, cargo=${cargoCapacity}. Waiting 60s before re-scanning`,
+      );
       await ctx.sleep(60000);
       continue;
     }
@@ -873,7 +855,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         }
 
         await recordMarketData(ctx);
-        await tryMissions(ctx);
 
         // Verify item is actually available
         yield "verify_availability";
@@ -932,8 +913,9 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         await bot.refreshStatus();
         const freeSpace = getFreeSpace(bot);
         let qty = Math.min(candidate.buyQty, maxItemsForCargo(freeSpace, candidate.itemId));
-        if (settings.maxSpendPerItem > 0) {
-          qty = Math.min(qty, Math.floor(settings.maxSpendPerItem / candidate.buyPrice));
+        const tripBudget = getSpendBudget(settings);
+        if (tripBudget > 0) {
+          qty = Math.min(qty, Math.floor(tripBudget / candidate.buyPrice));
         }
         if (qty > 0) {
           qty = Math.min(qty, Math.floor(bot.credits / candidate.buyPrice));
@@ -1179,7 +1161,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
     bot.docked = true;
-    await tryMissions(ctx);
 
     // ── Deposit items to faction storage ──
     yield "deposit";

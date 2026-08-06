@@ -17646,7 +17646,7 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Max Spend Per Item (credits)</div>
-        <div class="setting-hint">Maximum credits to spend on a single item type per run. 0 = unlimited.</div>
+        <div class="setting-hint">Credit budget for one buy trip — caps how many units are bought. Must be at least (unit price × min quantity) or the item will be skipped. 0 = unlimited.</div>
       </div>
       <input type="number" id="set-trade_buyer-maxSpendPerItem" min="0" max="1000000" value="${maxSpendPerItem}">
     </div>
@@ -17654,7 +17654,7 @@
     <div class="setting-row">
       <div>
         <div class="setting-label">Max Total Spend (credits)</div>
-        <div class="setting-hint">Maximum total credits to spend per run. 0 = unlimited.</div>
+        <div class="setting-hint">Overall spend cap per buy trip. The tighter of this and Max Spend Per Item applies. 0 = unlimited.</div>
       </div>
       <input type="number" id="set-trade_buyer-maxTotalSpend" min="0" max="10000000" value="${maxTotalSpend}">
     </div>

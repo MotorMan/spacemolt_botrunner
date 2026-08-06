@@ -901,6 +901,14 @@ function isFuelCellItemId(id: string): boolean {
   return lower === "military_fuel_cell" || lower === "premium_fuel_cell" || lower === "fuel_cell";
 }
 
+/** True when the bot is docked at its configured home system. Used to decide
+ *  whether plain fuel_cells are "free" (home) or a waste of credits (remote). */
+function isAtHomeStation(ctx: RoutineContext): boolean {
+  const homeSystem = ((readSettings().trader?.homeSystem as string) || "").toLowerCase();
+  if (!homeSystem) return false;
+  return ctx.bot.system.toLowerCase() === homeSystem;
+}
+
 /** How many fuel cells of the given id fit in available cargo (by weight). */
 function maxFuelCellsForCargo(ctx: RoutineContext, itemId: string): number {
   const { bot } = ctx;
@@ -937,9 +945,24 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
   if (bot.fuel >= bot.maxFuel * 0.9) return false;
 
   let sourced = 0;
+  // If we already carry ANY fuel cell, prefer refueling from cargo rather than
+  // buying inferior/expensive plain fuel_cells. This prevents the classic waste:
+  // a ship holding 10x military_fuel_cell (100 fuel each) still buying 6x plain
+  // fuel_cell (20 fuel each) for 20k at a remote station.
+  const haveAnyCell = bot.inventory.some((i) => isFuelCellItemId(i.itemId) && (i.quantity || 0) > 0);
   for (const { id } of FUEL_CELL_RANK) {
     const have = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
     if (have > 0) continue;
+    if (haveAnyCell) {
+      ctx.log("trade", `Carrying fuel cells already — will refuel from cargo instead of buying ${id}`);
+      continue;
+    }
+    // Never blow credits on plain fuel_cells at a remote station: military cells
+    // are free at home and give 5x the fuel per cell. Only buy plain fuel_cell at home.
+    if (id === "fuel_cell" && !isAtHomeStation(ctx)) {
+      ctx.log("trade", "Skipping expensive plain fuel_cell at remote station (military cells are free at home)");
+      continue;
+    }
 
     const cellFuel = FUEL_CELL_RANK.find((f) => f.id === id)?.fuel || 20;
     const cellsNeeded = Math.max(1, Math.ceil(fuelNeeded / cellFuel));
@@ -1069,6 +1092,9 @@ async function tryBuyOneFuelCell(ctx: RoutineContext): Promise<boolean> {
   const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
   if (!stationHasMarket(station)) return false;
   for (const { id } of FUEL_CELL_RANK) {
+    // Don't waste credits on plain fuel_cells at remote stations — military cells
+    // are free at home and vastly more efficient (100 vs 20 fuel, 3 vs 1 space).
+    if (id === "fuel_cell" && !isAtHomeStation(ctx)) continue;
     if (maxFuelCellsForCargo(ctx, id) <= 0) continue;
     try {
       const buyResp = await bot.exec("buy", { item_id: id, quantity: 1 });

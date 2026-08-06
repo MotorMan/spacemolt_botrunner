@@ -25,6 +25,9 @@ import {
   maxItemsForCargo,
   getItemSize,
   readSettings,
+  cargoUsedFromInventory,
+  isStationPoi,
+  stationHasMarket,
   logFactionActivity,
   isPirateSystem,
   checkAndFleeFromBattle,
@@ -519,6 +522,9 @@ function getTraderSettings(username?: string): {
   passengerFareEstimate: number;
   depositProfitsToFaction: boolean;
   useRemoteMarketQuery: boolean;
+  grabMilitaryFuelCells: boolean;
+  militaryFuelCellMin: number;
+  militaryFuelCellTarget: number;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -544,7 +550,103 @@ function getTraderSettings(username?: string): {
     passengerFareEstimate: (t.passengerFareEstimate as number) ?? 5000,
     depositProfitsToFaction: (t.depositProfitsToFaction as boolean) ?? true,
     useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
+    grabMilitaryFuelCells: (t.grabMilitaryFuelCells as boolean) ?? true,
+    militaryFuelCellMin: (t.militaryFuelCellMin as number) ?? 3,
+    militaryFuelCellTarget: (t.militaryFuelCellTarget as number) ?? 15,
   };
+}
+
+/**
+ * Quick-mode fuel safety: whenever docked at the HOME station, make sure the bot
+ * is carrying a healthy stock of military_fuel_cell. These are free at home and
+ * vastly superior to plain fuel_cell (100 fuel / 3 space vs 20 fuel / 1 space),
+ * so we never want to be caught buying expensive plain fuel_cells at a remote
+ * station. Grabs at least `militaryFuelCellMin` (default 3) and tops up toward
+ * `militaryFuelCellTarget` (cargo-space permitting).
+ *
+ * Source order at home: faction storage (free) → station storage (free) → market buy.
+ */
+async function stockpileMilitaryFuelCells(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  if (!settings.grabMilitaryFuelCells) return;
+  if (!bot.docked) return;
+
+  const homeSystem = settings.homeSystem || "";
+  const homePoi = getHomeStationPoi(settings.homeStation);
+  const atHome = !!homeSystem && bot.system === homeSystem && (homePoi === "" || bot.poi === homePoi);
+  if (!atHome) return;
+
+  const MIL = "military_fuel_cell";
+  await bot.refreshCargo();
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+
+  const current = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
+  const min = Math.max(1, settings.militaryFuelCellMin);
+  // Already at/above target — nothing to do.
+  if (current >= min && current >= settings.militaryFuelCellTarget) return;
+
+  const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
+  const maxFit = maxItemsForCargo(freeWeight, MIL);
+  if (maxFit <= 0) return;
+
+  const target = Math.min(settings.militaryFuelCellTarget, Math.max(min, maxFit));
+  let need = Math.min(target - current, maxFit);
+  if (need <= 0) return;
+
+  // 1) Faction storage (free)
+  const inFaction = bot.factionStorage.find((i) => i.itemId === MIL);
+  if (need > 0 && inFaction && inFaction.quantity > 0) {
+    const qty = Math.min(inFaction.quantity, need);
+    if (qty > 0) {
+      const fResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: MIL, quantity: qty, source: "faction" });
+      if (!fResp.error) {
+        await bot.refreshStorage();
+        const wResp = await bot.exec("withdraw_items", { item_id: MIL, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          need -= qty;
+        }
+      }
+    }
+  }
+
+  // 2) Station storage (free)
+  if (need > 0) {
+    const inStation = bot.storage.find((i) => i.itemId === MIL);
+    if (inStation && inStation.quantity > 0) {
+      const qty = Math.min(inStation.quantity, need);
+      if (qty > 0) {
+        const wResp = await bot.exec("withdraw_items", { item_id: MIL, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          need -= qty;
+        }
+      }
+    }
+  }
+
+  // 3) Buy from the (free/cheap) home market
+  if (need > 0) {
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      if (stationHasMarket(station)) {
+        const buyResp = await bot.exec("buy", { item_id: MIL, quantity: need });
+        if (!buyResp.error) {
+          await bot.refreshCargo();
+        }
+      }
+    } catch { /* market unavailable — skip */ }
+  }
+
+  const got = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
+  if (got !== current) {
+    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (min ${min}, target ${settings.militaryFuelCellTarget})`);
+  }
 }
 
 // ── Trade Session Recovery ──────────────────────────────────
@@ -1982,7 +2084,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Ensure docked (also records market data + analyzes market) ──
     yield "dock";
     await ensureDocked(ctx);
-    
+
+    // ── Quick-mode: stockpile free military fuel cells whenever at home ──
+    yield "stockpile_fuel_cells";
+    await stockpileMilitaryFuelCells(ctx, settings);
+
     // ── Priority 0: Sell trade items immediately after docking ──
     // This is the most time-critical operation - sell before anything else
     yield "sell_trade_items";

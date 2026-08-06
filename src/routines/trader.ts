@@ -62,7 +62,7 @@ import {
   getAllUnsoldItems,
   type UnsoldItem,
 } from "./unsoldItems.js";
-import { queryRemoteMarket } from "../client_sync_hooks.js";
+import { queryRemoteMarket, getMarketSourceInfo, resolveMarketSource } from "../client_sync_hooks.js";
 
 // ── CSV Logging ─────────────────────────────────────────────────
 
@@ -854,15 +854,32 @@ type PriceSpread = {
 };
 
 /**
- * Query every other connected client (via the sync master) for the cheapest
- * place to BUY each item in `items`, and return them as synthetic price spreads
- * that can be merged into the local mapStore spreads. For each remote sell
- * station we pair it with the best LOCAL buy listing (so the route stays
- * "current location → remote buy → local sell", keeping travel sane).
+ * Query the best market data source for the cheapest place to BUY each item in
+ * `items`, and return them as synthetic price spreads that can be merged into
+ * the local mapStore spreads. For each remote sell station we pair it with the
+ * best LOCAL buy listing (so the route stays "current location → remote buy →
+ * local sell", keeping travel sane).
  *
- * Returns [] when remote queries are disabled, fail, or find nothing, so callers
+ * The source is auto-detected: another connected client via the sync master
+ * when one holds the market data, or this client's own
+ * `data/marketDetails.json` when the market routines run right here (or no
+ * remote client is reachable).
+ *
+ * Returns [] when market queries are disabled, fail, or find nothing, so callers
  * can safely append the result to their local spreads.
  */
+/** Log line for "the market query found nothing", worded for whichever source
+ *  the client is actually using (local file vs a connected client) so the log
+ *  never claims a remote lookup happened when it didn't. */
+function describeNoMarketDeals(itemCount: number, prefix = ""): string {
+  const src = getMarketSourceInfo();
+  if (src.mode === "none") {
+    return `[Market] No market data source for ${prefix}${itemCount} item(s) — ${src.reason}`;
+  }
+  const kind = src.mode === "local" ? "local" : "remote";
+  return `[${src.label}] No ${kind} deals found for ${prefix}${itemCount} item(s)`;
+}
+
 async function collectRemoteSpreads(
   items: string[],
   currentSystem: string,
@@ -871,6 +888,18 @@ async function collectRemoteSpreads(
   const stop = perf.isEnabled() ? perf.startSpan("trader.collectRemoteSpreads") : null;
   const out: PriceSpread[] = [];
   if (items.length === 0) { stop?.end(); return out; }
+
+  // Work out where market data should come from BEFORE fanning out. When the
+  // market routines run in this same client (or there is no reachable remote
+  // client), queryRemoteMarket reads data/marketDetails.json directly instead
+  // of making a call out of the client that can only ever fail.
+  const source = await resolveMarketSource();
+  if (source.mode === "none") {
+    debugLog?.(`[Market] No market data source: ${source.reason}`);
+    stop?.end();
+    return out;
+  }
+  debugLog?.(`[${source.label}] ${source.reason}`);
 
   const results = await Promise.all(items.map(async (itemId) => {
     try {
@@ -2437,8 +2466,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const spreadCount = mapStore.findPriceSpreads().length;
       cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
 
-      // Remote market query: augment local data with fresh prices from other
-      // connected clients if enabled. Low-bandwidth (~200 bytes per query).
+      // Market query: augment local map data with fresh prices, either from
+      // another connected client or — when the market routines run in this
+      // same client — straight from data/marketDetails.json. Low-bandwidth
+      // (~200 bytes per remote query, zero bytes when served locally).
       let remoteSpreads: PriceSpread[] = [];
       if (settings.useRemoteMarketQuery !== false) {
         const uniqueItems = new Set<string>();
@@ -2450,7 +2481,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
           );
           if (remoteSpreads.length === 0) {
-            ctx.log("trade", `[RemoteMarket] No remote deals found for ${Math.min(uniqueItems.size, 20)} item(s)`);
+            ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20)));
           }
         }
       }
@@ -3873,7 +3904,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const nextCargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - nextFuelWeight);
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
 
-    // Remote market query: augment local data before next route scan
+    // Market query (remote client or local market file): augment local data
+    // before next route scan
     let nextRemoteSpreads: PriceSpread[] = [];
     if (settings.useRemoteMarketQuery !== false) {
       const uniqueItems = new Set<string>();
@@ -3885,7 +3917,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
         );
         if (nextRemoteSpreads.length === 0) {
-          ctx.log("trade", `[RemoteMarket] No remote deals found for next-scan ${Math.min(uniqueItems.size, 20)} item(s)`);
+          ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20), "next-scan "));
         }
       }
     }

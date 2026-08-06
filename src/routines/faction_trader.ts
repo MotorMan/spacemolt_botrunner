@@ -61,7 +61,7 @@ import {
   planAfterburnerTrip,
   stockAfterburnerConsumables,
 } from "./afterburner.js";
-import { queryRemoteMarket } from "../client_sync_hooks.js";
+import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../client_sync_hooks.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -1455,13 +1455,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await bot.refreshStatus();
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
 
-    // Remote market query: augment local buy demand with fresh prices from
-    // other connected clients. Each remote buy order becomes an extra buyer.
+    // Market query: augment local buy demand with fresh prices from another
+    // connected client, or — when the market routines run in this same client
+    // (or no remote client is reachable) — straight from the local
+    // data/marketDetails.json. Each buy order found becomes an extra buyer.
     let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
     if (settings.useRemoteMarketQuery !== false) {
       const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
       const uniqueItems = Array.from(new Set(storageItems)).slice(0, 20);
-      if (uniqueItems.length > 0) {
+      const marketSource = await resolveMarketSource();
+      if (uniqueItems.length > 0 && marketSource.mode === "none") {
+        ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
+      } else if (uniqueItems.length > 0) {
         const results = await Promise.all(uniqueItems.map(async (itemId) => {
           try {
             const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
@@ -1481,10 +1486,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
         }));
         remoteBuyDemand = results.filter(Boolean) as typeof remoteBuyDemand;
+        const src = getMarketSourceInfo();
+        const origin = src.mode === "local" ? "local market data" : "connected clients";
         if (remoteBuyDemand.length > 0) {
-          ctx.log("trade", `[RemoteMarket] Faction trader: found ${remoteBuyDemand.length} remote buyer(s) from connected clients`);
+          ctx.log("trade", `[${src.label}] Faction trader: found ${remoteBuyDemand.length} buyer(s) from ${origin}`);
         } else {
-          ctx.log("trade", `[RemoteMarket] Faction trader: no remote buyers for ${uniqueItems.length} item(s)`);
+          ctx.log("trade", `[${src.label}] Faction trader: no buyers in ${origin} for ${uniqueItems.length} item(s)`);
         }
       }
     }

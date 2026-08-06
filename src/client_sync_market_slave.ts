@@ -356,16 +356,11 @@ export class ClientSyncMarketSlave {
 
   private async checkMarketDataFreshness(): Promise<void> {
     try {
-      const { existsSync, readFileSync, statSync } = await import("fs");
-      const { join } = await import("path");
-      const marketFile = join(process.cwd(), "data", "marketDetails.json");
-      if (!existsSync(marketFile)) {
-        this.hasMarketData = false;
-        return;
-      }
-      const stats = statSync(marketFile);
-      const age = Date.now() - stats.mtimeMs;
-      this.hasMarketData = age < this.MARKET_DATA_STALE_MS;
+      // Shared with the in-client local market source so both agree on what
+      // "we have market data" means (and share one throttled stat call).
+      const { getLocalMarketFileInfo } = await import("./market_local_source.js");
+      const info = getLocalMarketFileInfo();
+      this.hasMarketData = info.exists && info.ageMs !== null && info.ageMs < this.MARKET_DATA_STALE_MS;
     } catch {
       this.hasMarketData = false;
     }

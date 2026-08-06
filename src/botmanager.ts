@@ -237,6 +237,12 @@ export function getBotStatuses(): BotStatus[] {
     .map((b) => b.status());
 }
 
+// Publish the status getter on globalThis so low-level modules can ask "is a
+// given routine running in this client?" WITHOUT importing botmanager (which
+// is the app entry point — importing it from a leaf module boots the whole
+// dashboard). Used by the local market source detection.
+(globalThis as { __getBotStatuses?: () => BotStatus[] }).__getBotStatuses = getBotStatuses;
+
 /**
  * Get the combined fleet status across EVERY connected client for fleet rescue.
  *

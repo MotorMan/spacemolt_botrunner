@@ -47,10 +47,10 @@ export class ClientSyncLightSlave {
   /** Last time we ran the catalog-sync step (throttled to avoid spamming the
    *  master with version reports every poll cycle). */
   private lastCatalogSync = 0;
-  /** Whether this node can serve market data queries. Light clients always keep
-   *  a local marketDetails.json for the shared game universe, so they can answer
-   *  remote market queries even though they don't do file-level market sync. */
-  private hasMarketData = true;
+  /** Whether this node can serve market data queries. Refreshed every poll
+   *  cycle from the presence of a local `data/marketDetails.json`; we only tell
+   *  the master we can answer market queries when we really can. */
+  private hasMarketData = false;
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -479,13 +479,27 @@ export class ClientSyncLightSlave {
   }
 
   /**
-   * Tell the master whether we currently have market data to share. Light
-   * clients always keep a local marketDetails.json for the shared game
-   * universe, so we advertise `hasMarketData` unconditionally — this is what
-   * lets the master route low-bandwidth market queries to us.
+   * Tell the master whether we currently have market data to share.
+   *
+   * This used to be advertised unconditionally, which meant a light client with
+   * no local `marketDetails.json` could still win the master's market-query
+   * routing and answer every query with "no matching orders" — the remote
+   * trader then logged "no remote deals found" and never learned why. We now
+   * advertise only when the file actually exists locally.
    */
   private async syncMarketAvailability(): Promise<void> {
     if (!this.clientId) return;
+    try {
+      const { getLocalMarketFileInfo } = await import("./market_local_source.js");
+      const info = getLocalMarketFileInfo();
+      const has = info.exists && info.sizeBytes > 2;
+      if (has !== this.hasMarketData) {
+        this.log(`Market data availability -> ${has ? "yes" : "no (no local data/marketDetails.json)"}`);
+        this.hasMarketData = has;
+      }
+    } catch {
+      // Keep the previous value rather than flapping on a transient fs error.
+    }
     try {
       await this.request("/api/client-sync/market-data-status", { method: "POST" }, {
         clientId: this.clientId,

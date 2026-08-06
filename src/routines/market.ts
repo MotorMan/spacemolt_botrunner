@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { marketStreamStore } from "../marketstreamstore.js";
+import { noteMarketRoutineActive, noteMarketRoutineStopped } from "../market_local_source.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -113,6 +114,11 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let currentBaseId: string | null = null;
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
 
+  // Advertise that THIS client produces its own market data. Traders running in
+  // this same client then read data/marketDetails.json directly instead of
+  // calling out to a remote market client that may not even exist.
+  noteMarketRoutineActive(bot.username);
+
   function unsubscribeMarketUpdates() {
     if (currentBaseId && marketUpdateCb) {
       marketStreamStore.unsubscribe(currentBaseId, marketUpdateCb);
@@ -136,6 +142,10 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
 
   while (bot.state === "running") {
     yield "market_monitor";
+
+    // Heartbeat: keeps the "market routine is running locally" detection alive
+    // for as long as this routine keeps cycling.
+    noteMarketRoutineActive(bot.username);
 
     if (!bot.docked) {
       ctx.log("warn", "Market routine requires being docked — waiting...");
@@ -200,4 +210,5 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   unsubscribeMarketUpdates();
+  noteMarketRoutineStopped(bot.username);
 };

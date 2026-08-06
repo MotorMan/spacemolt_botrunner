@@ -36146,6 +36146,14 @@ ignoreBlacklist: document.getElementById(
           </select>
       </div>
 
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Market Data Source</div>
+          <div class="setting-hint">Auto-detected. Traders query a remote client's market data, or read this client's own data/marketDetails.json when the market routine runs here (or no remote client can answer).</div>
+        </div>
+        <span id="marketSourceStatus" style="font-size:12px;color:var(--text-dim);text-align:right;max-width:340px">Checking...</span>
+      </div>
+
       <div id="clientSyncMasterPanel" style="${mode === "master" ? "" : "display:none"}">
         <div class="setting-row">
           <div>
@@ -36233,7 +36241,7 @@ ignoreBlacklist: document.getElementById(
           <span id="clientSyncStatus" style="font-size:12px;color:var(--text-dim)">Checking...</span>
         </div>
         <div style="margin-top:8px;display:flex;gap:8px">
-          <button class="sm" onclick="refreshClientSyncStatus()">Refresh Status</button>
+          <button class="sm" onclick="refreshClientSyncStatus(); refreshMarketSource()">Refresh Status</button>
           <button class="sm primary" onclick="testClientSyncConnection()">Test Connection</button>
         </div>
       </div>
@@ -36334,6 +36342,8 @@ ignoreBlacklist: document.getElementById(
   `;
         // Populate the per-file toggle list once the DOM is in place.
         setTimeout(() => refreshClientSyncFileList(), 0);
+        // Show which market data source this client resolves to right now.
+        setTimeout(() => refreshMarketSource(), 0);
       }
 
       // Fetch the list of syncable files and render a checkbox per file. The
@@ -36496,6 +36506,37 @@ ignoreBlacklist: document.getElementById(
           });
       }
 
+      function refreshMarketSource() {
+        const el = document.getElementById("marketSourceStatus");
+        if (!el) return;
+        fetch("/api/client-sync/market-source")
+          .then((r) => r.json())
+          .then((data) => {
+            const src = data.source || {};
+            const local = data.local || {};
+            const mode = src.mode || "none";
+            const colors = {
+              local: "var(--green, #00ff00)",
+              remote: "var(--blue, #55aaff)",
+              none: "var(--red, #ff4444)",
+            };
+            const ageMin =
+              typeof local.ageMs === "number"
+                ? Math.round(local.ageMs / 60000)
+                : null;
+            const localBits = local.exists
+              ? `local file: ${(local.sizeBytes / 1048576).toFixed(1)}MB, ${ageMin}min old${local.marketRoutineRunning ? `, market routine: ${local.marketRoutineBots.join(", ")}` : ""}`
+              : "no local marketDetails.json";
+            el.innerHTML =
+              `<b>${mode.toUpperCase()}</b> — ${esc(src.reason || "")}<br><span style="color:var(--text-dim)">${esc(localBits)}</span>`;
+            el.style.color = colors[mode] || "var(--text-dim)";
+          })
+          .catch(() => {
+            el.textContent = "Unavailable";
+            el.style.color = "var(--text-dim)";
+          });
+      }
+
       function testClientSyncConnection() {
         const masterUrl = document.getElementById(
           "set-client_sync-masterUrl",
@@ -36548,6 +36589,9 @@ ignoreBlacklist: document.getElementById(
           const mode = document.getElementById("set-client_sync-mode")?.value;
           if (mode === "master") refreshClientSyncConnectedClients();
           if (mode === "slave" || mode === "light") refreshClientSyncStatus();
+          // Market source detection applies in every mode (including
+          // "disabled": that's the pure local-file case).
+          refreshMarketSource();
         }
       }, 5000);
 

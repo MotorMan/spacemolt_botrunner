@@ -202,4 +202,9 @@ export interface MarketQueryResult {
   results: MarketQueryResponse[];
   /** Optional error when the whole query could not be served. */
   error?: string;
+  /** Where the answer came from: `local` = this client's own
+   *  data/marketDetails.json (market routine running in this same client, or
+   *  no reachable remote market client), `remote` = another connected client
+   *  via the sync master. Purely diagnostic — the payload is identical. */
+  source?: "local" | "remote";
 }

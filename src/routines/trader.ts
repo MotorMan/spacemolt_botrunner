@@ -586,14 +586,18 @@ async function stockpileMilitaryFuelCells(
 
   const current = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
   const min = Math.max(1, settings.militaryFuelCellMin);
-  // Already at/above target — nothing to do.
-  if (current >= min && current >= settings.militaryFuelCellTarget) return;
+  // A trader lives or dies by free cargo space — keep the reserve small. Don't
+  // hoard the full tank-worth of cells (default target 15 = 45 cargo on a 130
+  // hull). Trade routines want at most a few cells as an emergency reserve.
+  const reserveCap = Math.max(min, Math.min(settings.militaryFuelCellTarget, min + 2));
+  // Already at/above reserve cap — nothing to do.
+  if (current >= reserveCap) return;
 
   const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
   const maxFit = maxItemsForCargo(freeWeight, MIL);
   if (maxFit <= 0) return;
 
-  const target = Math.min(settings.militaryFuelCellTarget, Math.max(min, maxFit));
+  const target = Math.min(reserveCap, Math.max(min, maxFit));
   let need = Math.min(target - current, maxFit);
   if (need <= 0) return;
 
@@ -645,7 +649,7 @@ async function stockpileMilitaryFuelCells(
 
   const got = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
   if (got !== current) {
-    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (min ${min}, target ${settings.militaryFuelCellTarget})`);
+    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (min ${min}, reserve cap ${reserveCap})`);
   }
 }
 

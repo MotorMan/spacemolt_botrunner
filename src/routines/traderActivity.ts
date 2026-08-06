@@ -43,6 +43,8 @@ export interface TradeSession {
   state: TradeSessionState;
   isFactionRoute?: boolean;
   isCargoRoute?: boolean;
+  /** True when the session's buyer vanished and the cargo is being returned to its origin instead of sold. */
+  returnToSource?: boolean;
   hasInsurance?: boolean;
   notes?: string;
   passengersOnboard?: Array<{
@@ -218,6 +220,21 @@ export async function failTradeSession(botUsername: string, reason: string): Pro
   session.state = "failed";
   session.lastUpdatedAt = new Date().toISOString();
   session.notes = (session.notes || "") + " | Failed: " + reason;
+  if (!activity.sessionHistory) activity.sessionHistory = [];
+  activity.sessionHistory.unshift(session);
+  if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);
+  activity.activeSession = undefined;
+  await saveBotActivity(botUsername, activity);
+  return session;
+}
+
+export async function abandonTradeSession(botUsername: string, reason: string): Promise<TradeSession | null> {
+  const activity = getBotActivity(botUsername);
+  if (!activity.activeSession) return null;
+  const session = activity.activeSession;
+  session.state = "abandoned";
+  session.lastUpdatedAt = new Date().toISOString();
+  session.notes = (session.notes || "") + " | " + reason;
   if (!activity.sessionHistory) activity.sessionHistory = [];
   activity.sessionHistory.unshift(session);
   if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);

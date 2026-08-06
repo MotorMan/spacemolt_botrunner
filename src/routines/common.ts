@@ -25,6 +25,35 @@ import {
 export const EMERGENCY_WARP_STABILIZER_MESSAGE =
   "Emergency Warp Stabilizer activated! Hull critical — warped to Confederacy Central Command. The module has been destroyed.";
 
+// ── Denied fuel stations ─────────────────────────────────────
+// Persistent (in-memory for the bot session) record of stations that rejected
+// docking with "Access denied". We must NEVER loop trying to dock at a station
+// that explicitly denied us — it strands the bot until fuel hits 0.
+const deniedStations = new Set<string>();
+
+/** Record that a station denied docking so we stop retrying it this session. */
+export function markStationDenied(stationId: string): void {
+  if (stationId) deniedStations.add(stationId.toLowerCase());
+}
+
+/** True if a station previously denied us docking access. */
+export function isStationDenied(stationId: string): boolean {
+  return stationId ? deniedStations.has(stationId.toLowerCase()) : false;
+}
+
+/** Build the approved-fuel-station lookup set from settings (matches isApprovedFuelStation). */
+export function buildApprovedStationSet(settings: any): Set<string> {
+  const approved: string[] | undefined = settings?.general?.approvedFuelStations;
+  const set = new Set<string>();
+  if (!approved || approved.length === 0) return set;
+  for (const entry of approved) {
+    set.add(entry);
+    const parts = entry.split("|");
+    if (parts.length === 2) set.add(parts[1]);
+  }
+  return set;
+}
+
 /**
  * Check if the bot's current state indicates it should stop (e.g., due to emergency warp).
  * This is a convenience helper for routines to check between actions.
@@ -550,7 +579,12 @@ export function parseOreFromCargoDelta(
  *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits).
  *  @param minBalance Minimum credits to keep on bot when collecting from storage (only withdraw if below this). If 0, withdraws all.
  */
-export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true, minBalance: number = 0): Promise<boolean> {
+export async function ensureDocked(
+  ctx: RoutineContext,
+  skipStorageCollection: boolean = true,
+  minBalance: number = 0,
+  opts?: { skipApprovedCheck?: boolean },
+): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) {
     await bot.refreshStatus();
@@ -558,7 +592,9 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   }
 
   const { pois } = await getSystemInfo(ctx);
-  const station = findStation(pois);
+  const station = findStation(pois, undefined, true) && !isStationDenied(findStation(pois, undefined, true)?.id ?? "")
+    ? findStation(pois, undefined, true)
+    : pois.find(p => isStationPoi(p) && !isStationDenied(p.id)) ?? null;
 
   if (station) {
     if (bot.poi !== station.id) {
@@ -585,8 +621,12 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         await ensureInsured(ctx);
         return true;
       }
-      // Dock failed at current POI - check if it's "No base at this location"
-      if (dockResp.error?.message?.includes("No base at this location")) {
+      // A station that explicitly denied us must never be retried — remember it.
+      if (/access denied/i.test(dockResp.error?.message || "")) {
+        ctx.log("error", `Dock denied at ${station.name} — will not retry this station`);
+        markStationDenied(station.id);
+        // Fall through to search for a different (approved) station
+      } else if (dockResp.error?.message?.includes("No base at this location")) {
         ctx.log("error", `No dockable base at current POI (${bot.poi}) — searching for nearest station...`);
         // Don't fall through to "No station in current system" - we know we need a different station
         // Jump directly to the nearest station system
@@ -597,12 +637,13 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     }
   }
 
-  // No station in current system — find nearest station
-  ctx.log("system", "No station in current system — searching for nearest station...");
+  // No (usable) station in current system — find nearest station
+  ctx.log("system", "No usable station in current system — searching for nearest station...");
   const blacklist = getSystemBlacklist();
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+  const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedStations);
   if (!nearest) {
-    ctx.log("error", "No known station in mapped systems — cannot dock");
+    ctx.log("error", "No known approved station in mapped systems — cannot dock");
     return false;
   }
 
@@ -663,7 +704,13 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     return true;
   }
 
-  ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error?.message}`);
+  // A station that explicitly denied us must never be retried — remember it.
+  if (/access denied/i.test(dResp.error?.message || "")) {
+    ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
+    markStationDenied(nearest.poiId);
+  } else {
+    ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error?.message}`);
+  }
   return false;
 }
 
@@ -826,18 +873,28 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
 
   // Try to dock at current location
   if (!bot.docked) {
-    const dockResp = await bot.exec("dock");
-    if (!dockResp.error || dockResp.error.message.includes("already")) {
-      bot.docked = true;
-      ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
-      await collectFromStorage(ctx);
-      await ensureInsured(ctx);
-      await sellAllCargo(ctx);
-      await tryRefuel(ctx);
-      const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
-      if (!bot.docked || pct >= 30) {
-        ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
-        return true;
+    // Do not attempt to dock at a station that already denied us this session.
+    if (bot.poi && isStationDenied(bot.poi)) {
+      ctx.log("error", `Current station ${bot.poi} previously denied docking — not retrying`);
+    } else {
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error || dockResp.error.message.includes("already")) {
+        bot.docked = true;
+        ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
+        await collectFromStorage(ctx);
+        await ensureInsured(ctx);
+        await sellAllCargo(ctx);
+        await tryRefuel(ctx);
+        const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+        if (!bot.docked || pct >= 30) {
+          ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
+          return true;
+        }
+      } else if (/access denied/i.test(dockResp.error?.message || "")) {
+        // A station that explicitly denied us must never be retried — remember it.
+        const deniedId = bot.poi || ((dockResp as any)?.result?.poi ?? "");
+        ctx.log("error", `Dock denied during emergency recovery — will not retry this station`);
+        if (deniedId) markStationDenied(deniedId);
       }
     }
   }
@@ -1578,7 +1635,7 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -1735,6 +1792,8 @@ export async function ensureFueled(
   const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
 
   // If we undocked and were previously docked, only return there if it's APPROVED
+  // NOTE: station-approval is independent of the system blacklist (skipBlacklist).
+  // A cloaked trader must still respect the approved-fuel-station allowlist.
   if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
     ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
     const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
@@ -1747,10 +1806,10 @@ export async function ensureFueled(
   }
 
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  const isCurrentStationApproved = currentStation && (opts?.skipBlacklist || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
+  const isCurrentStationApproved = currentStation && (opts?.skipApprovedCheck || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
   if (isCurrentStationApproved) {
     ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${currentStation.name}...`);
-    const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipBlacklist });
+    const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipApprovedCheck });
     if (ok) return true;
   } else if (currentStation) {
     ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — checking if can reach home...`);
@@ -1813,19 +1872,15 @@ if (looted > 0) {
     }
   }
 
-  // ── STEP 5: Find nearest known station with fuel ────────────────────────
-  ctx.log("system", "No station in current system — searching known map for nearest station...");
+  // ── STEP 5: Find nearest known APPROVED station with fuel ────────────────
+  const haveCurrentStation = !!pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  ctx.log("system", haveCurrentStation
+    ? "Current station not approved for refuel — searching known map for nearest approved station..."
+    : "No approved station in current system — searching known map for nearest station...");
   const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
-  const approvedSet = new Set<string>();
-  if (approvedFuelStations) {
-    for (const entry of approvedFuelStations) {
-      approvedSet.add(entry);
-      const parts = entry.split("|");
-      if (parts.length === 2) approvedSet.add(parts[1]);
-    }
-  }
+  const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
 
-  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
+  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedStations);
   if (!nearest) {
     ctx.log("error", "No approved refuel station reachable");
     return false;
@@ -1891,11 +1946,17 @@ if (looted > 0) {
     await collectFromStorage(ctx);
     await ensureInsured(ctx);
   } else {
-    ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
+    // A station that explicitly denied us must never be retried — remember it.
+    if (/access denied/i.test(dResp.error?.message || "")) {
+      ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
+      markStationDenied(nearest.poiId);
+    } else {
+      ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
+    }
     return await emergencyFuelRecovery(ctx);
   }
 
-  await tryRefuel(ctx, { skipApprovedCheck: opts?.skipBlacklist });
+  await tryRefuel(ctx, { skipApprovedCheck: opts?.skipApprovedCheck });
   await bot.refreshShip();
   let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
@@ -2262,7 +2323,7 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-      const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+      const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
       if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;

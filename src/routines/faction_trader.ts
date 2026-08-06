@@ -35,6 +35,7 @@ import {
   updateTradeSession,
   completeTradeSession,
   failTradeSession,
+  abandonTradeSession,
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
@@ -278,51 +279,73 @@ async function recoverFactionTradeSession(
       b.poiId === session.destPoi
     );
 
-    if (!destBuyer || destBuyer.quantity <= 0) {
-      ctx.log("trade", `Destination buyer gone — finding alternative`);
-      // Find alternative buyer
-      const alternativeBuyers = allBuys
-        .filter(b => b.itemId === session.itemId && b.price > 0)
-        .filter(b => settings.minSellPrice === 0 || b.price >= settings.minSellPrice)
-        .sort((a, b) => b.price - a.price);
+      if (!destBuyer || destBuyer.quantity <= 0) {
+        // The buyer vanished before we could sell. Do NOT reroute to the
+        // nearest/highest-price station and dump the cargo there — we'd lose
+        // track of a valuable item forever. Put it back where we got it.
+        const originSystem = session.sourceSystem || settings.homeSystem;
+        const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
+        const originName = session.sourcePoiName || originPoi || originSystem;
 
-      if (alternativeBuyers.length === 0) {
-        ctx.log("error", "No alternative buyers found — abandoning session");
-        await failFactionSession(session.botUsername, "No buyers available");
-        return null;
+        ctx.log("trade", `Destination buyer gone at ${session.destPoiName} — returning cargo to origin (${originName}) instead of dumping it elsewhere`);
+
+        // Release the stale lock for the original destination BEFORE mutating the
+        // session's destination, or the lock leaks and blocks other bots.
+        releaseBuyOrderLock(
+          bot.username,
+          session.itemId,
+          session.destPoi,
+          session.sellPricePerUnit,
+          "buyer_gone_returning_to_origin",
+        );
+
+        const updated = await updateTradeSession(session.botUsername, {
+          destSystem: originSystem,
+          destPoi: originPoi,
+          destPoiName: originName,
+          returnToSource: true,
+          sellQuantity: session.quantityBought,
+          totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+          notes: (session.notes || "") + ` | Buyer gone — returning to ${originName}`,
+        });
+        if (updated) session = updated;
+      } else if (destBuyer.price < session.buyPricePerUnit) {
+        // For faction trades, buyPricePerUnit is 0 (no purchase cost), so this
+        // only fires when the price dropped to 0/unprofitable. Return home too.
+        if (destBuyer.price <= 0) {
+          const originSystem = session.sourceSystem || settings.homeSystem;
+          const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
+          const originName = session.sourcePoiName || originPoi || originSystem;
+
+          ctx.log("trade", `Price dropped to ${destBuyer.price}cr at ${session.destPoiName} — returning cargo to origin (${originName})`);
+          releaseBuyOrderLock(
+            bot.username,
+            session.itemId,
+            session.destPoi,
+            session.sellPricePerUnit,
+            "price_zero_returning_to_origin",
+          );
+          const updated = await updateTradeSession(session.botUsername, {
+            destSystem: originSystem,
+            destPoi: originPoi,
+            destPoiName: originName,
+            returnToSource: true,
+            sellQuantity: session.quantityBought,
+            totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+            notes: (session.notes || "") + ` | Price zero — returning to origin`,
+          });
+          if (updated) session = updated;
+        }
       }
-
-      const bestAlt = alternativeBuyers[0];
-
-      // Verify alternative destination is valid
-      if (!isValidDestination(ctx, bestAlt.systemId, bestAlt.poiId)) {
-        ctx.log("error", `Alternative destination invalid: ${bestAlt.poiName} — abandoning session`);
-        await failFactionSession(session.botUsername, "Invalid destination");
-        return null;
-      }
-
-      ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-      const updated = await updateTradeSession(session.botUsername, {
-        destSystem: bestAlt.systemId,
-        destPoi: bestAlt.poiId,
-        destPoiName: bestAlt.poiName,
-        sellPricePerUnit: bestAlt.price,
-        sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
-        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
-        notes: (session.notes || "") + ` | Rerouted to ${bestAlt.poiName}`,
-      });
-      if (updated) session = updated;
-    } else if (destBuyer.price < session.buyPricePerUnit) {
-      // For faction trades, buyPricePerUnit is 0 (no purchase cost), so check if price is still > 0
-      if (destBuyer.price <= 0) {
-        ctx.log("error", `Price dropped to ${destBuyer.price}cr — abandoning`);
-        await failFactionSession(session.botUsername, "Price too low");
-        return null;
-      }
-    }
   }
 
   ctx.log("trade", `Session recovered: ${session.quantityBought}x ${session.itemName} → ${session.destPoiName}`);
+
+  // When returning cargo to origin we deposit (not sell), so no buy order lock
+  // is needed — skip straight through.
+  if (session.returnToSource) {
+    return session;
+  }
 
   // Reacquire buy order lock for recovered session
   const lockKey = getBuyOrderKey(session.itemId, session.destPoi, session.sellPricePerUnit);
@@ -384,6 +407,8 @@ interface FactionSellRoute {
   roundTripJumps: number;  // dest + return home
   totalRevenue: number;
   totalProfit: number;     // revenue minus material cost and round-trip fuel
+  /** True when this route is a "buyer vanished — return cargo home" run. */
+  returningToSource?: boolean;
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -1115,6 +1140,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           roundTripJumps: recoveredSession!.totalJumps,
           totalRevenue: recoveredSession!.expectedRevenue,
           totalProfit: recoveredSession!.expectedProfit,
+          returningToSource: !!recoveredSession!.returnToSource,
         };
       withdrawQty = recoveredSession.quantityBought;
       recoveredSessionHandled = true;
@@ -1230,11 +1256,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               destPoiName: recoveredSession!.destPoiName,
               sellPrice: recoveredSession!.sellPricePerUnit,
               sellQty: recoveredSession!.sellQuantity,
-              jumps: recoveredSession!.totalJumps,
-              roundTripJumps: recoveredSession!.totalJumps,
-              totalRevenue: recoveredSession!.expectedRevenue,
-              totalProfit: recoveredSession!.expectedProfit,
-            };
+            jumps: recoveredSession!.totalJumps,
+            roundTripJumps: recoveredSession!.totalJumps,
+            totalRevenue: recoveredSession!.expectedRevenue,
+            totalProfit: recoveredSession!.expectedProfit,
+            returningToSource: !!recoveredSession!.returnToSource,
+          };
             withdrawQty = cargoQty;
             recoveredSessionHandled = true;
 
@@ -1717,6 +1744,38 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const isInStation = route!.jumps === 0 && route!.destSystem === bot.system;
 
     if (isInStation) {
+      // If this route is a "buyer vanished — return cargo home" run, just put
+      // the items back where they came from and clear the session. Never sell
+      // them or dump them at a random station.
+      if (route!.returningToSource) {
+        await ensureDocked(ctx);
+        await bot.refreshCargo();
+        const retQty = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+        if (retQty > 0) {
+          let dResp;
+          if (personalMode) {
+            dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: retQty });
+          } else {
+            dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: retQty });
+            if (dResp.error) {
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: retQty });
+            }
+          }
+          if (dResp.error) {
+            ctx.log("error", `Failed to return ${retQty}x ${route!.itemName} to origin storage: ${dResp.error.message}`);
+          } else {
+            ctx.log("trade", `Returned ${retQty}x ${route!.itemName} to origin storage (${route!.destPoiName})`);
+          }
+        } else {
+          ctx.log("trade", `No ${route!.itemName} in cargo to return — nothing to deposit`);
+        }
+        const retSession = getActiveSession(bot.username);
+        if (retSession) {
+          await abandonTradeSession(bot.username, "Cargo returned to origin (buyer vanished)");
+        }
+        await ctx.sleep(2000);
+        continue;
+      }
       // ── In-station: batch withdraw→sell loop ──
       let totalSold = 0;
       let totalRevenue = 0;
@@ -2411,6 +2470,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           noJettison: true,
           onJump: async (jumpNum) => {
             if (jumpNum % 3 !== 0) return true;
+            // When returning cargo to origin there is no buyer to validate —
+            // skip the "buyer gone" abort check or it would loop forever.
+            if (route!.returningToSource) return true;
             const buys = mapStore.getAllBuyDemand();
             const destBuyer = buys.find(b =>
               b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
@@ -2482,7 +2544,32 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await ensureDocked(ctx);
       await bot.refreshCargo();
       const inCargo = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-      if (inCargo > 0) {
+      if (route!.returningToSource) {
+        // Buyer vanished before we could sell — put the cargo back where we got
+        // it instead of dumping it at a random station.
+        if (inCargo > 0) {
+          let dResp;
+          if (personalMode) {
+            dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: inCargo });
+          } else {
+            dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: inCargo });
+            if (dResp.error) {
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: inCargo });
+            }
+          }
+          if (dResp.error) {
+            ctx.log("error", `Failed to return ${inCargo}x ${route!.itemName} to origin storage: ${dResp.error.message}`);
+          } else {
+            ctx.log("trade", `Returned ${inCargo}x ${route!.itemName} to origin storage (${route!.destPoiName})`);
+          }
+        } else {
+          ctx.log("trade", `No ${route!.itemName} in cargo to return — nothing to deposit`);
+        }
+        const retSession = getActiveSession(bot.username);
+        if (retSession) {
+          await abandonTradeSession(bot.username, "Cargo returned to origin (buyer vanished)");
+        }
+      } else if (inCargo > 0) {
         // Get actual market data to calculate real expected revenue
         const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
         const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;

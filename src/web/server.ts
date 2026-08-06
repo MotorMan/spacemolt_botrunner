@@ -20,6 +20,12 @@ import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
 import { reconcileDeliveredWithDestination, getCargoMoverSettings } from "../routines/cargo_mover.js";
 import { resetInTransitData } from "../routines/cargoMoverInTransit.js";
 import { resetCoordinationTracking } from "../routines/cargoMoverCoordination.js";
+import {
+  getFleetFtSummary,
+  resetCoordinationTracking as resetFtCoordinationTracking,
+  resetInTransitData as resetFtInTransitData,
+  flushAllCoordinationData as flushAllFtCoordinationData,
+} from "../routines/fuelTransferCoordination.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
 
 function getLocalIp(): string | null {
@@ -2398,6 +2404,20 @@ if (!this.settings.fuel_service) {
           if (url.pathname === "/api/facility-transfer-completions" && req.method === "DELETE") {
             clearAllCompletions();
             return Response.json({ ok: true, cleared: "all" });
+          }
+
+          // GET /api/fuel_transport/coop-status - Inspect fuel transport co-op locks / in-transit
+          if (url.pathname === "/api/fuel_transport/coop-status" && req.method === "GET") {
+            return Response.json(getFleetFtSummary());
+          }
+
+          // POST /api/fuel_transport/reset-coop - Drop all fuel transport locks and
+          // in-transit claims (recovery hatch for stuck "waiting on other bots" state)
+          if (url.pathname === "/api/fuel_transport/reset-coop" && req.method === "POST") {
+            const coordination = resetFtCoordinationTracking();
+            const inTransit = resetFtInTransitData();
+            flushAllFtCoordinationData();
+            return Response.json({ ok: true, coordination, inTransit });
           }
 
           // Serve index.css

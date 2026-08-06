@@ -32026,7 +32026,11 @@ ignoreBlacklist: document.getElementById(
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
         <button class="sm" onclick="resetFuelTransferLoadoutCompletions()">🔄 Reset Loadout Status</button>
-        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">If no loadout selected, resets all. Otherwise resets selected loadout.</span>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">If no loadout selected, resets all. Otherwise resets selected loadout. Also resets full-delivery haul progress.</span>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="sm" onclick="resetFuelTransportCoop()">🔓 Reset Co-op Locks</button>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clears all fuel transport delivery locks and in-transit claims if bots think another bot is handling a delivery.</span>
       </div>
     </div>
 
@@ -33165,6 +33169,34 @@ ignoreBlacklist: document.getElementById(
 
           if (response.ok) {
             alert(`Reset completion status for "${name}"`);
+          } else {
+            const error = await response.json();
+            alert(`Failed to reset: ${error.error || "Unknown error"}`);
+          }
+        } catch (e) {
+          alert(`Failed to reset: ${e.message}`);
+        }
+      }
+
+      async function resetFuelTransportCoop() {
+        if (
+          !confirm(
+            "Clear all fuel transport co-op locks and in-transit claims?\n\nUse this if bots are skipping deliveries because they think other bots are handling them.",
+          )
+        )
+          return;
+
+        try {
+          const response = await fetch("/api/fuel_transport/reset-coop", {
+            method: "POST",
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const locks = data?.coordination?.clearedLocks ?? 0;
+            const entries = data?.inTransit?.clearedEntries ?? 0;
+            alert(
+              `Cleared ${locks} delivery lock(s) and ${entries} in-transit claim(s)`,
+            );
           } else {
             const error = await response.json();
             alert(`Failed to reset: ${error.error || "Unknown error"}`);

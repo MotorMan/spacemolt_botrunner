@@ -258,8 +258,12 @@ export async function acquireDeliveryLockAtomic(params: {
     const key = lockKey(params.itemId, params.remoteStationId, params.botUsername);
     const now = new Date().toISOString();
 
+    // Our own lock is about to be replaced/updated below, so it must NOT be
+    // counted against the available capacity — otherwise a bot that still
+    // holds a lock from a previous trip locks itself out of its own delivery
+    // and reports "others handling rest" with no other bots running.
     const totalLockedRemaining = Object.values(coordData.activeLocks)
-      .filter(lock => lock.itemId === params.itemId && lock.remoteStationId === params.remoteStationId && lock.isActive)
+      .filter(lock => lock.itemId === params.itemId && lock.remoteStationId === params.remoteStationId && lock.isActive && lock.lockedBy !== params.botUsername)
       .reduce((sum, lock) => sum + Math.max(0, lock.lockedQuantity - lock.deliveredQuantity), 0);
 
     const totalInTransitOther = inTransitData.inTransitItems
@@ -270,7 +274,10 @@ export async function acquireDeliveryLockAtomic(params: {
     const actualQty = Math.min(params.quantity, available);
 
     if (actualQty <= 0) {
-      return { success: false, lockedQty: 0, message: `No capacity available (need ${params.totalNeed}, locked ${totalLockedRemaining}, in-transit ${totalInTransitOther})` };
+      const detail = totalLockedRemaining > 0 || totalInTransitOther > 0
+        ? `other bots already cover it (need ${params.totalNeed}, locked by others ${totalLockedRemaining}, in-transit by others ${totalInTransitOther})`
+        : `nothing left to claim (need ${params.totalNeed})`;
+      return { success: false, lockedQty: 0, message: `No capacity available — ${detail}` };
     }
 
     const existingLock = coordData.activeLocks[key];
@@ -440,30 +447,45 @@ export function removeInTransitItems(
   items: Array<{ itemId: string; quantity: number }>
 ): void {
   const data = getInTransitData();
-  let changed = false;
 
   for (const item of items) {
-    if (item.quantity <= 0) continue;
+    // Never mutate the caller's objects — callers reuse their load plans after
+    // this call, and decrementing their quantities corrupted later bookkeeping.
+    let remainingToRemove = item.quantity;
+    if (remainingToRemove <= 0) continue;
 
     const botEntries = data.inTransitItems.filter(
       entry => entry.botUsername === botUsername && entry.itemId === item.itemId && entry.remoteStationId === remoteStationId
     );
 
     for (const entry of botEntries) {
-      if (entry.quantity >= item.quantity) {
-        entry.quantity -= item.quantity;
-        changed = true;
-        break;
-      } else {
-        const remaining = item.quantity - entry.quantity;
-        entry.quantity = 0;
-        item.quantity = remaining;
-        changed = true;
-      }
+      if (remainingToRemove <= 0) break;
+      const take = Math.min(entry.quantity, remainingToRemove);
+      entry.quantity -= take;
+      remainingToRemove -= take;
     }
-
-    data.inTransitItems = data.inTransitItems.filter(entry => entry.quantity > 0);
   }
+
+  data.inTransitItems = data.inTransitItems.filter(entry => entry.quantity > 0);
+}
+
+/**
+ * Drop every in-transit claim this bot holds for an item, across all
+ * destinations. Used when the cargo never made it to its destination (e.g. it
+ * got dumped back into home storage) so the phantom cargo cannot keep other
+ * bots from claiming that quantity for the next 24 hours.
+ */
+export function clearInTransitForItem(botUsername: string, itemId: string): number {
+  const data = getInTransitData();
+  let cleared = 0;
+  data.inTransitItems = data.inTransitItems.filter(entry => {
+    if (entry.botUsername === botUsername && entry.itemId === itemId) {
+      cleared += entry.quantity;
+      return false;
+    }
+    return true;
+  });
+  return cleared;
 }
 
 export function getInTransitQuantity(itemId: string, remoteStationId: string, excludeBot?: string): number {

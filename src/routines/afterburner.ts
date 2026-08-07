@@ -439,7 +439,7 @@ export async function stockAfterburnerConsumables(
 /**
  * Burns `afterburner_fuel` before jumps to keep the +100% speed buff up.
  *
- * Hook `beforeJump` into `navigateToSystem({ onBeforeJump })`. The booster
+ * Hook `burnBeforeJump` into `navigateToSystem({ onPreJump })`. The booster
  * dedupes retries of the same jump (navigateToSystem retries a failed jump up
  * to 10 times with the same jump number) so a single unit is not wasted per
  * retry, and it stops cleanly the moment the ship runs out of fuel.
@@ -492,10 +492,17 @@ export class AfterburnerBooster {
   }
 
   /**
-   * `onBeforeJump` handler. Safe to call unconditionally — it no-ops when the
-   * booster is disabled or out of fuel.
+   * Burn one afterburner fuel immediately before a jump so the +100% speed buff
+   * is active when the jump command executes. Hook this into `navigateToSystem`
+   * via `onPreJump`, which fires right before `exec("jump")` — NOT `onBeforeJump`,
+   * which runs at the top of the loop and lets the ~3-tick buff expire during
+   * the pre-jump fueling / route / dock work (the jump would then land
+   * unboosted).
+   *
+   * Safe to call unconditionally — it no-ops when the booster is disabled or
+   * out of fuel.
    */
-  beforeJump = async (nextSystem: string, jumpNumber: number): Promise<void> => {
+  burnBeforeJump = async (nextSystem: string, jumpNumber: number): Promise<void> => {
     if (!this.enabled) return;
 
     const key = `${jumpNumber}:${nextSystem}`;

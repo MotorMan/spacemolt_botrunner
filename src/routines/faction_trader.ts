@@ -1132,7 +1132,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         if (settings.autoCloak && !bot.isCloaked && !bot.docked) {
           await enableCloakingIfPossible(ctx);
         }
-        if (abBooster) await abBooster.beforeJump(nextSystem, jumpNumber);
+      },
+      // Burn the afterburner fuel IMMEDIATELY before the jump command so the
+      // +100% speed buff is live when the jump resolves. Firing it any earlier
+      // (onBeforeJump) lets the ~3-tick buff lapse during pre-jump work and the
+      // jump lands at normal speed.
+      onPreJump: async (nextSystem: string, jumpNumber: number) => {
+        if (abBooster) await abBooster.burnBeforeJump(nextSystem, jumpNumber);
       },
     };
     let recoveredSessionHandled = false;

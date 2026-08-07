@@ -2179,7 +2179,10 @@ const locations = this.findOreLocations(oreId, blacklist);
         for (const m of poi.market) {
           if (m.item_id === itemId && m.best_buy !== null && m.buy_quantity > 0) {
             if (!best || m.best_buy > best.price) {
-              best = { systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: m.buy_quantity };
+              // Size by the depth at the BEST price, not the sum of all buy
+              // orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+              const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
+              best = { systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: depthAtBest };
             }
           }
         }
@@ -2203,6 +2206,9 @@ const locations = this.findOreLocations(oreId, blacklist);
         if (!(poi.has_base || poi.base_id)) continue;
         for (const m of poi.market) {
           if (m.best_buy !== null && m.buy_quantity > 0) {
+            // Size by the depth at the BEST price, not the sum of all buy
+            // orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+            const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
             results.push({
               itemId: m.item_id,
               itemName: m.item_name,
@@ -2210,7 +2216,7 @@ const locations = this.findOreLocations(oreId, blacklist);
               poiId: poi.id,
               poiName: poi.name,
               price: m.best_buy,
-              quantity: m.buy_quantity,
+              quantity: depthAtBest,
             });
           }
         }

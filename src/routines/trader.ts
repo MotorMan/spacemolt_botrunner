@@ -3694,19 +3694,24 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (remaining > 0) {
       yield "find_next_buyer";
       
-      // Check if current destination sale is profitable
-      const currentSaleRevenue = route.sellPrice * remaining;
-      const isCurrentSaleProfitable = currentSaleRevenue >= investedCredits;
-      
+      // Check if current destination sale is profitable.
+      // Credit revenue already earned from units sold earlier so this is a
+      // true whole-trade break-even, not a partial-quantity vs full-lot mismatch.
+      const remainingSaleRevenue = route.sellPrice * remaining;
+      const isCurrentSaleProfitable = (sellRevenue + remainingSaleRevenue) >= investedCredits;
+
       if (!isCurrentSaleProfitable && investedCredits > 0) {
-        ctx.log("trade", `Current sale at ${route.sellPrice}cr/ea would result in loss (cost: ${investedCredits}cr for ${buyQty}x) — searching for profitable alternatives`);
-        
-        // Search for profitable alternative buyers
+        ctx.log("trade", `Current sale at ${route.sellPrice}cr/ea would result in loss (cost: ${investedCredits}cr for ${buyQty}x, recovered: ${sellRevenue}cr) — searching for profitable alternatives`);
+
+        // Search for profitable alternative buyers. Pass the unrecovered cost
+        // basis (full lot minus what's already been earned) so the alternative
+        // search evaluates profitability of the *remaining* units correctly.
+        const unrecoveredCost = Math.max(0, investedCredits - sellRevenue);
         const alternatives = findProfitableAlternativeBuyers(
           route.itemId,
           route.itemName,
           remaining,
-          investedCredits,
+          unrecoveredCost,
           bot.system,
           settings,
         );
@@ -3755,7 +3760,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
 
           if (remaining > 0) {
-            const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(investedCredits / Math.max(1, remaining)), `Selling at ${best.buyer.poiName}`);
+            const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(unrecoveredCost / Math.max(1, remaining)), `Selling at ${best.buyer.poiName}`);
             totalSold += sale.sold;
             sellRevenue += sale.revenue;
             remaining = sale.remaining;

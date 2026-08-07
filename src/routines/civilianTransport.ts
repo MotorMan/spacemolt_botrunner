@@ -23,33 +23,25 @@ import { logTransportProfit } from "./transportProfitDebug.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 
 // ── Cloaking module detection and enablement ────────────────────────────────
 
 async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
   const { bot } = ctx;
-  let modules: unknown[];
+  let modules: Array<Record<string, unknown>>;
 
   if (cachedModules && cachedModules.length > 0) {
-    modules = cachedModules;
+    modules = extractShipModules(cachedModules).modules;
   } else {
     const shipResp = await bot.exec("get_ship");
     if (shipResp.error || !shipResp.result) return false;
-    const shipData = shipResp.result as Record<string, unknown>;
-    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+    modules = extractShipModules(shipResp.result).modules;
   }
 
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
-    const modName = ((modObj?.name as string) || "").toLowerCase();
-    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
-
-    const checkStr = `${modId} ${modName} ${modSpecial}`;
-    if (checkStr.includes("cloak")) {
-      return true;
-    }
+    if (moduleHaystack(mod).includes("cloak")) return true;
   }
   return false;
 }

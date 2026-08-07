@@ -1,5 +1,6 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { mapStore } from "../mapstore.js";
 import {
   ensureFueled,
@@ -541,16 +542,8 @@ async function buildFacilityAtStation(
       if (autoCloak && !bot.isCloaked && bot.fuel > 0) {
         const shipResp = await bot.exec("get_ship");
         if (shipResp.result) {
-          const shipData = shipResp.result as Record<string, unknown>;
-          const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
-          const hasCloak = modules.some((mod: unknown) => {
-            const m = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : {};
-            const id = (m?.id as string) || (m?.type_id as string) || "";
-            const name = (m?.name as string) || "";
-            const special = (m?.special as string) || "";
-            const checkStr = `${id.toLowerCase()} ${name.toLowerCase()} ${special.toLowerCase()}`;
-            return checkStr.includes("cloak");
-          });
+          const { modules } = extractShipModules(shipResp.result);
+          const hasCloak = modules.some(mod => moduleHaystack(mod).includes("cloak"));
           if (hasCloak) {
             ctx.log("fuel", "Enabling cloak for transport...");
             await bot.exec("cloak", { enable: true });

@@ -24,6 +24,7 @@ import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
 import { catalogStore } from "./catalogstore.js";
+import { extractShipModules, moduleTypeId } from "./shipmodules.js";
 import { isPirateTarget, isCreatureTarget, isCreatureName } from "./routines/battle.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
@@ -1823,11 +1824,9 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.shipSpeed = (ship.speed as number) || 1;
       this.shipId = (ship.id as string) || "";
 
-      const modulesArray = (
-        Array.isArray(r.modules) ? r.modules :
-        Array.isArray(ship.modules) ? ship.modules :
-        []
-      ) as Array<Record<string, unknown>>;
+      // `ship.modules` is a list of opaque instance ids; the detail objects
+      // live in the top-level `modules` array. extractShipModules joins them.
+      const { modules: modulesArray, resolved: modulesResolved } = extractShipModules(r);
 
       let totalAmmo = 0;
       for (const mod of modulesArray) {
@@ -1840,10 +1839,7 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       } else if (ship.ammo != null) {
         this.ammo = ship.ammo as number;
       }
-const ews = this.hasEwsModule(modulesArray);
-       if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
-       this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-       this.updateLeadLinedCargoFromModules(modulesArray);
+      this.applyModuleFlags(modulesArray, modulesResolved);
      }
 
     // Towing state handling - moved outside ship block since it's on player/location
@@ -1957,18 +1953,19 @@ const ews = this.hasEwsModule(modulesArray);
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
         this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
         this.shipId = (ship.id as string) || this.shipId;
-        const modulesArray = Array.isArray(ship.modules) ? ship.modules as Array<Record<string, unknown>> : [];
+        const { modules: modulesArray, resolved: modulesResolved } = extractShipModules(r);
         let totalAmmo = 0;
         for (const mod of modulesArray) {
           if (mod && typeof mod === "object" && mod.current_ammo != null) totalAmmo += mod.current_ammo as number;
         }
         if (totalAmmo > 0) this.ammo = totalAmmo;
         else if (ship.ammo != null) this.ammo = ship.ammo as number;
-        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-        const ews = this.hasEwsModule(modulesArray);
-        if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
-        this.updateLeadLinedCargoFromModules(modulesArray);
-        this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
+        this.applyModuleFlags(modulesArray, modulesResolved);
+        if (modulesArray.length > 0 || modulesResolved) {
+          this.installedMods = modulesArray
+            .map(m => moduleTypeId(m) || (m.name as string) || "")
+            .filter(Boolean);
+        }
       }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
@@ -2628,29 +2625,48 @@ const ews = this.hasEwsModule(modulesArray);
     this.log("system", "Routine finished");
   }
 
-  /** Fetch ship modules and cache installed mod IDs. */
+  /** Fetch ship modules and cache installed mod type ids. */
   async refreshShipMods(): Promise<string[]> {
     const resp = await this.exec("get_ship");
     if (resp.result && typeof resp.result === "object") {
-      const r = resp.result as Record<string, unknown>;
-      const ship = (r.ship as Record<string, unknown>) || r;
-      const modules = (
-        Array.isArray(ship.modules) ? ship.modules :
-        Array.isArray(ship.mods) ? ship.mods :
-        Array.isArray(ship.installed_mods) ? ship.installed_mods :
-        []
-      ) as Array<Record<string, unknown> | string>;
+      const { modules, resolved } = extractShipModules(resp.result);
 
-      this.installedMods = modules.map(m => {
-        if (typeof m === "string") return m;
-        return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
-      }).filter(Boolean);
-      this.hasPathfinderDrive = this.hasPathfinderModule(modules);
-      const ews = this.hasEwsModule(modules);
-      if (ews !== null) this.hasEmergencyWarpStabilizer = ews;
-      this.updateLeadLinedCargoFromModules(modules);
+      // Type ids ("afterburner_ii"), not instance UUIDs — callers compare these
+      // against configured mod profiles.
+      if (modules.length > 0 || resolved) {
+        this.installedMods = modules
+          .map(m => moduleTypeId(m) || (m.name as string) || "")
+          .filter(Boolean);
+      }
+      this.applyModuleFlags(modules, resolved);
     }
     return this.installedMods;
+  }
+
+  /**
+   * Apply module-derived capability flags.
+   *
+   * A positive match is always trusted. A negative is only trusted when the
+   * whole fitted list resolved to real module objects — otherwise the payload
+   * gave us nothing but opaque instance ids and "not found" would wrongly
+   * clear a flag we already learned from a richer response.
+   */
+  private applyModuleFlags(modules: Array<Record<string, unknown> | string>, resolved: boolean): void {
+    if (!resolved && modules.length === 0) return;
+
+    const pathfinder = this.hasPathfinderModule(modules);
+    const ews = this.hasEwsModule(modules) === true;
+    const leadLined = this.hasLeadLinedCargoModule(modules) === true;
+
+    if (resolved) {
+      this.hasPathfinderDrive = pathfinder;
+      this.hasEmergencyWarpStabilizer = ews;
+      this.hasLeadLinedCargoHold = leadLined;
+      return;
+    }
+    if (pathfinder) this.hasPathfinderDrive = true;
+    if (ews) this.hasEmergencyWarpStabilizer = true;
+    if (leadLined) this.hasLeadLinedCargoHold = true;
   }
 
   private hasPathfinderModule(modules: Array<Record<string, unknown> | string>): boolean {
@@ -2713,23 +2729,6 @@ const ews = this.hasEwsModule(modulesArray);
       }
     }
     return false;
-  }
-
-  /** Update the cached lead-lined cargo flag from module list. */
-  private updateLeadLinedCargoFromModules(modules: Array<Record<string, unknown> | string>): void {
-    const result = this.hasLeadLinedCargoModule(modules);
-    if (result !== null) this.hasLeadLinedCargoHold = result;
-  }
-
-  /**
-   * Update the cached EWS flag only from a *definitive* signal. `get_status`
-   * often omits enriched module data, so we must not clobber a known `true`
-   * (learned from get_ship) with a `false` inferred from an empty/UUID-only
-   * module list. A `null` result means "unknown" → keep the prior value.
-   */
-  private updateEwsFromModules(modules: Array<Record<string, unknown> | string>): void {
-    const result = this.hasEwsModule(modules);
-    if (result !== null) this.hasEmergencyWarpStabilizer = result;
   }
 
   async pollCurrentTick(): Promise<number | null> {

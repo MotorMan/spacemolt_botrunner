@@ -21,6 +21,7 @@
  */
 import type { Bot, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
+import { extractShipModules, moduleHaystack, moduleTypeId } from "../shipmodules.js";
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -151,11 +152,16 @@ function catalogSpeedBonus(moduleId: string): number {
 /**
  * Detect whether the bot's ship has an afterburner utility module fitted.
  *
- * Reads `get_ship` and matches each module's `type_id` / `module_id` / `name`
- * against the known afterburner ids, falling back to a substring match so a
- * future "Afterburner IV" is still recognised. Results are cached per bot for
- * `MODULE_CACHE_TTL_MS` because refits are rare and `get_ship` is called on
- * every trade cycle.
+ * `get_ship` reports the fitted list as instance UUIDs under `ship.modules`
+ * and publishes the detail objects separately under the top-level `modules`,
+ * so the raw ids must be resolved first (see shipmodules.ts) — matching
+ * `ship.modules` directly only ever sees opaque hashes and always answers
+ * "no afterburner fitted".
+ *
+ * Matching is by module `type_id` against the known afterburner ids with a
+ * substring fallback so a future "Afterburner IV" is still recognised.
+ * Results are cached per bot for `MODULE_CACHE_TTL_MS` because refits are rare
+ * and `get_ship` is called on every trade cycle.
  */
 export async function detectAfterburnerModule(
   ctx: RoutineContext,
@@ -177,41 +183,47 @@ export async function detectAfterburnerModule(
   const ship = ((root.ship as Record<string, unknown>) || root) as Record<string, unknown>;
   const shipSpeed = (ship.speed as number) || bot.shipSpeed || 1;
 
-  const modules = (
-    Array.isArray(ship.modules) ? ship.modules :
-    Array.isArray(ship.mods) ? ship.mods :
-    Array.isArray(ship.installed_mods) ? ship.installed_mods :
-    []
-  ) as Array<Record<string, unknown> | string>;
+  const { modules, unresolvedIds, resolved } = extractShipModules(resp.result);
 
+  let matched = false;
   let moduleId: string | null = null;
   let moduleName: string | null = null;
+  let moduleSpeedBonus = 0;
+  let bestRank = -2;
 
   for (const mod of modules) {
-    const id = typeof mod === "string"
-      ? mod
-      : ((mod.type_id as string) || (mod.module_id as string) || (mod.id as string) || "");
-    const name = typeof mod === "string" ? mod : ((mod.name as string) || "");
-    const haystack = `${id} ${name}`.toLowerCase();
-    if (!haystack.includes("afterburner")) continue;
+    if (!moduleHaystack(mod).includes("afterburner")) continue;
 
-    const normalizedId = (id || "").toLowerCase();
+    const normalizedId = moduleTypeId(mod);
+    const name = typeof mod.name === "string" ? mod.name : "";
     // Prefer the strongest afterburner if somehow more than one is fitted.
     const rank = (AFTERBURNER_MODULE_IDS as readonly string[]).indexOf(normalizedId);
-    const currentRank = moduleId
-      ? (AFTERBURNER_MODULE_IDS as readonly string[]).indexOf(moduleId)
-      : -1;
-    if (moduleId === null || rank > currentRank) {
-      moduleId = normalizedId || moduleId;
-      moduleName = name || moduleName || normalizedId;
-    }
+    if (matched && rank <= bestRank) continue;
+
+    matched = true;
+    bestRank = rank;
+    moduleId = normalizedId || moduleId;
+    moduleName = name || normalizedId || moduleName;
+    const bonus = mod.speed_bonus;
+    moduleSpeedBonus = typeof bonus === "number" ? bonus : 0;
+  }
+
+  // No match AND unreadable entries → inconclusive, not "definitely absent".
+  // Don't cache that, so the next cycle re-checks instead of running unboosted
+  // for the full TTL on a ship that does have an afterburner.
+  if (!matched && !resolved) {
+    ctx.log(
+      "debug",
+      `Afterburner detection inconclusive: ${unresolvedIds.length} unresolved module id(s) in get_ship`,
+    );
+    return unknownModuleInfo(shipSpeed);
   }
 
   const info: AfterburnerModuleInfo = {
-    hasModule: moduleId !== null,
+    hasModule: matched,
     moduleId,
     moduleName,
-    speedBonus: moduleId ? catalogSpeedBonus(moduleId) : 0,
+    speedBonus: moduleSpeedBonus || (moduleId ? catalogSpeedBonus(moduleId) : 0),
     shipSpeed,
     boostedSpeed: Math.min(MAX_SHIP_SPEED, shipSpeed * 2),
     unknown: false,

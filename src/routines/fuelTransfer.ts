@@ -1,5 +1,6 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import {
   ensureUndocked,
   ensureFueled,
@@ -89,19 +90,10 @@ async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
   const shipResp = await bot.exec("get_ship");
   if (shipResp.error || !shipResp.result) return false;
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const { modules } = extractShipModules(shipResp.result);
 
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
-    const modName = ((modObj?.name as string) || "").toLowerCase();
-    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
-
-    const checkStr = `${modId} ${modName} ${modSpecial}`;
-    if (checkStr.includes("cloak")) {
-      return true;
-    }
+    if (moduleHaystack(mod).includes("cloak")) return true;
   }
   return false;
 }

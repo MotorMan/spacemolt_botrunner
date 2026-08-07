@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import type { FaintSignature } from "../wildlivestore.js";
@@ -2608,19 +2609,13 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
   const shipResp = await bot.exec("get_ship");
   if (shipResp.error || !shipResp.result) return false;
 
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const { modules } = extractShipModules(shipResp.result);
 
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
-    const modName = (modObj?.name as string) || "";
-    const modSpecial = (modObj?.special as string) || "";
-
-    const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+    const checkStr = moduleHaystack(mod);
     if (checkStr.includes("deep_core_survey_scanner") ||
         checkStr.includes("deep core survey scanner") ||
-        modSpecial.includes("deep_core_detection")) {
+        checkStr.includes("deep_core_detection")) {
       return true;
     }
   }

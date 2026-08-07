@@ -15,6 +15,7 @@ import {
 } from "./craft-goals.js";
 import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 import { catalogStore } from "../catalogstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -1515,12 +1516,9 @@ async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
   const shipResp = await bot.exec("get_ship");
   if (shipResp.error || !shipResp.result) return false;
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const { modules } = extractShipModules(shipResp.result);
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const checkStr = `${(modObj?.id as string) || (modObj?.type_id as string) || ""} ${(modObj?.name as string) || ""} ${(modObj?.special as string) || ""}`.toLowerCase();
-    if (checkStr.includes("cloak")) return true;
+    if (moduleHaystack(mod).includes("cloak")) return true;
   }
   return false;
 }

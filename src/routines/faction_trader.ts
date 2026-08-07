@@ -84,6 +84,35 @@ const DEFAULT_CATEGORY_SELL_PERCENT = 50;
 const DEFAULT_CATEGORY_PRICE_PERCENT = 25;
 const FACTION_TRADER_DEFAULT_MIN_PRICE = 969696;
 
+/**
+ * Minimum fraction of an item's best-known buy price beneath which a buy order
+ * is treated as a fire-sale and excluded from a faction sale. Applied whenever
+ * no explicit per-item / global min sell price is configured, so a valuable
+ * item pulled from faction storage can never be dumped at 1cr just because the
+ * route planner found one good buyer while a junk 1cr order also exists.
+ */
+const FACTION_FIRESALE_FLOOR_PERCENT = 50;
+
+/**
+ * Resolve the lowest price per unit we are willing to accept for a faction sale.
+ *
+ * The trader routine guards against fire-sales with a break-even floor, but
+ * faction items have no purchase cost, so break-even is ~0 and would not stop a
+ * 1cr dump. Instead we floor at a fraction of the item's best-known buy price
+ * (or the planned sale price), unless the operator set an explicit min. With no
+ * price information at all we refuse to sell (the caller holds / returns it).
+ */
+function getFactionMinAcceptablePrice(
+  itemId: string,
+  configuredMin: number,
+  plannedPrice: number,
+): number {
+  if (configuredMin > 0) return configuredMin;
+  const basis = plannedPrice > 0 ? plannedPrice : (findBestBuyForItem(itemId)?.price ?? 0);
+  if (basis > 0) return Math.max(1, Math.floor((basis * FACTION_FIRESALE_FLOOR_PERCENT) / 100));
+  return FACTION_TRADER_DEFAULT_MIN_PRICE;
+}
+
 /** Defaults for the afterburner boost (see routines/afterburner.ts). */
 const DEFAULT_AFTERBURNER_JUMPS_PER_FUEL = 1;
 const DEFAULT_AFTERBURNER_FUEL_BUFFER = 2;
@@ -461,6 +490,7 @@ export async function calculateFactionOptimalSellQuantity(
   minPricePerUnit: number,
 ): Promise<{
   sellQty: number;
+  heldQty: number;
   expectedRevenue: number;
   priceBreakdown: string;
   weightedAvgPrice: number;
@@ -468,15 +498,23 @@ export async function calculateFactionOptimalSellQuantity(
 }> {
   const { bot } = ctx;
 
+  // Fire-sale guard: if no explicit floor was configured, derive one from the
+  // item's value so a valuable item is never dumped at a junk (e.g. 1cr) price.
+  let floor = minPricePerUnit;
+  if (floor <= 0) {
+    floor = getFactionMinAcceptablePrice(itemId, 0, 0);
+  }
+
   // Check the market for this specific item
   const marketResp = await bot.exec("view_market", { item_id: itemId });
   if (marketResp.error || !marketResp.result) {
     ctx.log("trade", `view_market failed for ${itemName} — using cached data`);
     return {
       sellQty: availableQuantity,
-      expectedRevenue: availableQuantity * minPricePerUnit,
+      heldQty: 0,
+      expectedRevenue: availableQuantity * floor,
       priceBreakdown: "cached",
-      weightedAvgPrice: minPricePerUnit,
+      weightedAvgPrice: floor,
       buyOrders: [],
     };
   }
@@ -493,58 +531,72 @@ export async function calculateFactionOptimalSellQuantity(
     ctx.log("trade", `No market data for ${itemName} — using cached data`);
     return {
       sellQty: availableQuantity,
-      expectedRevenue: availableQuantity * minPricePerUnit,
+      heldQty: 0,
+      expectedRevenue: availableQuantity * floor,
       priceBreakdown: "cached",
-      weightedAvgPrice: minPricePerUnit,
+      weightedAvgPrice: floor,
       buyOrders: [],
     };
   }
 
-  const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
-  if (buyOrders.length === 0) {
+  const rawBuyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+  if (rawBuyOrders.length === 0) {
     ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
-    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0, buyOrders: [] };
+    return { sellQty: 0, heldQty: availableQuantity, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0, buyOrders: [] };
   }
 
-  // Calculate how many we can sell at or above minimum price
-  let remainingToSell = availableQuantity;
+  // Fill best-priced orders first — exactly how the in-game sell behaves.
+  const sorted = rawBuyOrders
+    .map(o => ({
+      priceEach: (o.price_each as number) || (o.price as number) || 0,
+      orderQty: (o.quantity as number) || (o.remaining as number) || 0,
+    }))
+    .filter(o => o.orderQty > 0 && o.priceEach > 0)
+    .sort((a, b) => b.priceEach - a.priceEach);
+
+  // Sell ONLY units priced at or above the floor. Anything below the floor is
+  // held (and routed to an alternate buyer) instead of being dumped at a
+  // fire-sale price that destroys the whole trade's profit — mirroring the
+  // trader routine's sellUpToFloor guard.
+  let remaining = availableQuantity;
   let totalRevenue = 0;
   let totalSold = 0;
+  let heldQty = 0;
   const priceDetails: string[] = [];
-const eligibleBuyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell: number }> = [];
+  const eligibleBuyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell: number }> = [];
 
-  for (const order of buyOrders) {
-    if (remainingToSell <= 0) break;
+  for (const order of sorted) {
+    if (remaining <= 0) break;
 
-    const priceEach = (order.price_each as number) || 0;
-    const orderQty = (order.quantity as number) || 0;
+    const qtyAtThisPrice = Math.min(remaining, order.orderQty);
 
-    if (orderQty <= 0 || priceEach <= 0) continue;
-    if (priceEach < minPricePerUnit) continue;
-
-    const qtyAtThisPrice = Math.min(remainingToSell, orderQty);
-    const revenueAtThisPrice = qtyAtThisPrice * priceEach;
-
-    totalRevenue += revenueAtThisPrice;
-    totalSold += qtyAtThisPrice;
-    remainingToSell -= qtyAtThisPrice;
-
-    priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
-    eligibleBuyOrders.push({
-      priceEach,
-      orderQty,
-      qtyToSell: qtyAtThisPrice,
-    });
+    if (order.priceEach >= floor) {
+      totalRevenue += qtyAtThisPrice * order.priceEach;
+      totalSold += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
+      priceDetails.push(`${qtyAtThisPrice}x @ ${order.priceEach}cr`);
+      eligibleBuyOrders.push({
+        priceEach: order.priceEach,
+        orderQty: order.orderQty,
+        qtyToSell: qtyAtThisPrice,
+      });
+    } else {
+      // Below our floor — do not sell here.
+      heldQty += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
+    }
   }
 
   const weightedAvgPrice = totalSold > 0 ? totalRevenue / totalSold : 0;
   const priceBreakdown = priceDetails.join(", ");
 
-  if (remainingToSell > 0) {
-    ctx.log("trade", `Market check: can sell ${totalSold}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
+  if (heldQty > 0) {
+    ctx.log("warn", `Market check: ${totalSold}/${availableQuantity}x ${itemName} at >=${floor}cr (${priceBreakdown || "none"}), ${heldQty}x only available below floor — holding`);
+  } else if (totalSold < availableQuantity) {
+    ctx.log("trade", `Market check: can sell ${totalSold}/${availableQuantity}x ${itemName} (${priceBreakdown})`);
   }
 
-  return { sellQty: totalSold, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice, buyOrders: eligibleBuyOrders };
+  return { sellQty: totalSold, heldQty, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice, buyOrders: eligibleBuyOrders };
 }
 
 /** Free cargo weight (not item count — callers must divide by item size). */
@@ -1916,7 +1968,35 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", "Cargo recovery: item no longer in cargo!");
             break;
           }
-          const sellQty = Math.min(inCargo.quantity, remaining);
+          // Fire-sale guard: only sell what the market will actually pay at/above
+          // a sensible floor. Never dump the whole hold into a junk 1cr order.
+          const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
+          const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+          const mCheck = await calculateFactionOptimalSellQuantity(
+            ctx, route!.itemId, route!.itemName, Math.min(inCargo.quantity, remaining), itemMinSellPrice
+          );
+          if (mCheck.sellQty <= 0) {
+            ctx.log("warn", `Cargo recovery: no profitable buy orders for ${route!.itemName} at >= floor (${mCheck.priceBreakdown || "none"}) — depositing back to storage instead of fire-selling`);
+            const depQty = Math.min(inCargo.quantity, remaining);
+            let dResp;
+            if (personalMode) {
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: depQty });
+            } else {
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: depQty });
+              if (dResp.error) {
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: depQty });
+              }
+            }
+            if (dResp.error) {
+              ctx.log("error", `Cargo recovery: failed to deposit unsold ${route!.itemName}: ${dResp.error.message}`);
+            } else {
+              ctx.log("trade", `Cargo recovery: deposited ${depQty}x unsold ${route!.itemName} back to storage`);
+              remaining -= depQty;
+            }
+            break;
+          }
+          const sellQty = Math.min(inCargo.quantity, remaining, mCheck.sellQty);
+          ctx.log("trade", `Cargo recovery: selling ${sellQty}x ${route!.itemName} (${mCheck.priceBreakdown})...`);
           const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellQty });
           if (sResp.error) {
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);

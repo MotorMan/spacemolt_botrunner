@@ -1103,6 +1103,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const station = findStation(pois);
 
     // ── Visit each POI ──
+    let wormholeJumped = false;
     for (const { poi, reason } of toVisit) {
       if (bot.state !== "running") break;
 
@@ -1149,21 +1150,31 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!jumpResp.error) {
           const r = jumpResp.result as Record<string, unknown> | undefined;
           if (r && r.action === "jumped") {
-            const fromSystem = (r.from_system as string) || systemId;
-            const exitPoi = (r.poi as string) || "";
-            const destSystem = (r.system as string) || "";
-            const destSystemId = (r.system_id as string) || "";
-            ctx.log("info", `🌌 Wormhole jumped: ${fromSystem} -> ${destSystem} (${exitPoi})`);
-            mapStore.registerWormhole(destSystemId || fromSystem, {
-              id: exitPoi || poi.id,
-              name: exitPoi || poi.name,
-              exit_system_id: destSystemId || fromSystem,
-              exit_system_name: destSystem || destSystemId,
-              exit_poi_id: exitPoi || poi.id,
-              exit_poi_name: exitPoi || poi.name,
-              destination_system_id: fromSystem,
-              destination_system_name: bot.system || fromSystem,
-            });
+            // from_system/system are display names ("Alzirr"); the map is keyed
+            // by ids ("alzirr"), so never feed a name in as a system id.
+            const fromSystemName = (r.from_system as string) || systemId;
+            const exitPoi = (r.poi as string) || poi.id;
+            const destSystemName = (r.system as string) || "";
+            // bot.system is already updated to the arrival system by the jump.
+            const destSystemId = (r.system_id as string)
+              || (bot.system && bot.system !== systemId ? bot.system : "");
+            ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
+            if (destSystemId) {
+              mapStore.registerWormhole(destSystemId, {
+                id: exitPoi,
+                name: exitPoi,
+                exit_system_id: destSystemId,
+                exit_system_name: destSystemName || destSystemId,
+                exit_poi_id: exitPoi,
+                exit_poi_name: exitPoi,
+                // The entrance is the system we just left, not wherever the
+                // bot happens to be standing now.
+                destination_system_id: systemId,
+                destination_system_name: fromSystemName,
+              });
+            } else {
+              ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
+            }
             // Mark both entrance and exit POIs explored
             mapStore.markExplored(systemId, poi.id);
             if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
@@ -1171,7 +1182,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         // Refresh location after wormhole jump
         await bot.refreshLocation();
-        continue; // Skip normal POI visit, restart loop in new system
+        if (bot.system && bot.system !== systemId) {
+          // We're in a whole different system now — abandon this system's POI
+          // list and rescan from the top of the outer loop.
+          wormholeJumped = true;
+          break;
+        }
+        continue;
       }
 
       // Scavenge wrecks/containers at each POI (only if enabled — unsafe near pirates)
@@ -1236,6 +1253,13 @@ yield "deposit_cargo";
     }
 
     if (bot.state !== "running") break;
+
+    // A wormhole dropped us in a brand new system — rescan it from scratch
+    // instead of picking a next system based on the one we just left.
+    if (wormholeJumped) {
+      ctx.log("info", `Arrived in ${bot.system} via wormhole — restarting system scan`);
+      continue;
+    }
 
     // ── Check skills for level-ups ──
     yield "check_skills";

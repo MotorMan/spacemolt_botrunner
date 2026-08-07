@@ -278,6 +278,37 @@ const BACKUP_FILES = [
   'transportProfitDebug.csv',
 ];
 
+/**
+ * Backfill array members that a stored system record may be missing.
+ *
+ * A system record can predate a field (map.json files written before
+ * `wormhole_exits` existed), come from a hand-written/synced map, or come from
+ * seed_map.json — in all of those cases the array is simply absent, and any
+ * consumer doing `sys.wormhole_exits.findIndex(...)` throws
+ * "undefined is not an object". Normalizing once on load means every consumer
+ * can rely on the arrays existing instead of guarding each access.
+ */
+function normalizeSystem(sys: StoredSystem): StoredSystem {
+  if (!Array.isArray(sys.connections)) sys.connections = [];
+  if (!Array.isArray(sys.pois)) sys.pois = [];
+  if (!Array.isArray(sys.wormhole_exits)) sys.wormhole_exits = [];
+  if (!Array.isArray(sys.pirate_sightings)) sys.pirate_sightings = [];
+  if (!Array.isArray(sys.wrecks)) sys.wrecks = [];
+  return sys;
+}
+
+/** Normalize every system in a freshly parsed/merged map payload. */
+function normalizeMapData(data: MapData): MapData {
+  if (!data.systems || typeof data.systems !== "object") {
+    data.systems = {};
+    return data;
+  }
+  for (const sys of Object.values(data.systems)) {
+    if (sys) normalizeSystem(sys);
+  }
+  return data;
+}
+
 class MapStore {
   private data: MapData;
   private dirty = false;
@@ -321,11 +352,11 @@ class MapStore {
       for (const [sid, seedSys] of Object.entries(seed.systems)) {
         const existing = this.data.systems[sid];
         if (!existing) {
-          this.data.systems[sid] = seedSys;
+          this.data.systems[sid] = normalizeSystem(seedSys);
           continue;
         }
         const existingPois = new Map(existing.pois.map((p) => [p.id, p]));
-        for (const seedPoi of seedSys.pois) {
+        for (const seedPoi of seedSys.pois || []) {
           const ep = existingPois.get(seedPoi.id);
           if (!ep) {
             existing.pois.push(seedPoi);
@@ -405,7 +436,7 @@ class MapStore {
     if (existsSync(MAP_FILE)) {
       try {
         const raw = readFileSync(MAP_FILE, "utf-8");
-        return JSON.parse(raw) as MapData;
+        return normalizeMapData(JSON.parse(raw) as MapData);
       } catch {
         // Corrupt file — start fresh
       }
@@ -1226,8 +1257,12 @@ class MapStore {
     expires_in_text?: string; // e.g., "36477d 20h"
     expires_at?: string; // ISO timestamp if provided directly
   }): void {
-    // Get or create the exit system
-    let exitSys = this.data.systems[exitSystemId];
+    if (!exitSystemId) return;
+
+    // Get or create the exit system. Resolve case-insensitively so a display
+    // name ("Praecipua") reuses the existing "praecipua" record instead of
+    // creating a duplicate system.
+    let exitSys = this.getSystem(exitSystemId);
     if (!exitSys) {
       exitSys = {
         id: exitSystemId,
@@ -1240,7 +1275,12 @@ class MapStore {
         last_updated: now(),
       };
       this.data.systems[exitSystemId] = exitSys;
+    } else {
+      exitSystemId = exitSys.id || exitSystemId;
     }
+    // An already-known system may have been stored before `wormhole_exits`
+    // existed, so never assume the array is there.
+    normalizeSystem(exitSys);
 
     // Calculate expiry from expires_in_text or expires_at
     let expiresAt: string | null = null;
@@ -1284,9 +1324,8 @@ class MapStore {
 
     // Also ensure the entrance (destination) system exists
     const entranceSystemId = wormholeData.destination_system_id;
-    let entranceSys = this.data.systems[entranceSystemId];
-    if (!entranceSys) {
-      entranceSys = {
+    if (entranceSystemId && !this.getSystem(entranceSystemId)) {
+      this.data.systems[entranceSystemId] = {
         id: entranceSystemId,
         name: wormholeData.destination_system_name || entranceSystemId,
         connections: [],
@@ -1296,7 +1335,6 @@ class MapStore {
         wrecks: [],
         last_updated: now(),
       };
-      this.data.systems[entranceSystemId] = entranceSys;
     }
 
     this.scheduleSave();

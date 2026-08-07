@@ -810,8 +810,6 @@ function findFactionSellRoutes(
 
   // First, add explicit trade items
   for (const item of storage) {
-    const lower = item.itemId.toLowerCase();
-    if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
     if (item.quantity <= 0) continue;
 
     // Check if in explicit trade items list
@@ -830,8 +828,6 @@ function findFactionSellRoutes(
   if (settings.categoryTrade && settings.categoryTrade.length > 0) {
     for (const catConfig of settings.categoryTrade) {
       for (const item of storage) {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
         if (item.quantity <= 0) continue;
         if (processedItemIds.has(item.itemId)) continue;
 
@@ -848,8 +844,6 @@ function findFactionSellRoutes(
   // Finally, if sellAllItems is enabled, add remaining storage items
   if (settings.sellAllItems) {
     for (const item of storage) {
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       if (item.quantity <= 0) continue;
       if (processedItemIds.has(item.itemId)) continue;
 
@@ -1204,8 +1198,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // This prevents using stale cached storage data when we're not at home.
     await bot.refreshCargo();
     const pendingCargo = bot.inventory.filter(i => {
-      const lower = i.itemId.toLowerCase();
-      return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
+      return i.quantity > 0;
     });
     if (pendingCargo.length > 0 && !recoveredSession) {
       ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo on startup — treating as recovery`);
@@ -1681,8 +1674,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       // Check if bot has cargo items that need to be sold (recovery from interrupted session)
       await bot.refreshCargo();
       const nonFuelCargo = bot.inventory.filter(i => {
-        const lower = i.itemId.toLowerCase();
-        return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
+        return i.quantity > 0;
       });
       
       if (nonFuelCargo.length > 0) {

@@ -575,6 +575,12 @@
             >
               System Blacklist
             </div>
+            <div
+              class="sidebar-item"
+              onclick="switchSettingsTab('station_blacklist')"
+            >
+              Station Blacklist
+            </div>
             <div class="sidebar-item" onclick="switchSettingsTab('crafter')">
               Crafter
             </div>
@@ -12562,6 +12568,7 @@
         const dispatch = {
           general: renderGeneralSettings,
           system_blacklist: renderSystemBlacklistSettings,
+          station_blacklist: renderStationBlacklistSettings,
           miner: renderMinerSettings,
           miner_quotas: renderMinerQuotasSettings,
           flock_grouping: renderFlockGroupingSettings,
@@ -13407,6 +13414,174 @@
         send({
           type: "saveSettings",
           routine: "system_blacklist",
+          settings: s,
+        });
+      }
+
+      // ── Station Blacklist Settings ───────────────────────────
+      // Mirrors the System Blacklist UI but for individual stations / faction
+      // outposts (POI ids). Read by getStationBlacklist() and folded into the
+      // denied-station set used by fuel search and station selection, so the bot
+      // will never route to or refuel at a blacklisted station.
+
+      function renderStationBlacklistSettings(panel) {
+        const raw = settings.station_blacklist;
+        const blacklist = Array.isArray(raw)
+          ? raw
+          : raw && Array.isArray(raw.station_blacklist)
+            ? raw.station_blacklist
+            : [];
+        const blSet = new Set(blacklist.map((s) => s.toLowerCase()));
+
+        // Gather all known stations (POIs with a base) from mapData
+        const allStations = [];
+        for (const [sysId, sys] of Object.entries(mapData)) {
+          const pois = (sys && sys.pois) || [];
+          for (const p of pois) {
+            if (p && (p.has_base || p.base_name)) {
+              allStations.push({
+                sysId,
+                poiId: p.id,
+                name: p.name || p.base_name || p.id,
+                sysName: sys.name || sysId,
+              });
+            }
+          }
+        }
+        allStations.sort((a, b) =>
+          (a.name + a.sysName).localeCompare(b.name + b.sysName),
+        );
+
+        const isBlacklisted = (s) =>
+          blSet.has(s.poiId.toLowerCase()) ||
+          blSet.has(`${s.sysId}|${s.poiId}`.toLowerCase());
+        const blacklisted = allStations.filter(isBlacklisted);
+        const available = allStations.filter((s) => !isBlacklisted(s));
+
+        const blacklistedRows =
+          blacklisted.length > 0
+            ? blacklisted
+                .map(
+                  (s) => `
+        <div class="blacklist-item">
+          <span class="blacklist-name">${esc(s.name)} <span class="blacklist-id">(${esc(s.poiId)}) @ ${esc(s.sysName)}</span></span>
+          <button class="sm danger" onclick="removeStationFromBlacklist('${esc(s.poiId)}')">Remove</button>
+        </div>
+      `,
+                )
+                .join("")
+            : '<div class="blacklist-empty">No stations blacklisted. Add faction outposts below to prevent the bot from docking/refueling there.</div>';
+
+        const stationOptions =
+          available.length > 0
+            ? available
+                .map(
+                  (s) =>
+                    `<option value="${esc(s.poiId)}">${esc(s.name)} (${esc(s.poiId)}) @ ${esc(s.sysName)}</option>`,
+                )
+                .join("")
+            : '<option value="">All known stations are blacklisted</option>';
+
+        panel.innerHTML = `
+    <h3>Station Blacklist</h3>
+    <div class="settings-desc">
+      Banned faction outposts and stations the bot can never dock at (e.g. outposts that
+      can't be set public, or stations that denied docking). The bot will never route to or
+      refuel at these. Enter POI ids, optionally as <code>system|poiId</code>.
+    </div>
+
+    <div class="blacklist-section">
+      <div class="blacklist-header">
+        <span>Blacklisted Stations (${blacklisted.length})</span>
+      </div>
+      <div class="blacklist-list">
+        ${blacklistedRows}
+      </div>
+    </div>
+
+    <div class="blacklist-section" style="margin-top:16px">
+      <div class="blacklist-header">
+        <span>Add Station</span>
+      </div>
+      <div class="blacklist-add">
+        <div class="blacklist-add-row">
+          <select id="station-blacklist-select" style="flex:1;min-width:200px">
+            <option value="">(select a known station)</option>
+            ${stationOptions}
+          </select>
+          <button class="primary sm" onclick="addStationToBlacklistFromSelect()">Add to Blacklist</button>
+        </div>
+
+        <div class="blacklist-divider">
+          <span>OR</span>
+        </div>
+
+        <div class="blacklist-add-row">
+          <input
+            type="text"
+            id="station-blacklist-manual"
+            placeholder="e.g., bda0a4a03041d80373d220f479c3407e, barnardstar|poiId"
+            style="flex:1;min-width:200px"
+            ${available.length === 0 ? "disabled" : ""}
+          />
+          <button class="primary sm" onclick="addStationToBlacklistFromText()" ${available.length === 0 ? "disabled" : ""}>Add to Blacklist</button>
+        </div>
+        <div class="blacklist-hint">POI ids are matched exactly (case-insensitive). You can paste the long faction-outpost id shown in the logs.</div>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveStationBlacklistSettings()">Save Settings</button>
+    </div>
+  `;
+      }
+
+      function addStationToBlacklistFromSelect() {
+        const sel = document.getElementById("station-blacklist-select");
+        const poiId = sel ? sel.value : "";
+        if (!poiId) return;
+        if (!Array.isArray(settings.station_blacklist)) {
+          settings.station_blacklist = [];
+        }
+        if (!settings.station_blacklist.includes(poiId)) {
+          settings.station_blacklist.push(poiId);
+        }
+        rerenderCurrentSettings();
+      }
+
+      function addStationToBlacklistFromText() {
+        const input = document.getElementById("station-blacklist-manual");
+        const text = input ? input.value.trim() : "";
+        if (!text) return;
+        if (!Array.isArray(settings.station_blacklist)) {
+          settings.station_blacklist = [];
+        }
+        const items = text
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        for (const it of items) {
+          if (!settings.station_blacklist.includes(it)) {
+            settings.station_blacklist.push(it);
+          }
+        }
+        input.value = "";
+        rerenderCurrentSettings();
+      }
+
+      function removeStationFromBlacklist(poiId) {
+        if (!Array.isArray(settings.station_blacklist)) return;
+        settings.station_blacklist = settings.station_blacklist.filter(
+          (s) => s.toLowerCase() !== poiId.toLowerCase(),
+        );
+        rerenderCurrentSettings();
+      }
+
+      function saveStationBlacklistSettings() {
+        const s = settings.station_blacklist || [];
+        send({
+          type: "saveSettings",
+          routine: "station_blacklist",
           settings: s,
         });
       }

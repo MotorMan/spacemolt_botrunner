@@ -2,7 +2,7 @@ import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { perf } from "../perf.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import {
@@ -2636,6 +2636,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
         return true;
       });
+      // Skip any route whose buy or sell station is on the station blacklist
+      // (e.g. banned faction outposts that can never be set public / docked at).
+      {
+        const stationBl = new Set(getStationBlacklist().map(s => s.toLowerCase()));
+        const isBlacklisted = (sysId: string | undefined, poiId: string | undefined) =>
+          !!poiId && (stationBl.has(poiId.toLowerCase()) ||
+            (sysId ? stationBl.has(`${sysId}|${poiId}`.toLowerCase()) : false));
+        const before = allRoutes.length;
+        allRoutes = allRoutes.filter(r =>
+          !isBlacklisted(r.sourceSystem, r.sourcePoi) &&
+          !isBlacklisted(r.destSystem, r.destPoi));
+        if (allRoutes.length < before) {
+          ctx.log("trade", `Skipped ${before - allRoutes.length} route(s) — buy/sell station on station blacklist`);
+        }
+      }
       allRoutesCount = allRoutes.length;
 
       // Filter out routes where bot can't afford even 1 unit (will try again with cheaper items next scan)

@@ -492,12 +492,28 @@ export class AfterburnerBooster {
   }
 
   /**
-   * Burn one afterburner fuel immediately before a jump so the +100% speed buff
-   * is active when the jump command executes. Hook this into `navigateToSystem`
-   * via `onPreJump`, which fires right before `exec("jump")` — NOT `onBeforeJump`,
-   * which runs at the top of the loop and lets the ~3-tick buff expire during
-   * the pre-jump fueling / route / dock work (the jump would then land
-   * unboosted).
+   * Issue `use_item` WITHOUT awaiting it, then return. The caller (the jump
+   * navigation) must issue `jump` immediately after, so both mutations queue in
+   * the SAME server tick. On `@spacemolt/lib` (which queues commands) this is
+   * what makes the +100% speed buff active when the jump resolves — the buff
+   * lands in the same tick the jump is processed, so 2–3 ticks of it run during
+   * the transit. Awaiting `use_item` first would push it a tick ahead of the
+   * jump and the ~3-tick buff would lapse before the jump acts (unboosted).
+   *
+   * Safe to call unconditionally — it no-ops when disabled or out of fuel, and
+   * dedupes retries of the same jump within `REUSE_GUARD_MS`.
+   */
+  fireUseItem = (nextSystem: string, jumpNumber: number): void => {
+    if (!this.enabled) return;
+    void this.burnBeforeJump(nextSystem, jumpNumber);
+  };
+
+  /**
+   * Burn one afterburner fuel immediately before a jump (awaits the
+   * `use_item` response). Used when the transport does not queue commands in
+   * the same tick as the jump — i.e. a fallback for non-library bots. For
+   * library-backed bots prefer `fireUseItem` + a concurrent `jump` so the buff
+   * and the jump share a tick.
    *
    * Safe to call unconditionally — it no-ops when the booster is disabled or
    * out of fuel.

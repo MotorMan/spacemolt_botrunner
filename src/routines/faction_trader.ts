@@ -1133,12 +1133,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           await enableCloakingIfPossible(ctx);
         }
       },
-      // Burn the afterburner fuel IMMEDIATELY before the jump command so the
-      // +100% speed buff is live when the jump resolves. Firing it any earlier
-      // (onBeforeJump) lets the ~3-tick buff lapse during pre-jump work and the
-      // jump lands at normal speed.
-      onPreJump: async (nextSystem: string, jumpNumber: number) => {
-        if (abBooster) await abBooster.burnBeforeJump(nextSystem, jumpNumber);
+      // Fire the afterburner fuel WITHOUT awaiting, then navigateToSystem
+      // issues `jump` immediately after — both queue in the same server tick so
+      // the +100% speed buff is active when the jump resolves. Awaiting here
+      // would push the buff a tick ahead of the jump and it would lapse before
+      // the jump acts (unboosted transit).
+      onPreJump: (nextSystem: string, jumpNumber: number) => {
+        if (abBooster) abBooster.fireUseItem(nextSystem, jumpNumber);
       },
     };
     let recoveredSessionHandled = false;

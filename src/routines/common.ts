@@ -2549,7 +2549,7 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -2780,13 +2780,15 @@ export async function navigateToSystem(
       if (opts.onBeforeJump) {
         await opts.onBeforeJump(nextSystem, attempt + 1);
       }
-      // `onPreJump` runs *immediately* before the jump command. Time-sensitive
-      // mutations (afterburner fuel, which grants a ~3-tick speed buff) MUST be
-      // issued here so the buff is active when the jump executes — firing them
-      // earlier in the loop lets the buff expire during the pre-jump fueling /
-      // route / dock work and the jump lands unboosted.
+      // `onPreJump` runs *immediately* before the jump. For library-backed bots
+      // that queue commands, the hook fires the time-sensitive mutation (e.g.
+      // afterburner fuel, a ~3-tick speed buff) WITHOUT awaiting, and we then
+      // issue `jump` straight away so BOTH mutations queue in the SAME server
+      // tick. That makes the buff active when the jump resolves; awaiting
+      // `use_item` first would push it a tick ahead and the buff would lapse
+      // before the jump acts (unboosted transit).
       if (opts.onPreJump) {
-        await opts.onPreJump(nextSystem, attempt + 1);
+        opts.onPreJump(nextSystem, attempt + 1);
       }
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });

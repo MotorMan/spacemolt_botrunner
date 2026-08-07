@@ -23,20 +23,6 @@
   </div>
 </nav>
 
-<!-- Side rail -->
-<aside class="rail">
-  <div class="rail-section">
-    <nav class="rail-nav">
-      <a class="rail-link active" href="/">HUB Stations</a>
-      <a class="rail-link" href="#" id="rail-settings">Settings</a>
-    </nav>
-  </div>
-  <div class="rail-spacer"></div>
-  <div class="rail-footer">
-    <button class="ghost-btn" id="refresh-btn-2">REFRESH_SYSTEMS</button>
-  </div>
-</aside>
-
 <!-- Main workspace (grid mode) -->
 <main class="workspace scanline" id="workspace">
   <div id="grid-view">
@@ -374,7 +360,6 @@
     fetch("/api/refresh", { method: "POST" }).catch(() => {});
   }
   document.getElementById("refresh-btn").onclick = doRefresh;
-  document.getElementById("refresh-btn-2").onclick = doRefresh;
 
   // ── rearrange ──
   const rearrangeBtn = document.getElementById("rearrange-btn");
@@ -430,7 +415,6 @@
   }
   function closeSettings() { overlay.classList.remove("open"); }
   document.getElementById("settings-btn").onclick = openSettings;
-  document.getElementById("rail-settings").onclick = (e) => { e.preventDefault(); openSettings(); };
   document.getElementById("settings-close").onclick = closeSettings;
   document.getElementById("settings-cancel").onclick = closeSettings;
 

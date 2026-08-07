@@ -136,39 +136,7 @@ body {
 .pip-alert { background: var(--error); box-shadow: 0 0 6px var(--error); }
 .pip-nodata { background: var(--outline); }
 
-/* ── Side rail ─────────────────────────────────────────────── */
-.rail {
-  position: fixed;
-  left: 0; top: 0; bottom: 0;
-  width: 240px;
-  z-index: 40;
-  display: flex;
-  flex-direction: column;
-  padding-top: 64px;
-  background: rgba(12, 14, 18, 0.45);
-  backdrop-filter: blur(12px);
-  border-right: 1px solid var(--outline-variant);
-}
-.rail-section { padding: var(--gutter); }
-.rail-nav { display: flex; flex-direction: column; gap: 2px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
-.rail-link {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  color: var(--on-surface-variant);
-  text-decoration: none;
-  border-left: 3px solid transparent;
-  transition: color 0.15s, background 0.15s;
-}
-.rail-link:hover { color: var(--primary-fixed-dim); background: rgba(51, 53, 57, 0.2); }
-.rail-link.active {
-  color: var(--on-primary-container);
-  background: var(--primary-container);
-  border-left-color: var(--primary-fixed-dim);
-}
-.rail-spacer { flex: 1; }
-.rail-footer { padding: var(--gutter); border-top: 1px solid rgba(58, 73, 75, 0.4); }
+/* ── Main buttons ──────────────────────────────────────────── */
 .ghost-btn {
   width: 100%;
   display: flex;
@@ -194,7 +162,7 @@ body {
 .workspace {
   position: relative;
   z-index: 10;
-  margin-left: 240px;
+  margin-left: 0;
   margin-top: 56px;
   padding: var(--margin);
   height: calc(100vh - 56px);

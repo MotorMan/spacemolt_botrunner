@@ -93,6 +93,7 @@ export interface MarketRecord {
   best_buy: number | null;
   best_sell: number | null;
   buy_quantity: number;
+  best_buy_quantity: number;
   sell_quantity: number;
   last_updated: string;
 }
@@ -697,20 +698,28 @@ class MapStore {
       let buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? 0;
 
       // If we have buy_orders array, calculate best price and total quantity from it
+      let bestBuyQty = buyQty;
       if (Array.isArray(item.buy_orders)) {
         let maxBuyPrice = 0;
         let totalBuyQty = 0;
+        let qtyAtBestPrice = 0;
         for (const order of item.buy_orders) {
           const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
           const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
           if (price > 0 && qty > 0) {
-            maxBuyPrice = Math.max(maxBuyPrice, price);
+            if (price > maxBuyPrice) {
+              maxBuyPrice = price;
+              qtyAtBestPrice = qty;
+            } else if (price === maxBuyPrice) {
+              qtyAtBestPrice += qty;
+            }
             totalBuyQty += qty;
           }
         }
         if (maxBuyPrice > 0) {
           buyPrice = buyPrice ?? maxBuyPrice;
           buyQty = buyQty || totalBuyQty;
+          bestBuyQty = qtyAtBestPrice;
         }
       } else if ((item.buy_orders as number) > 0) {
         // Fallback for cases where buy_orders is a number (count of orders)
@@ -748,6 +757,7 @@ class MapStore {
         best_buy: buyPrice,
         best_sell: sellPrice,
         buy_quantity: buyQty,
+        best_buy_quantity: bestBuyQty,
         sell_quantity: sellQty,
         last_updated: now(),
       });
@@ -2267,7 +2277,10 @@ const locations = this.findOreLocations(oreId, blacklist);
             sellListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_sell, quantity: m.sell_quantity });
           }
           if (m.best_buy !== null && m.best_buy > 0 && m.buy_quantity > 0) {
-            buyListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: m.buy_quantity });
+            // Size by quantity available at the BEST price, not the sum of all
+            // buy orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+            const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
+            buyListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: depthAtBest });
           }
         }
       }

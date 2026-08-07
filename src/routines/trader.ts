@@ -1064,15 +1064,6 @@ export function findTradeOpportunities(
       continue;
     }
 
-    const tradeQty = Math.min(sp.buyQty, sp.sellQty, maxItemsForCargo(cargoCapacity, sp.itemId));
-    const totalProfit = profitPerUnit * tradeQty;
-
-    // Cap by max cargo value
-    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) {
-      skippedValueCap++;
-      continue;
-    }
-
     // CRITICAL: Verify destination has actual buy demand (not just cached data)
     // This prevents buying items when no one wants to buy them
     const destSys = mapStore.getSystem(sp.destSystem);
@@ -1081,6 +1072,18 @@ export function findTradeOpportunities(
     if (!destMarket || !destMarket.best_buy || destMarket.buy_quantity <= 0) {
       skippedItems++;
       debugLog?.(`  Skipping ${sp.itemName}: no destination buyer (buyQty=${destMarket?.buy_quantity || 0})`);
+      continue;
+    }
+    // Size the trade by how many units the destination will actually pay the
+    // quoted price for — never by the sum of all buy orders across price tiers.
+    const destDepthAtBest = destMarket.best_buy_quantity > 0 ? destMarket.best_buy_quantity : destMarket.buy_quantity;
+
+    const tradeQty = Math.min(sp.buyQty, sp.sellQty, destDepthAtBest, maxItemsForCargo(cargoCapacity, sp.itemId));
+    const totalProfit = profitPerUnit * tradeQty;
+
+    // Cap by max cargo value
+    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) {
+      skippedValueCap++;
       continue;
     }
 
@@ -1442,14 +1445,14 @@ async function calculateOptimalSellQuantity(
   itemName: string,
   availableQuantity: number,
   minPricePerUnit: number,
-): Promise<{ sellQty: number; expectedRevenue: number; priceBreakdown: string }> {
+): Promise<{ sellQty: number; heldQty: number; expectedRevenue: number; priceBreakdown: string }> {
   const { bot } = ctx;
 
   // Check the market for this specific item
   const marketResp = await bot.exec("view_market", { item_id: itemId });
   if (marketResp.error || !marketResp.result) {
     ctx.log("trade", `view_market failed for ${itemName} — using cached data`);
-    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+    return { sellQty: availableQuantity, heldQty: 0, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
   }
 
   const marketData = marketResp.result as Record<string, unknown>;
@@ -1462,54 +1465,143 @@ async function calculateOptimalSellQuantity(
   const itemMarket = items.find(i => (i.item_id as string) === itemId);
   if (!itemMarket) {
     ctx.log("trade", `No market data for ${itemName} — using cached data`);
-    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+    return { sellQty: availableQuantity, heldQty: 0, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
   }
 
-  const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
-  if (buyOrders.length === 0) {
+  const rawBuyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+  if (rawBuyOrders.length === 0) {
     ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
-    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders" };
+    return { sellQty: 0, heldQty: availableQuantity, expectedRevenue: 0, priceBreakdown: "no buy orders" };
   }
 
-  // Calculate how many we can sell at or above minimum price
-  let remainingToSell = availableQuantity;
+  // Fill best-priced orders first, exactly like the in-game sell does.
+  const buyOrders = rawBuyOrders
+    .map(o => ({
+      priceEach: (o.price_each as number) || (o.price as number) || 0,
+      orderQty: (o.quantity as number) || (o.remaining as number) || 0,
+    }))
+    .filter(o => o.orderQty > 0 && o.priceEach > 0)
+    .sort((a, b) => b.priceEach - a.priceEach);
+
+  // Sell ONLY units priced at or above the break-even floor. Anything below the
+  // floor is held (and routed to an alternate buyer) instead of being dumped at
+  // a fire-sale price that destroys the whole trade's profit.
+  let remaining = availableQuantity;
   let totalRevenue = 0;
-  let soldAtProfit = 0;
+  let sellQty = 0;
+  let heldQty = 0;
   const priceDetails: string[] = [];
 
   for (const order of buyOrders) {
-    if (remainingToSell <= 0) break;
+    if (remaining <= 0) break;
 
-    const priceEach = (order.price_each as number) || 0;
-    const orderQty = (order.quantity as number) || 0;
+    const qtyAtThisPrice = Math.min(remaining, order.orderQty);
 
-    if (orderQty <= 0 || priceEach <= 0) continue;
-
-    const qtyAtThisPrice = Math.min(remainingToSell, orderQty);
-    const revenueAtThisPrice = qtyAtThisPrice * priceEach;
-
-    totalRevenue += revenueAtThisPrice;
-    remainingToSell -= qtyAtThisPrice;
-
-    if (priceEach >= minPricePerUnit) {
-      soldAtProfit += qtyAtThisPrice;
+    if (order.priceEach >= minPricePerUnit) {
+      totalRevenue += qtyAtThisPrice * order.priceEach;
+      sellQty += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
+      priceDetails.push(`${qtyAtThisPrice}x @ ${order.priceEach}cr`);
+    } else {
+      // Below our floor — do not sell here.
+      heldQty += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
     }
-
-    priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
   }
 
-  const actualSellQty = availableQuantity - remainingToSell;
   const priceBreakdown = priceDetails.join(", ");
 
-  if (remainingToSell > 0) {
-    ctx.log("trade", `Market check: can sell ${actualSellQty}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
+  if (heldQty > 0) {
+    ctx.log("warn", `Market check: ${sellQty}/${availableQuantity}x ${itemName} at >=${minPricePerUnit}cr (${priceBreakdown || "none"}), ${heldQty}x only available below floor — holding`);
+  } else if (sellQty < availableQuantity) {
+    ctx.log("trade", `Market check: can sell ${sellQty}/${availableQuantity}x ${itemName} (${priceBreakdown})`);
   }
 
-  if (soldAtProfit < actualSellQty && actualSellQty > 0) {
-    ctx.log("warn", `Market check: only ${soldAtProfit}/${actualSellQty}x ${itemName} at target price ${minPricePerUnit}cr — rest at lower prices`);
+  return { sellQty, heldQty, expectedRevenue: totalRevenue, priceBreakdown };
+}
+
+/**
+ * Authoritatively compute credits earned from a `sell` call.
+ *
+ * `bot.exec("sell")` already updates `bot.credits` to the post-sale absolute
+ * balance, so the credit delta is the source of truth. We never fall back to
+ * `sold * quotedPrice`, which previously turned a thin-depth fire-sale into a
+ * fabricated half-million-credit "profit".
+ */
+/**
+ * Minimum fraction of cargo that must be sellable at/above break-even before we
+ * commit to a sale at the planned destination. Below this, selling is a token
+ * sale and we route the whole stack to an alternate buyer instead.
+ */
+const MIN_GOOD_SELL_FRACTION = 0.2;
+
+function earnedFromSell(
+  ctx: RoutineContext,
+  creditsBefore: number,
+  sr: Record<string, unknown> | undefined,
+  sold: number,
+  fallbackPrice?: number,
+): number {
+  const delta = ctx.bot.credits - creditsBefore;
+  if (delta > 0) return sanitizeCredits(delta);
+  if (sr) {
+    const respEarned = sanitizeCredits(
+      (sr.credits_earned as number) ?? (sr.total as number) ?? (sr.revenue as number) ?? 0,
+    );
+    if (respEarned > 0) return respEarned;
+  }
+  if (fallbackPrice && fallbackPrice > 0 && sold > 0) {
+    ctx.log("warn", `Sell revenue unverified — estimating ${sold}x @ ${fallbackPrice}cr`);
+    return sanitizeCredits(sold * fallbackPrice);
+  }
+  return 0;
+}
+
+/**
+ * Sell up to the quantity the market will actually pay at/above `minPricePerUnit`,
+ * then stop. Returns what actually sold, the verified revenue, and what's left.
+ *
+ * This is the single chokepoint that prevents fire-sale dumping: it never sells
+ * below the break-even floor, and if the market can only absorb a token fraction
+ * at a good price it returns everything unsold so the caller can route the cargo
+ * to a better buyer instead. Revenue is always taken from the authoritative
+ * credit-delta (see `earnedFromSell`), never from a quoted best price.
+ */
+async function sellUpToFloor(
+  ctx: RoutineContext,
+  itemId: string,
+  itemName: string,
+  availableQty: number,
+  minPricePerUnit: number,
+  logLabel: string,
+): Promise<{ sold: number; revenue: number; remaining: number }> {
+  if (availableQty <= 0) return { sold: 0, revenue: 0, remaining: 0 };
+
+  const marketCheck = await calculateOptimalSellQuantity(ctx, itemId, itemName, availableQty, minPricePerUnit);
+  if (marketCheck.sellQty <= 0) {
+    return { sold: 0, revenue: 0, remaining: availableQty };
   }
 
-  return { sellQty: actualSellQty, expectedRevenue: totalRevenue, priceBreakdown };
+  const goodFraction = availableQty > 0 ? marketCheck.sellQty / availableQty : 1;
+  if (marketCheck.heldQty > 0 && goodFraction < MIN_GOOD_SELL_FRACTION) {
+    ctx.log("warn", `${logLabel}: market only absorbs ${marketCheck.sellQty}/${availableQty}x ${itemName} at >=${minPricePerUnit}cr (${Math.round(goodFraction * 100)}%) — skipping, routing to a better buyer`);
+    return { sold: 0, revenue: 0, remaining: availableQty };
+  }
+
+  const creditsBefore = ctx.bot.credits;
+  const actualSellQty = marketCheck.sellQty;
+  ctx.log("trade", `${logLabel}: selling ${actualSellQty}x ${itemName} (${marketCheck.priceBreakdown})...`);
+  const sellResp = await ctx.bot.exec("sell", { item_id: itemId, quantity: actualSellQty });
+  if (sellResp.error) {
+    ctx.log("error", `Sell failed: ${sellResp.error.message}`);
+    return { sold: 0, revenue: 0, remaining: availableQty };
+  }
+  const sr = sellResp.result as Record<string, unknown> | undefined;
+  await ctx.bot.refreshCargo();
+  const afterSell = ctx.bot.inventory.find(i => i.itemId === itemId)?.quantity ?? 0;
+  const sold = actualSellQty - afterSell;
+  const revenue = earnedFromSell(ctx, creditsBefore, sr, sold);
+  return { sold, revenue, remaining: afterSell };
 }
 
 /**
@@ -3583,43 +3675,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Only ${remaining}/${buyQty}x ${route!.itemName} left (${buyQty - remaining} consumed during travel)`);
       }
 
-      // Check actual market conditions before selling
-      const minAcceptablePrice = Math.floor(investedCredits / buyQty); // Break-even price per unit
-      const marketCheck = await calculateOptimalSellQuantity(
-        ctx,
-        route!.itemId,
-        route!.itemName,
-        remaining,
-        minAcceptablePrice,
-      );
-
-      if (marketCheck.sellQty <= 0) {
-        ctx.log("trade", `No viable buy orders for ${route!.itemName} — holding items for better prices`);
-        remaining = marketCheck.sellQty; // Will trigger deposit logic below
-      } else {
-        // Sell only what the market can absorb at reasonable prices
-        const actualSellQty = marketCheck.sellQty;
-        ctx.log("trade", `Selling ${actualSellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-        const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: actualSellQty });
-        if (!sellResp.error) {
-          const sr = sellResp.result as Record<string, unknown> | undefined;
-          const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
-          // Check how many actually sold
-          await bot.refreshCargo();
-          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          const sold = actualSellQty - afterSell;
-          totalSold += sold;
-          sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * route!.sellPrice);
-          remaining = afterSell;
-          if (remaining > 0) {
-            ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
-          }
-          // Refresh dest market cache with real post-sale data
-          await recordMarketData(ctx);
-        } else {
-          ctx.log("error", `Sell failed: ${sellResp.error.message}`);
-        }
+      // Check actual market conditions before selling. Only sell what the market
+      // will pay at/above break-even; never dump the rest at fire-sale prices.
+      const minAcceptablePrice = Math.floor(investedCredits / Math.max(1, remaining)); // Break-even price per unit
+      const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, minAcceptablePrice, "Market check");
+      totalSold += sale.sold;
+      sellRevenue += sale.revenue;
+      remaining = sale.remaining;
+      if (sale.sold > 0 && remaining > 0) {
+        ctx.log("trade", `Sold ${sale.sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
+      } else if (sale.sold <= 0) {
+        ctx.log("trade", `No viable sale for ${route!.itemName} at/above break-even (${minAcceptablePrice}cr) — holding items for a better buyer`);
       }
+      if (sale.sold > 0) await recordMarketData(ctx);
     }
 
     // If unsold items remain, find another buyer from mapStore
@@ -3687,17 +3755,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
 
           if (remaining > 0) {
-            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
-            if (!sResp.error) {
-              const sr = sResp.result as Record<string, unknown> | undefined;
-              const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? 0);
-              await bot.refreshCargo();
-              const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-              const sold = remaining - afterSell;
-              totalSold += sold;
-              sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * best.buyer.price);
-              remaining = afterSell;
-              ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
+            const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(investedCredits / Math.max(1, remaining)), `Selling at ${best.buyer.poiName}`);
+            totalSold += sale.sold;
+            sellRevenue += sale.revenue;
+            remaining = sale.remaining;
+            if (sale.sold > 0) {
+              ctx.log("trade", `Sold ${sale.sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
               await recordMarketData(ctx);
             }
           }
@@ -3763,20 +3826,15 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining <= 0) break;
 
-          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
-          if (!sResp.error) {
-            const sr = sResp.result as Record<string, unknown> | undefined;
-            const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
-            await bot.refreshCargo();
-            const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-            const sold = remaining - afterSell;
-            totalSold += sold;
-            sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * buyer.price);
-            remaining = afterSell;
-            ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
+          const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(investedCredits / Math.max(1, remaining)), `Selling at ${buyer.poiName}`);
+          totalSold += sale.sold;
+          sellRevenue += sale.revenue;
+          remaining = sale.remaining;
+          if (sale.sold > 0) {
+            ctx.log("trade", `Sold ${sale.sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
             await recordMarketData(ctx);
           } else {
-            ctx.log("error", `Sell failed: ${sResp.error.message}`);
+            ctx.log("trade", `No profitable sale at ${buyer.poiName} (${buyer.price}cr/ea) — moving on`);
           }
           break; // only try one alternative buyer, then fall back to storage
         }

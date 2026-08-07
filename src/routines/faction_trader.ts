@@ -29,6 +29,7 @@ import {
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  isFuelCellItem,
 } from "./common.js";
 import {
   getActiveSession,
@@ -779,6 +780,110 @@ function calculateCategoryMinSellPrice(itemId: string, pricePercent: number): nu
   return Math.floor(bestBuy.price * (pricePercent / 100));
 }
 
+/**
+ * The subset of settings that decides what may be sold and at what floor.
+ * Narrower than the full settings blob so the pure helpers below stay easy to
+ * reason about (and to test).
+ */
+export type SellPolicySettings = Pick<
+  ReturnType<typeof getFactionTraderSettings>,
+  "tradeItems" | "categoryTrade" | "minSellPrice"
+>;
+
+/**
+ * Resolve the minimum sell price this routine applies to an item, using the
+ * SAME precedence as the storage planner: explicit per-item config → category
+ * config (a percentage of the best known buy price) → global minimum.
+ *
+ * The cargo-recovery path used to only ever consult the per-item/global values.
+ * A category item withdrawn against a category floor could therefore be judged
+ * unsellable the instant it landed in the hold, so the bot would carry it back,
+ * stow it, withdraw it again next cycle and bounce forever.
+ */
+export function getEffectiveMinSellPrice(
+  itemId: string,
+  settings: SellPolicySettings,
+): number {
+  const lower = itemId.toLowerCase();
+  const itemConfig = settings.tradeItems.find(t => t.itemId.toLowerCase() === lower);
+  if (itemConfig) {
+    return itemConfig.minSellPrice > 0 ? itemConfig.minSellPrice : settings.minSellPrice;
+  }
+  if (settings.categoryTrade.length > 0) {
+    const category = ((catalogStore.getItem(itemId)?.category as string) || "").toLowerCase();
+    const catConfig = category
+      ? settings.categoryTrade.find(c => c.category.toLowerCase() === category)
+      : undefined;
+    if (catConfig) return calculateCategoryMinSellPrice(itemId, catConfig.pricePercentOfBestBuy);
+  }
+  return settings.minSellPrice;
+}
+
+/**
+ * Ship consumables (fuel cells, afterburner fuel) that the trader deliberately
+ * keeps aboard for the trip. They are NOT leftover trade goods: treating them
+ * as such put the bot into "cargo recovery" on every cycle, so it never looked
+ * at storage again and kept hunting for buyers for the very fuel it needs to fly.
+ *
+ * Detection is catalog-driven (`isFuelCellItem` = "the refuel command can burn
+ * this"). A substring test on "fuel" would be wrong in both directions and
+ * would quietly strand real trade goods such as fusion_fuel_rod,
+ * reactor_fuel_assembly or dark_energy_cell in the hold forever.
+ */
+function isShipConsumableItem(itemId: string): boolean {
+  return isAfterburnerFuelItem(itemId) || isFuelCellItem(itemId);
+}
+
+/**
+ * True when a cargo item is trade goods this routine must sell or stow.
+ * Consumables only count when the operator explicitly listed them as a trade
+ * item or trade category (a faction that really does sell fuel cells).
+ */
+export function isTradeCargoItem(
+  itemId: string,
+  settings: SellPolicySettings,
+): boolean {
+  if (!isShipConsumableItem(itemId)) return true;
+  const lower = itemId.toLowerCase();
+  if (settings.tradeItems.some(t => t.itemId.toLowerCase() === lower)) return true;
+  if (settings.categoryTrade.length > 0) {
+    const category = ((catalogStore.getItem(itemId)?.category as string) || "").toLowerCase();
+    if (category && settings.categoryTrade.some(c => c.category.toLowerCase() === category)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Put cargo back into storage: faction first, personal storage as a fallback so
+ * a station without faction storage still gets the hold emptied instead of the
+ * bot idling with a full hold forever.
+ */
+async function depositCargoItem(
+  ctx: RoutineContext,
+  itemId: string,
+  quantity: number,
+  personalMode: boolean,
+): Promise<{ ok: boolean; target?: "faction" | "personal"; error?: string }> {
+  const { bot } = ctx;
+  if (quantity <= 0) return { ok: true, target: personalMode ? "personal" : "faction" };
+
+  if (personalMode) {
+    const resp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: itemId, quantity });
+    return resp.error ? { ok: false, error: resp.error.message } : { ok: true, target: "personal" };
+  }
+
+  const factionResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: itemId, quantity });
+  if (!factionResp.error) return { ok: true, target: "faction" };
+  const personalResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: itemId, quantity });
+  if (!personalResp.error) return { ok: true, target: "personal" };
+  return {
+    ok: false,
+    error: `${factionResp.error.message} (personal storage fallback: ${personalResp.error.message})`,
+  };
+}
+
 /** Find sell routes for items currently in faction storage. Factors round-trip fuel cost. */
 function findFactionSellRoutes(
   ctx: RoutineContext,
@@ -1197,8 +1302,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // ── Always prioritize pending cargo or active session on restart ──
     // This prevents using stale cached storage data when we're not at home.
     await bot.refreshCargo();
+    // Only real trade goods count as "a hold that still needs selling". Fuel
+    // cells and afterburner fuel are the ship's own supplies: counting them
+    // here forced every cycle into cargo recovery, which meant the bot never
+    // planned a storage trade again and kept looking for buyers for its fuel.
     const pendingCargo = bot.inventory.filter(i => {
-      return i.quantity > 0;
+      return i.quantity > 0 && isTradeCargoItem(i.itemId, settings);
     });
     if (pendingCargo.length > 0 && !recoveredSession) {
       ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo on startup — treating as recovery`);
@@ -1674,7 +1783,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       // Check if bot has cargo items that need to be sold (recovery from interrupted session)
       await bot.refreshCargo();
       const nonFuelCargo = bot.inventory.filter(i => {
-        return i.quantity > 0;
+        return i.quantity > 0 && isTradeCargoItem(i.itemId, settings);
       });
       
       if (nonFuelCargo.length > 0) {
@@ -1688,8 +1797,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
         
         for (const item of nonFuelCargo) {
-          const itemConfig = settings.tradeItems.find(t => t.itemId === item.itemId);
-          const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+          // Same floor the storage planner used when it withdrew the item, or
+          // recovery could refuse to sell what planning was happy to withdraw.
+          const itemMinSellPrice = getEffectiveMinSellPrice(item.itemId, settings);
 
           const knownBuyers = allBuys
             .filter(b => b.itemId === item.itemId && b.price > 0 && b.quantity > 0)
@@ -1810,6 +1920,63 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
           continue;
         }
+
+        // ── At home with goods nobody will buy: stow them ──
+        // This is the branch that used to be missing. The bot arrived home with
+        // a loaded hold, found no buyer, and fell straight through to the idle
+        // timer below — so every cycle re-ran "cargo recovery → no buyers →
+        // wait 60s" forever while the cargo sat in the hold. Putting the goods
+        // back in storage ends the loop and lets the next cycle plan normally.
+        if (nonFuelCargo.length > 0) {
+          yield "deposit_cargo";
+          const docked = await ensureDocked(ctx);
+          if (!docked) {
+            ctx.log("error", `Cannot dock at home to stow unsellable cargo — retrying in 60s`);
+            await ctx.sleep(60000);
+            continue;
+          }
+
+          let depositedAny = false;
+          const failures: string[] = [];
+          const unitsBefore = nonFuelCargo.reduce((sum, i) => sum + i.quantity, 0);
+          for (const item of nonFuelCargo) {
+            const res = await depositCargoItem(ctx, item.itemId, item.quantity, personalMode);
+            if (res.ok) {
+              depositedAny = true;
+              ctx.log("trade", `Stowed ${item.quantity}x ${item.name} in ${res.target ?? storageType} storage — no buyer for it right now`);
+            } else {
+              failures.push(`${item.quantity}x ${item.name} (${res.error})`);
+            }
+          }
+
+          if (failures.length > 0) {
+            ctx.log("error", `Failed to stow unsellable cargo: ${failures.join("; ")}`);
+          }
+
+          // Trust the hold, not the response: a deposit that reports success
+          // without moving anything would otherwise put us straight back here
+          // on the next cycle, trading one busy-loop for another.
+          await bot.refreshCargo();
+          const unitsAfter = bot.inventory
+            .filter(i => i.quantity > 0 && isTradeCargoItem(i.itemId, settings))
+            .reduce((sum, i) => sum + i.quantity, 0);
+
+          if (depositedAny && unitsAfter < unitsBefore) {
+            // Storage just changed — drop the cache so the next cycle plans
+            // against what is actually in there.
+            clearFactionStorageCache();
+            bot.factionStorage = [];
+            await ctx.sleep(2000);
+            continue;
+          }
+
+          // Nothing left the hold (no storage at this station, deposit
+          // rejected, ...). Wait before retrying so the routine cannot spin.
+          ctx.log("error", `Cargo still holds ${unitsAfter} unsellable unit(s) after the deposit attempt — retrying in 60s`);
+          await ctx.sleep(60000);
+          continue;
+        }
+
         ctx.log("trade", `No ${storageType} storage items to sell — waiting 60s`);
         await ctx.sleep(60000);
         continue;
@@ -1962,25 +2129,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
           // Fire-sale guard: only sell what the market will actually pay at/above
           // a sensible floor. Never dump the whole hold into a junk 1cr order.
-          const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
-          const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+          const itemMinSellPrice = getEffectiveMinSellPrice(route!.itemId, settings);
           const mCheck = await calculateFactionOptimalSellQuantity(
             ctx, route!.itemId, route!.itemName, Math.min(inCargo.quantity, remaining), itemMinSellPrice
           );
           if (mCheck.sellQty <= 0) {
             ctx.log("warn", `Cargo recovery: no profitable buy orders for ${route!.itemName} at >= floor (${mCheck.priceBreakdown || "none"}) — depositing back to storage instead of fire-selling`);
             const depQty = Math.min(inCargo.quantity, remaining);
-            let dResp;
-            if (personalMode) {
-              dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: depQty });
-            } else {
-              dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: depQty });
-              if (dResp.error) {
-                dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: depQty });
-              }
-            }
-            if (dResp.error) {
-              ctx.log("error", `Cargo recovery: failed to deposit unsold ${route!.itemName}: ${dResp.error.message}`);
+            const dep = await depositCargoItem(ctx, route!.itemId, depQty, personalMode);
+            if (!dep.ok) {
+              ctx.log("error", `Cargo recovery: failed to deposit unsold ${route!.itemName}: ${dep.error}`);
             } else {
               ctx.log("trade", `Cargo recovery: deposited ${depQty}x unsold ${route!.itemName} back to storage`);
               remaining -= depQty;
@@ -2448,7 +2606,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: excess }); //fixed by human!
                 if (dResp.error) {
                   //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
-                  dResp = await bot.exec("storage", { action: '', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
+                  dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
                 }
               }
               deposited.push(`${excess}x ${item.name}`);

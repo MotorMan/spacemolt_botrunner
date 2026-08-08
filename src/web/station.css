@@ -118,7 +118,10 @@ body {
   font-weight: 700;
   letter-spacing: 0.08em;
   color: var(--primary-fixed-dim);
+  text-decoration: none;
+  cursor: pointer;
 }
+.brand:hover { color: var(--on-surface); }
 .topbar-right { display: flex; align-items: center; gap: var(--gutter); }
 .counter-chip {
   display: flex;

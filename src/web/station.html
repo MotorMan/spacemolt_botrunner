@@ -943,13 +943,41 @@
     return c ? c.category : null;
   }
 
+  // A facility is "active" (built & running) unless it is explicitly under
+  // construction, or the server reports an inactive/offline status. The
+  // `facility list` payload has no `status: "active"` field, so we key off
+  // `under_construction` and any explicit status/active flag when present.
+  function isFacilityActive(f) {
+    if (f.under_construction === true) return false;
+    if (typeof f.active === "boolean") return f.active;
+    if (typeof f.status === "string") {
+      const s = f.status.toLowerCase();
+      if (s === "active" || s === "online" || s === "running") return true;
+      return false;
+    }
+    return true;
+  }
+
+  // Per-round maintenance needs. Prefer the facility's own `maintenance_per_cycle`
+  // (level-adjusted, actual), falling back to the catalog definition's
+  // `maintenance_inputs` for station-type facilities that only expose those.
+  function facilityMaintenance(f) {
+    const live = Array.isArray(f.maintenance_per_cycle) ? f.maintenance_per_cycle : [];
+    if (live.length) {
+      return live.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+    }
+    const cat = detailState.catCache[f.facility_type || f.type || f.id];
+    const mi = (cat && cat.maintenance_inputs) || [];
+    return Array.isArray(mi) ? mi.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name })) : [];
+  }
+
   function facCard(f, cat) {
     const name = f.name || f.facility_type || f.type || "?";
     const fid = f.facility_id || f.id || "";
-    const active = f.status === "active" || f.active === true;
+    const active = isFacilityActive(f);
     const status = active ? '<span style="color:var(--secondary-fixed-dim)">Active</span>' : '<span style="color:var(--error)">Inactive</span>';
     const cat2 = detailState.catCache[f.facility_type || f.type || f.id];
-    const maint = (cat2 && cat2.maintenance_inputs) || [];
+    const maint = facilityMaintenance(f);
     const needs = STATION_CATS.includes(cat)
       ? maint.map((m) => `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`).join(", ")
       : "";
@@ -981,7 +1009,7 @@
     const fid = f.facility_id || f.id || "";
     const level = f.level != null ? f.level : (f.tier != null ? f.tier : "");
     const levelStr = level ? ` (L${level})` : "";
-    const active = f.status === "active" || f.active === true;
+    const active = isFacilityActive(f);
     const status = active ? '<span style="color:var(--secondary-fixed-dim)">Active</span>' : '<span style="color:var(--error)">Inactive</span>';
     const prod = f.production || {};
     const isPublic = prod.public === true;
@@ -1215,12 +1243,10 @@
     const totals = {};
     const contributing = [];
     (detailState.facilities || []).forEach((fac) => {
-      const active = fac.status === "active" || fac.active === true;
-      if (!active) return;
+      if (!isFacilityActive(fac)) return;
       const id = fac.facility_type || fac.type || fac.id;
-      const cat = detailState.catCache[id];
-      const maint = (cat && cat.maintenance_inputs) || [];
-      if (!Array.isArray(maint) || !maint.length) return;
+      const maint = facilityMaintenance(fac);
+      if (!maint.length) return;
       contributing.push({
         name: fac.name || id || "?",
         items: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),

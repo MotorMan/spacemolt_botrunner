@@ -147,9 +147,12 @@ export class StationWebServer {
           }
 
           if (url.pathname.startsWith("/api/station/")) {
-            const stationId = decodeURIComponent(url.pathname.slice("/api/station/".length));
+            let stationId = decodeURIComponent(url.pathname.slice("/api/station/".length));
             if (req.method === "GET") return this.handleStationGet(stationId, corsHeaders);
-            if (req.method === "POST") return this.handleStationAction(stationId, req, corsHeaders);
+            if (req.method === "POST") {
+              stationId = stationId.replace(/\/action$/, "");
+              return this.handleStationAction(stationId, req, corsHeaders);
+            }
           }
 
           if (url.pathname === "/api/catalog/facilities" && req.method === "GET") {

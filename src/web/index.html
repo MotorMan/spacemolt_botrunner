@@ -23231,8 +23231,10 @@ When responding:
         }
 
         let allGood = true;
-        // Cycle timing: one maintenance cycle is 100 ticks; 1 tick = 10s real time.
-        const TICKS_PER_CYCLE = 100;
+        // Cycle timing: maintenance is checked every 100 ticks, but consumables
+        // are only actually withdrawn once per 1000 ticks — so the real burn
+        // cycle is 1000 ticks; 1 tick = 10s real time.
+        const TICKS_PER_CYCLE = 1000;
         const SECONDS_PER_TICK = 10;
         const SECS_PER_CYCLE = TICKS_PER_CYCLE * SECONDS_PER_TICK;
         const fmtDuration = (secs) => {
@@ -23303,7 +23305,7 @@ When responding:
         </thead>
         <tbody>${rows}</tbody>
       </table>
-      <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes the current 100-tick (1000s) maintenance cycle; it is an estimate and does not account for unknown cycle start timing. Refresh after delivering items.</div>
+       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Refresh after delivering items.</div>
       ${contribHtml}
     `;
       }

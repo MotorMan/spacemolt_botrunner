@@ -1274,8 +1274,10 @@
     }
 
     let allGood = true;
-    // One maintenance cycle is 100 ticks; 1 tick = 10s real time.
-    const SECS_PER_CYCLE = 100 * 10;
+    // Maintenance is checked every 100 ticks, but consumables are only actually
+    // withdrawn once per 1000 ticks — so the real burn cycle is 1000 ticks.
+    // 1 tick = 10s real time.
+    const SECS_PER_CYCLE = 1000 * 10;
     const fmtDuration = (secs) => {
       if (secs === Infinity) return "—";
       const d = Math.floor(secs / 86400);
@@ -1340,7 +1342,7 @@
         </thead>
         <tbody>${rows}</tbody>
       </table>
-      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes the current 100-tick (1000s) maintenance cycle; it is an estimate and does not account for unknown cycle start timing.</div>
+      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing.</div>
       ${contribHtml}
     `;
   }

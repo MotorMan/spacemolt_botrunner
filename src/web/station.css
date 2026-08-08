@@ -558,6 +558,33 @@ pre.snap {
 .toggle-off { color: var(--on-surface-variant); }
 .detail-note { font-size: 11px; color: var(--on-surface-variant); margin-top: 8px; }
 
+/* Collapsible block (default-collapsed station settings) */
+.collapsible { padding: 0; overflow: hidden; }
+.collapsible-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: transparent; border: none; cursor: pointer;
+  padding: 12px 14px; color: var(--on-surface-variant);
+  font-family: var(--font-data); font-size: 11px; text-align: left;
+}
+.collapsible-head:hover { color: var(--on-surface); }
+.collapsible-head .coll-arrow { font-size: 10px; transition: transform 0.15s ease; }
+.collapsible-body { padding: 0 14px 14px; }
+
+/* Consumables / maintenance table */
+.cons-summary { font-weight: 600; margin-bottom: 8px; font-size: 12px; }
+.cons-summary.ok { color: var(--secondary-fixed-dim); }
+.cons-summary.bad { color: var(--error); }
+.cons-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.cons-table thead tr { border-bottom: 1px solid var(--outline-variant); color: var(--on-surface-variant); font-family: var(--font-data); }
+.cons-table th, .cons-table td { padding: 4px 8px; }
+.cons-table th { text-align: left; font-weight: 500; }
+.cons-item { font-family: var(--font-headline); }
+.cons-id { font-family: var(--font-data); color: var(--on-surface-variant); font-size: 11px; }
+.cons-num { text-align: right; font-family: var(--font-data); font-weight: 600; }
+.cons-eta { text-align: right; font-family: var(--font-data); font-size: 11px; color: var(--on-surface-variant); }
+.cons-foot { margin-top: 8px; font-size: 10px; color: var(--on-surface-variant); }
+.cons-contrib { margin-top: 10px; font-size: 11px; color: var(--on-surface-variant); font-family: var(--font-data); }
+
 /* Facilities */
 .fac-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--gutter); }
 .fac-card {

@@ -590,6 +590,9 @@
     facilities: [],
     upgrades: {},
     catCache: {},
+    itemCatalog: null,        // id -> { name }
+    consumableInv: null,      // { items, storage, factionStorage }
+    consumableData: null,     // computed { rows, allGood, contributing }
     buildCategory: "service",
     buildSearch: "",
     buildList: [],
@@ -653,7 +656,8 @@
     document.getElementById("detail-view").style.display = "block";
     document.getElementById("detail-body").innerHTML =
       '<div id="detail-msg" class="detail-note"></div>' +
-      '<div class="detail-section"><div class="detail-section-title">Overview &amp; Settings</div><div id="detail-overview"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Overview</div><div id="detail-overview"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Consumables / Maintenance</div><div id="detail-consumables"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Facilities</div><div id="detail-facilities"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Build Facility</div><div id="detail-build"><div class="detail-note">Loading…</div></div></div>';
 
@@ -685,6 +689,8 @@
     renderOverview();
     renderFacilities();
     renderBuild();
+    await loadConsumables();
+    renderConsumables();
   }
 
   function barRow(label, value, max) {
@@ -732,16 +738,21 @@
       `</div>`;
 
     const settings = `
-      <div class="detail-card" style="margin-top:12px;">
-        <div style="font-size:11px;color:var(--on-surface-variant);font-family:var(--font-data);margin-bottom:4px">Station settings (owner/admin, docked bot required):</div>
-        <div class="setting-row"><label>Rename</label><input type="text" id="set-rename" value="${esc(b.name || "")}" placeholder="New name" /><button class="small-btn" id="btn-rename">Save</button></div>
-        <div class="setting-row"><label>Description</label><input type="text" id="set-desc" value="${esc(b.description || "")}" placeholder="Description" /><button class="small-btn" id="btn-desc">Save</button></div>
-        <div class="setting-row"><label>Access</label><span class="toggle-pill ${b.public_access ? "toggle-on" : "toggle-off"}" id="pill-public">${pub}</span><button class="small-btn" id="btn-public">${b.public_access ? "Make Private" : "Make Public"}</button></div>
-        <div class="setting-row"><label>Market Fee %</label><input type="number" id="set-fee" min="0" max="10" step="1" value="${feePct}" placeholder="0-10" /><button class="small-btn" id="btn-fee">Set</button></div>
-        <div class="setting-row"><label>Refuel $/fuel</label><input type="number" id="set-refuel" min="0" step="1" value="${b.refuel_price_each != null ? b.refuel_price_each : ""}" placeholder="cr/fuel" /><button class="small-btn" id="btn-refuel">Set</button></div>
-        <div class="setting-row"><label>Repair $/hull</label><input type="number" id="set-repair" min="0" step="1" value="${b.repair_price_per_hull != null ? b.repair_price_per_hull : ""}" placeholder="cr/hull" /><button class="small-btn" id="btn-repair">Set</button></div>
-        <div class="setting-row"><label>Auto-Buy Fuel</label><span class="toggle-pill ${b.auto_buy_fuel ? "toggle-on" : "toggle-off"}" id="pill-autobuy">${b.auto_buy_fuel ? "On" : "Off"}</span><button class="small-btn" id="btn-autobuy">${b.auto_buy_fuel ? "Turn Off" : "Turn On"}</button></div>
-        <div class="setting-row"><label>Outsider Builds</label><span class="toggle-pill ${b.allow_outsider_facilities ? "toggle-on" : "toggle-off"}" id="pill-outsider">${b.allow_outsider_facilities ? "Allowed" : "Blocked"}</span><button class="small-btn" id="btn-outsider">${b.allow_outsider_facilities ? "Block" : "Allow"}</button></div>
+      <div class="detail-card collapsible" style="margin-top:12px;">
+        <button type="button" class="collapsible-head" id="settings-toggle" aria-expanded="false">
+          <span class="coll-arrow">▸</span>
+          <span>Station settings (owner/admin, docked bot required)</span>
+        </button>
+        <div class="collapsible-body" id="settings-body" style="display:none;">
+          <div class="setting-row"><label>Rename</label><input type="text" id="set-rename" value="${esc(b.name || "")}" placeholder="New name" /><button class="small-btn" id="btn-rename">Save</button></div>
+          <div class="setting-row"><label>Description</label><input type="text" id="set-desc" value="${esc(b.description || "")}" placeholder="Description" /><button class="small-btn" id="btn-desc">Save</button></div>
+          <div class="setting-row"><label>Access</label><span class="toggle-pill ${b.public_access ? "toggle-on" : "toggle-off"}" id="pill-public">${pub}</span><button class="small-btn" id="btn-public">${b.public_access ? "Make Private" : "Make Public"}</button></div>
+          <div class="setting-row"><label>Market Fee %</label><input type="number" id="set-fee" min="0" max="10" step="1" value="${feePct}" placeholder="0-10" /><button class="small-btn" id="btn-fee">Set</button></div>
+          <div class="setting-row"><label>Refuel $/fuel</label><input type="number" id="set-refuel" min="0" step="1" value="${b.refuel_price_each != null ? b.refuel_price_each : ""}" placeholder="cr/fuel" /><button class="small-btn" id="btn-refuel">Set</button></div>
+          <div class="setting-row"><label>Repair $/hull</label><input type="number" id="set-repair" min="0" step="1" value="${b.repair_price_per_hull != null ? b.repair_price_per_hull : ""}" placeholder="cr/hull" /><button class="small-btn" id="btn-repair">Set</button></div>
+          <div class="setting-row"><label>Auto-Buy Fuel</label><span class="toggle-pill ${b.auto_buy_fuel ? "toggle-on" : "toggle-off"}" id="pill-autobuy">${b.auto_buy_fuel ? "On" : "Off"}</span><button class="small-btn" id="btn-autobuy">${b.auto_buy_fuel ? "Turn Off" : "Turn On"}</button></div>
+          <div class="setting-row"><label>Outsider Builds</label><span class="toggle-pill ${b.allow_outsider_facilities ? "toggle-on" : "toggle-off"}" id="pill-outsider">${b.allow_outsider_facilities ? "Allowed" : "Blocked"}</span><button class="small-btn" id="btn-outsider">${b.allow_outsider_facilities ? "Block" : "Allow"}</button></div>
+        </div>
       </div>`;
 
     document.getElementById("detail-overview").innerHTML = bars + stats + settings;
@@ -778,6 +789,18 @@
 
   function wireOverview() {
     const q = (id) => document.getElementById(id);
+
+    const toggle = q("settings-toggle");
+    if (toggle) {
+      toggle.onclick = () => {
+        const body = document.getElementById("settings-body");
+        const open = body.style.display !== "none";
+        body.style.display = open ? "none" : "block";
+        toggle.setAttribute("aria-expanded", open ? "false" : "true");
+        toggle.querySelector(".coll-arrow").textContent = open ? "▸" : "▾";
+      };
+    }
+
     const refresh = async (okMsg) => {
       await refreshDetailBase();
       renderOverview();
@@ -1127,6 +1150,173 @@
         else setMsg("Build failed: " + (r.error || "unknown"), "err");
       };
     });
+  }
+
+  // ── Consumables / maintenance display ───────────────────────
+  // Aggregates the per-round maintenance_inputs of every built & active station
+  // facility, then compares against the bot's cargo + personal station storage +
+  // local faction storage. Auto-populated whenever the station view opens.
+  function itemName(id) {
+    const c = detailState.itemCatalog;
+    const e = c && c[id];
+    if (e && e.name) return e.name;
+    return id.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+  }
+
+  async function collectStationInventory() {
+    const inv = { items: {}, storage: {}, factionStorage: {} };
+    const addTo = (target, res) => {
+      if (!res || !res.ok || !res.data) return;
+      const d = res.data;
+      const arr = d.items || d.storage || d.cargo || d || [];
+      const list = Array.isArray(arr) ? arr : Object.values(arr);
+      list.forEach((c) => {
+        const id = c.item_id || c.id;
+        if (id) target[id] = (target[id] || 0) + (c.quantity || c.count || 0);
+      });
+    };
+    addTo(inv.items, await apiAction("get_cargo", {}));
+    addTo(inv.storage, await apiAction("view_storage", { target: "self" }));
+    addTo(inv.factionStorage, await apiAction("view_faction_storage", {}));
+    return inv;
+  }
+
+  async function loadConsumables() {
+    const el = document.getElementById("detail-consumables");
+    if (!el) return;
+    if (!detailState.bot) {
+      el.innerHTML = '<div class="detail-note">No bot configured for this station (cannot compute maintenance).</div>';
+      detailState.consumableData = null;
+      return;
+    }
+    if (!detailState.facilities || detailState.facilities.length === 0) {
+      await loadFacilities();
+    }
+    try {
+      if (!detailState.itemCatalog) {
+        const c = await (await fetch("/api/catalog")).json();
+        detailState.itemCatalog = c.items || {};
+      }
+    } catch {
+      detailState.itemCatalog = {};
+    }
+
+    // Ensure catalog cache for each facility type is warm.
+    const types = new Set();
+    (detailState.facilities || []).forEach((f) => {
+      const t = f.facility_type || f.type || f.id;
+      if (t) types.add(t);
+    });
+    await Promise.all([...types].map((t) => getCatalogFacility(t)));
+
+    const inv = await collectStationInventory();
+
+    // Sum maintenance inputs across built & active facilities.
+    const totals = {};
+    const contributing = [];
+    (detailState.facilities || []).forEach((fac) => {
+      const active = fac.status === "active" || fac.active === true;
+      if (!active) return;
+      const id = fac.facility_type || fac.type || fac.id;
+      const cat = detailState.catCache[id];
+      const maint = (cat && cat.maintenance_inputs) || [];
+      if (!Array.isArray(maint) || !maint.length) return;
+      contributing.push({
+        name: fac.name || id || "?",
+        items: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
+      });
+      maint.forEach((m) => {
+        const key = m.item_id;
+        totals[key] = (totals[key] || 0) + (m.quantity || 1);
+      });
+    });
+
+    detailState.consumableInv = inv;
+    detailState.consumableData = { totals, contributing, inv };
+  }
+
+  function renderConsumables() {
+    const el = document.getElementById("detail-consumables");
+    if (!el) return;
+    const data = detailState.consumableData;
+    if (!data) return;
+    const { totals, contributing, inv } = data;
+
+    if (Object.keys(totals).length === 0) {
+      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance requirements.</div>';
+      return;
+    }
+
+    let allGood = true;
+    // One maintenance cycle is 100 ticks; 1 tick = 10s real time.
+    const SECS_PER_CYCLE = 100 * 10;
+    const fmtDuration = (secs) => {
+      if (secs === Infinity) return "—";
+      const d = Math.floor(secs / 86400);
+      const h = Math.floor((secs % 86400) / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      const s = Math.floor(secs % 60);
+      if (d > 0) return `${d}d ${h}h`;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    };
+
+    const rows = Object.entries(totals)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([itemId, need]) => {
+        const have =
+          (inv.items[itemId] || 0) +
+          (inv.storage[itemId] || 0) +
+          (inv.factionStorage[itemId] || 0);
+        const ok = have >= need;
+        if (!ok) allGood = false;
+        const color = ok ? "var(--secondary-fixed-dim)" : "var(--error)";
+        const cyclesLeft = need > 0 ? have / need : Infinity;
+        const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+        const depletion =
+          have <= 0
+            ? "depleted"
+            : need <= 0
+              ? "—"
+              : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`;
+        return `<tr>
+          <td class="cons-item">${esc(itemName(itemId))}</td>
+          <td class="cons-id">${esc(itemId)}</td>
+          <td class="cons-num">${num(need)}</td>
+          <td class="cons-num" style="color:${color}">${num(have)}</td>
+          <td class="cons-num" style="color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+          <td class="cons-eta">${depletion}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const summary = allGood
+      ? '<div class="cons-summary ok">✓ All maintenance inputs satisfied for this round.</div>'
+      : '<div class="cons-summary bad">✗ Some maintenance inputs are short — facilities will not run this round without them.</div>';
+
+    const contribHtml = contributing.length
+      ? `<div class="cons-contrib">Contributing facilities: ${contributing.map((c) => esc(c.name)).join(", ")}</div>`
+      : "";
+
+    el.innerHTML = `
+      ${summary}
+      <table class="cons-table">
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th>ID</th>
+            <th class="cons-num">Need/round</th>
+            <th class="cons-num">You have</th>
+            <th class="cons-num">Status</th>
+            <th class="cons-eta">Est. until depletion</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes the current 100-tick (1000s) maintenance cycle; it is an estimate and does not account for unknown cycle start timing.</div>
+      ${contribHtml}
+    `;
   }
 
   // ── boot ──

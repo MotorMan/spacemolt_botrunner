@@ -588,6 +588,7 @@
     lifeSupport: {},
     power: {},
     facilities: [],
+    upgrades: {},
     catCache: {},
     buildCategory: "service",
     buildSearch: "",
@@ -839,24 +840,51 @@
   async function loadFacilities() {
     if (!detailState.bot) { detailState.facilities = []; return; }
     const fl = await apiAction("facility", { action: "faction_list" });
-    const list = await apiAction("facility", { action: "list" });
+    const listRes = await apiAction("facility", { action: "list" });
     const collect = (res, key) => {
       if (!res || !res.ok || !res.data) return [];
       const d = res.data.structuredContent || res.data.result || res.data;
       const arr = Array.isArray(d) ? d : Array.isArray(d[key]) ? d[key] : Array.isArray(d.facilities) ? d.facilities : [];
       return arr;
     };
-    const fromFl = collect(fl, "faction_facilities");
-    const fromList = collect(list, "player_facilities");
+    const ld = (listRes.ok && listRes.data) ? (listRes.data.structuredContent || listRes.data.result || listRes.data) : null;
+    const allLists = [
+      ...(Array.isArray(ld && ld.station_facilities) ? ld.station_facilities : []),
+      ...(Array.isArray(ld && ld.player_facilities) ? ld.player_facilities : []),
+      ...(Array.isArray(ld && ld.faction_facilities) ? ld.faction_facilities : []),
+      ...(Array.isArray(ld && ld.public_facilities) ? ld.public_facilities : []),
+    ];
     const merged = {};
-    [...fromFl, ...fromList].forEach((f) => {
+    [...collect(fl, "faction_facilities"), ...allLists].forEach((f) => {
       const fid = f.facility_id || f.id;
       if (fid) merged[fid] = f;
     });
+    // production map (public + price per run)
+    const prodMap = {};
+    allLists.forEach((f) => { if (f && f.facility_id && f.production) prodMap[f.facility_id] = f.production; });
+    Object.values(merged).forEach((f) => {
+      const fid = f.facility_id || f.id;
+      if (fid && prodMap[fid]) f.production = prodMap[fid];
+    });
     detailState.facilities = Object.values(merged);
+    // upgrades (so we only show Upgrade when there is a real path)
+    detailState.upgrades = {};
+    const up = await apiAction("facility", { action: "upgrades" });
+    const upData = (up.ok && up.data) ? (up.data.structuredContent || up.data.result || up.data) : null;
+    if (upData) {
+      [...(Array.isArray(upData.upgrades) ? upData.upgrades : []), ...(Array.isArray(upData.faction_upgrades) ? upData.faction_upgrades : [])]
+        .forEach((u) => { const k = u.your_facility_id || u.facility_id; if (k) detailState.upgrades[k] = u; });
+    }
   }
 
   const STATION_CATS = ["service", "infrastructure", "defense", "ranch"];
+
+  function isStationType(f) {
+    const cat = (f.category || resolveCat(f) || "").toLowerCase();
+    if (STATION_CATS.includes(cat)) return true;
+    const c = detailState.catCache[f.facility_type || f.type || f.id];
+    return !!(c && c.player_station_buildable);
+  }
 
   async function renderFacilities() {
     const el = document.getElementById("detail-facilities");
@@ -881,8 +909,8 @@
     const orderCats = ["service", "infrastructure", "defense", "ranch", "faction", "production", "personal", "other"];
     const cats = Object.keys(groups).sort((a, b) => orderCats.indexOf(a) - orderCats.indexOf(b));
     el.innerHTML = cats.map((cat) => {
-      const items = groups[cat].map((f) => facCard(f, cat)).join("");
-      return `<div style="margin-bottom:14px"><div class="fac-cat" style="margin-bottom:6px">${cat.toUpperCase()} (${groups[cat].length})</div><div class="fac-grid">${items}</div></div>`;
+      const items = groups[cat].map((f) => isStationType(f) ? facCard(f, cat) : facRowWide(f, cat)).join("");
+      return `<div style="margin-bottom:14px"><div class="fac-cat" style="margin-bottom:6px">${cat.toUpperCase()} (${groups[cat].length})</div>${items}</div>`;
     }).join("");
     wireFacilities();
   }
@@ -906,6 +934,8 @@
       ? (cat2 && cat2.satisfied_description) || f.description || ""
       : (cat2 && cat2.degraded_description) || f.description || "";
     const damaged = f.damaged || f.status === "damaged";
+    const up = detailState.upgrades[fid];
+    const canUpgrade = !!(up && up.upgrade_to);
     return `<div class="fac-card" data-fid="${esc(fid)}">
       <div class="fac-head"><span class="fac-name">${esc(name)}</span><span>${status}</span></div>
       ${desc ? `<div class="bc-meta">${esc(desc)}</div>` : ""}
@@ -914,7 +944,7 @@
         <button class="small-btn sm" data-act="toggle">${active ? "Disable" : "Enable"}</button>
         ${damaged ? `<button class="small-btn danger sm" data-act="repair">Repair</button>` : ""}
         <button class="small-btn sm" data-act="rename">Rename</button>
-        <button class="small-btn sm" data-act="upgrade">Upgrade</button>
+        ${canUpgrade ? `<button class="small-btn sm" data-act="upgrade">Upgrade</button>` : ""}
       </div>
       <div class="fac-rename" style="display:none;gap:6px;margin-top:4px">
         <input type="text" class="set-rename-fac" value="${esc(f.custom_name || name)}" style="flex:1;background:rgba(12,14,18,.6);border:1px solid var(--outline-variant);color:var(--on-surface);padding:3px 6px;font-size:11px" />
@@ -923,37 +953,90 @@
     </div>`;
   }
 
+  function facRowWide(f, cat) {
+    const name = f.name || f.facility_type || f.type || "?";
+    const fid = f.facility_id || f.id || "";
+    const level = f.level != null ? f.level : (f.tier != null ? f.tier : "");
+    const levelStr = level ? ` (L${level})` : "";
+    const active = f.status === "active" || f.active === true;
+    const status = active ? '<span style="color:var(--secondary-fixed-dim)">Active</span>' : '<span style="color:var(--error)">Inactive</span>';
+    const prod = f.production || {};
+    const isPublic = prod.public === true;
+    const price = typeof prod.output_price_per_unit === "number"
+      ? prod.output_price_per_unit
+      : (typeof prod.rental_fee_per_run === "number" ? prod.rental_fee_per_run : 0);
+    const up = detailState.upgrades[fid];
+    const canUpgrade = !!(up && up.upgrade_to);
+    const damaged = f.damaged || f.status === "damaged";
+    return `<div class="fac-row" data-fid="${esc(fid)}">
+      <span class="fac-name">${esc(name)}${esc(levelStr)}</span>
+      <span class="fac-id" title="Click to copy facility_id" onclick="navigator.clipboard.writeText('${esc(fid)}')">${esc(fid)}</span>
+      <span class="status-dot">${status}</span>
+      <div class="fac-ctrl">
+        <span style="font-size:11px;color:${isPublic ? "var(--secondary-fixed-dim)" : "var(--on-surface-variant)"}">${isPublic ? "Public" : "Private"}</span>
+        <button class="small-btn sm" data-act="access">${isPublic ? "Make Private" : "Make Public"}</button>
+        <button class="small-btn sm" data-act="rename" title="Rename">✏️</button>
+        <span style="font-size:11px;color:var(--on-surface-variant)">PPR</span>
+        <input type="number" class="set-price" min="0" step="0.25" value="${price}" />
+        <button class="primary-btn sm" data-act="set-price">Set Price</button>
+        <button class="small-btn sm" data-act="toggle">${active ? "Disable" : "Enable"}</button>
+        ${damaged ? `<button class="small-btn danger sm" data-act="repair">Repair</button>` : ""}
+        ${canUpgrade ? `<button class="small-btn sm" data-act="upgrade">Upgrade</button>` : ""}
+      </div>
+      <div class="fac-rename" style="display:none;gap:6px;margin-top:4px;width:100%">
+        <input type="text" class="set-rename-fac" value="${esc(f.custom_name || name)}" style="flex:1;background:rgba(12,14,18,.6);border:1px solid var(--outline-variant);color:var(--on-surface);padding:3px 6px;font-size:11px" />
+        <button class="small-btn sm" data-act="rename-save">Save</button>
+      </div>
+    </div>`;
+  }
+
   function wireFacilities() {
-    document.querySelectorAll("#detail-facilities .fac-card").forEach((card) => {
+    document.querySelectorAll("#detail-facilities [data-fid]").forEach((card) => {
       const fid = card.getAttribute("data-fid");
-      card.querySelector('[data-act="toggle"]').onclick = async () => {
+      const q = (a) => card.querySelector(`[data-act="${a}"]`);
+
+      if (q("toggle")) q("toggle").onclick = async () => {
         const r = await apiAction("facility", { action: "toggle", facility_id: fid });
         if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility toggled.", "ok"); }
         else setMsg("Toggle failed: " + (r.error || "unknown"), "err");
       };
-      const rep = card.querySelector('[data-act="repair"]');
+      const rep = q("repair");
       if (rep) rep.onclick = async () => {
         const r = await apiAction("facility", { action: "repair", facility_id: fid });
         if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Repair initiated.", "ok"); }
         else setMsg("Repair failed: " + (r.error || "unknown"), "err");
       };
-      card.querySelector('[data-act="rename"]').onclick = () => {
+      if (q("rename")) q("rename").onclick = () => {
         const box = card.querySelector(".fac-rename");
-        box.style.display = box.style.display === "none" ? "flex" : "none";
+        if (box) box.style.display = box.style.display === "none" ? "flex" : "none";
       };
-      card.querySelector('[data-act="rename-save"]').onclick = async () => {
-        const v = card.querySelector(".set-rename-fac").value.trim();
+      if (q("rename-save")) q("rename-save").onclick = async () => {
+        const inp = card.querySelector(".set-rename-fac");
+        const v = inp ? inp.value.trim() : "";
         const r = await apiAction("facility", { action: "set_name", facility_id: fid, custom_name: v });
         if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility renamed.", "ok"); }
         else setMsg("Rename failed: " + (r.error || "unknown"), "err");
       };
-      card.querySelector('[data-act="upgrade"]').onclick = async () => {
-        const r = await apiAction("facility", { action: "upgrades" });
-        const d = r.ok && r.data ? (r.data.structuredContent || r.data.result || r.data) : null;
-        const all = [...(d && d.upgrades) || [], ...(d && d.faction_upgrades) || []];
-        const up = all.find((u) => (u.your_facility_id || u.facility_id) === fid);
+      if (q("access")) q("access").onclick = async () => {
+        const cur = (q("access").textContent || "").includes("Make Private");
+        const access = cur ? "private" : "public";
+        const r = await apiAction("facility", { action: "set_access", facility_id: fid, access });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Access updated.", "ok"); }
+        else setMsg("set_access failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("set-price")) q("set-price").onclick = async () => {
+        const inp = card.querySelector(".set-price");
+        const price = inp ? parseFloat(inp.value) : NaN;
+        if (isNaN(price) || price < 0) { setMsg("Enter a valid non-negative price.", "err"); return; }
+        const r = await apiAction("facility", { action: "set_output_price", facility_id: fid, price });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Price per run set.", "ok"); }
+        else setMsg("set_output_price failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("upgrade")) q("upgrade").onclick = async () => {
+        const up = detailState.upgrades[fid];
         if (up && up.upgrade_to) {
-          const r2 = await apiAction("facility", { action: "upgrade", facility_id: fid, facility_type: up.upgrade_to.type_id || up.upgrade_to.facility_type || up.upgrade_to.type });
+          const type = up.upgrade_to.type_id || up.upgrade_to.facility_type || up.upgrade_to.type;
+          const r2 = await apiAction("facility", { action: "upgrade", facility_id: fid, facility_type: type });
           if (r2.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility upgraded.", "ok"); }
           else setMsg("Upgrade failed: " + (r2.error || "unknown"), "err");
         } else {

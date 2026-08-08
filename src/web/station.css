@@ -492,7 +492,7 @@ h1.page-title {
 .conn-dot.off { background: var(--error); box-shadow: 0 0 6px var(--error); }
 
 /* ── Detail page ───────────────────────────────────────────── */
-.detail-wrap { max-width: 900px; margin: 0 auto; }
+.detail-wrap { max-width: none; }
 .back-link {
   color: var(--primary-fixed-dim);
   text-decoration: none;
@@ -573,6 +573,23 @@ pre.snap {
 .fac-needs { font-size: 11px; color: var(--primary-fixed-dim); font-family: var(--font-data); }
 .fac-actions { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
 .fac-actions .sm { font-size: 10px; padding: 2px 6px; }
+
+/* Wide facility row (faction / production / personal) */
+.fac-row {
+  background: rgba(30, 32, 36, 0.6);
+  border: 1px solid var(--outline-variant);
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  padding: 8px 12px;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.fac-row .fac-name { font-family: var(--font-headline); font-size: 13px; font-weight: 600; color: var(--on-surface); }
+.fac-row .fac-id { font-family: monospace; font-size: 10px; color: var(--on-surface-variant); cursor: pointer; }
+.fac-row .fac-ctrl { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.fac-row .fac-ctrl input[type="number"] {
+  width: 90px; background: rgba(12, 14, 18, 0.6); border: 1px solid var(--outline-variant);
+  color: var(--on-surface); padding: 3px 6px; font-size: 11px; font-family: var(--font-data);
+}
+.fac-row .status-dot { font-size: 11px; }
 
 /* Build browser */
 .build-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }

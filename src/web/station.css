@@ -216,14 +216,10 @@ h1.page-title {
 /* ── Grid + cards ──────────────────────────────────────────── */
 .grid {
   display: grid;
-  grid-template-columns: 1fr;
+  grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 280px), 1fr));
   gap: var(--gutter);
   padding-bottom: var(--margin);
 }
-@media (min-width: 700px)  { .grid { grid-template-columns: repeat(2, 1fr); } }
-@media (min-width: 1000px) { .grid { grid-template-columns: repeat(3, 1fr); } }
-@media (min-width: 1300px) { .grid { grid-template-columns: repeat(4, 1fr); } }
-@media (min-width: 1650px) { .grid { grid-template-columns: repeat(5, 1fr); } }
 
 .card {
   position: relative;

@@ -1932,8 +1932,9 @@ const locations = this.findOreLocations(oreId, blacklist);
     return perf.timeSync("mapStore.findRoute", () => this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate));
   }
 
-  /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes. */
-  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false): string[] | null {
+  /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes.
+   *  `allowWormholes` is opt-in and defaults to false — see the note in the body. */
+  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false, allowWormholes: boolean = false): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
 
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
@@ -1961,36 +1962,26 @@ const locations = this.findOreLocations(oreId, blacklist);
       return null;
     }
     
-    const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
-    if (wormholeRoute) {
-      return wormholeRoute;
-    }
-    
-    const visited = new Set<string>([fromId]);
-    const queue: Array<{ id: string; path: string[] }> = [
-      { id: fromId, path: [fromId] },
-    ];
+    // The plain (jumpable) shortest path through known connections.
+    const directRoute = this.findRegularBfsRoute(fromId, toId, blacklistArr);
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      const conns = this.data.systems[current.id]?.connections ?? [];
-
-      for (const conn of conns) {
-        const nextId = typeof conn === 'string' ? conn : (this.findSystemIdCaseInsensitive(conn.system_id) || conn.system_id);
-        if (!nextId || visited.has(nextId)) continue;
-        if (blacklistSet.has(nextId.toLowerCase())) continue;
-
-        const newPath = [...current.path, nextId];
-        if (nextId === toId) {
-          return newPath;
-        }
-
-        visited.add(nextId);
-        queue.push({ id: nextId, path: newPath });
+    // ── Wormhole shortcuts are OPT-IN ────────────────────────────────────────
+    // A wormhole "route" is two BFS paths glued together around a wormhole hop,
+    // so it can be dramatically LONGER than the direct route, and every caller
+    // walks the returned array with `jump { target_system }` — which cannot
+    // traverse a wormhole at all. Returning one unconditionally (the old
+    // behavior) sent bots on absurd detours the moment any explorer registered
+    // a wormhole: e.g. a low-fuel miner given a 49-jump path to a station that
+    // was 11 jumps away. Only use a wormhole route when the caller asked for it
+    // AND it is genuinely shorter.
+    if (allowWormholes) {
+      const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
+      if (wormholeRoute && (!directRoute || wormholeRoute.length < directRoute.length)) {
+        return wormholeRoute;
       }
     }
 
-    return null;
+    return directRoute;
   }
   
   /** Find system ID with case-insensitive matching. Returns the actual stored ID or null if not found. */
@@ -2116,21 +2107,24 @@ const locations = this.findOreLocations(oreId, blacklist);
       const exitSystem = wormhole.exit_system_id;
       
       // Check if entrance system is accessible
+      if (!entranceSystem || !exitSystem) continue;
       if (blacklistSet.has(entranceSystem.toLowerCase())) continue;
       if (blacklistSet.has(exitSystem.toLowerCase())) continue;
+      // Both ends must be real, known systems — registerWormhole creates empty
+      // stub records for unknown ends, and routing through a stub is nonsense.
+      if (!this.data.systems[entranceSystem] || !this.data.systems[exitSystem]) continue;
       
       // Calculate path segments
       const toEntrance = this.findRegularBfsRoute(fromId, entranceSystem, blacklist);
       const fromExitToDest = this.findRegularBfsRoute(exitSystem, toId, blacklist);
       
       if (toEntrance && fromExitToDest) {
-        // Valid wormhole route
-        // Full route: [...toEntrance (excluding last), exitSystem, ...fromExitToDest]
-        const fullRoute = [
-          ...toEntrance.slice(0, -1), // Exclude entrance system itself
-          exitSystem, // Jump through wormhole
-          ...fromExitToDest,
-        ];
+        // Valid wormhole route. `toEntrance` ends at the entrance system and
+        // `fromExitToDest` starts at the exit system, so simple concatenation
+        // gives ...entrance -> exit... with the wormhole hop in the middle.
+        // (The old version dropped the entrance system and duplicated the exit,
+        // producing a path whose "jump" from entrance-1 to exit was impossible.)
+        const fullRoute = [...toEntrance, ...fromExitToDest];
         
         if (fullRoute.length < bestRouteLength) {
           bestRoute = fullRoute;
@@ -2152,7 +2146,8 @@ const locations = this.findOreLocations(oreId, blacklist);
     return bestRoute;
   }
 
-  /** Regular BFS route finding (without wormholes) - used internally by tryFindWormholeRoute */
+  /** Plain BFS route finding over known connections (no wormholes, no precalc).
+   *  This is the only route every caller can actually fly, one `jump` per hop. */
   private findRegularBfsRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
     

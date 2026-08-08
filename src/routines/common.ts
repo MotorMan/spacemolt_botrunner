@@ -2262,7 +2262,20 @@ if (looted > 0) {
 
   if (nearest.systemId !== bot.system) {
     await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
+    let route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
+    // SANITY CHECK: findNearestStationSystem already told us how far the station
+    // is (BFS hops over the same map). If the planned route is wildly longer,
+    // the route is bogus (stale precalc entry / wormhole detour) and following
+    // it on low fuel strands the bot half a map away. Never fly it.
+    if (route && route.length - 1 > nearest.hops + 2) {
+      ctx.log("error", `Planned route to ${nearest.systemId} is ${route.length - 1} jumps but the station is only ${nearest.hops} away — rejecting bogus route`);
+      route = mapStore.findRouteWithMode(bot.system, nearest.systemId, blacklist, false);
+      if (route && route.length - 1 > nearest.hops + 2) {
+        ctx.log("error", `Fallback route is still ${route.length - 1} jumps — refusing to burn fuel on it`);
+        return await emergencyFuelRecovery(ctx);
+      }
+      ctx.log("travel", `Using direct ${route ? route.length - 1 : 0}-jump route instead`);
+    }
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;

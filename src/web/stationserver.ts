@@ -11,7 +11,7 @@ import {
   loadSnapshots,
   saveSnapshots,
   clampInterval,
-  clampCardMinPx,
+  clampCardCols,
   MIN_POLL_INTERVAL_SEC,
   type StationConfig,
   type StationRow,
@@ -233,8 +233,8 @@ export class StationWebServer {
       if (body.pollIntervalSec != null) {
         this.config.pollIntervalSec = clampInterval(body.pollIntervalSec);
       }
-      if (body.cardMinPx != null) {
-        this.config.cardMinPx = clampCardMinPx(body.cardMinPx);
+      if (body.cardCols != null) {
+        this.config.cardCols = clampCardCols(body.cardCols);
       }
       if (Array.isArray(body.rows)) {
         const seen = new Set<string>();

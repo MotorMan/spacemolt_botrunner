@@ -51,6 +51,7 @@
   <div class="drawer">
     <div class="drawer-head">
       <span>STATION CONFIG</span>
+      <button class="primary-btn" id="settings-save-top" style="padding:6px 14px;">SAVE</button>
       <button class="close-x" id="settings-close">×</button>
     </div>
     <div class="drawer-body">
@@ -59,10 +60,10 @@
         <input class="term-input" type="number" id="poll-interval" min="15" value="60" />
       </div>
       <div class="field">
-        <label>Card Size — <span id="card-size-val">280px</span></label>
-        <input type="range" id="card-size" min="200" max="460" step="10" value="280" style="width:100%;accent-color:var(--primary-fixed-dim);" />
+        <label>Cards per row — <span id="card-size-val">5</span></label>
+        <input type="range" id="card-size" min="1" max="16" step="1" value="5" style="width:100%;accent-color:var(--primary-fixed-dim);" />
         <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">
-          <span>SMALL</span><span>LARGE</span>
+          <span>1</span><span>16</span>
         </div>
       </div>
       <div id="rows-editor" style="display:flex;flex-direction:column;gap:12px;"></div>
@@ -83,7 +84,7 @@
   const detailId = isDetail ? decodeURIComponent(location.pathname.slice("/station/".length)) : null;
 
   // ── state ──
-  let config = { version: 1, pollIntervalSec: 60, cardMinPx: 280, rows: [] };
+  let config = { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [] };
   let views = new Map();   // id -> StationView
   let order = [];          // ids in display order
   let bots = [];           // discovered bot names
@@ -291,11 +292,11 @@
     if (pi) pi.value = cfg.pollIntervalSec;
     const cs = document.getElementById("card-size");
     if (cs) {
-      cs.value = cfg.cardMinPx;
+      cs.value = cfg.cardCols;
       const cv = document.getElementById("card-size-val");
-      if (cv) cv.textContent = cfg.cardMinPx + "px";
+      if (cv) cv.textContent = cfg.cardCols;
     }
-    document.documentElement.style.setProperty("--card-min", cfg.cardMinPx + "px");
+    document.documentElement.style.setProperty("--card-cols", cfg.cardCols);
     renderSettingsRows();
   }
 
@@ -366,11 +367,11 @@
       if (pi) pi.value = cfgR.pollIntervalSec;
       const cs = document.getElementById("card-size");
       if (cs) {
-        cs.value = cfgR.cardMinPx;
+        cs.value = cfgR.cardCols;
         const cv = document.getElementById("card-size-val");
-        if (cv) cv.textContent = cfgR.cardMinPx + "px";
+        if (cv) cv.textContent = cfgR.cardCols;
       }
-      document.documentElement.style.setProperty("--card-min", cfgR.cardMinPx + "px");
+      document.documentElement.style.setProperty("--card-cols", cfgR.cardCols);
       applyStations(stR.stations || []);
       renderSettingsRows();
     } catch (e) { /* WS will fill in */ }
@@ -442,10 +443,10 @@
   const cardSizeInput = document.getElementById("card-size");
   if (cardSizeInput) {
     cardSizeInput.addEventListener("input", () => {
-      const v = Math.max(200, Math.min(460, parseInt(cardSizeInput.value, 10) || 280));
-      document.documentElement.style.setProperty("--card-min", v + "px");
+      const v = Math.max(1, Math.min(16, parseInt(cardSizeInput.value, 10) || 5));
+      document.documentElement.style.setProperty("--card-cols", v);
       const cv = document.getElementById("card-size-val");
-      if (cv) cv.textContent = v + "px";
+      if (cv) cv.textContent = v;
     });
   }
 
@@ -521,11 +522,11 @@
     renderSettingsRows();
   };
 
-  function saveConfig(rows, pollIntervalSec, cardMinPx) {
+  function saveConfig(rows, pollIntervalSec, cardCols) {
     return fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows, pollIntervalSec, cardMinPx }),
+      body: JSON.stringify({ rows, pollIntervalSec, cardCols }),
     }).then((r) => r.json()).then((j) => {
       if (j.error) throw new Error(j.error);
       config = j;
@@ -533,11 +534,11 @@
     });
   }
 
-  document.getElementById("settings-save").onclick = async () => {
+  async function doSave() {
     const pi = document.getElementById("poll-interval");
     const pollIntervalSec = Math.max(15, parseInt(pi.value, 10) || 60);
     const cs = document.getElementById("card-size");
-    const cardMinPx = Math.max(200, Math.min(460, parseInt(cs.value, 10) || 280));
+    const cardCols = Math.max(1, Math.min(16, parseInt(cs.value, 10) || 5));
     // read edited rows from DOM
     const rows = [];
     document.querySelectorAll("#rows-editor .row-card").forEach((div) => {
@@ -558,12 +559,15 @@
       return { ...orig, ...edited };
     });
     try {
-      await saveConfig(finalRows, pollIntervalSec, cardMinPx);
+      await saveConfig(finalRows, pollIntervalSec, cardCols);
       closeSettings();
     } catch (e) {
       alert("Save failed: " + (e.message || e));
     }
-  };
+  }
+
+  document.getElementById("settings-save").onclick = doSave;
+  document.getElementById("settings-save-top").onclick = doSave;
 
   // attach row ids to DOM for save mapping
   const origRender = renderSettingsRows;

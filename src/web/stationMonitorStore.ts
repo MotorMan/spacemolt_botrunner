@@ -18,7 +18,7 @@ export interface StationRow {
 export interface StationConfig {
   version: number;
   pollIntervalSec: number;
-  cardMinPx: number;
+  cardCols: number;
   rows: StationRow[];
 }
 
@@ -70,16 +70,16 @@ function normalizeRow(raw: Record<string, unknown> | StationRow): StationRow {
   };
 }
 
-export const MIN_CARD_MIN_PX = 200;
-export const MAX_CARD_MIN_PX = 460;
+export const MIN_CARD_COLS = 1;
+export const MAX_CARD_COLS = 16;
 
-export function clampCardMinPx(px: number): number {
-  if (typeof px !== "number" || !isFinite(px)) return 280;
-  return Math.max(MIN_CARD_MIN_PX, Math.min(MAX_CARD_MIN_PX, Math.round(px)));
+export function clampCardCols(n: number): number {
+  if (typeof n !== "number" || !isFinite(n)) return 5;
+  return Math.max(MIN_CARD_COLS, Math.min(MAX_CARD_COLS, Math.round(n)));
 }
 
 export function defaultConfig(): StationConfig {
-  return { version: 1, pollIntervalSec: 60, cardMinPx: 280, rows: [] };
+  return { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [] };
 }
 
 export function loadStationConfig(): StationConfig {
@@ -94,7 +94,7 @@ export function loadStationConfig(): StationConfig {
       return {
         version: 1,
         pollIntervalSec: clampInterval((data.pollIntervalSec as number) ?? 60),
-        cardMinPx: clampCardMinPx((data.cardMinPx as number) ?? 280),
+        cardCols: clampCardCols((data.cardCols as number) ?? (data.cardMinPx as number) ?? 5),
         rows,
       };
     } catch (err) {
@@ -109,7 +109,7 @@ export function saveStationConfig(config: StationConfig): void {
   const clean: StationConfig = {
     version: 1,
     pollIntervalSec: clampInterval(config.pollIntervalSec),
-    cardMinPx: clampCardMinPx(config.cardMinPx),
+    cardCols: clampCardCols(config.cardCols),
     rows: config.rows.map(normalizeRow),
   };
   writeFileSync(CONFIG_FILE, JSON.stringify(clean, null, 2) + "\n", "utf-8");

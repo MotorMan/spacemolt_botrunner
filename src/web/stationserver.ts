@@ -23,6 +23,31 @@ const GET_BASE_TIMEOUT_MS = 25_000;
 
 type WSData = { id: number };
 
+interface SlimMat {
+  item_id: string;
+  quantity: number;
+  name: string;
+}
+
+interface SlimFacility {
+  id: string;
+  name: string;
+  category: string;
+  level: number;
+  description: string;
+  build_cost: number;
+  build_materials: SlimMat[];
+  maintenance_inputs: SlimMat[];
+  player_station_buildable: boolean;
+  upgrades_from: string | null;
+  power_draw: number;
+  life_support_draw: number;
+  recipe_id: string | null;
+  service_type: string | null;
+  faction_service_type: string | null;
+  station_or_faction_only: boolean;
+}
+
 export interface StationView {
   id: string;
   bot: string;
@@ -121,9 +146,20 @@ export class StationWebServer {
             return Response.json({ stations: this.getStations() }, { headers: corsHeaders });
           }
 
-          if (url.pathname.startsWith("/api/station/") && req.method === "GET") {
+          if (url.pathname.startsWith("/api/station/")) {
             const stationId = decodeURIComponent(url.pathname.slice("/api/station/".length));
-            return this.handleStationGet(stationId, corsHeaders);
+            if (req.method === "GET") return this.handleStationGet(stationId, corsHeaders);
+            if (req.method === "POST") return this.handleStationAction(stationId, req, corsHeaders);
+          }
+
+          if (url.pathname === "/api/catalog/facilities" && req.method === "GET") {
+            return this.handleCatalogFacilities(url, corsHeaders);
+          }
+
+          if (url.pathname.startsWith("/api/catalog/facility/") && req.method === "GET") {
+            const fid = decodeURIComponent(url.pathname.slice("/api/catalog/facility/".length));
+            const fac = this.loadCatalog().facilities.find((f) => f.id === fid) || null;
+            return Response.json({ facility: fac }, { headers: corsHeaders });
           }
 
           if (url.pathname === "/api/refresh" && req.method === "POST") {
@@ -306,6 +342,118 @@ export class StationWebServer {
       return Response.json({ error: "No snapshot for station", stationId }, { status: 404, headers: corsHeaders });
     }
     return Response.json({ stationId, snapshot: snap }, { headers: corsHeaders });
+  }
+
+  // Generic action proxy: runs a game-server command on the bot assigned to the
+  // station row. Powers all station/facility mutations + reads (rename, market
+  // fee, refuel/repair prices, public, auto-buy, build policy, facility
+  // build/toggle/repair/upgrade/rename, and facility list queries).
+  private async handleStationAction(
+    stationId: string,
+    req: Request,
+    corsHeaders: Record<string, string>,
+  ): Promise<Response> {
+    try {
+      const row = this.config.rows.find((r) => r.stationId === stationId);
+      if (!row) {
+        return Response.json({ ok: false, error: "Station not configured" }, { status: 404, headers: corsHeaders });
+      }
+      const botInstance = getBot(row.bot);
+      if (!botInstance) {
+        return Response.json({ ok: false, error: `Bot ${row.bot} not found` }, { status: 404, headers: corsHeaders });
+      }
+      const body = (await req.json()) as { command?: string; params?: Record<string, unknown> };
+      if (!body.command) {
+        return Response.json({ ok: false, error: "command required" }, { status: 400, headers: corsHeaders });
+      }
+      const resp = await this.execBot(botInstance, body.command, body.params || {});
+      return Response.json(resp, { headers: corsHeaders });
+    } catch (err) {
+      return Response.json(
+        { ok: false, error: err instanceof Error ? err.message : String(err) },
+        { status: 500, headers: corsHeaders },
+      );
+    }
+  }
+
+  private async execBot(
+    botInstance: Bot,
+    command: string,
+    params: Record<string, unknown>,
+  ): Promise<{ ok: boolean; data?: unknown; error?: string }> {
+    const apiPromise = botInstance.exec(command, params);
+    const timeoutPromise = new Promise<ApiResponse>((resolve) =>
+      setTimeout(
+        () => resolve({ error: { code: "timeout", message: `${command} timed out` } }),
+        GET_BASE_TIMEOUT_MS,
+      ),
+    );
+    const resp = await Promise.race([apiPromise, timeoutPromise]);
+    if (resp.error) return { ok: false, error: resp.error.message, data: resp.result };
+    return { ok: true, data: resp.result };
+  }
+
+  // Slimmed catalog facility list (avoids shipping the 5MB raw catalog).
+  private catalogCache: { facilities: SlimFacility[] } | null = null;
+
+  private loadCatalog(): { facilities: SlimFacility[] } {
+    if (this.catalogCache) return this.catalogCache;
+    let facilities: SlimFacility[] = [];
+    try {
+      const path = join(process.cwd(), "data", "catalog.json");
+      if (existsSync(path)) {
+        const raw = JSON.parse(readFileSync(path, "utf-8")) as { facilities?: Record<string, Record<string, unknown>> };
+        const facs = raw.facilities || {};
+        facilities = Object.values(facs).map((f) => ({
+          id: (f.id as string) || "",
+          name: (f.name as string) || "",
+          category: (f.category as string) || "",
+          level: (f.level as number) ?? 0,
+          description: (f.description as string) || "",
+          build_cost: (f.build_cost as number) ?? 0,
+          build_materials: Array.isArray(f.build_materials)
+            ? (f.build_materials as Record<string, unknown>[]).map((m) => ({
+                item_id: (m.item_id as string) || "",
+                quantity: (m.quantity as number) ?? 1,
+                name: (m.name as string) || "",
+              }))
+            : [],
+          maintenance_inputs: Array.isArray(f.maintenance_inputs)
+            ? (f.maintenance_inputs as Record<string, unknown>[]).map((m) => ({
+                item_id: (m.item_id as string) || "",
+                quantity: (m.quantity as number) ?? 1,
+                name: (m.name as string) || "",
+              }))
+            : [],
+          player_station_buildable: !!f.player_station_buildable,
+          upgrades_from: (f.upgrades_from as string) || null,
+          power_draw: (f.power_draw as number) ?? 0,
+          life_support_draw: (f.life_support_draw as number) ?? 0,
+          recipe_id: (f.recipe_id as string) || null,
+          service_type: (f.service_type as string) || null,
+          faction_service_type: (f.faction_service_type as string) || null,
+          station_or_faction_only: !!f.station_or_faction_only,
+        }));
+      }
+    } catch {
+      facilities = [];
+    }
+    this.catalogCache = { facilities };
+    return this.catalogCache;
+  }
+
+  private handleCatalogFacilities(url: URL, corsHeaders: Record<string, string>): Response {
+    const cat = url.searchParams.get("category");
+    const q = (url.searchParams.get("q") || "").toLowerCase();
+    let list = this.loadCatalog().facilities;
+    if (cat) list = list.filter((f) => f.category === cat);
+    if (q) {
+      list = list.filter(
+        (f) => (f.name || "").toLowerCase().includes(q) || (f.id || "").toLowerCase().includes(q),
+      );
+    }
+    const limited = list.slice(0, 400);
+    return Response.json({ count: list.length, facilities: limited }, { headers: corsHeaders });
   }
 
   // ── Poller ────────────────────────────────────────────────

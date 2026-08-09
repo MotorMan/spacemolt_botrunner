@@ -43,10 +43,11 @@ import {
 } from "./traderActivity.js";
 import {
   getBuyOrderLock,
+  getReservedQuantity,
   acquireBuyOrderLock,
+  updateBuyOrderLock,
   releaseBuyOrderLock,
   cleanupStaleFactionLocks,
-  getBuyOrderKey,
 } from "./factionTraderCoordination.js";
 import {
   type BattleState,
@@ -65,6 +66,7 @@ import {
   stockAfterburnerConsumables,
 } from "./afterburner.js";
 import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../client_sync_hooks.js";
+import { readSellOutcome, type SellFill } from "./sellOutcome.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -221,19 +223,24 @@ function getFactionTraderSettings(username?: string): {
 }
 
 /**
+ * Release the buy-order claim tied to a bot's active session, if any.
+ *
+ * Claims are keyed by item + POI only, so the session's destination is all that
+ * is needed. The old code passed `session.sellPricePerUnit` as part of the key,
+ * which meant a claim made at one price could never be released after the book
+ * moved — the lock then leaked until the stale sweep found it.
+ */
+function releaseSessionLock(botUsername: string, reason: string): boolean {
+  const session = getActiveSession(botUsername);
+  if (!session) return false;
+  return releaseBuyOrderLock(botUsername, session.itemId, session.destPoi, reason);
+}
+
+/**
  * Fail a faction trade session and release its buy order lock.
  */
 async function failFactionSession(botUsername: string, reason: string): Promise<void> {
-  const session = getActiveSession(botUsername);
-  if (session) {
-    releaseBuyOrderLock(
-      botUsername,
-      session.itemId,
-      session.destPoi,
-      session.sellPricePerUnit,
-      reason
-    );
-  }
+  releaseSessionLock(botUsername, reason);
   await failTradeSession(botUsername, reason);
 }
 
@@ -334,7 +341,6 @@ async function recoverFactionTradeSession(
           bot.username,
           session.itemId,
           session.destPoi,
-          session.sellPricePerUnit,
           "buyer_gone_returning_to_origin",
         );
 
@@ -361,7 +367,6 @@ async function recoverFactionTradeSession(
             bot.username,
             session.itemId,
             session.destPoi,
-            session.sellPricePerUnit,
             "price_zero_returning_to_origin",
           );
           const updated = await updateTradeSession(session.botUsername, {
@@ -387,8 +392,7 @@ async function recoverFactionTradeSession(
   }
 
   // Reacquire buy order lock for recovered session
-  const lockKey = getBuyOrderKey(session.itemId, session.destPoi, session.sellPricePerUnit);
-  const existingLock = getBuyOrderLock(session.itemId, session.destPoi, session.sellPricePerUnit);
+  const existingLock = getBuyOrderLock(session.itemId, session.destPoi);
   
   if (existingLock && existingLock.lockedBy !== bot.username) {
     ctx.log("trade", `Buy order lock held by ${existingLock.lockedBy} — attempting to reacquire`);
@@ -495,6 +499,8 @@ export async function calculateFactionOptimalSellQuantity(
   expectedRevenue: number;
   priceBreakdown: string;
   weightedAvgPrice: number;
+  /** The resolved price floor actually applied, so the sell path can enforce the same number. */
+  floor: number;
   buyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell: number }>;
 }> {
   const { bot } = ctx;
@@ -516,6 +522,7 @@ export async function calculateFactionOptimalSellQuantity(
       expectedRevenue: availableQuantity * floor,
       priceBreakdown: "cached",
       weightedAvgPrice: floor,
+      floor,
       buyOrders: [],
     };
   }
@@ -536,6 +543,7 @@ export async function calculateFactionOptimalSellQuantity(
       expectedRevenue: availableQuantity * floor,
       priceBreakdown: "cached",
       weightedAvgPrice: floor,
+      floor,
       buyOrders: [],
     };
   }
@@ -543,7 +551,7 @@ export async function calculateFactionOptimalSellQuantity(
   const rawBuyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
   if (rawBuyOrders.length === 0) {
     ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
-    return { sellQty: 0, heldQty: availableQuantity, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0, buyOrders: [] };
+    return { sellQty: 0, heldQty: availableQuantity, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0, floor, buyOrders: [] };
   }
 
   // Fill best-priced orders first — exactly how the in-game sell behaves.
@@ -597,7 +605,198 @@ export async function calculateFactionOptimalSellQuantity(
     ctx.log("trade", `Market check: can sell ${totalSold}/${availableQuantity}x ${itemName} (${priceBreakdown})`);
   }
 
-  return { sellQty: totalSold, heldQty, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice, buyOrders: eligibleBuyOrders };
+  return { sellQty: totalSold, heldQty, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice, floor, buyOrders: eligibleBuyOrders };
+}
+
+// ── Sell execution & realized-price verification ─────────────
+
+export interface FactionSellResult {
+  /** Units that left the hold at market. */
+  sold: number;
+  /** Credits actually received. 0 for a listing — nothing is earned until it fills. */
+  revenue: number;
+  /** Units handed to a limit order instead of sold at market. */
+  listed: number;
+  /** Realized average price per unit. */
+  avgPrice: number;
+  /** A fill landed below the floor: the book was swept out from under us. */
+  belowFloor: boolean;
+  fills: SellFill[];
+  /** Raw notifications from the sell command, so callers keep their battle checks. */
+  notifications: unknown[];
+  error?: string;
+}
+
+/** Compact, honest description of what a sale actually returned. */
+function describeFills(result: FactionSellResult): string {
+  if (result.fills.length === 0) {
+    return `${result.sold}x for ${result.revenue}cr`;
+  }
+  const detail = result.fills.map(f => `${f.quantity}x @ ${f.priceEach}cr`).join(", ");
+  return `${result.sold}x for ${result.revenue}cr (${detail})`;
+}
+
+/**
+ * The single chokepoint for turning faction cargo into credits.
+ *
+ * Two protections live here, both learned from the Node Alpha fuel-cell incident:
+ *
+ * 1. **Contested books get a limit order, not a market order.** The `sell`
+ *    endpoint takes only `id`/`quantity`/`auto_list` — there is no min-price
+ *    parameter, so a market order will happily sweep past every good bid into a
+ *    junk one if someone empties the book between our `view_market` and our
+ *    `sell`. When another of our bots holds a claim on this station's book we
+ *    use `create_sell_order` with an explicit `price_each` instead, which cannot
+ *    fill below that price.
+ *
+ * 2. **Realized prices are verified against the floor.** Whatever path ran, the
+ *    per-fill prices are checked and a breach is reported loudly instead of
+ *    being papered over with the quoted average.
+ */
+async function executeFactionSell(
+  ctx: RoutineContext,
+  params: {
+    itemId: string;
+    itemName: string;
+    quantity: number;
+    /** Lowest acceptable price per unit. 0 disables both the limit path and the check. */
+    floor: number;
+    /** Best eligible bid seen in the pre-sale market check, used as the limit ask. */
+    bestQuotedPrice: number;
+    destPoi: string;
+    destPoiName: string;
+    /** Skip the post-sell settle wait when the caller does its own. */
+    settleMs?: number;
+  },
+): Promise<FactionSellResult> {
+  const { bot } = ctx;
+  const { itemId, itemName, quantity, floor, bestQuotedPrice, destPoi, destPoiName } = params;
+  const settleMs = params.settleMs ?? 12000;
+
+  const none: FactionSellResult = {
+    sold: 0, revenue: 0, listed: 0, avgPrice: 0, belowFloor: false, fills: [], notifications: [],
+  };
+  if (quantity <= 0) return none;
+
+  const cargoBefore = bot.inventory.find(i => i.itemId === itemId)?.quantity ?? 0;
+  const contender = getBuyOrderLock(itemId, destPoi, bot.username);
+
+  // ── Contested: list at a protected price instead of sweeping the book ──
+  if (contender && floor > 0) {
+    const askPrice = Math.max(floor, Math.floor(bestQuotedPrice) || floor);
+    ctx.log(
+      "warn",
+      `${itemName} book at ${destPoiName} is also claimed by ${contender.lockedBy} — listing ${quantity}x @ ${askPrice}cr instead of a market sell (a market order could sweep below the ${floor}cr floor)`,
+    );
+
+    const listResp = await bot.exec("create_sell_order", {
+      item_id: itemId,
+      quantity,
+      price_each: askPrice,
+    });
+
+    if (listResp.error) {
+      ctx.log("error", `Limit sell order failed for ${itemName}: ${listResp.error.message}`);
+      return { ...none, error: listResp.error.message };
+    }
+
+    await ctx.sleep(settleMs);
+    await bot.refreshCargo();
+
+    ctx.log("trade", `Listed ${quantity}x ${itemName} @ ${askPrice}cr at ${destPoiName} — no credits until it fills`);
+    return { ...none, listed: quantity, notifications: listResp.notifications ?? [] };
+  }
+
+  // ── Uncontested: market sell ──
+  const creditsBefore = bot.credits;
+  const sResp = await bot.exec("sell", { item_id: itemId, quantity });
+  if (sResp.error) {
+    return { ...none, error: sResp.error.message, notifications: sResp.notifications ?? [] };
+  }
+
+  await ctx.sleep(settleMs);
+  await bot.refreshCargo();
+
+  const outcome = readSellOutcome(sResp.result as Record<string, unknown> | undefined);
+  const creditDelta = sanitizeCredits(bot.credits - creditsBefore);
+
+  // The response is authoritative; the credit delta is the cross-check. If the
+  // response carried nothing usable, fall back to the delta — never to a quote.
+  let sold = outcome.soldQty;
+  let revenue = outcome.revenue;
+  if (!outcome.verified || revenue <= 0) {
+    if (creditDelta > 0) {
+      revenue = creditDelta;
+      if (sold <= 0) sold = quantity;
+      ctx.log("warn", `Sell response carried no totals for ${itemName} — using verified credit delta of ${revenue}cr`);
+    } else {
+      ctx.log("warn", `Sell of ${quantity}x ${itemName} reported no revenue and no credit change — treating as 0cr earned`);
+    }
+  } else if (creditDelta > 0 && Math.abs(creditDelta - revenue) > 1) {
+    ctx.log(
+      "warn",
+      `Sell revenue mismatch for ${itemName}: response says ${revenue}cr, credit delta says ${creditDelta}cr — trusting the response`,
+    );
+  }
+
+  const result: FactionSellResult = {
+    sold,
+    revenue,
+    listed: 0,
+    avgPrice: sold > 0 ? revenue / sold : 0,
+    belowFloor: false,
+    fills: outcome.fills,
+    notifications: sResp.notifications ?? [],
+  };
+
+  // The cargo endpoint sometimes lags a tick behind the sale. The server's
+  // `quantity_sold` is authoritative, so reconcile the local hold against it
+  // rather than making every caller re-implement the same patch-up.
+  if (sold > 0) {
+    const item = bot.inventory.find(i => i.itemId === itemId);
+    const cargoNow = item?.quantity ?? 0;
+    if (cargoNow > Math.max(0, cargoBefore - sold)) {
+      ctx.log("warn", `Cargo endpoint still shows ${cargoNow}x ${itemName} after selling ${sold}x — correcting locally`);
+      if (item) {
+        item.quantity = Math.max(0, cargoBefore - sold);
+        if (item.quantity <= 0) bot.inventory = bot.inventory.filter(i => i.itemId !== itemId);
+      }
+    }
+  }
+
+  // ── Slippage guard ──
+  if (floor > 0 && sold > 0) {
+    const worst = outcome.worstFillPrice > 0 ? outcome.worstFillPrice : result.avgPrice;
+    if (worst < floor) {
+      result.belowFloor = true;
+      const quoted = bestQuotedPrice > 0 ? `${bestQuotedPrice}cr` : "unknown";
+      ctx.log(
+        "error",
+        `FIRE-SALE: ${itemName} at ${destPoiName} filled at ${Math.round(result.avgPrice)}cr/unit (worst ${worst}cr) against a ${floor}cr floor and a ${quoted} quote — the book was swept before our order landed. Realized ${describeFills(result)}`,
+      );
+      const thief = outcome.fills.find(f => f.priceEach < floor)?.counterparty;
+      if (thief) ctx.log("error", `Below-floor units went to ${thief}`);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Restate a route's profit against what the sale actually earned.
+ *
+ * Faction stock has no acquisition cost, so the planner's
+ * `totalProfit = totalRevenue - roundTripFuel`; recovering the fuel figure that
+ * way lets us re-derive profit from realized revenue without threading the fuel
+ * estimate through every call site.
+ *
+ * Reporting the *planned* `route.totalProfit` is what turned a 400cr fire-sale
+ * into a logged 7412cr win — and made `factionDonateProfit` pay 741cr out of the
+ * treasury on a trade that grossed 400cr.
+ */
+function realizedFactionProfit(route: FactionSellRoute, realizedRevenue: number): number {
+  const roundTripFuelCost = Math.max(0, route.totalRevenue - route.totalProfit);
+  return sanitizeCredits(realizedRevenue - roundTripFuelCost);
 }
 
 /** Free cargo weight (not item count — callers must divide by item size). */
@@ -1027,11 +1226,13 @@ function findFactionSellRoutes(
         continue;
       }
 
-      const existingLock = getBuyOrderLock(item.itemId, buy.poiId, buy.price);
-
-      if (existingLock) {
-        continue;
-      }
+      // Book depth another bot has already committed to consume at this station.
+      // Planning against the raw demand is what let two bots size the same 8-unit
+      // fuel-cell book: the first swept every good level, the second's market
+      // order fell straight through to a junk bid.
+      const reserved = getReservedQuantity(item.itemId, buy.poiId, bot.username);
+      const availableDepth = Math.max(0, buy.quantity - reserved);
+      if (availableDepth <= 0) continue;
 
       // Round-trip fuel: current → dest + dest → home
       const toDest = estimateFuelCost(currentSystem, buy.systemId, costPerJump);
@@ -1040,9 +1241,10 @@ function findFactionSellRoutes(
       const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
       const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
 
-      // Calculate quantity to sell, respecting max sell qty
+      // Calculate quantity to sell, respecting max sell qty and the depth other
+      // bots have not already claimed.
       const maxQty = itemMaxSellQty > 0 ? Math.min(remainingSellQty, item.quantity) : item.quantity;
-      const qty = Math.min(maxQty, buy.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+      const qty = Math.min(maxQty, availableDepth, maxItemsForCargo(cargoCapacity, item.itemId));
       if (qty <= 0) continue;
 
       // Skip routes that sell below material cost + round-trip fuel (would lose money)
@@ -1993,8 +2195,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const abModule = await detectAfterburnerModule(ctx);
       const minFillRatio = settings.afterburnerMinFillRatio;
 
-      // Iterate through found routes to find one with an available lock that
-      // also satisfies the afterburner minimum-fill rule.
+      // Iterate through found routes to find one we can claim that also
+      // satisfies the afterburner minimum-fill rule.
       for (const candidateRoute of foundRoutes) {
         // Verify destination is still valid
         if (!isValidDestination(ctx, candidateRoute.destSystem, candidateRoute.destPoi)) {
@@ -2002,11 +2204,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           continue;
         }
 
-        const lockKey = getBuyOrderKey(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
-        const existingLock = getBuyOrderLock(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
+        const existingLock = getBuyOrderLock(candidateRoute.itemId, candidateRoute.destPoi, bot.username);
 
         if (existingLock) {
-          ctx.log("trade", `Skipping route to ${candidateRoute.destPoiName} — buy order locked by ${existingLock.lockedBy}`);
+          ctx.log("trade", `Skipping route to ${candidateRoute.destPoiName} — ${candidateRoute.itemName} book claimed by ${existingLock.lockedBy} (${existingLock.quantityCommitted}x committed)`);
           continue;
         }
 
@@ -2033,8 +2234,28 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
         }
 
+        // Claim the book NOW, before withdrawing cargo. Previously the claim was
+        // only taken ~700 lines later, just before departure, so two bots could
+        // both pass the check above and both commit to the same buyer. The
+        // session id is filled in once the session exists; until then the claim
+        // is protected by the sessionless grace window in the coordination store.
+        const claimed = acquireBuyOrderLock({
+          botUsername: bot.username,
+          itemId: candidateRoute.itemId,
+          itemName: candidateRoute.itemName,
+          destSystem: candidateRoute.destSystem,
+          destPoi: candidateRoute.destPoi,
+          destPoiName: candidateRoute.destPoiName,
+          pricePerUnit: candidateRoute.sellPrice,
+          quantityCommitted: candidateRoute.sellQty,
+        });
+        if (!claimed) {
+          ctx.log("trade", `Lost the race for ${candidateRoute.itemName} at ${candidateRoute.destPoiName} — trying the next route`);
+          continue;
+        }
+
         route = candidateRoute;
-        ctx.log("trade", `Selected route: ${route.itemName} (${Math.round(route.totalProfit)}cr profit)`);
+        ctx.log("trade", `Selected route: ${route.itemName} (${Math.round(route.totalProfit)}cr profit) — claimed ${route.sellQty}x of the book at ${route.destPoiName}`);
         break;
       }
 
@@ -2147,53 +2368,40 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
           const sellQty = Math.min(inCargo.quantity, remaining, mCheck.sellQty);
           ctx.log("trade", `Cargo recovery: selling ${sellQty}x ${route!.itemName} (${mCheck.priceBreakdown})...`);
-          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellQty });
-          if (sResp.error) {
-            ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
+          const sale = await executeFactionSell(ctx, {
+            itemId: route!.itemId,
+            itemName: route!.itemName,
+            quantity: sellQty,
+            floor: mCheck.floor,
+            bestQuotedPrice: mCheck.buyOrders[0]?.priceEach ?? route!.sellPrice,
+            destPoi: route!.destPoi,
+            destPoiName: route!.destPoiName,
+          });
+
+          if (sale.error) {
+            ctx.log("error", `Cargo recovery sell failed: ${sale.error}`);
             break;
           }
-          // Get actual revenue from sell result (sanitize to int — API can return floats like 123.0000000002)
-          const sr = sResp.result as Record<string, unknown> | undefined;
-          const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
-          // Wait for cargo update after sell
-          await ctx.sleep(12000);
-          // Verify sale by checking cargo after sell
-          await bot.refreshCargo();
-          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          const actuallySold = inCargo.quantity - afterSell;
-
-          if (actuallySold <= 0 && actualRevenue <= 0) {
-            const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
-            const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
-            if (itemMinSellPrice > 0 && inCargo.quantity > 0) {
-              ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold! (price ${route!.sellPrice}cr may be below minimum ${itemMinSellPrice}cr)`);
-            } else {
-              ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold!`);
-            }
+          if (sale.listed > 0) {
+            ctx.log("trade", `Cargo recovery: listed ${sale.listed}x ${route!.itemName} at a protected price — 0cr realized until it fills`);
+            remaining -= sale.listed;
             break;
-          } else if (actuallySold <= 0 && actualRevenue > 0) {
-            // Sale succeeded but cargo not updated - manually update
-            ctx.log("warn", `Cargo recovery: Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
-            const item = bot.inventory.find(i => i.itemId === route!.itemId);
-            if (item) {
-              item.quantity -= sellQty;
-              if (item.quantity <= 0) {
-                bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
-              }
-            }
-            totalSold += sellQty;
-            remaining -= sellQty;
-            ctx.log("trade", `Cargo recovery: Sold ${sellQty}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
-            continue;
           }
 
-          totalSold += actuallySold;
-          remaining -= actuallySold;
-          ctx.log("trade", `Cargo recovery: Sold ${actuallySold}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
+          if (sale.sold <= 0) {
+            ctx.log("error", `Cargo recovery: sell command succeeded but no items were sold (floor ${mCheck.floor}cr)`);
+            break;
+          }
+
+          totalSold += sale.sold;
+          totalRevenue += sale.revenue;
+          remaining -= sale.sold;
+          ctx.log("trade", `Cargo recovery: sold ${describeFills(sale)} (${totalSold} total, ${remaining} remaining)`);
+          if (sale.belowFloor) break; // book was swept — stop feeding it
           continue;
         }
-        
+
         const freeSpace = getFreeSpace(bot);
         if (freeSpace <= 0) {
           await bot.refreshCargo();
@@ -2210,37 +2418,27 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
             if (marketCheck.sellQty > 0) {
             ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
-            if (!sResp.error) {
-              // Wait for cargo update after sell
-              await ctx.sleep(12000);
+            const sale = await executeFactionSell(ctx, {
+              itemId: route!.itemId,
+              itemName: route!.itemName,
+              quantity: marketCheck.sellQty,
+              floor: marketCheck.floor,
+              bestQuotedPrice: marketCheck.buyOrders[0]?.priceEach ?? route!.sellPrice,
+              destPoi: route!.destPoi,
+              destPoiName: route!.destPoiName,
+            });
 
-              // Get actual revenue from sell result (sanitize to int)
-              const sr = sResp.result as Record<string, unknown> | undefined;
-              const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
-
-              // Verify sale
-              await bot.refreshCargo();
-                const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-                const actuallySold = marketCheck.sellQty - afterSell;
-                if (actuallySold > 0) {
-                  totalSold += actuallySold;
-                  const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
-                  ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo — ${revenue}cr revenue (actual)`);
-                } else if (actualRevenue > 0) {
-                  // Sale succeeded but cargo not updated - manually update and count as sold
-                  ctx.log("warn", `Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
-                  const item = bot.inventory.find(i => i.itemId === route!.itemId);
-                  if (item) {
-                    item.quantity -= marketCheck.sellQty;
-                    if (item.quantity <= 0) {
-                      bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
-                    }
-                  }
-                  totalSold += marketCheck.sellQty;
-                  ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} from full cargo — ${actualRevenue}cr revenue (actual)`);
-                }
-              }
+            if (sale.error) {
+              ctx.log("error", `Sell from full cargo failed: ${sale.error}`);
+            } else if (sale.listed > 0) {
+              ctx.log("trade", `Listed ${sale.listed}x ${route!.itemName} from full cargo at a protected price — 0cr realized until it fills`);
+            } else if (sale.sold > 0) {
+              totalSold += sale.sold;
+              totalRevenue += sale.revenue;
+              ctx.log("trade", `Sold ${describeFills(sale)} from full cargo`);
+            } else {
+              ctx.log("warn", `Sell from full cargo moved no ${route!.itemName} and earned nothing`);
+            }
             } else {
               if (itemMinSellPrice > 0) {
                 ctx.log("trade", `No viable buy orders for ${route!.itemName} — all below minimum price of ${itemMinSellPrice}cr`);
@@ -2416,11 +2614,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
             ctx.log("trade", `Attempting to sell ${sellNow}x ${route!.itemName} at ${currentPrice}cr (retry ${retry + 1}/${maxRetries})...`);
 
-            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellNow });
+            const sale = await executeFactionSell(ctx, {
+              itemId: route!.itemId,
+              itemName: route!.itemName,
+              quantity: sellNow,
+              // This loop walks the book one price level at a time, so the level
+              // being targeted IS the floor — anything cheaper means the level
+              // was taken between the refresh above and our order landing.
+              floor: Math.max(initialMarketCheck.floor, currentPrice),
+              bestQuotedPrice: currentPrice,
+              destPoi: route!.destPoi,
+              destPoiName: route!.destPoiName,
+            });
 
             // Check for battle notifications
-            if (sResp.notifications && Array.isArray(sResp.notifications)) {
-              const battleDetected = await handleBattleNotifications(ctx, sResp.notifications, battleState);
+            if (Array.isArray(sale.notifications) && sale.notifications.length > 0) {
+              const battleDetected = await handleBattleNotifications(ctx, sale.notifications, battleState);
               if (battleDetected) {
                 ctx.log("combat", "Battle detected during sell - initiating flee!");
                 battleState.isFleeing = false;
@@ -2429,49 +2638,31 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
             }
 
-            if (sResp.error) {
-              ctx.log("error", `Sell failed: ${sResp.error.message} (retry ${retry + 1}/${maxRetries})`);
+            if (sale.error) {
+              ctx.log("error", `Sell failed: ${sale.error} (retry ${retry + 1}/${maxRetries})`);
               await ctx.sleep(1000);
               continue;
             }
 
-            // Get actual revenue from sell result (sanitize to int)
-            const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
+            if (sale.listed > 0) {
+              ctx.log("trade", `Listed ${sale.listed}x ${route!.itemName} at a protected price instead of racing the book`);
+              break;
+            }
 
-            // Wait for cargo update after successful sell
-            await ctx.sleep(12000);
-
-            // Verify sale
-            await bot.refreshCargo();
-            const afterQty = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-            const soldThisAttempt = cargoQty - afterQty;
-
-            if (soldThisAttempt <= 0 && actualRevenue <= 0) {
+            if (sale.sold <= 0) {
               ctx.log("error", `Sell succeeded but no items sold and no revenue earned (retry ${retry + 1}/${maxRetries})`);
               await ctx.sleep(1000);
               continue;
-            } else if (soldThisAttempt <= 0 && actualRevenue > 0) {
-              // Sale succeeded but cargo not updated - manually update and count as sold
-              ctx.log("warn", `Sell succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
-              const item = bot.inventory.find(i => i.itemId === route!.itemId);
-              if (item) {
-                item.quantity -= sellNow;
-                if (item.quantity <= 0) {
-                  bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
-                }
-              }
-              orderTotalSold += sellNow;
-              totalSold += sellNow;
-              totalRevenue += actualRevenue;
-              ctx.log("trade", `Sold ${sellNow}x ${route!.itemName} at ${currentPrice}cr — ${actualRevenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
-            } else {
-              // Success
-              orderTotalSold += soldThisAttempt;
-              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice);
-              totalSold += soldThisAttempt;
-              totalRevenue += revenue;
-              ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
+            }
+
+            orderTotalSold += sale.sold;
+            totalSold += sale.sold;
+            totalRevenue += sale.revenue;
+            ctx.log("trade", `Sold ${describeFills(sale)} (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
+
+            if (sale.belowFloor) {
+              ctx.log("error", `Stopping further sales of ${route!.itemName} at ${route!.destPoiName} — the book is being swept out from under us`);
+              break;
             }
 
             // If we've sold the target quantity for this order, break
@@ -2525,11 +2716,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       if (totalSold > 0) {
         await bot.refreshStatus();
         await recordMarketData(ctx);
+        // In-station sales have no travel leg, so realized profit is simply the
+        // realized revenue. Never report or donate against the planned figure.
+        const realizedProfit = sanitizeCredits(totalRevenue);
         bot.stats.totalTrades++;
-        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
-        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue, ${route!.totalProfit}cr profit`);
-        await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
-        await completeTradeSession(bot.username, totalRevenue, route!.totalProfit);
+        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + realizedProfit);
+        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue realized (planned ${route!.totalRevenue}cr)`);
+        await factionDonateProfit(ctx, realizedProfit, settings.creditsToHold);
+        await completeTradeSession(bot.username, totalRevenue, realizedProfit);
+        releaseSessionLock(bot.username, "completed");
       } else if (route) {
         // No items sold - fail any existing session
         const session = getActiveSession(bot.username);
@@ -2736,24 +2931,38 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       });
       session.state = isCargoRecovery ? "in_transit" : "buying"; // Cargo recovery is already past buying phase
 
-      // Acquire lock on the destination buy order
-      const lockAcquired = acquireBuyOrderLock({
-        botUsername: bot.username,
-        itemId: session.itemId,
-        itemName: session.itemName,
-        destSystem: session.destSystem,
-        destPoi: session.destPoi,
-        destPoiName: session.destPoiName,
-        pricePerUnit: session.sellPricePerUnit,
-        quantityCommitted: session.sellQuantity,
+      // Bind the claim taken at route-selection time to this session, and
+      // correct the committed depth to what we actually loaded. Acquiring here
+      // (as the old code did) was far too late — the cargo was already aboard,
+      // so losing the race meant flying home loaded or dumping into a swept book.
+      const bound = updateBuyOrderLock(bot.username, session.itemId, session.destPoi, {
         sessionId: session.sessionId,
+        quantityCommitted: qty,
+        pricePerUnit: session.sellPricePerUnit,
       });
 
-        if (!lockAcquired) {
-          ctx.log("trade", `Failed to acquire lock on buy order for ${session.itemName} at ${session.destPoiName} — picking next route`);
+      if (!bound) {
+        // No claim of ours survives — either it was reaped or another bot holds
+        // the book now. Re-acquire; only give up if someone else owns it.
+        const reclaimed = acquireBuyOrderLock({
+          botUsername: bot.username,
+          itemId: session.itemId,
+          itemName: session.itemName,
+          destSystem: session.destSystem,
+          destPoi: session.destPoi,
+          destPoiName: session.destPoiName,
+          pricePerUnit: session.sellPricePerUnit,
+          quantityCommitted: qty,
+          sessionId: session.sessionId,
+        });
+
+        if (!reclaimed) {
+          const holder = getBuyOrderLock(session.itemId, session.destPoi, bot.username);
+          ctx.log("trade", `Failed to claim the ${session.itemName} book at ${session.destPoiName} (held by ${holder?.lockedBy ?? "another bot"}) — picking next route`);
           await failFactionSession(bot.username, "Buy order locked by another bot");
           continue;
         }
+      }
 
       await startTradeSession(session);
       ctx.log("trade", `Trade session started: ${session.sessionId}`);
@@ -2815,7 +3024,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 const originSystem = sess.sourceSystem || settings.homeSystem;
                 const originPoi = sess.sourcePoi || getHomeStationPoi(settings.homeStation);
                 const originName = sess.sourcePoiName || originPoi || originSystem;
-                releaseBuyOrderLock(bot.username, sess.itemId, sess.destPoi, sess.sellPricePerUnit, "buyer_gone_returning_to_origin");
+                releaseBuyOrderLock(bot.username, sess.itemId, sess.destPoi, "buyer_gone_returning_to_origin");
                 await updateTradeSession(bot.username, {
                   destSystem: originSystem,
                   destPoi: originPoi,
@@ -2953,83 +3162,66 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           await failFactionSession(bot.username, "No viable buy orders at destination");
         } else {
           ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
-          if (sResp.error) {
-            ctx.log("error", `Sell failed: ${sResp.error.message}`);
-            await failFactionSession(bot.username, `Sell failed: ${sResp.error.message}`);
+          const sale = await executeFactionSell(ctx, {
+            itemId: route!.itemId,
+            itemName: route!.itemName,
+            quantity: marketCheck.sellQty,
+            floor: marketCheck.floor,
+            bestQuotedPrice: marketCheck.buyOrders[0]?.priceEach ?? route!.sellPrice,
+            destPoi: route!.destPoi,
+            destPoiName: route!.destPoiName,
+          });
+
+          if (sale.error) {
+            ctx.log("error", `Sell failed: ${sale.error}`);
+            await failFactionSession(bot.username, `Sell failed: ${sale.error}`);
+          } else if (sale.listed > 0) {
+            // Cargo went into a price-protected listing instead of a market
+            // order. No credits are earned until it fills, so the session ends
+            // with zero realized revenue and nothing is donated.
+            ctx.log("trade", `${sale.listed}x ${route!.itemName} listed at ${route!.destPoiName} — 0cr realized until it fills`);
+            releaseSessionLock(bot.username, "listed_contested_book");
+            await abandonTradeSession(bot.username, `Listed ${sale.listed}x at ${route!.destPoiName} (contested book)`);
+          } else if (sale.sold <= 0) {
+            ctx.log("error", `Sell command succeeded but no items were sold and no revenue earned - item still in cargo (${inCargo}x)`);
+            await failFactionSession(bot.username, "Sell command did not remove items from cargo");
           } else {
-            // Wait for cargo update after sell
-            await ctx.sleep(12000);
+            const revenue = sale.revenue;
+            const profit = realizedFactionProfit(route!, revenue);
+            const actuallySold = sale.sold;
 
-            // Get actual revenue from sell result (sanitize to int — prevents 123.0000000002 from API)
-            const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
+            bot.stats.totalTrades++;
+            bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + profit);
+            ctx.log("trade", `Sold ${describeFills(sale)} at ${route!.destPoiName} — ${profit}cr profit`);
 
-            // Verify sale by checking cargo after sell
-            await bot.refreshCargo();
-            const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-            const actuallySold = marketCheck.sellQty - afterSell;
+            // Only ever donate against realized profit. A swept book yields a
+            // loss, and paying a cut of an imaginary profit compounds it.
+            await factionDonateProfit(ctx, profit, settings.creditsToHold);
+            await completeTradeSession(bot.username, revenue, profit);
 
-            if (actuallySold <= 0 && actualRevenue <= 0) {
-              ctx.log("error", `Sell command succeeded but no items were sold and no revenue earned - item still in cargo (${inCargo}x)`);
-              await failFactionSession(bot.username, "Sell command did not remove items from cargo");
-            } else if (actuallySold <= 0 && actualRevenue > 0) {
-              // Sale succeeded (revenue earned) but cargo API not updated yet - manually update inventory
-              ctx.log("warn", `Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
-              const item = bot.inventory.find(i => i.itemId === route!.itemId);
-              if (item) {
-                item.quantity -= marketCheck.sellQty;
-                if (item.quantity <= 0) {
-                  bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
-                }
+            // Release buy order lock
+            releaseSessionLock(bot.username, sale.belowFloor ? "completed_below_floor" : "completed");
+
+            ctx.log("trade", "Trade session completed successfully");
+
+            // Update sold quantity tracking in settings
+            try {
+              const allSettings = readSettings();
+              const ftSettings = (allSettings["faction_trader"] as Record<string, unknown>) || {};
+              const tradeItems = (ftSettings.tradeItems as TradeItemConfig[]) || [];
+              const itemIndex = tradeItems.findIndex(t => t.itemId === route!.itemId);
+              if (itemIndex >= 0) {
+                tradeItems[itemIndex].soldQty = (tradeItems[itemIndex].soldQty || 0) + actuallySold;
+                writeSettings({ faction_trader: { tradeItems } as Record<string, unknown> });
+                ctx.log("trade", `Updated sold quantity for ${route!.itemName}: ${tradeItems[itemIndex].soldQty} total`);
               }
-              const revenue = actualRevenue;
-              bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
-              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
-              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
-              await completeTradeSession(bot.username, revenue, route!.totalProfit);
-            } else {
-              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
-              bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
-              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
-              await factionDonateProfit(ctx, route!.totalProfit, settings.creditsToHold);
-              await completeTradeSession(bot.username, revenue, route!.totalProfit);
-
-              // Release buy order lock
-              const completedSession = getActiveSession(bot.username);
-              if (completedSession) {
-                releaseBuyOrderLock(
-                  bot.username,
-                  completedSession.itemId,
-                  completedSession.destPoi,
-                  completedSession.sellPricePerUnit,
-                  "completed"
-                );
-              }
-
-              ctx.log("trade", "Trade session completed successfully");
-
-              // Update sold quantity tracking in settings
-              try {
-                const allSettings = readSettings();
-                const ftSettings = (allSettings["faction_trader"] as Record<string, unknown>) || {};
-                const tradeItems = (ftSettings.tradeItems as TradeItemConfig[]) || [];
-                const itemIndex = tradeItems.findIndex(t => t.itemId === route!.itemId);
-                if (itemIndex >= 0) {
-                  tradeItems[itemIndex].soldQty = (tradeItems[itemIndex].soldQty || 0) + actuallySold;
-                  writeSettings({ faction_trader: { tradeItems } as Record<string, unknown> });
-                  ctx.log("trade", `Updated sold quantity for ${route!.itemName}: ${tradeItems[itemIndex].soldQty} total`);
-                }
-              } catch (err) {
-                ctx.log("error", `Failed to update sold quantity tracking: ${err}`);
-              }
-
-              // Always refuel after selling before heading home (especially important for long return trips)
-              ctx.log("system", "Topping off fuel before return journey...");
-              await tryRefuel(ctx);
+            } catch (err) {
+              ctx.log("error", `Failed to update sold quantity tracking: ${err}`);
             }
+
+            // Always refuel after selling before heading home (especially important for long return trips)
+            ctx.log("system", "Topping off fuel before return journey...");
+            await tryRefuel(ctx);
           }
         }
       } else {

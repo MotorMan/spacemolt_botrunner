@@ -392,7 +392,9 @@ async function fulfillOrder(
     return;
   }
 
-  // Acquire a buy-order lock so two traders don't sell the same buyer.
+  // Claim the destination book so two traders don't sell into the same orders.
+  // The claim covers item + POI; the price is recorded for context only, because
+  // a market sell walks every price level and the top of book moves constantly.
   const lockKeyPrice = order.sellPrice;
   const lockAcquired = acquireBuyOrderLock({
     botUsername: bot.username,
@@ -406,7 +408,7 @@ async function fulfillOrder(
     sessionId: `ct_${order.orderId}`,
   });
   if (!lockAcquired) {
-    log("trade", `Buy order @ ${order.destPoiName} (${lockKeyPrice}cr) locked by another bot — skipping`);
+    log("trade", `${order.itemName} book @ ${order.destPoiName} claimed by another bot — skipping`);
     await returnUnsold(ctx, bot, s, order.itemId, cargoQty);
     return;
   }
@@ -428,7 +430,7 @@ async function fulfillOrder(
       await returnUnsold(ctx, bot, s, order.itemId, cargoQty);
     }
   } finally {
-    releaseBuyOrderLock(bot.username, order.itemId, order.destPoi, lockKeyPrice, "completed");
+    releaseBuyOrderLock(bot.username, order.itemId, order.destPoi, "completed");
   }
 }
 

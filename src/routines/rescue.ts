@@ -935,17 +935,22 @@ async function sendRescueBill(
     try {
       const result = await aiChatService.sendPrivateMessage(ctx.bot, targetUsername, {
         situation: isMayday
-          ? `You responded to their MAYDAY distress call and successfully refueled them. You are now sending them an invoice for the rescue service.`
-          : `You completed a fuel transfer mission to help them with their low fuel situation. You are now sending them an invoice for the rescue service.`,
+          ? `You ALREADY responded to their MAYDAY distress call, flew to them, and refueled them - the rescue is finished. You are now sending them the invoice for the completed service.`
+          : `You ALREADY completed the fuel transfer mission that fixed their low fuel situation - the job is finished. You are now sending them the invoice for the completed service.`,
         currentSystem: ctx.bot.system,
-        targetSystem: '',
-        jumps: jumpsToTarget + jumpsToHome,
+        // They are right where we just refueled them, so co-locate rather than
+        // leaving this blank (a blank target used to read as "somewhere N jumps away").
+        targetSystem: ctx.bot.system,
+        phase: "completed",
+        // Billed jumps are ALREADY flown (there + back). Passing them as `jumps`
+        // made the LLM announce a bogus ETA like "I'll reach you in six jumps".
+        billedJumps: jumpsToTarget + jumpsToHome,
         fuelRefueled: fuelDelivered,
         playerFuelPct: undefined,
         credits: bill.total,
       });
       if (result.ok) {
-        ctx.log("rescue", `📧 Sent rescue invoice to ${targetUsername}: ${bill.total} credits (${bill.jumpCost} jumps + ${bill.fuelCost} fuel)`);
+        ctx.log("rescue", `📧 Sent rescue invoice to ${targetUsername}: ${bill.total} credits (${bill.jumpCost}cr travel + ${bill.fuelCost}cr fuel)`);
       } else {
         ctx.log("warn", `Rescue invoice to ${targetUsername} failed: ${result.error}`);
       }
@@ -2419,6 +2424,7 @@ WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                     currentSystem: ctx.bot.system,
                     targetSystem: mayday.system,
+                    phase: "declined",
                     jumps: undefined,
                     fuelRefueled: undefined,
                     playerFuelPct: undefined,
@@ -2485,7 +2491,10 @@ WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                       currentSystem: ctx.bot.system,
                       targetSystem: mayday.system,
-                      jumps: pirateProximity.jumps,
+                      phase: "declined",
+                      // NOTE: pirateProximity.jumps is the pirate base's distance from the
+                      // pilot, not ours from the pilot - never feed it in as travel distance.
+                      jumps: undefined,
                       fuelRefueled: undefined,
                       playerFuelPct: undefined,
                     });
@@ -2555,7 +2564,7 @@ REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                      currentSystem: ctx.bot.system, targetSystem: mayday.system, phase: "declined", jumps: undefined,
                     fuelRefueled: undefined, playerFuelPct: undefined,
                   });
                 } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
@@ -2604,7 +2613,7 @@ REASON FOR DECLINE: There is no safe route to their location (${mayday.system}).
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                      currentSystem: ctx.bot.system, targetSystem: mayday.system, phase: "declined", jumps: undefined,
                     fuelRefueled: undefined, playerFuelPct: undefined,
                   });
                 } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
@@ -3282,6 +3291,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   situation: `You are halfway through the rescue mission. You have reached the target system (${target.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
                   currentSystem: bot.system,
                   targetSystem: target.system,
+                  phase: "arrived",
                   jumps: undefined,
                   playerFuelPct: target.fuelPct,
                   fuelRefueled: undefined,
@@ -3779,6 +3789,7 @@ if (travelSucceeded) {
                 situation: `You attempted to reach them to deliver fuel but could not complete the rescue — they were not at their reported location (they may have moved on, docked, or logged off). Let them know no charge was applied and they can send another distress call if they still need help.`,
                 currentSystem: bot.system,
                 targetSystem: target.system,
+                phase: "cancelled",
                 jumps: undefined,
                 fuelRefueled: 0,
                 playerFuelPct: undefined,
@@ -4686,6 +4697,7 @@ WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                 currentSystem: ctx.bot.system,
                 targetSystem: nextMayday.system,
+                phase: "declined",
                 jumps: undefined,
                 fuelRefueled: undefined,
                 playerFuelPct: undefined,
@@ -4830,6 +4842,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a decline. The player's fuel level is ${mayday.fuelPct}% - they are in critical condition and need immediate help.`,
             currentSystem: bot.system,
             targetSystem: mayday.system,
+            phase: "en_route",
             jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
             playerFuelPct: mayday.fuelPct,
             fuelRefueled: undefined,
@@ -4877,6 +4890,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
               situation: `You are halfway through the rescue mission. You have reached the target system (${mayday.system}) and are now traveling to their location. Continue waiting for rescue - help is on the way.`,
               currentSystem: bot.system,
               targetSystem: mayday.system,
+              phase: "arrived",
               jumps: undefined,
               playerFuelPct: mayday.fuelPct,
               fuelRefueled: undefined,
@@ -5049,10 +5063,11 @@ if (refuelResp.error) {
         try {
           const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
             situation: fuelTransferred > 0
-              ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
-              : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
+              ? `You have ALREADY successfully refueled the stranded pilot - the rescue is finished. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
+              : `You arrived to help but couldn't provide fuel. You did your best to assist and the attempt is over.`,
             currentSystem: mayday.system,
             targetSystem: mayday.system,
+            phase: fuelTransferred > 0 ? "completed" : "cancelled",
             fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
             playerFuelPct: undefined, // Don't pass player fuel - confuses LLM about whose fuel it is
           });
@@ -5773,6 +5788,7 @@ WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                     currentSystem: ctx.bot.system,
                     targetSystem: mayday.system,
+                    phase: "declined",
                     jumps: undefined,
                     fuelRefueled: undefined,
                     playerFuelPct: undefined,
@@ -5852,7 +5868,7 @@ REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                      currentSystem: ctx.bot.system, targetSystem: mayday.system, phase: "declined", jumps: undefined,
                     fuelRefueled: undefined, playerFuelPct: undefined,
                   });
                 } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
@@ -5901,7 +5917,7 @@ REASON FOR DECLINE: There is no safe route to their location (${mayday.system}).
 WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
 
 IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                      currentSystem: ctx.bot.system, targetSystem: mayday.system, phase: "declined", jumps: undefined,
                     fuelRefueled: undefined, playerFuelPct: undefined,
                   });
                 } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
@@ -7496,6 +7512,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 situation,
                 currentSystem: bot.system,
                 targetSystem: target.system,
+                phase: "cancelled",
                 jumps: undefined,
                 fuelRefueled: 0,
                 playerFuelPct: undefined,

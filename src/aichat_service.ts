@@ -1809,7 +1809,20 @@ ${botContext}
       situation: string;
       currentSystem: string;
       targetSystem: string;
+      /**
+       * Mission phase. Controls whether travel/ETA wording is allowed at all.
+       * - "en_route": still flying to the pilot (future tense, ETA allowed)
+       * - "arrived": in their system, closing on their POI
+       * - "completed": fuel already delivered, trip is over (past tense only)
+       * - "cancelled": mission ended without a delivery (past tense only)
+       * - "declined": never departed, not coming (no travel wording at all)
+       * Defaults to "en_route" for backwards compatibility.
+       */
+      phase?: "en_route" | "arrived" | "completed" | "cancelled" | "declined";
+      /** Jumps STILL REMAINING before reaching the pilot. Only meaningful while en route. */
       jumps?: number;
+      /** Jumps ALREADY FLOWN that appear on an invoice (round trip). Never rendered as an ETA. */
+      billedJumps?: number;
       fuelRefueled?: number;
       playerFuelPct?: number;
       credits?: number;
@@ -1826,40 +1839,94 @@ ${botContext}
     
     this.logFn("ai_chat_debug", `AI Chat enabled: ${settings.enabled}, sending private message...`);
 
+    const phase = context.phase ?? "en_route";
+    const pilotSystem = (context.targetSystem || "").trim();
+    // Only an en-route message may talk about jumps as distance/ETA. Anything else
+    // (invoices especially) would make the LLM claim it is still on its way.
+    const jumpsRemaining = phase === "en_route" ? context.jumps : undefined;
+
+    const locationLine = (() => {
+      switch (phase) {
+        case "completed":
+          return `- You are WITH the stranded pilot right now${pilotSystem ? ` in ${pilotSystem}` : ""} - the trip to them is already finished`;
+        case "arrived":
+          return `- You have ARRIVED in the stranded pilot's system${pilotSystem ? ` (${pilotSystem})` : ""} and are closing on their position`;
+        case "cancelled":
+          return `- The pilot's last reported location was${pilotSystem ? ` ${pilotSystem}` : " unknown"} - this mission is over, you are not going back`;
+        case "declined":
+          return `- The pilot is in${pilotSystem ? ` ${pilotSystem}` : " a location you cannot reach"} - you are NOT travelling there`;
+        default:
+          return `- Stranded pilot is in: ${pilotSystem || "their reported location"}${jumpsRemaining ? ` (${jumpsRemaining} jumps away)` : ""}`;
+      }
+    })();
+
+    const phaseRules = (() => {
+      switch (phase) {
+        case "completed":
+          return `MISSION STATUS - ALREADY COMPLETE (READ CAREFULLY):
+- The fuel has ALREADY been delivered and the rescue is FINISHED
+- You are NOT on your way, you are NOT approaching, and there is NO ETA to give
+- NEVER say "I'll reach you in X jumps", "on my way", "heading your way", "I'll check your fuel when I arrive", or anything implying a future arrival
+- Talk about the trip and the fuel transfer in the PAST tense${context.billedJumps !== undefined ? `
+- The ${context.billedJumps} jumps on the invoice are jumps you ALREADY FLEW (there and back), not a distance to them and not an ETA` : ""}`;
+        case "arrived":
+          return `MISSION STATUS - ARRIVED:
+- You are already in their system; do not quote a jump count or ETA
+- The fuel transfer has NOT happened yet - do not thank them or bill them`;
+        case "cancelled":
+          return `MISSION STATUS - ENDED WITHOUT DELIVERY:
+- The mission is over and you are NOT coming back
+- Do not give an ETA or promise another attempt on this run
+- Talk about the trip in the PAST tense`;
+        case "declined":
+          return `MISSION STATUS - DECLINED:
+- You never departed and you are NOT coming
+- Do not give an ETA, jump count to them, or any hint you might still show up`;
+        default:
+          return `MISSION STATUS - EN ROUTE:
+- You are still flying to them${jumpsRemaining ? ` and are ${jumpsRemaining} jumps out` : ""}
+- The fuel transfer has NOT happened yet - do not thank them or bill them`;
+      }
+    })();
+
     // Build system prompt for private message generation
     const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
 
 Context:
 - You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
-- Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
+${locationLine}
 - ${context.situation}
+
+${phaseRules}
 
 IMPORTANT NOTES ABOUT FUEL:
 ${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
-${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
-${context.credits !== undefined ? `- The rescue invoice totals ${context.credits} credits` : ''}
+${context.fuelRefueled !== undefined ? (context.fuelRefueled > 0 ? `- You ALREADY transferred ${context.fuelRefueled} fuel units to the stranded pilot` : `- NO fuel was delivered on this run`) : ''}
+${context.credits !== undefined ? (context.credits > 0 ? `- The rescue invoice totals ${context.credits} credits` : `- There is NO charge for this - do not quote any price or invoice`) : ''}
 - NEVER confuse the stranded pilot's fuel level with your own fuel level
 - When referring to fuel, always clarify whose fuel you're talking about
 
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
-If an invoice was sent, ALWAYS mention the credit amount in your message.
+${context.credits !== undefined && context.credits > 0 ? "An invoice was sent, so ALWAYS mention the credit amount in your message." : ""}
 
 Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
-- Include relevant details (ETA, jumps, credits, etc.) if provided
+- Include relevant details (${phase === "en_route" ? "ETA, jumps remaining, " : ""}credits, fuel delivered) if provided
 - Don't be overly verbose
 - Use 1st person ("I", "me", "my") when talking about yourself`;
 
     const userMessage = `Generate a private message to ${targetPlayer}:
 
+Phase: ${phase}
 Situation: ${context.situation}
-${context.jumps ? `Jumps remaining: ${context.jumps}` : ""}
-${context.fuelRefueled ? `Fuel transferred: ${context.fuelRefueled}` : ""}
+${jumpsRemaining ? `Jumps remaining before you reach them: ${jumpsRemaining}` : ""}
+${context.billedJumps !== undefined ? `Jumps already flown and billed (round trip, NOT an ETA): ${context.billedJumps}` : ""}
+${context.fuelRefueled ? `Fuel already transferred: ${context.fuelRefueled}` : ""}
 ${context.playerFuelPct ? `Their fuel before: ${context.playerFuelPct}%` : ""}
-${context.credits !== undefined ? `Invoice total: ${context.credits} credits` : ""}
+${context.credits !== undefined ? (context.credits > 0 ? `Invoice total: ${context.credits} credits` : `No charge for this run`) : ""}
 
 Message:`;
 
@@ -1969,15 +2036,29 @@ Message:`;
         break;
     }
 
+    // Only a not-yet-started rescue may talk about jumps as a distance still to fly.
+    const isFinished = messageType === "rescue_complete" || messageType === "rescue_no_show";
+    const jumpsLine = jumps
+      ? isFinished
+        ? ` (${jumps} jumps you already flew to get there)`
+        : ` (${jumps} jumps from your previous location)`
+      : "";
+    const timelineRule = isFinished
+      ? `- This job is ALREADY OVER: speak in the past tense and never imply you are still on your way or about to arrive`
+      : messageType === "rescue_arrived"
+        ? `- You are already on scene: do not give an ETA`
+        : `- The rescue is just starting: future tense is fine`;
+
     // Build system prompt for faction message generation
     const systemPrompt = `${personality || "You are a rescue pilot in SpaceMolt."}
 
 Context:
 - You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
-- Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
+- Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumpsLine}
 - Target name: ${targetName}
 - ${situation}
+${timelineRule}
 - This message goes to FACTION chat (all faction members can see it)
 
 Task:
@@ -1998,7 +2079,7 @@ Message type: ${messageType}
 Target: ${targetName}${isMayday ? " (MAYDAY distress call)" : ""}
 ${targetFuelPct ? `Their fuel level: ${targetFuelPct}%` : ""}
 Location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}
-${jumps ? `Jumps to get there: ${jumps}` : ""}
+${jumps ? (isFinished ? `Jumps already flown: ${jumps}` : `Jumps to get there: ${jumps}`) : ""}
 
 Message:`;
 

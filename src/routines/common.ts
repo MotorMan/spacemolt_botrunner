@@ -656,20 +656,23 @@ export async function ensureDocked(
 
   // No (usable) station in current system — find nearest station
   ctx.log("system", "No usable station in current system — searching for nearest station...");
-  const blacklist = getSystemBlacklist();
-  const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, buildDeniedStationSet());
-  if (!nearest) {
+  const dockTarget = await findReachableFuelStation(ctx, {
+    skipApprovedCheck: opts?.skipApprovedCheck,
+  });
+  if (!dockTarget) {
     ctx.log("error", "No known approved station in mapped systems — cannot dock");
     return false;
   }
+  const nearest = dockTarget;
+  // Keep the blacklist bypass consistent for the route leg too (see ensureFueled).
+  const dockBlacklist = dockTarget.blacklistBypassed ? [] : getSystemBlacklist();
 
-  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} hops)`);
+  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} hops)${dockTarget.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
 
   // Navigate there
   if (nearest.systemId !== bot.system) {
     await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, dockBlacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -1985,6 +1988,164 @@ export async function safetyCheck(
   return true;
 }
 
+// ── Fuel-station selection (with blacklist bypass) ───────────
+// The system blacklist is a *preference* (avoid sketchy systems). It must NEVER
+// be a hard wall that strands a low-fuel bot in a pocket where every exit is
+// blacklisted — that was the bug: the miner sat at 20% fuel for 40 minutes
+// spamming "No approved refuel station reachable" while a station ~10 jumps away
+// had room for it 3x over. When the blacklisted search finds nothing, we retry
+// without the blacklist (still skipping pirate systems) and, as a last resort,
+// ask the server for a reachable approved station we can actually afford to fly to.
+
+export interface FuelStationTarget {
+  systemId: string;
+  poiId: string;
+  poiName: string;
+  hops: number;
+  blacklistBypassed: boolean;
+  serverRoute?: RouteSegment[];
+}
+
+export interface RouteFuelCheck {
+  found: boolean;
+  route?: RouteSegment[];
+  totalJumps?: number;
+  estimatedFuel?: number;
+  fuelAvailable?: number;
+  hasWormhole?: boolean;
+  affordable?: boolean;
+}
+
+/** Ask the server for a route to a target system and whether we can afford it. */
+export async function checkRouteFuel(
+  ctx: RoutineContext,
+  targetSystemId: string,
+): Promise<RouteFuelCheck> {
+  const { bot } = ctx;
+  try {
+    const resp = await bot.exec("find_route", { target_system: targetSystemId });
+    const raw = resp.result as any;
+    if (resp.error || !raw || !raw.found) return { found: false };
+    const hasWormhole = routeHasWormhole(raw.route);
+    let affordable: boolean | undefined;
+    if (raw.fuel_available !== undefined && raw.estimated_fuel !== undefined && !hasWormhole) {
+      affordable = raw.fuel_available >= raw.estimated_fuel;
+    }
+    return {
+      found: true,
+      route: raw.route,
+      totalJumps: raw.total_jumps,
+      estimatedFuel: raw.estimated_fuel,
+      fuelAvailable: raw.fuel_available,
+      hasWormhole,
+      affordable,
+    };
+  } catch (e) {
+    ctx.log("debug", `checkRouteFuel(${targetSystemId}) failed: ${e}`);
+    return { found: false };
+  }
+}
+
+/** Candidate {system, poiId} pairs to fall back to when local map search fails. */
+function candidateApprovedStations(
+  approvedSet: Set<string>,
+  deniedSet: Set<string>,
+): Array<{ systemId: string; poiId: string }> {
+  const out: Array<{ systemId: string; poiId: string }> = [];
+  const seen = new Set<string>();
+  // 1) Explicit approvedFuelStations entries ("system|poi" or bare "poi")
+  for (const e of approvedSet) {
+    const parts = e.split("|");
+    if (parts.length === 2) out.push({ systemId: parts[0], poiId: parts[1] });
+  }
+  // 2) Any known station POI on the map (prefer ones explicitly approved)
+  for (const sys of mapStore.getSystems()) {
+    for (const p of sys.pois) {
+      if (!(p.has_base || (p as any).base_id)) continue;
+      const key = `${sys.id}|${p.id}`;
+      if (approvedSet.has(p.id) || approvedSet.has(key)) {
+        const sKey = `${sys.id}|${p.id}`.toLowerCase();
+        if (!seen.has(sKey) && !deniedSet.has(sKey) && !deniedSet.has(p.id.toLowerCase())) {
+          out.push({ systemId: sys.id, poiId: p.id });
+          seen.add(sKey);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Find a reachable approved fuel station, escalating through three strategies:
+ *   1. Local map BFS honouring the blacklist (normal behaviour).
+ *   2. Local map BFS ignoring the blacklist (recover from a blacklisted pocket).
+ *   3. Server `find_route` over known approved stations, keeping only routes we
+ *      can actually afford (enough fuel_available >= estimated_fuel).
+ * Returns null when nothing reachable was found (caller should give up / recover).
+ */
+export async function findReachableFuelStation(
+  ctx: RoutineContext,
+  opts: { skipBlacklist?: boolean; skipApprovedCheck?: boolean; excludePoiIds?: Set<string> } = {},
+): Promise<FuelStationTarget | null> {
+  const { bot } = ctx;
+  const approvedSet = opts.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
+  const deniedSet = buildDeniedStationSet(opts.excludePoiIds);
+  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
+
+  // Strategy 1: honour the blacklist (unless explicitly skipped)
+  if (blacklist.length > 0) {
+    const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedSet);
+    if (nearest) {
+      return { ...nearest, blacklistBypassed: false };
+    }
+    ctx.log("system", "Blacklisted fuel search found no station — retrying without blacklist (avoiding pirate systems) before giving up");
+  }
+
+  // Strategy 2: ignore the blacklist (still skips pirate systems inside mapStore)
+  const bypass = mapStore.findNearestStationSystem(bot.system, [], approvedSet, deniedSet);
+  if (bypass) {
+    ctx.log("system", `Found station ${bypass.poiName} in ${bypass.systemId} by bypassing the blacklist — stranded is worse than an avoided system`);
+    return { ...bypass, blacklistBypassed: true };
+  }
+
+  // Strategy 3: ask the server for a reachable, affordable approved station.
+  const candidates = candidateApprovedStations(approvedSet, deniedSet)
+    .filter(c => c.systemId.toLowerCase() !== bot.system.toLowerCase());
+  // Prefer stations whose distance we already know from the map.
+  for (const c of candidates) {
+    try { (c as any)._hops = mapStore.findNearestStationSystem(bot.system, [], approvedSet, new Set([c.poiId.toLowerCase()]))?.hops ?? 999; }
+    catch { (c as any)._hops = 999; }
+  }
+  candidates.sort((a, b) => ((a as any)._hops as number) - ((b as any)._hops as number));
+
+  let best: FuelStationTarget | null = null;
+  let bestJumps = Infinity;
+  for (const c of candidates.slice(0, 12)) {
+    const check = await checkRouteFuel(ctx, c.systemId);
+    if (!check.found || check.hasWormhole) continue;
+    if (check.affordable === false) {
+      ctx.log("debug", `Server route to ${c.systemId} not affordable (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — skipping`);
+      continue;
+    }
+    const jumps = check.totalJumps ?? (check.route?.length ? check.route.length - 1 : 999);
+    if (jumps < bestJumps) {
+      bestJumps = jumps;
+      best = {
+        systemId: c.systemId,
+        poiId: c.poiId,
+        poiName: c.poiId,
+        hops: jumps,
+        blacklistBypassed: true,
+        serverRoute: check.route,
+      };
+    }
+  }
+  if (best) {
+    ctx.log("system", `Server routed to approved station in ${best.systemId} (${best.hops} jumps) — flying there to refuel`);
+  }
+  return best;
+}
+
 /**
  * Ensure the bot has adequate fuel.
  * If an approved fuel station list is configured and fuel is low,
@@ -2147,9 +2308,6 @@ export async function ensureFueled(
     // If we couldn't reach home or refuel there, continue to other options
   }
 
-  // Check for approved fuel stations - if empty/undefined, allow all stations (handled by isApprovedFuelStation)
-  const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
-
   // If we undocked and were previously docked, only return there if it's APPROVED
   // NOTE: station-approval is independent of the system blacklist (skipBlacklist).
   // A cloaked trader must still respect the approved-fuel-station allowlist.
@@ -2232,44 +2390,93 @@ if (looted > 0) {
   }
 
   // ── STEP 5: Find nearest known APPROVED station with fuel ────────────────
+  // Loop so a station that turns out to be empty/denied can be skipped and the
+  // next reachable candidate tried, instead of giving up on the first miss.
   const haveCurrentStation = !!pois.find(p => isStationPoi(p) && p.id === bot.poi);
   ctx.log("system", haveCurrentStation
     ? "Current station not approved for refuel — searching known map for nearest approved station..."
     : "No approved station in current system — searching known map for nearest station...");
-  const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
-  const approvedSet = opts?.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
 
-  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, buildDeniedStationSet());
-  if (!nearest) {
-    ctx.log("error", "No approved refuel station reachable");
-    return false;
-  }
+  const rejected = new Set<string>();
+  let nearest: FuelStationTarget | null = null;
+  let unaffordableTarget: FuelStationTarget | null = null;
+  for (let attempt = 0; attempt < 4 && !nearest; attempt++) {
+    const candidate = await findReachableFuelStation(ctx, {
+      skipBlacklist: opts?.skipBlacklist,
+      skipApprovedCheck: opts?.skipApprovedCheck,
+      excludePoiIds: rejected,
+    });
+    if (!candidate) break;
 
-  // Check if the nearest station has fuel before traveling there
-  // Sol Central is always assumed to have fuel (faction station with guaranteed supply)
-  if (nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
-    try {
-      const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-      const fuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
-      if (fuel !== null && fuel !== undefined && fuel <= 0) {
-        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
-        return false;
+    // Skip stations that explicitly report 0 fuel (Sol is always stocked).
+    if (candidate.poiId !== "sol_station" && candidate.poiId !== "sol_central") {
+      let fuelAtStation: number | null = null;
+      try {
+        const poiResp = await bot.exec("get_poi", { poi_id: candidate.poiId });
+        fuelAtStation = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+      } catch {}
+      if (fuelAtStation !== null && fuelAtStation !== undefined && fuelAtStation <= 0) {
+        ctx.log("system", `Skipping ${candidate.poiName} — station reports 0 fuel`);
+        rejected.add(candidate.poiId.toLowerCase());
+        continue;
       }
-    } catch {}
+    }
+
+    // Don't fly to a station we can't afford to reach — check the server route
+    // (unless we're already there, or we already validated it via checkRouteFuel).
+    if (candidate.systemId.toLowerCase() !== bot.system.toLowerCase() && !candidate.serverRoute) {
+      const check = await checkRouteFuel(ctx, candidate.systemId);
+      if (check.found && check.hasWormhole) {
+        ctx.log("system", `Route to ${candidate.poiName} uses a wormhole — skipping (bot cannot traverse it)`);
+        rejected.add(candidate.poiId.toLowerCase());
+        continue;
+      }
+      if (check.affordable === false) {
+        ctx.log("system", `Cannot afford route to ${candidate.poiName} (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — will retry further stations first`);
+        if (!unaffordableTarget) unaffordableTarget = { ...candidate, serverRoute: check.route };
+        rejected.add(candidate.poiId.toLowerCase());
+        continue;
+      }
+      candidate.serverRoute = check.route;
+    }
+
+    nearest = candidate;
   }
 
-  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
+  if (!nearest) {
+    if (unaffordableTarget) {
+      ctx.log("error", `No affordable approved refuel station reachable — falling back to furthest-possible target`);
+      nearest = unaffordableTarget;
+    } else {
+      ctx.log("error", "No approved refuel station reachable");
+      return false;
+    }
+  }
 
-  if (nearest.systemId !== bot.system) {
+  // A blacklist bypass is a last-resort escape from a blacklisted pocket: keep
+  // it bypassed for the route too, otherwise findRoute() returns null and the
+  // bot jumps blind or gets "stuck" again.
+  const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getSystemBlacklist());
+
+  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)${nearest.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
+
+  if (nearest.systemId.toLowerCase() !== bot.system.toLowerCase()) {
     await ensureUndocked(ctx);
-    let route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
-    // SANITY CHECK: findNearestStationSystem already told us how far the station
+    // Prefer the server-validated route (matches what return_home used: 10 jumps,
+    // 166 fuel available >= 50 needed). Fall back to the local map route.
+    let route: string[] | null = null;
+    if (nearest.serverRoute && nearest.serverRoute.length > 1) {
+      route = nearest.serverRoute.map(s => s.system_id);
+    } else {
+      route = mapStore.findRoute(bot.system, nearest.systemId, routeBlacklist);
+    }
+    // SANITY CHECK: findReachableFuelStation already told us how far the station
     // is (BFS hops over the same map). If the planned route is wildly longer,
     // the route is bogus (stale precalc entry / wormhole detour) and following
     // it on low fuel strands the bot half a map away. Never fly it.
     if (route && route.length - 1 > nearest.hops + 2) {
       ctx.log("error", `Planned route to ${nearest.systemId} is ${route.length - 1} jumps but the station is only ${nearest.hops} away — rejecting bogus route`);
-      route = mapStore.findRouteWithMode(bot.system, nearest.systemId, blacklist, false);
+      route = mapStore.findRouteWithMode(bot.system, nearest.systemId, routeBlacklist, false);
       if (route && route.length - 1 > nearest.hops + 2) {
         ctx.log("error", `Fallback route is still ${route.length - 1} jumps — refusing to burn fuel on it`);
         return await emergencyFuelRecovery(ctx);

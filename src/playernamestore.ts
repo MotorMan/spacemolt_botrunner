@@ -2,6 +2,7 @@ import { debugLogForBot } from "./debug.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { onPlayerNameUpdate } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
@@ -127,13 +128,15 @@ export class PlayerNameStore {
 
   /** Save full player info to disk */
   private saveFullPlayerInfo(): void {
-    try {
-      this.fullPlayerInfo.lastUpdated = new Date().toISOString();
-      writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo, null, 2), "utf-8");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[PlayerNameStore] Save full player info failed: ${msg}`);
-    }
+    perf.timeSync("playernamestore.saveFullPlayerInfo", () => {
+      try {
+        this.fullPlayerInfo.lastUpdated = new Date().toISOString();
+        writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo, null, 2), "utf-8");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[PlayerNameStore] Save full player info failed: ${msg}`);
+      }
+    });
   }
 
   /** Ensure data is loaded from disk (called lazily on first use) */
@@ -698,22 +701,24 @@ export class PlayerNameStore {
    * Save player names, pirates, and empire NPCs to disk.
    */
   private save(): void {
-    try {
-      const data = {
-        names: this.getAll(),
-        pirates: this.getAllPirates(),
-        empire_npcs: this.getAllEmpireNpcs(),
-        lastUpdated: new Date().toISOString(),
-        count: this.names.size,
-        pirate_count: this.pirates.size,
-        empire_npc_count: this.empireNpcs.size,
-      };
-      writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data, null, 2), "utf-8");
-      // debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[PlayerNameStore] Save failed: ${msg}`);
-    }
+    perf.timeSync("playernamestore.save", () => {
+      try {
+        const data = {
+          names: this.getAll(),
+          pirates: this.getAllPirates(),
+          empire_npcs: this.getAllEmpireNpcs(),
+          lastUpdated: new Date().toISOString(),
+          count: this.names.size,
+          pirate_count: this.pirates.size,
+          empire_npc_count: this.empireNpcs.size,
+        };
+        writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data, null, 2), "utf-8");
+        // debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[PlayerNameStore] Save failed: ${msg}`);
+      }
+    });
   }
 
   /**

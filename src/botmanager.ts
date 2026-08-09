@@ -819,7 +819,7 @@ function registerClientDisconnectHandlers(): void {
  * batched call (used by the watchdog). Intentionally-stopped bots are skipped.
  */
 async function reconnectDeadBots(ids?: string[]): Promise<void> {
-  const selected = getClerkConfig().bots;
+  const selected = perf.timeSync("botmanager.getClerkConfig", () => getClerkConfig()).bots;
   if (!selected.length) return;
 
   // Lazily (re)initialize clients from the configured keys so a bot added via a
@@ -833,7 +833,7 @@ async function reconnectDeadBots(ids?: string[]): Promise<void> {
   }
 
   const targets = (ids ?? selected).filter((id) => {
-    if (getStoppedState(id)) return false;
+    if (perf.timeSync("botmanager.getStoppedState", () => getStoppedState(id))) return false;
     if (!bots.has(id)) return false;
     // Library is already managing this account (cached, possibly mid-reconnect).
     // Let it do its in-place reconnect; do NOT open a competing connection.
@@ -996,7 +996,7 @@ export async function forceReconnectBot(id: string): Promise<void> {
  * untouched.
  */
 async function ensureSelectedBotsConnected(): Promise<void> {
-  const selected = getClerkConfig().bots;
+  const selected = perf.timeSync("botmanager.getClerkConfig", () => getClerkConfig()).bots;
   if (!selected.length) return;
 
   // First, breathe life back into any bot whose socket died but whose Bot
@@ -1067,7 +1067,7 @@ function startConnectionHealthMonitor(): ReturnType<typeof setInterval> {
       // Only running bots have a live routine that would otherwise mask a dead
       // socket behind "idle" — but a dead idle bot should also be revived so its
       // next Start/login works instantly. Cover both, skip stopped ones.
-      if (getStoppedState(bot.username)) continue;
+      if (perf.timeSync("botmanager.getStoppedState", () => getStoppedState(bot.username))) continue;
 
       const acct = bot.account;
       if (!acct) continue;

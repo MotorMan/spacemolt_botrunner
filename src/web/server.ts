@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeF
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
+import { perf } from "../perf.js";
 import { getBot, getTotalBandwidth, getDiscoveredBots } from "../botmanager.js";
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore } from "../mapstore.js";
@@ -2990,17 +2991,19 @@ if (!this.settings.fuel_service) {
   }
 
   private broadcast(data: unknown): void {
-    this.trackWsBytes(data);
-    const msg = JSON.stringify(data);
-    const dead: ServerWebSocket<WSData>[] = [];
-    for (const ws of this.clients) {
-      try {
-        ws.send(msg);
-      } catch {
-        dead.push(ws);
+    perf.timeSync("server.broadcast", () => {
+      this.trackWsBytes(data);
+      const msg = JSON.stringify(data);
+      const dead: ServerWebSocket<WSData>[] = [];
+      for (const ws of this.clients) {
+        try {
+          ws.send(msg);
+        } catch {
+          dead.push(ws);
+        }
       }
-    }
-    for (const ws of dead) this.clients.delete(ws);
+      for (const ws of dead) this.clients.delete(ws);
+    });
   }
 
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {

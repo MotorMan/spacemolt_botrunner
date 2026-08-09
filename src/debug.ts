@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from "fs";
 import { join } from "path";
+import { perf } from "./perf.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const LOGS_DIR = join(DATA_DIR, "logs");
@@ -159,8 +160,10 @@ export function debugLogForBot(botName: string, source: string, message: string,
   line += "\n";
   try {
     const botLogFile = join(LOGS_DIR, `${botName}_debug.log`);
-    appendFileSync(botLogFile, line);
-    rotateBotLog(botName);
+    perf.timeSync("debug.appendLine", () => {
+      appendFileSync(botLogFile, line);
+      rotateBotLog(botName);
+    });
   } catch {
     // ignore write errors
   }
@@ -177,14 +180,16 @@ export function logBotActivity(botName: string, category: string, message: strin
   const line = `${timestamp} [${botName}] [${category}] ${message}\n`;
   try {
     const botLogFile = join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`);
-    appendFileSync(botLogFile, line);
-    if (shouldRotateLog(botLogFile)) {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const rotatedPath = join(OLD_ACTIVITY_LOGS_DIR, `${botName}_activity_${ts}.log`);
-      try {
-        renameSync(botLogFile, rotatedPath);
-      } catch { /* ignore rotation errors */ }
-    }
+    perf.timeSync("debug.appendLine", () => {
+      appendFileSync(botLogFile, line);
+      if (shouldRotateLog(botLogFile)) {
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        const rotatedPath = join(OLD_ACTIVITY_LOGS_DIR, `${botName}_activity_${ts}.log`);
+        try {
+          renameSync(botLogFile, rotatedPath);
+        } catch { /* ignore rotation errors */ }
+      }
+    });
   } catch {
     // ignore write errors
   }

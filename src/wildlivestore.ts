@@ -2,6 +2,7 @@ import { debugLogForBot } from "./debug.js";
 import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
 import { onWildlifeUpdate } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 const CREATURES_DIR = join(process.cwd(), "data", "creatures");
 const LEGACY_WILDLIFE_FILE = join(process.cwd(), "data", "wildlifeInfo.json");
@@ -225,40 +226,42 @@ export class WildlifeStore {
     if (!system) system = "unknown";
     if (!poi) poi = "unknown";
 
-    const sys = this.loadSystem(system);
-    const list = (sys.pois[poi] = sys.pois[poi] || []);
+    return perf.timeSync("wildlivestore.add", () => {
+      const sys = this.loadSystem(system);
+      const list = (sys.pois[poi] = sys.pois[poi] || []);
 
-    const now = new Date().toISOString();
-    const existing = list.find((e) => e.n === normalized && e.h === maxHull);
+      const now = new Date().toISOString();
+      const existing = list.find((e) => e.n === normalized && e.h === maxHull);
 
-    let newType = false;
-    if (existing) {
-      if (creatureId && !existing.ids.includes(creatureId)) {
-        existing.ids.push(creatureId);
+      let newType = false;
+      if (existing) {
+        if (creatureId && !existing.ids.includes(creatureId)) {
+          existing.ids.push(creatureId);
+        }
+        existing.seen = now;
+        if (species) existing.s = species;
+        if (role) existing.r = role;
+      } else {
+        list.push({
+          n: normalized,
+          h: maxHull || 0,
+          s: species || "",
+          r: role || "",
+          ids: creatureId ? [creatureId] : [],
+          seen: now,
+        });
+        newType = true;
       }
-      existing.seen = now;
-      if (species) existing.s = species;
-      if (role) existing.r = role;
-    } else {
-      list.push({
-        n: normalized,
-        h: maxHull || 0,
-        s: species || "",
-        r: role || "",
-        ids: creatureId ? [creatureId] : [],
-        seen: now,
-      });
-      newType = true;
-    }
 
-    sys.lastUpdated = now;
-    this.writeSystemFile(sys);
-    void onWildlifeUpdate({ system: sys.system, data: sys });
+      sys.lastUpdated = now;
+      this.writeSystemFile(sys);
+      void onWildlifeUpdate({ system: sys.system, data: sys });
 
-    if (newType) {
-      debugLogForBot(this._botName || "unknown", "wildlife:add", `${this._botName || "unknown"}`, `Added wildlife: "${name}" (${species}) in ${system}/${poi}`);
-    }
-    return newType;
+      if (newType) {
+        debugLogForBot(this._botName || "unknown", "wildlife:add", `${this._botName || "unknown"}`, `Added wildlife: "${name}" (${species}) in ${system}/${poi}`);
+      }
+      return newType;
+    });
   }
 
   private *iterateEntries(): Generator<{ system: string; poi: string; entry: CreatureEntry }> {

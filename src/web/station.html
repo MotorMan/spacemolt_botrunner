@@ -591,6 +591,7 @@
     upgrades: {},
     catCache: {},
     itemCatalog: null,        // id -> { name }
+    facilityCatalog: null,    // id -> facility def (incl. ammo_item)
     consumableInv: null,      // { items, storage, factionStorage }
     consumableData: null,     // computed { rows, allGood, contributing }
     buildCategory: "service",
@@ -1221,12 +1222,14 @@
       await loadFacilities();
     }
     try {
-      if (!detailState.itemCatalog) {
+      if (!detailState.itemCatalog || !detailState.facilityCatalog) {
         const c = await (await fetch("/api/catalog")).json();
         detailState.itemCatalog = c.items || {};
+        detailState.facilityCatalog = c.facilities || {};
       }
     } catch {
       detailState.itemCatalog = {};
+      detailState.facilityCatalog = {};
     }
 
     // Ensure catalog cache for each facility type is warm.
@@ -1257,8 +1260,23 @@
       });
     });
 
+    // Sum weapon-ammo requirements from active defense facilities. A defense
+    // facility goes silent/unarmed if its ammo box is empty, so we track it even
+    // though there's no per-round burn to estimate a depletion time from.
+    const ammo = {};
+    const ammoContributing = [];
+    (detailState.facilities || []).forEach((fac) => {
+      if (!isFacilityActive(fac)) return;
+      const id = fac.facility_type || fac.type || fac.id;
+      const cat = detailState.facilityCatalog && detailState.facilityCatalog[id];
+      const ammoItem = cat && cat.ammo_item;
+      if (!ammoItem) return;
+      ammo[ammoItem] = (ammo[ammoItem] || 0) + 1;
+      ammoContributing.push(fac.name || id || "?");
+    });
+
     detailState.consumableInv = inv;
-    detailState.consumableData = { totals, contributing, inv };
+    detailState.consumableData = { totals, ammo, contributing, ammoContributing, inv };
   }
 
   function renderConsumables() {
@@ -1266,17 +1284,18 @@
     if (!el) return;
     const data = detailState.consumableData;
     if (!data) return;
-    const { totals, contributing, inv } = data;
+    const { totals, ammo, contributing, ammoContributing, inv } = data;
 
-    if (Object.keys(totals).length === 0) {
-      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance requirements.</div>';
+    const ammoKeys = Object.keys(ammo || {});
+    if (Object.keys(totals).length === 0 && ammoKeys.length === 0) {
+      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance or ammo requirements.</div>';
       return;
     }
 
     let allGood = true;
     // Maintenance is checked every 100 ticks, but consumables are only actually
     // withdrawn once per 1000 ticks — so the real burn cycle is 1000 ticks.
-    // 1 tick = 10s real time.
+    // 1 tick = 10s real time. Ammo rows have no ETA (no per-round burn).
     const SECS_PER_CYCLE = 1000 * 10;
     const fmtDuration = (secs) => {
       if (secs === Infinity) return "—";
@@ -1290,41 +1309,53 @@
       return `${s}s`;
     };
 
-    const rows = Object.entries(totals)
+    const rowFor = (itemId, need, isAmmo) => {
+      const have =
+        (inv.items[itemId] || 0) +
+        (inv.storage[itemId] || 0) +
+        (inv.factionStorage[itemId] || 0);
+      const ok = have >= need;
+      if (!ok) allGood = false;
+      const color = ok ? "var(--secondary-fixed-dim)" : "var(--error)";
+      const cyclesLeft = need > 0 ? have / need : Infinity;
+      const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+      const depletion = isAmmo
+        ? "—"
+        : (have <= 0
+          ? "depleted"
+          : need <= 0
+            ? "—"
+            : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`);
+      const tag = isAmmo ? ' <span class="cons-tag">AMMO</span>' : "";
+      return `<tr>
+        <td class="cons-item">${esc(itemName(itemId))}${tag}</td>
+        <td class="cons-id">${esc(itemId)}</td>
+        <td class="cons-num">${num(need)}</td>
+        <td class="cons-num" style="color:${color}">${num(have)}</td>
+        <td class="cons-num" style="color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+        <td class="cons-eta">${depletion}</td>
+      </tr>`;
+    };
+
+    const maintRows = Object.entries(totals)
       .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([itemId, need]) => {
-        const have =
-          (inv.items[itemId] || 0) +
-          (inv.storage[itemId] || 0) +
-          (inv.factionStorage[itemId] || 0);
-        const ok = have >= need;
-        if (!ok) allGood = false;
-        const color = ok ? "var(--secondary-fixed-dim)" : "var(--error)";
-        const cyclesLeft = need > 0 ? have / need : Infinity;
-        const secsLeft = cyclesLeft * SECS_PER_CYCLE;
-        const depletion =
-          have <= 0
-            ? "depleted"
-            : need <= 0
-              ? "—"
-              : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`;
-        return `<tr>
-          <td class="cons-item">${esc(itemName(itemId))}</td>
-          <td class="cons-id">${esc(itemId)}</td>
-          <td class="cons-num">${num(need)}</td>
-          <td class="cons-num" style="color:${color}">${num(have)}</td>
-          <td class="cons-num" style="color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
-          <td class="cons-eta">${depletion}</td>
-        </tr>`;
-      })
+      .map(([itemId, need]) => rowFor(itemId, need, false))
+      .join("");
+
+    const ammoRows = ammoKeys
+      .sort((a, b) => a.localeCompare(b))
+      .map((itemId) => rowFor(itemId, ammo[itemId], true))
       .join("");
 
     const summary = allGood
-      ? '<div class="cons-summary ok">✓ All maintenance inputs satisfied for this round.</div>'
-      : '<div class="cons-summary bad">✗ Some maintenance inputs are short — facilities will not run this round without them.</div>';
+      ? '<div class="cons-summary ok">✓ All station requirements satisfied.</div>'
+      : '<div class="cons-summary bad">✗ Some station requirements are short — facilities will not run or defenses will be unarmed without them.</div>';
 
     const contribHtml = contributing.length
-      ? `<div class="cons-contrib">Contributing facilities: ${contributing.map((c) => esc(c.name)).join(", ")}</div>`
+      ? `<div class="cons-contrib">Maintenance from: ${contributing.map((c) => esc(c.name)).join(", ")}</div>`
+      : "";
+    const ammoHtml = ammoContributing.length
+      ? `<div class="cons-contrib">Ammo for: ${ammoContributing.map((c) => esc(c)).join(", ")}</div>`
       : "";
 
     el.innerHTML = `
@@ -1334,16 +1365,17 @@
           <tr>
             <th>Item</th>
             <th>ID</th>
-            <th class="cons-num">Need/round</th>
+            <th class="cons-num">Need</th>
             <th class="cons-num">You have</th>
             <th class="cons-num">Status</th>
             <th class="cons-eta">Est. until depletion</th>
           </tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody>${maintRows}${ammoRows}</tbody>
       </table>
-      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing.</div>
+      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Ammo rows show no depletion estimate — they only flag whether ammo is present (not 0).</div>
       ${contribHtml}
+      ${ammoHtml}
     `;
   }
 

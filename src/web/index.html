@@ -23224,9 +23224,26 @@ When responding:
           });
         });
 
-        if (Object.keys(totals).length === 0) {
+        // 3b) Sum weapon-ammo requirements from active defense facilities. A
+        // defense facility goes silent/unarmed if its ammo box is empty, so we
+        // track it too (no per-round burn → no depletion estimate).
+        const ammo = {};
+        const ammoContributing = [];
+        (stationFacilitiesData || []).forEach((fac) => {
+          const active = fac.status === "active" || fac.active === true;
+          if (!active) return;
+          const id = fac.facility_type || fac.type || fac.id;
+          const cat = resolveStationCatalog(fac);
+          const ammoItem = cat && cat.ammo_item;
+          if (!ammoItem) return;
+          ammo[ammoItem] = (ammo[ammoItem] || 0) + 1;
+          ammoContributing.push(fac.name || id || "?");
+        });
+
+        const ammoKeys = Object.keys(ammo);
+        if (Object.keys(totals).length === 0 && ammoKeys.length === 0) {
           container.innerHTML =
-            '<div class="faction-no-data">No active station facilities with maintenance requirements.</div>';
+            '<div class="faction-no-data">No active station facilities with maintenance or ammo requirements.</div>';
           return;
         }
 
@@ -23248,45 +23265,61 @@ When responding:
           if (m > 0) return `${m}m ${s}s`;
           return `${s}s`;
         };
-        const rows = Object.entries(totals)
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([itemId, need]) => {
-            const have =
-              (inv.items[itemId] || 0) +
-              (inv.storage[itemId] || 0) +
-              (inv.factionStorage[itemId] || 0);
-            const ok = have >= need;
-            if (!ok) allGood = false;
-            const haveStr = num(have);
-            const color = ok ? "var(--green)" : "var(--red)";
-            // Estimate until depletion at the current per-cycle burn. Excess stock
-            // (have above this round's need) is consumed first, then it goes short.
-            const cyclesLeft = need > 0 ? have / need : Infinity;
-            const secsLeft = cyclesLeft * SECS_PER_CYCLE;
-            const depletion =
-              have <= 0
-                ? "depleted"
-                : need <= 0
-                  ? "—"
-                  : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`;
-            return `<tr>
-          <td style="padding:4px 8px">${esc(catalogName(itemId))}</td>
+        const rowFor = (itemId, need, isAmmo) => {
+          const have =
+            (inv.items[itemId] || 0) +
+            (inv.storage[itemId] || 0) +
+            (inv.factionStorage[itemId] || 0);
+          const ok = have >= need;
+          if (!ok) allGood = false;
+          const haveStr = num(have);
+          const color = ok ? "var(--green)" : "var(--red)";
+          // Estimate until depletion at the current per-cycle burn. Excess stock
+          // (have above this round's need) is consumed first, then it goes short.
+          const cyclesLeft = need > 0 ? have / need : Infinity;
+          const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+          const depletion = isAmmo
+            ? "—"
+            : (have <= 0
+              ? "depleted"
+              : need <= 0
+                ? "—"
+                : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`);
+          const tag = isAmmo
+            ? ' <span style="font-size:9px;color:var(--text-dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;margin-left:4px">AMMO</span>'
+            : "";
+          return `<tr>
+          <td style="padding:4px 8px">${esc(catalogName(itemId))}${tag}</td>
           <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim)">${esc(itemId)}</td>
           <td style="padding:4px 8px;text-align:right;font-weight:600">${num(need)}</td>
           <td style="padding:4px 8px;text-align:right;color:${color}">${haveStr}</td>
           <td style="padding:4px 8px;text-align:right;color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
           <td style="padding:4px 8px;text-align:right;color:var(--text-dim);font-size:11px">${depletion}</td>
         </tr>`;
-          })
+        };
+
+        const rows = Object.entries(totals)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([itemId, need]) => rowFor(itemId, need, false))
+          .join("");
+
+        const ammoRows = ammoKeys
+          .sort((a, b) => a.localeCompare(b))
+          .map((itemId) => rowFor(itemId, ammo[itemId], true))
           .join("");
 
         const summary = allGood
-          ? '<div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ All maintenance inputs satisfied for this round.</div>'
-          : '<div style="color:var(--red);font-weight:600;margin-bottom:8px">✗ Some maintenance inputs are short — facilities will not run this round without them.</div>';
+          ? '<div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ All station requirements satisfied.</div>'
+          : '<div style="color:var(--red);font-weight:600;margin-bottom:8px">✗ Some station requirements are short — facilities will not run or defenses will be unarmed without them.</div>';
 
         const contribHtml = contributing.length
-          ? `<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Contributing facilities: ${contributing
+          ? `<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Maintenance from: ${contributing
               .map((c) => esc(c.name))
+              .join(", ")}</div>`
+          : "";
+        const ammoHtml = ammoContributing.length
+          ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">Ammo for: ${ammoContributing
+              .map((c) => esc(c))
               .join(", ")}</div>`
           : "";
 
@@ -23297,16 +23330,17 @@ When responding:
           <tr style="border-bottom:1px solid var(--border);color:var(--text-dim)">
             <th style="padding:4px 8px;text-align:left">Item</th>
             <th style="padding:4px 8px;text-align:left">ID</th>
-            <th style="padding:4px 8px;text-align:right">Need/round</th>
+            <th style="padding:4px 8px;text-align:right">Need</th>
             <th style="padding:4px 8px;text-align:right">You have</th>
             <th style="padding:4px 8px;text-align:right">Status</th>
             <th style="padding:4px 8px;text-align:right">Est. until depletion</th>
           </tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody>${rows}${ammoRows}</tbody>
       </table>
-       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Refresh after delivering items.</div>
+       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Ammo rows show no depletion estimate — they only flag whether ammo is present (not 0). Refresh after delivering items.</div>
       ${contribHtml}
+      ${ammoHtml}
     `;
       }
 

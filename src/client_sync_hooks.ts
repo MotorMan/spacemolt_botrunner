@@ -1,6 +1,7 @@
 import { type SyncEventType } from "./client_sync_types.js";
 import type { MarketQueryRequest, MarketQueryResult } from "./client_sync_types.js";
 import { getLocalMarketStatus, queryLocalMarket, type LocalMarketStatus } from "./market_local_source.js";
+import { perf } from "./perf.js";
 
 type PushFn = (type: SyncEventType, payload: Record<string, unknown>) => Promise<void>;
 
@@ -68,7 +69,9 @@ export async function onRescueUpdate(type: "queue" | "blackbook", data: unknown)
 }
 
 export async function onWildlifeUpdate(data: unknown): Promise<void> {
-  await _fire("wildlife", { data: JSON.parse(JSON.stringify(data)) });
+  await perf.timeAsync("wildlivestore.onWildlifeUpdate", async () => {
+    await _fire("wildlife", { data: JSON.parse(JSON.stringify(data)) });
+  });
 }
 
 /**

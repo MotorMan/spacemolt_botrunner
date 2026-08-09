@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import { perf } from "../perf.js";
 import { marketStreamStore } from "../marketstreamstore.js";
 import { mapStore } from "../mapstore.js";
 import {
@@ -66,60 +67,69 @@ function saveItemsToMarketDetails(
   stationName: string,
   items: Array<Record<string, unknown>>,
 ): void {
-  const marketDetails = loadMarketDetails();
-  let detailsUpdated = false;
-  const observations: Array<{
-    itemId: string;
-    itemName: string;
-    buyOrders: MarketOrderDetail[];
-    sellOrders: MarketOrderDetail[];
-  }> = [];
+  // Measure only the (disk-bound) load + parse + rewrite of marketDetails.json.
+  // The in-memory overlay publish (`noteLocalMarketObservation`) is kept outside
+  // the timer so it doesn't inflate the FS cost measurement.
+  const observations = perf.timeSync("market.saveItemsToMarketDetails", () => {
+    const marketDetails = loadMarketDetails();
+    let detailsUpdated = false;
+    const obs: Array<{
+      itemId: string;
+      itemName: string;
+      buyOrders: MarketOrderDetail[];
+      sellOrders: MarketOrderDetail[];
+    }> = [];
 
-  for (const item of items) {
-    const itemId = (item.item_id as string) || (item.id as string) || "";
-    const itemName = (item.name as string) || (item.item_name as string) || itemId;
-    if (!itemId) continue;
+    for (const item of items) {
+      const itemId = (item.item_id as string) || (item.id as string) || "";
+      const itemName = (item.name as string) || (item.item_name as string) || itemId;
+      if (!itemId) continue;
 
-    const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order) => ({
-      price: (order.price_each as number) || (order.price as number) || 0,
-      quantity: (order.quantity as number) || 0,
-    })).filter((order) => order.price > 0 && order.quantity > 0);
+      const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order) => ({
+        price: (order.price_each as number) || (order.price as number) || 0,
+        quantity: (order.quantity as number) || 0,
+      })).filter((order) => order.price > 0 && order.quantity > 0);
 
-    const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map((order) => ({
-      price: (order.price_each as number) || (order.price as number) || 0,
-      quantity: (order.quantity as number) || 0,
-    })).filter((order) => order.price > 0 && order.quantity > 0);
+      const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map((order) => ({
+        price: (order.price_each as number) || (order.price as number) || 0,
+        quantity: (order.quantity as number) || 0,
+      })).filter((order) => order.price > 0 && order.quantity > 0);
 
-    const existingIndex = marketDetails.items.findIndex(
-      (m) => m.systemId === systemId && m.stationPoiId === stationPoiId && m.itemId === itemId,
-    );
+      const existingIndex = marketDetails.items.findIndex(
+        (m) => m.systemId === systemId && m.stationPoiId === stationPoiId && m.itemId === itemId,
+      );
 
-    const marketItemDetail: MarketItemDetails = {
-      systemId,
-      stationPoiId,
-      stationName,
-      itemId,
-      itemName,
-      buyOrders,
-      sellOrders,
-      lastUpdated: now(),
-    };
+      const marketItemDetail: MarketItemDetails = {
+        systemId,
+        stationPoiId,
+        stationName,
+        itemId,
+        itemName,
+        buyOrders,
+        sellOrders,
+        lastUpdated: now(),
+      };
 
-    if (existingIndex >= 0) {
-      marketDetails.items[existingIndex] = marketItemDetail;
-    } else {
-      marketDetails.items.push(marketItemDetail);
+      if (existingIndex >= 0) {
+        marketDetails.items[existingIndex] = marketItemDetail;
+      } else {
+        marketDetails.items.push(marketItemDetail);
+      }
+
+      obs.push({ itemId, itemName, buyOrders, sellOrders });
+      detailsUpdated = true;
     }
 
-    observations.push({ itemId, itemName, buyOrders, sellOrders });
-    detailsUpdated = true;
-  }
+    if (detailsUpdated) {
+      saveMarketDetails(marketDetails);
+    }
+    return detailsUpdated ? obs : [];
+  });
 
-  if (detailsUpdated) {
-    saveMarketDetails(marketDetails);
-    // Publish to the in-memory overlay too, so routines in this process see
-    // these prices immediately instead of waiting for the (throttled) re-parse
-    // of the 10MB marketDetails.json.
+  // Publish to the in-memory overlay too, so routines in this process see
+  // these prices immediately instead of waiting for the (throttled) re-parse
+  // of the 10MB marketDetails.json.
+  if (observations.length) {
     noteLocalMarketObservation(systemId, stationPoiId, stationName, observations);
   }
 }

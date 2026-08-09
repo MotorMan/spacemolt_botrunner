@@ -16,6 +16,7 @@
  */
 
 import { monitorEventLoopDelay, type Histogram } from "node:perf_hooks";
+import { getHeapStatistics } from "node:v8";
 
 export interface EventLoopStats {
   meanMs: number;
@@ -41,6 +42,25 @@ export interface RoutineStat {
   ticks: number;
 }
 
+/** A single synchronously-executed call that exceeded the stall threshold. */
+export interface StallRecord {
+  name: string;
+  wallMs: number;
+  cpuMs: number;
+  ts: number;
+  heapUsed: number;
+  rss: number;
+}
+
+export interface MemoryStat {
+  rss: number;
+  heapTotal: number;
+  heapUsed: number;
+  external: number;
+  arrayBuffers: number;
+  heapSizeLimit: number;
+}
+
 export interface PerfSnapshot {
   /** Wall-clock time this snapshot was taken. */
   ts: number;
@@ -51,7 +71,22 @@ export interface PerfSnapshot {
   eventLoop: EventLoopStats;
   hotFunctions: HotFunctionStat[];
   routines: RoutineStat[];
+  /** Heap/memory snapshot at the end of the window. */
+  memory: MemoryStat;
+  /** `memory.heapUsed` delta vs the previous window's snapshot (bytes). */
+  memDeltaHeapUsed: number;
+  /** Synchronous calls in this window whose wall time breached the threshold. */
+  stalls: StallRecord[];
+  /** True when the event-loop stall is NOT explained by a captured sync op,
+   * suggesting a GC pause correlated with a heap drop in this window. */
+  suspectedGcStall: boolean;
 }
+
+/** Wall time (ms) above which a call is recorded as a stall candidate. */
+const STALL_THRESHOLD_MS = 250;
+
+/** Max number of stall records kept per window (kept bounded for jsonl size). */
+const MAX_STALLS_PER_WINDOW = 20;
 
 interface SpanAcc {
   wallMs: number;
@@ -75,6 +110,10 @@ let activePlayers = 0;
 
 const spans = new Map<string, SpanAcc>();
 const routines = new Map<string, RoutineAcc>();
+const stalls: StallRecord[] = [];
+
+/** Heap used (bytes) captured at the previous snapshot, for delta math. */
+let lastHeapUsed: number | null = null;
 
 function roundMs(v: number): number {
   return Math.round(v * 100) / 100;
@@ -102,6 +141,8 @@ export function setEnabled(v: boolean): void {
     windowStart = Date.now();
     spans.clear();
     routines.clear();
+    stalls.length = 0;
+    lastHeapUsed = null;
   } else {
     if (elHistogram) {
       try { elHistogram.disable(); } catch { /* ignore */ }
@@ -127,6 +168,21 @@ function recordSpan(name: string, wallMs: number, cpuMs: number): void {
   acc.wallMs += wallMs;
   acc.cpuMs += cpuMs;
   if (wallMs > acc.maxMs) acc.maxMs = wallMs;
+
+  // Capture stalls (slow synchronously-blocking calls) for attribution. Bounded
+  // here is unnecessary: we only keep the top MAX_STALLS_PER_WINDOW at snapshot
+  // time. Sampling every over-threshold call keeps the attribution honest.
+  if (wallMs >= STALL_THRESHOLD_MS) {
+    const mem = process.memoryUsage();
+    stalls.push({
+      name,
+      wallMs: roundMs(wallMs),
+      cpuMs: roundMs(cpuMs),
+      ts: Date.now(),
+      heapUsed: mem.heapUsed,
+      rss: mem.rss,
+    });
+  }
 }
 
 /**
@@ -197,9 +253,9 @@ export function markRoutineTick(botName: string, routineName: string, cpuMs: num
 
 /**
  * Return the accumulated metrics for the window since the last call and reset
- * the window accumulators. The event-loop histogram is read (but not reset) so
- * its lag stats reflect the whole enabled period. Returns `null` when nothing
- * was recorded in the window (so the sampler can skip empty rows).
+ * the window accumulators. The event-loop histogram is read and **reset** so its
+ * lag stats are genuinely *per-window* (not lifetime). Returns `null` when
+ * nothing was recorded in the window (so the sampler can skip empty rows).
  */
 export function snapshotAndReset(): PerfSnapshot | null {
   const now = Date.now();
@@ -215,6 +271,40 @@ export function snapshotAndReset(): PerfSnapshot | null {
         maxMs: roundMs(el.max / 1e6),
       }
     : { meanMs: 0, p50Ms: 0, p95Ms: 0, p99Ms: 0, maxMs: 0 };
+
+  // Reset the histogram so the next snapshot starts a fresh *per-window* window
+  // (it was previously never reset, making every stat a lifetime aggregate).
+  if (el) el.reset();
+
+  // Memory snapshot (process + v8 heap limits) for GC/delta correlation.
+  const mem = process.memoryUsage();
+  const heap = getHeapStatistics();
+  const memDeltaHeapUsed =
+    lastHeapUsed === null ? 0 : mem.heapUsed - lastHeapUsed;
+  const memory: MemoryStat = {
+    rss: mem.rss,
+    heapTotal: mem.heapTotal,
+    heapUsed: mem.heapUsed,
+    external: mem.external,
+    arrayBuffers: mem.arrayBuffers,
+    heapSizeLimit: heap.heap_size_limit,
+  };
+  lastHeapUsed = mem.heapUsed;
+
+  // Keep only the top MAX_STALLS_PER_WINDOW stalls by wall time, then clear.
+  const windowStalls = stalls
+    .sort((a, b) => b.wallMs - a.wallMs)
+    .slice(0, MAX_STALLS_PER_WINDOW);
+  const totalStallMs = windowStalls.reduce((s, r) => s + r.wallMs, 0);
+  stalls.length = 0;
+
+  // Heuristic: a large event-loop stall that is NOT explained by any captured
+  // synchronous op, paired with a heap drop, points at a GC pause rather than a
+  // slow file write. Correlation hint only — intentionally fuzzy.
+  const suspectedGcStall =
+    eventLoop.maxMs >= STALL_THRESHOLD_MS &&
+    totalStallMs < eventLoop.maxMs * 0.5 &&
+    memDeltaHeapUsed < 0;
 
   const hotFunctions: HotFunctionStat[] = [...spans.entries()]
     .map(([name, a]) => ({
@@ -251,6 +341,10 @@ export function snapshotAndReset(): PerfSnapshot | null {
     eventLoop,
     hotFunctions,
     routines: routineSnaps,
+    memory,
+    memDeltaHeapUsed,
+    stalls: windowStalls,
+    suspectedGcStall,
   };
 }
 

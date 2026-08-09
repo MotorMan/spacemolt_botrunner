@@ -585,6 +585,7 @@ pre.snap {
 .cons-id { font-family: var(--font-data); color: var(--on-surface-variant); font-size: 11px; }
 .cons-num { text-align: right; font-family: var(--font-data); font-weight: 600; }
 .cons-eta { text-align: right; font-family: var(--font-data); font-size: 11px; color: var(--on-surface-variant); }
+.cons-tag { font-size: 9px; font-family: var(--font-data); color: var(--on-surface-variant); border: 1px solid var(--outline-variant); border-radius: 3px; padding: 0 4px; margin-left: 4px; vertical-align: middle; }
 .cons-foot { margin-top: 8px; font-size: 10px; color: var(--on-surface-variant); }
 .cons-contrib { margin-top: 10px; font-size: 11px; color: var(--on-surface-variant); font-family: var(--font-data); }
 

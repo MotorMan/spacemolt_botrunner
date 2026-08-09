@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { dirname, join, normalize, relative } from "path";
+import { perf } from "./perf.js";
 
 /**
  * File-based client sync.
@@ -84,40 +85,42 @@ function readFileForHash(absPath: string): { content: string; hash: string; mtim
 
 /** List every file in the sync set under `dataDir`. */
 export function listSyncedFiles(dataDir: string): FileEntry[] {
-  const out: FileEntry[] = [];
-  if (!existsSync(dataDir)) return out;
+  return perf.timeSync("client_sync.listSyncedFiles", () => {
+    const out: FileEntry[] = [];
+    if (!existsSync(dataDir)) return out;
 
-  // Top-level .json files.
-  for (const name of readdirSync(dataDir)) {
-    const abs = join(dataDir, name);
-    let st;
-    try { st = statSync(abs); } catch { continue; }
-    if (!st.isFile()) continue;
-    if (EXCLUDE_TOPLEVEL.has(name)) continue;
-    if (extOf(name) !== ".json") continue;
-    const r = readFileForHash(abs);
-    if (r) out.push({ path: name, mtime: r.mtime, size: r.size, hash: r.hash });
-  }
-
-  // Included subdirectories (one level deep).
-  for (const sub of INCLUDE_SUBDIRS) {
-    const subAbs = join(dataDir, sub);
-    if (!existsSync(subAbs)) continue;
-    let entries: string[];
-    try { entries = readdirSync(subAbs); } catch { continue; }
-    for (const name of entries) {
-      const abs = join(subAbs, name);
+    // Top-level .json files.
+    for (const name of readdirSync(dataDir)) {
+      const abs = join(dataDir, name);
       let st;
       try { st = statSync(abs); } catch { continue; }
       if (!st.isFile()) continue;
-      if (EXCLUDE_EXT.has(extOf(name))) continue;
+      if (EXCLUDE_TOPLEVEL.has(name)) continue;
+      if (extOf(name) !== ".json") continue;
       const r = readFileForHash(abs);
-      if (r) out.push({ path: `${sub}/${name}`, mtime: r.mtime, size: r.size, hash: r.hash });
+      if (r) out.push({ path: name, mtime: r.mtime, size: r.size, hash: r.hash });
     }
-  }
 
-  out.sort((a, b) => a.path.localeCompare(b.path));
-  return out;
+    // Included subdirectories (one level deep).
+    for (const sub of INCLUDE_SUBDIRS) {
+      const subAbs = join(dataDir, sub);
+      if (!existsSync(subAbs)) continue;
+      let entries: string[];
+      try { entries = readdirSync(subAbs); } catch { continue; }
+      for (const name of entries) {
+        const abs = join(subAbs, name);
+        let st;
+        try { st = statSync(abs); } catch { continue; }
+        if (!st.isFile()) continue;
+        if (EXCLUDE_EXT.has(extOf(name))) continue;
+        const r = readFileForHash(abs);
+        if (r) out.push({ path: `${sub}/${name}`, mtime: r.mtime, size: r.size, hash: r.hash });
+      }
+    }
+
+    out.sort((a, b) => a.path.localeCompare(b.path));
+    return out;
+  });
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {

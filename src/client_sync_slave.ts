@@ -228,8 +228,11 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     const data = await this.request<Record<string, unknown>>("/api/client-sync/wildlife");
     if (data && typeof data === "object" && "systems" in data) {
       wildlifeStore.mergeFrom(data as any);
-      const counts = wildlifeStore.getCounts();
-      this.log(`Updated wildlife: ${counts.creatures} types across ${counts.systems} systems`);
+      // Count from the payload, not from the store: the store now reads cold
+      // systems from disk on demand, so getCounts() would re-scan every file
+      // on every sync cycle just to produce this log line.
+      const systems = Object.keys((data as { systems?: Record<string, unknown> }).systems || {}).length;
+      this.log(`Merged wildlife from master: ${systems} system(s)`);
     }
   }
 

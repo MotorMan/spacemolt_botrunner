@@ -192,7 +192,7 @@ export function mergeIntoFile(dataDir: string, relPath: string, incoming: string
     }
   }
 
-  const out = JSON.stringify(current, null, 2) + "\n";
+  const out = JSON.stringify(current) + "\n";
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, out, "utf-8");
   return hashContent(out);
@@ -210,7 +210,7 @@ export function seedIntoFile(dataDir: string, relPath: string, content: string):
     const existing = readFileForHash(abs);
     return existing ? existing.hash : null;
   }
-  const out = JSON.stringify(safeParse(content) ?? content, null, 2) + "\n";
+  const out = JSON.stringify(safeParse(content) ?? content) + "\n";
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, out, "utf-8");
   return hashContent(out);

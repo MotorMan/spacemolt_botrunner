@@ -1289,9 +1289,24 @@ async function travelToPoiWithSurvey(
   poiId: string,
   poiName: string,
   isHidden: boolean,
+  targetSystemId?: string,
+  navOpts?: { fuelThresholdPct: number; hullThresholdPct: number },
 ): Promise<{ success: boolean; error?: string }> {
   const { bot } = ctx;
   
+  // Determine which system the target POI actually lives in. A hidden POI is
+  // only discoverable (and only travelable) from within its OWN system, so we
+  // must survey that system — not wherever the bot happens to be right now.
+  async function resolveTargetSystem(): Promise<string | undefined> {
+    if (targetSystemId) return targetSystemId;
+    try {
+      const poiInfo = await bot.exec("get_poi", { poi_id: poiId });
+      const sys = (poiInfo?.result as any)?.system_id || (poiInfo?.result as any)?.poi?.system_id;
+      if (sys) return sys;
+    } catch { /* fall through to current system */ }
+    return undefined;
+  }
+
   // First attempt to travel
   const travelResp = await runLibCommand(bot.commands.spacemolt.travel({ id: poiId }));
 
@@ -1335,13 +1350,28 @@ async function travelToPoiWithSurvey(
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       return { success: false, error: travelResp.error.message };
     }
-    
-    // Survey the system to reveal the hidden POI
+
+    // A hidden POI only exists in ITS OWN system. If the bot is currently in a
+    // different system (e.g. it got pulled away chasing another target), surveying
+    // the wrong system would never reveal the POI. Resolve the real system and
+    // jump there first so the survey actually finds it.
+    const poiSystem = await resolveTargetSystem();
+    if (poiSystem && bot.system !== poiSystem) {
+      ctx.log("mining", `Hidden POI ${poiName} lives in ${poiSystem} but we are in ${bot.system} — jumping there to scan`);
+      const arrived = await navigateToSystem(ctx, poiSystem, navOpts ?? { fuelThresholdPct: 40, hullThresholdPct: 30 });
+      if (!arrived) {
+        ctx.log("error", `Failed to reach ${poiSystem} to scan for hidden POI ${poiName}`);
+        return { success: false, error: "failed to reach target system" };
+      }
+      await bot.refreshLocation();
+    }
+
+    // Survey the (correct) system to reveal the hidden POI
     const surveySuccess = await surveySystemForHiddenPois(ctx);
     if (!surveySuccess) {
       return { success: false, error: "survey failed" };
     }
-    
+
     // Retry travel after survey
     ctx.log("mining", `Retrying travel to hidden POI ${poiName} after survey...`);
     const retryResp = await runLibCommand(bot.commands.spacemolt.travel({ id: poiId }));
@@ -4345,6 +4375,31 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
     }
 
     if (!miningPoi) {
+      // Deep core miners may be chasing a hidden POI that only exists as 2nd-hand
+      // intel (e.g. faction intel). Such a POI is NOT returned by get_system until
+      // the system is actually surveyed, so it looks "missing/depleted" and the bot
+      // would wrongly wander off to chase another target. Survey the current system
+      // FIRST to discover the hidden POI before giving up on our real target.
+      if (effectiveTarget && isDeepCoreOre(effectiveTarget) && targetPoiId && targetSystemId &&
+          bot.system === targetSystemId && deepCoreCap.canMineHidden) {
+        ctx.log("mining", `Deep core target ${targetPoiName || targetPoiId} is a hidden POI not yet visible in ${bot.system} — surveying to discover it before searching elsewhere`);
+        const discovered = await surveySystemForHiddenPois(ctx);
+        if (discovered) {
+          const checkResp = await bot.exec("get_poi", { poi_id: targetPoiId });
+          const scan = checkResp?.result as any;
+          const resources = Array.isArray(scan?.resources) ? scan.resources : [];
+          const hasTarget = resources.some((r: any) => r.resource_id === effectiveTarget);
+          if (hasTarget) {
+            miningPoi = { id: targetPoiId, name: targetPoiName || targetPoiId };
+            ctx.log("mining", `Discovered hidden deep core target ${miningPoi.name} via survey — proceeding to mine`);
+          } else {
+            ctx.log("mining", `Surveyed ${bot.system} but ${targetPoiId} does not contain ${effectiveTarget} — falling back to alternative search`);
+          }
+        } else {
+          ctx.log("warn", `Survey to discover ${targetPoiName || targetPoiId} failed — falling back to alternative search`);
+        }
+      }
+
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
@@ -4732,7 +4787,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
     ctx.log("mining", `Current actual location before travel: ${actualPoi || "(none)"}`);
     if (!bot.poi || bot.poi !== miningPoi.id) {
       // Use the new travel function that handles hidden POI discovery
-      const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi);
+      const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi, targetSystemId || undefined, safetyOpts);
 
       if (!travelResult.success) {
         ctx.log("error", `Travel to mining location failed: ${travelResult.error}`);
@@ -4936,7 +4991,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
         ctx.log("mining", `DEEP CORE VERIFICATION FAILURE: actually at ${realCurrentPoi || "none"}, intended: ${intendedPoi} — fixing...`);
         
         // MUST travel to the correct hidden POI
-        const verifyTravel = await travelToPoiWithSurvey(ctx, intendedPoi, targetPoiName || intendedPoi, true);
+        const verifyTravel = await travelToPoiWithSurvey(ctx, intendedPoi, targetPoiName || intendedPoi, true, targetSystemId || undefined, safetyOpts);
         
         // Verify AGAIN after travel - refresh location to get actual location
         await bot.refreshLocation();
@@ -5004,7 +5059,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             
             // Found a POI with the target resource - try to travel there
             ctx.log("mining", `Found correct POI: ${storedPoi.name} contains ${effectiveTarget} - traveling...`);
-            const correctTrav = await travelToPoiWithSurvey(ctx, storedPoi.id, storedPoi.name, true);
+            const correctTrav = await travelToPoiWithSurvey(ctx, storedPoi.id, storedPoi.name, true, targetSystemId || undefined, safetyOpts);
             if (correctTrav.success) {
               targetPoiId = storedPoi.id;
               targetPoiName = storedPoi.name;
@@ -5478,7 +5533,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 }
 
                 // Travel to new POI using the survey-aware travel function
-                const travelResult = await travelToPoiWithSurvey(ctx, bestLoc.poiId, bestLoc.poiName, bestLoc.isHidden);
+                const travelResult = await travelToPoiWithSurvey(ctx, bestLoc.poiId, bestLoc.poiName, bestLoc.isHidden, bestLoc.systemId, safetyOpts);
 
                 if (travelResult.success) {
                   miningPoi = { id: bestLoc.poiId, name: bestLoc.poiName };

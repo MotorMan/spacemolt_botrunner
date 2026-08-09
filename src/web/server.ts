@@ -498,6 +498,11 @@ function pruneOldDates(daily: Record<string, Record<string, DayStats>>, maxAgeDa
 // ── WebServer ──────────────────────────────────────────────
 
 const MAX_LOG_BUFFER = 200;
+
+/** How long a built creature snapshot may be reused before it is rebuilt. */
+const WILDLIFE_JSON_TTL_MS = 10_000;
+/** Drop the snapshot entirely once nothing has asked for it for this long. */
+const WILDLIFE_JSON_IDLE_MS = 60_000;
 const MAIN_LOG_SAVE_DEBOUNCE_MS = 5000;
 
 export class WebServer {
@@ -559,6 +564,9 @@ export class WebServer {
   private wsBytesByType = new Map<string, number>();
   private wsTotalBytes = 0;
   private wsBytesTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Memoized creature snapshot (see getWildlifeJson)
+  private wildlifeJsonCache: { json: string; builtAt: number; lastUsed: number } | null = null;
 
 constructor(port: number = 3000) {
     this.port = port;
@@ -661,19 +669,39 @@ if (!this.settings.fuel_service) {
     this.latestStatuses = seeded;
     this.applyInitialLogSettings();
 
-    this.wsBytesTimer = setInterval(() => this.logWsBytesSummary(), 10000);
+    this.wsBytesTimer = setInterval(() => {
+      this.logWsBytesSummary();
+      this.evictWildlifeJson();
+    }, 10000);
   }
 
-  private trackWsBytes(data: unknown): void {
-    const raw = JSON.stringify(data);
-    const len = Buffer.byteLength(raw, "utf8");
-    this.wsTotalBytes += len;
-    const type = (data as Record<string, unknown>)?.type;
-    if (typeof type === "string" && type) {
-      this.wsBytesByType.set(type, (this.wsBytesByType.get(type) || 0) + len);
+  /**
+   * Serialized creature snapshot for the creatures page / sync pull.
+   *
+   * The page polls every 5s and the store now reads cold systems from disk on
+   * demand, so both the read and the ~6MB stringify are memoized briefly and
+   * dropped again once nobody is looking.
+   */
+  private getWildlifeJson(): string {
+    const now = Date.now();
+    if (this.wildlifeJsonCache && now - this.wildlifeJsonCache.builtAt < WILDLIFE_JSON_TTL_MS) {
+      this.wildlifeJsonCache.lastUsed = now;
+      return this.wildlifeJsonCache.json;
+    }
+    const json = JSON.stringify(wildlifeStore.getFullData());
+    this.wildlifeJsonCache = { json, builtAt: now, lastUsed: now };
+    return json;
+  }
+
+  private evictWildlifeJson(): void {
+    if (!this.wildlifeJsonCache) return;
+    if (Date.now() - this.wildlifeJsonCache.lastUsed > WILDLIFE_JSON_IDLE_MS) {
+      this.wildlifeJsonCache = null;
     }
   }
 
+  /** Account for an outbound WS payload. Callers pass the already-serialized
+   *  string so nothing is ever stringified twice just to be measured. */
   private trackWsBytesRaw(jsonStr: string, fallbackType: string): void {
     const len = Buffer.byteLength(jsonStr, "utf8");
     this.wsTotalBytes += len;
@@ -1236,10 +1264,12 @@ if (!this.settings.fuel_service) {
           }
         }
         if (url.pathname === "/api/wildlife") {
-          return Response.json(wildlifeStore.getFullData());
+          return new Response(this.getWildlifeJson(), {
+            headers: { "Content-Type": "application/json" },
+          });
         }
         if (url.pathname === "/data/wildlifeInfo.json") {
-          return Response.json(wildlifeStore.getFullData(), {
+          return new Response(this.getWildlifeJson(), {
             headers: { "Content-Type": "application/json" },
           });
         }
@@ -1717,7 +1747,9 @@ if (!this.settings.fuel_service) {
             return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/wildlife" && req.method === "GET") {
-            return Response.json(wildlifeStore.getFullData(), { headers: cors });
+            return new Response(this.getWildlifeJson(), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
           }
           if (url.pathname === "/api/client-sync/wildlife-update" && req.method === "POST") {
             try {
@@ -2704,8 +2736,9 @@ if (!this.settings.fuel_service) {
                 flockSettings: loadFlockSettings(),
                 lastUsedRoutines: getAllLastUsedRoutines(),
               };
-              this.trackWsBytes(initPayload);
-              ws.send(JSON.stringify(initPayload));
+              const initJson = JSON.stringify(initPayload);
+              this.trackWsBytesRaw(initJson, "init");
+              ws.send(initJson);
 
               // Send large data separately to avoid blocking with JSON serialization.
               // These payloads are cached (built once, reused for every connection)
@@ -2746,8 +2779,9 @@ if (!this.settings.fuel_service) {
             // keep it from being reaped); reply with a pong so the client's
             // data watchdog sees activity.
             if (raw && raw.type === "ping") {
-              this.trackWsBytes({ type: "pong" });
-              try { ws.send(JSON.stringify({ type: "pong" })); } catch {}
+              const pong = JSON.stringify({ type: "pong" });
+              this.trackWsBytesRaw(pong, "pong");
+              try { ws.send(pong); } catch {}
               return;
             }
             seq = raw._seq;
@@ -2760,8 +2794,9 @@ if (!this.settings.fuel_service) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
               const responseData = { type: resType, action: data.type, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
-              this.trackWsBytes(responseData);
-              ws.send(JSON.stringify(responseData));
+              const responseJson = JSON.stringify(responseData);
+              this.trackWsBytesRaw(responseJson, resType);
+              ws.send(responseJson);
             }
           } catch (err) {
             const rawData = JSON.parse(typeof msg === "string" ? msg : msg.toString());
@@ -2774,8 +2809,9 @@ if (!this.settings.fuel_service) {
               ok: false,
               error: err instanceof Error ? err.message : String(err),
             };
-            this.trackWsBytes(errorResponse);
-            ws.send(JSON.stringify(errorResponse));
+            const errorJson = JSON.stringify(errorResponse);
+            this.trackWsBytesRaw(errorJson, errorResponse.type);
+            ws.send(errorJson);
           }
         },
 
@@ -2992,8 +3028,11 @@ if (!this.settings.fuel_service) {
 
   private broadcast(data: unknown): void {
     perf.timeSync("server.broadcast", () => {
-      this.trackWsBytes(data);
+      // Stringify once: trackWsBytes used to re-serialize the same payload just
+      // to measure it, doubling the cost of every dashboard broadcast.
       const msg = JSON.stringify(data);
+      const type = (data as Record<string, unknown>)?.type;
+      this.trackWsBytesRaw(msg, typeof type === "string" && type ? type : "unknown");
       const dead: ServerWebSocket<WSData>[] = [];
       for (const ws of this.clients) {
         try {

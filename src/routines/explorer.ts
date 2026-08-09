@@ -37,6 +37,7 @@ import {
 } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
 
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
@@ -44,30 +45,8 @@ const FUEL_SAFETY_PCT = 40;
 // ── Market Details Storage ──────────────────────────────────
 
 const DATA_DIR = join(process.cwd(), "data");
-const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
 const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
 const RAW_MISSIONS_FILE = join(DATA_DIR, "rawMissions.json");
-
-interface MarketOrderDetail {
-  price: number;
-  quantity: number;
-}
-
-interface MarketItemDetails {
-  systemId: string;
-  stationPoiId: string;
-  stationName: string;
-  itemId: string;
-  itemName: string;
-  buyOrders: MarketOrderDetail[];
-  sellOrders: MarketOrderDetail[];
-  lastUpdated: string;
-}
-
-interface MarketDetailsData {
-  lastSaved: string;
-  items: MarketItemDetails[];
-}
 
 interface ShipListing {
   systemId: string;
@@ -115,29 +94,6 @@ interface RawMissionRecord {
 interface RawMissionsData {
   lastSaved: string;
   missions: Record<string, RawMissionRecord>; // key: mission_id
-}
-
-function loadMarketDetails(): MarketDetailsData {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (existsSync(MARKET_DETAILS_FILE)) {
-    try {
-      const raw = readFileSync(MARKET_DETAILS_FILE, "utf-8");
-      return JSON.parse(raw) as MarketDetailsData;
-    } catch {
-      // Corrupt file — start fresh
-    }
-  }
-  return { lastSaved: now(), items: [] };
-}
-
-function saveMarketDetails(data: MarketDetailsData): void {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  data.lastSaved = now();
-  writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
 function loadShipsForSale(log?: (cat: string, msg: string) => void): ShipsForSaleData {
@@ -1852,8 +1808,7 @@ async function* scanStation(
 
       // Extract detailed order book data from view_market response and save to marketDetails.json
       if (items.length > 0) {
-        const marketDetails = loadMarketDetails();
-        let detailsUpdated = false;
+        const observations: MarketItemObservation[] = [];
 
         ctx.log("info", `Saving detailed market data for ${items.length} items...`);
 
@@ -1883,35 +1838,16 @@ async function* scanStation(
             }
           }
 
-          // Update or add to market details
-          const existingIndex = marketDetails.items.findIndex(
-            m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
-          );
-
-          const marketItemDetail: MarketItemDetails = {
-            systemId,
-            stationPoiId: poi.id,
-            stationName: poi.name,
-            itemId,
-            itemName,
-            buyOrders,
-            sellOrders,
-            lastUpdated: now(),
-          };
-
-          if (existingIndex >= 0) {
-            marketDetails.items[existingIndex] = marketItemDetail;
-          } else {
-            marketDetails.items.push(marketItemDetail);
-          }
-
-          detailsUpdated = true;
+          observations.push({ itemId, itemName, buyOrders, sellOrders });
         }
 
+        // Memory-only upsert; marketDetailsStore persists on its 2-min cadence
+        // (and on shutdown) instead of rewriting the whole ~10MB file here.
+        const detailsUpdated = marketDetailsStore.upsertItems(systemId, poi.id, poi.name, observations) > 0;
+
         if (detailsUpdated) {
-          saveMarketDetails(marketDetails);
-          ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
-          
+          ctx.log("info", `Recorded detailed market data for ${items.length} items`);
+
           // Submit trade intel to faction if station has the facility
           const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, poi.id);
           if (hasTradeIntel) {
@@ -2924,8 +2860,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
             if (items.length > 0) {
               ctx.log("info", `Saving detailed market data for ${items.length} items...`);
-              const marketDetails = loadMarketDetails();
-              let detailsUpdated = false;
+              const observations: MarketItemObservation[] = [];
 
               for (const item of items) {
                 const itemId = (item.item_id as string) || (item.id as string) || "";
@@ -2943,35 +2878,16 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                   quantity: (order.quantity as number) || 0,
                 })).filter(order => order.price > 0 && order.quantity > 0);
 
-                // Update or add to market details
-                const existingIndex = marketDetails.items.findIndex(
-                  m => m.systemId === target.systemId && m.stationPoiId === target.stationPoi && m.itemId === itemId
-                );
-
-                const marketItemDetail: MarketItemDetails = {
-                  systemId: target.systemId,
-                  stationPoiId: target.stationPoi,
-                  stationName: target.stationName,
-                  itemId,
-                  itemName,
-                  buyOrders,
-                  sellOrders,
-                  lastUpdated: now(),
-                };
-
-                if (existingIndex >= 0) {
-                  marketDetails.items[existingIndex] = marketItemDetail;
-                } else {
-                  marketDetails.items.push(marketItemDetail);
-                }
-
-                detailsUpdated = true;
+                observations.push({ itemId, itemName, buyOrders, sellOrders });
               }
 
+              const detailsUpdated = marketDetailsStore.upsertItems(
+                target.systemId, target.stationPoi, target.stationName, observations,
+              ) > 0;
+
               if (detailsUpdated) {
-                saveMarketDetails(marketDetails);
-                ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
-                
+                ctx.log("info", `Recorded detailed market data for ${items.length} items`);
+
                 // Submit trade intel to faction if station has the facility
                 const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, target.stationPoi);
                 if (hasTradeIntel) {

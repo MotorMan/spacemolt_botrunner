@@ -11,7 +11,7 @@ import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
-import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature } from "./wildlivestore.js";
+import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature, type ObservedCreature } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
@@ -4387,34 +4387,48 @@ if (this.craftQueueTracker && jobId && recipeId) {
     }
   }
 
+  /**
+   * Feed one `get_nearby` result into the creature store.
+   *
+   * A nearby scan is the COMPLETE creature list for the POI we are sitting in,
+   * so it is handed to `wildlifeStore.reconcile()` as a single "present set"
+   * instead of one `add()` per creature: that adds what we now see and prunes
+   * the creatureIds we no longer see (killed / despawned), which is what keeps
+   * data/creatures from growing forever.
+   */
   trackWildlife(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
       return;
     }
 
     const data = nearbyResult as Record<string, unknown>;
-    const creaturesArray = Array.isArray(data.creatures) ? data.creatures : [];
+    // Only a response that actually carries a creature list may reconcile —
+    // a partial/unrelated payload must never be read as "no creatures here".
+    if (!Array.isArray(data.creatures)) return;
+    const creaturesArray = data.creatures as Array<Record<string, unknown>>;
 
-    let wildlifeCount = 0;
-    for (const entity of creaturesArray as Array<Record<string, unknown>>) {
+    const observed: ObservedCreature[] = [];
+    for (const entity of creaturesArray) {
       const name = (entity.name as string) || "";
-      if (name && name.trim()) {
-        const trimmedName = name.trim();
-        const creatureId = (entity.creature_id as string) || "";
-        const species = (entity.species as string) || "";
-        const role = (entity.role as string) || "";
-        const hull = (entity.hull as number) || 0;
-        const maxHull = (entity.max_hull as number) || hull;
-        const inCombat = (entity.in_combat as boolean) || false;
-        
-        if (wildlifeStore.add(trimmedName, this.system, this.poi, creatureId, species, role, hull, maxHull, inCombat)) {
-          wildlifeCount++;
-        }
-      }
+      if (!name || !name.trim()) continue;
+      const hull = (entity.hull as number) || 0;
+      observed.push({
+        name: name.trim(),
+        creatureId: (entity.creature_id as string) || "",
+        species: (entity.species as string) || "",
+        role: (entity.role as string) || "",
+        maxHull: (entity.max_hull as number) || hull,
+      });
     }
 
-    if (wildlifeCount > 0) {
-      this.log("wildlife", `Discovered ${wildlifeCount} new wildlife creature(s) from nearby scan`);
+    const result = wildlifeStore.reconcile(this.system, this.poi, observed);
+
+    if (result.newTypes > 0) {
+      this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
+    }
+    if (result.prunedIds > 0 || result.prunedTypes > 0) {
+      debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
+        `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${this.poi}`);
     }
   }
 

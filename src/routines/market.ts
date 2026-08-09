@@ -7,59 +7,7 @@ import {
   noteMarketRoutineStopped,
   noteLocalMarketObservation,
 } from "../market_local_source.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
-import { join } from "path";
-
-const DATA_DIR = join(process.cwd(), "data");
-const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
-
-interface MarketOrderDetail {
-  price: number;
-  quantity: number;
-}
-
-interface MarketItemDetails {
-  systemId: string;
-  stationPoiId: string;
-  stationName: string;
-  itemId: string;
-  itemName: string;
-  buyOrders: MarketOrderDetail[];
-  sellOrders: MarketOrderDetail[];
-  lastUpdated: string;
-}
-
-interface MarketDetailsData {
-  lastSaved: string;
-  items: MarketItemDetails[];
-}
-
-function now(): string {
-  return new Date().toISOString();
-}
-
-function loadMarketDetails(): MarketDetailsData {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (existsSync(MARKET_DETAILS_FILE)) {
-    try {
-      const raw = readFileSync(MARKET_DETAILS_FILE, "utf-8");
-      return JSON.parse(raw) as MarketDetailsData;
-    } catch {
-      // Corrupt file — start fresh
-    }
-  }
-  return { lastSaved: now(), items: [] };
-}
-
-function saveMarketDetails(data: MarketDetailsData): void {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  data.lastSaved = now();
-  writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
-}
+import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
@@ -67,12 +15,10 @@ function saveItemsToMarketDetails(
   stationName: string,
   items: Array<Record<string, unknown>>,
 ): void {
-  // Measure only the (disk-bound) load + parse + rewrite of marketDetails.json.
-  // The in-memory overlay publish (`noteLocalMarketObservation`) is kept outside
-  // the timer so it doesn't inflate the FS cost measurement.
+  // In-memory upsert only. `marketDetailsStore` persists the whole file on a
+  // 2-minute cadence (and on shutdown) instead of rewriting ~10MB per push,
+  // which was ~17 full rewrites a minute on a market client.
   const observations = perf.timeSync("market.saveItemsToMarketDetails", () => {
-    const marketDetails = loadMarketDetails();
-    let detailsUpdated = false;
     const obs: Array<{
       itemId: string;
       itemName: string;
@@ -95,35 +41,13 @@ function saveItemsToMarketDetails(
         quantity: (order.quantity as number) || 0,
       })).filter((order) => order.price > 0 && order.quantity > 0);
 
-      const existingIndex = marketDetails.items.findIndex(
-        (m) => m.systemId === systemId && m.stationPoiId === stationPoiId && m.itemId === itemId,
-      );
-
-      const marketItemDetail: MarketItemDetails = {
-        systemId,
-        stationPoiId,
-        stationName,
-        itemId,
-        itemName,
-        buyOrders,
-        sellOrders,
-        lastUpdated: now(),
-      };
-
-      if (existingIndex >= 0) {
-        marketDetails.items[existingIndex] = marketItemDetail;
-      } else {
-        marketDetails.items.push(marketItemDetail);
-      }
-
       obs.push({ itemId, itemName, buyOrders, sellOrders });
-      detailsUpdated = true;
     }
 
-    if (detailsUpdated) {
-      saveMarketDetails(marketDetails);
+    if (obs.length) {
+      marketDetailsStore.upsertItems(systemId, stationPoiId, stationName, obs);
     }
-    return detailsUpdated ? obs : [];
+    return obs;
   });
 
   // Publish to the in-memory overlay too, so routines in this process see

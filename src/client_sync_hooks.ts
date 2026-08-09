@@ -29,6 +29,14 @@ export function setMarketQueryFn(fn: (query: MarketQueryRequest) => Promise<Mark
   _marketQueryFn = fn;
 }
 
+/**
+ * Is anything actually listening for sync pushes? Hot producers (wildlife) use
+ * this to skip building a payload that `_fire` would only throw away.
+ */
+export function isSyncPushEnabled(): boolean {
+  return !!_push;
+}
+
 async function _fire(type: SyncEventType, payload: Record<string, unknown>): Promise<void> {
   if (!_push) return;
   try {
@@ -69,8 +77,14 @@ export async function onRescueUpdate(type: "queue" | "blackbook", data: unknown)
 }
 
 export async function onWildlifeUpdate(data: unknown): Promise<void> {
+  // Fast bail-out BEFORE any work: on a standalone client (or a light slave)
+  // there is no push target, and this used to deep-clone the whole system
+  // snapshot per sighting only for `_fire` to drop it on the floor.
+  if (!_push) return;
   await perf.timeAsync("wildlivestore.onWildlifeUpdate", async () => {
-    await _fire("wildlife", { data: JSON.parse(JSON.stringify(data)) });
+    // No clone: the push layer serializes the payload, so passing the live
+    // object through is equivalent and free.
+    await _fire("wildlife", { data });
   });
 }
 

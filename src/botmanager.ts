@@ -32,6 +32,9 @@ import { idleRoutine } from "./routines/1-idle.js";
 import { marketRoutine } from "./routines/market.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
+import { wildlifeStore } from "./wildlivestore.js";
+import { playerNameStore } from "./playernamestore.js";
+import { flushMarketDetailsSync } from "./marketdetailsstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { flushStationFacilityCache } from "./stationFacilityCache.js";
@@ -40,7 +43,7 @@ import { ChatWebServer } from "./web/chatserver.js";
 import { StationWebServer } from "./web/stationserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
-import { debugLogForBot, logBotActivity } from "./debug.js";
+import { debugLogForBot, logBotActivity, flushLogsSync } from "./debug.js";
 import { isConnectionError } from "./connection.js";
 import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, getConnectedAccount, removeConnectedAccount } from "./libClient.js";
 import { CLOSE_CODE, type Account } from "@spacemolt/lib";
@@ -2920,6 +2923,12 @@ async function main(): Promise<void> {
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();
+    // Stores that now batch their writes (see the 2-minute persist cadence):
+    // without these the last window of creature/market/player data is lost.
+    wildlifeStore.flushSync();
+    playerNameStore.flush();
+    flushMarketDetailsSync();
+    flushLogsSync();
     flushFactionStorageCache();
     flushStationFacilityCache();
     // Flush miner activity data to ensure no data loss

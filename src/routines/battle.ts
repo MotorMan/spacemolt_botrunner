@@ -10,10 +10,13 @@ import { combatDebugLog } from "../debug.js";
  * Returns true if the given display name belongs to a known creature (wildlife).
  * Creatures are NOT players — even with onlyNPCs=true the hunter should fight
  * (or at least not flee from) a creature that attacks it.
+ *
+ * Uses the store's name index (a Set lookup): this runs for every battle
+ * participant on every combat tick, so it must never walk the creature data.
  */
 export function isCreatureName(name: string | undefined): boolean {
   if (!name) return false;
-  return !!wildlifeStore.getWildlifeDetail(name);
+  return wildlifeStore.hasCreatureName(name);
 }
 
 // ── Types ─────────────────────────────────────────────

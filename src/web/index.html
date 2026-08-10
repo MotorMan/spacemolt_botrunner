@@ -1370,6 +1370,29 @@
       </div>
     </div>
 
+    <!-- Faction Dismantle Facility Confirmation Modal -->
+    <div class="modal-overlay" id="factionDismantleModal">
+      <div class="modal">
+        <h2>💥 Dismantle Facility?</h2>
+        <p style="color: var(--text-dim); margin: 16px 0">
+          You are about to dismantle
+          <b id="factionDismantleName">this facility</b>. This
+          <b style="color: var(--red)">permanently destroys</b> the facility —
+          all of the credits and materials spent to build and upgrade it are
+          lost.
+        </p>
+        <p style="color: var(--red); font-size: 13px">
+          ⚠️ This action cannot be undone.
+        </p>
+        <div class="modal-actions">
+          <button onclick="hideFactionDismantleModal()">Cancel</button>
+          <button class="danger" onclick="confirmFactionDismantle()">
+            💥 Dismantle
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- Name Ship Modal -->
     <div class="modal-overlay" id="nameShipModal">
       <div class="modal">
@@ -23552,10 +23575,11 @@ When responding:
                <div style="display:flex;gap:4px;margin-left:auto">
                  ${canTransfer && !restricted ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ""}
                  <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? "Disable" : "Enable"}</button>
-                 ${(fac.damaged || fac.status === "damaged") ? `<button class="sm danger" style="font-size:10px;padding:2px 6px" onclick="factionRepairFacility('${esc(username)}','${esc(facId)}')">Repair</button>` : ""}
-                 ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
-                </div>
-        </div>`;
+                  ${(fac.damaged || fac.status === "damaged") ? `<button class="sm danger" style="font-size:10px;padding:2px 6px" onclick="factionRepairFacility('${esc(username)}','${esc(facId)}')">Repair</button>` : ""}
+                  ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ""}
+                  <button class="sm danger" style="font-size:10px;padding:2px 6px" title="Dismantle facility (destroys it and wastes the build credits)" onclick="showFactionDismantleConfirm('${esc(username)}','${esc(facId)}','${esc(name)}')">💥</button>
+                 </div>
+         </div>`;
                   })
                   .join("");
 
@@ -23958,6 +23982,44 @@ When responding:
             appendLine("system", `Repair prep failed: ${err.message || "unknown"}`);
           }
         })();
+      }
+
+      // ── Faction Dismantle (with confirmation) ────────────────
+      let factionDismantlePending = null; // { username, facilityId }
+
+      function showFactionDismantleConfirm(username, facilityId, facilityName) {
+        factionDismantlePending = { username, facilityId };
+        const nameEl = document.getElementById("factionDismantleName");
+        if (nameEl) nameEl.textContent = facilityName || facilityId || "this facility";
+        document.getElementById("factionDismantleModal").classList.add("active");
+      }
+
+      function hideFactionDismantleModal() {
+        factionDismantlePending = null;
+        document.getElementById("factionDismantleModal").classList.remove("active");
+      }
+
+      function confirmFactionDismantle() {
+        const pending = factionDismantlePending;
+        if (!pending) return;
+        const { username, facilityId } = pending;
+        hideFactionDismantleModal();
+        sendExec(
+          username,
+          "facility",
+          { action: "faction_dismantle", facility_id: facilityId },
+          (result) => {
+            if (result.ok) {
+              appendLine("system", `${username}: Facility ${facilityId} dismantled`);
+              fetchFactionFacilities(username);
+            } else {
+              appendLine(
+                "system",
+                `Dismantle failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
       }
 
       function toggleFactionFacilityRename(username, facilityId) {

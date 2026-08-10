@@ -2400,175 +2400,213 @@ if (looted > 0) {
   const rejected = new Set<string>();
   let nearest: FuelStationTarget | null = null;
   let unaffordableTarget: FuelStationTarget | null = null;
-  for (let attempt = 0; attempt < 4 && !nearest; attempt++) {
-    const candidate = await findReachableFuelStation(ctx, {
-      skipBlacklist: opts?.skipBlacklist,
-      skipApprovedCheck: opts?.skipApprovedCheck,
-      excludePoiIds: rejected,
-    });
-    if (!candidate) break;
 
-    // Skip stations that explicitly report 0 fuel (Sol is always stocked).
-    if (candidate.poiId !== "sol_station" && candidate.poiId !== "sol_central") {
-      let fuelAtStation: number | null = null;
-      try {
-        const poiResp = await bot.exec("get_poi", { poi_id: candidate.poiId });
-        fuelAtStation = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
-      } catch {}
-      if (fuelAtStation !== null && fuelAtStation !== undefined && fuelAtStation <= 0) {
-        ctx.log("system", `Skipping ${candidate.poiName} — station reports 0 fuel`);
-        rejected.add(candidate.poiId.toLowerCase());
-        continue;
+  // Try several stations in turn. If the station we fly to turns out to be empty
+  // on arrival (reserve depleted / no fuel cells), remember it for THIS search
+  // and move on to the next reachable station instead of looping forever on a dead one.
+  for (let stationAttempt = 0; stationAttempt < 6; stationAttempt++) {
+    if (!nearest) {
+      for (let attempt = 0; attempt < 4 && !nearest; attempt++) {
+        const candidate = await findReachableFuelStation(ctx, {
+          skipBlacklist: opts?.skipBlacklist,
+          skipApprovedCheck: opts?.skipApprovedCheck,
+          excludePoiIds: rejected,
+        });
+        if (!candidate) break;
+
+        // Skip stations that explicitly report 0 fuel (Sol is always stocked).
+        if (candidate.poiId !== "sol_station" && candidate.poiId !== "sol_central") {
+          let fuelAtStation: number | null = null;
+          try {
+            const poiResp = await bot.exec("get_poi", { poi_id: candidate.poiId });
+            fuelAtStation = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+          } catch {}
+          if (fuelAtStation !== null && fuelAtStation !== undefined && fuelAtStation <= 0) {
+            ctx.log("system", `Skipping ${candidate.poiName} — station reports 0 fuel`);
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+        }
+
+        // Don't fly to a station we can't afford to reach — check the server route
+        // (unless we're already there, or we already validated it via checkRouteFuel).
+        if (candidate.systemId.toLowerCase() !== bot.system.toLowerCase() && !candidate.serverRoute) {
+          const check = await checkRouteFuel(ctx, candidate.systemId);
+          if (check.found && check.hasWormhole) {
+            ctx.log("system", `Route to ${candidate.poiName} uses a wormhole — skipping (bot cannot traverse it)`);
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+          if (check.affordable === false) {
+            ctx.log("system", `Cannot afford route to ${candidate.poiName} (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — will retry further stations first`);
+            if (!unaffordableTarget) unaffordableTarget = { ...candidate, serverRoute: check.route };
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+          candidate.serverRoute = check.route;
+        }
+
+        nearest = candidate;
       }
     }
 
-    // Don't fly to a station we can't afford to reach — check the server route
-    // (unless we're already there, or we already validated it via checkRouteFuel).
-    if (candidate.systemId.toLowerCase() !== bot.system.toLowerCase() && !candidate.serverRoute) {
-      const check = await checkRouteFuel(ctx, candidate.systemId);
-      if (check.found && check.hasWormhole) {
-        ctx.log("system", `Route to ${candidate.poiName} uses a wormhole — skipping (bot cannot traverse it)`);
-        rejected.add(candidate.poiId.toLowerCase());
-        continue;
+    if (!nearest) {
+      if (unaffordableTarget) {
+        ctx.log("error", `No affordable approved refuel station reachable — falling back to furthest-possible target`);
+        nearest = unaffordableTarget;
+        unaffordableTarget = null;
+      } else {
+        ctx.log("error", "No approved refuel station reachable");
+        return false;
       }
-      if (check.affordable === false) {
-        ctx.log("system", `Cannot afford route to ${candidate.poiName} (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — will retry further stations first`);
-        if (!unaffordableTarget) unaffordableTarget = { ...candidate, serverRoute: check.route };
-        rejected.add(candidate.poiId.toLowerCase());
-        continue;
+    }
+
+    // A blacklist bypass is a last-resort escape from a blacklisted pocket: keep
+    // it bypassed for the route too, otherwise findRoute() returns null and the
+    // bot jumps blind or gets "stuck" again.
+    const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getSystemBlacklist());
+
+    ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)${nearest.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
+
+    if (nearest.systemId.toLowerCase() !== bot.system.toLowerCase()) {
+      await ensureUndocked(ctx);
+      // Prefer the server-validated route (matches what return_home used: 10 jumps,
+      // 166 fuel available >= 50 needed). Fall back to the local map route.
+      let route: string[] | null = null;
+      if (nearest.serverRoute && nearest.serverRoute.length > 1) {
+        route = nearest.serverRoute.map(s => s.system_id);
+      } else {
+        route = mapStore.findRoute(bot.system, nearest.systemId, routeBlacklist);
       }
-      candidate.serverRoute = check.route;
-    }
-
-    nearest = candidate;
-  }
-
-  if (!nearest) {
-    if (unaffordableTarget) {
-      ctx.log("error", `No affordable approved refuel station reachable — falling back to furthest-possible target`);
-      nearest = unaffordableTarget;
-    } else {
-      ctx.log("error", "No approved refuel station reachable");
-      return false;
-    }
-  }
-
-  // A blacklist bypass is a last-resort escape from a blacklisted pocket: keep
-  // it bypassed for the route too, otherwise findRoute() returns null and the
-  // bot jumps blind or gets "stuck" again.
-  const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getSystemBlacklist());
-
-  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)${nearest.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
-
-  if (nearest.systemId.toLowerCase() !== bot.system.toLowerCase()) {
-    await ensureUndocked(ctx);
-    // Prefer the server-validated route (matches what return_home used: 10 jumps,
-    // 166 fuel available >= 50 needed). Fall back to the local map route.
-    let route: string[] | null = null;
-    if (nearest.serverRoute && nearest.serverRoute.length > 1) {
-      route = nearest.serverRoute.map(s => s.system_id);
-    } else {
-      route = mapStore.findRoute(bot.system, nearest.systemId, routeBlacklist);
-    }
-    // SANITY CHECK: findReachableFuelStation already told us how far the station
-    // is (BFS hops over the same map). If the planned route is wildly longer,
-    // the route is bogus (stale precalc entry / wormhole detour) and following
-    // it on low fuel strands the bot half a map away. Never fly it.
-    if (route && route.length - 1 > nearest.hops + 2) {
-      ctx.log("error", `Planned route to ${nearest.systemId} is ${route.length - 1} jumps but the station is only ${nearest.hops} away — rejecting bogus route`);
-      route = mapStore.findRouteWithMode(bot.system, nearest.systemId, routeBlacklist, false);
+      // SANITY CHECK: findReachableFuelStation already told us how far the station
+      // is (BFS hops over the same map). If the planned route is wildly longer,
+      // the route is bogus (stale precalc entry / wormhole detour) and following
+      // it on low fuel strands the bot half a map away. Never fly it.
       if (route && route.length - 1 > nearest.hops + 2) {
-        ctx.log("error", `Fallback route is still ${route.length - 1} jumps — refusing to burn fuel on it`);
-        return await emergencyFuelRecovery(ctx);
-      }
-      ctx.log("travel", `Using direct ${route ? route.length - 1 : 0}-jump route instead`);
-    }
-    if (route && route.length > 1) {
-      for (let i = 1; i < route.length; i++) {
-        if (bot.state !== "running") return false;
-        await bot.refreshLocation();
-        const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-        if (preFuel < 10) {
-          ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
+        ctx.log("error", `Planned route to ${nearest.systemId} is ${route.length - 1} jumps but the station is only ${nearest.hops} away — rejecting bogus route`);
+        route = mapStore.findRouteWithMode(bot.system, nearest.systemId, routeBlacklist, false);
+        if (route && route.length - 1 > nearest.hops + 2) {
+          ctx.log("error", `Fallback route is still ${route.length - 1} jumps — refusing to burn fuel on it`);
           return await emergencyFuelRecovery(ctx);
         }
-        ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
-        const jumpResp = await bot.exec("jump", { target_system: route[i] });
+        ctx.log("travel", `Using direct ${route ? route.length - 1 : 0}-jump route instead`);
+      }
+      if (route && route.length > 1) {
+        for (let i = 1; i < route.length; i++) {
+          if (bot.state !== "running") return false;
+          await bot.refreshLocation();
+          const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (preFuel < 10) {
+            ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
+            return await emergencyFuelRecovery(ctx);
+          }
+          ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
+          const jumpResp = await bot.exec("jump", { target_system: route[i] });
+          if (jumpResp.error) {
+            ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+            return await emergencyFuelRecovery(ctx);
+          }
+        }
+      } else {
+        ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
+        const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
           return await emergencyFuelRecovery(ctx);
         }
       }
+    }
+
+    await bot.refreshLocation();
+    await ensureUndocked(ctx);
+    ctx.log("travel", `Traveling to ${nearest.poiName}...`);
+    const tResp = await bot.exec("travel", { target_poi: nearest.poiId });
+    if (tResp.error && !tResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to station failed: ${tResp.error.message}`);
+      return await emergencyFuelRecovery(ctx);
+    }
+    bot.poi = nearest.poiId;
+
+    const dResp = await bot.exec("dock");
+    if (!dResp.error || dResp.error.message.includes("already")) {
+      bot.docked = true;
+      await collectFromStorage(ctx);
+      await ensureInsured(ctx);
     } else {
-      ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
-      const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
-      if (jumpResp.error) {
-        ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        return await emergencyFuelRecovery(ctx);
+      // A station that explicitly denied us must never be retried — remember it.
+      if (/access denied/i.test(dResp.error?.message || "")) {
+        ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
+        markStationDenied(nearest.poiId);
+        rejected.add(nearest.poiId.toLowerCase());
+      } else {
+        ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
       }
+      await ensureUndocked(ctx);
+      nearest = null;
+      continue;
     }
-  }
 
-  await bot.refreshLocation();
-  await ensureUndocked(ctx);
-  ctx.log("travel", `Traveling to ${nearest.poiName}...`);
-  const tResp = await bot.exec("travel", { target_poi: nearest.poiId });
-  if (tResp.error && !tResp.error.message.includes("already")) {
-    ctx.log("error", `Travel to station failed: ${tResp.error.message}`);
-    return await emergencyFuelRecovery(ctx);
-  }
-  bot.poi = nearest.poiId;
+    await tryRefuel(ctx, { skipApprovedCheck: opts?.skipApprovedCheck });
+    await bot.refreshShip();
+    let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
 
-  const dResp = await bot.exec("dock");
-  if (!dResp.error || dResp.error.message.includes("already")) {
-    bot.docked = true;
-    await collectFromStorage(ctx);
-    await ensureInsured(ctx);
-  } else {
-    // A station that explicitly denied us must never be retried — remember it.
-    if (/access denied/i.test(dResp.error?.message || "")) {
-      ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
-      markStationDenied(nearest.poiId);
-    } else {
-      ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
+    if (newFuel >= thresholdPct) return true;
+
+    // Below threshold — if the station itself is empty, don't loop on it: remember
+    // it for this search and try the next reachable station instead.
+    let stationEmpty = false;
+    if (nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
+      try {
+        const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
+        const f = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+        if (f !== null && f !== undefined && f <= 0) stationEmpty = true;
+      } catch {}
     }
-    return await emergencyFuelRecovery(ctx);
-  }
 
-  await tryRefuel(ctx, { skipApprovedCheck: opts?.skipApprovedCheck });
-  await bot.refreshShip();
-  let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
+    if (stationEmpty) {
+      ctx.log("error", `Station ${nearest.poiName} reports 0 fuel after arrival — moving to another station`);
+      rejected.add(nearest.poiId.toLowerCase());
+      await ensureUndocked(ctx);
+      nearest = null;
+      continue;
+    }
 
-  if (newFuel < thresholdPct) {
-    ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
-    for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
-      await sleep(REFUEL_WAIT_INTERVAL);
-      await bot.refreshShip();
-      const refuelResp = await bot.exec("refuel");
-      if (refuelResp.error) {
-        const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
-          ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
-          return false;
+    if (newFuel < thresholdPct) {
+      ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
+      for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
+        await sleep(REFUEL_WAIT_INTERVAL);
+        await bot.refreshShip();
+        const refuelResp = await bot.exec("refuel");
+        if (refuelResp.error) {
+          const msg = refuelResp.error.message.toLowerCase();
+          if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
+            ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
+            break;
+          }
         }
+        await bot.refreshShip();
+        newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuel >= thresholdPct) {
+          ctx.log("system", `Fuel recovered to ${newFuel}% — resuming`);
+          break;
+        }
+        ctx.log("system", `Still waiting for fuel (${newFuel}%)... (${w + 1}/${REFUEL_WAIT_RETRIES})`);
       }
-      await bot.refreshShip();
-      newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (newFuel >= thresholdPct) {
-        ctx.log("system", `Fuel recovered to ${newFuel}% — resuming`);
-        break;
-      }
-      ctx.log("system", `Still waiting for fuel (${newFuel}%)... (${w + 1}/${REFUEL_WAIT_RETRIES})`);
     }
+
+    await bot.refreshShip();
+    newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("system", "Undocking...");
+    await bot.exec("undock");
+    bot.docked = false;
+    // Preserve prior behaviour: report success if we at least have some fuel,
+    // otherwise signal the caller we're still short so it can re-plan.
+    return newFuel >= 10;
   }
 
-  await bot.refreshShip();
-  newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  ctx.log("system", "Undocking...");
-  await bot.exec("undock");
-  bot.docked = false;
-  return newFuel >= 10;
+  await ensureUndocked(ctx);
+  return false;
 }
 
 // ── Cargo deposit ──────────────────────────────────────────

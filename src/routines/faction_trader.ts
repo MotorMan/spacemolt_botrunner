@@ -1801,15 +1801,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         yield "return_home";
         if (homeSystem && bot.system !== homeSystem) {
           await ensureUndocked(ctx);
-          const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
-          if (homeFueled) {
-            await navigateToSystem(ctx, homeSystem, {
-              fuelThresholdPct: settings.refuelThreshold,
-              hullThresholdPct: settings.repairThreshold,
-            });
-          }
+          // Try to top up fuel, but navigate home regardless — being in the home
+          // SYSTEM is required before we can travel to the home station POI, and we
+          // may still be able to limp home even if not fully refueled. Gating the
+          // navigation on a successful refuel previously left the bot in another
+          // system trying to `travel` directly to the home POI (cross-system error).
+          await ensureFueled(ctx, settings.refuelThreshold);
+          await navigateToSystem(ctx, homeSystem, {
+            fuelThresholdPct: settings.refuelThreshold,
+            hullThresholdPct: settings.repairThreshold,
+          });
+          await bot.refreshLocation();
         }
-        if (homeStationPoi && bot.poi !== homeStationPoi) {
+        if (bot.system === homeSystem && homeStationPoi && bot.poi !== homeStationPoi) {
           await ensureUndocked(ctx);
           const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
 

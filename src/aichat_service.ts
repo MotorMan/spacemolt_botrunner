@@ -2940,7 +2940,6 @@ No other text, formatting, or explanation.`;
    */
   // Track daily update runs to prevent re-entry / concurrent queues.
   private dailyUpdateRunning = false;
-  private readonly DAILY_UPDATE_MAX_MS = 5 * 60 * 1000; // safety cap
 
   // Track consecutive failures per update type so we don't busy-loop LLM calls
   // when something is permanently failing (auth, missing API, etc.).
@@ -2952,7 +2951,6 @@ No other text, formatting, or explanation.`;
       return;
     }
     this.dailyUpdateRunning = true;
-    const deadline = Date.now() + this.DAILY_UPDATE_MAX_MS;
     try {
       const settings = getAiChatSettings();
       const now = Date.now();
@@ -2967,7 +2965,6 @@ No other text, formatting, or explanation.`;
           this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
           let statusSuccessCount = 0;
           for (const bot of bots) {
-            if (Date.now() >= deadline) break;
             if (bot.state !== "running" || !bot.isConnected()) continue;
             const ok = await this.generateAndSetBotStatus(bot);
             if (ok) statusSuccessCount++;
@@ -2999,7 +2996,6 @@ No other text, formatting, or explanation.`;
           this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
           let colorSuccessCount = 0;
           for (const bot of bots) {
-            if (Date.now() >= deadline) break;
             if (bot.state !== "running" || !bot.isConnected()) continue;
             const ok = await this.generateAndSetBotColors(bot);
             if (ok) colorSuccessCount++;
@@ -3031,7 +3027,6 @@ No other text, formatting, or explanation.`;
           this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
           let logSuccessCount = 0;
           for (const bot of bots) {
-            if (Date.now() >= deadline) break;
             if (bot.state !== "running" || !bot.isConnected()) continue;
             const ok = await this.generateAndSetCaptainLog(bot);
             if (ok) logSuccessCount++;

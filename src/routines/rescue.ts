@@ -1015,13 +1015,41 @@ function isWormholeEntranceOrExit(poiName: string, systemName?: string): boolean
 }
 
 /**
+ * Margin above the rescue trigger threshold at which a target counts as
+ * "recovered". A bot only qualifies for rescue at/below the threshold, and fuel
+ * can only go UP by refueling, so being back above the threshold by this margin
+ * means they (or someone else) already solved the problem.
+ */
+const REFUELED_MARGIN_PCT = 5;
+
+/**
+ * Has the target climbed back out of the "stranded" band?
+ *
+ * `thresholdPct` is the SAME configured threshold that qualified them for
+ * rescue (rescue.fuelThreshold for fleet bots, rescue.maydayFuelThreshold for
+ * MAYDAYs) — not a hardcoded number — so raising the trigger threshold in
+ * settings automatically raises the abort point instead of leaving the rescue
+ * bot chasing a bot it would no longer even flag as stranded.
+ */
+function isNoLongerStranded(currentFuelPct: number, thresholdPct: number): boolean {
+  return currentFuelPct >= thresholdPct + REFUELED_MARGIN_PCT;
+}
+
+/**
  * Check if a rescue target still needs rescue by verifying their current fuel and position.
+ *
+ * Called on EVERY jump while en-route, so it must read the same fleet source the
+ * target was selected from — see the `getTrackingFleet` note below.
+ *
  * Returns an object with:
  *   - needsRescue: whether the target still needs rescue
  *   - currentFuelPct: current fuel percentage (if available)
  *   - currentSystem: current system (if available)
  *   - currentDocked: whether currently docked (if available)
  *   - reason: why rescue is no longer needed (if applicable)
+ *
+ * @param opts.rescueFuelThresholdPct Threshold this target was flagged at.
+ *   Defaults to the fleet rescue threshold; pass `maydayFuelThreshold` for MAYDAYs.
  */
 async function checkTargetStillNeedsRescue(
   ctx: RoutineContext,
@@ -1029,6 +1057,7 @@ async function checkTargetStillNeedsRescue(
   originalFuelPct: number,
   originalSystem: string,
   originalDocked: boolean,
+  opts?: { rescueFuelThresholdPct?: number },
 ): Promise<{
   needsRescue: boolean;
   currentFuelPct: number | null;
@@ -1036,16 +1065,23 @@ async function checkTargetStillNeedsRescue(
   currentDocked: boolean | null;
   reason?: string;
 }> {
-  const { bot } = ctx;
-
-  // Get current fleet status to find the target
-  const fleet = ctx.getFleetStatus?.() || [];
+  // Resolve the target from the CROSS-CLIENT fleet, not the local-only
+  // `ctx.getFleetStatus()`. Fleet targets are routinely bots owned by another
+  // connected client: they only exist in the combined fleet pulled over the
+  // client-sync channel (which is where the rescue scan found them in the first
+  // place). Reading the local list here made every en-route check report
+  // "not in fleet list" for a remote bot, so `needsRescue` fell back to `true`
+  // forever and the rescue bot kept chasing a bot that had already refueled.
+  const fleet = await getTrackingFleet(ctx);
   const targetBot = fleet.find(b => b.username === targetUsername);
 
   if (!targetBot) {
-    // Target not in fleet - can't verify status
-    // This might mean they logged off or fleet status is unavailable
-    ctx.log("rescue", `⚠️ Cannot verify ${targetUsername} status - not in fleet list`);
+    // Not in the combined fleet. For an external player MAYDAY that's normal
+    // (players never appear in fleet status), so only warn for our OWN bots —
+    // where it means the cross-client pull actually failed.
+    if (isOwnBot(targetUsername)) {
+      ctx.log("rescue", `⚠️ Cannot verify ${targetUsername} status - not in cross-client fleet list`);
+    }
     return {
       needsRescue: true, // Assume they still need rescue
       currentFuelPct: null,
@@ -1058,11 +1094,16 @@ async function checkTargetStillNeedsRescue(
   const currentFuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
   const currentSystem = targetBot.system;
   const currentDocked = targetBot.docked;
+  const rescueThresholdPct = opts?.rescueFuelThresholdPct ?? getRescueSettings().fuelThreshold;
 
-  // Check if target has refueled themselves
-  if (currentFuelPct > 25 && originalFuelPct <= 10) {
-    // Significant fuel increase indicates they refueled
-    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - fuel increased from ${originalFuelPct}% to ${currentFuelPct}% (self-refueled)`);
+  // Check if target has refueled themselves.
+  // Compared against the configured trigger threshold — the previous
+  // "fuel > 25% && original <= 10%" test could never fire for a bot flagged at,
+  // say, 20%, so a target that topped off to 98% right after the alert still
+  // counted as stranded and got followed across the map.
+  if (isNoLongerStranded(currentFuelPct, rescueThresholdPct)) {
+    // Fuel only increases by refueling
+    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - fuel increased from ${originalFuelPct}% to ${currentFuelPct}% (self-refueled, threshold ${rescueThresholdPct}%)`);
     return {
       needsRescue: false,
       currentFuelPct,
@@ -1072,9 +1113,12 @@ async function checkTargetStillNeedsRescue(
     };
   }
 
-  // Check if target has moved to a different system
+  // Check if target has moved to a different system.
+  // They're still low on fuel, but the route we're flying is now stale — stop
+  // and let the next scan re-plan against their new position instead of
+  // arriving somewhere they've already left.
   if (currentSystem && normalizeSystemName(currentSystem) !== normalizeSystemName(originalSystem)) {
-    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - moved from ${originalSystem} to ${currentSystem}`);
+    ctx.log("rescue", `↪️ ${targetUsername} moved from ${originalSystem} to ${currentSystem} (fuel ${currentFuelPct}%) - current route is stale, re-planning`);
     return {
       needsRescue: false,
       currentFuelPct,
@@ -1088,8 +1132,8 @@ async function checkTargetStillNeedsRescue(
   if (currentDocked && !originalDocked && currentFuelPct > originalFuelPct) {
     ctx.log("rescue", `✓ ${targetUsername} is now docked and refueling - fuel ${currentFuelPct}% (was ${originalFuelPct}%)`);
     // Don't cancel rescue yet - they might still need fuel after refueling
-    // Only cancel if fuel is above threshold
-    if (currentFuelPct > 25) {
+    // Only cancel once they're back above the configured rescue threshold
+    if (isNoLongerStranded(currentFuelPct, rescueThresholdPct)) {
       return {
         needsRescue: false,
         currentFuelPct,
@@ -2222,12 +2266,16 @@ function stopCreditTopOffBackground(): void {
     let recoveredSession: RescueSession | null = null;
     if (activeSession && !manualRescueTarget) {
       ctx.log("rescue", `Found incomplete rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Cross-client fleet: a target owned by another connected client is not in
+      // the local list, and treating that as "gone" would drop a live session.
+      const fleet = await getTrackingFleet(ctx);
       const targetStillStranded = fleet.find(b => b.username === activeSession.targetUsername);
 
       if (targetStillStranded) {
+        const recoverySettings = getRescueSettings();
+        const recoveryThresholdPct = activeSession.isMayday ? recoverySettings.maydayFuelThreshold : recoverySettings.fuelThreshold;
         const fuelPct = targetStillStranded.maxFuel > 0 ? Math.round((targetStillStranded.fuel / targetStillStranded.maxFuel) * 100) : 100;
-        if (fuelPct <= 25) {
+        if (!isNoLongerStranded(fuelPct, recoveryThresholdPct)) {
           recoveredSession = activeSession;
           ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
           // Reset idle timer since we have a mission
@@ -2270,7 +2318,9 @@ function stopCreditTopOffBackground(): void {
       isMaydayTarget = recoveredSession.isMayday;
       logCategory = isMaydayTarget ? "mayday" : "rescue";
 
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Cross-client fleet so a remote target's live fuel/docked state seeds
+      // the en-route checks instead of leaving fuelPct at 0%.
+      const fleet = await getTrackingFleet(ctx);
       const targetBot = fleet.find(b => b.username === target!.username);
       if (targetBot) {
         target.fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
@@ -3219,13 +3269,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           hullThresholdPct: 30,
           skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
-            // Check if target still needs rescue on every jump
+            // Check if target still needs rescue on every jump, against the
+            // threshold that actually flagged them (MAYDAYs use their own).
             const statusCheck = await checkTargetStillNeedsRescue(
               ctx,
               target!.username,
               target!.fuelPct,
               target!.system,
               target!.docked,
+              { rescueFuelThresholdPct: isMaydayTarget ? settings.maydayFuelThreshold : settings.fuelThreshold },
             );
 
             if (!statusCheck.needsRescue) {
@@ -3328,7 +3380,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
          yield "travel_to_target";
 
          // CRITICAL: Refresh target's current position from fleet status after arriving at system
-         const fleet = ctx.getFleetStatus?.() || [];
+         // (cross-client — a target on another client is not in the local list)
+         const fleet = await getTrackingFleet(ctx);
          const targetBot = fleet.find(b => b.username === target.username);
          if (targetBot) {
            const oldSystem = target.system;
@@ -4236,7 +4289,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     yield "travel_to_target";
     
     // CRITICAL: Refresh fleet status to get current target position
-    const fleet = ctx.getFleetStatus?.() || [];
+    // (cross-client — a target on another client is not in the local list)
+    const fleet = await getTrackingFleet(ctx);
     const targetBotCheck = fleet.find(b => b.username === targetPlayer);
     if (targetBotCheck) {
       const currentSystem = targetBotCheck.system;
@@ -4588,8 +4642,9 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // ── Handle recovered session ──
     let mayday: MaydayRequest | null = null;
     if (recoveredSession) {
-      // Reconstruct mayday from session
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Reconstruct mayday from session (cross-client: one of our own bots on
+      // another client can be the MAYDAY sender)
+      const fleet = await getTrackingFleet(ctx);
       const targetBot = fleet.find(b => b.username === recoveredSession.targetUsername);
       const fuelPct = targetBot ? (targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100) : 0;
       
@@ -4925,7 +4980,8 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     yield "travel_to_target";
     
     // CRITICAL: Refresh target's current position from fleet status after arriving at system
-    const fleet = ctx.getFleetStatus?.() || [];
+    // (cross-client — a fleet bot that sent the MAYDAY may live on another client)
+    const fleet = await getTrackingFleet(ctx);
     const targetBot = fleet.find(b => b.username === mayday.sender);
     if (targetBot) {
       const oldSystem = mayday.system;
@@ -5538,13 +5594,17 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     let recoveredSession: RescueSession | null = null;
     if (activeSession && !manualRescueTarget) {
       ctx.log("rescue", `Found incomplete rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
-      // Validate the session is still relevant
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Validate the session is still relevant. Use the cross-client fleet: a
+      // remote client's bot is absent from the local list, and treating that as
+      // "not in fleet" would drop a perfectly valid session.
+      const fleet = await getTrackingFleet(ctx);
       const targetStillStranded = fleet.find(b => b.username === activeSession.targetUsername);
       
       if (targetStillStranded) {
+        const recoverySettings = getRescueSettings();
+        const recoveryThresholdPct = activeSession.isMayday ? recoverySettings.maydayFuelThreshold : recoverySettings.fuelThreshold;
         const fuelPct = targetStillStranded.maxFuel > 0 ? Math.round((targetStillStranded.fuel / targetStillStranded.maxFuel) * 100) : 100;
-        if (fuelPct <= 25) {
+        if (!isNoLongerStranded(fuelPct, recoveryThresholdPct)) {
           // Target still needs help - resume the session
           recoveredSession = activeSession;
           ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
@@ -5588,8 +5648,9 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
       isMaydayTarget = recoveredSession.isMayday;
       logCategory = isMaydayTarget ? "mayday" : "rescue";
 
-      // Update fleet info for target
-      const fleet = ctx.getFleetStatus?.() || [];
+      // Update fleet info for target — cross-client, so a remote bot's live
+      // fuel/docked state seeds the en-route checks instead of staying at 0%.
+      const fleet = await getTrackingFleet(ctx);
       const targetBot = fleet.find(b => b.username === target!.username);
       if (targetBot) {
         target.fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
@@ -6523,29 +6584,52 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       const originalTargetFuel = target.fuelPct;
       const originalTargetDocked = target.docked;
 
+      // Set when an en-route check cancels the mission (target refueled/moved),
+      // so the `!arrived` handler below can tell a deliberate stand-down apart
+      // from an actual navigation failure. Held in an object because it is
+      // assigned from inside the onJump closure.
+      const enRouteAbort: { reason: string | null } = { reason: null };
+
       const arrived = await navigateToSystem(ctx, target.system, {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: 30,
         onJump: async (jumpNumber: number) => {
-          // Periodically re-check where our fleet bot actually is (they can still move)
+          // Re-check our fleet bot's fuel AND position on every jump: they can
+          // refuel or move while we're en-route, and this is a fleet target so
+          // it's flagged against the fleet fuelThreshold.
           const statusCheck = await checkTargetStillNeedsRescue(
             ctx,
             target.username,
             originalTargetFuel,
             originalTargetSystem,
             originalTargetDocked,
+            { rescueFuelThresholdPct: settings.fuelThreshold },
           );
           if (!statusCheck.needsRescue) {
-            ctx.log("rescue", `🛑 ABORTING fleet navigation - ${statusCheck.reason || "target moved or refueled"}`);
+            enRouteAbort.reason = statusCheck.reason || "target moved or refueled";
+            ctx.log("rescue", `🛑 ABORTING fleet navigation - ${enRouteAbort.reason}`);
             return false; // stop navigateToSystem
           }
-          if (jumpNumber % 3 === 0 && statusCheck.currentSystem) {
-            ctx.log("rescue", `📍 Jump ${jumpNumber}: fleet target now at ${statusCheck.currentSystem}/${statusCheck.currentSystem ? target.poi : ""}`);
+          if (jumpNumber % 3 === 0 && statusCheck.currentFuelPct !== null) {
+            ctx.log("rescue", `📍 Jump ${jumpNumber}: ${target.username} at ${statusCheck.currentFuelPct}% fuel in ${statusCheck.currentSystem}`);
           }
           return true;
         },
       });
       if (!arrived) {
+        // Distinguish "we stood down on purpose" from "we couldn't get there".
+        // A per-jump check that finds the target refueled (or moved) is a
+        // successful outcome, not a navigation failure, so don't log it as an
+        // error or count it toward the consecutive-failure abort.
+        if (enRouteAbort.reason) {
+          ctx.log("rescue", `✅ Fleet rescue for ${target.username} called off en-route — ${enRouteAbort.reason}`);
+          if (getActiveRescueSession(bot.username)) {
+            await failRescueSession(bot.username, `Called off en-route: ${enRouteAbort.reason}`);
+          }
+          await ctx.sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
         ctx.log("error", `Could not reach fleet target system ${target.system} for ${target.username} (or target moved during travel)`);
         
         const activeSession = getActiveRescueSession(bot.username);
@@ -6762,13 +6846,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: 30,
         onJump: async (jumpNumber: number) => {
-          // Check if target still needs rescue on every jump
+          // Check if target still needs rescue on every jump.
+          // This branch only runs for MAYDAY targets, so verify against the
+          // MAYDAY fuel threshold rather than the fleet one.
           const statusCheck = await checkTargetStillNeedsRescue(
             ctx,
             target!.username,
             target!.fuelPct,
             target!.system,
             target!.docked,
+            { rescueFuelThresholdPct: settings.maydayFuelThreshold },
           );
 
           if (!statusCheck.needsRescue) {

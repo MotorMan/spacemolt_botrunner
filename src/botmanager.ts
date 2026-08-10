@@ -2118,6 +2118,47 @@ async function handleChat(action: WebAction): Promise<WebActionResult> {
   return { ok: true, message: `Message sent as ${bot.username}` };
 }
 
+// ── Gift credit auto-collection ──────────────────────────────────────────
+// Gifted credits land in the recipient's station storage locker, so when the
+// recipient is one of our own docked bots we withdraw them into its wallet.
+// A fleet-wide "Send Credits" fires one gift per bot (75+ at once) at the SAME
+// recipient. Issuing one withdraw per gift blows through that single account's
+// mutation budget (1 per tick), trips the server rate limiter, and parks the
+// recipient's `libExec` in a 30s+ backoff sleep — which blocks the *sender's*
+// exec response and makes the dashboard report
+// "Timeout: send_gift did not respond". So we accumulate the gifted amount per
+// recipient and issue ONE withdraw after the burst settles, off the exec path.
+const pendingGiftWithdrawals = new Map<string, number>();
+const giftWithdrawTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const GIFT_WITHDRAW_DEBOUNCE_MS = 12_000; // > one mutation tick
+
+function scheduleGiftCreditWithdraw(recipient: string, credits: number): void {
+  pendingGiftWithdrawals.set(recipient, (pendingGiftWithdrawals.get(recipient) || 0) + credits);
+
+  const existing = giftWithdrawTimers.get(recipient);
+  if (existing) clearTimeout(existing);
+
+  giftWithdrawTimers.set(recipient, setTimeout(() => {
+    giftWithdrawTimers.delete(recipient);
+    const amount = pendingGiftWithdrawals.get(recipient) || 0;
+    pendingGiftWithdrawals.delete(recipient);
+    if (amount <= 0) return;
+
+    const recipientBot = bots.get(recipient);
+    if (!recipientBot || !recipientBot.docked || !recipientBot.isConnected()) return;
+
+    server.logSystem(`Auto-withdrawing ${amount} gifted credits from storage for ${recipient}...`);
+    void (async () => {
+      const wResp = await recipientBot.exec("withdraw_credits", { amount });
+      if (wResp.error) {
+        server.logSystem(`Auto-withdraw for ${recipient} failed: ${wResp.error.message}`);
+      }
+      await recipientBot.refreshStatus();
+      refreshStatusTable();
+    })().catch(() => { /* never let a background withdraw crash the manager */ });
+  }, GIFT_WITHDRAW_DEBOUNCE_MS));
+}
+
 async function handleExec(action: WebAction): Promise<WebActionResult> {
   const { bot: botName, command, params } = action;
   if (!botName || !command) return { ok: false, error: "Bot and command required" };
@@ -2251,17 +2292,19 @@ const skillsObj: Record<string, unknown> | null =
       await ensureInsured({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)) });
     }
 
-    // Also refresh the recipient bot after gift/trade
-    if (command === "send_gift" || command === "trade_offer") {
+    // Also refresh the recipient bot after a SUCCESSFUL gift/trade. A failed
+    // gift moved nothing, so touching the recipient there just burns its
+    // mutation budget (and, in a fleet-wide gift, rate-limits it into a stall).
+    if (!resp.error && (command === "send_gift" || command === "trade_offer")) {
       const recipient = (params as Record<string, unknown> | undefined)?.recipient as string | undefined;
       const recipientBot = recipient ? bots.get(recipient) : undefined;
       if (recipientBot) {
-        // Credits go to recipient's storage locker — auto-withdraw if docked
+        // Credits go to recipient's storage locker — auto-withdraw if docked.
+        // Coalesced + off the exec path so a fleet-wide gift can't stall us.
         if (recipientBot.docked && recipientBot.isConnected()) {
           const giftCredits = (params as Record<string, unknown> | undefined)?.credits as number | undefined;
           if (giftCredits && giftCredits > 0) {
-            server.logSystem(`Auto-withdrawing ${giftCredits} credits from storage for ${recipient}...`);
-            await recipientBot.exec("withdraw_credits", { amount: giftCredits });
+            scheduleGiftCreditWithdraw(recipient!, giftCredits);
           }
         }
         await recipientBot.refreshStatus();

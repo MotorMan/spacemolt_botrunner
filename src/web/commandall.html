@@ -523,6 +523,13 @@
           <button class="sm" onclick="caExec('send_gift',{recipient:val('ca-credits-target'),credits:intVal('ca-credits-amount')})">Send</button>
         </div>
 
+        <div class="cmd-group">
+          <label>Faction Credits (All Bots)</label>
+          <input type="number" id="ca-fac-credits-amount" min="1" value="100" style="width:90px">
+          <button class="sm" onclick="caExec('faction_deposit_credits',{amount:intVal('ca-fac-credits-amount')})">Deposit</button>
+          <button class="sm" onclick="caFactionWithdrawCredits()">Withdraw</button>
+        </div>
+
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Status Commands</label>
         </div>
@@ -1360,6 +1367,46 @@
       caGiftSendAllRunning = false;
         caLog(`<span class="resp-err">Fleet Gift Send All stopped. Remaining items will not be sent.</span>`);
       caUpdateGiftQueueStatus();
+    }
+
+    /** Execute faction credit withdraw for all bots (faction treasury → wallet) */
+    function caFactionWithdrawCredits() {
+      const amt = intVal('ca-fac-credits-amount');
+      if (!amt || amt <= 0) {
+        caLog('<span class="resp-err">Enter a credit amount greater than 0</span>');
+        return;
+      }
+
+      const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (allBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to command</span>');
+        return;
+      }
+
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      caLog(`<span class="resp-cmd">${ts} > FLEET: Faction Withdraw ${amt}cr (${allBots.length} bots)</span>`);
+
+      let index = 0;
+      function executeNext() {
+        if (index >= allBots.length) return;
+        const bot = allBots[index];
+        sendExec(bot.username, 'storage', {
+          action: 'withdraw',
+          target: 'faction',
+          item_id: 'credits',
+          quantity: amt,
+        }, (result) => {
+          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
+          caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
+        });
+
+        index++;
+        if (index < allBots.length) {
+          setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+        }
+      }
+      executeNext();
     }
 
     /** Execute faction withdraw for all bots using two-step queue */

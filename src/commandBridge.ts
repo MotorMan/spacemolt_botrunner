@@ -240,7 +240,7 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
    'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
    'faction_deposit_credits': 'deposit',   // auto-add item_id: 'credits', target: 'faction'
    'faction_withdraw_credits': 'withdraw', // auto-add item_id: 'credits', source: 'faction'
-    'send_gift': 'withdraw',               // auto-add item_id: 'credits'
+    'send_gift': 'deposit',                // gift = deposit with target=<player name>
     'withdraw_credits': 'withdraw',        // auto-add item_id: 'credits' (self withdrawal)
     'get_faction_tax_estimate': 'tax_estimate',
 
@@ -413,10 +413,28 @@ export function buildLibDispatch(
   if (command === "prepay_tax" && body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
   // faction_prepay_tax posts to spacemolt_faction/prepay_tax, whose required
   // field is `amount` (NOT `quantity` like the personal prepay_tax). Keep it as-is.
+  // Gifting is a storage DEPOSIT into someone else's locker:
+  //   storage {action:"deposit", target:"<player>", item_id:"credits", quantity:N}
+  // NOT a withdraw — `withdraw` only accepts target "self"/"faction" and rejects a
+  // player name with `invalid_target: Cannot withdraw from another player's storage`.
+  // Only default item_id to "credits" when the caller did not name an item/ship,
+  // otherwise item gifts (rescue fuel cells, cargo mover) silently turn into credit
+  // transfers.
   if (command === "send_gift") {
-    body.item_id = "credits";
-    if (body.credits !== undefined) { body.quantity = body.credits; delete body.credits; }
     if (body.recipient !== undefined) { body.target = body.recipient; delete body.recipient; }
+    if (body.ship_id !== undefined && body.item_id === undefined) {
+      // A stored ship instance UUID is passed as item_id for gift_ship.
+      body.item_id = body.ship_id;
+      delete body.ship_id;
+      delete body.quantity;
+    } else if (body.credits !== undefined) {
+      body.item_id = "credits";
+      body.quantity = body.credits;
+      delete body.credits;
+    } else if (body.item_id === undefined) {
+      body.item_id = "credits";
+      if (body.amount !== undefined) { body.quantity = body.amount; delete body.amount; }
+    }
   }
   if (command === "find_route") {
     delete body.target_poi;

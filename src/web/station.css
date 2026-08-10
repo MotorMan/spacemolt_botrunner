@@ -173,7 +173,7 @@ body {
   scrollbar-width: thin;
   scrollbar-color: var(--outline-variant) var(--surface-container-lowest);
 }
-.workspace.scanline::after {
+.workspace.scanline .scanline-bar {
   content: "";
   position: absolute;
   top: 0; left: 0; right: 0;
@@ -388,7 +388,7 @@ h1.page-title {
   font-weight: 700;
   letter-spacing: 0.08em;
 }
-.fuel-chip::before {
+.fuel-chip .fuel-dot {
   content: "";
   flex: none;
   width: 6px;
@@ -398,7 +398,7 @@ h1.page-title {
   box-shadow: 0 0 6px currentColor;
 }
 .fuel-ok { color: var(--secondary-fixed-dim); }
-.fuel-ok::before { animation: fuelPulse 1.8s ease-in-out infinite; }
+.fuel-ok .fuel-dot { animation: fuelPulse 1.8s ease-in-out infinite; }
 .fuel-warn { color: var(--tertiary-fixed-dim); }
 .fuel-bad { color: var(--error); }
 .fuel-unknown { color: var(--on-surface-variant); opacity: 0.7; }
@@ -408,6 +408,25 @@ h1.page-title {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
 }
+
+/* ── Frame-rate cap (GPU) ─────────────────────────────────── */
+/* When a cap is active, native CSS animations are disabled and driven from a
+   throttled rAF loop in station.html instead. */
+body.fx-capped .workspace.scanline .scanline-bar,
+body.fx-capped .card.alert,
+body.fx-capped .fuel-ok .fuel-dot { animation: none; }
+
+/* "Off" = static: no animations and drop the per-card backdrop blur, which is
+   the single largest GPU cost on this page. */
+body.fx-off .workspace.scanline .scanline-bar { display: none; }
+body.fx-off .card.alert { animation: none; box-shadow: none; }
+body.fx-off .fuel-ok .fuel-dot { animation: none; opacity: 1; }
+body.fx-off .card,
+body.fx-off .detail-card,
+body.fx-off .fac-card,
+body.fx-off .fac-row,
+body.fx-off .build-card,
+body.fx-off .topbar { backdrop-filter: none; }
 
 .empty-state {
   grid-column: 1 / -1;

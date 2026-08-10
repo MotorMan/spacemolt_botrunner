@@ -12,6 +12,7 @@ import {
   saveSnapshots,
   clampInterval,
   clampCardCols,
+  clampFpsCap,
   MIN_POLL_INTERVAL_SEC,
   type StationConfig,
   type StationRow,
@@ -325,6 +326,9 @@ export class StationWebServer {
       }
       if (body.cardCols != null) {
         this.config.cardCols = clampCardCols(body.cardCols);
+      }
+      if (body.fpsCap != null) {
+        this.config.fpsCap = clampFpsCap(body.fpsCap);
       }
       if (Array.isArray(body.rows)) {
         const seen = new Set<string>();

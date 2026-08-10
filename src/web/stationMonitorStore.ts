@@ -20,6 +20,8 @@ export interface StationConfig {
   pollIntervalSec: number;
   cardCols: number;
   rows: StationRow[];
+  /** Animation frame-rate cap. -1 = off (static), 0 = uncapped, otherwise max FPS. */
+  fpsCap: number;
 }
 
 /**
@@ -102,8 +104,16 @@ export function clampCardCols(n: number): number {
   return Math.max(MIN_CARD_COLS, Math.min(MAX_CARD_COLS, Math.round(n)));
 }
 
+/** Clamp the animation frame-rate cap: -1 = off, 0 = uncapped, 1..240 = capped FPS. */
+export function clampFpsCap(n: number): number {
+  if (n === -1) return -1;
+  if (typeof n !== "number" || !isFinite(n) || n < 0) return 0;
+  if (n === 0) return 0;
+  return Math.max(1, Math.min(240, Math.round(n)));
+}
+
 export function defaultConfig(): StationConfig {
-  return { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [] };
+  return { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [], fpsCap: 0 };
 }
 
 export function loadStationConfig(): StationConfig {
@@ -120,6 +130,7 @@ export function loadStationConfig(): StationConfig {
         pollIntervalSec: clampInterval((data.pollIntervalSec as number) ?? 60),
         cardCols: clampCardCols((data.cardCols as number) ?? (data.cardMinPx as number) ?? 5),
         rows,
+        fpsCap: clampFpsCap((data.fpsCap as number) ?? 0),
       };
     } catch (err) {
       console.warn("[StationServer] Warning: corrupt stationMonitor.json, starting fresh —", err);
@@ -135,6 +146,7 @@ export function saveStationConfig(config: StationConfig): void {
     pollIntervalSec: clampInterval(config.pollIntervalSec),
     cardCols: clampCardCols(config.cardCols),
     rows: config.rows.map(normalizeRow),
+    fpsCap: clampFpsCap(config.fpsCap),
   };
   writeFileSync(CONFIG_FILE, JSON.stringify(clean, null, 2) + "\n", "utf-8");
 }

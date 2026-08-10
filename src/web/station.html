@@ -25,6 +25,7 @@
 
 <!-- Main workspace (grid mode) -->
 <main class="workspace scanline" id="workspace">
+  <div class="scanline-bar"></div>
   <div id="grid-view">
     <header class="workspace-head">
       <div>
@@ -65,6 +66,17 @@
           <span>1</span><span>16</span>
         </div>
       </div>
+      <div class="field">
+        <label>Frame Rate Cap (GPU)</label>
+        <select class="term-input" id="fps-cap">
+          <option value="0">Uncapped (smooth)</option>
+          <option value="60">60 FPS</option>
+          <option value="30">30 FPS</option>
+          <option value="15">15 FPS (low GPU)</option>
+          <option value="-1">Off (static, minimal GPU)</option>
+        </select>
+        <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Caps the decorative animations and background blur to reduce GPU usage.</div>
+      </div>
       <div id="rows-editor" style="display:flex;flex-direction:column;gap:12px;"></div>
       <button class="small-btn" id="add-row">+ ADD ROW</button>
     </div>
@@ -83,7 +95,7 @@
   const detailId = isDetail ? decodeURIComponent(location.pathname.slice("/station/".length)) : null;
 
   // ── state ──
-  let config = { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [] };
+  let config = { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [], fpsCap: 0 };
   let views = new Map();   // id -> StationView
   let order = [];          // ids in display order
   let bots = [];           // discovered bot names
@@ -257,7 +269,7 @@
           <div>FEE: <span style="color:var(--tertiary-fixed-dim)">${fee}</span></div>
         </div>
         <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);display:flex;align-items:center;justify-content:space-between;gap:6px;">
-          <span class="fuel-chip ${fuel.cls}" title="${esc(fuel.title)}">${esc(fuel.label)}</span>
+          <span class="fuel-chip ${fuel.cls}" title="${esc(fuel.title)}"><span class="fuel-dot"></span>${esc(fuel.label)}</span>
           <span class="card-age">${ageText(v.fetchedAt)}</span>
         </div>
       </div>
@@ -278,6 +290,7 @@
     }
     attachDnD();
     updateCounters();
+    collectAnimTargets();
   }
 
   function updateCounters() {
@@ -324,6 +337,9 @@
       if (cv) cv.textContent = cfg.cardCols;
     }
     document.documentElement.style.setProperty("--card-cols", cfg.cardCols);
+    const fc = document.getElementById("fps-cap");
+    if (fc) fc.value = String(num(cfg.fpsCap));
+    applyFrameCap(num(cfg.fpsCap));
     renderSettingsRows();
   }
 
@@ -399,6 +415,9 @@
         if (cv) cv.textContent = cfgR.cardCols;
       }
       document.documentElement.style.setProperty("--card-cols", cfgR.cardCols);
+      const fc = document.getElementById("fps-cap");
+      if (fc) fc.value = String(num(cfgR.fpsCap));
+      applyFrameCap(num(cfgR.fpsCap));
       applyStations(stR.stations || []);
       renderSettingsRows();
     } catch (e) { /* WS will fill in */ }
@@ -549,11 +568,11 @@
     renderSettingsRows();
   };
 
-  function saveConfig(rows, pollIntervalSec, cardCols) {
+  function saveConfig(rows, pollIntervalSec, cardCols, fpsCap) {
     return fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows, pollIntervalSec, cardCols }),
+      body: JSON.stringify({ rows, pollIntervalSec, cardCols, fpsCap }),
     }).then((r) => r.json()).then((j) => {
       if (j.error) throw new Error(j.error);
       config = j;
@@ -566,6 +585,8 @@
     const pollIntervalSec = Math.max(15, parseInt(pi.value, 10) || 60);
     const cs = document.getElementById("card-size");
     const cardCols = Math.max(1, Math.min(16, parseInt(cs.value, 10) || 5));
+    const fc = document.getElementById("fps-cap");
+    const fpsCap = parseInt(fc.value, 10) || 0;
     // read edited rows from DOM
     const rows = [];
     document.querySelectorAll("#rows-editor .row-card").forEach((div) => {
@@ -586,7 +607,7 @@
       return { ...orig, ...edited };
     });
     try {
-      await saveConfig(finalRows, pollIntervalSec, cardCols);
+      await saveConfig(finalRows, pollIntervalSec, cardCols, fpsCap);
       closeSettings();
     } catch (e) {
       alert("Save failed: " + (e.message || e));
@@ -1405,6 +1426,82 @@
       ${contribHtml}
       ${ammoHtml}
     `;
+  }
+
+  // ── Frame-rate cap (GPU) ──────────────────────────────────
+  // Decorative CSS animations (scanline, alert pulse, fuel pulse) re-composite at
+  // the display refresh rate, forcing the per-card backdrop blur to recompute every
+  // frame. Driving them from a throttled rAF loop caps how often the GPU composites.
+  let capFps = 0;            // -1 off, 0 uncapped, else max FPS
+  let animRaf = null;
+  let animTargets = { scan: null, alerts: [], fuelDots: [] };
+  let scanStart = 0;
+  let alertStart = 0;
+  let fuelStart = 0;
+
+  function collectAnimTargets() {
+    animTargets.scan = document.querySelector(".workspace .scanline-bar");
+    animTargets.alerts = Array.from(document.querySelectorAll(".card.alert"));
+    animTargets.fuelDots = Array.from(document.querySelectorAll(".fuel-ok .fuel-dot"));
+  }
+
+  function clearInlineAnim() {
+    if (animTargets.scan) {
+      animTargets.scan.style.transform = "";
+      animTargets.scan.style.opacity = "";
+    }
+    animTargets.alerts.forEach((el) => { el.style.boxShadow = ""; });
+    animTargets.fuelDots.forEach((el) => { el.style.opacity = ""; });
+  }
+
+  function renderAnimFrame(t) {
+    const scan = animTargets.scan;
+    if (scan) {
+      const p = ((t - scanStart) % 6000) / 6000;
+      const y = -10 + p * 1610;
+      scan.style.transform = "translateY(" + y + "px)";
+      scan.style.opacity = String(Math.sin(p * Math.PI) * 0.5);
+    }
+    const aPh = ((t - alertStart) % 2400) / 2400;
+    const aInt = (Math.sin(aPh * 2 * Math.PI - Math.PI / 2) + 1) / 2;
+    animTargets.alerts.forEach((el) => {
+      el.style.boxShadow = "0 0 " + (14 * aInt) + "px rgba(255,180,171," + (0.55 * aInt) + ")";
+    });
+    const fPh = ((t - fuelStart) % 1800) / 1800;
+    const fOp = 0.65 + 0.35 * Math.cos(fPh * 2 * Math.PI);
+    animTargets.fuelDots.forEach((el) => { el.style.opacity = String(fOp); });
+  }
+
+  function stopAnimLoop() {
+    if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; }
+  }
+
+  function startAnimLoop() {
+    stopAnimLoop();
+    if (capFps <= 0) return;        // uncapped: native CSS animations run
+    if (capFps === -1) return;      // off: fx-off class handles static state
+    const interval = 1000 / capFps;
+    let last = 0;
+    const loop = (t) => {
+      animRaf = requestAnimationFrame(loop);
+      if (t - last < interval) return;
+      last = t;
+      renderAnimFrame(t);
+    };
+    animRaf = requestAnimationFrame(loop);
+  }
+
+  function applyFrameCap(fps) {
+    capFps = fps;
+    document.body.classList.remove("fx-capped", "fx-off");
+    if (fps === -1) document.body.classList.add("fx-off");
+    else if (fps > 0) document.body.classList.add("fx-capped");
+    clearInlineAnim();
+    collectAnimTargets();
+    if (fps > 0) {
+      scanStart = alertStart = fuelStart = performance.now();
+    }
+    startAnimLoop();
   }
 
   // ── boot ──

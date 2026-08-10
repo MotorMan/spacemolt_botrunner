@@ -126,10 +126,18 @@ export function shouldProceedOrYield(
     return "proceed"; // No competition
   }
 
+  // A jump count of -1 means "no route found", not "zero jumps away". Treat it as
+  // infinitely far so a bot that cannot reach the target never outbids a partner
+  // that can.
+  const distanceOf = (claim: RescueClaim) =>
+    typeof claim.jumps === "number" && claim.jumps >= 0 ? claim.jumps : Number.POSITIVE_INFINITY;
+  const myDistance = distanceOf(myClaim);
+  const partnerDistance = distanceOf(partnerClaim);
+
   // Compare jump distances - closer bot wins
-  if (myClaim.jumps < partnerClaim.jumps) {
+  if (myDistance < partnerDistance) {
     return "proceed"; // We're closer
-  } else if (myClaim.jumps > partnerClaim.jumps) {
+  } else if (myDistance > partnerDistance) {
     return "yield"; // Partner is closer
   } else {
     // Same distance - use round-robin to decide who goes
@@ -414,20 +422,32 @@ export function processBotChatMessage(
 /**
  * Calculate jumps to a target system, respecting the system blacklist.
  * Returns -1 if no valid route exists.
+ *
+ * `targetSystem` may be an id ("cargo_lanes") or a display name ("Cargo Lanes") —
+ * MAYDAY messages carry names, so mapStore resolves both.
+ *
+ * Pass `ignoreBlacklist` when the caller's routine is configured to treat every
+ * system as available; otherwise a rescue that must cross a blacklisted system
+ * reports -1 even though the bot will happily fly it.
  */
 export async function calculateJumpsToTarget(
   bot: Bot,
-  targetSystem: string
+  targetSystem: string,
+  ignoreBlacklist = false
 ): Promise<number> {
   if (bot.system === targetSystem) {
     return 0;
   }
 
   // First try mapStore with blacklist validation
-  const blacklist = getSystemBlacklist();
+  const blacklist = ignoreBlacklist ? [] : getSystemBlacklist();
   const mappedRoute = mapStore.findRoute(bot.system, targetSystem, blacklist);
   if (mappedRoute && mappedRoute.length > 1) {
     return mappedRoute.length - 1;
+  }
+  // Resolved to the same system (id vs display name) — we are already there.
+  if (mappedRoute && mappedRoute.length === 1) {
+    return 0;
   }
 
   // No mapped route — try server route, but validate against blacklist

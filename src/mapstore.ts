@@ -297,6 +297,13 @@ function normalizeSystem(sys: StoredSystem): StoredSystem {
   return sys;
 }
 
+/** Loose comparison key for a system id or display name: "Cargo Lanes",
+ *  "cargo lanes", "cargo-lanes" and "cargo_lanes" all collapse to "cargolanes",
+ *  so ids and human-typed names resolve to the same system. */
+function looseSystemKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 /** Normalize every system in a freshly parsed/merged map payload. */
 function normalizeMapData(data: MapData): MapData {
   if (!data.systems || typeof data.systems !== "object") {
@@ -320,6 +327,9 @@ class MapStore {
   private writeQueued = false;
   private precalcRoutes: Record<string, Record<string, string[] | null>> = {};
   private precalcNoPirateRoutes: Record<string, Record<string, string[] | null>> = {};
+  // id/name → id lookup, rebuilt whenever mapGeneration changes.
+  private systemLookupIndex: Map<string, string> | null = null;
+  private systemLookupIndexGeneration = -1;
 
   constructor() {
     this.data = this.load();
@@ -1935,17 +1945,19 @@ const locations = this.findOreLocations(oreId, blacklist);
   /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes.
    *  `allowWormholes` is opt-in and defaults to false — see the note in the body. */
   findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false, allowWormholes: boolean = false): string[] | null {
-    if (fromSystemId === toSystemId) return [fromSystemId];
-
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
-    
-    const fromId = this.findSystemIdCaseInsensitive(fromSystemId);
-    const toId = this.findSystemIdCaseInsensitive(toSystemId);
-    
+
+    // Resolve BEFORE the identity check: callers routinely pass display names
+    // ("Tau Ceti") for one end and ids ("tau_ceti") for the other.
+    const fromId = this.resolveSystemId(fromSystemId);
+    const toId = this.resolveSystemId(toSystemId);
+
     if (!fromId || !toId) {
       return null;
     }
+
+    if (fromId === toId) return [fromId];
 
     const precalcRoutes = useNoPirate ? this.precalcNoPirateRoutes : this.precalcRoutes;
     if (precalcRoutes[fromId] && precalcRoutes[fromId][toId] !== undefined) {
@@ -1984,17 +1996,53 @@ const locations = this.findOreLocations(oreId, blacklist);
     return directRoute;
   }
   
-  /** Find system ID with case-insensitive matching. Returns the actual stored ID or null if not found. */
-  private findSystemIdCaseInsensitive(systemId: string): string | null {
-    if (!systemId) return null;
-    const lower = systemId.toLowerCase();
-    // First try exact match (most common case)
-    if (this.data.systems[systemId]) return systemId;
-    // Then try case-insensitive match
-    for (const id of Object.keys(this.data.systems)) {
-      if (id.toLowerCase() === lower) return id;
+  /** Find a system ID from an id OR a display name.
+   *
+   *  System *ids* are snake_case ("tau_ceti", "cargo_lanes") but almost every
+   *  human-facing source — MAYDAY chat messages, rescue targets, the web UI —
+   *  carries the display *name* ("Tau Ceti", "Cargo Lanes"). Matching ids only
+   *  meant every multi-word system silently failed to resolve, so findRoute
+   *  returned null and callers fell back to the server route for journeys the
+   *  local map could answer perfectly. Resolution order: exact id, then
+   *  case-insensitive id, then display name, then a loose form that treats
+   *  spaces/hyphens and underscores as equivalent. Returns null if unknown. */
+  resolveSystemId(systemIdOrName: string): string | null {
+    if (!systemIdOrName) return null;
+    // Fast path: exact id hit (the overwhelmingly common case).
+    if (this.data.systems[systemIdOrName]) return systemIdOrName;
+
+    const index = this.getSystemLookupIndex();
+    const raw = systemIdOrName.trim().toLowerCase();
+    return index.get(raw) ?? index.get(looseSystemKey(systemIdOrName)) ?? null;
+  }
+
+  /** Lazily built lowercase id/name → id index, rebuilt when the map changes. */
+  private getSystemLookupIndex(): Map<string, string> {
+    if (this.systemLookupIndex && this.systemLookupIndexGeneration === this.mapGeneration) {
+      return this.systemLookupIndex;
     }
-    return null;
+    const index = new Map<string, string>();
+    for (const id of Object.keys(this.data.systems)) {
+      // Ids win over names so a name collision can never shadow a real system.
+      index.set(id.toLowerCase(), id);
+      index.set(looseSystemKey(id), id);
+    }
+    for (const [id, sys] of Object.entries(this.data.systems)) {
+      const name = sys?.name;
+      if (!name) continue;
+      const lower = name.trim().toLowerCase();
+      if (!index.has(lower)) index.set(lower, id);
+      const loose = looseSystemKey(name);
+      if (!index.has(loose)) index.set(loose, id);
+    }
+    this.systemLookupIndex = index;
+    this.systemLookupIndexGeneration = this.mapGeneration;
+    return index;
+  }
+
+  /** @deprecated Use resolveSystemId — kept as the old name for clarity at call sites. */
+  private findSystemIdCaseInsensitive(systemId: string): string | null {
+    return this.resolveSystemId(systemId);
   }
 
   /** Debug function: Get detailed explanation of why a route wasn't found. */

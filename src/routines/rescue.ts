@@ -2587,10 +2587,20 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const routeData = routeResp.result as Record<string, unknown>;
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
-                  const blacklistedOnRoute = serverRoute.find(r => 
-                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  // Validate against the EFFECTIVE blacklist, never the raw settings list.
+                  // With ignoreBlacklist (or the cloaked-MAYDAY bypass) every system is fair
+                  // game, so `blacklist` is empty and no server route may be vetoed. Checking
+                  // runtimeBlacklist here declined perfectly reachable MAYDAYs whenever the
+                  // shortest server path happened to clip a blacklisted system — e.g. every
+                  // short route to Cargo Lanes runs through fuyue/ross_248/kruger_60.
+                  const blacklistedOnRoute = serverRoute.find(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
-                  if (!blacklistedOnRoute) viableRoute = true;
+                  if (blacklistedOnRoute) {
+                    ctx.log("mayday", `Server route to ${mayday.system} crosses blacklisted "${blacklistedOnRoute.system_id}" — not viable`);
+                  } else {
+                    viableRoute = true;
+                  }
                 }
               }
             }
@@ -5891,10 +5901,20 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const routeData = routeResp.result as Record<string, unknown>;
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
-                  const blacklistedOnRoute = serverRoute.find(r => 
-                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  // Validate against the EFFECTIVE blacklist, never the raw settings list.
+                  // With ignoreBlacklist (or the cloaked-MAYDAY bypass) every system is fair
+                  // game, so `blacklist` is empty and no server route may be vetoed. Checking
+                  // runtimeBlacklist here declined perfectly reachable MAYDAYs whenever the
+                  // shortest server path happened to clip a blacklisted system — e.g. every
+                  // short route to Cargo Lanes runs through fuyue/ross_248/kruger_60.
+                  const blacklistedOnRoute = serverRoute.find(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
-                  if (!blacklistedOnRoute) viableRoute = true;
+                  if (blacklistedOnRoute) {
+                    ctx.log("mayday", `Server route to ${mayday.system} crosses blacklisted "${blacklistedOnRoute.system_id}" — not viable`);
+                  } else {
+                    viableRoute = true;
+                  }
                 }
               }
             }
@@ -6122,7 +6142,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                        
                        // Calculate jumps for our claim
                        const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
-                       const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                       const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system, settings.ignoreBlacklist);
                        
                        // Create our claim for comparison
                        const myClaim: RescueClaim = {
@@ -6162,7 +6182,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                        if (isCooperationEnabled()) {
                          // Calculate jumps for our claim
                          const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
-                         const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                         const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system, settings.ignoreBlacklist);
                          
                          const myClaim: RescueClaim = {
                            type: "RESCUE_CLAIM",
@@ -6195,7 +6215,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                          if (partnerClaim) {
                            // Calculate jumps for our claim (again, to be safe)
                            const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
-                           const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                           const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system, settings.ignoreBlacklist);
                            
                            const myClaim: RescueClaim = {
                              type: "RESCUE_CLAIM",

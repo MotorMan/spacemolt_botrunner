@@ -22,6 +22,28 @@ export interface StationConfig {
   rows: StationRow[];
 }
 
+/**
+ * Fuel production status for a station, derived from the station bot's
+ * `craft action=queue`. Any craft job that outputs `fuel_reserve` counts — that
+ * item only ever lands in the station's fuel supply, so this catches every
+ * current and future fuel recipe (manufacture_fuel_h2o2, extract_fuel_cell, …).
+ */
+export interface FuelCraftStatus {
+  /** active = a job is running, queued = only pending jobs, none = nothing making fuel, unknown = queue unreadable. */
+  state: "active" | "queued" | "none" | "unknown";
+  activeJobs: number;
+  queuedJobs: number;
+  /** Runs still to complete across all fuel jobs. */
+  runsRemaining: number;
+  /** fuel_reserve units still to be produced across all fuel jobs. */
+  unitsRemaining: number;
+  /** ETA (ticks) of the running job, when reported. */
+  etaTicks: number | null;
+  /** Recipe name of the running (or first pending) fuel job. */
+  recipe: string | null;
+  checkedAt: number;
+}
+
 export interface StationSnapshot {
   stationId: string;
   stationName: string;
@@ -34,6 +56,8 @@ export interface StationSnapshot {
   factionFuelCapacity: number;
   faction: string | null;
   wrecked: boolean;
+  /** Optional: absent in snapshots written before fuel tracking existed. */
+  fuelCraft?: FuelCraftStatus | null;
 }
 
 export type StationSnapshots = Record<string, StationSnapshot>;

@@ -376,6 +376,39 @@ h1.page-title {
   color: var(--on-surface-variant);
 }
 
+/* fuel production indicator (bottom-left of the card) */
+.fuel-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.fuel-chip::before {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.fuel-ok { color: var(--secondary-fixed-dim); }
+.fuel-ok::before { animation: fuelPulse 1.8s ease-in-out infinite; }
+.fuel-warn { color: var(--tertiary-fixed-dim); }
+.fuel-bad { color: var(--error); }
+.fuel-unknown { color: var(--on-surface-variant); opacity: 0.7; }
+.card-age { flex: none; white-space: nowrap; opacity: 0.75; }
+
+@keyframes fuelPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 .empty-state {
   grid-column: 1 / -1;
   text-align: center;

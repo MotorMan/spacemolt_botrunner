@@ -135,7 +135,31 @@
     if (num(b.hull) < num(b.max_hull)) return true;
     if (num(b.max_fuel) > 0 && num(b.fuel) < num(b.max_fuel) * 0.1) return true;
     if (b.wrecked === true) return true;
+    // Nothing is making fuel for this station — flag it before the tanks run dry.
+    // "unknown" (queue unreadable) never alerts, so a hiccup can't red-flag every card.
+    if (fuelInfo(v).state === "none") return true;
     return false;
+  }
+
+  // ── fuel production indicator ──
+  // Keyed off the produced item (`fuel_reserve`), not a recipe id: that item
+  // only ever feeds the station's fuel supply, so any present or future fuel
+  // recipe is picked up automatically.
+  function fuelInfo(v) {
+    const f = v.fuelCraft;
+    if (!f || !f.state || f.state === "unknown") {
+      return { state: "unknown", label: "FUEL ?", cls: "fuel-unknown", title: "Fuel production unknown — craft queue could not be read" };
+    }
+    const active = num(f.activeJobs), queued = num(f.queuedJobs);
+    const jobs = active + queued;
+    const detail = `${f.recipe || "fuel"} · ${active} active / ${queued} queued · ${kfmt(num(f.unitsRemaining))} fuel pending`;
+    if (f.state === "active") {
+      return { state: "active", label: "FUEL CRAFTING" + (jobs > 1 ? " x" + jobs : ""), cls: "fuel-ok", title: detail };
+    }
+    if (f.state === "queued") {
+      return { state: "queued", label: "FUEL QUEUED" + (jobs > 1 ? " x" + jobs : ""), cls: "fuel-warn", title: detail + " (nothing running yet)" };
+    }
+    return { state: "none", label: "NO FUEL CRAFT", cls: "fuel-bad", title: "No craft job producing fuel_reserve at this station" };
   }
 
   function classify(v) {
@@ -210,6 +234,7 @@
 
     const fee = base.market_fee_bps != null ? (base.market_fee_bps + "bps") : "—";
     const satFoot = satPct + "%";
+    const fuel = fuelInfo(v);
 
     const href = v.stationId ? `/station/${encodeURIComponent(v.stationId)}` : "#";
 
@@ -231,7 +256,10 @@
           <div>SAT: <span class="${satPct === 100 ? "" : ""}" style="color:${satPct === 100 ? "var(--secondary-fixed-dim)" : "var(--error)"}">${satFoot}</span></div>
           <div>FEE: <span style="color:var(--tertiary-fixed-dim)">${fee}</span></div>
         </div>
-        <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);text-align:right;">updated ${ageText(v.fetchedAt)}</div>
+        <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);display:flex;align-items:center;justify-content:space-between;gap:6px;">
+          <span class="fuel-chip ${fuel.cls}" title="${esc(fuel.title)}">${esc(fuel.label)}</span>
+          <span class="card-age">${ageText(v.fetchedAt)}</span>
+        </div>
       </div>
     </a>`;
   }

@@ -17,9 +17,19 @@ import {
   type StationRow,
   type StationSnapshot,
   type StationSnapshots,
+  type FuelCraftStatus,
 } from "./stationMonitorStore.js";
 
 const GET_BASE_TIMEOUT_MS = 25_000;
+
+/**
+ * Every fuel recipe funnels its output straight into the station's fuel supply
+ * as `fuel_reserve`, so matching on the produced item (instead of a recipe id)
+ * automatically covers new fuel recipes and other players' recipe choices.
+ */
+const FUEL_RESERVE_ITEM = "fuel_reserve";
+const ACTIVE_JOB_STATUSES = new Set(["active", "running", "in_progress", "in-progress", "crafting", "started"]);
+const FINISHED_JOB_STATUSES = new Set(["complete", "completed", "done", "finished", "cancelled", "canceled", "failed", "error"]);
 
 type WSData = { id: number };
 
@@ -62,6 +72,7 @@ export interface StationView {
   power: Record<string, unknown> | null;
   factionFuelReserve: number;
   factionFuelCapacity: number;
+  fuelCraft: FuelCraftStatus | null;
   lastError: string | null;
   lastErrorAt: number | null;
   /** FetchedAt of the last successful get_base (last good snapshot). */
@@ -74,6 +85,46 @@ function sleep(ms: number): Promise<void> {
 
 function num(v: unknown, fallback = 0): number {
   return typeof v === "number" && isFinite(v) ? v : fallback;
+}
+
+/** True when a craft job outputs `fuel_reserve` (i.e. it refills station fuel). */
+function jobMakesFuel(job: Record<string, unknown>): boolean {
+  const outputs = [
+    ...(Array.isArray(job.produces) ? (job.produces as Record<string, unknown>[]) : []),
+    ...(Array.isArray(job.outputs) ? (job.outputs as Record<string, unknown>[]) : []),
+  ];
+  return outputs.some(
+    (o) => o && typeof o === "object" && String(o.item_id ?? "").toLowerCase() === FUEL_RESERVE_ITEM,
+  );
+}
+
+/** fuel_reserve produced per run by this job (0 when the job makes something else). */
+function fuelPerRun(job: Record<string, unknown>): number {
+  const outputs = [
+    ...(Array.isArray(job.produces) ? (job.produces as Record<string, unknown>[]) : []),
+    ...(Array.isArray(job.outputs) ? (job.outputs as Record<string, unknown>[]) : []),
+  ];
+  for (const o of outputs) {
+    if (o && typeof o === "object" && String(o.item_id ?? "").toLowerCase() === FUEL_RESERVE_ITEM) {
+      return num(o.quantity, 0);
+    }
+  }
+  return 0;
+}
+
+/**
+ * A station's craft queue is read through its own docked drone, so jobs are
+ * already station-scoped. We still match on base_id/base_name when the payload
+ * carries them, so a drone that queued work elsewhere can't produce a false
+ * "fuel is flowing" reading. Jobs without any base info are trusted.
+ */
+function jobBelongsToStation(job: Record<string, unknown>, stationId: string, stationName: string): boolean {
+  const baseId = typeof job.base_id === "string" ? job.base_id : "";
+  const baseName = typeof job.base_name === "string" ? job.base_name : "";
+  if (!baseId && !baseName) return true;
+  if (baseId && stationId && baseId === stationId) return true;
+  if (baseName && stationName && baseName.toLowerCase() === stationName.toLowerCase()) return true;
+  return false;
 }
 
 export class StationWebServer {
@@ -484,8 +535,10 @@ export class StationWebServer {
       for (const s of getBotStatuses()) statusMap.set(s.username, s);
       const stepMs = rows.length > 0 ? (this.config.pollIntervalSec * 1000) / rows.length : 0;
       const freshViews: Record<string, StationView> = {};
+      // One craft-queue read per bot per sweep, shared across its rows.
+      const queueCache = new Map<string, Record<string, unknown>[] | null>();
       for (const row of rows) {
-        const view = await this.readRow(row, statusMap);
+        const view = await this.readRow(row, statusMap, queueCache);
         freshViews[row.id] = view;
         this.broadcast({ type: "station", station: view });
         await sleep(stepMs);
@@ -497,7 +550,11 @@ export class StationWebServer {
     }
   }
 
-  private async readRow(row: StationRow, statusMap: Map<string, BotStatus>): Promise<StationView> {
+  private async readRow(
+    row: StationRow,
+    statusMap: Map<string, BotStatus>,
+    queueCache: Map<string, Record<string, unknown>[] | null>,
+  ): Promise<StationView> {
     const id = row.id;
     const prev = this.views[id];
     const lastGood = this.snapshots[id];
@@ -543,6 +600,10 @@ export class StationWebServer {
             row.stationName ||
             (base.poi_id as string) ||
             row.stationId;
+          // Fuel production check: any queued/running craft job that outputs
+          // `fuel_reserve` at this station.
+          const jobs = await this.readCraftQueue(botInstance, row.bot, queueCache);
+          const fuelCraft = this.summarizeFuelCraft(jobs, row.stationId, name);
           const snapshot: StationSnapshot = {
             stationId: row.stationId,
             stationName: name,
@@ -555,6 +616,7 @@ export class StationWebServer {
             factionFuelCapacity: num(r.faction_fuel_capacity),
             faction: status?.faction ?? null,
             wrecked,
+            fuelCraft,
           };
           this.snapshots[id] = snapshot;
           this.markSnapshotsDirty();
@@ -573,6 +635,7 @@ export class StationWebServer {
             power,
             factionFuelReserve: snapshot.factionFuelReserve,
             factionFuelCapacity: snapshot.factionFuelCapacity,
+            fuelCraft,
             lastError: null,
             lastErrorAt: null,
             fetchedAt,
@@ -608,6 +671,9 @@ export class StationWebServer {
       power: lastGood?.power ?? null,
       factionFuelReserve: lastGood?.factionFuelReserve ?? 0,
       factionFuelCapacity: lastGood?.factionFuelCapacity ?? 0,
+      // No fresh queue read this pass — carry the last known status forward
+      // rather than reporting a fuel outage we did not actually observe.
+      fuelCraft: prev?.fuelCraft ?? lastGood?.fuelCraft ?? null,
       lastError,
       lastErrorAt,
       fetchedAt,
@@ -624,6 +690,110 @@ export class StationWebServer {
       ),
     );
     return Promise.race([apiPromise, timeoutPromise]);
+  }
+
+  /**
+   * Read a bot's whole craft queue once per sweep. Results are cached by bot
+   * name so two rows sharing a drone only cost one call. `null` means the queue
+   * could not be read (treated as "unknown", never as "no fuel").
+   */
+  private async readCraftQueue(
+    botInstance: Bot,
+    botName: string,
+    cache: Map<string, Record<string, unknown>[] | null>,
+  ): Promise<Record<string, unknown>[] | null> {
+    if (cache.has(botName)) return cache.get(botName) ?? null;
+    let jobs: Record<string, unknown>[] | null = null;
+    try {
+      const resp = await this.execBot(botInstance, "craft", { action: "queue" });
+      if (resp.ok) {
+        const data = (resp.data ?? {}) as Record<string, unknown>;
+        const root =
+          (data.structuredContent as Record<string, unknown>) ??
+          (data.details as Record<string, unknown>) ??
+          data;
+        const raw = Array.isArray(root?.jobs)
+          ? (root.jobs as unknown[])
+          : Array.isArray(data.jobs)
+            ? (data.jobs as unknown[])
+            : null;
+        // An empty/absent `jobs` array on a successful call legitimately means
+        // "nothing queued" — only a failed call stays unknown.
+        jobs = (raw ?? []).filter(
+          (j): j is Record<string, unknown> => !!j && typeof j === "object",
+        );
+      }
+    } catch {
+      jobs = null;
+    }
+    cache.set(botName, jobs);
+    return jobs;
+  }
+
+  /** Collapse a craft queue into this station's fuel-production status. */
+  private summarizeFuelCraft(
+    jobs: Record<string, unknown>[] | null,
+    stationId: string,
+    stationName: string,
+  ): FuelCraftStatus {
+    const checkedAt = Date.now();
+    if (!jobs) {
+      return {
+        state: "unknown",
+        activeJobs: 0,
+        queuedJobs: 0,
+        runsRemaining: 0,
+        unitsRemaining: 0,
+        etaTicks: null,
+        recipe: null,
+        checkedAt,
+      };
+    }
+
+    let activeJobs = 0;
+    let queuedJobs = 0;
+    let runsRemaining = 0;
+    let unitsRemaining = 0;
+    let etaTicks: number | null = null;
+    let activeRecipe: string | null = null;
+    let anyRecipe: string | null = null;
+
+    for (const job of jobs) {
+      if (!jobMakesFuel(job)) continue;
+      if (!jobBelongsToStation(job, stationId, stationName)) continue;
+      const status = String(job.status ?? "").toLowerCase();
+      if (FINISHED_JOB_STATUSES.has(status)) continue;
+
+      const runs = num(job.runs_remaining, 0);
+      runsRemaining += runs;
+      unitsRemaining += runs * fuelPerRun(job);
+      const recipe = typeof job.recipe === "string" ? job.recipe : null;
+      if (!anyRecipe) anyRecipe = recipe;
+
+      // Anything not explicitly finished and not explicitly running still
+      // represents pending fuel, so it counts as queued.
+      if (ACTIVE_JOB_STATUSES.has(status) || (!status && num(job.progress, 0) > 0)) {
+        activeJobs++;
+        if (!activeRecipe) activeRecipe = recipe;
+        if (etaTicks == null && job.eta_ticks != null) etaTicks = num(job.eta_ticks, 0);
+      } else {
+        queuedJobs++;
+      }
+    }
+
+    const state: FuelCraftStatus["state"] =
+      activeJobs > 0 ? "active" : queuedJobs > 0 ? "queued" : "none";
+
+    return {
+      state,
+      activeJobs,
+      queuedJobs,
+      runsRemaining,
+      unitsRemaining,
+      etaTicks,
+      recipe: activeRecipe ?? anyRecipe,
+      checkedAt,
+    };
   }
 
   /** Merged view: config rows + latest snapshot + derived state, in config order. */
@@ -647,6 +817,7 @@ export class StationWebServer {
         power: snap?.power ?? null,
         factionFuelReserve: snap?.factionFuelReserve ?? 0,
         factionFuelCapacity: snap?.factionFuelCapacity ?? 0,
+        fuelCraft: snap?.fuelCraft ?? null,
         lastError: null,
         lastErrorAt: null,
         fetchedAt: snap?.fetchedAt ?? null,

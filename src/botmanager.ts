@@ -459,7 +459,40 @@ function setupBotLogging(bot: Bot): void {
 
 let lastStatusKey = "";
 
+/**
+ * Minimum gap between dashboard status pushes.
+ *
+ * `refreshStatusTable` is wired to `onStateChanged` for every bot, and each
+ * push carries the FULL fleet snapshot (inventory, storage, skills, ...). With
+ * a four-figure bot count a "start all idle" produced thousands of multi-MB
+ * broadcasts in a few seconds, which no dashboard can render as fast as it
+ * receives them — the browser then queues payloads faster than it can free them
+ * and eats all available RAM/swap. Bursts are coalesced into a single trailing
+ * push instead; the 2s periodic refresh still guarantees eventual consistency.
+ */
+const STATUS_PUSH_MIN_INTERVAL_MS = 250;
+let lastStatusPushAt = 0;
+let statusPushTimer: ReturnType<typeof setTimeout> | null = null;
+
 function refreshStatusTable(): void {
+  if (statusPushTimer) return; // a trailing push is already scheduled
+
+  const wait = STATUS_PUSH_MIN_INTERVAL_MS - (Date.now() - lastStatusPushAt);
+  if (wait > 0) {
+    statusPushTimer = setTimeout(() => {
+      statusPushTimer = null;
+      refreshStatusTableNow();
+    }, wait);
+    // Never let a pending UI push keep the process alive during shutdown.
+    (statusPushTimer as unknown as { unref?: () => void }).unref?.();
+    return;
+  }
+  refreshStatusTableNow();
+}
+
+function refreshStatusTableNow(): void {
+  lastStatusPushAt = Date.now();
+
   const key = [...bots.entries()]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([, b]) =>
@@ -2949,6 +2982,10 @@ async function main(): Promise<void> {
     server.logSystem(`Server shutdown requested (${signal}${restart ? ", restart requested" : ""})`);
     // Clear intervals
     for (const id of intervals) clearInterval(id);
+    if (statusPushTimer) {
+      clearTimeout(statusPushTimer);
+      statusPushTimer = null;
+    }
     // Flush stats before stopping bots
     const statuses = [...bots.values()].map(b => b.status());
     server.flushBotStats(statuses);

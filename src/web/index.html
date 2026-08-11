@@ -1622,6 +1622,8 @@
         if (tab) tab.classList.add("active");
         const page = document.getElementById(`page-${name}`);
         if (page) page.classList.add("active");
+        // The bot table skips rendering while it is off-screen — catch it up.
+        if (name === "dashboard") flushBotsRender();
         if (name === "settings") renderSettingsPanel();
         if (name === "map") renderMapPage();
         if (name === "market") renderMarketPage();
@@ -2245,16 +2247,27 @@
       let wsBytesByType = {};
       let wsTotalBytes = 0;
       let wsBytesTimer = null;
-      function trackWsBytes(data) {
-        const raw = typeof data === "string" ? data : JSON.stringify(data);
-        const len = new Blob([raw]).size;
+      /**
+       * Account for an inbound frame. `type` MUST be supplied by the caller
+       * (which has already parsed the payload).
+       *
+       * This used to do `new Blob([raw]).size` and a second `JSON.parse` just to
+       * read the message type. Both were catastrophic at fleet scale: a
+       * ~1000-bot `status` push is multiple megabytes, so every message was
+       * copied into the browser's blob store (which spills to disk once it grows
+       * past its memory quota) and parsed twice. The blob copies are only
+       * released when their JS wrappers are collected — which does not happen
+       * while the main thread is saturated re-rendering the bot table, so they
+       * accumulate into tens of GB of RAM/swap. Size is now approximated from
+       * the string length (these payloads are effectively all ASCII) with zero
+       * allocation.
+       */
+      function trackWsBytes(data, type) {
+        if (typeof data !== "string") return;
+        const len = data.length;
         wsTotalBytes += len;
-        let type = "unknown";
-        if (data && typeof data === "object" && data.type) type = data.type;
-        else if (typeof data === "string") {
-          try { type = JSON.parse(data).type || "raw"; } catch { type = "raw"; }
-        }
-        wsBytesByType[type] = (wsBytesByType[type] || 0) + len;
+        const key = type || "unknown";
+        wsBytesByType[key] = (wsBytesByType[key] || 0) + len;
       }
       function logWsBytesSummary() {
         if (wsTotalBytes === 0) return;
@@ -2369,13 +2382,14 @@
         };
 
         _ws.onmessage = (ev) => {
-          trackWsBytes(ev.data);
           let msg;
           try {
             msg = JSON.parse(ev.data);
           } catch {
+            trackWsBytes(ev.data, "raw");
             return;
           }
+          trackWsBytes(ev.data, msg.type);
           if (msg.type === "pong") return;
           wsLastMsg = Date.now();
           switch (msg.type) {
@@ -2512,141 +2526,7 @@
               }
 
               if (!_blockStatusUpdate) {
-                renderBots();
-                renderStats();
-                updateChatBotSelect();
-                // Update the home-station fuel from the live bots[] snapshot.
-                refreshHomeStationFuel();
-                // Update skills data for live updates (when debug logging is disabled)
-                if (skillsLoaded && skillsData && skillsData.bots) {
-                  for (const bot of bots) {
-                    if (bot.skills) {
-                      const skills = {};
-                      for (const [skillId, skillData] of Object.entries(
-                        bot.skills,
-                      )) {
-                        const xp = skillData.xp || skillData["xp"] || 0;
-                        const nextLevelXp =
-                          skillData.xpToNext ||
-                          skillData["xp_to_next"] ||
-                          skillData.next_level_xp ||
-                          0;
-                        const cachedNextLevelXp =
-                          skillsNextLevelCache[bot.username]?.[skillId];
-                        const finalNextLevelXp =
-                          nextLevelXp > 0 ? nextLevelXp : cachedNextLevelXp || 0;
-                        skills[skillId] = {
-                          level: skillData.level || 0,
-                          xp: xp,
-                          nextLevelXp: finalNextLevelXp,
-                        };
-                        if (!skillsNextLevelCache[bot.username])
-                          skillsNextLevelCache[bot.username] = {};
-                        if (nextLevelXp > 0) {
-                          skillsNextLevelCache[bot.username][skillId] = nextLevelXp;
-                        }
-                      }
-                      skillsData.bots[bot.username] = {
-                        skills,
-                        lastUpdated: new Date().toISOString(),
-                      };
-                    }
-                  }
-                  // Re-render skills tab if it's currently visible
-                  if (
-                    document
-                      .getElementById("page-stats")
-                      ?.classList.contains("active") &&
-                    document.getElementById("statsSkillsView")?.style
-                      .display !== "none"
-                  ) {
-                    renderSkillsTab();
-                  }
-                }
-                // Update profile sidebar if open (location, credits, cargo, etc.)
-                if (profileBot) {
-                  updateProfileSidebar();
-                  // Update storage/cargo dropdowns in manual controls (without full re-render)
-                  updateStorageDropdowns();
-
-                  // Update faction storage panel in manual controls if fresh data is available
-                  // (renderManualControls is blocked by _blockRenderUntil, so update manually)
-                  if (
-                    _pendingFreshFactionStorage !== null &&
-                    _pendingFreshFactionStorage !== undefined
-                  ) {
-                    const factionItems = _pendingFreshFactionStorage;
-                    const factionSelect =
-                      document.getElementById("faction-wit-item");
-                    if (factionSelect && factionItems) {
-                      // Store current selection
-                      const currentValue = factionSelect.value;
-                      // Rebuild options
-                      let sortedFaction = [...factionItems];
-                      if (factionWithdrawSortOrder === "alpha") {
-                        sortedFaction.sort((a, b) => {
-                          const nameA = (
-                            a.name ||
-                            a.item_name ||
-                            a.item_id ||
-                            a.id ||
-                            ""
-                          ).toLowerCase();
-                          const nameB = (
-                            b.name ||
-                            b.item_name ||
-                            b.item_id ||
-                            b.id ||
-                            ""
-                          ).toLowerCase();
-                          return nameA.localeCompare(nameB);
-                        });
-                      } else if (factionWithdrawSortOrder === "quantity") {
-                        sortedFaction.sort(
-                          (a, b) =>
-                            (b.quantity || b.count || 0) -
-                            (a.quantity || a.count || 0),
-                        );
-                      }
-                      const opts = sortedFaction
-                        .map(
-                          (i) =>
-                            `<option value="${esc(i.item_id)}" data-max="${i.quantity}"${i.item_id === currentValue ? " selected" : ""}>${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`,
-                        )
-                        .join("");
-                      factionSelect.innerHTML =
-                        opts ||
-                        '<option value="">Empty or not available</option>';
-                    }
-                  }
-
-                  // If bot changed systems or docked status, refresh relevant data
-                  // (renderManualControls will be called when the data fetches complete)
-                  const bot = bots.find((b) => b.username === profileBot);
-                  const prevBot = window._profilePrevBot;
-                  window._profilePrevBot = bot;
-
-                  if (
-                    bot &&
-                    prevBot &&
-                    (bot.system !== prevBot.system ||
-                      bot.docked !== prevBot.docked)
-                  ) {
-                    // System changed or docked/undocked - refresh system data
-                    profileSystemData = null;
-                    fetchSystemData(profileBot);
-
-                    // If now docked, refresh station-specific data
-                    if (bot.docked) {
-                      profileMarket = null;
-                      profileRecipes = null;
-                      profileFactionStorage = null;
-                      fetchMarket(profileBot);
-                      fetchRecipes(profileBot);
-                      fetchFactionStorage(profileBot);
-                    }
-                  }
-                }
+                scheduleStatusUiUpdate();
               } else {
                 console.log(
                   `[DEBUG] status handler: BLOCKED - refreshingStorage is true`,
@@ -2654,7 +2534,7 @@
               }
               break;
             case "log":
-              appendLine(msg.panel, msg.line);
+              queueLogLine(msg.panel, msg.line);
               break;
             case "actionResult":
               if (msg.error) {
@@ -2946,6 +2826,343 @@
         return "";
       }
 
+      // ── Coalesced status rendering ─────────────────────────────
+      // The server pushes a full-fleet `status` snapshot on every bot state
+      // change. A bulk start/stop of ~1000 bots therefore fires thousands of
+      // multi-megabyte pushes within a few seconds. Rendering each one
+      // synchronously pins the main thread, and while it is pinned the browser
+      // can neither run GC nor drain the socket queue — so parsed payloads and
+      // discarded DOM pile up until the tab has eaten every GB it can get.
+      // Repaint at most once per animation frame and simply drop the
+      // intermediate snapshots; `bots` always holds the newest one anyway.
+      let _statusUiQueued = false;
+      let _statusUiTimer = null;
+      function scheduleStatusUiUpdate() {
+        if (_statusUiQueued) return;
+        _statusUiQueued = true;
+        const run = () => {
+          if (!_statusUiQueued) return; // already ran via the other trigger
+          _statusUiQueued = false;
+          if (_statusUiTimer !== null) {
+            clearTimeout(_statusUiTimer);
+            _statusUiTimer = null;
+          }
+          try {
+            applyStatusUiUpdate();
+          } catch (err) {
+            console.error("status UI update failed:", err);
+          }
+        };
+        if (!document.hidden && typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(run);
+          // Safety net: rAF is starved while the window is occluded or
+          // minimised, which does not always flip `document.hidden`.
+          _statusUiTimer = setTimeout(run, 2000);
+        } else {
+          // rAF never fires while the document is hidden. Fall back to a slow
+          // timer so a backgrounded dashboard still tracks the fleet without
+          // queueing a render per push.
+          _statusUiTimer = setTimeout(run, 1000);
+        }
+      }
+
+      // A hidden tab renders nothing; make sure it catches up as soon as it is
+      // shown again instead of waiting for the next server push.
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) scheduleStatusUiUpdate();
+      });
+
+      /**
+       * Apply the newest `status` snapshot to the dashboard UI.
+       *
+       * Never call this straight from the socket handler — use
+       * scheduleStatusUiUpdate() so bursts collapse into one repaint.
+       */
+      function applyStatusUiUpdate() {
+        renderBots();
+        renderStats();
+        updateChatBotSelect();
+        // Update the home-station fuel from the live bots[] snapshot.
+        refreshHomeStationFuel();
+        // Update skills data for live updates (when debug logging is disabled)
+        if (skillsLoaded && skillsData && skillsData.bots) {
+          for (const bot of bots) {
+            if (bot.skills) {
+              const skills = {};
+              for (const [skillId, skillData] of Object.entries(
+                bot.skills,
+              )) {
+                const xp = skillData.xp || skillData["xp"] || 0;
+                const nextLevelXp =
+                  skillData.xpToNext ||
+                  skillData["xp_to_next"] ||
+                  skillData.next_level_xp ||
+                  0;
+                const cachedNextLevelXp =
+                  skillsNextLevelCache[bot.username]?.[skillId];
+                const finalNextLevelXp =
+                  nextLevelXp > 0 ? nextLevelXp : cachedNextLevelXp || 0;
+                skills[skillId] = {
+                  level: skillData.level || 0,
+                  xp: xp,
+                  nextLevelXp: finalNextLevelXp,
+                };
+                if (!skillsNextLevelCache[bot.username])
+                  skillsNextLevelCache[bot.username] = {};
+                if (nextLevelXp > 0) {
+                  skillsNextLevelCache[bot.username][skillId] = nextLevelXp;
+                }
+              }
+              skillsData.bots[bot.username] = {
+                skills,
+                lastUpdated: new Date().toISOString(),
+              };
+            }
+          }
+          // Re-render skills tab if it's currently visible
+          if (
+            document
+              .getElementById("page-stats")
+              ?.classList.contains("active") &&
+            document.getElementById("statsSkillsView")?.style
+              .display !== "none"
+          ) {
+            renderSkillsTab();
+          }
+        }
+        // Update profile sidebar if open (location, credits, cargo, etc.)
+        if (profileBot) {
+          updateProfileSidebar();
+          // Update storage/cargo dropdowns in manual controls (without full re-render)
+          updateStorageDropdowns();
+
+          // Update faction storage panel in manual controls if fresh data is available
+          // (renderManualControls is blocked by _blockRenderUntil, so update manually)
+          if (
+            _pendingFreshFactionStorage !== null &&
+            _pendingFreshFactionStorage !== undefined
+          ) {
+            const factionItems = _pendingFreshFactionStorage;
+            const factionSelect =
+              document.getElementById("faction-wit-item");
+            if (factionSelect && factionItems) {
+              // Store current selection
+              const currentValue = factionSelect.value;
+              // Rebuild options
+              let sortedFaction = [...factionItems];
+              if (factionWithdrawSortOrder === "alpha") {
+                sortedFaction.sort((a, b) => {
+                  const nameA = (
+                    a.name ||
+                    a.item_name ||
+                    a.item_id ||
+                    a.id ||
+                    ""
+                  ).toLowerCase();
+                  const nameB = (
+                    b.name ||
+                    b.item_name ||
+                    b.item_id ||
+                    b.id ||
+                    ""
+                  ).toLowerCase();
+                  return nameA.localeCompare(nameB);
+                });
+              } else if (factionWithdrawSortOrder === "quantity") {
+                sortedFaction.sort(
+                  (a, b) =>
+                    (b.quantity || b.count || 0) -
+                    (a.quantity || a.count || 0),
+                );
+              }
+              const opts = sortedFaction
+                .map(
+                  (i) =>
+                    `<option value="${esc(i.item_id)}" data-max="${i.quantity}"${i.item_id === currentValue ? " selected" : ""}>${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`,
+                )
+                .join("");
+              factionSelect.innerHTML =
+                opts ||
+                '<option value="">Empty or not available</option>';
+            }
+          }
+
+          // If bot changed systems or docked status, refresh relevant data
+          // (renderManualControls will be called when the data fetches complete)
+          const bot = bots.find((b) => b.username === profileBot);
+          const prevBot = window._profilePrevBot;
+          window._profilePrevBot = bot;
+
+          if (
+            bot &&
+            prevBot &&
+            (bot.system !== prevBot.system ||
+              bot.docked !== prevBot.docked)
+          ) {
+            // System changed or docked/undocked - refresh system data
+            profileSystemData = null;
+            fetchSystemData(profileBot);
+
+            // If now docked, refresh station-specific data
+            if (bot.docked) {
+              profileMarket = null;
+              profileRecipes = null;
+              profileFactionStorage = null;
+              fetchMarket(profileBot);
+              fetchRecipes(profileBot);
+              fetchFactionStorage(profileBot);
+            }
+          }
+        }
+      }
+
+      // ── Bot table rendering ────────────────────────────────────
+      // Rebuilding the whole <tbody> from a template string is O(bots ×
+      // routines) DOM work — every non-running row carries a full routine
+      // <select>, so a 1000-bot fleet means ~40k nodes thrown away and rebuilt
+      // per render. Combined with the server's per-state-change `status` push
+      // that is enough to wedge the main thread during a bulk start. Rows are
+      // therefore cached per bot and only rebuilt when the data they display
+      // actually changed, which also preserves each row's <select> state.
+      const _botRowCache = new Map(); // username -> { tr, sig }
+      let _routineOptsCache = { routines: null, bySelected: new Map() };
+      let _botsRenderDirty = false;
+
+      /** Options markup for a row's routine <select>, memoised per selection. */
+      function routineOptionsHtml(selected) {
+        if (_routineOptsCache.routines !== routines) {
+          _routineOptsCache = { routines, bySelected: new Map() };
+        }
+        let html = _routineOptsCache.bySelected.get(selected);
+        if (html === undefined) {
+          html = routines
+            .map(
+              (r) =>
+                `<option value="${esc(r)}"${r === selected ? " selected" : ""}>${esc(r)}</option>`,
+            )
+            .join("");
+          _routineOptsCache.bySelected.set(selected, html);
+        }
+        return html;
+      }
+
+      /** True when the bot table is actually on screen and worth rendering. */
+      function botTableVisible() {
+        if (document.hidden) return false;
+        const page = document.getElementById("page-dashboard");
+        if (!page || !page.classList.contains("active")) return false;
+        // The routine-groups layout replaces the table with its own view.
+        if (document.body.classList.contains("routine-groups-active"))
+          return false;
+        return true;
+      }
+
+      /** Render the table now if a render was skipped while it was hidden. */
+      function flushBotsRender() {
+        if (_botsRenderDirty) renderBots();
+      }
+
+      /** Compact, allocation-light key for a bot's bounty map. */
+      function bountyKey(bot) {
+        const b = bot.bounties;
+        if (!b || typeof b !== "object") return "";
+        const keys = Object.keys(b);
+        if (keys.length === 0) return "";
+        return keys.map((k) => `${k}=${b[k]}`).join(",");
+      }
+
+      /** Everything the row markup depends on — unchanged sig means no rebuild. */
+      function botRowSignature(bot, loc, stateLabel) {
+        return [
+          stateLabel,
+          bot.state,
+          bot.routine,
+          bot.shipName,
+          bot.credits,
+          bot.fuel,
+          bot.maxFuel,
+          bot.hull,
+          bot.maxHull,
+          bot.shield,
+          bot.maxShield,
+          bot.cargo,
+          bot.cargoMax,
+          loc,
+          bot.docked === true,
+          bot.isCloaked === true,
+          bot.hasEmergencyWarpStabilizer === false,
+          bot.inBattle === true,
+          bot.battleId || "",
+          bountyKey(bot),
+        ].join("\u0001");
+      }
+
+      function botRowHtml(bot, loc, stateLabel) {
+        const fuelPct =
+          bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+        const fuelDisplay =
+          bot.maxFuel > 0 ? `${bot.fuel}/${bot.maxFuel}` : `${bot.fuel}`;
+        const isLowFuel = bot.maxFuel > 0 && bot.fuel / bot.maxFuel < 0.2;
+        const fuelClass = isLowFuel ? "low-fuel" : "";
+        const fuelGradient = getFuelGradient(fuelPct);
+        const cargoPct =
+          bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
+        const cargoDisplay =
+          bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
+        const isCargoFull = bot.cargoMax > 0 && bot.cargo / bot.cargoMax > 0.9;
+        const cargoClass = isCargoFull ? "cargo-full" : "";
+        const hullShd =
+          bot.maxHull > 0 || bot.maxShield > 0
+            ? `${bot.hull}/${bot.shield}`
+            : "-";
+        let actions = "";
+        if (bot.state !== "running" && bot.state !== "stopping") {
+          const prevSel = document.getElementById(
+            `routine-${esc(bot.username)}`,
+          );
+          const prevRoutine = prevSel
+            ? prevSel.value
+            : lastUsedRoutines[bot.username] || bot.routine || "miner";
+          actions = `
+        <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()" onchange="toggleReturnHomeOptions('${esc(bot.username)}')">
+          ${routineOptionsHtml(prevRoutine)}
+        </select>
+        <label class="rh-ignore-label" id="routine-returnhome-lbl-${esc(bot.username)}" style="display:${prevRoutine === "return_home" ? "inline-flex" : "none"};align-items:center;gap:3px;font-size:11px;color:var(--text-dim);white-space:nowrap">
+          <input type="checkbox" id="routine-returnhome-ignore-${esc(bot.username)}" onclick="event.stopPropagation()">
+          Ignore blacklist
+        </label>
+        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
+        <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
+        } else if (bot.state === "running") {
+          actions =
+            bot.routine === "civilian_transport"
+              ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+              : bot.routine === "cargo_mover"
+                ? `<button class="warning-cargo sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+                : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
+        }
+        return `
+      <td class="bot-name-cell ${bot.isCloaked ? "cloaked" : ""}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</td>
+      <td class="ship-cell">${esc(bot.shipName || "-")}</td>
+      <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
+      <td>${num(bot.credits)}cr</td>
+      <td class="fuel-cell ${fuelClass}">
+        <div class="cell-bar-wrapper">
+          <div class="cell-bar-track"><div class="cell-bar-fuel" style="width:${fuelPct}%;${fuelGradient}"></div></div>
+          <span class="cell-bar-text">${fuelDisplay}</span>
+        </div>
+      </td>
+      <td class="hull-shield-cell">${hullShd}</td>
+      <td class="cargo-cell ${cargoClass}">
+        <div class="cell-bar-wrapper">
+          <div class="cell-bar-track"><div class="cell-bar-cargo" style="width:${cargoPct}%;${getCargoGradient(cargoPct)}"></div></div>
+          <span class="cell-bar-text">${cargoDisplay}</span>
+        </div>
+      </td>
+      <td class="location-cell" title="${esc(loc)}">${esc(loc)}</td>
+      <td><div class="row-actions">${actions}</div></td>`;
+      }
+
       function renderBots() {
         // If a routine dropdown in the dashboard table is focused/open, skip re-rendering
         // The browser's native dropdown closes when the element is removed from DOM
@@ -2953,6 +3170,15 @@
           updateBotTableBadges();
           return;
         }
+
+        // Nothing to paint while the dashboard is hidden — remember that the
+        // table is stale and rebuild it when it comes back into view. Without
+        // this, a bulk start keeps rebuilding thousands of off-screen rows.
+        if (!botTableVisible()) {
+          _botsRenderDirty = true;
+          return;
+        }
+        _botsRenderDirty = false;
 
         // Grid view rendering
         if (gridView) {
@@ -2968,14 +3194,15 @@
           }
           gridContainer.style.display = "grid";
           document.getElementById("botTable").style.display = "none";
-          if (bots.length === 0) {
-            gridContainer.innerHTML =
-              '<div class="grid-empty">No bots configured</div>';
-            return;
+          const gridHtml =
+            bots.length === 0
+              ? '<div class="grid-empty">No bots configured</div>'
+              : bots.map((bot) => renderBotGridCard(bot)).join("");
+          // Skip the DOM write when nothing actually changed.
+          if (gridContainer._lastHtml !== gridHtml) {
+            gridContainer.innerHTML = gridHtml;
+            gridContainer._lastHtml = gridHtml;
           }
-          gridContainer.innerHTML = bots
-            .map((bot) => renderBotGridCard(bot))
-            .join("");
           return;
         } else {
           // Make sure table is visible
@@ -2987,6 +3214,7 @@
 
         const tbody = document.getElementById("botTableBody");
         if (bots.length === 0) {
+          _botRowCache.clear();
           tbody.innerHTML =
             '<tr class="empty-row"><td colspan="9">No bots configured</td></tr>';
           return;
@@ -3015,94 +3243,64 @@
           });
         }
 
-        tbody.innerHTML = bots
-          .map((bot) => {
-            const fuelPct =
-              bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
-            const fuelDisplay =
-              bot.maxFuel > 0 ? `${bot.fuel}/${bot.maxFuel}` : `${bot.fuel}`;
-            const isLowFuel = bot.maxFuel > 0 && bot.fuel / bot.maxFuel < 0.2;
-            const fuelClass = isLowFuel ? "low-fuel" : "";
-            const fuelGradient = getFuelGradient(fuelPct);
-            const loc = bot.poi
-              ? resolveLocation(bot.system, bot.poi)
-              : resolveLocation(bot.system) || bot.location;
-            const stateLabel =
-              bot.state === "running" && bot.routine
-                ? bot.routine
-                : bot.state === "error"
-                  ? lastUsedRoutines[bot.username] || "miner"
-                  : bot.state;
-            const cargoPct =
-              bot.cargoMax > 0
-                ? Math.round((bot.cargo / bot.cargoMax) * 100)
-                : 0;
-            const cargoDisplay =
-              bot.cargoMax > 0
-                ? `${bot.cargo}/${bot.cargoMax}`
-                : `${bot.cargo}`;
-            const isCargoFull =
-              bot.cargoMax > 0 && bot.cargo / bot.cargoMax > 0.9;
-            const cargoClass = isCargoFull ? "cargo-full" : "";
-            const hullShd =
-              bot.maxHull > 0 || bot.maxShield > 0
-                ? `${bot.hull}/${bot.shield}`
-                : "-";
-            let actions = "";
-            if (bot.state !== "running" && bot.state !== "stopping") {
-              const prevSel = document.getElementById(
-                `routine-${esc(bot.username)}`,
-              );
-              const prevRoutine = prevSel
-                ? prevSel.value
-                : lastUsedRoutines[bot.username] || bot.routine || "miner";
-              actions = `
-        <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()" onchange="toggleReturnHomeOptions('${esc(bot.username)}')">
-          ${routines.map((r) => `<option value="${esc(r)}"${r === prevRoutine ? " selected" : ""}>${esc(r)}</option>`).join("")}
-        </select>
-        <label class="rh-ignore-label" id="routine-returnhome-lbl-${esc(bot.username)}" style="display:${prevRoutine === "return_home" ? "inline-flex" : "none"};align-items:center;gap:3px;font-size:11px;color:var(--text-dim);white-space:nowrap">
-          <input type="checkbox" id="routine-returnhome-ignore-${esc(bot.username)}" onclick="event.stopPropagation()">
-          Ignore blacklist
-        </label>
-        <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
-        <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
-            } else if (bot.state === "running") {
-              actions =
-                bot.routine === "civilian_transport"
-                  ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-                  : bot.routine === "cargo_mover"
-                    ? `<button class="warning-cargo sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
-                    : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
-            }
-            return `<tr data-bot="${esc(bot.username)}">
-      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}${ewsWarningDot(bot)}${dockedIndicator(bot)}${bountyIndicator(bot)}${combatIndicator(bot)}</td>
-      <td class="ship-cell">${esc(bot.shipName || "-")}</td>
-      <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
-      <td>${num(bot.credits)}cr</td>
-      <td class="fuel-cell ${fuelClass}">
-        <div class="cell-bar-wrapper">
-          <div class="cell-bar-track"><div class="cell-bar-fuel" style="width:${fuelPct}%;${fuelGradient}"></div></div>
-          <span class="cell-bar-text">${fuelDisplay}</span>
-        </div>
-      </td>
-      <td class="hull-shield-cell">${hullShd}</td>
-      <td class="cargo-cell ${cargoClass}">
-        <div class="cell-bar-wrapper">
-          <div class="cell-bar-track"><div class="cell-bar-cargo" style="width:${cargoPct}%;${getCargoGradient(cargoPct)}"></div></div>
-          <span class="cell-bar-text">${cargoDisplay}</span>
-        </div>
-      </td>
-      <td class="location-cell" title="${esc(loc)}">${esc(loc)}</td>
-      <td><div class="row-actions">${actions}</div></td>
-    </tr>`;
-          })
-          .join("");
+        // Build (or reuse) the row for every bot.
+        const desired = new Array(bots.length);
+        for (let i = 0; i < bots.length; i++) {
+          const bot = bots[i];
+          const loc = bot.poi
+            ? resolveLocation(bot.system, bot.poi)
+            : resolveLocation(bot.system) || bot.location;
+          const stateLabel =
+            bot.state === "running" && bot.routine
+              ? bot.routine
+              : bot.state === "error"
+                ? lastUsedRoutines[bot.username] || "miner"
+                : bot.state;
+          const sig = botRowSignature(bot, loc, stateLabel);
+          const cached = _botRowCache.get(bot.username);
+          if (cached && cached.sig === sig) {
+            desired[i] = cached.tr;
+            continue;
+          }
+          const tr = cached ? cached.tr : document.createElement("tr");
+          if (!cached) tr.dataset.bot = bot.username;
+          tr.innerHTML = botRowHtml(bot, loc, stateLabel);
+          _botRowCache.set(bot.username, { tr, sig });
+          desired[i] = tr;
+        }
+
+        // Forget rows for bots that are gone so the cache can't grow forever.
+        if (_botRowCache.size > bots.length) {
+          const live = new Set(bots.map((b) => b.username));
+          for (const name of [..._botRowCache.keys()]) {
+            if (!live.has(name)) _botRowCache.delete(name);
+          }
+        }
+
+        // Keyed reconcile: in the common case (same bots, same order) this
+        // touches the DOM zero times.
+        let node = tbody.firstElementChild;
+        for (let i = 0; i < desired.length; i++) {
+          const tr = desired[i];
+          if (node === tr) {
+            node = node.nextElementSibling;
+            continue;
+          }
+          tbody.insertBefore(tr, node);
+        }
+        while (node) {
+          const next = node.nextElementSibling;
+          tbody.removeChild(node);
+          node = next;
+        }
       }
 
       /** Update badge/state text in existing table rows without replacing DOM (preserves focus) */
       function updateBotTableBadges() {
         bots.forEach((bot) => {
-          const row = document.querySelector(`tr[data-bot="${bot.username}"]`);
+          const row =
+            _botRowCache.get(bot.username)?.tr ||
+            document.querySelector(`tr[data-bot="${bot.username}"]`);
           if (!row) return;
           const badge = row.querySelector(
             `.state-badge[data-bot="${bot.username}"]`,
@@ -19206,17 +19404,23 @@ When responding:
       }
 
       // ── Chat bot select ────────────────────────────────────────
+      // Rebuilding a ~1000-option <select> on every status push is pure waste:
+      // the roster only changes when a bot is added or removed.
+      let _chatBotSelectKey = null;
       function updateChatBotSelect() {
         const select = document.getElementById("chatBot");
+        if (!select) return;
+        const names = bots
+          .map((b) => b.username || "")
+          .sort((a, b) => a.localeCompare(b));
+        const key = names.join("\u0001");
+        if (key === _chatBotSelectKey) return;
+        _chatBotSelectKey = key;
         const prev = select.value;
-        select.innerHTML = [...bots]
-          .sort((a, b) => (a.username || "").localeCompare(b.username || ""))
-          .map(
-            (b) =>
-              `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
-          )
+        select.innerHTML = names
+          .map((name) => `<option value="${esc(name)}">${esc(name)}</option>`)
           .join("");
-        if (prev && bots.find((b) => b.username === prev)) {
+        if (prev && names.includes(prev)) {
           select.value = prev;
         }
       }
@@ -19260,6 +19464,46 @@ When responding:
         if (m) div.classList.add(`cat-${m[1].toLowerCase().trim()}`);
         div.textContent = text;
         return div;
+      }
+
+      // ── Log batching ───────────────────────────────────────────
+      // Every bot log line arrives as its own WS frame, so a busy 1000-bot
+      // fleet delivers thousands per second. Handling them one at a time means
+      // one DOM insert plus a `scrollTop` write (a forced layout) each, which
+      // is enough on its own to keep the main thread from ever going idle.
+      // Buffer them and flush once per frame instead.
+      const _pendingLogLines = { activity: [], broadcast: [], system: [] };
+      let _logFlushQueued = false;
+      function queueLogLine(panel, line) {
+        const buf = _pendingLogLines[panel];
+        if (!buf) return;
+        buf.push(line);
+        // The panels only keep the newest 1000 lines, so never buffer more.
+        if (buf.length > 1000) buf.splice(0, buf.length - 1000);
+        if (_logFlushQueued) return;
+        _logFlushQueued = true;
+        const flush = () => {
+          _logFlushQueued = false;
+          const elMap = {
+            activity: activityEl,
+            broadcast: broadcastEl,
+            system: systemEl,
+          };
+          for (const panelName of Object.keys(_pendingLogLines)) {
+            const lines = _pendingLogLines[panelName];
+            if (lines.length === 0) continue;
+            _pendingLogLines[panelName] = [];
+            const el = elMap[panelName];
+            // appendLines() prepends in array order, so reverse to keep the
+            // newest line on top exactly like the one-at-a-time path did.
+            if (el) appendLines(el, panelName, lines.reverse());
+          }
+        };
+        if (!document.hidden && typeof requestAnimationFrame === "function") {
+          requestAnimationFrame(flush);
+        } else {
+          setTimeout(flush, 1000);
+        }
       }
 
       // ── Actions ────────────────────────────────────────────────

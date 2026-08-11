@@ -597,15 +597,24 @@
     }
 
     /** Update only the bot list dropdowns (lightweight update for status messages) */
+    // The roster only changes when a bot is added or removed, but `status` is
+    // pushed on every bot state change. Rebuilding three ~1000-option <select>
+    // elements per push is pure churn, so bail out when nothing changed.
+    let _caBotListKey = null;
     function updateCommandAllBotList() {
+      const key = bots.map(b => b.username).join('\u0001');
+      if (key === _caBotListKey) return;
+
       const allBotOpts = bots.length > 0
         ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')
         : '<option value="">No bots available</option>';
 
       const targets = ['ca-gift-target', 'ca-giftall-target', 'ca-credits-target'];
+      let populated = false;
       for (const id of targets) {
         const el = document.getElementById(id);
         if (el) {
+          populated = true;
           const currentVal = el.value;
           el.innerHTML = allBotOpts;
           // Restore selection if still valid
@@ -614,6 +623,9 @@
           }
         }
       }
+      // Only remember the roster once it actually reached the DOM, otherwise a
+      // later control render would be left with stale/empty dropdowns.
+      _caBotListKey = populated ? key : null;
     }
 
     /** Execute a command on all bots with delay between each */

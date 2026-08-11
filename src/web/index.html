@@ -1378,11 +1378,18 @@
           You are about to dismantle
           <b id="factionDismantleName">this facility</b>. This
           <b style="color: var(--red)">permanently destroys</b> the facility —
-          all of the credits and materials spent to build and upgrade it are
-          lost.
+          the credits spent to build and upgrade it are
+          <b style="color: var(--red)">lost</b> for good.
+        </p>
+        <p style="color: var(--text-dim); margin: 16px 0; font-size: 13px">
+          The materials are <b>not</b> lost: all build/upgrade materials are
+          packaged (in bundles of 100) into faction storage. You also need
+          enough <b>cargo_container(s)</b> in faction storage — the failure
+          message tells you exactly how many. Unpack the packages afterward to
+          recover the materials.
         </p>
         <p style="color: var(--red); font-size: 13px">
-          ⚠️ This action cannot be undone.
+          ⚠️ The facility is gone for good and the credits are wasted.
         </p>
         <div class="modal-actions">
           <button onclick="hideFactionDismantleModal()">Cancel</button>

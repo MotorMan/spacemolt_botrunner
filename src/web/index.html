@@ -7119,6 +7119,43 @@
           <label>Cancel Status</label>
           <span id="mc-cancel-craft-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
         </div>
+
+        <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+          <label style="color:var(--text-bright);font-weight:600">Batch Unpack Packages</label>
+        </div>
+
+        <div class="cmd-group">
+          <label>Facility</label>
+          <select id="mc-unpack-facility" style="min-width:180px"><option value="">Load facilities…</option></select>
+          <button class="sm" onclick="mcLoadLogisticsFacilities()" title="Resolve package_logistics_* facilities at this station">Load Facilities</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Source</label>
+          <select id="mc-unpack-source" onchange="mcRenderUnpackPackageList()">
+            <option value="faction" selected>Faction Storage</option>
+            <option value="storage">Station Storage</option>
+          </select>
+          <button class="sm" onclick="fetchFactionStorage(profileBot)" title="Refresh faction storage packages">Refresh</button>
+        </div>
+
+        <div class="cmd-group">
+          <button class="sm" onclick="mcSelectAllUnpackPackages(true)">Select All</button>
+          <button class="sm" onclick="mcSelectAllUnpackPackages(false)">Clear</button>
+          <span id="mc-unpack-count" style="font-size:11px;color:var(--text-dim)"></span>
+        </div>
+
+        <div id="mc-unpack-pkg-list" style="max-height:160px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:6px;margin-bottom:6px"></div>
+
+        <div class="cmd-group">
+          <button class="primary sm" onclick="mcStartBatchUnpack()">Start Batch Unpack</button>
+          <button class="sm" onclick="mcStopBatchUnpack()">Stop</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Queue Status</label>
+          <span id="mc-unpack-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+        </div>
       </div>
     </div>
 
@@ -7153,6 +7190,11 @@
 
         // Populate module preset dropdown (Phase 1)
         populateModulePresetSelect();
+
+        // Populate the Batch Unpack Packages checklist + facility dropdown.
+        mcRenderUnpackFacilitySelect();
+        mcRenderUnpackPackageList();
+        mcUpdateUnpackCount();
         }
 
       function mcFactionDeposit() {
@@ -8479,6 +8521,252 @@
 
       let depositAllQueue = null; // { mode: string, items: Array<{item_id, quantity, source, target}>, index: number }
       let depositAllRunning = false;
+
+      // ── Batch Unpack Packages (craft unpack_package) ─────────
+      // The package_logistics facilities by level. Higher level = faster
+      // packing/unpacking. We resolve the REAL facility_id of the chosen
+      // level at the current station before queuing the craft jobs.
+      const PACKAGE_LOGISTICS_FACILITIES = [
+        { level: 1, type: "package_logistics_bay", label: "Logistics Bay (L1)" },
+        { level: 2, type: "package_logistics_center", label: "Logistics Center (L2)" },
+        { level: 3, type: "package_logistics_hub", label: "Logistics Hub (L3)" },
+        { level: 4, type: "package_logistics_nexus", label: "Logistics Nexus (L4)" },
+      ];
+      // Max jobs per bulk `craft` request (server rejects > 50).
+      const CRAFT_BULK_MAX = 50;
+
+      // Resolved package_logistics facilities at the current station.
+      let mcUnpackFacilities = [];
+      let mcUnpackRunning = false;
+      let mcUnpackQueue = null; // { jobs: Array<{recipe_id, facility_id, source, package_id}>, index }
+      let mcUnpackSource = "faction";
+
+      /** Fetch the facility list for the profile bot and resolve the
+       *  package_logistics_* facilities (the unpack venues). Mirrors the
+       *  Faction-tab fetchStationFacilities but keeps the data local so the
+       *  manual-control dropdown can resolve the real facility_id. */
+      function mcLoadLogisticsFacilities() {
+        if (!profileBot) return;
+        const sel = document.getElementById("mc-unpack-facility");
+        if (sel) sel.innerHTML = '<option value="">Loading facilities…</option>';
+        const collectFrom = (result, key) => {
+          if (!result || !result.ok || !result.data) return [];
+          const d = result.data;
+          return Array.isArray(d)
+            ? d
+            : Array.isArray(d[key])
+              ? d[key]
+              : Array.isArray(d.facilities)
+                ? d.facilities
+                : [];
+        };
+        sendExec(profileBot, "facility", { action: "faction_list" }, (flRes) => {
+          sendExec(profileBot, "facility", { action: "list" }, (listRes) => {
+            const fromFl = collectFrom(flRes, "faction_facilities");
+            const fromList = collectFrom(listRes, "player_facilities");
+            const merged = {};
+            [...fromFl, ...fromList].forEach((fac) => {
+              const fid = fac.facility_id || fac.id;
+              if (fid) merged[fid] = fac;
+            });
+            const all = Object.values(merged);
+            mcUnpackFacilities = all.filter((fac) =>
+              PACKAGE_LOGISTICS_FACILITIES.some(
+                (f) => (fac.type || fac.facility_type || "") === f.type,
+              ),
+            );
+            mcRenderUnpackFacilitySelect();
+          });
+        });
+      }
+
+      /** Populate the facility-level <select> from the resolved facilities,
+       *  defaulting to the highest available level (fastest unpack). */
+      function mcRenderUnpackFacilitySelect() {
+        const sel = document.getElementById("mc-unpack-facility");
+        if (!sel) return;
+        const byType = {};
+        for (const fac of mcUnpackFacilities) {
+          const t = fac.type || fac.facility_type || "";
+          const active = fac.status === "active" || fac.active === true;
+          if (!byType[t] || active) byType[t] = fac;
+        }
+        const opts = PACKAGE_LOGISTICS_FACILITIES.map((f) => {
+          const fac = byType[f.type];
+          if (fac) {
+            const fid = fac.facility_id || fac.id || "";
+            const short = fid.length > 12 ? fid.slice(0, 12) + "…" : fid;
+            const active = fac.status === "active" || fac.active === true;
+            const name = fac.name || f.label;
+            return `<option value="${esc(fid)}">${esc(name)} — ${esc(short)}${active ? "" : " (offline)"}</option>`;
+          }
+          return `<option value="" disabled>${esc(f.label)} — not at station</option>`;
+        });
+        sel.innerHTML = opts.join("");
+        // Default to the fastest (highest-level) available facility.
+        const available = PACKAGE_LOGISTICS_FACILITIES.filter((f) => byType[f.type]);
+        if (available.length > 0) {
+          const best = available[available.length - 1];
+          const fac = byType[best.type];
+          sel.value = fac.facility_id || fac.id || "";
+        }
+      }
+
+      /** Render the package checklist from the chosen storage source. */
+      function mcRenderUnpackPackageList() {
+        const list = document.getElementById("mc-unpack-pkg-list");
+        if (!list) return;
+        const source = val("mc-unpack-source") || "faction";
+        mcUnpackSource = source;
+        const items =
+          source === "storage"
+            ? _pendingFreshStorage || (getProfileBot() && getProfileBot().storage) || []
+            : _pendingFreshFactionStorage || profileFactionStorage || [];
+        const pkgs = (items || []).filter((i) => {
+          const id = i.item_id || i.itemId || "";
+          return id.startsWith("package:");
+        });
+        if (pkgs.length === 0) {
+          list.innerHTML =
+            '<div style="font-size:11px;color:var(--text-dim);padding:6px">No packages found in ' +
+            esc(source) +
+            ' storage. Refresh storage / load facilities first.</div>';
+          return;
+        }
+        list.innerHTML = pkgs
+          .map((p) => {
+            const id = p.item_id || p.itemId;
+            const qty = p.quantity || 1;
+            const short = id.length > 24 ? id.slice(0, 24) + "…" : id;
+            return `<label style="display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 0;cursor:pointer">
+              <input type="checkbox" class="mc-unpack-pkg" value="${esc(id)}" checked>
+              <span style="font-family:monospace">${esc(short)}</span>
+              <span style="color:var(--text-dim)">×${Number(qty).toLocaleString()}</span>
+            </label>`;
+          })
+          .join("");
+      }
+
+      function mcGetSelectedUnpackPackages() {
+        return Array.from(
+          document.querySelectorAll("#mc-unpack-pkg-list .mc-unpack-pkg:checked"),
+        ).map((c) => c.value);
+      }
+
+      function mcUpdateUnpackStatus() {
+        const el = document.getElementById("mc-unpack-status");
+        if (!el) return;
+        if (!mcUnpackRunning || !mcUnpackQueue) {
+          el.textContent = "Idle";
+          el.style.color = "var(--text-dim)";
+          return;
+        }
+        const { jobs, index } = mcUnpackQueue;
+        const remaining = jobs.length - index;
+        el.textContent = `Processing: ${index}/${jobs.length} jobs (${remaining} remaining, ${Math.ceil(remaining / CRAFT_BULK_MAX)} tick(s))`;
+        el.style.color = "var(--green)";
+      }
+
+      /** Build the craft job queue and start the per-tick runner. Each job is
+       *  one `unpack_package` at the selected logistics facility, sourced from
+       *  the chosen store. Jobs are chunked to CRAFT_BULK_MAX per request. */
+      function mcStartBatchUnpack() {
+        if (!profileBot) return;
+        if (mcUnpackRunning) {
+          logResponse('<span class="resp-err">Batch Unpack already running</span>');
+          return;
+        }
+        const facilityId = val("mc-unpack-facility");
+        if (!facilityId) {
+          logResponse(
+            '<span class="resp-err">No Logistics facility selected — click "Load Facilities" first (must be docked at a station with a package_logistics_* facility)</span>',
+          );
+          return;
+        }
+        const source = val("mc-unpack-source") || "faction";
+        const packages = mcGetSelectedUnpackPackages();
+        if (packages.length === 0) {
+          logResponse('<span class="resp-err">No packages selected</span>');
+          return;
+        }
+        const jobs = packages.map((pkgId) => ({
+          recipe_id: "unpack_package",
+          facility_id: facilityId,
+          source: source,
+          package_id: pkgId,
+        }));
+        mcUnpackQueue = { jobs, index: 0 };
+        mcUnpackRunning = true;
+        logResponse(
+          `<span class="resp-cmd">Starting Batch Unpack: ${jobs.length} package(s) at ${esc(facilityId)} (source=${esc(source)}, ${Math.ceil(jobs.length / CRAFT_BULK_MAX)} tick(s))</span>`,
+        );
+        mcUpdateUnpackStatus();
+        setTimeout(mcProcessBatchUnpackQueue, 500);
+      }
+
+      function mcProcessBatchUnpackQueue() {
+        if (!mcUnpackRunning || !mcUnpackQueue) return;
+        const { jobs, index } = mcUnpackQueue;
+        if (index >= jobs.length) {
+          logResponse(
+            '<span class="resp-ok">Batch Unpack complete! All packages queued.</span>',
+          );
+          mcUnpackRunning = false;
+          mcUnpackQueue = null;
+          mcUpdateUnpackStatus();
+          return;
+        }
+        const chunk = jobs.slice(index, index + CRAFT_BULK_MAX);
+        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+        logResponse(
+          `<span class="resp-cmd">${ts} > unpacking ${chunk.length} package(s) (${index + 1}-${index + chunk.length}/${jobs.length})</span>`,
+        );
+        sendExec(profileBot, "craft", { jobs: chunk }, (result) => {
+          if (result.ok) {
+            logResponse('<span class="resp-ok">OK</span>');
+          } else {
+            logResponse(
+              `<span class="resp-err">Failed: ${esc(result.error || "unknown")}</span>`,
+            );
+          }
+          mcUnpackQueue.index += chunk.length;
+          mcUpdateUnpackStatus();
+          setTimeout(mcProcessBatchUnpackQueue, TICK_COOLDOWN_MS + 500);
+        });
+      }
+
+      function mcStopBatchUnpack() {
+        if (!mcUnpackRunning) {
+          logResponse('<span class="resp-err">No batch unpack running</span>');
+          return;
+        }
+        mcUnpackRunning = false;
+        const remaining = mcUnpackQueue
+          ? mcUnpackQueue.jobs.length - mcUnpackQueue.index
+          : 0;
+        logResponse(
+          `<span class="resp-err">Batch Unpack stopped. ${remaining} jobs remaining.</span>`,
+        );
+        mcUnpackQueue = null;
+        mcUpdateUnpackStatus();
+      }
+
+      function mcSelectAllUnpackPackages(checked) {
+        document
+          .querySelectorAll("#mc-unpack-pkg-list .mc-unpack-pkg")
+          .forEach((c) => (c.checked = checked));
+        mcUpdateUnpackCount();
+      }
+
+      function mcUpdateUnpackCount() {
+        const el = document.getElementById("mc-unpack-count");
+        if (!el) return;
+        const total = document.querySelectorAll("#mc-unpack-pkg-list .mc-unpack-pkg").length;
+        const sel = document.querySelectorAll(
+          "#mc-unpack-pkg-list .mc-unpack-pkg:checked",
+        ).length;
+        el.textContent = `${sel}/${total} selected`;
+      }
 
       // Ship loadout withdrawal queue (Faction → Station)
       let loadoutWithdrawalQueue = null; // { items: Array<{item_id, quantity}>, index: number, loadoutName: string }

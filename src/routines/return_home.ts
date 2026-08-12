@@ -46,6 +46,8 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
 
   if (bot.isCloaked) {
     ctx.log("travel", "Bot is already cloaked - no action needed");
+    // Cloaking always undocks the ship — keep the local flag in sync.
+    bot.docked = false;
     return true;
   }
 
@@ -61,11 +63,53 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
     const msg = resp.error.message.toLowerCase();
     if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
       ctx.log("warn", `Failed to enable cloak: ${resp.error.message}`);
+      return false;
     }
-    return false;
+    // Server reports we're already cloaked — treat as success and sync state.
+    bot.isCloaked = true;
+    bot.docked = false;
+    return true;
   }
 
+  // Cloaking always undocks the ship — clear the stale docked flag so a later
+  // ensureDocked() actually re-docks instead of believing we're still docked.
+  bot.isCloaked = true;
+  bot.docked = false;
   ctx.log("travel", "Cloaking enabled successfully");
+  return true;
+}
+
+/**
+ * Decloak (if currently cloaked) and wait for the cloak mutation to fully
+ * resolve before returning. Cloaking/decloaking is a server mutation that takes
+ * one tick to apply; issuing `dock` immediately after `decloak` is rejected with
+ * "action is already pending", and the local `docked` flag is stale (decloaking
+ * undocks the ship). We refresh status and poll until the cloak state settles so
+ * the caller's subsequent dock decision / dock command is accurate.
+ */
+async function decloakAndSettle(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.isCloaked) return true;
+
+  ctx.log("travel", "Decloaking before docking at home station...");
+  const resp = await bot.exec("cloak", { enable: false });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already") && !msg.includes("cloaked")) {
+      ctx.log("warn", `Failed to decloak: ${resp.error.message}`);
+      return false;
+    }
+  }
+
+  // Wait for the 1-tick decloak mutation to resolve, refreshing so the local
+  // isCloaked/docked flags reflect reality before the caller issues dock.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await ctx.sleep(2000);
+    await bot.refreshStatus();
+    if (!bot.isCloaked) break;
+  }
+  // Decloaking undocks the ship — clear the stale flag so ensureDocked() re-docks.
+  bot.docked = false;
   return true;
 }
 
@@ -172,13 +216,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
       if (bot.isCloaked && decloakBeforeDock) {
-        ctx.log("travel", "Already at home station but cloaked — decloaking before docking...");
-        const decloakResp = await bot.exec("cloak", { enable: false });
-        if (decloakResp.error) {
-          ctx.log("warn", `Failed to decloak before docking: ${decloakResp.error.message}`);
-        } else {
-          ctx.log("travel", "Decloaked successfully before docking");
-        }
+        await decloakAndSettle(ctx);
       }
       if (!bot.docked) {
         ctx.log("travel", "At home station but not docked — docking now...");
@@ -446,15 +484,11 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
-  // Decloak before docking if configured
-  if (decloakBeforeDock && bot.isCloaked) {
-    ctx.log("travel", "Decloaking before docking at destination station...");
-    const decloakResp = await bot.exec("cloak", { enable: false });
-    if (decloakResp.error) {
-      ctx.log("warn", `Failed to decloak before docking: ${decloakResp.error.message}`);
-    } else {
-      ctx.log("travel", "Decloaked successfully before docking");
-    }
+  // A ship cannot be both cloaked and docked, and `cloak` is a 1-tick mutation.
+  // Decloak (if cloaked) and wait for the mutation to settle BEFORE docking so the
+  // dock command isn't rejected with "action pending" and the docked flag is accurate.
+  if (bot.isCloaked) {
+    await decloakAndSettle(ctx);
   }
 
   // Dock at station (skip storage collection - return home doesn't need to manage items)

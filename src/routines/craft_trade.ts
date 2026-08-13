@@ -556,6 +556,7 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
     rentalSpendingLimit: 0,
     cycleTimeSec: 30,
     craftingHomeBase: s.craftingHomeBase,
+    recipeFacilityLinks: {},
   };
 
   const facTypeByRecipe = new Map<string, string>();

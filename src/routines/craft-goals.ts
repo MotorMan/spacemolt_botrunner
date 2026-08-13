@@ -201,9 +201,10 @@ export function findRecipeForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  allowedFacilityRecipeIds?: Set<string>,
 ): Recipe | null {
   const blacklistedRecipes = getBlacklistedRecipes();
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r, allowedFacilityRecipeIds).ok && !blacklistedRecipes.has(r.recipe_id));
 
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
@@ -247,6 +248,7 @@ function buildCraftingTree(
   depth: number = 0,
   visited: Set<string> = new Set(),
   baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingNode | null {
   // Cycle detection
   if (visited.has(goalRecipe.output_item_id)) {
@@ -287,7 +289,7 @@ function buildCraftingTree(
     if (compToCraft <= 0) continue;
 
     // Find recipe for this component, preferring recipes with available materials
-    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn, facilityAvailableRecipes);
+    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn, facilityAvailableRecipes, allowedFacilityRecipeIds);
 
     if (!prereqRecipe) {
       // No recipe to craft this - it's a base material
@@ -305,6 +307,7 @@ function buildCraftingTree(
       depth + 1,
       new Set(visited),
       baseCountFn,
+      allowedFacilityRecipeIds,
     );
 
     if (childNode) {
@@ -357,8 +360,9 @@ export function calculateCraftingPlan(
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
   baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingPlan | null {
-  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes);
+  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes, allowedFacilityRecipeIds);
 
   if (!goalRecipe) {
     return null;
@@ -374,6 +378,7 @@ export function calculateCraftingPlan(
     0,
     new Set(),
     baseCountFn,
+    allowedFacilityRecipeIds,
   );
 
   if (!tree) {
@@ -409,9 +414,10 @@ export function findAllRecipesForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  allowedFacilityRecipeIds?: Set<string>,
 ): Recipe[] {
   const blacklistedRecipes = getBlacklistedRecipes();
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r, allowedFacilityRecipeIds).ok && !blacklistedRecipes.has(r.recipe_id));
   if (candidates.length === 0) return [];
 
   const unwrapCandidates = candidates.filter(isUnwrapRecipe);
@@ -446,6 +452,7 @@ export function calculateMultiGoalPlan(
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
   baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingPlan[] {
   const plans: CraftingPlan[] = [];
 
@@ -476,7 +483,7 @@ export function calculateMultiGoalPlan(
       // Always use the specified recipe exactly as requested
       goalRecipe = goal.recipe;
     } else {
-      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0, facilityAvailableRecipes);
+      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0, facilityAvailableRecipes, allowedFacilityRecipeIds);
     }
     
     if (!goalRecipe) continue;
@@ -496,6 +503,7 @@ export function calculateMultiGoalPlan(
       0,
       new Set(),
       baseStock,
+      allowedFacilityRecipeIds,
     );
 
     if (tree) {
@@ -580,8 +588,19 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
 
 /**
  * Check if a recipe is craftable (not ship passive or facility only).
+ *
+ * `allowedFacilityRecipeIds` is the set of recipe IDs explicitly linked to an
+ * owned/available facility via the crafter's `recipeFacilityLinks` config. A
+ * "facility only" recipe (e.g. breed_plutonium) would otherwise be rejected
+ * here, but when it has been linked to a real facility it IS craftable — just
+ * not by hand — so we let it through. This is what unlocks these recipes in the
+ * crafter while still blocking unlinked facility-only recipes (which have no
+ * venue and would only ever error at craft time).
  */
-export function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string } {
+export function isRecipeCraftable(
+  recipe: Recipe,
+  allowedFacilityRecipeIds?: Set<string>,
+): { ok: boolean; reason: string } {
   const category = (recipe.category || "").toLowerCase();
 
   if (category.includes("ship passive")) {
@@ -589,6 +608,9 @@ export function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string
   }
 
   if (category.includes("facility only")) {
+    if (allowedFacilityRecipeIds && allowedFacilityRecipeIds.has(recipe.recipe_id)) {
+      return { ok: true, reason: "Facility-only recipe linked to a facility" };
+    }
     return { ok: false, reason: "Recipe can only be crafted at facilities" };
   }
 

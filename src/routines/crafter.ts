@@ -66,6 +66,12 @@ async function getCrafterSettings(): Promise<{
   rentalSpendingLimit: number;
   cycleTimeSec: number;
   craftingHomeBase: string;
+  // Explicit recipe -> facility-type links for "facility only" recipes that the
+  // catalog may not auto-associate (or where we want to pin the venue). e.g.
+  // { "breed_plutonium": ["breeder_reactor_core", "enhanced_breeder_reactor",
+  // "industrial_breeder_complex", "advanced_breeder_array"] }. These unblock the
+  // recipe in the planner and let the crafter route it to the correct facility.
+  recipeFacilityLinks: Record<string, string[]>;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -85,6 +91,19 @@ async function getCrafterSettings(): Promise<{
   ]) as string[];
 
   const useQueuedCrafting = (c.useQueuedCrafting as boolean) ?? true;
+
+  // Recipe -> facility-type links for facility-only recipes (see CrafterSettings).
+  const rawRecipeFacilityLinks = (c.recipeFacilityLinks as Record<string, unknown>) || {};
+  const recipeFacilityLinks: Record<string, string[]> = {};
+  for (const [recipeId, facTypes] of Object.entries(rawRecipeFacilityLinks)) {
+    if (typeof recipeId !== "string" || !recipeId) continue;
+    const list = Array.isArray(facTypes)
+      ? (facTypes as unknown[]).filter(t => typeof t === "string").map(t => t as string)
+      : (typeof facTypes === "string" ? [facTypes as string] : []);
+    if (list.length > 0) {
+      recipeFacilityLinks[recipeId] = list;
+    }
+  }
 
   let crafters: CrafterProfile[] = [];
   if (Array.isArray(c.crafters)) {
@@ -176,6 +195,7 @@ async function getCrafterSettings(): Promise<{
     // explicitly (falling back to general.factionStorageStation) — otherwise it
     // reads the wrong station and "loses" its stock, holding the whole chain.
     craftingHomeBase: (c.craftingHomeBase as string) || generalFactionStorageStation || "",
+    recipeFacilityLinks,
   };
 }
 
@@ -375,9 +395,23 @@ export function getFacilityRecipeMap(): FacilityRecipeMap[] {
   return map;
 }
 
+// Normalize a recipeFacilityLinks config into a facility-type -> recipeId index.
+// This is what lets an explicit link (e.g. breed_plutonium -> breeder_reactor_core)
+// drive venue resolution even when the catalog doesn't carry the recipe_id.
+function buildLinkIndex(recipeFacilityLinks: Record<string, string[]>): Map<string, string> {
+  const idx = new Map<string, string>();
+  for (const [recipeId, facTypes] of Object.entries(recipeFacilityLinks || {})) {
+    for (const ft of facTypes || []) {
+      idx.set(ft, recipeId);
+    }
+  }
+  return idx;
+}
+
 function getRecipesAvailableAtFacilities(
   factionFacilities: FactionFacility[],
-  facilityRecipeMap: FacilityRecipeMap[]
+  facilityRecipeMap: FacilityRecipeMap[],
+  recipeFacilityLinks: Record<string, string[]> = {},
 ): Set<string> {
   const facilityTypes = new Set(
     factionFacilities
@@ -389,6 +423,13 @@ function getRecipesAvailableAtFacilities(
     if (facilityTypes.has(entry.facilityType)) {
       availableRecipes.add(entry.recipeId);
     }
+  }
+  // Also count any explicitly linked facility we own, even if the catalog has
+  // no recipe_id for it (the whole point of the linking feature).
+  const linkIdx = buildLinkIndex(recipeFacilityLinks);
+  for (const ft of facilityTypes) {
+    const linkedRecipe = linkIdx.get(ft);
+    if (linkedRecipe) availableRecipes.add(linkedRecipe);
   }
   return availableRecipes;
 }
@@ -406,16 +447,22 @@ function getRecipesAvailableAtFacilities(
 
 export type OwnFacilityMap = Map<string, FactionFacility[]>;
 
-export function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFacilityMap {
+export function buildOwnFacilityRecipeMap(
+  factionFacilities: FactionFacility[],
+  recipeFacilityLinks: Record<string, string[]> = {},
+): OwnFacilityMap {
   const map: OwnFacilityMap = new Map();
   const catalogFacilities = catalogStore.getAll().facilities;
+  const linkIdx = buildLinkIndex(recipeFacilityLinks);
   for (const f of factionFacilities) {
     if (f.faction_service !== "") continue; // only facilities we personally own
     if (f.status && f.status.toLowerCase() === "inactive") continue; // skip non-functional ones
     if (!f.facility_id || !f.type) continue;
     const catFac = catalogFacilities[f.type] as Record<string, unknown> | undefined;
-    if (!catFac) continue;
-    const recipeId = (catFac.recipe_id as string) || "";
+    // Prefer the catalog's recipe_id, then fall back to an explicit link so a
+    // facility-only recipe (e.g. breed_plutonium) still maps to its facility
+    // even when the catalog doesn't carry the association.
+    const recipeId = ((catFac?.recipe_id as string) || linkIdx.get(f.type) || "");
     if (!recipeId) continue;
     const list = map.get(recipeId) || [];
     list.push(f);
@@ -467,6 +514,7 @@ export interface CrafterSettings {
   rentalSpendingLimit: number;
   cycleTimeSec: number;
   craftingHomeBase: string;
+  recipeFacilityLinks: Record<string, string[]>;
 }
 
 function isRentalAllowed(settings: CrafterSettings): boolean {
@@ -1217,12 +1265,19 @@ async function executeCraftingPlan(
    const crafted: string[] = [];
    const prereqs: string[] = [];
 
+   // Facility-only recipes that have been explicitly linked to a facility via
+   // recipeFacilityLinks are permitted in the planner (otherwise breed_plutonium
+   // and friends are rejected by isRecipeCraftable as "facility only").
+   const allowedFacilityRecipeIds = new Set(
+     Object.keys(settings?.recipeFacilityLinks || {})
+   );
+
    const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
    const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
 
    const recipeIdForGoal = (g: { itemId: string; recipe?: Recipe }): string => {
      if (g.recipe) return g.recipe.recipe_id;
-     const r = findRecipeForItem(g.itemId, recipes, countItemFn!, facilityAvailableRecipes);
+      const r = findRecipeForItem(g.itemId, recipes, countItemFn!, facilityAvailableRecipes, allowedFacilityRecipeIds);
      return r ? r.recipe_id : "";
    };
 
@@ -1331,7 +1386,7 @@ async function executeCraftingPlan(
         return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
       };
 
-      const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!);
+      const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!, allowedFacilityRecipeIds);
      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
      for (const plan of plans) {
        log("craft", formatCraftingPlan(plan));
@@ -1427,7 +1482,7 @@ async function craftFromCategories(
     const blacklisted = new Set((await getCrafterSettings()).blacklistedRecipes);
     if (blacklisted.has(recipe.recipe_id)) continue;
     if (recipe.components.length === 0) continue;
-    if (!isRecipeCraftableNew(recipe).ok) continue;
+    if (!isRecipeCraftableNew(recipe, new Set(Object.keys(settings.recipeFacilityLinks || {}))).ok) continue;
 
     const priority = categoryPriority[recipeCategory] || 99;
     candidates.push({ recipe, priority });
@@ -1616,6 +1671,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const settings = await getCrafterSettings();
     const cycleWaitMs = (settings.cycleTimeSec || 30) * 1000;
 
+    // Facility-only recipes that have been explicitly linked to a facility via
+    // recipeFacilityLinks. These are allowed through isRecipeCraftable even
+    // though their category is "Facility Only" (e.g. breed_plutonium).
+    const allowedFacilityRecipeIds = new Set(Object.keys(settings.recipeFacilityLinks || {}));
+
     yield "scavenge";
 
     yield "dock";
@@ -1709,8 +1769,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const factionFacilities = await fetchFactionFacilities(bot);
     const facilityRecipeMap = getFacilityRecipeMap();
-    const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap);
-    const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities);
+    const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap, settings.recipeFacilityLinks);
+    const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities, settings.recipeFacilityLinks);
     ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
     ctx.log("craft", `Own facilities: ${[...ownFacilityMap.values()].reduce((n, l) => n + l.length, 0)} covering ${ownFacilityMap.size} recipes (forceOwnFacility=${settings.forceOwnFacility})`);
     if (settings.allowRentalPurchase) {
@@ -1741,7 +1801,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       const isItemGoal = recipe.output_item_id === recipeId || recipe.output_item_id.toLowerCase() === recipeId.toLowerCase();
-      const craftableCheck = isRecipeCraftableNew(recipe);
+      const craftableCheck = isRecipeCraftableNew(recipe, allowedFacilityRecipeIds);
       if (!craftableCheck.ok) {
         ctx.log("error", `Recipe "${recipeId}" (${recipe.name}) is not craftable: ${craftableCheck.reason}`);
         continue;

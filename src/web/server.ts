@@ -3,7 +3,7 @@ import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
 import { perf } from "../perf.js";
-import { getBot, getTotalBandwidth, getDiscoveredBots } from "../botmanager.js";
+import { getBot, getTotalBandwidth, getDiscoveredBots, getBotStatuses } from "../botmanager.js";
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -1704,7 +1704,32 @@ if (!this.settings.fuel_service) {
             // Combined fleet: this node's own bots plus every connected client's
             // bots (full name + status). Works for both full slaves and the
             // lightweight "light" connect, since both push bot-status updates.
-            const combined = [...this.latestStatuses];
+            //
+            // This node's OWN bots come from two sources, unioned so light/slave
+            // clients always see them even if `latestStatuses` is momentarily
+            // stale (e.g. right after a restart, before the first status flush):
+            //   - `latestStatuses`: the dashboard's cached bot list, and
+            //   - `getBotStatuses()`: the authoritative live local bots.
+            // They are tagged with this node's label so a light/slave client can
+            // tell them apart from its own bots and from other clients' bots
+            // (its own pushed bots arrive unlabeled from `latestStatuses` and
+            // would otherwise be indistinguishable in the dropdown).
+            const selfLabel = (this.settings.clientSync && this.settings.clientSync.label) || "master";
+            const local: Array<Record<string, unknown>> = [...(this.latestStatuses as unknown as Array<Record<string, unknown>>)];
+            try {
+              const live = getBotStatuses() as unknown as Array<Record<string, unknown>>;
+              for (const b of live) {
+                const u = b.username;
+                if (!u || local.some((x) => (x as Record<string, unknown>).username === u)) continue;
+                local.push(b);
+              }
+            } catch { /* best-effort */ }
+            const combined: Array<Record<string, unknown>> = local.map((b) => {
+              const e = { ...b } as Record<string, unknown>;
+              if (!e._clientLabel) e._clientLabel = selfLabel;
+              if (!e._clientId) e._clientId = "self";
+              return e;
+            });
             for (const b of (this.syncMaster?.getBots() ?? [])) {
               const u = (b as unknown as Record<string, unknown>).username;
               if (!u || combined.some((x) => (x as unknown as Record<string, unknown>).username === u)) continue;

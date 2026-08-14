@@ -2,7 +2,7 @@
 
 > **A comprehensive fleet manager for [SpaceMolt](https://www.spacemolt.com) — manage unlimited automated bots from a single web dashboard.**
 
-![Dashboard](https://img.shields.io/badge/interface-web_dashboard-blue) ![Runtime](https://img.shields.io/badge/runtime-bun-black) ![No Dependencies](https://img.shields.io/badge/deps-zero_runtime-green) ![Bots](https://img.shields.io/badge/bots-unlimited-orange) ![Language](https://img.shields.io/badge/language-TypeScript-blue) ![Platform](https://img.shields.io/badge/platform-cross--platform-green) ![License](https://img.shields.io/badge/license-MIT-yellow)
+![Dashboard](https://img.shields.io/badge/interface-web_dashboard-blue) ![Runtime](https://img.shields.io/badge/runtime-bun-black) ![No Dependencies](https://img.shields.io/badge/deps-zero_runtime-green) ![Bots](https://img.shields.io/badge/bots-unlimited-orange) ![Language](https://img.shields.io/badge/language-TypeScript-blue) ![Platform](https://img.shields.io/badge/platform-cross--platform-green) ![License](https://img.shields.io/badge/license-MIT-yellow) ![Routines](https://img.shields.io/badge/routines-28_available-blueviolet)
 
 ---
 
@@ -11,7 +11,7 @@
 - [What It Does](#what-it-does)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
-- [Bot Routines (20 Available)](#bot-routines)
+- [Bot Routines (28 Available)](#bot-routines)
   - [Economic Routines](#economic-routines)
   - [Combat Routines](#combat-routines)
   - [Coordination Routines](#coordination-routines)
@@ -38,7 +38,7 @@
 Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www.spacemolt.com), a text-based space MMO designed for AI agents. It provides:
 
 - **Web Dashboard** — real-time monitoring, controls, and management at `http://localhost:3000`
-- **20 Automated Routines** — mining, exploring, trading, combat, crafting, rescue, fuel selling, fuel transport, and more
+- **28 Automated Routines** — mining, exploring, trading, combat, crafting, rescue, fuel selling, fuel transport, fuel service, module selling, civilian transport, market streaming, craft trade, stealth skill grind, anti-idle, and more
 - **Multi-Bot Coordination** — flock mining, fleet combat, cargo hauling, trade routes, fuel logistics
 - **AI-Powered Features** — LLM-driven autonomous play, intelligent chat responses, standalone CLI commander
 - **Faction Management** — full in-game faction controls from your browser
@@ -491,6 +491,117 @@ Keeps bot running and ready to receive manual commands. (~30 lines)
 
 ---
 
+#### ��� Fuel Service
+Automated fuel production facility management across multiple empire stations. (~1168 lines)
+
+- **Automated facility management** — builds/manages fuel facilities (peroxide_reaction_cell, hydrogen_processor, etc.) at remote faction stations
+- **Material transport** — hauls build materials from home faction storage to remote stations with resume capability
+- **Remote fuel reserve monitoring** — checks `faction_fuel_reserve` without traveling to the station
+- **Global craft queue monitoring** — reads queue from anywhere via `craft action=queue`
+- **Best logistics ship selection** — picks highest cargo capacity ship at startup for all transport runs
+- **Multi-empire support** — configurable target empires (Solarian, Voidborn, Nebula, Crimson, Outer Rim)
+- **Facility build failure tracking** — 3 strikes = give up on that station/facility
+- **Configurable refresh interval** (default 300s)
+
+**Settings:** `stations[]`, `facilityConfigs[]`, `serviceAllEmpires`, `useAllStationsInEmpire`, `targetEmpires[]`, `refreshIntervalSec`, `refuelThreshold`, `repairThreshold`, `autoCloak`
+
+---
+
+#### ��� Module Seller
+Sells ship modules (weapon/defense/utility slots) from faction storage. (~546 lines)
+
+- **Smart pricing** — premium (+N%) or undercut (-N cr) modes
+- **Auto-destination** — finds best buy-order station automatically from map data
+- **Per-module config** — `maxQty`, `doNotSell`
+- **Battle-aware** — periodic flee stance re-issue while in combat
+- **Returns home** after each sell cycle
+- **Configurable price floor** (100 cr minimum)
+
+**Settings:** `homeSystem`, `homeStation`, `fuelCostPerJump`, `refuelThreshold`, `repairThreshold`, `priceMode`, `premiumPct`, `undercutCr`, `sellAtHome`, `maxQtyDefault`, `moduleItems[]`
+
+---
+
+#### ��� Civilian Transport
+Passenger transport between stations with berth management. (~3694 lines — largest routine)
+
+- **Berth management** — economy/business/first class with configurable limits per class
+- **Cloaking support** — auto-recloak logic when decloaked
+- **Transit Lounge handoff** — `unload_passenger target=lounge` for multi-bot relay
+- **Achievement logging** — per-bot permanent record of transported passengers (`data/CivTransportLogs/`)
+- **Empire station routing** — 5 empires × 5-8 stations each with multi-empire support
+- **Mobile station resolution** — mobile_capital via `find_route`
+- **Station reference file** — `data/stationRef.json` for destination resolution
+- **Pirate station blocking** + manual blocked station list
+- **Faction credit deposit threshold** — auto-deposits excess credits
+- **Passenger priority filtering** — first/business/economy/off
+- **Fleet ship discovery** — via `list_ships` with berth detection from modules/catalog
+- **Persistent state** — `data/civilianTransport.json`
+
+**Settings:** `maxJumps`, `roundsBeforeMoving`, `refuelThreshold`, `repairThreshold`, `homeSystem`, `homeStation`, `maxPassengers`, `maxEconomy`, `maxBusiness`, `maxFirst`, `blockPirateStations`, `blockedStationIds[]`, `passengerPriority`, `allowFirstClass`, `allowBusinessClass`, `allowEconomyClass`, `announceDestination`, `disableFactionMessage`, `enableCloak`, `factionDepositThreshold`
+
+---
+
+#### ��� Market
+Market data streaming and collection routine. (~178 lines)
+
+- **Market streaming** — subscribes to `subscribe_market` WebSocket for real-time updates
+- **Docked collection** — collects market data while docked at stations
+- **In-memory overlay** — publishes to `marketStreamStore` for instant routine access
+- **Batched persistence** — writes to `marketDetails.json` via `marketDetailsStore` (2-min cadence)
+- **Cross-client queries** — feeds `market_local_source` for remote market queries (~200B vs 10MB)
+- **Heartbeat mechanism** — multi-client market routine detection
+
+---
+
+#### ������ Stealth Skill Grind
+Simple cloaking loop for stealth skill XP. (~99 lines)
+
+- **Cloak on/off loop** — 100ms each for stealth skill XP gain
+- **Auto-dock and refuel** — when fuel < 5%
+- **Runs until stopped**
+
+---
+
+#### ��� Pathfinder Test
+Pathfinder bearing calculation testing routine.
+
+---
+
+#### ������ Craft Trade
+Dual-role routine combining traders + single crafter via persisted order file + bot chat ping. (~664 lines)
+
+- **Dual-role** — TRADERS (10+ bots) + CRAFTER (1 bot) in single routine
+- **Traders** — find profitable deals for *craftable* items using market spreads + `analyze_market` insights
+- **Crafter** — reads build orders from `data/craft_trade_orders.json`, crafts on owned facilities, deposits to faction storage
+- **Coordination** — persisted order file (source of truth) + bot chat ping for wake-up
+- **Reuses existing logic** — trader.ts for deal finding, crafter.ts for crafting, faction_trader for sell validation
+- **Per-bot role assignment** — via settings (`crafterBots[]`, `traderBots[]`)
+- **Margin analysis** — skips deals below `minMarginPct` (default 10%)
+- **Max concurrent orders** — per trader (default 3)
+- **Order timeout** — auto-expiry (default 360 min)
+- **Uncraftable item alerts** — profitable buyers but no recipe exists
+- **Facility build alerts** — when crafter lacks required facility
+- **Buy order locking** — prevents duplicate sells (via `factionTraderCoordination`)
+- **Remote market query** — craft cost estimation via client sync
+- **Faction profit donation** support
+
+**Settings:** `crafterBots[]`, `traderBots[]`, `enabledCategories[]`, `minProfitPerUnit`, `minFacilityAlertProfit`, `maxDealQty`, `maxCargoValue`, `fuelCostPerJump`, `refuelThreshold`, `repairThreshold`, `homeSystem`, `homeStation`, `useAnalyzeMarket`, `forceOwnFacility`, `craftingPreset`, `blacklistedRecipes[]`, `craftingHomeBase`, `maxConcurrentOrders`, `orderTimeoutMin`, `minMarginPct`, `useRemoteMarketQuery`
+
+---
+
+#### ��� 1-Idle / Observation
+Anti-idle routine with passive observation subscription. (~151 lines)
+
+- **Session keepalive** — lightweight `get_nearby` every 30 seconds
+- **Status refresh** — refreshes cargo + location so dashboard/status stays current
+- **Passive observation subscription** — `subscribeToObservation` for live nearby object/system agent/signature updates
+- **Auto-resubscribe** — when bot's location (system/POI) changes
+- **Observation logging** — first 5 full payloads, then keys + snippets; pirate detection alert
+- **Zero game actions** — never moves ship, safe for any idle bot
+- **Clean unsubscription** — on routine exit or location change
+
+---
+
 ## Web Dashboard Features
 
 The dashboard is a **comprehensive single-page application** (~877KB HTML + 78KB CSS) delivered by the Bun HTTP server. Real-time updates are pushed to all connected browser tabs via WebSocket. The dashboard auto-detects the server's local network IP for LAN access.
@@ -556,8 +667,27 @@ The dashboard is a **comprehensive single-page application** (~877KB HTML + 78KB
 - **Performance metrics** and trends over time
 - **Per-bot activity log** — full history of bot actions
 
+### Catalog Tab
+- **Game catalog browser** — items, ships, skills, recipes with search and filtering
+- **Item details** — stats, size, category, recipe outputs, facility requirements
+- **Ship browser** — stats, modules, cargo capacity, speed, tier
+- **Skill tree viewer** — skill dependencies, XP requirements, bonuses
+- **Recipe explorer** — components, outputs, facility types, crafting time
+
+### Achievements Tab
+- **Player achievement tracking** — progress and completion status
+- **Achievement categories** — exploration, combat, trading, crafting, social
+- **Progress bars** and unlock requirements
+- **Per-bot achievement breakdown** for fleet-wide tracking
+
+### Creatures Tab
+- **Wildlife/creature data browser** — discovered creatures with stats
+- **Creature details** — health, damage, loot tables, behavior
+- **Location tracking** — where each creature type spawns
+- **Kill statistics** and loot drop tracking
+
 ### Settings Tab
-- **Per-routine configuration** for all 20 routines
+- **Per-routine configuration** for all 28 routines
 - **Per-bot overrides** for individual customization
 - **Global settings** — port, home system, blacklist, faction storage
 - **Settings saved** to `data/settings.json` with corruption recovery
@@ -585,6 +715,10 @@ Click any bot name to access full manual control panel:
 - **Player Browser** (`src/web/players.html`) — browse known players, pirates, empire NPCs
 - **Ship Marketplace** (`src/web/shipsforsale.html`) — browse ships for sale across the galaxy
 - **Ship Simulator** (`src/web/shipSim.html`) — compare ship stats and simulate combat
+- **Chat Server** (`src/web/chatserver.ts`, port 4000) — dedicated WebSocket chat server with REST API
+  - **REST API** for bots, channels, messages, sending chat
+  - **Full chat UI** served from same server
+  - **Cross-instance** — connects to botrunner for bot operations
 
 ---
 
@@ -664,6 +798,71 @@ Fuel transport bots coordinate to keep remote faction stations stocked.
 - **Trip tracking** — full delivery history with timestamps and event logs in `data/fuelTransfer.json`
 - **Cargo optimization** — calculates item size and available cargo space
 
+### Civilian Transport Cooperation
+Multi-bot passenger transport coordination via `src/client_sync_hooks.ts` and `src/bot_chat_channel.ts`.
+
+- **Transit Lounge handoff** — Bots relay passengers via faction Transit Lounge at home base
+- **Achievement cross-reference** — Per-bot logs (`data/CivTransportLogs/`) prevent duplicate passenger transport
+- **Cross-client sync** — Passenger manifests synchronized across connected clients
+- **Empire routing** — Coordinated multi-empire station coverage via shared stationRef.json
+
+### Bot-to-Bot Chat Channel Enhancements
+In-memory, client-side communication for fast coordination **without** API calls via `src/bot_chat_channel.ts`.
+
+- **Zero API calls** — pure in-process messaging
+- **4 channels:** `fleet`, `escort`, `coordination`, `general`
+- **Directed or broadcast** messaging — send to specific bots or all
+- **Message history** (last 100 messages retained per channel)
+- **Metadata support** for structured data (coordinates, timestamps, etc.)
+- **Used by:** Escort, Fleet Hunter, Cargo Mover, Commander, Fuel Transport, Civilian Transport, Craft Trade routines
+- **Global logging** — all messages logged to system panel for human monitoring
+
+---
+
+### Client Sync / Multi-Instance Coordination
+**Files:** `client_sync_master.ts`, `client_sync_slave.ts`, `client_sync_light_slave.ts`, `client_sync_market_slave.ts`, `client_sync_files.ts`, `client_sync_hooks.ts`, `client_sync_types.ts`
+
+Master/Slave architecture for running multiple botrunner instances sharing data.
+
+- **Catalog version orchestration** — Single client elected to download `catalog.json` from gameserver, then relayed to all clients (avoids rate limits)
+- **Cross-client fleet rescue polling** — Rescue bots see combined fleet status across ALL connected clients via `getCombinedFleetStatus()`
+- **File synchronization** — Deep-merges JSON data files across clients (map, market, player names, cargo mover, fuel transfer, etc.)
+- **Market query handler** — Remote traders query local `marketDetails.json` via master (~200 bytes vs 10MB transfer)
+- **Catalog sync state tracking** — Per-client version reporting with master-side election
+- **Passenger/Civilian transport sync** — Multi-client passenger handoff coordination
+
+**Modes:** `master`, `slave`, `light` (minimal sync), `market` (market-only slave)
+
+---
+
+### Clerk API / Headless Client Integration
+**Files:** `libClient.ts`, `botmanager.ts` (connectLibraryAccounts)
+
+Headless client connections using `@spacemolt/lib` for bots owned by different accounts.
+
+- **Multiple Clerk API keys** — primary + secondary for bots owned by different accounts
+- **Player selection UI** — Dashboard "Add Bots from Account" lists all owned players with empire info
+- **Auto-connect selected bots** on startup via `@spacemolt/lib`
+- **Session management** — Library handles WebSocket, reconnection, auth
+- **Staggered connection** — 5s between resumes, 13s between full logins
+- **Selected bot persistence** in `settings.clerk.bots` (normalized to usernames)
+
+---
+
+### Enhanced Bot Management & Resilience
+**Files:** `botmanager.ts`, `bot.ts`
+
+Major resilience improvements for large fleet operations.
+
+- **Instant routine resume** — For large fleets (>100 bots default threshold): bots start their routine the moment they connect, not waiting for fleet-wide sequential resume
+- **Reconnection backoff with load-aware scaling** — Exponential backoff (5s→120s) scaled by event loop lag via `loadMonitor.ts`
+- **Terminal close handling** — `session_replaced` (4001) / `auth_timeout` (4002) detection — bots connected elsewhere are NOT auto-reconnected (prevents endless storms)
+- **Old socket close waiting** — Before forcing reconnect, waits for old WebSocket to fully close (8s timeout + 750ms settle)
+- **Reconnect deduplication** — In-flight guard prevents concurrent reconnect attempts for same bot
+- **First-reconnect jitter** — Random 0-8s delay (scaled by load) to desynchronize fleet-wide reconnect storms
+- **Performance monitoring** (`perf.ts`) — Operation timing with `perf.timeSync()`
+- **Load monitoring** (`loadMonitor.ts`) — Event loop lag detection for adaptive scaling
+
 ---
 
 ## AI Integration
@@ -711,6 +910,15 @@ Standalone AI commander tool (`src/commander.ts`, ~462 lines) for direct LLM-dri
   bun run src/commander.ts --model anthropic/claude-sonnet-4-20250514 --session explorer "explore unknown systems"
   ```
 - **Cross-platform binaries** released via GitHub Actions (Linux x64/ARM64, macOS x64/ARM64, Windows x64)
+
+### AI Integration Enhancements
+**Files:** `tools.ts`, `loop.ts`, `schema.ts`, `model.ts`
+
+- **Expanded tool definitions** — Game commands, memory operations, TODO tracking, credential management via `src/tools.ts`
+- **Context compaction** — 55% context budget, minimum 10 messages preserved via `src/loop.ts`
+- **OpenAPI spec loading** — Fetches game command documentation for LLM via `src/schema.ts` and `src/openapi.ts`
+- **Model resolution** — `src/model.ts` uses `pi-ai` library for provider/model resolution
+- **Commander CLI** — Session support, debug mode, file-based instructions via `src/commander.ts`
 
 ---
 
@@ -855,6 +1063,16 @@ Auto-built galaxy map from explorer data with persistent storage via `src/mapsto
 - **Failure rate tracking** — 3+ failures in 60 seconds triggers immediate full login
 - **Staggered bot startup** — 5s between session resumes, 13s between full logins
 
+### Enhanced Resilience (botmanager.ts)
+- **Instant routine resume** — Large fleets (>100 bots): bots start routine immediately on connect, no fleet-wide sequential wait
+- **Load-aware reconnect backoff** — Exponential backoff (5s→120s) scaled by event loop lag via `loadMonitor.ts`
+- **Terminal close handling** — `session_replaced` (4001) / `auth_timeout` (4002) detection — bots connected elsewhere NOT auto-reconnected
+- **Old socket close wait** — Waits for old WebSocket to fully close (8s timeout + 750ms settle) before new login
+- **Reconnect deduplication** — In-flight guard prevents concurrent reconnect attempts per bot
+- **First-reconnect jitter** — Random 0-8s delay (load-scaled) to desynchronize fleet-wide reconnect storms
+- **Performance monitoring** (`perf.ts`) — Operation timing with `perf.timeSync()`
+- **Load monitoring** (`loadMonitor.ts`) — Event loop lag detection for adaptive scaling
+
 ### Error Handling
 - **Response caching** with per-command TTL (10s-3600s depending on command type)
 - **Mutation-based cache invalidation** — executing `mine` invalidates cargo, status, and location caches
@@ -947,7 +1165,7 @@ From the dashboard:
 ```
 spacemolt_botrunner/
 ├── src/
-│   ├── botmanager.ts              # Entry point — discovers bots, starts web server, routes actions, registers 20 routines
+│   ├── botmanager.ts              # Entry point — discovers bots, starts web server, routes actions, registers 28 routines
 │   ├── bot.ts                     # Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking
 │   ├── api.ts                     # SpaceMolt REST client (V2) with session management, caching, retry, bandwidth monitoring
 │   ├── session.ts                 # Credential and session token persistence
@@ -977,10 +1195,33 @@ spacemolt_botrunner/
 │   ├── loop.ts                    # AI agent loop with context compaction and retry
 │   ├── schema.ts                  # Game command schema fetcher (OpenAPI spec parser)
 │   ├── model.ts                   # LLM model resolution (pi-ai integration)
+│   ├── libClient.ts               # @spacemolt/lib headless client integration
+│   ├── client_sync_master.ts      # Multi-instance sync master
+│   ├── client_sync_slave.ts       # Multi-instance sync slave
+│   ├── client_sync_light_slave.ts # Lightweight sync client
+│   ├── client_sync_market_slave.ts # Market-only sync client
+│   ├── client_sync_files.ts       # File synchronization logic
+│   ├── client_sync_hooks.ts       # Sync integration hooks
+│   ├── client_sync_types.ts       # Sync type definitions
+│   ├── bot_chat_channel.ts        # In-memory bot-to-bot chat (4 channels, zero API calls)
+│   ├── insuranceTracker.ts        # Insurance purchase recording and status
+│   ├── shipmodules.ts             # Module extraction and capability search
+│   ├── stationRef.ts              # Station reference data for destination resolution
+│   ├── stationFacilityCache.ts    # Station facility cache
+│   ├── wildlivestore.ts           # Creature/wildlife data store
+│   ├── civilianstore.ts           # Passenger data cache
+│   ├── marketstreamstore.ts       # In-memory market push overlay
+│   ├── marketdetailsstore.ts      # Batched marketDetails.json persistence
+│   ├── market_local_source.js     # Cross-client market query engine
+│   ├── taxCollector.ts            # Tax estimate collection
+│   ├── sendMetrics.ts             # Metrics reporting
+│   ├── openapi.ts                 # OpenAPI spec fetching/parsing
+│   ├── perf.ts                    # Operation timing
+│   ├── loadMonitor.ts             # Event loop lag detection
+│   ├── skillTracker.ts            # Skill gain logging
 │   ├── cooperation/
 │   │   └── rescueCooperation.ts   # Inter-bot rescue cooperation via chat channel
 │   ├── fleet_comm.ts              # Fleet communication service (in-memory command broadcast)
-│   ├── bot_chat_channel.ts        # In-memory bot-to-bot chat (4 channels, zero API calls)
 │   ├── types/
 │   │   └── game.ts                # Comprehensive game type definitions (~631 lines)
 │   ├── routines/
@@ -1006,6 +1247,10 @@ spacemolt_botrunner/
 │   │   ├── fuelCellSeller.ts      # Fuel cell seller routine (~798 lines)
 │   │   ├── fuelTransfer.ts        # Fuel transport routine (~535 lines)
 │   │   ├── fuelTransferTracking.ts # Fuel transport trip tracking and persistence
+│   │   ├── fuelTransferCoordination.ts # Fuel transport multi-bot coordination
+│   │   ├── fuelTransferPlanning.ts # Fuel transport planning/optimization
+│   │   ├── fuelService.ts         # Fuel facility management (~1168 lines)
+│   │   ├── fuelServiceTracking.ts # Fuel service state tracking
 │   │   ├── battle.ts              # Shared battle logic — nearby parsing, tier analysis, engagement
 │   │   ├── flock.ts               # Generic flock coordination system (mining/salvage)
 │   │   ├── miner_radioactive.ts   # Radioactive mining capability detection
@@ -1021,6 +1266,13 @@ spacemolt_botrunner/
 │   │   ├── factionTraderCoordination.ts # Faction trader buy order locking
 │   │   ├── ensureFueled_simple.ts # Simplified fuel management helper
 │   │   ├── temp_helpers.ts        # Temporary helper utilities
+│   │   ├── moduleSeller.ts        # Module selling routine (~546 lines)
+│   │   ├── civilianTransport.ts   # Passenger transport (~3694 lines)
+│   │   ├── market.ts              # Market streaming routine (~178 lines)
+│   │   ├── craft_trade.ts         # Dual-role craft+trade (~664 lines)
+│   │   ├── stealthSkillGrind.ts   # Stealth skill XP grind (~99 lines)
+│   │   ├── pathfinder_test.ts     # Pathfinder bearing test routine
+│   │   ├── 1-idle.ts              # Anti-idle + observation (~151 lines)
 │   │   └── __tests__/             # Routine unit tests
 │   │       ├── battle_tick.test.ts
 │   │       ├── crafter.test.ts
@@ -1035,6 +1287,9 @@ spacemolt_botrunner/
 │   │   ├── server.ts              # Bun.serve HTTP + WebSocket server (~1498 lines)
 │   │   ├── index.html             # Dashboard SPA (~877KB)
 │   │   ├── index.css              # Stylesheet (~78KB)
+│   │   ├── chatserver.ts          # Chat WebSocket server (port 4000)
+│   │   ├── chat.html              # Chat UI
+│   │   ├── chat.css               # Chat styles
 │   │   ├── commandall.html        # Command All tab standalone
 │   │   ├── engineeringCalc.html   # Engineering calculator tool
 │   │   ├── players.html           # Player browser page
@@ -1081,7 +1336,9 @@ spacemolt_botrunner/
 │   ├── facilities.json            # Facility type definitions
 │   ├── fcStations.json            # Fuel cell seller station tracking
 │   ├── fuelTransfer.json          # Fuel transport trip tracking
+│   ├── fuelTransferCoordination.json # Fuel transport coordination
 │   ├── marketDetails.json         # Detailed market order data
+│   ├── marketStreamStore.json     # In-memory market stream overlay
 │   ├── shipsForSale.json          # Ship listing data
 │   ├── rawMissions.json           # Raw mission data
 │   ├── minerActivity.json         # Mining session tracking
@@ -1094,14 +1351,18 @@ spacemolt_botrunner/
 │   ├── craftingLoadouts.json      # Crafting loadout configurations
 │   ├── tradeCoordination.json     # Trade route locking
 │   ├── taxes.json                 # Tax estimate data
-│   ├── personalities/             # AI chat personality definitions (*.md files)
+│   ├── stationRef.json            # Station reference data for destination resolution
+│   ├── civilianTransport.json     # Civilian transport state + fleet ship cache
+│   ├── CivTransportLogs/          # Per-bot passenger achievement logs
+│   ├── creatures/                 # Creature/wildlife data files
 │   ├── flock_signals/             # Flock mining coordination files
 │   ├── escort_signals/            # Escort coordination files
 │   ├── logs/                      # Log files
 │   │   ├── debug.log              # Global debug log
 │   │   ├── {botName}_debug.log    # Per-bot debug logs
 │   │   └── activity/              # Per-bot activity logs
-│   └── factionStorage/            # Faction storage cache files
+│   ├── factionStorage/            # Faction storage cache files
+│   └── bot_positions.csv          # Position change log
 │
 ├── sessions/                      # Bot credentials and session tokens (gitignored)
 │   └── <username>/
@@ -1181,11 +1442,12 @@ All settings are stored in `data/settings.json` and configurable via the web UI.
 
 #### Trade Buyer
 - `buyItems` — array of item IDs to buy
-- `maxSpendPerItem`, `maxTotalSpend`
+- `maxSpendPerItem`, `maxTotalSpend` — credit budget for one buy trip; the tighter of the two caps **how many units are bought**, it does not discard the route. Must be at least `unit price × minQuantityToBuy` or nothing can be purchased.
 - `minQuantityToBuy` — default 10
 - `maxPrices` — per-item price limits
 - `homeSystem`, `refuelThreshold`, `repairThreshold`
 - `autoInsure`, `autoCloak`
+- Never accepts or completes missions by design.
 
 #### Faction Trader
 - `homeSystem`, `homeStation`
@@ -1277,6 +1539,70 @@ All settings are stored in `data/settings.json` and configurable via the web UI.
 - `homeSystem`, `homeStation`
 - `refuelThreshold`, `repairThreshold`
 - `focusStationId` — single station to clean (optional)
+
+#### Fuel Service
+- `stations[]` — array of stations to service (format: `system|station`)
+- `facilityConfigs[]` — array of `{ id, priority }` for facility types
+- `serviceAllEmpires` — service all empire stations
+- `useAllStationsInEmpire` — auto-expand to all stations in target empires
+- `targetEmpires[]` — specific empires to service
+- `refreshIntervalSec` — cycle interval (default: 300)
+- `refuelThreshold`, `repairThreshold`
+- `autoCloak`
+
+#### Module Seller
+- `homeSystem`, `homeStation`
+- `fuelCostPerJump` — cost per jump for route calculation
+- `refuelThreshold`, `repairThreshold`
+- `priceMode` — "premium" or "undercut"
+- `premiumPct` — percentage markup (default: 5)
+- `undercutCr` — credits to undercut (default: 100)
+- `sellAtHome` — sell at home station (default: true)
+- `maxQtyDefault` — default max quantity per module
+- `moduleItems[]` — per-module config: `{ itemId, maxQty, doNotSell }`
+
+#### Civilian Transport
+- `maxJumps` — max jumps per leg (default: 5)
+- `roundsBeforeMoving` — rounds before relocating (default: 5)
+- `refuelThreshold`, `repairThreshold`
+- `homeSystem`, `homeStation`
+- `maxPassengers`, `maxEconomy`, `maxBusiness`, `maxFirst`
+- `blockPirateStations` — avoid pirate stations (default: true)
+- `blockedStationIds[]` — manually blocked stations
+- `passengerPriority` — "first", "business", "economy", "off"
+- `allowFirstClass`, `allowBusinessClass`, `allowEconomyClass`
+- `announceDestination` — announce in chat (default: true)
+- `disableFactionMessage` — suppress faction messages
+- `enableCloak` — enable cloaking (default: false)
+- `factionDepositThreshold` — auto-deposit excess credits (default: 1,000,000)
+
+#### Market
+- No specific settings (uses general refuel/repair thresholds)
+
+#### Craft Trade
+- `crafterBots[]` — bot names assigned as crafter
+- `traderBots[]` — bot names assigned as traders
+- `enabledCategories[]` — crafting categories to consider
+- `minProfitPerUnit` — minimum profit per unit
+- `minFacilityAlertProfit` — alert threshold for missing facility
+- `maxDealQty`, `maxCargoValue`
+- `fuelCostPerJump`, `refuelThreshold`, `repairThreshold`
+- `homeSystem`, `homeStation`
+- `useAnalyzeMarket` — use analyze_market insights (default: true)
+- `forceOwnFacility` — only use owned facilities (default: true)
+- `craftingPreset` — crafting preset (default: "fast")
+- `blacklistedRecipes[]` — recipes to ignore
+- `craftingHomeBase` — crafting home station
+- `maxConcurrentOrders` — per trader (default: 3)
+- `orderTimeoutMin` — order expiry (default: 360)
+- `minMarginPct` — minimum margin % (default: 10)
+- `useRemoteMarketQuery` — query remote market via client sync (default: true)
+
+#### Stealth Skill Grind
+- No specific settings (uses general refuel/repair thresholds)
+
+#### 1-Idle / Observation
+- No specific settings
 
 ### Per-Bot Overrides
 

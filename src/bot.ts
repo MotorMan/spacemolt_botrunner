@@ -23,7 +23,10 @@ import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled 
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
-import { loadScale } from "./loadMonitor.js";
+
+/** A login() promise older than this (ms) is treated as wedged and reset, so a
+ *  dead socket can never permanently park the routine on an unresolved promise. */
+const LOGIN_WEDGE_TIMEOUT_MS = 60_000;
 import { catalogStore } from "./catalogstore.js";
 import { extractShipModules, moduleTypeId } from "./shipmodules.js";
 import { isPirateTarget, isCreatureTarget, isCreatureName } from "./routines/battle.js";
@@ -475,6 +478,11 @@ shipSpeed = 1;
 
   /** Track ongoing login to prevent duplicate concurrent logins */
   private _loginPromise: Promise<boolean> | null = null;
+  /** When the current (or last) login() promise was started — used to detect a
+   *  wedged login (one whose underlying doLogin never settled, e.g. a
+   *  refreshStatus stuck waiting on a dead socket) so we can reset it instead of
+   *  waiting on a promise that will never resolve. */
+  private _loginStartedAt = 0;
 
   /** Flag to request stop after current cycle completes (for civilian transport). */
   private _stopAfterCycle = false;
@@ -1134,10 +1142,14 @@ shipSpeed = 1;
       }
       // Escalate to ONE forced fresh socket only when:
       //   - the library gave up (terminal close fired — _terminalClosed), OR
-      //   - a load-scaled grace window has elapsed with no recovery.
-      // Either way it happens at most once per window — see the note above.
-      const waited = cycle * (POLL_MS * loadScale(50));
-      const grace = LIBRARY_GRACE_MS * loadScale(50);
+      //   - a grace window has elapsed with no recovery.
+      // Either way it happens at most once per window — see the note above. The
+      // reconnect STORM is prevented by forceReconnectBot's own exponential
+      // backoff + in-flight guard, NOT by stretching this grace, so we keep this
+      // grace FIXED (prompt) regardless of CPU load: scaling it up would just
+      // make the bot wait minutes before its first forced reconnect.
+      const waited = cycle * POLL_MS;
+      const grace = LIBRARY_GRACE_MS;
       if (this._terminalClosed) {
         this.log("warn", "Library reported the socket gone for good — requesting one fresh socket (backed off) and waiting for recovery...");
         this.clearTerminalClosed();
@@ -1146,7 +1158,7 @@ shipSpeed = 1;
         this.log("warn", "Still disconnected after grace window — requesting one fresh socket (backed off) and waiting for recovery...");
         await this.forceSocketReconnect();
       }
-      await new Promise((r) => setTimeout(r, POLL_MS * loadScale(50)));
+      await new Promise((r) => setTimeout(r, POLL_MS));
       cycle++;
     }
   }
@@ -1676,18 +1688,44 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
   /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
   async login(): Promise<boolean> {
-    // If login already in progress, wait for it instead of starting a new one
     if (this._loginPromise) {
-      this.log("system", "Login already in progress, waiting...");
-      return this._loginPromise;
+      const age = Date.now() - this._loginStartedAt;
+      // A login that's been "in progress" longer than this is wedged: its
+      // doLogin() never settled (almost always a refreshStatus/get_status stuck
+      // waiting on a dead socket whose recovery never completed). Waiting on it
+      // forever is what leaves a bot "never able to reconnect" — the routine is
+      // parked on a promise that will never resolve. Discard it and retry so the
+      // bot can actually make progress once the socket is back.
+      if (age < LOGIN_WEDGE_TIMEOUT_MS) {
+        this.log("system", "Login already in progress, waiting...");
+        return this._loginPromise;
+      }
+      this.log("warn", `Previous login() promise wedged for ${Math.round(age / 1000)}s — resetting and retrying.`);
+      this._loginPromise = null;
     }
 
-    // Start new login
+    this._loginStartedAt = Date.now();
     this._loginPromise = this.doLogin().finally(() => {
       this._loginPromise = null;
     });
 
     return this._loginPromise;
+  }
+
+  /** Race `p` against a timeout; resolves to `undefined` (instead of hanging)
+   *  if it doesn't settle within `ms`. Used to keep login()/resumeSession()
+   *  from wedging on a refreshStatus/get_status stuck waiting for a socket that
+   *  may be down for a long time. */
+  private async bound<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<undefined>((res) => {
+      timer = setTimeout(() => res(undefined), ms);
+    });
+    try {
+      return await Promise.race([p, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** True when this bot has a live library Account connection.
@@ -1722,8 +1760,16 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     // so there is no HTTP credential flow to perform.
     if (this.account) {
       this.log("system", `Connected via @spacemolt/lib as ${this.account.id ?? this.username} (no login needed)`);
-      await this.refreshStatus();
-      try { await this.checkSkills(); } catch { /* ignore */ }
+      // Best-effort, BOUNDED state warm-up. For a library bot the account is
+      // already connected, so the only reason to refresh here is to populate
+      // cached status/skills before the routine runs. We must NOT await it
+      // unboundedly: a flaky socket makes refreshStatus()/checkSkills() hang
+      // inside sendResilient waiting for recovery, which wedges login() (and
+      // thus the whole routine) forever on a promise that won't resolve until
+      // the socket is back. The routine refreshes state on its own as it runs,
+      // so if this times out we simply proceed with the library's seeded data.
+      await this.bound(this.refreshStatus(), 15_000);
+      await this.bound(this.checkSkills(), 15_000);
       return true;
     }
 
@@ -1739,8 +1785,9 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     // Library-backed bots are already connected; nothing to restore.
     if (this.account) {
       this.log("system", `Session already active via @spacemolt/lib (${this.account.id ?? this.username})`);
-      await this.refreshStatus();
-      try { await this.checkSkills(); } catch { /* ignore */ }
+      // Bounded (see doLogin): a dead socket must never wedge resumeSession.
+      await this.bound(this.refreshStatus(), 15_000);
+      await this.bound(this.checkSkills(), 15_000);
       return true;
     }
 

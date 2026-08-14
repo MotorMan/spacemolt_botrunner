@@ -37129,7 +37129,7 @@ ignoreBlacklist: document.getElementById(
           return Promise.resolve();
         }
         let url;
-        if (cs.mode === "slave" && cs.masterUrl) {
+        if ((cs.mode === "slave" || cs.mode === "light") && cs.masterUrl) {
           url = cs.masterUrl.replace(/\/+$/, "") + "/api/client-sync/bots";
         } else if (cs.mode === "master") {
           url = "/api/client-sync/bots";

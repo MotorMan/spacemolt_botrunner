@@ -13138,6 +13138,8 @@
       function renderGeneralSettings(panel) {
         const general = settings.general || {};
         const port = general.port ?? 3000;
+        const instantResumeMode = (typeof general.instantRoutineResume === "string" ? general.instantRoutineResume : "auto");
+        const instantResumeThreshold = (typeof general.instantResumeThreshold === "number" ? general.instantResumeThreshold : 100);
         const factionDonatePct = general.factionDonatePct ?? 10;
         const factionStorageSystem = general.factionStorageSystem || "";
         const factionStorageStation = general.factionStorageStation || "";
@@ -13429,6 +13431,21 @@
         </div>
       </div>
 
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Routine Resume</div>
+          <div class="setting-hint">When bots should resume their last-used routine after a (re)start. <b>Auto (based on bot count)</b> waits for every bot to connect then resumes all at once (the classic behavior) when the fleet is small, but resumes each bot the instant it logs in when the selected-bot count exceeds the threshold below — recommended for 100+ bots, where waiting for the whole fleet causes slow connects and reconnect storms. <b>Always (resume on login)</b> resumes each bot immediately no matter the count. <b>Wait for all</b> is always the classic sequential sweep.</div>
+        </div>
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+          <select id="set-general-instantRoutineResume" style="font-size:12px;padding:4px 8px">
+            <option value="auto" ${instantResumeMode === "auto" ? "selected" : ""}>Auto (based on bot count)</option>
+            <option value="on" ${instantResumeMode === "on" ? "selected" : ""}>Always (resume on login)</option>
+            <option value="off" ${instantResumeMode === "off" ? "selected" : ""}>Wait for all (classic)</option>
+          </select>
+          <span style="display:flex;gap:6px;align-items:center">Auto threshold: <input type="number" id="set-general-instantResumeThreshold" min="1" max="5000" step="1" value="${instantResumeThreshold}" style="width:90px" /> <span style="color:var(--text-dim);font-size:11px">bots</span></span>
+        </div>
+      </div>
+
       <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
         <div>
           <div class="setting-label">Clerk API Key</div>
@@ -13564,6 +13581,13 @@
             parseInt(
               document.getElementById("set-general-periodicRefreshSec").value,
             ) || 30,
+          instantRoutineResume:
+            document.getElementById("set-general-instantRoutineResume").value ||
+            "auto",
+          instantResumeThreshold:
+            parseInt(
+              document.getElementById("set-general-instantResumeThreshold").value,
+            ) || 100,
           windowTitle:
             (document.getElementById("set-general-windowTitle").value || "")
               .trim() || "",

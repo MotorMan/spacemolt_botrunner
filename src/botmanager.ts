@@ -229,6 +229,80 @@ function resetReconnectBackoff(id: string): void {
   reconnectBackoff.delete(id);
 }
 
+/**
+ * Instant routine resumption on login.
+ *
+ * The default startup behavior connects EVERY selected bot, then runs the
+ * auto-resume loop which awaits each bot's `handleStart` one at a time. With a
+ * large fleet (100+ bots) that connect phase is slow and connections start
+ * dropping before the fleet-wide resume even begins — by the time the loop
+ * reaches the later bots they're mid-reconnect storm and the whole client
+ * struggles. "Instant resume" instead kicks each bot's last-used routine the
+ * instant that bot's account connects (in `addOwnedAccountAsBot`), so bots that
+ * are already online start working immediately and never wait on the tail of a
+ * slow connect.
+ *
+ * Mode (Settings → General → Routine Resume):
+ *   - "auto": enabled when the selected-bot count exceeds `threshold` (default 100).
+ *   - "on":   always resume on login.
+ *   - "off":  the classic wait-for-all sequential resume.
+ * `instantResumeEnabled` is resolved once at startup from these settings.
+ */
+let instantResumeEnabled = false;
+const INSTANT_RESUME_AUTO_THRESHOLD_DEFAULT = 100;
+
+/** Resolve whether instant resume is on from settings + selected-bot count. */
+function computeInstantResumeEnabled(): boolean {
+  const settings = loadSettings();
+  const general = (settings.general as Record<string, unknown>) || {};
+  const mode = (typeof general.instantRoutineResume === "string" ? general.instantRoutineResume : "auto");
+  const threshold = typeof general.instantResumeThreshold === "number" ? general.instantResumeThreshold : INSTANT_RESUME_AUTO_THRESHOLD_DEFAULT;
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  // "auto": instant resume only when running a large fleet.
+  return getClerkConfig().bots.length > threshold;
+}
+
+/**
+ * Bots that have already been auto-resumed on login. Used to (a) skip the
+ * sequential startup sweep when instant resume is enabled, and (b) guard
+ * `addOwnedAccountAsBot` so a bot is never resumed twice if that path somehow
+ * fires for it more than once.
+ */
+const autoResumedBots = new Set<string>();
+
+/**
+ * Resume a single bot's last-used routine at startup (unless it was stopped
+ * intentionally or has no assigned routine). Shared by the instant-resume path
+ * (called per-bot the moment it logs in) and the classic wait-for-all sweep
+ * (called sequentially for every bot).
+ */
+async function autoResumeBot(name: string, bot: Bot): Promise<void> {
+  if (autoResumedBots.has(name)) return;
+  autoResumedBots.add(name);
+
+  try {
+    await bot.updateTaxEstimate();
+    await bot.updateFactionTaxEstimate();
+  } catch (err) {
+    server.logSystem(`Tax collection failed for ${name}: ${err}`);
+  }
+
+  const assignments = server.getBotAssignments();
+  const routineKey = getLastUsedRoutine(name) || assignments[name];
+  if (!routineKey || !ROUTINES[routineKey]) {
+    server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
+    return;
+  }
+  const stoppedState = getStoppedState(name);
+  if (stoppedState) {
+    server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+  } else {
+    server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+    await handleStart({ type: "start", bot: name, routine: routineKey });
+  }
+}
+
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()].sort((a, b) => a.localeCompare(b));
@@ -647,6 +721,14 @@ function addOwnedAccountAsBot(account: Account): void {
   // fresh canonical seed in case seeding hasn't settled by the onConnect call.
   initBot(bot, account);
   flushEarlyLogin(id);
+
+  // Instant resume: this bot just finished its FIRST login, so kick its
+  // last-used routine immediately instead of waiting for the rest of the fleet
+  // to connect (see `computeInstantResumeEnabled`). Fire-and-forget so a slow
+  // start doesn't block other bots logging in on their own sockets.
+  if (instantResumeEnabled) {
+    void autoResumeBot(id, bot);
+  }
 }
 
 /**
@@ -2471,6 +2553,15 @@ async function main(): Promise<void> {
   // Load port from settings.json (general.port), env var, or default to 3000
   const settings = loadSettings();
   const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
+
+  // Resolve the routine-resume mode from Settings → General (instant vs
+  // wait-for-all). Done once here so the connect + auto-resume logic below can
+  // branch on it without re-reading settings per bot.
+  instantResumeEnabled = computeInstantResumeEnabled();
+  server.logSystem(
+    `Routine resume mode resolved: ${instantResumeEnabled ? "instant (resume each bot on its own login)" : "wait-for-all (resume after every bot connects)"}. ` +
+    `Change it in Settings → General → Routine Resume.`,
+  );
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
@@ -2658,17 +2749,20 @@ async function main(): Promise<void> {
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
     const existingLastUsedRoutines = getAllLastUsedRoutines();
-    
+
     // Migrate any missing last-used routines from assignments (one-time migration)
     for (const [botName, routine] of Object.entries(assignments)) {
       if (!existingLastUsedRoutines[botName] && routine && ROUTINES[routine]) {
         saveLastUsedRoutine(botName, routine);
       }
     }
-    
+
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].sort((a, b) => a.localeCompare(b)).join(", ")}`);
     server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
     server.logSystem(`Last-used routines: ${JSON.stringify(getAllLastUsedRoutines())}`);
+    server.logSystem(
+      `Routine resume mode: ${instantResumeEnabled ? "instant (resume each bot on its own login)" : "wait-for-all (sequential after every bot connects)"}`,
+    );
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
@@ -2683,6 +2777,10 @@ async function main(): Promise<void> {
     // (c) leave `intervals` uninitialized so a shutdown during this window
     // threw a TDZ error. Running it fire-and-forget keeps startup instant and
     // lets the 2s status push + watchdog start immediately.
+    //
+    // When instant resume is enabled, each bot's routine is already kicked the
+    // moment it logs in (see `addOwnedAccountAsBot`), so this sequential sweep
+    // is skipped — running it too would just double-resume every bot.
     void (async () => {
       try {
         // Reconcile the catalog against the live gameserver version (from the
@@ -2699,26 +2797,15 @@ async function main(): Promise<void> {
         server.logSystem(`Catalog sync failed: ${err}`);
       }
 
-      for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
-        try {
-          await bot.updateTaxEstimate();
-          await bot.updateFactionTaxEstimate();
-        } catch (err) {
-          server.logSystem(`Tax collection failed for ${name}: ${err}`);
-        }
+      if (instantResumeEnabled) {
+        server.logSystem(
+          `Instant resume active: ${autoResumedBots.size} bot(s) already resumed on login; skipping sequential sweep.`,
+        );
+        return;
+      }
 
-        const routineKey = getLastUsedRoutine(name) || assignments[name];
-        if (!routineKey || !ROUTINES[routineKey]) {
-          server.logSystem(`${name}: no routine assigned, skipping auto-resume`);
-          continue;
-        }
-        const stoppedState = getStoppedState(name);
-        if (stoppedState) {
-          server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
-        } else {
-          server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-          await handleStart({ type: "start", bot: name, routine: routineKey });
-        }
+      for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+        await autoResumeBot(name, bot);
       }
     })();
   }

@@ -166,7 +166,16 @@ function getBotPersonality(botName: string): string {
     }
   }
   
-  // Fall back to default
+  // Fall back to the configured "Bot Personality" from AI Chat settings,
+  // then the hardcoded default if that is somehow empty.
+  try {
+    const settings = getAiChatSettings();
+    if (settings.personality && settings.personality.trim()) {
+      return settings.personality;
+    }
+  } catch {
+    /* fall through to hardcoded default */
+  }
   return DEFAULT_PERSONALITY;
 }
 

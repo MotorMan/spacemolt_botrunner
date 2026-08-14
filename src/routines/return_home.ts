@@ -487,7 +487,9 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   // A ship cannot be both cloaked and docked, and `cloak` is a 1-tick mutation.
   // Decloak (if cloaked) and wait for the mutation to settle BEFORE docking so the
   // dock command isn't rejected with "action pending" and the docked flag is accurate.
-  if (bot.isCloaked) {
+  // Only do this when decloakBeforeDock is enabled; otherwise leave the cloak on
+  // (e.g. to avoid fuel burn while docked, per the in-game patch).
+  if (bot.isCloaked && decloakBeforeDock) {
     await decloakAndSettle(ctx);
   }
 

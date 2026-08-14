@@ -45,6 +45,7 @@ import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity, flushLogsSync } from "./debug.js";
 import { isConnectionError } from "./connection.js";
+import { loadScale } from "./loadMonitor.js";
 import { connectOwnedAccounts, initSpacemoltClients, hasSpacemoltClient, listOwnedPlayers, listOwnedPlayersByKey, getConnectedAccounts, getSpacemoltClients, getConnectedAccount, removeConnectedAccount } from "./libClient.js";
 import { CLOSE_CODE, type Account } from "@spacemolt/lib";
 import { AiChatService } from "./aichat_service.js";
@@ -931,7 +932,13 @@ export async function forceReconnectBot(id: string): Promise<void> {
   // gently instead of hammered every few seconds (which itself provokes
   // the server's "duplicate session" close and wedges the bot for good).
   const b = reconnectBackoff.get(id);
-  const delay = b ? Math.min(RECONNECT_BASE_MS * 2 ** b.attempts, RECONNECT_MAX_MS) : 0;
+  // Back off more gently (longer gaps) under CPU load: when the event loop is
+  // saturated, forcing reconnects rapidly is what provokes the server's
+  // duplicate-session (session_replaced) close and wedges the bot. Scaling the
+  // delay up with loop lag keeps recovery lenient instead of stormy.
+  const delay = b
+    ? Math.min(RECONNECT_BASE_MS * 2 ** b.attempts * loadScale(50), RECONNECT_MAX_MS * loadScale(50))
+    : 0;
   if (b && now - b.lastAttempt < delay) return;
 
   reconnectingBots.add(id);
@@ -986,8 +993,15 @@ export async function forceReconnectBot(id: string): Promise<void> {
     // this do we open the fresh socket — guaranteeing the server never sees two
     // concurrent sessions for the same account.
     if (oldAccounts.length) {
-      await Promise.all(oldAccounts.map((a) => waitForAccountSocketClosed(a)));
-      await new Promise<void>((r) => setTimeout(r, OLD_SOCKET_SETTLE_MS));
+      // Under CPU load the close "event" fires late, so wait proportionally
+      // longer before declaring the old socket dead and before reopening — a
+      // too-short barrier can reopen while the server still holds the old
+      // session, which answers our fresh login with session_replaced and wedges
+      // the bot. Lenient scaling avoids that.
+      const closeTimeout = OLD_SOCKET_CLOSE_TIMEOUT_MS * loadScale(50);
+      const settle = OLD_SOCKET_SETTLE_MS * loadScale(50);
+      await Promise.all(oldAccounts.map((a) => waitForAccountSocketClosed(a, closeTimeout)));
+      await new Promise<void>((r) => setTimeout(r, settle));
     }
 
     // Attempt the reconnect with a hard timeout so a hanging connectOwned can
@@ -1011,7 +1025,7 @@ export async function forceReconnectBot(id: string): Promise<void> {
       server.logSystem(
         `Reconnect of ${id} did not produce a live socket yet ` +
           `(next attempt in ~${Math.round(
-            Math.min(RECONNECT_BASE_MS * 2 ** reconnectBackoff.get(id)!.attempts, RECONNECT_MAX_MS) / 1000,
+            Math.min(RECONNECT_BASE_MS * 2 ** reconnectBackoff.get(id)!.attempts * loadScale(50), RECONNECT_MAX_MS * loadScale(50)) / 1000,
           )}s) — watchdog/backoff will keep retrying.`,
       );
     }

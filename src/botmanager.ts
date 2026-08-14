@@ -2556,15 +2556,16 @@ async function main(): Promise<void> {
 
   // Resolve the routine-resume mode from Settings → General (instant vs
   // wait-for-all). Done once here so the connect + auto-resume logic below can
-  // branch on it without re-reading settings per bot.
+  // branch on it without re-reading settings per bot. `server` isn't created yet
+  // at this point, so the log line is emitted just after `server` is assigned.
   instantResumeEnabled = computeInstantResumeEnabled();
+  server = new WebServer(port);
+  server.routines = Object.keys(ROUTINES).sort();
+  server.onAction = handleAction;
   server.logSystem(
     `Routine resume mode resolved: ${instantResumeEnabled ? "instant (resume each bot on its own login)" : "wait-for-all (resume after every bot connects)"}. ` +
     `Change it in Settings → General → Routine Resume.`,
   );
-  server = new WebServer(port);
-  server.routines = Object.keys(ROUTINES).sort();
-  server.onAction = handleAction;
   server.onShutdown = async (restart: boolean = false) => {
     // gracefulShutdown is a hoisted function declaration in main(), so it is
     // safe to call directly here. Previously this went through

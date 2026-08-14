@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import type { FaintSignature } from "../wildlivestore.js";
@@ -36,6 +37,7 @@ import {
 } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
 
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
@@ -43,30 +45,8 @@ const FUEL_SAFETY_PCT = 40;
 // ── Market Details Storage ──────────────────────────────────
 
 const DATA_DIR = join(process.cwd(), "data");
-const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
 const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
 const RAW_MISSIONS_FILE = join(DATA_DIR, "rawMissions.json");
-
-interface MarketOrderDetail {
-  price: number;
-  quantity: number;
-}
-
-interface MarketItemDetails {
-  systemId: string;
-  stationPoiId: string;
-  stationName: string;
-  itemId: string;
-  itemName: string;
-  buyOrders: MarketOrderDetail[];
-  sellOrders: MarketOrderDetail[];
-  lastUpdated: string;
-}
-
-interface MarketDetailsData {
-  lastSaved: string;
-  items: MarketItemDetails[];
-}
 
 interface ShipListing {
   systemId: string;
@@ -114,29 +94,6 @@ interface RawMissionRecord {
 interface RawMissionsData {
   lastSaved: string;
   missions: Record<string, RawMissionRecord>; // key: mission_id
-}
-
-function loadMarketDetails(): MarketDetailsData {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  if (existsSync(MARKET_DETAILS_FILE)) {
-    try {
-      const raw = readFileSync(MARKET_DETAILS_FILE, "utf-8");
-      return JSON.parse(raw) as MarketDetailsData;
-    } catch {
-      // Corrupt file — start fresh
-    }
-  }
-  return { lastSaved: now(), items: [] };
-}
-
-function saveMarketDetails(data: MarketDetailsData): void {
-  if (!existsSync(DATA_DIR)) {
-    mkdirSync(DATA_DIR, { recursive: true });
-  }
-  data.lastSaved = now();
-  writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
 function loadShipsForSale(log?: (cat: string, msg: string) => void): ShipsForSaleData {
@@ -1102,6 +1059,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const station = findStation(pois);
 
     // ── Visit each POI ──
+    let wormholeJumped = false;
     for (const { poi, reason } of toVisit) {
       if (bot.state !== "running") break;
 
@@ -1148,21 +1106,31 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!jumpResp.error) {
           const r = jumpResp.result as Record<string, unknown> | undefined;
           if (r && r.action === "jumped") {
-            const fromSystem = (r.from_system as string) || systemId;
-            const exitPoi = (r.poi as string) || "";
-            const destSystem = (r.system as string) || "";
-            const destSystemId = (r.system_id as string) || "";
-            ctx.log("info", `🌌 Wormhole jumped: ${fromSystem} -> ${destSystem} (${exitPoi})`);
-            mapStore.registerWormhole(destSystemId || fromSystem, {
-              id: exitPoi || poi.id,
-              name: exitPoi || poi.name,
-              exit_system_id: destSystemId || fromSystem,
-              exit_system_name: destSystem || destSystemId,
-              exit_poi_id: exitPoi || poi.id,
-              exit_poi_name: exitPoi || poi.name,
-              destination_system_id: fromSystem,
-              destination_system_name: bot.system || fromSystem,
-            });
+            // from_system/system are display names ("Alzirr"); the map is keyed
+            // by ids ("alzirr"), so never feed a name in as a system id.
+            const fromSystemName = (r.from_system as string) || systemId;
+            const exitPoi = (r.poi as string) || poi.id;
+            const destSystemName = (r.system as string) || "";
+            // bot.system is already updated to the arrival system by the jump.
+            const destSystemId = (r.system_id as string)
+              || (bot.system && bot.system !== systemId ? bot.system : "");
+            ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
+            if (destSystemId) {
+              mapStore.registerWormhole(destSystemId, {
+                id: exitPoi,
+                name: exitPoi,
+                exit_system_id: destSystemId,
+                exit_system_name: destSystemName || destSystemId,
+                exit_poi_id: exitPoi,
+                exit_poi_name: exitPoi,
+                // The entrance is the system we just left, not wherever the
+                // bot happens to be standing now.
+                destination_system_id: systemId,
+                destination_system_name: fromSystemName,
+              });
+            } else {
+              ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
+            }
             // Mark both entrance and exit POIs explored
             mapStore.markExplored(systemId, poi.id);
             if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
@@ -1170,7 +1138,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         // Refresh location after wormhole jump
         await bot.refreshLocation();
-        continue; // Skip normal POI visit, restart loop in new system
+        if (bot.system && bot.system !== systemId) {
+          // We're in a whole different system now — abandon this system's POI
+          // list and rescan from the top of the outer loop.
+          wormholeJumped = true;
+          break;
+        }
+        continue;
       }
 
       // Scavenge wrecks/containers at each POI (only if enabled — unsafe near pirates)
@@ -1235,6 +1209,13 @@ yield "deposit_cargo";
     }
 
     if (bot.state !== "running") break;
+
+    // A wormhole dropped us in a brand new system — rescan it from scratch
+    // instead of picking a next system based on the one we just left.
+    if (wormholeJumped) {
+      ctx.log("info", `Arrived in ${bot.system} via wormhole — restarting system scan`);
+      continue;
+    }
 
     // ── Check skills for level-ups ──
     yield "check_skills";
@@ -1827,8 +1808,7 @@ async function* scanStation(
 
       // Extract detailed order book data from view_market response and save to marketDetails.json
       if (items.length > 0) {
-        const marketDetails = loadMarketDetails();
-        let detailsUpdated = false;
+        const observations: MarketItemObservation[] = [];
 
         ctx.log("info", `Saving detailed market data for ${items.length} items...`);
 
@@ -1858,35 +1838,16 @@ async function* scanStation(
             }
           }
 
-          // Update or add to market details
-          const existingIndex = marketDetails.items.findIndex(
-            m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
-          );
-
-          const marketItemDetail: MarketItemDetails = {
-            systemId,
-            stationPoiId: poi.id,
-            stationName: poi.name,
-            itemId,
-            itemName,
-            buyOrders,
-            sellOrders,
-            lastUpdated: now(),
-          };
-
-          if (existingIndex >= 0) {
-            marketDetails.items[existingIndex] = marketItemDetail;
-          } else {
-            marketDetails.items.push(marketItemDetail);
-          }
-
-          detailsUpdated = true;
+          observations.push({ itemId, itemName, buyOrders, sellOrders });
         }
 
+        // Memory-only upsert; marketDetailsStore persists on its 2-min cadence
+        // (and on shutdown) instead of rewriting the whole ~10MB file here.
+        const detailsUpdated = marketDetailsStore.upsertItems(systemId, poi.id, poi.name, observations) > 0;
+
         if (detailsUpdated) {
-          saveMarketDetails(marketDetails);
-          ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
-          
+          ctx.log("info", `Recorded detailed market data for ${items.length} items`);
+
           // Submit trade intel to faction if station has the facility
           const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, poi.id);
           if (hasTradeIntel) {
@@ -2608,19 +2569,13 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
   const shipResp = await bot.exec("get_ship");
   if (shipResp.error || !shipResp.result) return false;
 
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const { modules } = extractShipModules(shipResp.result);
 
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
-    const modName = (modObj?.name as string) || "";
-    const modSpecial = (modObj?.special as string) || "";
-
-    const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+    const checkStr = moduleHaystack(mod);
     if (checkStr.includes("deep_core_survey_scanner") ||
         checkStr.includes("deep core survey scanner") ||
-        modSpecial.includes("deep_core_detection")) {
+        checkStr.includes("deep_core_detection")) {
       return true;
     }
   }
@@ -2905,8 +2860,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
             if (items.length > 0) {
               ctx.log("info", `Saving detailed market data for ${items.length} items...`);
-              const marketDetails = loadMarketDetails();
-              let detailsUpdated = false;
+              const observations: MarketItemObservation[] = [];
 
               for (const item of items) {
                 const itemId = (item.item_id as string) || (item.id as string) || "";
@@ -2924,35 +2878,16 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                   quantity: (order.quantity as number) || 0,
                 })).filter(order => order.price > 0 && order.quantity > 0);
 
-                // Update or add to market details
-                const existingIndex = marketDetails.items.findIndex(
-                  m => m.systemId === target.systemId && m.stationPoiId === target.stationPoi && m.itemId === itemId
-                );
-
-                const marketItemDetail: MarketItemDetails = {
-                  systemId: target.systemId,
-                  stationPoiId: target.stationPoi,
-                  stationName: target.stationName,
-                  itemId,
-                  itemName,
-                  buyOrders,
-                  sellOrders,
-                  lastUpdated: now(),
-                };
-
-                if (existingIndex >= 0) {
-                  marketDetails.items[existingIndex] = marketItemDetail;
-                } else {
-                  marketDetails.items.push(marketItemDetail);
-                }
-
-                detailsUpdated = true;
+                observations.push({ itemId, itemName, buyOrders, sellOrders });
               }
 
+              const detailsUpdated = marketDetailsStore.upsertItems(
+                target.systemId, target.stationPoi, target.stationName, observations,
+              ) > 0;
+
               if (detailsUpdated) {
-                saveMarketDetails(marketDetails);
-                ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
-                
+                ctx.log("info", `Recorded detailed market data for ${items.length} items`);
+
                 // Submit trade intel to faction if station has the facility
                 const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, target.stationPoi);
                 if (hasTradeIntel) {

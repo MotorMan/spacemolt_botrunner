@@ -51,6 +51,12 @@
     let currentBot = "";
     let currentChannel = "local";
     let ws = null;
+    let wsManualClose = false;
+    let wsConnectTimer = null;
+    let wsInitTimer = null;
+    let wsHeartbeatTimer = null;
+    let wsWatchdogTimer = null;
+    let wsLastMsg = Date.now();
     let pollTimer = null;
     let lastMessageTimestamp = 0;
     let isAtBottom = true;
@@ -283,45 +289,80 @@
     }
 
     function connectWebSocket() {
+      if (wsManualClose) return;
+      clearTimeout(wsConnectTimer);
+
       const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${proto}//${window.location.host}/ws`;
-
+      let host = window.location.host;
+      if (!host) host = (window.location.hostname || "localhost") + (window.location.port ? ":" + window.location.port : "");
+      let wsUrl;
       try {
+        wsUrl = `${proto}//${host}/ws`;
         ws = new WebSocket(wsUrl);
-
-        ws.onopen = () => {
-          console.log("Chat WebSocket connected");
-        };
-
-        ws.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
-            if (data.type === "new_message" && data.message) {
-              const msg = data.message;
-              const showBot = currentBot === "__all__";
-              if (showBot || (msg.botUsername === currentBot && msg.channel === currentChannel)) {
-                renderMessage(msg, showBot);
-                lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
-                checkEmpty();
-                if (isAtBottom) scrollToBottom();
-              }
-            }
-          } catch {
-            // ignore parse errors
-          }
-        };
-
-        ws.onclose = () => {
-          console.log("Chat WebSocket disconnected, reconnecting in 3s…");
-          setTimeout(connectWebSocket, 3000);
-        };
-
-        ws.onerror = () => {
-          ws?.close();
-        };
-      } catch {
-        setTimeout(connectWebSocket, 3000);
+      } catch (err) {
+        console.warn("Chat WebSocket constructor failed, retrying in 1s:", err);
+        wsConnectTimer = setTimeout(connectWebSocket, 1000);
+        return;
       }
+
+      wsLastMsg = Date.now();
+
+      clearTimeout(wsInitTimer);
+      wsInitTimer = setTimeout(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          console.warn("Chat WebSocket not open after 4s — reconnect");
+          try { ws && ws.close(); } catch {}
+        }
+      }, 4000);
+
+      ws.onopen = () => {
+        clearTimeout(wsInitTimer);
+        console.log("Chat WebSocket connected");
+        clearInterval(wsHeartbeatTimer);
+        wsHeartbeatTimer = setInterval(() => {
+          try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" })); } catch {}
+        }, 15000);
+        clearInterval(wsWatchdogTimer);
+        wsWatchdogTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+            console.warn("Chat WebSocket silent for 30s, forcing reconnect");
+            try { ws.close(); } catch {}
+          }
+        }, 5000);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "pong") return;
+          wsLastMsg = Date.now();
+          if (data.type === "new_message" && data.message) {
+            const msg = data.message;
+            const showBot = currentBot === "__all__";
+            if (showBot || (msg.botUsername === currentBot && msg.channel === currentChannel)) {
+              renderMessage(msg, showBot);
+              lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+              checkEmpty();
+              if (isAtBottom) scrollToBottom();
+            }
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      ws.onclose = () => {
+        clearTimeout(wsInitTimer);
+        clearInterval(wsHeartbeatTimer);
+        clearInterval(wsWatchdogTimer);
+        if (wsManualClose) return;
+        console.log("Chat WebSocket disconnected, reconnecting in 1s…");
+        wsConnectTimer = setTimeout(connectWebSocket, 1000);
+      };
+
+      ws.onerror = () => {
+        try { ws && ws.close(); } catch {}
+      };
     }
 
     function startPolling() {

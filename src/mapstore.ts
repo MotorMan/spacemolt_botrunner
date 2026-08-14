@@ -1,9 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, writeFile, copyFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -23,6 +24,8 @@ export interface OreRecord {
   last_seen: string;
   depleted?: boolean;
   depleted_at?: string;
+  /** True for ore entries seeded from seed_map.json (static hints, not real scan data). */
+  seed?: boolean;
 }
 
 /** Resource data from get_poi scan */
@@ -90,6 +93,7 @@ export interface MarketRecord {
   best_buy: number | null;
   best_sell: number | null;
   buy_quantity: number;
+  best_buy_quantity: number;
   sell_quantity: number;
   last_updated: string;
 }
@@ -127,7 +131,8 @@ export interface StoredPOI {
   base_type: string | null;
   services: string[];
   ores_found: OreRecord[];
-  resources: ResourceRecord[];
+  /** Undefined when a POI has never been scan-scanned (or is a seed hint). An empty [] means a real scan found nothing. */
+  resources?: ResourceRecord[];
   market: MarketRecord[];
   orders: OrderRecord[];
   missions: MissionRecord[];
@@ -226,6 +231,30 @@ export interface MapData {
   };
 }
 
+// ── Station identity cross-referencing ─────────────────────
+//
+// A station can be referenced several ways: by its POI hex id (e.g.
+// "d1c54e3a473f4d3ce9c7603c5e0c6b38"), by its friendly POI name (e.g.
+// "crosshaven_station"), by its base id/name, or as a "system|poi" pair. The
+// game occasionally reports a station only as an unresolved hex id, while the
+// user's config may use a friendly name (or vice versa). Comparing those
+// references with a raw string equality check makes the bot think it is NOT at
+// the destination and can misroute or lose cargo. These helpers resolve any
+// station reference into a single canonical identity (carrying BOTH the hex id
+// and the friendly name) and compare two references so that a hex id and a name
+// that point at the same station are treated as equal.
+
+export interface ResolvedStation {
+  /** Resolved system id, or null if unknown. */
+  systemId: string | null;
+  /** Resolved POI hex id, or the raw token if unresolved. */
+  poiId: string | null;
+  /** Resolved friendly POI name, or null if not known. */
+  poiName: string | null;
+  /** True if the reference matched a POI in the map. */
+  matched: boolean;
+}
+
 // ── MapStore singleton ──────────────────────────────────────
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -249,21 +278,110 @@ const BACKUP_FILES = [
   'transportProfitDebug.csv',
 ];
 
+/**
+ * Backfill array members that a stored system record may be missing.
+ *
+ * A system record can predate a field (map.json files written before
+ * `wormhole_exits` existed), come from a hand-written/synced map, or come from
+ * seed_map.json — in all of those cases the array is simply absent, and any
+ * consumer doing `sys.wormhole_exits.findIndex(...)` throws
+ * "undefined is not an object". Normalizing once on load means every consumer
+ * can rely on the arrays existing instead of guarding each access.
+ */
+function normalizeSystem(sys: StoredSystem): StoredSystem {
+  if (!Array.isArray(sys.connections)) sys.connections = [];
+  if (!Array.isArray(sys.pois)) sys.pois = [];
+  if (!Array.isArray(sys.wormhole_exits)) sys.wormhole_exits = [];
+  if (!Array.isArray(sys.pirate_sightings)) sys.pirate_sightings = [];
+  if (!Array.isArray(sys.wrecks)) sys.wrecks = [];
+  return sys;
+}
+
+/** Loose comparison key for a system id or display name: "Cargo Lanes",
+ *  "cargo lanes", "cargo-lanes" and "cargo_lanes" all collapse to "cargolanes",
+ *  so ids and human-typed names resolve to the same system. */
+function looseSystemKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Normalize every system in a freshly parsed/merged map payload. */
+function normalizeMapData(data: MapData): MapData {
+  if (!data.systems || typeof data.systems !== "object") {
+    data.systems = {};
+    return data;
+  }
+  for (const sys of Object.values(data.systems)) {
+    if (sys) normalizeSystem(sys);
+  }
+  return data;
+}
+
 class MapStore {
   private data: MapData;
   private dirty = false;
+  private mapGeneration = 0;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
+  // Guard so two async disk writes never overlap (which would race on the file).
+  private writeInFlight = false;
+  private writeQueued = false;
   private precalcRoutes: Record<string, Record<string, string[] | null>> = {};
   private precalcNoPirateRoutes: Record<string, Record<string, string[] | null>> = {};
+  // id/name → id lookup, rebuilt whenever mapGeneration changes.
+  private systemLookupIndex: Map<string, string> | null = null;
+  private systemLookupIndexGeneration = -1;
 
   constructor() {
     this.data = this.load();
+    // Only seed when the live map is empty (fresh bootstrap). A populated
+    // data/map.json is never modified here, so the running client is safe.
+    if (Object.keys(this.data.systems).length === 0) {
+      this.mergeSeedMap();
+    }
     this.loadPrecalcRoutes();
     if (!existsSync(BACKUP_DIR)) {
       mkdirSync(BACKUP_DIR, { recursive: true });
     }
     this.backupTimer = setInterval(() => this.performBackup(), 30 * 60 * 1000);
+  }
+
+  /**
+   * Merge the static seed map (seed_map.json in the project root) into the
+   * in-memory store. Seed POIs carry ores_found entries flagged `seed: true`
+   * and omit `resources`, so findOreLocations treats them as ore hints that a
+   * real get_poi scan later overrides. No save is scheduled here — persistence
+   * happens via the client's own normal update/save flow, so data/map.json is
+   * never written by this method.
+   */
+  private mergeSeedMap(): void {
+    const seedFile = join(process.cwd(), "seed_map.json");
+    if (!existsSync(seedFile)) return;
+    try {
+      const raw = readFileSync(seedFile, "utf-8");
+      const seed = JSON.parse(raw) as MapData;
+      for (const [sid, seedSys] of Object.entries(seed.systems)) {
+        const existing = this.data.systems[sid];
+        if (!existing) {
+          this.data.systems[sid] = normalizeSystem(seedSys);
+          continue;
+        }
+        const existingPois = new Map(existing.pois.map((p) => [p.id, p]));
+        for (const seedPoi of seedSys.pois || []) {
+          const ep = existingPois.get(seedPoi.id);
+          if (!ep) {
+            existing.pois.push(seedPoi);
+            continue;
+          }
+          const have = new Set((ep.ores_found || []).map((o) => o.item_id));
+          for (const so of seedPoi.ores_found || []) {
+            if (!have.has(so.item_id)) ep.ores_found.push(so);
+          }
+        }
+      }
+      log("info", `Merged seed map (${Object.keys(seed.systems).length} systems) into empty store`);
+    } catch (e) {
+      log("error", `Failed to merge seed map: ${e}`);
+    }
   }
 
   private loadPrecalcRoutes(): void {
@@ -312,10 +430,23 @@ class MapStore {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
+    // First-time bootstrap: if map.json doesn't exist yet, copy the seed map
+    // so miners have ore locations available from the very first start.
+    if (!existsSync(MAP_FILE)) {
+      const seedFile = join(DATA_DIR, "seed_map.json");
+      if (existsSync(seedFile)) {
+        try {
+          copyFileSync(seedFile, MAP_FILE);
+          log("info", "Initialized data/map.json from seed_map.json (first start)");
+        } catch (e) {
+          log("error", `Failed to bootstrap map from seed: ${e}`);
+        }
+      }
+    }
     if (existsSync(MAP_FILE)) {
       try {
         const raw = readFileSync(MAP_FILE, "utf-8");
-        return JSON.parse(raw) as MapData;
+        return normalizeMapData(JSON.parse(raw) as MapData);
       } catch {
         // Corrupt file — start fresh
       }
@@ -325,6 +456,7 @@ class MapStore {
 
   private scheduleSave(): void {
     this.dirty = true;
+    this.mapGeneration++;
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
@@ -334,12 +466,33 @@ class MapStore {
 
   private writeToDisk(): void {
     if (!this.dirty) return;
+    if (this.writeInFlight) {
+      // A write is already in progress; mark that we still have pending
+      // changes so another write runs once the current one finishes.
+      this.writeQueued = true;
+      return;
+    }
+    this.writeInFlight = true;
+    this.dirty = false;
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     this.data.last_saved = now();
-    writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
-    this.dirty = false;
+    const payload = JSON.stringify(this.data, null, 2) + "\n";
+    // Write asynchronously so the (single-threaded) event loop is never blocked
+    // by a multi-MB map write — otherwise active bots exploring+save map would
+    // stall the web server and delay every other client's connection.
+    writeFile(MAP_FILE, payload, "utf-8", (err) => {
+      this.writeInFlight = false;
+      if (err) {
+        this.dirty = true;
+        log("error", `Failed to write map.json: ${err}`);
+      }
+      if (this.writeQueued) {
+        this.writeQueued = false;
+        this.writeToDisk();
+      }
+    });
   }
 
   /** Flush pending writes to disk immediately. Call on shutdown. */
@@ -352,7 +505,17 @@ class MapStore {
       clearInterval(this.backupTimer);
       this.backupTimer = null;
     }
-    this.writeToDisk();
+    // Synchronous flush on shutdown so pending changes are guaranteed on disk.
+    if (this.dirty) {
+      this.dirty = false;
+      this.data.last_saved = now();
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+    }
+  }
+
+  getMapGeneration(): number {
+    return this.mapGeneration;
   }
 
   private getTimestamp(): string {
@@ -487,7 +650,11 @@ class MapStore {
           base_type: (p.base_type as string) ?? prev?.base_type ?? null,
           services: (p.services as string[]) ?? prev?.services ?? [],
           ores_found: prev?.ores_found ?? [],
-          resources: prev?.resources ?? [],
+          // Preserve undefined (not default to []) so seeded POIs that omit
+          // `resources` remain authoritative via ores_found until a real get_poi
+          // scan populates `resources`. A genuinely scanned-empty POI gets []
+          // from updatePoiResources, preserving the "ore not present" guard.
+          resources: prev?.resources,
           market: prev?.market ?? [],
           orders: prev?.orders ?? [],
           missions: prev?.missions ?? [],
@@ -572,20 +739,28 @@ class MapStore {
       let buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? 0;
 
       // If we have buy_orders array, calculate best price and total quantity from it
+      let bestBuyQty = buyQty;
       if (Array.isArray(item.buy_orders)) {
         let maxBuyPrice = 0;
         let totalBuyQty = 0;
+        let qtyAtBestPrice = 0;
         for (const order of item.buy_orders) {
           const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
           const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
           if (price > 0 && qty > 0) {
-            maxBuyPrice = Math.max(maxBuyPrice, price);
+            if (price > maxBuyPrice) {
+              maxBuyPrice = price;
+              qtyAtBestPrice = qty;
+            } else if (price === maxBuyPrice) {
+              qtyAtBestPrice += qty;
+            }
             totalBuyQty += qty;
           }
         }
         if (maxBuyPrice > 0) {
           buyPrice = buyPrice ?? maxBuyPrice;
           buyQty = buyQty || totalBuyQty;
+          bestBuyQty = qtyAtBestPrice;
         }
       } else if ((item.buy_orders as number) > 0) {
         // Fallback for cases where buy_orders is a number (count of orders)
@@ -623,6 +798,7 @@ class MapStore {
         best_buy: buyPrice,
         best_sell: sellPrice,
         buy_quantity: buyQty,
+        best_buy_quantity: bestBuyQty,
         sell_quantity: sellQty,
         last_updated: now(),
       });
@@ -637,7 +813,6 @@ class MapStore {
 
     poi.market = [...existingMarket.values()];
     poi.last_updated = now();
-    this.scheduleSave();
   }
 
   /** Remove an item from a station's cached market data (e.g. when buy fails with item_not_available). */
@@ -648,7 +823,10 @@ class MapStore {
     if (!poi) return;
     const before = poi.market.length;
     poi.market = poi.market.filter((m) => m.item_id !== itemId);
-    if (poi.market.length < before) this.scheduleSave();
+    if (poi.market.length < before) {
+      // Intentionally no scheduleSave() here — market data is persisted
+      // exclusively through marketDetails.json, not map.json.
+    }
   }
 
   /** Reduce cached market quantities when a bot commits to a trade route.
@@ -808,6 +986,7 @@ class MapStore {
       existing.times_seen++;
       existing.last_seen = now();
       existing.depleted = false; // Reset depleted flag on successful mining
+      existing.seed = false; // Real mining converts a seed hint into real data
     } else {
       poi.ores_found.push({
         item_id: oreItem.item_id,
@@ -1088,8 +1267,12 @@ class MapStore {
     expires_in_text?: string; // e.g., "36477d 20h"
     expires_at?: string; // ISO timestamp if provided directly
   }): void {
-    // Get or create the exit system
-    let exitSys = this.data.systems[exitSystemId];
+    if (!exitSystemId) return;
+
+    // Get or create the exit system. Resolve case-insensitively so a display
+    // name ("Praecipua") reuses the existing "praecipua" record instead of
+    // creating a duplicate system.
+    let exitSys = this.getSystem(exitSystemId);
     if (!exitSys) {
       exitSys = {
         id: exitSystemId,
@@ -1102,7 +1285,12 @@ class MapStore {
         last_updated: now(),
       };
       this.data.systems[exitSystemId] = exitSys;
+    } else {
+      exitSystemId = exitSys.id || exitSystemId;
     }
+    // An already-known system may have been stored before `wormhole_exits`
+    // existed, so never assume the array is there.
+    normalizeSystem(exitSys);
 
     // Calculate expiry from expires_in_text or expires_at
     let expiresAt: string | null = null;
@@ -1146,9 +1334,8 @@ class MapStore {
 
     // Also ensure the entrance (destination) system exists
     const entranceSystemId = wormholeData.destination_system_id;
-    let entranceSys = this.data.systems[entranceSystemId];
-    if (!entranceSys) {
-      entranceSys = {
+    if (entranceSystemId && !this.getSystem(entranceSystemId)) {
+      this.data.systems[entranceSystemId] = {
         id: entranceSystemId,
         name: wormholeData.destination_system_name || entranceSystemId,
         connections: [],
@@ -1158,7 +1345,6 @@ class MapStore {
         wrecks: [],
         last_updated: now(),
       };
-      this.data.systems[entranceSystemId] = entranceSys;
     }
 
     this.scheduleSave();
@@ -1240,9 +1426,10 @@ class MapStore {
   /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems).
    *  If approvedSet is provided, only stations whose poiId or "system|poiId" is in the set are considered.
    *  Returns { systemId, poiId, poiName, hops } or null. */
-  findNearestStationSystem(fromSystemId: string, blacklist?: string[], approvedSet?: Set<string>): { systemId: string; poiId: string; poiName: string; hops: number } | null {
+  findNearestStationSystem(fromSystemId: string, blacklist?: string[], approvedSet?: Set<string>, deniedSet?: Set<string>): { systemId: string; poiId: string; poiName: string; hops: number } | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    const denied = deniedSet && deniedSet.size > 0 ? new Set(Array.from(deniedSet).map(s => s.toLowerCase())) : null;
 
     const isApproved = (sysId: string, poiId: string): boolean => {
       if (!approvedSet || approvedSet.size === 0) return true;
@@ -1251,11 +1438,18 @@ class MapStore {
       return false;
     };
 
+    const isDenied = (sysId: string, poiId: string): boolean => {
+      if (!denied) return false;
+      if (denied.has(poiId.toLowerCase())) return true;
+      if (denied.has(`${sysId}|${poiId}`.toLowerCase())) return true;
+      return false;
+    };
+
     // Check current system first (but skip if it's a pirate or blacklisted system)
     if (!this.isPirateSystem(fromSystemId) && !blacklistSet.has(fromSystemId.toLowerCase())) {
       const sys = this.data.systems[fromSystemId];
       if (sys) {
-        const localStation = sys.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(fromSystemId, p.id));
+        const localStation = sys.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(fromSystemId, p.id) && !isDenied(fromSystemId, p.id));
         if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
       }
     }
@@ -1277,7 +1471,7 @@ class MapStore {
         visited.add(nextId);
 
         const nextSys = this.data.systems[nextId];
-        const station = nextSys?.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(nextId, p.id));
+        const station = nextSys?.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(nextId, p.id) && !isDenied(nextId, p.id));
         if (station) {
           return { systemId: nextId, poiId: station.id, poiName: station.name, hops: current.hops + 1 };
         }
@@ -1745,22 +1939,25 @@ const locations = this.findOreLocations(oreId, blacklist);
   findRoute(fromSystemId: string, toSystemId: string, blacklist?: string[]): string[] | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const useNoPirate = blacklistArr.length > 0;
-    return this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate);
+    return perf.timeSync("mapStore.findRoute", () => this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate));
   }
 
-  /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes. */
-  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false): string[] | null {
-    if (fromSystemId === toSystemId) return [fromSystemId];
-
+  /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes.
+   *  `allowWormholes` is opt-in and defaults to false — see the note in the body. */
+  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false, allowWormholes: boolean = false): string[] | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
-    
-    const fromId = this.findSystemIdCaseInsensitive(fromSystemId);
-    const toId = this.findSystemIdCaseInsensitive(toSystemId);
-    
+
+    // Resolve BEFORE the identity check: callers routinely pass display names
+    // ("Tau Ceti") for one end and ids ("tau_ceti") for the other.
+    const fromId = this.resolveSystemId(fromSystemId);
+    const toId = this.resolveSystemId(toSystemId);
+
     if (!fromId || !toId) {
       return null;
     }
+
+    if (fromId === toId) return [fromId];
 
     const precalcRoutes = useNoPirate ? this.precalcNoPirateRoutes : this.precalcRoutes;
     if (precalcRoutes[fromId] && precalcRoutes[fromId][toId] !== undefined) {
@@ -1777,49 +1974,75 @@ const locations = this.findOreLocations(oreId, blacklist);
       return null;
     }
     
-    const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
-    if (wormholeRoute) {
-      return wormholeRoute;
-    }
-    
-    const visited = new Set<string>([fromId]);
-    const queue: Array<{ id: string; path: string[] }> = [
-      { id: fromId, path: [fromId] },
-    ];
+    // The plain (jumpable) shortest path through known connections.
+    const directRoute = this.findRegularBfsRoute(fromId, toId, blacklistArr);
 
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      const conns = this.data.systems[current.id]?.connections ?? [];
-
-      for (const conn of conns) {
-        const nextId = typeof conn === 'string' ? conn : (this.findSystemIdCaseInsensitive(conn.system_id) || conn.system_id);
-        if (!nextId || visited.has(nextId)) continue;
-        if (blacklistSet.has(nextId.toLowerCase())) continue;
-
-        const newPath = [...current.path, nextId];
-        if (nextId === toId) {
-          return newPath;
-        }
-
-        visited.add(nextId);
-        queue.push({ id: nextId, path: newPath });
+    // ── Wormhole shortcuts are OPT-IN ────────────────────────────────────────
+    // A wormhole "route" is two BFS paths glued together around a wormhole hop,
+    // so it can be dramatically LONGER than the direct route, and every caller
+    // walks the returned array with `jump { target_system }` — which cannot
+    // traverse a wormhole at all. Returning one unconditionally (the old
+    // behavior) sent bots on absurd detours the moment any explorer registered
+    // a wormhole: e.g. a low-fuel miner given a 49-jump path to a station that
+    // was 11 jumps away. Only use a wormhole route when the caller asked for it
+    // AND it is genuinely shorter.
+    if (allowWormholes) {
+      const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
+      if (wormholeRoute && (!directRoute || wormholeRoute.length < directRoute.length)) {
+        return wormholeRoute;
       }
     }
 
-    return null;
+    return directRoute;
   }
   
-  /** Find system ID with case-insensitive matching. Returns the actual stored ID or null if not found. */
-  private findSystemIdCaseInsensitive(systemId: string): string | null {
-    if (!systemId) return null;
-    const lower = systemId.toLowerCase();
-    // First try exact match (most common case)
-    if (this.data.systems[systemId]) return systemId;
-    // Then try case-insensitive match
-    for (const id of Object.keys(this.data.systems)) {
-      if (id.toLowerCase() === lower) return id;
+  /** Find a system ID from an id OR a display name.
+   *
+   *  System *ids* are snake_case ("tau_ceti", "cargo_lanes") but almost every
+   *  human-facing source — MAYDAY chat messages, rescue targets, the web UI —
+   *  carries the display *name* ("Tau Ceti", "Cargo Lanes"). Matching ids only
+   *  meant every multi-word system silently failed to resolve, so findRoute
+   *  returned null and callers fell back to the server route for journeys the
+   *  local map could answer perfectly. Resolution order: exact id, then
+   *  case-insensitive id, then display name, then a loose form that treats
+   *  spaces/hyphens and underscores as equivalent. Returns null if unknown. */
+  resolveSystemId(systemIdOrName: string): string | null {
+    if (!systemIdOrName) return null;
+    // Fast path: exact id hit (the overwhelmingly common case).
+    if (this.data.systems[systemIdOrName]) return systemIdOrName;
+
+    const index = this.getSystemLookupIndex();
+    const raw = systemIdOrName.trim().toLowerCase();
+    return index.get(raw) ?? index.get(looseSystemKey(systemIdOrName)) ?? null;
+  }
+
+  /** Lazily built lowercase id/name → id index, rebuilt when the map changes. */
+  private getSystemLookupIndex(): Map<string, string> {
+    if (this.systemLookupIndex && this.systemLookupIndexGeneration === this.mapGeneration) {
+      return this.systemLookupIndex;
     }
-    return null;
+    const index = new Map<string, string>();
+    for (const id of Object.keys(this.data.systems)) {
+      // Ids win over names so a name collision can never shadow a real system.
+      index.set(id.toLowerCase(), id);
+      index.set(looseSystemKey(id), id);
+    }
+    for (const [id, sys] of Object.entries(this.data.systems)) {
+      const name = sys?.name;
+      if (!name) continue;
+      const lower = name.trim().toLowerCase();
+      if (!index.has(lower)) index.set(lower, id);
+      const loose = looseSystemKey(name);
+      if (!index.has(loose)) index.set(loose, id);
+    }
+    this.systemLookupIndex = index;
+    this.systemLookupIndexGeneration = this.mapGeneration;
+    return index;
+  }
+
+  /** @deprecated Use resolveSystemId — kept as the old name for clarity at call sites. */
+  private findSystemIdCaseInsensitive(systemId: string): string | null {
+    return this.resolveSystemId(systemId);
   }
 
   /** Debug function: Get detailed explanation of why a route wasn't found. */
@@ -1932,21 +2155,24 @@ const locations = this.findOreLocations(oreId, blacklist);
       const exitSystem = wormhole.exit_system_id;
       
       // Check if entrance system is accessible
+      if (!entranceSystem || !exitSystem) continue;
       if (blacklistSet.has(entranceSystem.toLowerCase())) continue;
       if (blacklistSet.has(exitSystem.toLowerCase())) continue;
+      // Both ends must be real, known systems — registerWormhole creates empty
+      // stub records for unknown ends, and routing through a stub is nonsense.
+      if (!this.data.systems[entranceSystem] || !this.data.systems[exitSystem]) continue;
       
       // Calculate path segments
       const toEntrance = this.findRegularBfsRoute(fromId, entranceSystem, blacklist);
       const fromExitToDest = this.findRegularBfsRoute(exitSystem, toId, blacklist);
       
       if (toEntrance && fromExitToDest) {
-        // Valid wormhole route
-        // Full route: [...toEntrance (excluding last), exitSystem, ...fromExitToDest]
-        const fullRoute = [
-          ...toEntrance.slice(0, -1), // Exclude entrance system itself
-          exitSystem, // Jump through wormhole
-          ...fromExitToDest,
-        ];
+        // Valid wormhole route. `toEntrance` ends at the entrance system and
+        // `fromExitToDest` starts at the exit system, so simple concatenation
+        // gives ...entrance -> exit... with the wormhole hop in the middle.
+        // (The old version dropped the entrance system and duplicated the exit,
+        // producing a path whose "jump" from entrance-1 to exit was impossible.)
+        const fullRoute = [...toEntrance, ...fromExitToDest];
         
         if (fullRoute.length < bestRouteLength) {
           bestRoute = fullRoute;
@@ -1968,7 +2194,8 @@ const locations = this.findOreLocations(oreId, blacklist);
     return bestRoute;
   }
 
-  /** Regular BFS route finding (without wormholes) - used internally by tryFindWormholeRoute */
+  /** Plain BFS route finding over known connections (no wormholes, no precalc).
+   *  This is the only route every caller can actually fly, one `jump` per hop. */
   private findRegularBfsRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
     
@@ -2024,6 +2251,7 @@ const locations = this.findOreLocations(oreId, blacklist);
 
   /** Find the best buy price (highest buyer) for an item across all known markets (excluding pirate systems). */
   findBestBuyPrice(itemId: string): { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.findBestBuyPrice") : null;
     let best: { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null = null;
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2032,18 +2260,23 @@ const locations = this.findOreLocations(oreId, blacklist);
         for (const m of poi.market) {
           if (m.item_id === itemId && m.best_buy !== null && m.buy_quantity > 0) {
             if (!best || m.best_buy > best.price) {
-              best = { systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: m.buy_quantity };
+              // Size by the depth at the BEST price, not the sum of all buy
+              // orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+              const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
+              best = { systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: depthAtBest };
             }
           }
         }
       }
     }
 
+    stop?.end();
     return best;
   }
 
   /** Find all items with buy orders across all known stations (excluding pirate systems). */
   getAllBuyDemand(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.getAllBuyDemand") : null;
     const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2054,6 +2287,9 @@ const locations = this.findOreLocations(oreId, blacklist);
         if (!(poi.has_base || poi.base_id)) continue;
         for (const m of poi.market) {
           if (m.best_buy !== null && m.buy_quantity > 0) {
+            // Size by the depth at the BEST price, not the sum of all buy
+            // orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+            const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
             results.push({
               itemId: m.item_id,
               itemName: m.item_name,
@@ -2061,17 +2297,19 @@ const locations = this.findOreLocations(oreId, blacklist);
               poiId: poi.id,
               poiName: poi.name,
               price: m.best_buy,
-              quantity: m.buy_quantity,
+              quantity: depthAtBest,
             });
           }
         }
       }
     }
 
+    stop?.end();
     return results;
   }
 
   getAllSellSupply(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.getAllSellSupply") : null;
     const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -2096,6 +2334,7 @@ const locations = this.findOreLocations(oreId, blacklist);
       }
     }
 
+    stop?.end();
     return results;
   }
 
@@ -2107,6 +2346,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     destSystem: string; destPoi: string; destPoiName: string; sellAt: number; sellQty: number;
     spread: number;
   }> {
+    const stop = perf.isEnabled() ? perf.startSpan("mapStore.findPriceSpreads") : null;
     // Collect all sell listings (where we can buy from NPC market)
     const sellListings: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
     // Collect all buy listings (where we can sell to NPC market / fill buy orders)
@@ -2124,7 +2364,10 @@ const locations = this.findOreLocations(oreId, blacklist);
             sellListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_sell, quantity: m.sell_quantity });
           }
           if (m.best_buy !== null && m.best_buy > 0 && m.buy_quantity > 0) {
-            buyListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: m.buy_quantity });
+            // Size by quantity available at the BEST price, not the sum of all
+            // buy orders. A book of `1 @ 5583 + 120 @ 1` is NOT 121 units at 5583.
+            const depthAtBest = m.best_buy_quantity > 0 ? m.best_buy_quantity : m.buy_quantity;
+            buyListings.push({ itemId: m.item_id, itemName: m.item_name, systemId: sysId, poiId: poi.id, poiName: poi.name, price: m.best_buy, quantity: depthAtBest });
           }
         }
       }
@@ -2164,6 +2407,7 @@ const locations = this.findOreLocations(oreId, blacklist);
     }
 
     results.sort((a, b) => b.spread - a.spread);
+    stop?.end();
     return results;
   }
 
@@ -2251,6 +2495,129 @@ const locations = this.findOreLocations(oreId, blacklist);
   /** Return the full systems map for the web dashboard. */
   getAllSystems(): Record<string, StoredSystem> {
     return this.data.systems;
+  }
+
+  // ── Station identity cross-referencing ───────────────────
+
+  /**
+   * Resolve a station reference into a canonical identity carrying BOTH the POI
+   * hex id and the friendly POI name (when known). The reference may be:
+   *   - "system|poi"        (e.g. "crosshaven|d1c54e3a...")
+   *   - "system|name"       (e.g. "crosshaven|crosshaven_station")
+   *   - "poi" (hex or name) e.g. "d1c54e3a..." or "crosshaven_station"
+   *   - a bare system id     (no POI)
+   * If nothing in the map matches (e.g. an unresolved hex id the server hasn't
+   * fully described yet), the raw token is preserved in `poiId` so callers can
+   * still compare/travel. This is what lets a hex id and a friendly name for the
+   * same station be treated as equal.
+   */
+  resolveStationIdentity(stationRef: string): ResolvedStation {
+    if (!stationRef) return { systemId: null, poiId: null, poiName: null, matched: false };
+
+    let systemPart: string | null = null;
+    let token = stationRef;
+    if (stationRef.includes("|")) {
+      const parts = stationRef.split("|");
+      systemPart = (parts[0] || "").trim() || null;
+      token = (parts[1] || parts[0] || "").trim();
+    }
+    if (!token) return { systemId: systemPart, poiId: null, poiName: null, matched: false };
+
+    const tokenLower = token.toLowerCase();
+
+    const poiMatches = (poi: StoredPOI): boolean =>
+      poi.id.toLowerCase() === tokenLower ||
+      (poi.base_id !== null && poi.base_id.toLowerCase() === tokenLower) ||
+      (poi.name !== null && poi.name.toLowerCase() === tokenLower) ||
+      (poi.base_name !== null && poi.base_name.toLowerCase() === tokenLower);
+
+    // 1) Preferred: search within the named system first.
+    if (systemPart) {
+      const sys = this.getSystem(systemPart);
+      const poi = sys?.pois.find(poiMatches);
+      if (poi) {
+        return { systemId: sys!.id, poiId: poi.id, poiName: poi.name, matched: true };
+      }
+    }
+
+    // 2) Global search by poi id / base id / name (handles a stale or missing
+    //    system part, and resolves an unresolved hex id to its friendly name).
+    for (const sys of this.getSystems()) {
+      const poi = sys.pois.find(poiMatches);
+      if (poi) {
+        return { systemId: sys.id, poiId: poi.id, poiName: poi.name, matched: true };
+      }
+    }
+
+    // 3) A bare token that is itself a known system (no POI specified).
+    if (!systemPart) {
+      const asSystem = this.getSystem(token);
+      if (asSystem) {
+        return { systemId: asSystem.id, poiId: null, poiName: null, matched: true };
+      }
+    }
+
+    // 4) Unresolved — preserve the raw token so the caller can still travel to
+    //    / compare against it.
+    return { systemId: systemPart, poiId: token, poiName: null, matched: false };
+  }
+
+  /**
+   * Return the best POI token to hand to commands like `travel`/`dock` for the
+   * given station reference. Prefers the resolved POI hex id (what the server
+   * expects), falling back to the friendly name, then to the raw token.
+   */
+  resolveStationTarget(stationRef: string): string {
+    const resolved = this.resolveStationIdentity(stationRef);
+    if (resolved.matched && resolved.poiId) return resolved.poiId;
+    if (stationRef.includes("|")) {
+      const parts = stationRef.split("|");
+      return (parts[1] || parts[0] || "").trim();
+    }
+    return stationRef;
+  }
+
+  /**
+   * Compare two station references and return true if they point at the SAME
+   * station, matching on either the hex POI id OR the friendly POI name (and
+   * respecting system when both sides know their system). This is safe against
+   * the game intermittently reporting a station as an unresolved hex id while
+   * the config uses its friendly name.
+   */
+  sameStation(a: string, b: string): boolean {
+    if (!a || !b) return false;
+    if (a.toLowerCase() === b.toLowerCase()) return true;
+
+    const ra = this.resolveStationIdentity(a);
+    const rb = this.resolveStationIdentity(b);
+
+    // If neither resolved to the map, fall back to a raw token compare.
+    if (!ra.matched && !rb.matched) {
+      return a.toLowerCase() === b.toLowerCase();
+    }
+
+    // System compatibility: if both sides know their system and they differ,
+    // they are not the same station.
+    if (ra.systemId && rb.systemId &&
+        ra.systemId.toLowerCase() !== rb.systemId.toLowerCase()) {
+      return false;
+    }
+
+    const na = (ra.poiName || "").toLowerCase();
+    const nb = (rb.poiName || "").toLowerCase();
+
+    // Strongest signal: POI hex id match (works even when names are blank).
+    if (ra.poiId && rb.poiId &&
+        ra.poiId.toLowerCase() === rb.poiId.toLowerCase()) return true;
+
+    // Friendly name match.
+    if (na && nb && na === nb) return true;
+
+    // Cross check: one side resolved to an id, the other to a name that equals it.
+    if (ra.poiId && nb && ra.poiId.toLowerCase() === nb) return true;
+    if (rb.poiId && na && rb.poiId.toLowerCase() === na) return true;
+
+    return false;
   }
 
   // ── Mobile Capitol Tracking ───────────────────────────────

@@ -1,9 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
-import type { SpaceMoltAPI } from "./api.js";
+import { getSpacemoltClient } from "./libClient.js";
 import { debugLog } from "./debug.js";
-
-const OPENAPI_BASE_URL = "https://game.spacemolt.com/api/v2";
 
 export interface CatalogItem {
   id: string;
@@ -41,9 +39,24 @@ export interface CatalogFacility {
   [key: string]: unknown;
 }
 
+/**
+ * The catalog as exposed to consumers (REST / WS). It always carries the five
+ * known id-keyed collections plus `version` / `lastFetched`, and — crucially —
+ * forwards any other top-level section the server may add (e.g. `achievements`)
+ * so nothing is ever silently stripped.
+ */
 export interface CatalogData {
   version: string | null;
   lastFetched: string | null;
+  items: Record<string, CatalogItem>;
+  ships: Record<string, CatalogShip>;
+  skills: Record<string, CatalogSkill>;
+  recipes: Record<string, CatalogRecipe>;
+  facilities: Record<string, CatalogFacility>;
+  [key: string]: unknown;
+}
+
+interface IndexedCatalog {
   items: Record<string, CatalogItem>;
   ships: Record<string, CatalogShip>;
   skills: Record<string, CatalogSkill>;
@@ -56,93 +69,171 @@ export interface CatalogData {
 const DATA_DIR = join(process.cwd(), "data");
 const CATALOG_FILE = join(DATA_DIR, "catalog.json");
 const SAVE_DEBOUNCE_MS = 5000;
-const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
+/** Floor between version-driven reconcile attempts, so a fleet of bots all
+ *  reporting the same not-yet-republished gameserver version can't storm the
+ *  gameserver with catalog requests during a patch window. */
+const RECONCILE_COOLDOWN_MS = 30_000;
+
+/** Top-level keys the store normalizes into id-keyed indexes. */
+const KNOWN_COLLECTION_KEYS = new Set(["items", "ships", "skills", "recipes", "facilities"]);
+
+/**
+ * Fetch the raw `catalog.json` exactly as the server publishes it — arrays and
+ * every top-level section included. We deliberately do NOT go through
+ * `@spacemolt/lib`'s `client.catalog()`: its `fetchCatalog` rebuilds the object
+ * with only `version/ships/items/recipes/skills/facilities`, which would drop
+ * any new top-level key (e.g. `achievements`) before we ever see it.
+ */
+/**
+ * Result of a raw `catalog.json` fetch. The endpoint is served with HTTP
+ * caching headers (`ETag` / `Last-Modified`) — the server's intended
+ * "has this changed?" signal. We surface those headers so callers can issue a
+ * conditional request and cheaply detect a new release via a `304`, instead of
+ * re-downloading the full payload or (worse) trusting a cached version string.
+ */
+interface RawCatalogResponse {
+  /** HTTP status. `304` means "unchanged since your last request". */
+  status: number;
+  /** Server `ETag` header (quotes/weak `W/` prefix preserved verbatim). */
+  etag: string | null;
+  /** Server `Last-Modified` header, if no `ETag` was provided. */
+  lastModified: string | null;
+  /** Parsed payload — `null` on a `304` (body is intentionally empty). */
+  data: Record<string, unknown> | null;
+}
+
+/**
+ * Fetch the raw `catalog.json` exactly as the server publishes it — arrays and
+ * every top-level section included. We deliberately do NOT go through
+ * `@spacemolt/lib`'s `client.catalog()`: its `fetchCatalog` rebuilds the object
+ * with only `version/ships/items/recipes/skills/facilities`, which would drop
+ * any new top-level key (e.g. `achievements`) before we ever see it, AND the
+ * client caches the catalog for the process lifetime so its `version` never
+ * updates — which is why a new game release was never detected.
+ *
+ * When `ifNoneMatch` / `ifModifiedSince` are supplied we send a conditional
+ * request; the server answers `304 Not Modified` (no body) when the catalog is
+ * unchanged, letting us skip the download entirely.
+ */
+async function fetchRawCatalog(
+  httpBaseUrl: string,
+  opts: { ifNoneMatch?: string | null; ifModifiedSince?: string | null } = {},
+): Promise<RawCatalogResponse> {
+  const base = httpBaseUrl.replace(/\/$/, "");
+  const url = `${base}/api/catalog.json`;
+  const headers: Record<string, string> = { accept: "application/json" };
+  if (opts.ifNoneMatch) headers["If-None-Match"] = opts.ifNoneMatch;
+  else if (opts.ifModifiedSince) headers["If-Modified-Since"] = opts.ifModifiedSince;
+  const res = await fetch(url, { headers });
+  const etag = res.headers.get("etag");
+  const lastModified = res.headers.get("last-modified");
+  if (res.status === 304) {
+    return { status: 304, etag, lastModified, data: null };
+  }
+  if (!res.ok) {
+    throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+  }
+  const data = await res.json();
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(`catalog.json returned a non-object payload`);
+  }
+  return { status: 200, etag, lastModified, data: data as Record<string, unknown> };
+}
+
+/** Build an id-keyed record from either an array of entries or an id-keyed object. */
+function indexCollection<T extends { id?: string }>(data: unknown): Record<string, T> {
+  const out: Record<string, T> = {};
+  if (data == null) return out;
+  const entries = Array.isArray(data) ? data : Object.values(data as Record<string, T>);
+  for (const e of entries) {
+    const id = (e as { id?: unknown })?.id;
+    if (typeof id === "string") out[id] = e as T;
+  }
+  return out;
+}
+
+function emptyIndexed(): IndexedCatalog {
+  return { items: {}, ships: {}, skills: {}, recipes: {}, facilities: {} };
+}
 
 class CatalogStore {
-  private data: CatalogData;
+  /** Id-keyed indexes derived from the server payload for O(1) lookups. */
+  private indexed: IndexedCatalog = emptyIndexed();
+  /** Any top-level section other than the known collections + version. */
+  private extra: Record<string, unknown> = {};
+  private version: string | null = null;
+  private lastFetched: string | null = null;
+  /** Server `ETag` from the last fetch — our conditional-request token. */
+  private etag: string | null = null;
+  /** Server `Last-Modified` — fallback validation token when no `ETag`. */
+  private lastModified: string | null = null;
+  /** The gameserver version we last reconciled the catalog against. */
+  private lastGameServerVersion: string | null = null;
+  /** Timestamp of the last version-driven reconcile attempt (cooldown gate). */
+  private lastReconcileAt = 0;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
-  private _fetchPromise: Promise<void> | null = null;
+  private _fetchPromise: Promise<boolean> | null = null;
 
   constructor() {
-    this.data = this.load();
+    this.load();
   }
 
   // ── Persistence ─────────────────────────────────────────
 
-  private load(): CatalogData {
+  private load(): void {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     if (existsSync(CATALOG_FILE)) {
       try {
-        const raw = readFileSync(CATALOG_FILE, "utf-8");
-        const parsed = JSON.parse(raw) as Partial<CatalogData> & { 
-          items?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
-          ships?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
-          skills?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
-          recipes?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
-          facilities?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
-        };
-        
-        const itemsData = parsed.items as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
-        const shipsData = parsed.ships as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
-        const skillsData = parsed.skills as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
-        const recipesData = parsed.recipes as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
-        const facilitiesData = parsed.facilities as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
-        
-        const items: Record<string, CatalogItem> = {};
-        const facilities: Record<string, CatalogFacility> = {};
-        
-        const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
-        for (const item of itemsEntries) {
-          const id = (item as { id?: unknown; category?: string })?.id;
-          const category = (item as { category?: string })?.category;
-          if (typeof id === "string") {
-            items[id] = item as CatalogItem;
-            if (category === "personal" || category === "production") {
-              facilities[id] = item as unknown as CatalogFacility;
-            }
-          }
-        }
-        const ships: Record<string, CatalogShip> = {};
-        const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
-        for (const ship of shipsEntries) {
-          const id = (ship as { id?: unknown })?.id;
-          if (typeof id === "string") ships[id] = ship as CatalogShip;
-        }
-        const skills: Record<string, CatalogSkill> = {};
-        const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
-        for (const skill of skillsEntries) {
-          const id = (skill as { id?: unknown })?.id;
-          if (typeof id === "string") skills[id] = skill as CatalogSkill;
-        }
-        const recipes: Record<string, CatalogRecipe> = {};
-        const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
-        for (const recipe of recipesEntries) {
-          const id = (recipe as { id?: unknown })?.id;
-          if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
-        }
-        const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
-        for (const facility of facilitiesEntries) {
-          const id = (facility as { id?: unknown })?.id;
-          if (typeof id === "string") facilities[id] = facility as CatalogFacility;
-        }
-        
-        return {
-          version: parsed.version ?? null,
-          lastFetched: parsed.lastFetched ?? null,
-          items,
-          ships,
-          skills,
-          recipes,
-          facilities,
-        };
+        const parsed = JSON.parse(readFileSync(CATALOG_FILE, "utf-8")) as Record<string, unknown>;
+        // `lastFetched`/`etag`/`lastModified` are metadata we add on write —
+        // strip them so `raw` stays server-faithful and never re-persists a
+        // stale copy of itself, and so the validation tokens survive reload.
+        const { lastFetched, etag, lastModified, ...serverRaw } = parsed;
+        this.lastFetched = typeof lastFetched === "string" ? lastFetched : null;
+        this.etag = typeof etag === "string" ? etag : null;
+        this.lastModified = typeof lastModified === "string" ? lastModified : null;
+        this.applyRaw(serverRaw);
+        return;
       } catch {
         // Corrupt file — start fresh
       }
     }
-    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {}, facilities: {} };
+    this.indexed = emptyIndexed();
+    this.extra = {};
+    this.version = null;
+    this.lastFetched = null;
+    this.etag = null;
+    this.lastModified = null;
+  }
+
+  /** Fold a verbatim server payload into our indexed + extra views. */
+  private applyRaw(raw: Record<string, unknown>): void {
+    const items = indexCollection<CatalogItem>(raw.items);
+    const facilitiesFromItems: Record<string, CatalogFacility> = {};
+    for (const [id, it] of Object.entries(items)) {
+      if (it.category === "personal" || it.category === "production") {
+        facilitiesFromItems[id] = it as unknown as CatalogFacility;
+      }
+    }
+    this.indexed = {
+      items,
+      ships: indexCollection<CatalogShip>(raw.ships),
+      skills: indexCollection<CatalogSkill>(raw.skills),
+      recipes: indexCollection<CatalogRecipe>(raw.recipes),
+      facilities: { ...indexCollection<CatalogFacility>(raw.facilities), ...facilitiesFromItems },
+    };
+
+    this.version = typeof raw.version === "string" ? raw.version : null;
+
+    const extra: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (KNOWN_COLLECTION_KEYS.has(k) || k === "version" || k === "lastFetched") continue;
+      extra[k] = v;
+    }
+    this.extra = extra;
   }
 
   private scheduleSave(): void {
@@ -160,7 +251,23 @@ class CatalogStore {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     try {
-      const json = JSON.stringify(this.data, null, 2) + "\n";
+      // Write every section the server sent. The five known collections are
+      // persisted as id-keyed records (what the web UI expects) — a lossless
+      // transform — while any other top-level key (e.g. `achievements`) is
+      // forwarded verbatim so nothing is ever stripped.
+      const out = {
+        version: this.version,
+        lastFetched: this.lastFetched,
+        etag: this.etag,
+        lastModified: this.lastModified,
+        items: this.indexed.items,
+        ships: this.indexed.ships,
+        skills: this.indexed.skills,
+        recipes: this.indexed.recipes,
+        facilities: this.indexed.facilities,
+        ...this.extra,
+      };
+      const json = JSON.stringify(out, null, 2) + "\n";
       writeFileSync(CATALOG_FILE, json, "utf-8");
       debugLog("catalog", `Catalog written to ${CATALOG_FILE} (${json.length} bytes)`);
     } catch (err) {
@@ -169,6 +276,26 @@ class CatalogStore {
       debugLog("catalog", `Error writing catalog: ${err}`);
     }
     this.dirty = false;
+  }
+
+  /**
+   * Replace the in-memory catalog (and on-disk file) with a verbatim payload
+   * received from a peer (the client-sync master relays a single
+   * fleet-converged `catalog.json` so only one node ever downloads it from the
+   * gameserver). The payload is treated exactly like a server payload — every
+   * top-level section is preserved and `lastFetched` is refreshed.
+   */
+  replaceWith(raw: Record<string, unknown>): void {
+    this.applyRaw(raw);
+    this.lastFetched = typeof raw.lastFetched === "string" ? raw.lastFetched : new Date().toISOString();
+    // Data came from a peer, not the gameserver — our HTTP validation tokens
+    // are no longer meaningful for this payload. Clear them so the next
+    // gameserver fetch revalidates unconditionally.
+    this.etag = null;
+    this.lastModified = null;
+    this.dirty = true;
+    this.writeToDisk();
+    debugLog("catalog", `Replaced catalog from remote sync: ${this.getSummary()}`);
   }
 
   /** Flush pending writes to disk immediately. Call on shutdown. */
@@ -180,287 +307,119 @@ class CatalogStore {
     this.writeToDisk();
   }
 
-  // ── Staleness check ───────────────────────────────────────
+  // ── Version-driven refresh ───────────────────────────────
 
-  /** True if catalog data is missing or older than 24 hours. */
-  isStale(): boolean {
-    if (!this.data.lastFetched) return true;
-    const age = Date.now() - new Date(this.data.lastFetched).getTime();
-    return age > STALE_MS;
+  /** The catalog's `version` field (the gameserver version it matches), or null. */
+  getVersion(): string | null {
+    return this.version;
   }
-
-  /** Check if the server version has changed since last fetch. */
-  async checkVersionChanged(api: SpaceMoltAPI): Promise<boolean> {
-    if (this.data.version === null) return true;
-    try {
-      const versionResp = await api.execute("get_version");
-      if (!versionResp.error && versionResp.result) {
-        const v = versionResp.result as Record<string, unknown>;
-        const currentVersion = (v.version as string) || String(versionResp.result);
-        return currentVersion !== this.data.version;
-      }
-    } catch {
-      // If we can't check, assume no change to avoid unnecessary fetch
-    }
-    return false;
-  }
-
-  // ── Fetch from API ────────────────────────────────────────
 
   /**
-   * Fetch catalog from the API. Returns a promise that resolves when complete.
-   * Also fetches the OpenAPI spec if this was a version change.
+   * True if we have never loaded a catalog (first run / corrupt file). Used only
+   * for bootstrap — there is deliberately NO time-based staleness check anymore:
+   * the gameserver can ship multiple patches a day, so the catalog is kept fresh
+   * purely by reacting to gameserver-version changes (see `noteGameServerVersion`).
    */
-  async fetchAll(api: SpaceMoltAPI): Promise<void> {
+  isStale(): boolean {
+    return this.version === null;
+  }
+
+  /**
+   * React to learning the current gameserver version. If it differs from the
+   * catalog we already hold, reconcile: a *conditional* GET fetches the fresh
+   * `catalog.json` only once the file has actually been republished (a `304`
+   * keeps us cheap until then), so a new patch lands within moments of the
+   * first version report — no 24h wait, no download storm.
+   *
+   * @returns `true` if a fresh catalog was downloaded.
+   */
+  async noteGameServerVersion(gsVersion: string | null): Promise<boolean> {
+    if (!gsVersion) return false;
+    // Already holding a catalog that matches the live gameserver version.
+    if (this.version === gsVersion) {
+      this.lastGameServerVersion = gsVersion;
+      return false;
+    }
+    const now = Date.now();
+    // A different version is in play but we already reconciled for THIS exact
+    // version recently (server may not have republished the catalog file yet) —
+    // back off until the cooldown elapses so the fleet doesn't hammer it.
+    if (gsVersion === this.lastGameServerVersion && now - this.lastReconcileAt < RECONCILE_COOLDOWN_MS) {
+      return false;
+    }
+    this.lastGameServerVersion = gsVersion;
+    this.lastReconcileAt = now;
+    try {
+      return await this.fetchFromLib(false);
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Fetch the raw catalog.json (preserves all sections) ───
+
+  /**
+   * Fetch the catalog directly from the server's `catalog.json` endpoint and
+   * store it verbatim. Replaces the previous `client.catalog()` path, which
+   * silently dropped any top-level key it didn't explicitly model AND cached
+   * the catalog for the process lifetime — so the version never updated and a
+   * new game release went unnoticed.
+   *
+   * Uses the server's `ETag`/`Last-Modified` headers to issue a *conditional*
+   * request: if the catalog hasn't changed since our last fetch the server
+   * answers `304` with no body and we keep the cached copy (just bumping
+   * `lastFetched`). This is what reliably detects a new game version — both on
+   * a scheduled refresh and on every client restart — without re-downloading.
+   *
+   * @param force When true, ignore any cached validation token and always
+   *   re-download (used by master/slave sync that must publish a fresh copy).
+   * @returns `true` if the catalog was actually updated, `false` on a `304`.
+   */
+  async fetchFromLib(force = false): Promise<boolean> {
     if (this._fetchPromise) return this._fetchPromise;
-    this._fetchPromise = this._doFetchAll(api).then(async () => {
-      if (this.data.version) {
-        await this.fetchOpenApi();
-      }
-    }).finally(() => {
+    this._fetchPromise = this._doFetchFromLib(force).finally(() => {
       this._fetchPromise = null;
     });
     return this._fetchPromise;
   }
-  private async _doFetchAll(api: SpaceMoltAPI): Promise<void> {
-    let serverVersion: string | null = null;
-    try {
-      const versionResp = await api.execute("get_version");
-      if (!versionResp.error && versionResp.result) {
-        const v = versionResp.result as Record<string, unknown>;
-        serverVersion = (v.version as string) || null;
-        debugLog("catalog", `Server version: ${serverVersion}`);
-      }
-    } catch (err) {
-      debugLog("catalog", `Failed to fetch server version: ${err}`);
-    }
 
-    debugLog("catalog", `Fetching catalog from /api/catalog.json`);
-    try {
-      const baseUrl = api.baseUrl.replace(/\/api\/v2$/, "/api");
-      const resp = await fetch(`${baseUrl}/catalog.json`, {
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const catalogData = await resp.json() as Record<string, unknown>;
-      const versionFromCatalog = catalogData.version as string | null;
-      
-      // Handle both array format (from catalog.json file) and keyed format (from API)
-      const itemsData = catalogData.items as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
-      const shipsData = catalogData.ships as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
-      const skillsData = catalogData.skills as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
-      const recipesData = catalogData.recipes as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
-      const facilitiesData = catalogData.facilities as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
-      
-      const items: Record<string, CatalogItem> = {};
-      const facilities: Record<string, CatalogFacility> = {};
-      
-      // Extract items from either array or keyed format
-      const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
-      for (const item of itemsEntries) {
-        const id = (item as { id?: unknown; category?: string })?.id;
-        const category = (item as { category?: string })?.category;
-        if (typeof id === "string") {
-          items[id] = item as CatalogItem;
-          if (category === "personal" || category === "production") {
-            facilities[id] = item as unknown as CatalogFacility;
-          }
-        }
-      }
-      
-      const ships: Record<string, CatalogShip> = {};
-      const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
-      for (const ship of shipsEntries) {
-        const id = (ship as { id?: unknown })?.id;
-        if (typeof id === "string") ships[id] = ship as CatalogShip;
-      }
-      const skills: Record<string, CatalogSkill> = {};
-      const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
-      for (const skill of skillsEntries) {
-        const id = (skill as { id?: unknown })?.id;
-        if (typeof id === "string") skills[id] = skill as CatalogSkill;
-      }
-      const recipes: Record<string, CatalogRecipe> = {};
-      const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
-      for (const recipe of recipesEntries) {
-        const id = (recipe as { id?: unknown })?.id;
-        if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
-      }
-      
-      const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
-      for (const facility of facilitiesEntries) {
-        const id = (facility as { id?: unknown })?.id;
-        if (typeof id === "string") facilities[id] = facility as CatalogFacility;
-      }
+  private async _doFetchFromLib(force: boolean): Promise<boolean> {
+    const ifNoneMatch = force ? null : this.etag;
+    const ifModifiedSince = force ? null : this.lastModified;
+    const res = await fetchRawCatalog(getSpacemoltClient().httpBaseUrl, { ifNoneMatch, ifModifiedSince });
 
-      this.data.version = serverVersion;
-      this.data.lastFetched = new Date().toISOString();
-      this.data.items = items;
-      this.data.ships = ships;
-      this.data.skills = skills;
-      this.data.recipes = recipes;
-      this.data.facilities = facilities;
-
+    // `304 Not Modified` — server's "it hasn't changed" signal. Keep the
+    // cached payload; only refresh the staleness timestamp (and re-persist the
+    // surviving validation tokens). No body was returned to apply.
+    if (res.status === 304) {
+      this.lastFetched = new Date().toISOString();
       this.dirty = true;
       this.writeToDisk();
-
-      const counts = [
-        `${Object.keys(this.data.items).length} items`,
-        `${Object.keys(this.data.ships).length} ships`,
-        `${Object.keys(this.data.skills).length} skills`,
-        `${Object.keys(this.data.recipes).length} recipes`,
-        `${Object.keys(this.data.facilities).length} facilities`,
-      ];
-      debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
-
-      if (versionFromCatalog && versionFromCatalog !== serverVersion) {
-        debugLog("catalog", `Catalog version ${versionFromCatalog} differs from server version ${serverVersion}`);
-      }
-
-      return void counts;
-    } catch (err) {
-      debugLog("catalog", `Catalog fetch failed, falling back to paginated approach: ${err}`);
-      await this._doFetchAllPaginated(api);
-    }
-  }
-
-  /**
-   * Fallback: Paginate all 5 catalog types and store results.
-   * Used when the new /api/catalog.json endpoint is unavailable.
-   */
-  private async _doFetchAllPaginated(api: SpaceMoltAPI): Promise<void> {
-    let serverVersion: string | null = null;
-    try {
-      const versionResp = await api.execute("get_version");
-      if (!versionResp.error && versionResp.result) {
-        const v = versionResp.result as Record<string, unknown>;
-        serverVersion = (v.version as string) || null;
-        debugLog("catalog", `Server version: ${serverVersion}`);
-      }
-    } catch (err) {
-      debugLog("catalog", `Failed to fetch server version: ${err}`);
+      debugLog("catalog", "Catalog unchanged (HTTP 304) — kept cached copy");
+      return false;
     }
 
-    const types = ["items", "ships", "skills", "recipes", "facilities"] as const;
-    const results: Record<string, Record<string, unknown>> = {
-      items: {},
-      ships: {},
-      skills: {},
-      recipes: {},
-      facilities: {},
-    };
-
-    for (const type of types) {
-      let page = 1;
-      let totalPages = 1;
-
-      while (page <= totalPages) {
-        debugLog("catalog", `Fetching ${type} page ${page}/${totalPages}`);
-        const resp = await api.execute("catalog", { type, page, page_size: 50 });
-        if (resp.error) {
-          debugLog("catalog", `Fetch error for ${type} page ${page}: ${resp.error.message}`);
-          break;
-        }
-
-        const data = resp.result as Record<string, unknown> | undefined;
-        if (!data) {
-          debugLog("catalog", `No result data for ${type} page ${page}`);
-          break;
-        }
-
-        const dataKeys = Object.keys(data);
-        debugLog("catalog", `Response keys for ${type} page ${page}: ${dataKeys.join(", ")}`);
-
-        const entries = extractArray(data, type);
-        debugLog("catalog", `Extracted ${entries.length} entries for ${type} page ${page}`);
-
-        for (const entry of entries) {
-          const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || (entry.facility_id as string) || "";
-          if (id) {
-            entry.id = id;
-            results[type][id] = entry;
-          }
-        }
-
-        totalPages = (data.total_pages as number) || (data.totalPages as number) || 1;
-        page++;
-
-        if (page <= totalPages) {
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-      }
-      debugLog("catalog", `Finished ${type}: ${Object.keys(results[type]).length} total entries`);
-    }
-
-    this.data.items = results.items as Record<string, CatalogItem>;
-    this.data.ships = results.ships as Record<string, CatalogShip>;
-    this.data.skills = results.skills as Record<string, CatalogSkill>;
-    this.data.recipes = results.recipes as Record<string, CatalogRecipe>;
-    this.data.facilities = results.facilities as Record<string, CatalogFacility>;
-    this.data.version = serverVersion;
-    this.data.lastFetched = new Date().toISOString();
-
+    this.applyRaw(res.data!);
+    this.etag = res.etag;
+    this.lastModified = res.lastModified;
+    this.lastFetched = new Date().toISOString();
     this.dirty = true;
     this.writeToDisk();
-
-    const counts = [
-      `${Object.keys(this.data.items).length} items`,
-      `${Object.keys(this.data.ships).length} ships`,
-      `${Object.keys(this.data.skills).length} skills`,
-      `${Object.keys(this.data.recipes).length} recipes`,
-      `${Object.keys(this.data.facilities).length} facilities`,
-    ];
-    debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
-    return void counts;
+    debugLog("catalog", `Fetched raw catalog.json: ${this.getSummary()}`);
+    return true;
   }
 
-  // ── OpenAPI fetch ──────────────────────────────────────────
 
-  /**
-   * Download openapi.json from the server and save as openapi-V2-{version}.json in the root.
-   * Only downloads if the version has changed since last save.
-   */
-  async fetchOpenApi(): Promise<void> {
-    const version = this.data.version;
-    if (!version) {
-      debugLog("catalog", "Cannot fetch OpenAPI: no version available");
-      return;
-    }
-
-    const openapiPath = join(process.cwd(), `openapi-V2-${version}.json`);
-
-    if (existsSync(openapiPath)) {
-      debugLog("catalog", `OpenAPI already exists at ${openapiPath}`);
-      return;
-    }
-
-    debugLog("catalog", `Fetching OpenAPI spec for version ${version}`);
-    try {
-      const resp = await fetch(`${OPENAPI_BASE_URL}/openapi.json`, {
-        signal: AbortSignal.timeout(30_000),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const spec = await resp.text();
-      writeFileSync(openapiPath, spec, "utf-8");
-      debugLog("catalog", `OpenAPI spec saved to ${openapiPath} (${spec.length} bytes)`);
-    } catch (err) {
-      debugLog("catalog", `Failed to fetch OpenAPI: ${err}`);
-    }
-  }
 
   // ── Lookup methods ────────────────────────────────────────
 
   getItem(id: string): CatalogItem | undefined {
-    return this.data.items[id];
+    return this.indexed.items[id];
   }
 
   getItemByName(name: string): CatalogItem | undefined {
     const lower = name.toLowerCase();
-    for (const item of Object.values(this.data.items)) {
+    for (const item of Object.values(this.indexed.items)) {
       if ((item.name || "").toLowerCase() === lower) {
         return item;
       }
@@ -469,53 +428,54 @@ class CatalogStore {
   }
 
   getShip(id: string): CatalogShip | undefined {
-    return this.data.ships[id];
+    return this.indexed.ships[id];
   }
 
   getSkill(id: string): CatalogSkill | undefined {
-    return this.data.skills[id];
+    return this.indexed.skills[id];
   }
 
   getRecipe(id: string): CatalogRecipe | undefined {
-    return this.data.recipes[id];
+    return this.indexed.recipes[id];
   }
 
   getFacility(id: string): CatalogFacility | undefined {
-    return this.data.facilities[id];
+    return this.indexed.facilities[id];
   }
 
   /** Resolve a human-readable name for any catalog ID. Falls back to formatted ID. */
   resolveItemName(id: string): string {
-    const entry = this.data.items[id] || this.data.ships[id] || this.data.skills[id] || this.data.recipes[id] || this.data.facilities[id];
+    const entry = this.indexed.items[id] || this.indexed.ships[id] || this.indexed.skills[id] || this.indexed.recipes[id] || this.indexed.facilities[id];
     if (entry?.name) return entry.name as string;
     return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
   /** Return full catalog data for WS broadcast / REST endpoint. */
-  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; facilities: Record<string, CatalogFacility>; lastFetched: string | null } {
+  getAll(): CatalogData {
     return {
-      version: this.data.version,
-      items: this.data.items,
-      ships: this.data.ships,
-      skills: this.data.skills,
-      recipes: this.data.recipes,
-      facilities: this.data.facilities,
-      lastFetched: this.data.lastFetched,
+      version: this.version,
+      lastFetched: this.lastFetched,
+      items: this.indexed.items,
+      ships: this.indexed.ships,
+      skills: this.indexed.skills,
+      recipes: this.indexed.recipes,
+      facilities: this.indexed.facilities,
+      ...this.extra,
     };
   }
 
   /** Check if catalog is empty (no data loaded at all). */
   isEmpty(): boolean {
-    return Object.keys(this.data.items).length === 0
-      && Object.keys(this.data.ships).length === 0
-      && Object.keys(this.data.skills).length === 0
-      && Object.keys(this.data.recipes).length === 0
-      && Object.keys(this.data.facilities).length === 0;
+    return Object.keys(this.indexed.items).length === 0
+      && Object.keys(this.indexed.ships).length === 0
+      && Object.keys(this.indexed.skills).length === 0
+      && Object.keys(this.indexed.recipes).length === 0
+      && Object.keys(this.indexed.facilities).length === 0;
   }
 
   /** Check if an item appears as a component in any crafting recipe. */
   isCraftingComponent(itemId: string): boolean {
-    for (const recipe of Object.values(this.data.recipes)) {
+    for (const recipe of Object.values(this.indexed.recipes)) {
       if (!recipe.components) continue;
       if (recipe.components.some(c => c.item_id === itemId)) return true;
     }
@@ -524,7 +484,7 @@ class CatalogStore {
 
   /** Check if an item is the output of any crafting recipe. */
   isCraftedItem(itemId: string): boolean {
-    for (const recipe of Object.values(this.data.recipes)) {
+    for (const recipe of Object.values(this.indexed.recipes)) {
       const outputId = (recipe as Record<string, unknown>).output_item_id as string | undefined;
       if (outputId === itemId) return true;
     }
@@ -543,7 +503,7 @@ class CatalogStore {
 
     const index: Record<string, string[]> = {};
 
-    for (const [itemId, item] of Object.entries(this.data.items)) {
+    for (const [itemId, item] of Object.entries(this.indexed.items)) {
       const effect = item.effect as Record<string, unknown> | undefined;
       if (effect?.type === "ammo" && typeof effect.subtype === "string") {
         const ammoType = effect.subtype;
@@ -571,26 +531,10 @@ class CatalogStore {
 
   /** Summary string for logging. */
   getSummary(): string {
-    return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes, ${Object.keys(this.data.facilities).length} facilities`;
+    const base = `${Object.keys(this.indexed.items).length} items, ${Object.keys(this.indexed.ships).length} ships, ${Object.keys(this.indexed.skills).length} skills, ${Object.keys(this.indexed.recipes).length} recipes, ${Object.keys(this.indexed.facilities).length} facilities`;
+    const extraCount = Object.keys(this.extra).length;
+    return extraCount > 0 ? `${base}, +${extraCount} other section(s)` : base;
   }
-}
-
-/** Extract an array of entries from a catalog API response. */
-function extractArray(data: Record<string, unknown>, type: string): Array<Record<string, unknown>> {
-  if (!data) return [];
-  // V2 format: { type: "ships", items: [...] }
-  if (typeof data.type === 'string' && Array.isArray(data.items)) {
-    return data.items as Array<Record<string, unknown>>;
-  }
-  // Direct array response
-  if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
-  // Keyed by type name
-  if (Array.isArray(data[type])) return data[type] as Array<Record<string, unknown>>;
-  // Common alternate keys
-  for (const key of ["items", "catalog", "results", "data", "entries", "list"]) {
-    if (Array.isArray(data[key])) return data[key] as Array<Record<string, unknown>>;
-  }
-  return [];
 }
 
 /** Singleton instance shared across the application. */

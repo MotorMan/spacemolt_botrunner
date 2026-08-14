@@ -10,6 +10,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { loadInTransitData } from "./cargoMoverInTransit.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "cargoMoverActivity.json");
@@ -122,12 +123,17 @@ export type CargoActivityType =
   | "withdraw_start"
   | "withdraw_success"
   | "withdraw_failed"
+  | "cargo_loaded"
+  | "in_transit"
+  | "arrived_destination"
   | "deposit_start"
   | "deposit_success"
   | "deposit_failed"
   | "trip_complete"
   | "refuel"
   | "repair"
+  | "fuel_cells"
+  | "cloak"
   | "battle_encounter"
   | "battle_escaped"
   | "death_recovery"
@@ -136,7 +142,10 @@ export type CargoActivityType =
   | "lock_released"
   | "lock_conflict"
   | "interruption"
-  | "resume";
+  | "resume"
+  | "graceful_stop"
+  | "load_verify"
+  | "load_verify_failed";
 
 export interface CargoMoverActivityData {
   /** Active movements keyed by movementId. */
@@ -554,4 +563,65 @@ export function getCargoMoverSummary(botUsername?: string): {
     totalItemsLost,
     itemProgress,
   };
+}
+
+/**
+ * Live per-item delivery status aggregated from the authoritative data sources
+ * (activity progress + in-transit tracking). Unlike the `totalDelivered` mirror
+ * kept on the settings object, this always reflects the real current counts.
+ */
+export function getCargoMoverItemStatuses(): Record<
+  string,
+  { itemName: string; delivered: number; inTransit: number }
+> {
+  const activity = loadCargoMoverActivity();
+  const inTransit = loadInTransitData();
+  const result: Record<string, { itemName: string; delivered: number; inTransit: number }> = {};
+
+  for (const p of Object.values(activity.itemProgress)) {
+    const entry = result[p.itemId] || (result[p.itemId] = { itemName: p.itemName, delivered: 0, inTransit: 0 });
+    entry.delivered += p.totalDelivered || 0;
+    entry.itemName = p.itemName || entry.itemName;
+  }
+
+  // The activity-progress `totalDelivered` above is a *fleet-wide cumulative*
+  // that never resets when the destination changes and is spread across every
+  // bot, so it does NOT reflect what is actually at the current destination.
+  // The authoritative, reconcilable delivered count lives in the cargo_mover
+  // settings (`totalDelivered` per configured item) — that is exactly what the
+  // "Reconcile" button writes. Prefer it so the dashboard shows the real
+  // per-destination delivered amount instead of an inflated lifetime sum.
+  const settings = loadCargoMoverSettings();
+  const configuredItems = (settings.items as Array<Record<string, unknown>>) || [];
+  for (const it of configuredItems) {
+    const itemId = it.itemId as string;
+    if (!itemId) continue;
+    const entry = result[itemId] || (result[itemId] = { itemName: (it.itemName as string) || itemId, delivered: 0, inTransit: 0 });
+    entry.delivered = (it.totalDelivered as number) || 0;
+    entry.itemName = (it.itemName as string) || entry.itemName;
+  }
+
+  for (const entries of Object.values(inTransit.inTransitItems)) {
+    for (const e of entries) {
+      if (e.quantity <= 0) continue;
+      const entry = result[e.itemId] || (result[e.itemId] = { itemName: e.itemName, delivered: 0, inTransit: 0 });
+      entry.inTransit += e.quantity;
+      entry.itemName = e.itemName || entry.itemName;
+    }
+  }
+
+  return result;
+}
+
+/** Lightweight read of just the cargo_mover settings block (no circular deps). */
+function loadCargoMoverSettings(): Record<string, unknown> {
+  try {
+    const settingsPath = join(DATA_DIR, "settings.json");
+    if (!existsSync(settingsPath)) return {};
+    const raw = readFileSync(settingsPath, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return (parsed.cargo_mover as Record<string, unknown>) || {};
+  } catch {
+    return {};
+  }
 }

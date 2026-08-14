@@ -166,7 +166,16 @@ function getBotPersonality(botName: string): string {
     }
   }
   
-  // Fall back to default
+  // Fall back to the configured "Bot Personality" from AI Chat settings,
+  // then the hardcoded default if that is somehow empty.
+  try {
+    const settings = getAiChatSettings();
+    if (settings.personality && settings.personality.trim()) {
+      return settings.personality;
+    }
+  } catch {
+    /* fall through to hardcoded default */
+  }
   return DEFAULT_PERSONALITY;
 }
 
@@ -1190,7 +1199,7 @@ private async runLoop(): Promise<void> {
     if (!bots || bots.length === 0) return null;
 
     const target = bots.find(b => b.username === botName);
-    if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
+    if (target && (target.state === "running" || target.state === "idle") && target.isConnected()) {
       return target;
     }
     return null;
@@ -1211,7 +1220,7 @@ private async runLoop(): Promise<void> {
 
     // Log all bots and their states
     for (const b of bots) {
-      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}, system=${b.system}, poi=${b.poi}`);
+      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.isConnected()}, system=${b.system}, poi=${b.poi}`);
     }
 
     const candidates: Bot[] = [];
@@ -1221,8 +1230,8 @@ private async runLoop(): Promise<void> {
     // BUT: For faction chat, only add receiving bot to the pool (don't prioritize it) to encourage randomness
     if (receivingBot) {
       const target = bots.find(b => b.username === receivingBot);
-      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
-      if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
+      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.isConnected()}`);
+      if (target && (target.state === "running" || target.state === "idle") && target.isConnected()) {
         // For local chat, prioritize receiving bot (must be at correct location)
         // For faction/system chat, just add to pool without prioritizing
         if (msg.channel === "local") {
@@ -1238,7 +1247,7 @@ private async runLoop(): Promise<void> {
     if (msg.channel === "local" && msg.botSystem && msg.botPoi) {
       for (const bot of bots) {
         if (addedBots.has(bot.username)) continue;
-        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
         if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
           this.logFn("ai_chat_debug", `Adding location-matched bot: ${bot.username}`);
           candidates.push(bot);
@@ -1251,7 +1260,7 @@ private async runLoop(): Promise<void> {
     if (msg.channel === "system" && msg.botSystem) {
       for (const bot of bots) {
         if (addedBots.has(bot.username)) continue;
-        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
         if (bot.system === msg.botSystem) {
           this.logFn("ai_chat_debug", `Adding system-matched bot: ${bot.username}`);
           candidates.push(bot);
@@ -1265,7 +1274,7 @@ private async runLoop(): Promise<void> {
     // For other channels, add to candidates
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
-      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+      if ((bot.state !== "running" && bot.state !== "idle") || !bot.isConnected()) continue;
       if (msg.channel === "faction") {
         addedBots.add(bot.username);
       } else {
@@ -1277,7 +1286,7 @@ private async runLoop(): Promise<void> {
     // Fallback: Any bot with session (even if state is unusual)
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
-      if (bot.api.getSession()) {
+      if (bot.isConnected()) {
         if (msg.channel === "faction") {
           addedBots.add(bot.username);
         } else {
@@ -1809,7 +1818,20 @@ ${botContext}
       situation: string;
       currentSystem: string;
       targetSystem: string;
+      /**
+       * Mission phase. Controls whether travel/ETA wording is allowed at all.
+       * - "en_route": still flying to the pilot (future tense, ETA allowed)
+       * - "arrived": in their system, closing on their POI
+       * - "completed": fuel already delivered, trip is over (past tense only)
+       * - "cancelled": mission ended without a delivery (past tense only)
+       * - "declined": never departed, not coming (no travel wording at all)
+       * Defaults to "en_route" for backwards compatibility.
+       */
+      phase?: "en_route" | "arrived" | "completed" | "cancelled" | "declined";
+      /** Jumps STILL REMAINING before reaching the pilot. Only meaningful while en route. */
       jumps?: number;
+      /** Jumps ALREADY FLOWN that appear on an invoice (round trip). Never rendered as an ETA. */
+      billedJumps?: number;
       fuelRefueled?: number;
       playerFuelPct?: number;
       credits?: number;
@@ -1826,40 +1848,94 @@ ${botContext}
     
     this.logFn("ai_chat_debug", `AI Chat enabled: ${settings.enabled}, sending private message...`);
 
+    const phase = context.phase ?? "en_route";
+    const pilotSystem = (context.targetSystem || "").trim();
+    // Only an en-route message may talk about jumps as distance/ETA. Anything else
+    // (invoices especially) would make the LLM claim it is still on its way.
+    const jumpsRemaining = phase === "en_route" ? context.jumps : undefined;
+
+    const locationLine = (() => {
+      switch (phase) {
+        case "completed":
+          return `- You are WITH the stranded pilot right now${pilotSystem ? ` in ${pilotSystem}` : ""} - the trip to them is already finished`;
+        case "arrived":
+          return `- You have ARRIVED in the stranded pilot's system${pilotSystem ? ` (${pilotSystem})` : ""} and are closing on their position`;
+        case "cancelled":
+          return `- The pilot's last reported location was${pilotSystem ? ` ${pilotSystem}` : " unknown"} - this mission is over, you are not going back`;
+        case "declined":
+          return `- The pilot is in${pilotSystem ? ` ${pilotSystem}` : " a location you cannot reach"} - you are NOT travelling there`;
+        default:
+          return `- Stranded pilot is in: ${pilotSystem || "their reported location"}${jumpsRemaining ? ` (${jumpsRemaining} jumps away)` : ""}`;
+      }
+    })();
+
+    const phaseRules = (() => {
+      switch (phase) {
+        case "completed":
+          return `MISSION STATUS - ALREADY COMPLETE (READ CAREFULLY):
+- The fuel has ALREADY been delivered and the rescue is FINISHED
+- You are NOT on your way, you are NOT approaching, and there is NO ETA to give
+- NEVER say "I'll reach you in X jumps", "on my way", "heading your way", "I'll check your fuel when I arrive", or anything implying a future arrival
+- Talk about the trip and the fuel transfer in the PAST tense${context.billedJumps !== undefined ? `
+- The ${context.billedJumps} jumps on the invoice are jumps you ALREADY FLEW (there and back), not a distance to them and not an ETA` : ""}`;
+        case "arrived":
+          return `MISSION STATUS - ARRIVED:
+- You are already in their system; do not quote a jump count or ETA
+- The fuel transfer has NOT happened yet - do not thank them or bill them`;
+        case "cancelled":
+          return `MISSION STATUS - ENDED WITHOUT DELIVERY:
+- The mission is over and you are NOT coming back
+- Do not give an ETA or promise another attempt on this run
+- Talk about the trip in the PAST tense`;
+        case "declined":
+          return `MISSION STATUS - DECLINED:
+- You never departed and you are NOT coming
+- Do not give an ETA, jump count to them, or any hint you might still show up`;
+        default:
+          return `MISSION STATUS - EN ROUTE:
+- You are still flying to them${jumpsRemaining ? ` and are ${jumpsRemaining} jumps out` : ""}
+- The fuel transfer has NOT happened yet - do not thank them or bill them`;
+      }
+    })();
+
     // Build system prompt for private message generation
     const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
 
 Context:
 - You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
-- Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
+${locationLine}
 - ${context.situation}
+
+${phaseRules}
 
 IMPORTANT NOTES ABOUT FUEL:
 ${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
-${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
-${context.credits !== undefined ? `- The rescue invoice totals ${context.credits} credits` : ''}
+${context.fuelRefueled !== undefined ? (context.fuelRefueled > 0 ? `- You ALREADY transferred ${context.fuelRefueled} fuel units to the stranded pilot` : `- NO fuel was delivered on this run`) : ''}
+${context.credits !== undefined ? (context.credits > 0 ? `- The rescue invoice totals ${context.credits} credits` : `- There is NO charge for this - do not quote any price or invoice`) : ''}
 - NEVER confuse the stranded pilot's fuel level with your own fuel level
 - When referring to fuel, always clarify whose fuel you're talking about
 
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
-If an invoice was sent, ALWAYS mention the credit amount in your message.
+${context.credits !== undefined && context.credits > 0 ? "An invoice was sent, so ALWAYS mention the credit amount in your message." : ""}
 
 Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
-- Include relevant details (ETA, jumps, credits, etc.) if provided
+- Include relevant details (${phase === "en_route" ? "ETA, jumps remaining, " : ""}credits, fuel delivered) if provided
 - Don't be overly verbose
 - Use 1st person ("I", "me", "my") when talking about yourself`;
 
     const userMessage = `Generate a private message to ${targetPlayer}:
 
+Phase: ${phase}
 Situation: ${context.situation}
-${context.jumps ? `Jumps remaining: ${context.jumps}` : ""}
-${context.fuelRefueled ? `Fuel transferred: ${context.fuelRefueled}` : ""}
+${jumpsRemaining ? `Jumps remaining before you reach them: ${jumpsRemaining}` : ""}
+${context.billedJumps !== undefined ? `Jumps already flown and billed (round trip, NOT an ETA): ${context.billedJumps}` : ""}
+${context.fuelRefueled ? `Fuel already transferred: ${context.fuelRefueled}` : ""}
 ${context.playerFuelPct ? `Their fuel before: ${context.playerFuelPct}%` : ""}
-${context.credits !== undefined ? `Invoice total: ${context.credits} credits` : ""}
+${context.credits !== undefined ? (context.credits > 0 ? `Invoice total: ${context.credits} credits` : `No charge for this run`) : ""}
 
 Message:`;
 
@@ -1969,15 +2045,29 @@ Message:`;
         break;
     }
 
+    // Only a not-yet-started rescue may talk about jumps as a distance still to fly.
+    const isFinished = messageType === "rescue_complete" || messageType === "rescue_no_show";
+    const jumpsLine = jumps
+      ? isFinished
+        ? ` (${jumps} jumps you already flew to get there)`
+        : ` (${jumps} jumps from your previous location)`
+      : "";
+    const timelineRule = isFinished
+      ? `- This job is ALREADY OVER: speak in the past tense and never imply you are still on your way or about to arrive`
+      : messageType === "rescue_arrived"
+        ? `- You are already on scene: do not give an ETA`
+        : `- The rescue is just starting: future tense is fine`;
+
     // Build system prompt for faction message generation
     const systemPrompt = `${personality || "You are a rescue pilot in SpaceMolt."}
 
 Context:
 - You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
-- Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
+- Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumpsLine}
 - Target name: ${targetName}
 - ${situation}
+${timelineRule}
 - This message goes to FACTION chat (all faction members can see it)
 
 Task:
@@ -1998,7 +2088,7 @@ Message type: ${messageType}
 Target: ${targetName}${isMayday ? " (MAYDAY distress call)" : ""}
 ${targetFuelPct ? `Their fuel level: ${targetFuelPct}%` : ""}
 Location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}
-${jumps ? `Jumps to get there: ${jumps}` : ""}
+${jumps ? (isFinished ? `Jumps already flown: ${jumps}` : `Jumps to get there: ${jumps}`) : ""}
 
 Message:`;
 
@@ -2554,7 +2644,7 @@ async sendRescueEnRouteNotification(
    * activity log and personality, then write it via captains_log_add.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetCaptainLog(bot: Bot): Promise<boolean> {
+  private async generateAndSetCaptainLog(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
     this.logFn("ai_chat_debug", `Captain's log: effective llmTimeoutSec=${settings.llmTimeoutSec}s, activityMinutes=${settings.autoCaptainLogActivityMinutes}, model=${settings.model || "(default)"}`);
 
@@ -2563,7 +2653,7 @@ async sendRescueEnRouteNotification(
       return false;
     }
 
-    if (!settings.autoCaptainLogEnabled) {
+    if (!force && !settings.autoCaptainLogEnabled) {
       this.logFn("ai_chat_debug", `Captain's log skipped: autoCaptainLogEnabled is false`);
       return false;
     }
@@ -2571,7 +2661,7 @@ async sendRescueEnRouteNotification(
     // Check if bot is available
     const bots = AiChatService.getBots();
     const botRef = bots.find(b => b.username === bot.username);
-    if (!botRef || botRef.state !== "running" || !botRef.api.getSession()) {
+    if (!botRef || botRef.state !== "running" || !botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} not in running state (state: ${botRef?.state}), skipping captain's log`);
       return false;
     }
@@ -2628,7 +2718,6 @@ Write a captain's log entry (personal journal) describing what you did during th
       if (!logResp.error) {
         this.logFn("ai_chat", `📔 Captain's log updated for ${bot.username}: "${logEntry.slice(0, 80)}${logEntry.length > 80 ? "…" : ""}"`);
         bot.log("captains_log", `📔 Log: ${logEntry}`);
-        saveDailyUpdates({ ...loadDailyUpdates(), lastCaptainLogUpdate: Date.now() });
         return true;
       }
 
@@ -2665,7 +2754,7 @@ Write a captain's log entry (personal journal) describing what you did during th
    * Generate and set a bot's status message using LLM and personality.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetBotStatus(bot: Bot): Promise<boolean> {
+  private async generateAndSetBotStatus(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
 
     if (!settings.enabled) {
@@ -2673,7 +2762,7 @@ Write a captain's log entry (personal journal) describing what you did during th
       return false;
     }
 
-    if (!settings.autoStatusUpdateEnabled) {
+    if (!force && !settings.autoStatusUpdateEnabled) {
       this.logFn("ai_chat_debug", `Status update skipped: autoStatusUpdateEnabled is false`);
       return false;
     }
@@ -2686,7 +2775,7 @@ Write a captain's log entry (personal journal) describing what you did during th
       return false;
     }
 
-    if (!botRef.api.getSession()) {
+    if (!botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping status update`);
       return false;
     }
@@ -2737,7 +2826,6 @@ Be creative but concise. Think like you're setting a social status that other pl
         if (!statusResp.error) {
           this.logFn("ai_chat", `✅ Status updated for ${bot.username}: "${status}"`);
           bot.log("status", `🎨 Status set: "${status}"`);
-          saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
           return true;
         }
 
@@ -2771,7 +2859,7 @@ Be creative but concise. Think like you're setting a social status that other pl
    * Generate and set a bot's ship colors using LLM and personality.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetBotColors(bot: Bot): Promise<boolean> {
+  private async generateAndSetBotColors(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
 
     if (!settings.enabled) {
@@ -2779,7 +2867,7 @@ Be creative but concise. Think like you're setting a social status that other pl
       return false;
     }
 
-    if (!settings.autoColorUpdateEnabled) {
+    if (!force && !settings.autoColorUpdateEnabled) {
       this.logFn("ai_chat_debug", `Color update skipped: autoColorUpdateEnabled is false`);
       return false;
     }
@@ -2792,7 +2880,7 @@ Be creative but concise. Think like you're setting a social status that other pl
       return false;
     }
 
-    if (!botRef.api.getSession()) {
+    if (!botRef.isConnected()) {
       this.logFn("ai_chat", `Bot ${bot.username} has no active session, skipping color update`);
       return false;
     }
@@ -2836,7 +2924,6 @@ No other text, formatting, or explanation.`;
       if (!colorResp.error) {
         this.logFn("ai_chat", `✅ Colors updated for ${bot.username}: primary=${primaryColor}, secondary=${secondaryColor}`);
         bot.log("status", `🎨 Colors set: ${primaryColor}, ${secondaryColor}`);
-        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
         return true;
       }
 
@@ -2860,63 +2947,188 @@ No other text, formatting, or explanation.`;
    * Run daily updates for all bots (status and/or colors based on settings).
    * Called from runLoop when intervals have elapsed.
    */
-  private async runDailyUpdates(): Promise<void> {
+  // Track daily update runs to prevent re-entry / concurrent queues.
+  private dailyUpdateRunning = false;
+
+  // Tracks which forced update types are currently running (so the web UI
+  // buttons can't accidentally double-trigger the same one).
+  private forcedRuns = new Set<string>();
+
+  // Track consecutive failures per update type so we don't busy-loop LLM calls
+  // when something is permanently failing (auth, missing API, etc.).
+  private consecutiveFailures = new Map<string, number>();
+  private readonly MAX_CONSECUTIVE_FAILURES = 3;
+
+  /**
+   * Force a status/color/captain's-log update for ALL bots, regardless of the
+   * auto-update interval or the autoXEnabled flags. Runs in the background so
+   * the web UI call returns immediately. Used by the "Force update" buttons.
+   */
+  async forceStatusUpdate(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("status");
+  }
+
+  async forceColorUpdate(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("color");
+  }
+
+  async forceCaptainLog(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("captainLog");
+  }
+
+  private async triggerForcedUpdate(kind: "status" | "color" | "captainLog"): Promise<{ triggered: boolean; message: string }> {
+    if (this.forcedRuns.has(kind)) {
+      return { triggered: false, message: `Forced ${kind} update is already running` };
+    }
+    this.forcedRuns.add(kind);
+    void this.runForcedUpdate(kind).finally(() => this.forcedRuns.delete(kind));
+    return { triggered: true, message: `Forced ${kind} update started for all bots` };
+  }
+
+  private async runForcedUpdate(kind: "status" | "color" | "captainLog"): Promise<void> {
     const settings = getAiChatSettings();
-    const now = Date.now();
-    const updates = loadDailyUpdates();
+    if (!settings.enabled) {
+      this.logFn("ai_chat", `🔧 Forced ${kind} update skipped: AI Chat is disabled`);
+      return;
+    }
 
     const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return;
-
-    // Check status update interval
-    if (settings.autoStatusUpdateEnabled && settings.autoStatusUpdateIntervalSec > 0) {
-      const statusIntervalMs = settings.autoStatusUpdateIntervalSec * 1000;
-      if (now - updates.lastStatusUpdate >= statusIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
-
-        // Update each bot's status
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
-          await this.generateAndSetBotStatus(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
-        }
-
-        // Record the attempt even on failure so the configured interval is honored
-        // (otherwise a permanently-failing update would retry every cycle).
-        saveDailyUpdates({ ...loadDailyUpdates(), lastStatusUpdate: Date.now() });
-      }
+    if (!bots || bots.length === 0) {
+      this.logFn("ai_chat", `🔧 Forced ${kind} update skipped: no bots available`);
+      return;
     }
 
-    // Check color update interval
-    if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
-      const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
-      if (now - updates.lastColorUpdate >= colorIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
-
-        // Update each bot's colors
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
-          await this.generateAndSetBotColors(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
-        }
-
-        // Record the attempt even on failure so the configured interval is honored.
-        saveDailyUpdates({ ...loadDailyUpdates(), lastColorUpdate: Date.now() });
+    this.logFn("ai_chat", `🔧 Forcing ${kind} update for ${bots.length} bot(s)...`);
+    let success = 0;
+    for (const bot of bots) {
+      if (bot.state !== "running" || !bot.isConnected()) continue;
+      let ok = false;
+      try {
+        if (kind === "status") ok = await this.generateAndSetBotStatus(bot, true);
+        else if (kind === "color") ok = await this.generateAndSetBotColors(bot, true);
+        else ok = await this.generateAndSetCaptainLog(bot, true);
+      } catch (err) {
+        this.logFn("error", `Forced ${kind} update error for ${bot.username}: ${err}`);
       }
+      if (ok) success++;
     }
 
-    // Check captain's log interval
-    if (settings.autoCaptainLogEnabled && settings.autoCaptainLogIntervalSec > 0) {
-      const captainLogIntervalMs = settings.autoCaptainLogIntervalSec * 1000;
-      if (now - updates.lastCaptainLogUpdate >= captainLogIntervalMs) {
-        this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
+    // Update the timestamp so the normal daily cycle doesn't immediately redo it.
+    const updates = loadDailyUpdates();
+    if (kind === "status") updates.lastStatusUpdate = Date.now();
+    else if (kind === "color") updates.lastColorUpdate = Date.now();
+    else updates.lastCaptainLogUpdate = Date.now();
+    saveDailyUpdates(updates);
 
-        for (const bot of bots) {
-          if (bot.state !== "running" || !bot.api.getSession()) continue;
-          await this.generateAndSetCaptainLog(bot);
-          await sleep(2000); // Small delay between updates to avoid rate limiting
+    this.logFn("ai_chat", `✅ Forced ${kind} update complete: ${success}/${bots.length} bots succeeded`);
+  }
+
+  private async runDailyUpdates(): Promise<void> {
+    if (this.dailyUpdateRunning) {
+      return;
+    }
+    this.dailyUpdateRunning = true;
+    try {
+      const settings = getAiChatSettings();
+      const now = Date.now();
+      let updates = loadDailyUpdates();
+      const bots = AiChatService.getBots();
+      if (!bots || bots.length === 0) return;
+
+      // Check status update interval
+      if (settings.autoStatusUpdateEnabled && settings.autoStatusUpdateIntervalSec > 0) {
+        const statusIntervalMs = settings.autoStatusUpdateIntervalSec * 1000;
+        if (now - updates.lastStatusUpdate >= statusIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running daily status updates for ${bots.length} bot(s)...`);
+          let statusSuccessCount = 0;
+          for (const bot of bots) {
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetBotStatus(bot);
+            if (ok) statusSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("status") || 0;
+          if (statusSuccessCount > 0) {
+            this.consecutiveFailures.set("status", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("status", fails + 1);
+            this.logFn("ai_chat", `⚠️ Status update failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("status", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastStatusUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("status", 0);
         }
       }
+      else {
+        this.consecutiveFailures.set("status", 0);
+      }
+
+      // Check color update interval
+      if (settings.autoColorUpdateEnabled && settings.autoColorUpdateIntervalSec > 0) {
+        const colorIntervalMs = settings.autoColorUpdateIntervalSec * 1000;
+        if (now - updates.lastColorUpdate >= colorIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running daily color updates for ${bots.length} bot(s)...`);
+          let colorSuccessCount = 0;
+          for (const bot of bots) {
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetBotColors(bot);
+            if (ok) colorSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("color") || 0;
+          if (colorSuccessCount > 0) {
+            this.consecutiveFailures.set("color", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("color", fails + 1);
+            this.logFn("ai_chat", `⚠️ Color update failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("color", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastColorUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("color", 0);
+        }
+      }
+      else {
+        this.consecutiveFailures.set("color", 0);
+      }
+
+      // Check captain's log interval
+      if (settings.autoCaptainLogEnabled && settings.autoCaptainLogIntervalSec > 0) {
+        const captainLogIntervalMs = settings.autoCaptainLogIntervalSec * 1000;
+        if (now - updates.lastCaptainLogUpdate >= captainLogIntervalMs) {
+          this.logFn("ai_chat", `⏰ Running captain's log updates for ${bots.length} bot(s)...`);
+          let logSuccessCount = 0;
+          for (const bot of bots) {
+            if (bot.state !== "running" || !bot.isConnected()) continue;
+            const ok = await this.generateAndSetCaptainLog(bot);
+            if (ok) logSuccessCount++;
+            await sleep(2000);
+          }
+          const fails = this.consecutiveFailures.get("captainLog") || 0;
+          if (logSuccessCount > 0) {
+            this.consecutiveFailures.set("captainLog", 0);
+          } else if (fails + 1 >= this.MAX_CONSECUTIVE_FAILURES) {
+            this.consecutiveFailures.set("captainLog", fails + 1);
+            this.logFn("ai_chat", `⚠️ Captain's log failed ${fails + 1} consecutive times — backing off`);
+          } else {
+            this.consecutiveFailures.set("captainLog", fails + 1);
+          }
+          updates = { ...loadDailyUpdates(), lastCaptainLogUpdate: Date.now() };
+          saveDailyUpdates(updates);
+        } else {
+          this.consecutiveFailures.set("captainLog", 0);
+        }
+      }
+      else {
+        this.consecutiveFailures.set("captainLog", 0);
+      }
+    } finally {
+      this.dailyUpdateRunning = false;
     }
   }
 }

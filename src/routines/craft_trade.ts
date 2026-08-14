@@ -62,6 +62,7 @@ import {
   countOpenOrdersForTrader,
   type CraftOrder,
 } from "./craftTradeOrders.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -82,9 +83,11 @@ interface CraftTradeSettings {
   forceOwnFacility: boolean;
   craftingPreset: string;
   blacklistedRecipes: string[];
+  craftingHomeBase: string;
   maxConcurrentOrders: number;
   orderTimeoutMin: number;
   minMarginPct: number;
+  useRemoteMarketQuery: boolean;
 }
 
 function getCraftTradeSettings(username?: string): CraftTradeSettings {
@@ -118,9 +121,12 @@ function getCraftTradeSettings(username?: string): CraftTradeSettings {
     forceOwnFacility: (t.forceOwnFacility as boolean) ?? true,
     craftingPreset: (t.craftingPreset as string) || "fast",
     blacklistedRecipes: arr(t.blacklistedRecipes),
+    craftingHomeBase: (t.craftingHomeBase as string) ||
+      (general.factionStorageStation as string) || "",
     maxConcurrentOrders: (t.maxConcurrentOrders as number) || 3,
     orderTimeoutMin: (t.orderTimeoutMin as number) || 360,
     minMarginPct: (t.minMarginPct as number) || 10,
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -160,6 +166,7 @@ function buildTraderSettingsShim(s: CraftTradeSettings): Parameters<typeof findT
     minProfitPerUnit: s.minProfitPerUnit,
     fuelCostPerJump: s.fuelCostPerJump,
     maxCargoValue: s.maxCargoValue,
+    useRemoteMarketQuery: s.useRemoteMarketQuery,
   } as unknown as Parameters<typeof findTradeOpportunities>[0];
 }
 
@@ -224,7 +231,9 @@ async function* traderLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGen
       if (entry) {
         // Craftable — request a build order.
         const recipe = entry.recipe;
-        const estCost = estimateCraftCost(recipe);
+        const estCost = s.useRemoteMarketQuery !== false
+          ? await estimateCraftCostWithRemote(recipe, bot.system)
+          : estimateCraftCost(recipe);
         const expectedRevenue = route.sellPrice * route.buyQty;
         if (route.totalProfit <= 0) continue;
         if (expectedRevenue < estCost * (1 + s.minMarginPct / 100)) {
@@ -302,6 +311,26 @@ function estimateCraftCost(recipe: Recipe): number {
   return cost;
 }
 
+/** Try to get component costs from remote market data for craft cost estimation. */
+export async function estimateCraftCostWithRemote(recipe: Recipe, currentSystemId?: string): Promise<number> {
+  let cost = 0;
+  for (const comp of recipe.components) {
+    const localCost = getItemMarketCost(comp.item_id);
+    let remoteCost = 0;
+    try {
+      const result = await queryRemoteMarket({ itemId: comp.item_id, tradeType: "buy", requesterSystemId: currentSystemId });
+      if (result.ok && result.results.length > 0) {
+        remoteCost = result.results[0].price;
+      }
+    } catch {
+      // Non-fatal: use local cost
+    }
+    const usedCost = remoteCost > 0 ? remoteCost : localCost;
+    cost += (usedCost > 0 ? usedCost : 0) * comp.quantity;
+  }
+  return cost;
+}
+
 // ── Sell a crafted order: withdraw from faction storage → travel → sell ──
 
 async function fulfillOrder(
@@ -363,7 +392,9 @@ async function fulfillOrder(
     return;
   }
 
-  // Acquire a buy-order lock so two traders don't sell the same buyer.
+  // Claim the destination book so two traders don't sell into the same orders.
+  // The claim covers item + POI; the price is recorded for context only, because
+  // a market sell walks every price level and the top of book moves constantly.
   const lockKeyPrice = order.sellPrice;
   const lockAcquired = acquireBuyOrderLock({
     botUsername: bot.username,
@@ -377,7 +408,7 @@ async function fulfillOrder(
     sessionId: `ct_${order.orderId}`,
   });
   if (!lockAcquired) {
-    log("trade", `Buy order @ ${order.destPoiName} (${lockKeyPrice}cr) locked by another bot — skipping`);
+    log("trade", `${order.itemName} book @ ${order.destPoiName} claimed by another bot — skipping`);
     await returnUnsold(ctx, bot, s, order.itemId, cargoQty);
     return;
   }
@@ -399,7 +430,7 @@ async function fulfillOrder(
       await returnUnsold(ctx, bot, s, order.itemId, cargoQty);
     }
   } finally {
-    releaseBuyOrderLock(bot.username, order.itemId, order.destPoi, lockKeyPrice, "completed");
+    releaseBuyOrderLock(bot.username, order.itemId, order.destPoi, "completed");
   }
 }
 
@@ -524,6 +555,8 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
     allowRentalPurchase: false,
     rentalSpendingLimit: 0,
     cycleTimeSec: 30,
+    craftingHomeBase: s.craftingHomeBase,
+    recipeFacilityLinks: {},
   };
 
   const facTypeByRecipe = new Map<string, string>();
@@ -576,10 +609,11 @@ async function* crafterLoop(ctx: RoutineContext, s: CraftTradeSettings): AsyncGe
           markFailed(order.orderId, "no facility");
           continue;
         }
-        const result = await queueCraftJob(
-          ctx, order.recipeId, order.quantity, bot, bot.craftQueueTracker!,
-          countFactionItemFn, recipes, venue, crafterSettings, ownFacilityMap,
-        );
+         const result = await queueCraftJob(
+           ctx, order.recipeId, order.quantity, bot, bot.craftQueueTracker!,
+           countFactionItemFn, recipes, venue, crafterSettings, ownFacilityMap,
+           0, countFactionItemFn,
+         );
         if (result.success) {
           markCrafting(order.orderId);
           ctx.log("craft", `Queued craft order ${order.orderId}: ${order.quantity}x ${recipe.output_name}`);

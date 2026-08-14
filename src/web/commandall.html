@@ -41,6 +41,11 @@
     let knownOres = [];
     let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
     let reconnectDelay = 1000;
+    let wsManualClose = false;
+    let wsConnectTimer = null;
+    let wsHeartbeatTimer = null;
+    let wsWatchdogTimer = null;
+    let wsLastMsg = Date.now();
     let mapData = {};
     let modalMode = 'add';
     let activeSettingsTab = 'general';
@@ -56,6 +61,8 @@
     let factionWithdrawSortOrder = 'alpha';
     let caGiftSendAllRunning = false;
     let caDepositAllRunning = false;
+    let caWeaponsCache = {};
+    let caSelectedAmmoType = '';
 
     // ── Command send queue for send-before-open or closed socket ──
     let wsSendQueue = [];
@@ -158,36 +165,68 @@
     }
 
       function connect() {
-        clearTimeout(wsInitTimer);
+        if (wsManualClose) return;
+        clearTimeout(wsConnectTimer);
 
         const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        let host = location.host;
+        if (!host) host = (location.hostname || 'localhost') + (location.port ? ':' + location.port : '');
+        let url;
+        try {
+          url = `${proto}//${host}/ws`;
+          ws = new WebSocket(url);
+        } catch (err) {
+          console.warn('WebSocket constructor failed, retrying in 1s:', err);
+          wsConnectTimer = setTimeout(connect, 1000);
+          return;
+        }
 
+        wsLastMsg = Date.now();
+
+        clearTimeout(wsInitTimer);
         wsInitTimer = setTimeout(() => {
           if (!ws || ws.readyState !== WebSocket.OPEN) {
-            console.warn('WebSocket slow, fetching initial data via REST...');
-            fetchInitialData();
+            console.warn('WebSocket not open after 4s — REST fallback + reconnect');
+            try { fetchInitialData(); } catch (e) {}
+            try { ws && ws.close(); } catch {}
           }
-        }, 500);
+        }, 4000);
 
         ws.onopen = () => {
           clearTimeout(wsInitTimer);
           reconnectDelay = 1000;
           flushWsSendQueue();
+          clearInterval(wsHeartbeatTimer);
+          wsHeartbeatTimer = setInterval(() => {
+            try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+          }, 15000);
+          clearInterval(wsWatchdogTimer);
+          wsWatchdogTimer = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+              console.warn('WebSocket silent for 30s, forcing reconnect');
+              try { ws.close(); } catch {}
+            }
+          }, 5000);
         };
 
         ws.onclose = () => {
           clearTimeout(wsInitTimer);
+          clearInterval(wsHeartbeatTimer);
+          clearInterval(wsWatchdogTimer);
           ws = null;
-          setTimeout(connect, reconnectDelay);
-          reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+          if (wsManualClose) return;
+          wsConnectTimer = setTimeout(connect, 1000);
         };
 
-        ws.onerror = () => {};
+        ws.onerror = () => {
+          try { ws && ws.close(); } catch {}
+        };
 
         ws.onmessage = (ev) => {
           let msg;
           try { msg = JSON.parse(ev.data); } catch { return; }
+          if (msg.type === 'pong') return;
+          wsLastMsg = Date.now();
           switch (msg.type) {
             case 'init':
               clearTimeout(wsInitTimer);
@@ -232,6 +271,7 @@
     // ═══════════════════════════════════════════════════════════════════════════
 
     const COMMAND_ALL_DELAY_MS = 100; // .1 second delay between each bot command
+    const BULK_MAX_ITEMS = 100; // max items per bulk storage request (server limit)
 
     /** Render the Command All controls panel */
     function renderCommandAllControls() {
@@ -380,6 +420,11 @@
           <button class="sm" onclick="caExec('repair')">Repair All</button>
         </div>
 
+        <div class="cmd-group">
+          <button class="sm" onclick="caExec('cloak', { enable: 'true' })">Cloak All</button>
+          <button class="sm" onclick="caExec('cloak')">Decloak All</button>
+        </div>
+
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Fleet Cargo Operations</label>
         </div>
@@ -478,6 +523,13 @@
           <button class="sm" onclick="caExec('send_gift',{recipient:val('ca-credits-target'),credits:intVal('ca-credits-amount')})">Send</button>
         </div>
 
+        <div class="cmd-group">
+          <label>Faction Credits (All Bots)</label>
+          <input type="number" id="ca-fac-credits-amount" min="1" value="100" style="width:90px">
+          <button class="sm" onclick="caExec('faction_deposit_credits',{amount:intVal('ca-fac-credits-amount')})">Deposit</button>
+          <button class="sm" onclick="caFactionWithdrawCredits()">Withdraw</button>
+        </div>
+
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Status Commands</label>
         </div>
@@ -489,6 +541,40 @@
           <button class="sm" onclick="caExec('view_market')">Market All</button>
           <button class="sm" onclick="caExec('get_system')">System All</button>
           <button class="sm" onclick="caExec('get_nearby')">Nearby All</button>
+        </div>
+
+        <div class="cmd-group">
+          <button class="sm" onclick="caExec('battle',{action:'advance'})" style="color: var(--red)">Advance All</button>
+          <button class="sm" onclick="caExec('battle',{action:'retreat'})" style="color: var(--red)">Retreat All</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'fire'})" style="color: var(--red)">Stance Fire</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'flee'})" style="color: var(--red)">Stance Flee</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'brace'})" style="color: var(--red)">Stance Brace</button>
+          <button class="sm" onclick="caExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
+        </div>
+
+        <div class="cmd-group">
+          <label>Target All</label>
+          <input type="text" id="ca-battle-target-id" placeholder="target_id" style="min-width:100px">
+          <button class="sm" onclick="caExec('battle',{action:'target',target_id:val('ca-battle-target-id')})" style="color: var(--red)">Target</button>
+        </div>
+
+        <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+          <label style="color:var(--text-bright);font-weight:600">Mass Weapon Reload</label>
+        </div>
+
+        <div class="cmd-group">
+          <button class="sm" onclick="caLoadAllWeapons()" id="ca-load-weapons-btn">🔫 Load Weapons</button>
+        </div>
+
+        <div id="ca-weapon-reload-controls" style="display:none">
+          <div class="cmd-group">
+            <label>Selected Ammo</label>
+            <select id="ca-ammo-type-select">
+              <option value="">Select ammo type...</option>
+            </select>
+            <button class="primary sm" onclick="caMassReloadAll()">Reload All Weapons</button>
+          </div>
+          <div id="ca-weapons-summary" style="font-size:11px;color:var(--text-dim);margin-top:4px"></div>
         </div>
 
         <div class="cmd-group">
@@ -511,15 +597,24 @@
     }
 
     /** Update only the bot list dropdowns (lightweight update for status messages) */
+    // The roster only changes when a bot is added or removed, but `status` is
+    // pushed on every bot state change. Rebuilding three ~1000-option <select>
+    // elements per push is pure churn, so bail out when nothing changed.
+    let _caBotListKey = null;
     function updateCommandAllBotList() {
+      const key = bots.map(b => b.username).join('\u0001');
+      if (key === _caBotListKey) return;
+
       const allBotOpts = bots.length > 0
         ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')
         : '<option value="">No bots available</option>';
 
       const targets = ['ca-gift-target', 'ca-giftall-target', 'ca-credits-target'];
+      let populated = false;
       for (const id of targets) {
         const el = document.getElementById(id);
         if (el) {
+          populated = true;
           const currentVal = el.value;
           el.innerHTML = allBotOpts;
           // Restore selection if still valid
@@ -528,6 +623,9 @@
           }
         }
       }
+      // Only remember the roster once it actually reached the DOM, otherwise a
+      // later control render would be left with stale/empty dropdowns.
+      _caBotListKey = populated ? key : null;
     }
 
     /** Execute a command on all bots with delay between each */
@@ -552,7 +650,8 @@
         const botTs = new Date().toLocaleTimeString('en-US', { hour12: false });
 
         sendExec(bot.username, command, params, (result) => {
-          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          const success = result.ok !== false && !result.error;
+          const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
           const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
           caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
         });
@@ -581,6 +680,199 @@
         }
       }
       caExec(cmd, params);
+    }
+
+    /** Load weapon module data for all bots */
+    function caLoadAllWeapons() {
+      const activeBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (activeBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to load weapons</span>');
+        return;
+      }
+
+      caLog('<span class="resp-cmd">Loading weapons from all bots...</span>');
+      caWeaponsCache = {};
+      let weaponsLoaded = 0;
+      let cargoLoaded = 0;
+
+      // Collect all cargo items across bots for aggregated dropdown
+      const allCargoItems = {};
+
+      // Progress element for in-place updates
+      let progressEl = document.getElementById('ca-weapons-progress');
+      if (!progressEl) {
+        progressEl = document.createElement('div');
+        progressEl.id = 'ca-weapons-progress';
+        progressEl.style.cssText = 'font-size:12px;color:var(--text-dim);margin:5px 0';
+        document.getElementById('ca-weapon-reload-controls')?.insertBefore(progressEl, document.getElementById('ca-weapons-summary'));
+      }
+
+      for (let i = 0; i < activeBots.length; i++) {
+        const bot = activeBots[i];
+        const progress = document.createElement('span');
+        progress.textContent = `get_ship: ${i + 1}/${activeBots.length}`;
+        progress.style.color = 'var(--text-dim)';
+        progressEl.innerHTML = '';
+        progressEl.appendChild(progress);
+
+        // First get ship data for weapons
+        sendExec(bot.username, 'get_ship', {}, (result) => {
+          const data = result.data || {};
+          const modules = Array.isArray(data.modules) ? data.modules : [];
+
+          const weapons = modules
+              .filter((mod) => {
+                const modType = ((mod.type || mod.module_type || '') + '').toLowerCase();
+                const modId = ((mod.module_id || mod.mod_id || mod.id || '') + '').toLowerCase();
+                return modType.includes('weapon') || modType.includes('missile') ||
+                       modType.includes('launcher') || modType.includes('torpedo') ||
+                       modId.includes('weapon') || modId.includes('missile') || modId.includes('launcher');
+              })
+              .map((mod) => {
+                let ammoType = mod.ammo_type || null;
+                const modId = mod.module_id || mod.mod_id || mod.id || '';
+                if (!ammoType && modId) {
+                  const catalogModule = catalog.items?.[modId];
+                  if (catalogModule && catalogModule.ammo_type) {
+                    ammoType = catalogModule.ammo_type;
+                  }
+                }
+
+                let currentAmmo = mod.current_ammo;
+                let maxAmmo = mod.magazine_size || 0;
+
+                return {
+                  instanceId: mod.module_id || mod.instance_id || mod.weapon_instance_id || mod.id || '',
+                  typeId: modId,
+                  name: mod.name || modId || 'Unknown Weapon',
+                  currentAmmo: currentAmmo,
+                  maxAmmo: maxAmmo,
+                  ammoType: ammoType,
+                  loadedAmmoName: mod.loaded_ammo_name || null,
+                };
+              })
+              .filter((w) => w.instanceId);
+
+          caWeaponsCache[bot.username] = { weapons, cargo: [] };
+          weaponsLoaded++;
+
+          // Now get cargo data
+          sendExec(bot.username, 'get_cargo', {}, (cargoResult) => {
+            const cargoData = cargoResult.data || {};
+            const shipCargo = Array.isArray(cargoData.cargo) ? cargoData.cargo : 
+                              Array.isArray(cargoData.items) ? cargoData.items : [];
+
+            // Update cache with cargo
+            caWeaponsCache[bot.username].cargo = shipCargo;
+
+            // Aggregate cargo items across all bots
+            for (const item of shipCargo) {
+              const itemId = item.item_id || item.itemId || item.id || '';
+              if (!itemId) continue;
+              if (!allCargoItems[itemId]) {
+                allCargoItems[itemId] = {
+                  name: item.name || item.item_name || catalog.items?.[itemId]?.name || itemId.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+                  quantity: 0
+                };
+              }
+              allCargoItems[itemId].quantity += item.quantity || item.qty || 0;
+            }
+
+            cargoLoaded++;
+
+            if (weaponsLoaded === activeBots.length && cargoLoaded === activeBots.length) {
+              const totalWeapons = Object.values(caWeaponsCache).reduce((sum, v) => sum + (v.weapons?.length || 0), 0);
+              const controls = document.getElementById('ca-weapon-reload-controls');
+              const summary = document.getElementById('ca-weapons-summary');
+              const ammoSelect = document.getElementById('ca-ammo-type-select');
+              
+              if (controls) controls.style.display = 'block';
+              if (summary) summary.textContent = `Found ${totalWeapons} weapons across ${Object.keys(caWeaponsCache).length} bots`;
+
+              if (ammoSelect) {
+                const sortedItems = Object.entries(allCargoItems).sort((a, b) => b[1].quantity - a[1].quantity);
+                ammoSelect.innerHTML = '<option value="">Select item...</option>' +
+                  sortedItems.map(([id, data]) => {
+                    return `<option value="${esc(id)}">${esc(data.name)} (${data.quantity})</option>`;
+                  }).join('');
+              }
+              if (progressEl) progressEl.textContent = `✓ Loaded ${totalWeapons} weapons from ${activeBots.length} bots`;
+            }
+          });
+        });
+      }
+    }
+
+    /** Mass reload all weapons on all bots with selected ammo type */
+    function caMassReloadAll() {
+      const ammoId = val('ca-ammo-type-select');
+      if (!ammoId) {
+        caLog('<span class="resp-err">Select an ammo type first</span>');
+        return;
+      }
+
+      const activeBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (activeBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to reload</span>');
+        return;
+      }
+
+      const weaponsToReload = [];
+      for (const bot of activeBots) {
+        const botWeapons = caWeaponsCache[bot.username]?.weapons || [];
+        for (const weapon of botWeapons) {
+          weaponsToReload.push({ bot, weapon });
+        }
+      }
+
+      if (weaponsToReload.length === 0) {
+        caLog('<span class="resp-warn">No weapons found to reload</span>');
+        return;
+      }
+
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      caLog(`<span class="resp-cmd">${ts} > FLEET: Reloading ${weaponsToReload.length} weapons with ${catalogName(ammoId)}</span>`);
+
+      let index = 0;
+      let completedCount = 0;
+
+      // Progress element for in-place updates
+      let reloadProgressEl = document.getElementById('ca-reload-progress');
+      if (!reloadProgressEl) {
+        reloadProgressEl = document.createElement('div');
+        reloadProgressEl.id = 'ca-reload-progress';
+        reloadProgressEl.style.cssText = 'font-size:12px;color:var(--text-dim);margin:5px 0';
+        document.getElementById('ca-weapon-reload-controls')?.insertBefore(reloadProgressEl, document.getElementById('ca-weapons-summary'));
+      }
+
+      function executeNext() {
+        if (index >= weaponsToReload.length) return;
+
+        const { bot, weapon } = weaponsToReload[index];
+        const reloadParams = {
+          weapon_instance_id: weapon.instanceId,
+          ammo_item_id: ammoId,
+        };
+
+        reloadProgressEl.textContent = `Reloading weapon ${index + 1}/${weaponsToReload.length} on ${bot.username}: ${weapon.name}`;
+
+        sendExec(bot.username, 'reload', reloadParams, (result) => {
+          const success = result.ok !== false && !result.error;
+          const status = success ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          caLog(`<span class="resp-bot">${esc(bot.username)}:</span> Reloaded "${esc(weapon.name)}": ${status}`);
+          completedCount++;
+          if (completedCount === weaponsToReload.length) {
+            reloadProgressEl.textContent = `✓ All ${weaponsToReload.length} weapons reloaded successfully`;
+          }
+        });
+
+        index++;
+        if (index < weaponsToReload.length) {
+          setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+        }
+      }
+
+      executeNext();
     }
 
     /** Get faction storage options for command-all faction withdraw dropdown */
@@ -806,53 +1098,100 @@
         return;
       }
 
-      // Include all bots: running OR idle
       const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
       if (allBots.length === 0) {
         caLog('<span class="resp-warn">No bots available to command</span>');
         return;
       }
 
-      // Build per-bot queues
-      const botQueues = {};
-      let totalItems = 0;
-      for (const bot of allBots) {
-        const queue = caBuildDepositQueue(bot, mode);
-        if (queue && queue.items.length > 0) {
-          botQueues[bot.username] = queue.items;
-          totalItems += queue.items.length;
+      const buildAndStart = (factionItems) => {
+        const botQueues = {};
+        let totalItems = 0;
+        for (const bot of allBots) {
+          const queue = caBuildDepositQueue(bot, mode, factionItems);
+          if (queue && queue.items.length > 0) {
+            botQueues[bot.username] = queue;
+            totalItems += queue.items.length;
+          }
         }
-      }
 
-      if (totalItems === 0) {
-        caLog('<span class="resp-err">No items to deposit in fleet</span>');
+        if (totalItems === 0) {
+          caLog('<span class="resp-err">No items to deposit in fleet</span>');
+          return;
+        }
+
+        caDepositAllRunning = true;
+        caLog(`<span class="resp-cmd">Starting Fleet Deposit All: ${mode} (${totalItems} items across ${Object.keys(botQueues).length} bots)</span>`);
+        caUpdateDepositQueueStatus();
+
+        for (const botUsername in botQueues) {
+          const bot = allBots.find(b => b.username === botUsername);
+          caProcessBotDepositQueue(bot, botQueues[botUsername]);
+        }
+      };
+
+      if (mode === 'faction_to_station') {
+        caLog('<span class="resp-warn">Loading faction storage first, please wait...</span>');
+        const bot = allBots.find(b => b.state === 'running' || b.state === 'idle');
+        if (!bot) {
+          caLog('<span class="resp-err">No idle or running bot to fetch faction storage</span>');
+          return;
+        }
+        sendExec(bot.username, 'view_faction_storage', undefined, (result) => {
+          if (result.ok && result.data) {
+            const items = result.data.items || result.data.storage || [];
+            commandAllFactionStorage = items.map(item => ({
+              itemId: item.item_id || item.itemId,
+              quantity: item.quantity || item.count || 1,
+            }));
+            caLog(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
+          } else {
+            commandAllFactionStorage = [];
+            caLog(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
+          }
+          buildAndStart(commandAllFactionStorage);
+        });
         return;
       }
 
-      caDepositAllRunning = true;
-      caLog(`<span class="resp-cmd">Starting Fleet Deposit All: ${mode} (${totalItems} items across ${Object.keys(botQueues).length} bots)</span>`);
-      caUpdateDepositQueueStatus();
+      buildAndStart(null);
+    }
 
-      // Start processing each bot's queue in parallel
-      for (const botUsername in botQueues) {
-        const bot = allBots.find(b => b.username === botUsername);
-        caProcessBotDepositQueue(bot, botQueues[botUsername]);
+    /** Translate a queue chunk into the unified `storage` command params
+     *  for a bulk request. The `storage` command moves every item in its
+     *  `items` array in ONE tick. */
+    function caBulkStorageParams(items) {
+      const first = items[0];
+      if (first.command === 'withdraw_items') {
+        return { items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })) };
       }
+      const params = {
+        action: first.action === 'withdraw' ? 'withdraw' : 'deposit',
+        items: items.map((it) => ({ item_id: it.item_id, quantity: it.quantity })),
+      };
+      if (first.action === 'withdraw') {
+        params.source = first.source === 'faction' ? 'faction' : 'storage';
+        params.target = 'self';
+      } else {
+        params.target = first.target === 'faction' ? 'faction' : 'self';
+        if (first.source) params.source = first.source;
+      }
+      return params;
     }
 
     /** Build deposit queue for a bot based on mode */
-    function caBuildDepositQueue(bot, mode) {
+    function caBuildDepositQueue(bot, mode, factionItems) {
       const cargo = bot.inventory || [];
       const storage = bot.storage || [];
-
       const items = [];
+      let command = 'storage';
 
       if (mode === 'cargo_to_station') {
         for (const item of cargo) {
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'cargo' });
+            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'cargo', action: 'deposit' });
           }
         }
       } else if (mode === 'cargo_to_faction') {
@@ -860,7 +1199,7 @@
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' });
+            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'cargo', action: 'deposit' });
           }
         }
       } else if (mode === 'station_to_faction') {
@@ -868,71 +1207,64 @@
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage' });
+            items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage', action: 'deposit' });
           }
         }
       } else if (mode === 'station_to_cargo') {
+        command = 'withdraw_items';
         for (const item of storage) {
           const itemId = item.itemId || item.item_id;
           const qty = item.quantity || item.count || 1;
           if (qty > 0 && itemId) {
-            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'storage', action: 'withdraw' });
+            items.push({ item_id: itemId, quantity: qty, source: 'storage', action: 'withdraw', command: 'withdraw_items' });
           }
         }
       } else if (mode === 'faction_to_station') {
-        // This would need faction storage data, but for now assume not implemented or handle differently
-        // For simplicity, skip or note that faction withdrawal is handled separately
-        caLog(`<span class="resp-warn">Faction to Station not implemented in Command All</span>`);
-        return null;
+        const fItems = factionItems || [];
+        for (const item of fItems) {
+          const itemId = item.itemId || item.item_id;
+          const qty = item.quantity || item.count || 1;
+          if (qty > 0 && itemId) {
+            items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'faction', action: 'deposit' });
+          }
+        }
       }
 
-      return { items };
+      return { mode, command, items, index: 0 };
     }
 
-    /** Process a single bot's deposit queue sequentially */
+    /** Process a single bot's deposit queue sequentially in bulk */
     function caProcessBotDepositQueue(bot, queue) {
-      if (!caDepositAllRunning || queue.length === 0) return;
+      if (!caDepositAllRunning || !queue || queue.items.length === 0) {
+        caCheckDepositQueuesComplete();
+        return;
+      }
 
       let index = 0;
 
       function sendNext() {
-        if (!caDepositAllRunning || index >= queue.length) {
+        if (!caDepositAllRunning || index >= queue.items.length) {
           caCheckDepositQueuesComplete();
           return;
         }
 
-        const item = queue[index];
+        const chunk = queue.items.slice(index, index + BULK_MAX_ITEMS);
         const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const verb = item.action === 'withdraw' ? 'withdrawing' : 'depositing';
-        const targetDesc = item.target === 'faction' ? 'faction' : item.action === 'withdraw' ? 'cargo' : 'station';
-        caLog(`<span class="resp-cmd">${ts} > ${esc(bot.username)} ${verb} ${item.quantity}x ${item.item_id} to ${targetDesc}</span>`);
+        const verb = chunk[0].action === 'withdraw' ? 'withdrawing' : 'depositing';
+        const targetDesc = chunk[0].target === 'faction' ? 'faction' : chunk[0].action === 'withdraw' ? 'cargo' : 'station';
+        caLog(`<span class="resp-cmd">${ts} > ${esc(bot.username)} ${verb} ${chunk.length} item(s) in bulk (${index + 1}-${index + chunk.length}/${queue.items.length}) to ${targetDesc}</span>`);
 
-        let command;
-        const params = {
-          item_id: item.item_id,
-          quantity: item.quantity,
-        };
-
-        if (item.action === 'withdraw') {
-          command = 'withdraw_items';
-          params.source = item.source;
-        } else {
-          command = 'deposit_items';
-          params.source = item.source;
-          if (item.target === 'faction') {
-            params.target = item.target;
-          }
-        }
-
-        sendExec(bot.username, command, params, (result) => {
+        const params = caBulkStorageParams(chunk);
+        const moveCommand = queue.command || 'storage';
+        sendExec(bot.username, moveCommand, params, (result) => {
           if (result.ok) {
             caLog(`<span class="resp-ok">${esc(bot.username)}: OK</span>`);
           } else {
             caLog(`<span class="resp-err">${esc(bot.username)}: Failed: ${esc(result.error || 'unknown')}</span>`);
           }
 
-          index++;
-          setTimeout(sendNext, 10000);
+          index += chunk.length;
+          setTimeout(sendNext, 1000);
         });
       }
 
@@ -1049,6 +1381,46 @@
       caUpdateGiftQueueStatus();
     }
 
+    /** Execute faction credit withdraw for all bots (faction treasury → wallet) */
+    function caFactionWithdrawCredits() {
+      const amt = intVal('ca-fac-credits-amount');
+      if (!amt || amt <= 0) {
+        caLog('<span class="resp-err">Enter a credit amount greater than 0</span>');
+        return;
+      }
+
+      const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+      if (allBots.length === 0) {
+        caLog('<span class="resp-warn">No bots available to command</span>');
+        return;
+      }
+
+      const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+      caLog(`<span class="resp-cmd">${ts} > FLEET: Faction Withdraw ${amt}cr (${allBots.length} bots)</span>`);
+
+      let index = 0;
+      function executeNext() {
+        if (index >= allBots.length) return;
+        const bot = allBots[index];
+        sendExec(bot.username, 'storage', {
+          action: 'withdraw',
+          target: 'faction',
+          item_id: 'credits',
+          quantity: amt,
+        }, (result) => {
+          const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+          const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
+          caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
+        });
+
+        index++;
+        if (index < allBots.length) {
+          setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+        }
+      }
+      executeNext();
+    }
+
     /** Execute faction withdraw for all bots using two-step queue */
     function caFactionWithdraw() {
       const itemId = val('ca-fac-wit-item');
@@ -1104,6 +1476,32 @@
     }
 
     /** Log to the Command All log panel */
+    const CA_LOG_KEY = 'spacemolt_commandall_log';
+    const CA_LOG_MAX = 300;
+
+    /** Restore the persisted Fleet Command Log (survives iframe reloads). */
+    function restoreCommandAllLog() {
+      try {
+        const raw = localStorage.getItem(CA_LOG_KEY);
+        if (!raw) return;
+        const log = document.getElementById('commandAllLog');
+        if (!log) return;
+        log.innerHTML = raw;
+        // Enforce the cap on restore too.
+        while (log.children.length > CA_LOG_MAX) log.removeChild(log.lastChild);
+        log.scrollTop = 0;
+      } catch { /* localStorage unavailable — ignore */ }
+    }
+
+    /** Persist the current Fleet Command Log to localStorage. */
+    function persistCommandAllLog() {
+      try {
+        const log = document.getElementById('commandAllLog');
+        if (log) localStorage.setItem(CA_LOG_KEY, log.innerHTML);
+      } catch { /* localStorage unavailable — ignore */ }
+    }
+
+    /** Log to the Command All log panel */
     function caLog(html) {
       const log = document.getElementById('commandAllLog');
       if (!log) return;
@@ -1112,18 +1510,22 @@
       div.innerHTML = html;
       log.prepend(div);
       // Cap DOM entries
-      while (log.children.length > 300) log.removeChild(log.lastChild);
+      while (log.children.length > CA_LOG_MAX) log.removeChild(log.lastChild);
       log.scrollTop = 0;
+      persistCommandAllLog();
     }
 
     /** Clear the command all log */
     function clearCommandAllLog() {
       const log = document.getElementById('commandAllLog');
       if (log) log.innerHTML = '';
+      persistCommandAllLog();
     }
 
     // Helper functions
     let execCallbacks = new Map();
+    let execTimeouts = new Map();
+    let execSeq = 0;
 
     function val(id) {
       const el = document.getElementById(id);
@@ -1144,9 +1546,20 @@
     }
 
     function sendExec(bot, command, params, callback) {
-      const seq = Date.now();
+      const seq = ++execSeq;
       const msg = { type: 'exec', bot, command, params, _seq: seq };
       execCallbacks.set(seq, callback);
+
+      // Add timeout for callback
+      const timeout = setTimeout(() => {
+        if (execCallbacks.has(seq)) {
+          execCallbacks.delete(seq);
+          if (callback) {
+            callback({ ok: false, error: `Timeout: ${command} did not respond for ${bot}` });
+          }
+        }
+      }, 30000);
+      execTimeouts.set(seq, timeout);
 
       if (!ws || ws.readyState !== WebSocket.OPEN) {
         wsSendQueue.push(msg);
@@ -1174,14 +1587,21 @@
     }
 
     function handleExecResult(msg) {
-      const callback = execCallbacks.get(msg._seq);
+      const seq = msg._seq;
+      const callback = execCallbacks.get(seq);
       if (callback) {
-        execCallbacks.delete(msg._seq);
+        execCallbacks.delete(seq);
+        const timeout = execTimeouts.get(seq);
+        if (timeout) {
+          clearTimeout(timeout);
+          execTimeouts.delete(seq);
+        }
         callback(msg);
       }
     }
 
     // Initialize
+    restoreCommandAllLog();
     connect();
   </script>
 </body>

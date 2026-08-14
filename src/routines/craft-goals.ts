@@ -17,13 +17,38 @@ interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
+  outputs: Array<{ item_id: string; name: string; quantity: number }>;
   category?: string;
+}
+
+// The output with the LOWEST quantity per run is the limiting factor for a
+// multi-output recipe (e.g. electrolyze_water -> 4x hydrogen + 2x oxygen): the
+// effective throughput is bounded by the smaller output, so requests and
+// "have" counts must be measured against it.
+export function lowestOutputItem(recipe: Recipe): { item_id: string; name: string; quantity: number } {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return { item_id: recipe.output_item_id, name: recipe.output_name, quantity: recipe.output_quantity || 1 };
+  }
+  return recipe.outputs.reduce((min, o) =>
+    (o.quantity || 1) < (min.quantity || 1) ? o : min
+  );
+}
+
+// Human-readable list of all outputs, e.g. "4x hydrogen_gas + 2x oxygen_gas".
+export function formatOutputs(recipe: Recipe): string {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return `${recipe.output_quantity || 1}x ${recipe.output_name || recipe.output_item_id}`;
+  }
+  return recipe.outputs
+    .map(o => `${o.quantity}x ${o.name || o.item_id}`)
+    .join(" + ");
 }
 
 interface CraftingNode {
   recipe: Recipe;
   quantityNeeded: number;        // Total quantity needed for parent goals (in items)
-  quantityHave: number;          // Current inventory count
+  quantityHave: number;          // Real current inventory count (NOT including in-flight pending)
+  quantityPending: number;       // Output credited from in-flight jobs not yet produced
   quantityToCraft: number;       // Net quantity to craft (needed - have) - in ITEMS
   children: CraftingNode[];      // Prerequisite recipes
   depth: number;
@@ -42,6 +67,7 @@ interface CraftingPlan {
   nodes: CraftingNode[];
   flatOrder: CraftingPlanItem[]; // Sorted: craft these first
   totalSteps: number;
+  goalRecipe?: Recipe;
 }
 
 const DEFAULT_BLACKLISTED_RECIPES = new Set([
@@ -175,9 +201,10 @@ export function findRecipeForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  allowedFacilityRecipeIds?: Set<string>,
 ): Recipe | null {
   const blacklistedRecipes = getBlacklistedRecipes();
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r, allowedFacilityRecipeIds).ok && !blacklistedRecipes.has(r.recipe_id));
 
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
@@ -220,6 +247,8 @@ function buildCraftingTree(
   facilityAvailableRecipes?: Set<string>,
   depth: number = 0,
   visited: Set<string> = new Set(),
+  baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingNode | null {
   // Cycle detection
   if (visited.has(goalRecipe.output_item_id)) {
@@ -234,10 +263,17 @@ function buildCraftingTree(
 
   visited.add(goalRecipe.output_item_id);
 
+  const limiter = lowestOutputItem(goalRecipe);
+  const limiterQty = limiter.quantity || 1;
+  const runsNeeded = Math.ceil(quantityToCraftInItems / limiterQty);
+  const limiterId = limiter.item_id;
+  const realHave = (baseCountFn || countItemFn)(limiterId);
+  const totalHave = countItemFn(limiterId);
   const node: CraftingNode = {
     recipe: goalRecipe,
     quantityNeeded: quantityToCraftInItems,
-    quantityHave: countItemFn(goalRecipe.output_item_id),
+    quantityHave: realHave,
+    quantityPending: Math.max(0, totalHave - realHave),
     quantityToCraft: quantityToCraftInItems,
     children: [],
     depth,
@@ -246,14 +282,14 @@ function buildCraftingTree(
   // Find prerequisites for each component
   // Calculate total components needed for all items
   for (const comp of goalRecipe.components) {
-    const totalCompNeeded = comp.quantity * quantityToCraftInItems;
+    const totalCompNeeded = comp.quantity * runsNeeded;
     const compHave = countItemFn(comp.item_id.toLowerCase());
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 
     if (compToCraft <= 0) continue;
 
     // Find recipe for this component, preferring recipes with available materials
-    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn, facilityAvailableRecipes);
+    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn, facilityAvailableRecipes, allowedFacilityRecipeIds);
 
     if (!prereqRecipe) {
       // No recipe to craft this - it's a base material
@@ -270,6 +306,8 @@ function buildCraftingTree(
       facilityAvailableRecipes,
       depth + 1,
       new Set(visited),
+      baseCountFn,
+      allowedFacilityRecipeIds,
     );
 
     if (childNode) {
@@ -321,8 +359,10 @@ export function calculateCraftingPlan(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingPlan | null {
-  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes);
+  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn, facilityAvailableRecipes, allowedFacilityRecipeIds);
 
   if (!goalRecipe) {
     return null;
@@ -335,6 +375,10 @@ export function calculateCraftingPlan(
     recipes,
     countItemFn,
     facilityAvailableRecipes,
+    0,
+    new Set(),
+    baseCountFn,
+    allowedFacilityRecipeIds,
   );
 
   if (!tree) {
@@ -356,6 +400,7 @@ export function calculateCraftingPlan(
     nodes: [tree],
     flatOrder,
     totalSteps: flatOrder.length,
+    goalRecipe,
   };
 }
 
@@ -369,9 +414,10 @@ export function findAllRecipesForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  allowedFacilityRecipeIds?: Set<string>,
 ): Recipe[] {
   const blacklistedRecipes = getBlacklistedRecipes();
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r, allowedFacilityRecipeIds).ok && !blacklistedRecipes.has(r.recipe_id));
   if (candidates.length === 0) return [];
 
   const unwrapCandidates = candidates.filter(isUnwrapRecipe);
@@ -405,12 +451,17 @@ export function calculateMultiGoalPlan(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   facilityAvailableRecipes?: Set<string>,
+  baseCountFn?: (itemId: string) => number,
+  allowedFacilityRecipeIds?: Set<string>,
 ): CraftingPlan[] {
   const plans: CraftingPlan[] = [];
 
   // Create a mutable inventory counter that updates as we plan
   const inventory = new Map<string, number>();
   const baseCount = countItemFn;
+  // Real current stock, used purely for the displayed "have" (excludes
+  // in-flight pending and planned-but-not-yet-queued output).
+  const baseStock = baseCountFn || countItemFn;
 
   // Initialize inventory
   const allItemIds = new Set<string>();
@@ -432,7 +483,7 @@ export function calculateMultiGoalPlan(
       // Always use the specified recipe exactly as requested
       goalRecipe = goal.recipe;
     } else {
-      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0, facilityAvailableRecipes);
+      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0, facilityAvailableRecipes, allowedFacilityRecipeIds);
     }
     
     if (!goalRecipe) continue;
@@ -449,6 +500,10 @@ export function calculateMultiGoalPlan(
       recipes,
       (itemId) => inventory.get(itemId) || 0,
       facilityAvailableRecipes,
+      0,
+      new Set(),
+      baseStock,
+      allowedFacilityRecipeIds,
     );
 
     if (tree) {
@@ -459,14 +514,25 @@ export function calculateMultiGoalPlan(
         nodes: [tree],
         flatOrder,
         totalSteps: flatOrder.length,
+        goalRecipe,
       };
       plans.push(plan);
 
-      // Update inventory as if we crafted everything in this plan
+      // Update inventory as if we crafted everything in this plan. Multi-output
+      // recipes (e.g. electrolyze_water -> hydrogen + oxygen) must credit EVERY
+      // output, otherwise the planner never sees the secondary outputs as
+      // "produced" and keeps trying to craft them by some other (nonexistent)
+      // recipe.
       for (const item of plan.flatOrder) {
-        const craftedQty = item.quantityToCraft * (item.recipe.output_quantity || 1);
-        const current = inventory.get(item.recipe.output_item_id) || 0;
-        inventory.set(item.recipe.output_item_id, current + craftedQty);
+        const runs = item.quantityToCraft;
+        const outs = (item.recipe.outputs && item.recipe.outputs.length > 0)
+          ? item.recipe.outputs
+          : [{ item_id: item.recipe.output_item_id, name: item.recipe.output_name, quantity: item.recipe.output_quantity || 1 }];
+        for (const o of outs) {
+          const craftedQty = runs * (o.quantity || 1);
+          const current = inventory.get(o.item_id) || 0;
+          inventory.set(o.item_id, current + craftedQty);
+        }
       }
     }
   }
@@ -479,14 +545,20 @@ export function calculateMultiGoalPlan(
  */
 export function formatCraftingTree(node: CraftingNode, prefix: string = ""): string {
   const lines: string[] = [];
-  
-  const haveStr = node.quantityHave > 0 ? ` (have ${node.quantityHave})` : "";
-  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${node.quantityToCraft}x${haveStr}`);
-  
+
+  const limiter = lowestOutputItem(node.recipe);
+  const limiterQty = limiter.quantity || 1;
+  const runs = Math.ceil(node.quantityToCraft / limiterQty);
+  const outStr = formatOutputs(node.recipe);
+  const haveStr = node.quantityHave > 0 || node.quantityPending > 0
+    ? ` (limiting ${limiter.name}: have ${node.quantityHave}${node.quantityPending > 0 ? `, ${node.quantityPending} pending` : ""})`
+    : "";
+  lines.push(`${prefix}├─ ${node.recipe.output_name}: craft ${runs} runs -> ${outStr}${haveStr}`);
+
   for (const child of node.children) {
     lines.push(formatCraftingTree(child, prefix + "│  "));
   }
-  
+
   return lines.join("\n");
 }
 
@@ -498,8 +570,12 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
     return `✓ ${plan.goalItem}: Already have ${plan.goalQuantity}x`;
   }
 
+  const outStr = plan.goalRecipe ? ` -> ${formatOutputs(plan.goalRecipe)}` : "";
+  const limiter = plan.goalRecipe ? lowestOutputItem(plan.goalRecipe) : null;
+  const limiterQty = limiter?.quantity || 1;
+  const runs = Math.ceil(plan.goalQuantity / limiterQty);
   const lines = [
-    `🎯 Goal: ${plan.goalQuantity}x ${plan.goalItem}`,
+    `🎯 Goal: ${runs} runs of ${plan.goalItem}${outStr} (${plan.goalQuantity} items)`,
     `   Steps: ${plan.totalSteps} recipes to craft`,
   ];
 
@@ -512,8 +588,19 @@ export function formatCraftingPlan(plan: CraftingPlan): string {
 
 /**
  * Check if a recipe is craftable (not ship passive or facility only).
+ *
+ * `allowedFacilityRecipeIds` is the set of recipe IDs explicitly linked to an
+ * owned/available facility via the crafter's `recipeFacilityLinks` config. A
+ * "facility only" recipe (e.g. breed_plutonium) would otherwise be rejected
+ * here, but when it has been linked to a real facility it IS craftable — just
+ * not by hand — so we let it through. This is what unlocks these recipes in the
+ * crafter while still blocking unlinked facility-only recipes (which have no
+ * venue and would only ever error at craft time).
  */
-export function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string } {
+export function isRecipeCraftable(
+  recipe: Recipe,
+  allowedFacilityRecipeIds?: Set<string>,
+): { ok: boolean; reason: string } {
   const category = (recipe.category || "").toLowerCase();
 
   if (category.includes("ship passive")) {
@@ -521,6 +608,9 @@ export function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string
   }
 
   if (category.includes("facility only")) {
+    if (allowedFacilityRecipeIds && allowedFacilityRecipeIds.has(recipe.recipe_id)) {
+      return { ok: true, reason: "Facility-only recipe linked to a facility" };
+    }
     return { ok: false, reason: "Recipe can only be crafted at facilities" };
   }
 

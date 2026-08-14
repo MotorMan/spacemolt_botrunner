@@ -33,6 +33,7 @@ import {
   handleBattleNotifications,
   getBattleStatus,
   fleeFromBattle,
+  enableCloakingIfPossible,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -44,6 +45,8 @@ function getCleanupSettings(username?: string): {
   repairThreshold: number;
   focusStationId: string;
   depositAllStorage: boolean;
+  enableCloak: boolean;
+  cloakIgnoreBlacklist: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -57,7 +60,9 @@ function getCleanupSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
-    depositAllStorage: (t.depositAllStorage as boolean) ?? true,
+    depositAllStorage: (t.depositAllStorage as boolean) || true,
+    enableCloak: (t.enableCloak as boolean) ?? false,
+    cloakIgnoreBlacklist: (t.cloakIgnoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -82,6 +87,55 @@ interface StorageHintEntry {
   name?: string;
   items?: number;
   credits?: number;
+}
+
+// ── Cloaking helpers ────────────────────────────────────────
+
+/** Re-cloak the ship whenever it is undocked and has a cloak module. */
+async function ensureCloaked(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.docked) return bot.isCloaked;
+  if (bot.isCloaked) {
+    ctx.log("cleanup", "Cloak already active");
+    return true;
+  }
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("cleanup", "Cloaking enabled (ship has cloak module)");
+  } else {
+    ctx.log("cleanup", "No cloaking module available — could not cloak");
+  }
+  return cloaked;
+}
+
+/** Undock and re-cloak. Use before any jump/travel. */
+async function undockForTravel(ctx: RoutineContext): Promise<void> {
+  await ensureUndocked(ctx);
+  await ensureCloaked(ctx);
+}
+
+/** Enable cloak at startup/cycle start: undock, cloak, re-dock. */
+async function enableCloakAtDock(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
+  if (!settings.enableCloak) return;
+  const { bot } = ctx;
+  if (bot.isCloaked) return;
+  if (!bot.docked) {
+    ctx.log("cleanup", "Not docked — cannot enable cloak at dock, will cloak before travel instead");
+    return;
+  }
+  ctx.log("cleanup", "Undocking before cloaking to control state...");
+  await ensureUndocked(ctx);
+  await ctx.sleep(500);
+  await bot.refreshShip();
+  const cloaked = await enableCloakingIfPossible(ctx);
+  if (cloaked) {
+    ctx.log("cleanup", "Cloaking enabled — re-docking at home station");
+    try {
+      await ensureDocked(ctx);
+    } catch {
+      // dock failed — that's okay, we're cloaked and can travel
+    }
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -205,35 +259,33 @@ function isHomeStation(stationId: string, poiId: string, homeSystem: string, hom
   return false;
 }
 
-/** Get the home station's base_id and poi_id for storage operations. */
-function getHomeStationInfo(homeSystem: string, homeStation: string): { baseId: string; poiId: string } | null {
+/** Get the home station's base_id, poi_id, and system_id for storage operations. */
+function getHomeStationInfo(homeSystem: string, homeStation: string): { baseId: string; poiId: string; systemId: string } | null {
   if (!homeStation) return null;
-  
+
   const allSystems = mapStore.getAllSystems();
   const lowerHome = homeStation.toLowerCase();
-  
-  // First check mobile capitol
+
   const mcLocation = mapStore.getMobileCapitolLocation();
   if (mcLocation && (lowerHome.includes("mobile") || lowerHome.includes("frontier"))) {
-    return { baseId: "frontier_station", poiId: mcLocation.poiId };
+    return { baseId: "frontier_station", poiId: mcLocation.poiId, systemId: mcLocation.systemId };
   }
-  
-  // Check all systems
+
   for (const [sysId, sys] of Object.entries(allSystems)) {
     for (const poi of sys.pois) {
       const travelId = poi.base_id || poi.id;
       const normalizedHome = lowerHome.replace(/_/g, ' ');
-      
-      if (travelId.toLowerCase() === lowerHome || 
+
+      if (travelId.toLowerCase() === lowerHome ||
           poi.id.toLowerCase() === lowerHome ||
           (poi.base_name && poi.base_name.toLowerCase().includes(normalizedHome)) ||
           (poi.name && poi.name.toLowerCase().includes(normalizedHome)) ||
           (poi.id.toLowerCase().includes(lowerHome))) {
-        return { baseId: poi.base_id || poi.id, poiId: poi.id };
+        return { baseId: poi.base_id || poi.id, poiId: poi.id, systemId: sysId };
       }
     }
   }
-  
+
   return null;
 }
 
@@ -357,90 +409,43 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  await ensureUndocked(ctx);
-  
+  const homeInfo = getHomeStationInfo(settings.homeSystem, settings.homeStation);
+  if (!homeInfo) {
+    ctx.log("error", `Cannot resolve home station "${settings.homeStation}" — aborting deposit`);
+    return;
+  }
+
+  if (bot.system !== homeInfo.systemId) {
+    await ensureUndocked(ctx);
+    const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+    if (!fueled) {
+      ctx.log("error", `Cannot refuel to reach ${homeInfo.systemId} — aborting deposit`);
+      return;
+    }
+    ctx.log("travel", `Returning to home system ${homeInfo.systemId} (resolved from station ${homeInfo.baseId})...`);
+    const arrived = await navigateToSystem(ctx, homeInfo.systemId, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Failed to reach ${homeInfo.systemId}`);
+      return;
+    }
+  }
+
   const { pois } = await getSystemInfo(ctx);
-  let targetStation = null;
-  
-  const currentStation = bot.poi ? pois.find(p => p.id === bot.poi || p.base_id === bot.poi) : null;
-  if (currentStation && isStationPoi(currentStation) && currentStation.id !== settings.focusStationId) {
-    ctx.log("info", `Already at home station (${currentStation.base_id || currentStation.id})`);
-    targetStation = currentStation;
-  }
-
-  if (settings.homeStation) {
-    targetStation = pois.find(p => 
-      isStationPoi(p) && 
-      (p.id === settings.homeStation || p.base_id === settings.homeStation || p.name?.toLowerCase().replace(/ /g, '_') === settings.homeStation.toLowerCase())
-    );
-    if (!targetStation) {
-      targetStation = pois.find(p => 
-        isStationPoi(p) && 
-        p.base_id && 
-        p.base_id.toLowerCase() === settings.homeStation.toLowerCase()
-      );
-    }
-    if (!targetStation) {
-      const normalizedHome = settings.homeStation.toLowerCase().replace(/_/g, ' ');
-      targetStation = pois.find(p => 
-        isStationPoi(p) && 
-        p.name && 
-        p.name.toLowerCase().includes(normalizedHome)
-      );
-    }
-  }
+  const targetStation = pois.find(p =>
+    isStationPoi(p) &&
+    (p.base_id === homeInfo.baseId || p.id === homeInfo.poiId || p.id === homeInfo.baseId)
+  );
 
   if (!targetStation) {
-    targetStation = pois.find(p =>
-      isStationPoi(p) &&
-      p.base_id !== settings.focusStationId &&
-      p.id !== settings.focusStationId
-    );
-    if (targetStation) {
-      ctx.log("info", `Using default station in ${settings.homeSystem}: ${targetStation.base_id || targetStation.name || targetStation.id}`);
-    }
-  }
-
-  if (!targetStation && currentStation && isStationPoi(currentStation)) {
-    targetStation = currentStation;
-    ctx.log("info", `Using current station as home: ${targetStation.base_id || targetStation.id}`);
-  }
-
-  if (!targetStation && settings.homeSystem !== "sol") {
-    ctx.log("warn", `No valid home station in ${settings.homeSystem} — falling back to sol system`);
-    const solSystem = "sol";
-    if (bot.system !== solSystem) {
-      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-      if (fueled) {
-        const arrived = await navigateToSystem(ctx, solSystem, safetyOpts);
-        if (!arrived) {
-          ctx.log("error", "Failed to reach sol system for fallback");
-          return;
-        }
-      } else {
-        ctx.log("error", "Cannot refuel to reach sol system");
-        return;
-      }
-    }
-    const { pois: solPois } = await getSystemInfo(ctx);
-    targetStation = solPois.find(p =>
-      isStationPoi(p) &&
-      p.base_id !== settings.focusStationId &&
-      p.id !== settings.focusStationId
-    );
-    if (targetStation) {
-      ctx.log("info", `Using fallback station in sol: ${targetStation.base_id || targetStation.name || targetStation.id}`);
-    }
-  }
-
-  if (!targetStation) {
-    ctx.log("error", `Could not find home station (focus: ${settings.focusStationId || 'none'}, current: ${bot.poi}). Configure factionStorageStation in settings.`);
+    ctx.log("error", `Home station ${homeInfo.baseId} not found in ${homeInfo.systemId} — aborting deposit`);
     return;
   }
 
   const targetPoiId = targetStation.base_id || targetStation.id;
+  const alreadyThere = bot.poi === targetPoiId;
 
-  if (bot.poi !== targetPoiId) {
+  if (!alreadyThere) {
+    await ensureUndocked(ctx);
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
 
@@ -483,19 +488,34 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   const isAtHomeStation = targetStation && (
     targetStation.id === botPoiId || 
     targetStation.base_id === botPoiId ||
-    (targetStation as { poiId?: string }).poiId === botPoiId
+    targetStation.id === homeInfo.poiId ||
+    targetStation.base_id === homeInfo.baseId
   );
+
+  if (!isAtHomeStation) {
+    ctx.log("error", `Not at home station (at ${botPoiId}, expected ${homeInfo.baseId}) — aborting deposit`);
+    return;
+  }
 
   const deposited: string[] = [];
   const skipped: string[] = [];
 
-  if (settings.depositAllStorage && isAtHomeStation && bot.storage.length > 0) {
-    ctx.log("trade", `At home station — depositing all station storage to faction...`);
-    for (const item of [...bot.storage]) {
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+  // Deposit station storage: always deposit package:*; deposit everything else only when depositAllStorage is true
+  const storageItemsToDeposit = bot.storage.filter(item => {
+    if (item.quantity <= 0) return false;
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+    if (item.itemId.startsWith("package:")) return true;
+    return settings.depositAllStorage;
+  });
 
+  if (storageItemsToDeposit.length > 0 && isAtHomeStation) {
+    ctx.log("trade", `At home station — depositing station storage to faction...`);
+    for (const item of storageItemsToDeposit) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -520,9 +540,15 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   if (bot.inventory.some(i => i.quantity > 0)) {
     for (const item of [...bot.inventory]) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+      if (!settings.depositAllStorage && !item.itemId.startsWith("package:")) continue;
 
       if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
 
@@ -569,14 +595,14 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   ctx.log("info", `Cleaning home station storage at ${settings.homeStation}...`);
   
   // Navigate to home system if needed
-  if (bot.system !== settings.homeSystem) {
+  if (bot.system !== homeInfo.systemId) {
     await ensureUndocked(ctx);
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot refuel to reach home system for home station cleanup");
       return;
     }
-    const arrived = await navigateToSystem(ctx, settings.homeSystem, {
+    const arrived = await navigateToSystem(ctx, homeInfo.systemId, {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     });
@@ -586,27 +612,9 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
     }
   }
   
-  await ensureUndocked(ctx);
-  
-  // Check storage at home station using view_storage with station_id
-  const storageResp = await bot.viewStorage(homeInfo.baseId);
-  const storageError = storageResp.error as { message?: string } | undefined;
-  if (storageError) {
-    ctx.log("warn", `Could not view home station storage: ${storageError.message}`);
-    return;
-  }
-  
-  const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
-  await bot.refreshStorage();
-  const hasItems = bot.storage.length > 0;
-  
-  if (storedCredits === 0 && !hasItems) {
-    ctx.log("info", "Home station storage is empty — nothing to clean");
-    return;
-  }
-  
-  // Travel to home station if not already there
+  // Travel to home station POI if not already there
   if (bot.poi !== homeInfo.poiId) {
+    await ensureUndocked(ctx);
     ctx.log("travel", `Traveling to home station ${homeInfo.poiId}...`);
     const tResp = await bot.exec("travel", { target_poi: homeInfo.poiId });
     if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
@@ -622,19 +630,38 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
     return;
   }
   
+  // Now docked at home station - check storage and deposit
   await bot.refreshStorage();
   await bot.refreshCargo();
+  
+  const storageResp = await bot.viewStorage();
+  const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
+  const hasItems = bot.storage.some(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+  
+  if (storedCredits === 0 && !hasItems) {
+    ctx.log("info", "Home station storage is empty — nothing to clean");
+    return;
+  }
   
   let depositedCount = 0;
   
   // Deposit station storage (home station's storage) to faction
-  if (bot.storage.length > 0) {
+  // Always deposit package:* items; deposit everything else only when depositAllStorage is true
+  const storageItemsToDeposit = bot.storage.filter(item => {
+    if (item.quantity <= 0) return false;
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+    if (item.itemId.startsWith("package:")) return true;
+    return settings.depositAllStorage;
+  });
+
+  if (storageItemsToDeposit.length > 0) {
     ctx.log("trade", `Depositing home station storage to faction...`);
-    for (const item of [...bot.storage]) {
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      
+    for (const item of storageItemsToDeposit) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -642,7 +669,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
         quantity: item.quantity,
         source: "storage"
       });
-      
+
       if (!fResp.error) {
         depositedCount++;
         ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station storage`);
@@ -653,15 +680,19 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
       }
     }
   }
-  
+
   // Deposit cargo to faction
   if (bot.inventory.some(i => i.quantity > 0)) {
     ctx.log("trade", `Depositing cargo to faction...`);
     for (const item of [...bot.inventory]) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting deposit");
+        return;
+      }
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      
+
       const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
@@ -669,7 +700,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
         quantity: item.quantity,
         source: "cargo"
       });
-      
+
       if (!fResp.error) {
         depositedCount++;
         ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station cargo`);
@@ -774,7 +805,21 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
     };
+    ctx.log("info", `Cleanup settings: home=${settings.homeStation} (${settings.homeSystem}), focus=${settings.focusStationId || 'none'}, depositAllStorage=${settings.depositAllStorage}`);
+
+    // ── Cloak: enable at startup/cycle start if configured ──
+    await enableCloakAtDock(ctx, settings);
+
+    // ── Cloak: re-enable after refuel/rescue if lost ──
+    if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+      ctx.log("cleanup", "Cloak check: not cloaked, attempting to re-enable...");
+      const cloaked = await enableCloakingIfPossible(ctx);
+      if (cloaked) {
+        ctx.log("cleanup", "Cloaking re-enabled successfully");
+      }
+    }
 
     // ── Phase 0: Clean home station storage ──
     yield "clean_home_station";
@@ -813,7 +858,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const hintEntries = parseStorageHints(hint);
 
     // Get all known stations for comparison
-    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId);
+    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId, false);
 
     // If we got hints, mark stations that have items
     const stationsWithStorage: StationTarget[] = [];
@@ -888,15 +933,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         // Remotely verify this station actually has items/credits
         const remote = await bot.viewStorage(target.stationId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const itemArray = (
-          Array.isArray(remote) ? remote :
-          Array.isArray(remote.items) ? remote.items :
-          Array.isArray(remote.storage) ? remote.storage :
-          []
-        ) as Array<Record<string, unknown>>;
-        const hasItems = itemArray.some(
-          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
-        );
+        const parsedItems = bot.parseItemList(remote);
+        const hasItems = parsedItems.some(i => i.quantity > 0);
 
         if (credits > 0 || hasItems) {
           target.hasCredits = credits > 0;
@@ -924,15 +962,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const remote = await bot.viewStorage(storageId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const itemArray = (
-          Array.isArray(remote) ? remote :
-          Array.isArray(remote.items) ? remote.items :
-          Array.isArray(remote.storage) ? remote.storage :
-          []
-        ) as Array<Record<string, unknown>>;
-        const hasItems = itemArray.some(
-          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
-        );
+        const parsedItems = bot.parseItemList(remote);
+        const hasItems = parsedItems.some(i => i.quantity > 0);
 
         if (credits > 0 || hasItems) {
           station.hasCredits = credits > 0;
@@ -1052,7 +1083,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalItems = 0;
 
     // Sort by distance (same-system first, then by jump count, avoiding blacklisted systems)
-    const blacklist = getSystemBlacklist();
+    const blacklist = bot.isCloaked && settings.cloakIgnoreBlacklist ? [] : getSystemBlacklist();
     stationsWithStorage.sort((a, b) => {
       const aLocal = a.systemId === bot.system ? 0 : 1;
       const bLocal = b.systemId === bot.system ? 0 : 1;
@@ -1072,7 +1103,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("travel", `Heading to ${station.poiName} in ${station.systemId}...`);
 
       if (bot.system !== station.systemId) {
-        await ensureUndocked(ctx);
+        await undockForTravel(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
           ctx.log("error", `Cannot refuel to reach ${station.systemId} — skipping`);
@@ -1111,7 +1142,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      await ensureUndocked(ctx);
+      await undockForTravel(ctx);
       
       // Force refresh status to get accurate poi after undocking
       await bot.refreshLocation();
@@ -1205,6 +1236,11 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       if (storedCredits === 0 && !hasItems) {
         ctx.log("info", `${station.poiName}: empty — skipping`);
         await tryRefuel(ctx);
+        // Re-enable cloak after refuel if we were rescued and settings allow it
+        if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+          ctx.log("cleanup", "Re-enabling cloak after refuel...");
+          await enableCloakingIfPossible(ctx);
+        }
         // If this is the only station (or last station), we're done - don't keep looping
         if (stationsWithStorage.length === 1) {
           ctx.log("info", "Only station was empty - ending cleanup cycle");
@@ -1262,6 +1298,11 @@ for (const order of orderList) {
 
       // Refuel while docked
       await tryRefuel(ctx);
+      // Re-enable cloak after refuel if we were rescued and settings allow it
+      if (settings.enableCloak && bot.fuel > 0 && !bot.isCloaked) {
+        ctx.log("cleanup", "Re-enabling cloak after refuel...");
+        await enableCloakingIfPossible(ctx);
+      }
 
       // If cargo >= 80% full, deposit at home before continuing
       await bot.refreshCargo();

@@ -1,7 +1,8 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { perf } from "../perf.js";
+import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { writeFileSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import {
@@ -24,12 +25,20 @@ import {
   maxItemsForCargo,
   getItemSize,
   readSettings,
+  cargoUsedFromInventory,
+  isStationPoi,
+  stationHasMarket,
   logFactionActivity,
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getBattleStatus,
   fleeFromBattle,
+  isFuelCellItem,
+  getCargoFuelCells,
+  ensureFuelCellReserve,
+  estimateRouteFuel,
+  readPurchaseEstimate,
   type BattleState,
 } from "./common.js";
 import {
@@ -58,6 +67,8 @@ import {
   getAllUnsoldItems,
   type UnsoldItem,
 } from "./unsoldItems.js";
+import { queryRemoteMarket, getMarketSourceInfo, resolveMarketSource } from "../client_sync_hooks.js";
+import { noteLocalMarketUnavailable } from "../market_local_source.js";
 
 // ── CSV Logging ─────────────────────────────────────────────────
 
@@ -265,7 +276,7 @@ interface AboardPassenger {
 
 async function getPassengersAtStation(ctx: RoutineContext, stationId: string, systemId: string): Promise<StationPassenger[]> {
   const { bot } = ctx;
-  const resp = await bot.exec("list_station_passengers", { station: stationId });
+  const resp = await bot.exec("list_station_passengers");
   if (resp.error || !resp.result) return [];
 
   const result = resp.result as Record<string, unknown>;
@@ -327,6 +338,8 @@ function parseListPassengers(result: unknown): { passengers: AboardPassenger[]; 
 const TRADER_WORKING_BALANCE = 200_000;
 /** Buffer above working balance before depositing excess to faction storage. */
 const TRADER_DEPOSIT_THRESHOLD = 210_000;
+/** Fuel per jump assumed only when `find_route` can't tell us the real number. */
+const TRADER_FALLBACK_FUEL_PER_JUMP = 10;
 
 /**
  * Check if the bot can afford a trade route, including potential withdrawal from storage.
@@ -503,10 +516,12 @@ function getTraderSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
+  homeStation: string;
   tradeItems: string[];
   autoInsure: boolean;
   stationPriority: boolean;
   autoCloak: boolean;
+  ignorePiratesWhenCloaked: boolean;
   maxFactionCreditsToUse: number;
   enableMissions: boolean;
   debugLogging: boolean;
@@ -514,6 +529,10 @@ function getTraderSettings(username?: string): {
   enablePassengerTransport: boolean;
   passengerFareEstimate: number;
   depositProfitsToFaction: boolean;
+  useRemoteMarketQuery: boolean;
+  grabMilitaryFuelCells: boolean;
+  militaryFuelCellMin: number;
+  militaryFuelCellTarget: number;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -525,10 +544,12 @@ function getTraderSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
     tradeItems: Array.isArray(t.tradeItems) ? (t.tradeItems as string[]) : [],
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
+    ignorePiratesWhenCloaked: (t.ignorePiratesWhenCloaked as boolean) ?? true,
     maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0,
     enableMissions: (t.enableMissions as boolean) !== false,
     debugLogging: (t.debugLogging as boolean) ?? false,
@@ -536,10 +557,120 @@ function getTraderSettings(username?: string): {
     enablePassengerTransport: (t.enablePassengerTransport as boolean) ?? true,
     passengerFareEstimate: (t.passengerFareEstimate as number) ?? 5000,
     depositProfitsToFaction: (t.depositProfitsToFaction as boolean) ?? true,
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
+    grabMilitaryFuelCells: (t.grabMilitaryFuelCells as boolean) ?? true,
+    // Low-water mark: when the in-cargo military_fuel_cell reserve drops to this
+    // many (or fewer) while away from home, the bot heads home to restock.
+    militaryFuelCellMin: (t.militaryFuelCellMin as number) ?? 1,
+    // Full load to carry: a 130-cargo trader keeps 6 (=18 cargo) as a free,
+    // high-density emergency fuel reserve (100 fuel / 3 space each).
+    militaryFuelCellTarget: (t.militaryFuelCellTarget as number) ?? 6,
   };
 }
 
+/**
+ * Quick-mode fuel safety: whenever docked at the HOME station, make sure the bot
+ * is carrying a full load of military_fuel_cell. These are free at home and
+ * vastly superior to plain fuel_cell (100 fuel / 3 space vs 20 fuel / 1 space),
+ * so we never want to be caught buying expensive plain fuel_cells at a remote
+ * station. Tops up to `militaryFuelCellTarget` (default 6 = 18 cargo on a 130
+ * hull — a full tank's worth) when cargo space permits.
+ *
+ * Source order at home: faction storage (free) → station storage (free) → market buy.
+ */
+async function stockpileMilitaryFuelCells(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  if (!settings.grabMilitaryFuelCells) return;
+  if (!bot.docked) return;
+
+  const homeSystem = settings.homeSystem || "";
+  const homePoi = getHomeStationPoi(settings.homeStation);
+  const atHome = !!homeSystem && bot.system === homeSystem && (homePoi === "" || bot.poi === homePoi);
+  if (!atHome) return;
+
+  const MIL = "military_fuel_cell";
+  await bot.refreshCargo();
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+
+  const current = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
+  // Full load of military fuel cells: a 130-cargo trader carries 6 (=18 cargo)
+  // as a free, high-density emergency fuel reserve. Nothing to do if already full.
+  const target = Math.max(1, settings.militaryFuelCellTarget);
+  if (current >= target) return;
+
+  const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
+  const maxFit = maxItemsForCargo(freeWeight, MIL);
+  if (maxFit <= 0) return;
+
+  let need = Math.min(target - current, maxFit);
+  if (need <= 0) return;
+
+  // 1) Faction storage (free)
+  const inFaction = bot.factionStorage.find((i) => i.itemId === MIL);
+  if (need > 0 && inFaction && inFaction.quantity > 0) {
+    const qty = Math.min(inFaction.quantity, need);
+    if (qty > 0) {
+      const fResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: MIL, quantity: qty, source: "faction" });
+      if (!fResp.error) {
+        await bot.refreshStorage();
+        const wResp = await bot.exec("withdraw_items", { item_id: MIL, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          need -= qty;
+        }
+      }
+    }
+  }
+
+  // 2) Station storage (free)
+  if (need > 0) {
+    const inStation = bot.storage.find((i) => i.itemId === MIL);
+    if (inStation && inStation.quantity > 0) {
+      const qty = Math.min(inStation.quantity, need);
+      if (qty > 0) {
+        const wResp = await bot.exec("withdraw_items", { item_id: MIL, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          need -= qty;
+        }
+      }
+    }
+  }
+
+  // 3) Buy from the (free/cheap) home market
+  if (need > 0) {
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      if (stationHasMarket(station)) {
+        const buyResp = await bot.exec("buy", { item_id: MIL, quantity: need });
+        if (!buyResp.error) {
+          await bot.refreshCargo();
+        }
+      }
+    } catch { /* market unavailable — skip */ }
+  }
+
+  const got = bot.inventory.find((i) => i.itemId === MIL)?.quantity || 0;
+  if (got !== current) {
+    ctx.log("trade", `Stockpiled military_fuel_cell at home: ${current} -> ${got} (target ${target})`);
+  }
+}
+
 // ── Trade Session Recovery ──────────────────────────────────
+
+/**
+ * Normalize a configured home station value to a bare POI id.
+ * Settings may store it as "system|poi" (e.g. "sol|sol_central") or just "poi".
+ */
+function getHomeStationPoi(homeStation: string): string {
+  if (!homeStation) return "";
+  return homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+}
 
 /**
  * Check for and recover an incomplete trade session.
@@ -726,6 +857,126 @@ export interface TradeRoute {
 
 // ── Trade route discovery ────────────────────────────────────
 
+/** The shape of a price spread used by findTradeOpportunities. */
+type PriceSpread = {
+  itemId: string; itemName: string;
+  sourceSystem: string; sourcePoi: string; sourcePoiName: string; buyAt: number; buyQty: number;
+  destSystem: string; destPoi: string; destPoiName: string; sellAt: number; sellQty: number;
+  spread: number;
+};
+
+/**
+ * Query the best market data source for the cheapest place to BUY each item in
+ * `items`, and return them as synthetic price spreads that can be merged into
+ * the local mapStore spreads. For each remote sell station we pair it with the
+ * best LOCAL buy listing (so the route stays "current location → remote buy →
+ * local sell", keeping travel sane).
+ *
+ * The source is auto-detected: another connected client via the sync master
+ * when one holds the market data, or this client's own
+ * `data/marketDetails.json` when the market routines run right here (or no
+ * remote client is reachable).
+ *
+ * Returns [] when market queries are disabled, fail, or find nothing, so callers
+ * can safely append the result to their local spreads.
+ */
+/** Log line for "the market query found nothing", worded for whichever source
+ *  the client is actually using (local file vs a connected client) so the log
+ *  never claims a remote lookup happened when it didn't. */
+function describeNoMarketDeals(itemCount: number, prefix = ""): string {
+  const src = getMarketSourceInfo();
+  if (src.mode === "none") {
+    return `[Market] No market data source for ${prefix}${itemCount} item(s) — ${src.reason}`;
+  }
+  const kind = src.mode === "local" ? "local" : "remote";
+  return `[${src.label}] No ${kind} deals found for ${prefix}${itemCount} item(s)`;
+}
+
+async function collectRemoteSpreads(
+  items: string[],
+  currentSystem: string,
+  debugLog?: (msg: string) => void,
+): Promise<PriceSpread[]> {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.collectRemoteSpreads") : null;
+  const out: PriceSpread[] = [];
+  if (items.length === 0) { stop?.end(); return out; }
+
+  // Work out where market data should come from BEFORE fanning out. When the
+  // market routines run in this same client (or there is no reachable remote
+  // client), queryRemoteMarket reads data/marketDetails.json directly instead
+  // of making a call out of the client that can only ever fail.
+  const source = await resolveMarketSource();
+  if (source.mode === "none") {
+    debugLog?.(`[Market] No market data source: ${source.reason}`);
+    stop?.end();
+    return out;
+  }
+  debugLog?.(`[${source.label}] ${source.reason}`);
+
+  const results = await Promise.all(items.map(async (itemId) => {
+    try {
+      const res = await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystem });
+      if (!res.ok || res.results.length === 0) return null;
+      // Reconstruct a lean spread object from the remote response
+      const r = res.results[0];
+      return {
+        itemId,
+        itemName: itemId,
+        remoteSystem: r.systemId,
+        remotePoi: r.stationPoiId,
+        remotePoiName: r.stationName,
+        remotePrice: r.price,
+        remoteQty: r.quantity,
+      };
+    } catch {
+      return null;
+    }
+  }));
+
+  const hits = results.filter(Boolean) as Array<{
+    itemId: string; itemName: string;
+    remoteSystem: string; remotePoi: string; remotePoiName: string;
+    remotePrice: number; remoteQty: number;
+  }>;
+
+  if (hits.length === 0) { stop?.end(); return out; }
+
+  // Pair each remote buy source with the best local sell listing for the item.
+  const localBuys = mapStore.getAllBuyDemand();
+  for (const hit of hits) {
+    // Only use remote deals whose source station is actually reachable in our
+    // local map — otherwise estimateFuelCost() returns 999-jump penalties and
+    // the route is unexecutable.
+    const srcSys = mapStore.getSystem(hit.remoteSystem);
+    if (!srcSys || !srcSys.pois.find(p => p.id === hit.remotePoi)) continue;
+    if (!mapStore.findRoute(currentSystem, hit.remoteSystem, getSystemBlacklist())) continue;
+
+    const dests = localBuys
+      .filter(b => b.itemId === hit.itemId && b.price > hit.remotePrice && b.quantity > 0)
+      .sort((a, b) => b.price - a.price);
+    if (dests.length === 0) continue;
+    const dest = dests[0];
+    out.push({
+      itemId: hit.itemId,
+      itemName: hit.itemName,
+      sourceSystem: hit.remoteSystem,
+      sourcePoi: hit.remotePoi,
+      sourcePoiName: hit.remotePoiName,
+      buyAt: hit.remotePrice,
+      buyQty: hit.remoteQty,
+      destSystem: dest.systemId,
+      destPoi: dest.poiId,
+      destPoiName: dest.poiName,
+      sellAt: dest.price,
+      sellQty: dest.quantity,
+      spread: dest.price - hit.remotePrice,
+    });
+  }
+  debugLog?.(`collectRemoteSpreads: ${out.length} remote-augmented route(s) from ${hits.length} client(s)`);
+  stop?.end();
+  return out;
+}
+
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
   const blacklist = getSystemBlacklist();
@@ -744,7 +995,9 @@ export function findTradeOpportunities(
   cargoCapacity: number = 999,
   marketInsights: Array<Record<string, unknown>> = [],
   debugLog?: (msg: string) => void,
+  remoteSpreads: PriceSpread[] = [],
 ): TradeRoute[] {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.findTradeOpportunities") : null;
   // Extract oversupply items to filter out bad sell destinations
   const oversupplyItems = new Set<string>();
   for (const insight of marketInsights) {
@@ -756,7 +1009,10 @@ export function findTradeOpportunities(
       oversupplyItems.add(insight.item_id);
     }
   }
-  const spreads = mapStore.findPriceSpreads();
+  const spreads = [...mapStore.findPriceSpreads(), ...remoteSpreads];
+  if (remoteSpreads.length > 0) {
+    debugLog?.(`findTradeOpportunities: merged ${remoteSpreads.length} remote spread(s) into ${spreads.length} total`);
+  }
   const routes: TradeRoute[] = [];
 
   // Process market insights first (higher priority)
@@ -808,15 +1064,6 @@ export function findTradeOpportunities(
       continue;
     }
 
-    const tradeQty = Math.min(sp.buyQty, sp.sellQty, maxItemsForCargo(cargoCapacity, sp.itemId));
-    const totalProfit = profitPerUnit * tradeQty;
-
-    // Cap by max cargo value
-    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) {
-      skippedValueCap++;
-      continue;
-    }
-
     // CRITICAL: Verify destination has actual buy demand (not just cached data)
     // This prevents buying items when no one wants to buy them
     const destSys = mapStore.getSystem(sp.destSystem);
@@ -825,6 +1072,18 @@ export function findTradeOpportunities(
     if (!destMarket || !destMarket.best_buy || destMarket.buy_quantity <= 0) {
       skippedItems++;
       debugLog?.(`  Skipping ${sp.itemName}: no destination buyer (buyQty=${destMarket?.buy_quantity || 0})`);
+      continue;
+    }
+    // Size the trade by how many units the destination will actually pay the
+    // quoted price for — never by the sum of all buy orders across price tiers.
+    const destDepthAtBest = destMarket.best_buy_quantity > 0 ? destMarket.best_buy_quantity : destMarket.buy_quantity;
+
+    const tradeQty = Math.min(sp.buyQty, sp.sellQty, destDepthAtBest, maxItemsForCargo(cargoCapacity, sp.itemId));
+    const totalProfit = profitPerUnit * tradeQty;
+
+    // Cap by max cargo value
+    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) {
+      skippedValueCap++;
       continue;
     }
 
@@ -853,15 +1112,16 @@ export function findTradeOpportunities(
 
   // Sort by total profit descending
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  stop?.end();
   return routes;
 }
 
 /** Find the cheapest known market sell price for an item (replacement/acquisition cost). */
-export function getItemMarketCost(itemId: string): number {
+export function getItemMarketCost(itemId: string, settings?: { useRemoteMarketQuery?: boolean }, currentSystemId?: string): number {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.getItemMarketCost") : null;
   let cheapest = Infinity;
   const systems = mapStore.getAllSystems();
   for (const sys of Object.values(systems)) {
-    // Skip pirate systems
     if (isPirateSystem(sys.id)) continue;
     for (const poi of sys.pois) {
       for (const m of poi.market) {
@@ -871,7 +1131,24 @@ export function getItemMarketCost(itemId: string): number {
       }
     }
   }
-  return cheapest === Infinity ? 0 : cheapest;
+  stop?.end();
+  if (cheapest === Infinity) return 0;
+  return cheapest;
+}
+
+/** Try to get market cost from a remote client via the sync master.
+ *  Returns the cheapest remote sell price, or 0 if no remote data is available. */
+export async function getRemoteItemMarketCost(itemId: string, currentSystemId?: string): Promise<number> {
+  try {
+    const result = await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystemId });
+    if (result.ok && result.results.length > 0) {
+      const cheapest = result.results.reduce((min, r) => r.price < min ? r.price : min, Infinity);
+      return cheapest === Infinity ? 0 : cheapest;
+    }
+  } catch {
+    // Non-fatal: fall back to local data
+  }
+  return 0;
 }
 
 /**
@@ -886,6 +1163,7 @@ export function processMarketInsights(
   cargoCapacity: number = 999,
   debugLog?: (msg: string) => void,
 ): TradeRoute[] {
+  const stop = perf.isEnabled() ? perf.startSpan("trader.processMarketInsights") : null;
   const routes: TradeRoute[] = [];
 
   debugLog?.(`processMarketInsights: ${insights.length} insights, priority threshold 100000`);
@@ -1152,6 +1430,7 @@ export function processMarketInsights(
 
   // Sort by total profit descending
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  stop?.end();
   return routes;
 }
 
@@ -1166,14 +1445,14 @@ async function calculateOptimalSellQuantity(
   itemName: string,
   availableQuantity: number,
   minPricePerUnit: number,
-): Promise<{ sellQty: number; expectedRevenue: number; priceBreakdown: string }> {
+): Promise<{ sellQty: number; heldQty: number; expectedRevenue: number; priceBreakdown: string }> {
   const { bot } = ctx;
 
   // Check the market for this specific item
   const marketResp = await bot.exec("view_market", { item_id: itemId });
   if (marketResp.error || !marketResp.result) {
     ctx.log("trade", `view_market failed for ${itemName} — using cached data`);
-    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+    return { sellQty: availableQuantity, heldQty: 0, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
   }
 
   const marketData = marketResp.result as Record<string, unknown>;
@@ -1186,54 +1465,143 @@ async function calculateOptimalSellQuantity(
   const itemMarket = items.find(i => (i.item_id as string) === itemId);
   if (!itemMarket) {
     ctx.log("trade", `No market data for ${itemName} — using cached data`);
-    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+    return { sellQty: availableQuantity, heldQty: 0, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
   }
 
-  const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
-  if (buyOrders.length === 0) {
+  const rawBuyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+  if (rawBuyOrders.length === 0) {
     ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
-    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders" };
+    return { sellQty: 0, heldQty: availableQuantity, expectedRevenue: 0, priceBreakdown: "no buy orders" };
   }
 
-  // Calculate how many we can sell at or above minimum price
-  let remainingToSell = availableQuantity;
+  // Fill best-priced orders first, exactly like the in-game sell does.
+  const buyOrders = rawBuyOrders
+    .map(o => ({
+      priceEach: (o.price_each as number) || (o.price as number) || 0,
+      orderQty: (o.quantity as number) || (o.remaining as number) || 0,
+    }))
+    .filter(o => o.orderQty > 0 && o.priceEach > 0)
+    .sort((a, b) => b.priceEach - a.priceEach);
+
+  // Sell ONLY units priced at or above the break-even floor. Anything below the
+  // floor is held (and routed to an alternate buyer) instead of being dumped at
+  // a fire-sale price that destroys the whole trade's profit.
+  let remaining = availableQuantity;
   let totalRevenue = 0;
-  let soldAtProfit = 0;
+  let sellQty = 0;
+  let heldQty = 0;
   const priceDetails: string[] = [];
 
   for (const order of buyOrders) {
-    if (remainingToSell <= 0) break;
+    if (remaining <= 0) break;
 
-    const priceEach = (order.price_each as number) || 0;
-    const orderQty = (order.quantity as number) || 0;
+    const qtyAtThisPrice = Math.min(remaining, order.orderQty);
 
-    if (orderQty <= 0 || priceEach <= 0) continue;
-
-    const qtyAtThisPrice = Math.min(remainingToSell, orderQty);
-    const revenueAtThisPrice = qtyAtThisPrice * priceEach;
-
-    totalRevenue += revenueAtThisPrice;
-    remainingToSell -= qtyAtThisPrice;
-
-    if (priceEach >= minPricePerUnit) {
-      soldAtProfit += qtyAtThisPrice;
+    if (order.priceEach >= minPricePerUnit) {
+      totalRevenue += qtyAtThisPrice * order.priceEach;
+      sellQty += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
+      priceDetails.push(`${qtyAtThisPrice}x @ ${order.priceEach}cr`);
+    } else {
+      // Below our floor — do not sell here.
+      heldQty += qtyAtThisPrice;
+      remaining -= qtyAtThisPrice;
     }
-
-    priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
   }
 
-  const actualSellQty = availableQuantity - remainingToSell;
   const priceBreakdown = priceDetails.join(", ");
 
-  if (remainingToSell > 0) {
-    ctx.log("trade", `Market check: can sell ${actualSellQty}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
+  if (heldQty > 0) {
+    ctx.log("warn", `Market check: ${sellQty}/${availableQuantity}x ${itemName} at >=${minPricePerUnit}cr (${priceBreakdown || "none"}), ${heldQty}x only available below floor — holding`);
+  } else if (sellQty < availableQuantity) {
+    ctx.log("trade", `Market check: can sell ${sellQty}/${availableQuantity}x ${itemName} (${priceBreakdown})`);
   }
 
-  if (soldAtProfit < actualSellQty && actualSellQty > 0) {
-    ctx.log("warn", `Market check: only ${soldAtProfit}/${actualSellQty}x ${itemName} at target price ${minPricePerUnit}cr — rest at lower prices`);
+  return { sellQty, heldQty, expectedRevenue: totalRevenue, priceBreakdown };
+}
+
+/**
+ * Authoritatively compute credits earned from a `sell` call.
+ *
+ * `bot.exec("sell")` already updates `bot.credits` to the post-sale absolute
+ * balance, so the credit delta is the source of truth. We never fall back to
+ * `sold * quotedPrice`, which previously turned a thin-depth fire-sale into a
+ * fabricated half-million-credit "profit".
+ */
+/**
+ * Minimum fraction of cargo that must be sellable at/above break-even before we
+ * commit to a sale at the planned destination. Below this, selling is a token
+ * sale and we route the whole stack to an alternate buyer instead.
+ */
+const MIN_GOOD_SELL_FRACTION = 0.2;
+
+function earnedFromSell(
+  ctx: RoutineContext,
+  creditsBefore: number,
+  sr: Record<string, unknown> | undefined,
+  sold: number,
+  fallbackPrice?: number,
+): number {
+  const delta = ctx.bot.credits - creditsBefore;
+  if (delta > 0) return sanitizeCredits(delta);
+  if (sr) {
+    const respEarned = sanitizeCredits(
+      (sr.credits_earned as number) ?? (sr.total as number) ?? (sr.revenue as number) ?? 0,
+    );
+    if (respEarned > 0) return respEarned;
+  }
+  if (fallbackPrice && fallbackPrice > 0 && sold > 0) {
+    ctx.log("warn", `Sell revenue unverified — estimating ${sold}x @ ${fallbackPrice}cr`);
+    return sanitizeCredits(sold * fallbackPrice);
+  }
+  return 0;
+}
+
+/**
+ * Sell up to the quantity the market will actually pay at/above `minPricePerUnit`,
+ * then stop. Returns what actually sold, the verified revenue, and what's left.
+ *
+ * This is the single chokepoint that prevents fire-sale dumping: it never sells
+ * below the break-even floor, and if the market can only absorb a token fraction
+ * at a good price it returns everything unsold so the caller can route the cargo
+ * to a better buyer instead. Revenue is always taken from the authoritative
+ * credit-delta (see `earnedFromSell`), never from a quoted best price.
+ */
+async function sellUpToFloor(
+  ctx: RoutineContext,
+  itemId: string,
+  itemName: string,
+  availableQty: number,
+  minPricePerUnit: number,
+  logLabel: string,
+): Promise<{ sold: number; revenue: number; remaining: number }> {
+  if (availableQty <= 0) return { sold: 0, revenue: 0, remaining: 0 };
+
+  const marketCheck = await calculateOptimalSellQuantity(ctx, itemId, itemName, availableQty, minPricePerUnit);
+  if (marketCheck.sellQty <= 0) {
+    return { sold: 0, revenue: 0, remaining: availableQty };
   }
 
-  return { sellQty: actualSellQty, expectedRevenue: totalRevenue, priceBreakdown };
+  const goodFraction = availableQty > 0 ? marketCheck.sellQty / availableQty : 1;
+  if (marketCheck.heldQty > 0 && goodFraction < MIN_GOOD_SELL_FRACTION) {
+    ctx.log("warn", `${logLabel}: market only absorbs ${marketCheck.sellQty}/${availableQty}x ${itemName} at >=${minPricePerUnit}cr (${Math.round(goodFraction * 100)}%) — skipping, routing to a better buyer`);
+    return { sold: 0, revenue: 0, remaining: availableQty };
+  }
+
+  const creditsBefore = ctx.bot.credits;
+  const actualSellQty = marketCheck.sellQty;
+  ctx.log("trade", `${logLabel}: selling ${actualSellQty}x ${itemName} (${marketCheck.priceBreakdown})...`);
+  const sellResp = await ctx.bot.exec("sell", { item_id: itemId, quantity: actualSellQty });
+  if (sellResp.error) {
+    ctx.log("error", `Sell failed: ${sellResp.error.message}`);
+    return { sold: 0, revenue: 0, remaining: availableQty };
+  }
+  const sr = sellResp.result as Record<string, unknown> | undefined;
+  await ctx.bot.refreshCargo();
+  const afterSell = ctx.bot.inventory.find(i => i.itemId === itemId)?.quantity ?? 0;
+  const sold = actualSellQty - afterSell;
+  const revenue = earnedFromSell(ctx, creditsBefore, sr, sold);
+  return { sold, revenue, remaining: afterSell };
 }
 
 /**
@@ -1481,6 +1849,10 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
 
+  // Respect the enableMissions setting (default true). When disabled, never
+  // touch active missions — neither completing nor accepting them.
+  if (getTraderSettings(bot.username).enableMissions === false) return;
+
   // Try to complete active missions
   const activeResp = await bot.exec("get_active_missions");
   let activeMissionCount = 0;
@@ -1569,8 +1941,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   const startSystem = bot.system;
 
   // ── Cloaking setup (one-time at routine start) ──
+  // Only cloak now if already undocked. If docked, the bot must stay docked for
+  // the market-analysis phase; navigateToSystem() will cloak it before travel.
   const settings = getTraderSettings(bot.username);
-  if (settings.autoCloak) {
+  if (settings.autoCloak && !bot.docked) {
     await enableCloakingIfPossible(ctx);
   }
 
@@ -1658,9 +2032,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Cloak status check (every cycle when autoCloak enabled) ──
-    // Re-verify cloaking status and re-enable if needed (but only if we have fuel)
-    if (settings.autoCloak && !bot.isCloaked && bot.fuel > 0) {
-      ctx.log("trade", "Cloak status check: bot not cloaked and has fuel — re-enabling cloak");
+    // Re-verify cloaking status and re-enable if needed — but ONLY while undocked.
+    // Cloaking undocks the ship, so re-enabling it while docked would break the
+    // docked-only operations below (analyze_market, missions, etc.) because
+    // ensureDocked() short-circuits on a stale docked flag. The bot always
+    // re-docks at the top of the docked phase, and navigateToSystem() re-cloaks
+    // before each jump, so do NOT cloak here when already docked.
+    if (settings.autoCloak && !bot.isCloaked && !bot.docked && bot.fuel > 0) {
+      ctx.log("trade", "Cloak status check: bot undocked and not cloaked — re-enabling cloak");
       await enableCloakingIfPossible(ctx);
     }
 
@@ -1679,7 +2058,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+      ignoreBlacklistWhenCloaked: settings.autoCloak,
     };
+
+    // ── Low military fuel cell reserve → return home to restock ──
+    // Military fuel cells are a free, high-density emergency fuel reserve
+    // (100 fuel / 3 cargo). When the reserve runs down while out trading, the
+    // bot would otherwise have to buy expensive plain fuel_cells at remote
+    // stations. If we're not mid-delivery (no active session) and the in-cargo
+    // reserve drops to `militaryFuelCellMin` or fewer, head home and top back
+    // up to a full load instead of starting another trade run.
+    if (settings.grabMilitaryFuelCells && !activeSession) {
+      const homePoi = getHomeStationPoi(settings.homeStation);
+      const atHome = !!homeSystem && bot.system === homeSystem &&
+        (homePoi === "" || bot.poi === homePoi);
+      if (!atHome) {
+        await bot.refreshCargo();
+        const milCells = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity ?? 0;
+        if (milCells <= settings.militaryFuelCellMin) {
+          ctx.log("trade", `Low military_fuel_cell reserve (${milCells} ≤ ${settings.militaryFuelCellMin}) — returning home to restock`);
+          const ok = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (ok) {
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              await bot.exec("travel", { target_poi: homeStation.id });
+              bot.poi = homeStation.id;
+              await ensureDocked(ctx);
+            }
+          }
+          // Loop back — stockpileMilitaryFuelCells() refills the load at home.
+          await ctx.sleep(2000);
+          continue;
+        }
+      }
+    }
+
     let extraRevenue = 0;
     let recoveredSessionHandled = false; // Track if we've handled a recovered session
     let recoveredSessionAtDestination = false; // Track if recovered session already arrived at dest and docked
@@ -1836,7 +2251,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Ensure docked (also records market data + analyzes market) ──
     yield "dock";
     await ensureDocked(ctx);
-    
+
+    // ── Quick-mode: stockpile free military fuel cells whenever at home ──
+    yield "stockpile_fuel_cells";
+    await stockpileMilitaryFuelCells(ctx, settings);
+
     // ── Priority 0: Sell trade items immediately after docking ──
     // This is the most time-critical operation - sell before anything else
     yield "sell_trade_items";
@@ -1952,6 +2371,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               fuelThresholdPct: settings.refuelThreshold,
               hullThresholdPct: settings.repairThreshold,
               autoCloak: settings.autoCloak,
+              ignorePiratesWhenCloaked: settings.ignorePiratesWhenCloaked,
+              ignoreBlacklistWhenCloaked: settings.autoCloak,
             });
             if (arrived) {
               // Find station at home
@@ -2135,6 +2556,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!recoveredSessionHandled) {
       await bot.refreshLocation();
       await bot.refreshCargo();
+
+      // ── Early fuel-cell offload ──
+      // Fuel cells are a cargo blocker: if they fill the hold, cargoCapacity
+      // collapses to 0 and every route computes "buy 0x" → permanent skip loop.
+      // While docked, deposit the EXCESS above a small reserve into faction
+      // storage so the hold has room for actual trade goods. We keep a modest
+      // reserve (no route chosen yet) so the bot can still fuel between jumps.
+      if (bot.docked) {
+        const FREE_TRADE_SPACE = Math.max(50, Math.floor((bot.cargoMax > 0 ? bot.cargoMax : 50) * 0.5));
+        const fuelReserveSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
+        let fuelCellWeight = 0;
+        for (const item of bot.inventory) {
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) {
+            fuelCellWeight += item.quantity * getItemSize(item.itemId);
+          }
+        }
+        const freeSpace = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
+        if (freeSpace < FREE_TRADE_SPACE) {
+          const offloadSummary: string[] = [];
+          for (const item of [...bot.inventory]) {
+            const lower = item.itemId.toLowerCase();
+            if (!(lower.includes("fuel") || lower.includes("energy_cell"))) continue;
+            const excess = item.quantity - fuelReserveSlots;
+            if (excess <= 0) continue;
+            const dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: excess });
+            if (!dResp.error) {
+              offloadSummary.push(`${excess}x ${item.name}`);
+            }
+          }
+          if (offloadSummary.length > 0) {
+            ctx.log("trade", `Offloaded cargo-blocking fuel cells to faction storage: ${offloadSummary.join(", ")}`);
+            await bot.refreshCargo();
+          }
+        }
+      }
+
       let fuelCellWeight = 0;
       for (const item of bot.inventory) {
         const lower = item.itemId.toLowerCase();
@@ -2145,8 +2603,30 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
       const spreadCount = mapStore.findPriceSpreads().length;
       cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
+
+      // Market query: augment local map data with fresh prices, either from
+      // another connected client or — when the market routines run in this
+      // same client — straight from data/marketDetails.json. Low-bandwidth
+      // (~200 bytes per remote query, zero bytes when served locally).
+      let remoteSpreads: PriceSpread[] = [];
+      if (settings.useRemoteMarketQuery !== false) {
+        const uniqueItems = new Set<string>();
+        for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
+        if (uniqueItems.size > 0) {
+          remoteSpreads = await collectRemoteSpreads(
+            Array.from(uniqueItems).slice(0, 20),
+            bot.system,
+            settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+          );
+          if (remoteSpreads.length === 0) {
+            ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20)));
+          }
+        }
+      }
+
       marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
-        settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined);
+        settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+        remoteSpreads);
       unsoldRoutes = findUnsoldItemRoutes(ctx, settings, bot.system, cargoCapacity);
       ctx.log("trade", `findCargoSellRoutes found ${cargoRoutes.length} routes`);
       ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${spreadCount} spreads`);
@@ -2156,6 +2636,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
         return true;
       });
+      // Skip any route whose buy or sell station is on the station blacklist
+      // (e.g. banned faction outposts that can never be set public / docked at).
+      {
+        const stationBl = new Set(getStationBlacklist().map(s => s.toLowerCase()));
+        const isBlacklisted = (sysId: string | undefined, poiId: string | undefined) =>
+          !!poiId && (stationBl.has(poiId.toLowerCase()) ||
+            (sysId ? stationBl.has(`${sysId}|${poiId}`.toLowerCase()) : false));
+        const before = allRoutes.length;
+        allRoutes = allRoutes.filter(r =>
+          !isBlacklisted(r.sourceSystem, r.sourcePoi) &&
+          !isBlacklisted(r.destSystem, r.destPoi));
+        if (allRoutes.length < before) {
+          ctx.log("trade", `Skipped ${before - allRoutes.length} route(s) — buy/sell station on station blacklist`);
+        }
+      }
       allRoutesCount = allRoutes.length;
 
       // Filter out routes where bot can't afford even 1 unit (will try again with cheaper items next scan)
@@ -2619,87 +3114,65 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Verify item is actually available via estimate_purchase
+      // Verify item is actually available via estimate_purchase.
+      // NOTE: this command answers `available: 0` (no error!) when nobody is
+      // selling, so the number has to be read — checking `.error` alone let
+      // ghost listings through and the buy then failed at the far end.
       yield "verify_availability";
       const estResp = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
-      if (estResp.error) {
+      const estParsed = readPurchaseEstimate(estResp.result);
+      if (estResp.error || estParsed.available <= 0) {
         failedSources.add(sourceKey);
         mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
-        ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (stale data) — trying next route`);
+        noteLocalMarketUnavailable(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+        const why = estResp.error
+          ? estResp.error.message
+          : `market reports 0 available${estParsed.message ? ` (${estParsed.message})` : ""}`;
+        ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName}: ${why} — trying next route`);
         releaseTradeLock(bot.username, candidate.itemId, "aborted:item_not_available");
         pendingLockItemId = null;
         pendingLockReleased = true;
         continue;
       }
 
-      // Emergency fuel reserve — ship starts fully fueled, ensureFueled docks at
-      // stations along the route. Cells are only for systems with no station.
-      // ~1 cell per 4 jumps is plenty, min 3, max 10% of cargo.
-      const maxFuelSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
-      const RESERVE_FUEL_CELLS = Math.min(Math.max(3, Math.ceil(candidate.jumps / 4)), maxFuelSlots);
-
-      // Clear cargo: keep fuel cells + trade item, deposit everything else
+      // Clear cargo: keep fuel cells + trade item, deposit everything else.
+      //
+      // Fuel cells are NEVER deposited here. They are the emergency reserve, they
+      // are free out of faction storage at home, and dumping them at a remote
+      // station used to strand the ship with a "3 cells" count that ignored the
+      // fact that a military cell carries 100 fuel and a plain one carries 20.
       await bot.refreshCargo();
       const depositSummary: string[] = [];
       for (const item of [...bot.inventory]) {
         if (item.itemId === candidate.itemId) continue; // keep the item we're about to buy
-        const lower = item.itemId.toLowerCase();
-        const isFuel = lower.includes("fuel") || lower.includes("energy_cell");
-        if (isFuel) {
-          const excess = item.quantity - RESERVE_FUEL_CELLS;
-          if (excess > 0) {
-            //await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
-            await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
-            depositSummary.push(`${excess}x ${item.name}`);
-          }
-        } else {
-          //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-          await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
-          depositSummary.push(`${item.quantity}x ${item.name}`);
-        }
+        if (isFuelCellItem(item.itemId)) continue;      // keep the fuel reserve
+        //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
+        depositSummary.push(`${item.quantity}x ${item.name}`);
       }
       if (depositSummary.length > 0) {
         ctx.log("trade", `Cleared cargo: ${depositSummary.join(", ")}`);
       }
 
-      // Ensure we have enough fuel cells for the route + return home (exact calc)
+      // ── Emergency fuel reserve for the trip home, in FUEL, not cell count ──
+      // The ship starts fueled and ensureFueled docks at stations along the way;
+      // cells only have to cover systems with no station. `find_route` knows this
+      // ship's real burn, so ask it instead of guessing "1 cell per 4 jumps".
       await bot.refreshCargo();
       await bot.refreshLocation();
-      let fuelInCargo = 0;
-      for (const item of bot.inventory) {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-      }
-      let needed = RESERVE_FUEL_CELLS;
-      try {
-        const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
-        if (r?.estimated_fuel && r?.fuel_available) {
-          const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
-          needed = Math.ceil(deficit / 20); // regular fuel_cell = 20 fuel
-          ctx.log("trade", `Exact return fuel: need ${needed} cells (${deficit} fuel deficit)`);
-        }
-      } catch {}
-      if (fuelInCargo < needed) {
-        const isAtHome = homeSystem && bot.system === homeSystem;
-        let stillNeeded = needed - fuelInCargo;
-        if (isAtHome) {
-          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-          if (!prem.error) stillNeeded = Math.max(0, stillNeeded - 50);
-          if (stillNeeded > 0) {
-            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
-            if (!reg.error) stillNeeded = 0;
-          }
-          if (stillNeeded <= 0) ctx.log("trade", `Withdrew fuel cells from faction storage`);
-        }
-        if (stillNeeded > 0) {
-          const freeSpace = getFreeSpace(bot);
-          const buyQty = Math.min(Math.ceil(stillNeeded / 20), maxItemsForCargo(freeSpace, "fuel_cell"));
-          if (buyQty > 0) {
-            ctx.log("trade", `Buying ${buyQty} fuel cells for return trip (last resort)`);
-            await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
-          }
-        }
-      }
+      const routeHome = await estimateRouteFuel(ctx, homeSystem);
+      const tripFuelHome = routeHome?.estimatedFuel ?? candidate.jumps * TRADER_FALLBACK_FUEL_PER_JUMP;
+      const tankFuelHome = routeHome?.fuelAvailable ?? bot.fuel;
+      const carriedCells = getCargoFuelCells(bot);
+      ctx.log(
+        "trade",
+        `Return fuel: route needs ~${Math.round(tripFuelHome)}, tank has ${tankFuelHome}, cargo cells hold ${carriedCells.fuel} (${carriedCells.summary})`,
+      );
+      await ensureFuelCellReserve(ctx, {
+        // 25% margin for reroutes around blacklists / blocked gates.
+        fuelNeeded: Math.max(0, Math.ceil(tripFuelHome * 1.25) - tankFuelHome),
+        reason: `return to ${homeSystem || "home"}`,
+      });
 
       // Check if we already have the trade item in cargo (kept during clear)
       await bot.refreshCargo();
@@ -2879,7 +3352,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               
               if (passengersToLoad.length > 0) {
                 ctx.log("trade", `Found ${passengersToLoad.length} passengers going to ${currentRoute.destPoiName} - loading...`);
-                const loadResp = await bot.exec("load_passenger", { destination: currentRoute.destPoi });
+                const loadResp = await bot.exec("load_passenger", { id: currentRoute.destPoi });
                 if (!loadResp.error) {
                   await ctx.sleep(11000);
                   // Verify passengers loaded
@@ -3137,13 +3610,16 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
           bot.trackWildlife(nearbyResp.result);
-          const { checkAndFleeFromPirates } = await import("./common.js");
-          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-          if (fled) {
-            ctx.log("error", "Pirates detected at destination - fled, aborting trade");
-            await ensureDocked(ctx);
-            await ctx.sleep(30000);
-            continue;
+          // Cloaked ships cannot be ambushed — skip the pirate flee when enabled.
+          if (!(settings.ignorePiratesWhenCloaked !== false && bot.isCloaked)) {
+            const { checkAndFleeFromPirates } = await import("./common.js");
+            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+            if (fled) {
+              ctx.log("error", "Pirates detected at destination - fled, aborting trade");
+              await ensureDocked(ctx);
+              await ctx.sleep(30000);
+              continue;
+            }
           }
         }
       }
@@ -3214,62 +3690,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Only ${remaining}/${buyQty}x ${route!.itemName} left (${buyQty - remaining} consumed during travel)`);
       }
 
-      // Check actual market conditions before selling
-      const minAcceptablePrice = Math.floor(investedCredits / buyQty); // Break-even price per unit
-      const marketCheck = await calculateOptimalSellQuantity(
-        ctx,
-        route!.itemId,
-        route!.itemName,
-        remaining,
-        minAcceptablePrice,
-      );
-
-      if (marketCheck.sellQty <= 0) {
-        ctx.log("trade", `No viable buy orders for ${route!.itemName} — holding items for better prices`);
-        remaining = marketCheck.sellQty; // Will trigger deposit logic below
-      } else {
-        // Sell only what the market can absorb at reasonable prices
-        const actualSellQty = marketCheck.sellQty;
-        ctx.log("trade", `Selling ${actualSellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-        const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: actualSellQty });
-        if (!sellResp.error) {
-          const sr = sellResp.result as Record<string, unknown> | undefined;
-          const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
-          // Check how many actually sold
-          await bot.refreshCargo();
-          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          const sold = actualSellQty - afterSell;
-          totalSold += sold;
-          sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * route!.sellPrice);
-          remaining = afterSell;
-          if (remaining > 0) {
-            ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
-          }
-          // Refresh dest market cache with real post-sale data
-          await recordMarketData(ctx);
-        } else {
-          ctx.log("error", `Sell failed: ${sellResp.error.message}`);
-        }
+      // Check actual market conditions before selling. Only sell what the market
+      // will pay at/above break-even; never dump the rest at fire-sale prices.
+      const minAcceptablePrice = Math.floor(investedCredits / Math.max(1, remaining)); // Break-even price per unit
+      const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, minAcceptablePrice, "Market check");
+      totalSold += sale.sold;
+      sellRevenue += sale.revenue;
+      remaining = sale.remaining;
+      if (sale.sold > 0 && remaining > 0) {
+        ctx.log("trade", `Sold ${sale.sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
+      } else if (sale.sold <= 0) {
+        ctx.log("trade", `No viable sale for ${route!.itemName} at/above break-even (${minAcceptablePrice}cr) — holding items for a better buyer`);
       }
+      if (sale.sold > 0) await recordMarketData(ctx);
     }
 
     // If unsold items remain, find another buyer from mapStore
     if (remaining > 0) {
       yield "find_next_buyer";
       
-      // Check if current destination sale is profitable
-      const currentSaleRevenue = route.sellPrice * remaining;
-      const isCurrentSaleProfitable = currentSaleRevenue >= investedCredits;
-      
+      // Check if current destination sale is profitable.
+      // Credit revenue already earned from units sold earlier so this is a
+      // true whole-trade break-even, not a partial-quantity vs full-lot mismatch.
+      const remainingSaleRevenue = route.sellPrice * remaining;
+      const isCurrentSaleProfitable = (sellRevenue + remainingSaleRevenue) >= investedCredits;
+
       if (!isCurrentSaleProfitable && investedCredits > 0) {
-        ctx.log("trade", `Current sale at ${route.sellPrice}cr/ea would result in loss (cost: ${investedCredits}cr for ${buyQty}x) — searching for profitable alternatives`);
-        
-        // Search for profitable alternative buyers
+        ctx.log("trade", `Current sale at ${route.sellPrice}cr/ea would result in loss (cost: ${investedCredits}cr for ${buyQty}x, recovered: ${sellRevenue}cr) — searching for profitable alternatives`);
+
+        // Search for profitable alternative buyers. Pass the unrecovered cost
+        // basis (full lot minus what's already been earned) so the alternative
+        // search evaluates profitability of the *remaining* units correctly.
+        const unrecoveredCost = Math.max(0, investedCredits - sellRevenue);
         const alternatives = findProfitableAlternativeBuyers(
           route.itemId,
           route.itemName,
           remaining,
-          investedCredits,
+          unrecoveredCost,
           bot.system,
           settings,
         );
@@ -3318,17 +3775,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
 
           if (remaining > 0) {
-            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
-            if (!sResp.error) {
-              const sr = sResp.result as Record<string, unknown> | undefined;
-              const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? 0);
-              await bot.refreshCargo();
-              const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-              const sold = remaining - afterSell;
-              totalSold += sold;
-              sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * best.buyer.price);
-              remaining = afterSell;
-              ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
+            const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(unrecoveredCost / Math.max(1, remaining)), `Selling at ${best.buyer.poiName}`);
+            totalSold += sale.sold;
+            sellRevenue += sale.revenue;
+            remaining = sale.remaining;
+            if (sale.sold > 0) {
+              ctx.log("trade", `Sold ${sale.sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
               await recordMarketData(ctx);
             }
           }
@@ -3394,50 +3846,60 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining <= 0) break;
 
-          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
-          if (!sResp.error) {
-            const sr = sResp.result as Record<string, unknown> | undefined;
-            const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
-            await bot.refreshCargo();
-            const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-            const sold = remaining - afterSell;
-            totalSold += sold;
-            sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * buyer.price);
-            remaining = afterSell;
-            ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
+          const sale = await sellUpToFloor(ctx, route!.itemId, route!.itemName, remaining, Math.floor(investedCredits / Math.max(1, remaining)), `Selling at ${buyer.poiName}`);
+          totalSold += sale.sold;
+          sellRevenue += sale.revenue;
+          remaining = sale.remaining;
+          if (sale.sold > 0) {
+            ctx.log("trade", `Sold ${sale.sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
             await recordMarketData(ctx);
           } else {
-            ctx.log("error", `Sell failed: ${sResp.error.message}`);
+            ctx.log("trade", `No profitable sale at ${buyer.poiName} (${buyer.price}cr/ea) — moving on`);
           }
           break; // only try one alternative buyer, then fall back to storage
         }
       }
     }
 
-    // If still unsold, deposit at faction storage
+    // If still unsold, deposit at the bot's configured home base
     if (remaining > 0) {
       yield "store_unsold";
-      
-      // Check if we've recovered our investment
+
+      // Whether we recovered our investment only affects logging — the storage
+      // destination is always the configured home base, never a hardcoded system.
       const totalRevenue = sellRevenue + extraRevenue;
-      const isProfitable = totalRevenue >= investedCredits;
-      if (!isProfitable && investedCredits > 0 && homeSystem) {
-        // Unprofitable trade — return home and deposit to faction storage
-        ctx.log("trade", `${remaining}x ${route.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${homeSystem} to deposit`);
-        
-        // Navigate to home system
-        if (bot.system !== homeSystem) {
-          await ensureUndocked(ctx);
-          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
-          if (fueled) {
-            await navigateToSystem(ctx, homeSystem, { ...safetyOpts, noJettison: true });
-          }
+      const unprofitable = totalRevenue < investedCredits && investedCredits > 0;
+      const depositSystem = homeSystem || bot.system;
+      const configuredHomePoi = getHomeStationPoi(settings.homeStation);
+
+      if (unprofitable) {
+        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${depositSystem} to deposit`);
+      } else {
+        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — storing at home base (${depositSystem})`);
+      }
+
+      // Navigate to the home system
+      if (bot.system !== depositSystem) {
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+        if (fueled) {
+          await navigateToSystem(ctx, depositSystem, { ...safetyOpts, noJettison: true });
         }
-        
-        // Find station at home
+      }
+
+      if (bot.system !== depositSystem) {
+        // Never made it home — keep the cargo instead of dumping it in a random system
+        ctx.log("trade", `Could not reach home system ${depositSystem} — keeping ${remaining}x ${route!.itemName} in cargo for next cycle`);
+      } else {
+        // Prefer the explicitly configured home station, else any station in the home system
         const { pois: homePois } = await getSystemInfo(ctx);
-        const homeStation = findStation(homePois);
-        if (homeStation) {
+        const homeStation =
+          (configuredHomePoi ? homePois.find(p => p.id === configuredHomePoi) : undefined) || findStation(homePois);
+
+        if (!homeStation) {
+          ctx.log("trade", `No station found in home system ${depositSystem} — keeping ${remaining}x ${route!.itemName} in cargo`);
+        } else {
+          let atHomeStation = true;
           if (bot.poi !== homeStation.id) {
             await ensureUndocked(ctx);
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
@@ -3446,90 +3908,49 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               await ctx.sleep(2000);
               continue;
             }
-            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
               const errMsg = travelResp.error.message.toLowerCase();
+              // CRITICAL: Check for battle interrupt error
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
                 await ctx.sleep(5000);
                 continue;
               }
-            }
-            bot.poi = homeStation.id;
-          }
-          await ensureDocked(ctx);
-
-          // Deposit unsold items
-          await bot.refreshCargo();
-          remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          if (remaining > 0) {
-            await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
-            ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
-            logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
-            addUnsoldItem({
-              itemId: route!.itemId,
-              itemName: route!.itemName,
-              boughtPrice: route!.buyPrice,
-              quantity: remaining,
-              storageSystem: homeSystem,
-              storagePoi: homeStation.id,
-              depositedAt: new Date().toISOString(),
-              botUsername: bot.username,
-            });
-          }
-        }
-      } else {
-        // Profitable or break-even — deposit at Sol Central as before
-        const SOL_CENTRAL = "sol_central";
-        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — storing at Sol Central`);
-
-        // Navigate to Sol Central if needed
-        const solSystem = "sol";
-        if (bot.system !== solSystem) {
-          await ensureUndocked(ctx);
-          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
-          if (fueled) {
-            await navigateToSystem(ctx, solSystem, { ...safetyOpts, noJettison: true });
-          }
-        }
-
-        if (bot.poi !== SOL_CENTRAL) {
-          await ensureUndocked(ctx);
-          const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
-          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-            ctx.log("combat", "Battle detected during travel — fleeing!");
-            await ctx.sleep(2000);
-            continue;
-          }
-          // CRITICAL: Check for battle interrupt error
-          if (travelResp.error) {
-            const errMsg = travelResp.error.message.toLowerCase();
-            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await ctx.sleep(5000);
-              continue;
+              // Any other travel failure: don't fake our position, just keep the cargo
+              ctx.log("trade", `Travel to ${homeStation.name} failed (${travelResp.error.message}) — keeping ${remaining}x ${route!.itemName} in cargo`);
+              atHomeStation = false;
+            } else {
+              bot.poi = homeStation.id;
             }
           }
-          bot.poi = SOL_CENTRAL;
-        }
 
-        await ensureDocked(ctx);
-        await bot.refreshCargo();
-        remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-        if (remaining > 0) {
-          await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
-          ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to Sol Central storage`);
-          addUnsoldItem({
-            itemId: route!.itemId,
-            itemName: route!.itemName,
-            boughtPrice: route!.buyPrice,
-            quantity: remaining,
-            storageSystem: solSystem,
-            storagePoi: SOL_CENTRAL,
-            depositedAt: new Date().toISOString(),
-            botUsername: bot.username,
-          });
+          if (atHomeStation) {
+            await ensureDocked(ctx);
+            await bot.refreshCargo();
+            remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+            if (remaining > 0) {
+              const depResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining });
+              if (depResp.error) {
+                ctx.log("trade", `Failed to deposit ${remaining}x ${route!.itemName} at ${homeStation.name}: ${depResp.error.message}`);
+              } else {
+                ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name}${unprofitable ? " (will sell when prices improve)" : ""}`);
+                if (unprofitable) {
+                  logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
+                }
+                addUnsoldItem({
+                  itemId: route!.itemId,
+                  itemName: route!.itemName,
+                  boughtPrice: route!.buyPrice,
+                  quantity: remaining,
+                  storageSystem: depositSystem,
+                  storagePoi: homeStation.id,
+                  depositedAt: new Date().toISOString(),
+                  botUsername: bot.username,
+                });
+              }
+            }
+          }
         }
       }
     }
@@ -3584,7 +4005,26 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     const nextCargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - nextFuelWeight);
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
-    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights);
+
+    // Market query (remote client or local market file): augment local data
+    // before next route scan
+    let nextRemoteSpreads: PriceSpread[] = [];
+    if (settings.useRemoteMarketQuery !== false) {
+      const uniqueItems = new Set<string>();
+      for (const sp of mapStore.findPriceSpreads()) uniqueItems.add(sp.itemId);
+      if (uniqueItems.size > 0) {
+        nextRemoteSpreads = await collectRemoteSpreads(
+          Array.from(uniqueItems).slice(0, 20),
+          bot.system,
+          settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined,
+        );
+        if (nextRemoteSpreads.length === 0) {
+          ctx.log("trade", describeNoMarketDeals(Math.min(uniqueItems.size, 20), "next-scan "));
+        }
+      }
+    }
+
+    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights, undefined, nextRemoteSpreads);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     // ── Deposit excess credits to faction storage ──

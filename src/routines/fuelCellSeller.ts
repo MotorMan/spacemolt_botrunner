@@ -31,6 +31,7 @@ import {
   getBattleStatus,
   fleeFromBattle,
 } from "./common.js";
+import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
@@ -215,6 +216,7 @@ function getFuelCellSellerSettings(username?: string): {
   autoMinPrice: number;
   autoMaxPrice: number;
   maxFuelCellsPerStation: number;
+  useRemoteMarketQuery: boolean;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -234,6 +236,7 @@ function getFuelCellSellerSettings(username?: string): {
     autoMinPrice: (fc.autoMinPrice as number) || 30,
     autoMaxPrice: (fc.autoMaxPrice as number) || 50,
     maxFuelCellsPerStation: (fc.maxFuelCellsPerStation as number) || 20000,
+    useRemoteMarketQuery: (fc.useRemoteMarketQuery as boolean) ?? true,
   };
 }
 
@@ -703,6 +706,30 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
     if (!marketResp.error && marketResp.result) {
       marketData = marketResp.result;
+    } else if (settings.useRemoteMarketQuery !== false) {
+      // Fallback to remote market query if local view_market failed
+      ctx.log("fc", "[RemoteMarket] view_market failed, trying remote market query for fuel_cell pricing...");
+      try {
+        const result = await queryRemoteMarket({ itemId: FUEL_CELL_ITEM_ID, tradeType: "sell", requesterSystemId: bot.system });
+        if (result.ok && result.results.length > 0) {
+          const best = result.results[0];
+          ctx.log("fc", `[RemoteMarket] Got remote fuel_cell price: ${best.price}cr @ ${best.stationName} (qty: ${best.quantity})`);
+          // Build synthetic marketData for getOptimalPrice
+          marketData = {
+            items: [{
+              item_id: FUEL_CELL_ITEM_ID,
+              best_sell: best.price,
+              best_buy: best.price,
+              sell_quantity: best.quantity,
+              buy_quantity: best.quantity,
+            }],
+          };
+        } else {
+          ctx.log("fc", `[RemoteMarket] No remote fuel_cell data available: ${result.error || "no results"}`);
+        }
+      } catch (err) {
+        ctx.log("fc", `[RemoteMarket] Remote query failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     let price: number | null = null;

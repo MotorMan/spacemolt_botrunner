@@ -2,18 +2,32 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeF
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
+import { perf } from "../perf.js";
 import { getBot, getTotalBandwidth, getDiscoveredBots } from "../botmanager.js";
 import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
-import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, setLoadoutForceFullDelivery, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
 import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
-import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
-import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
+import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse, type MarketQueryRequest, type MarketQueryResult } from "../client_sync_master.js";
+import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
+import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, resolveMarketSource } from "../client_sync_hooks.js";
+import { queryLocalMarket, getLocalMarketStatus } from "../market_local_source.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
+import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
+import { reconcileDeliveredWithDestination, getCargoMoverSettings } from "../routines/cargo_mover.js";
+import { resetInTransitData } from "../routines/cargoMoverInTransit.js";
+import { resetCoordinationTracking } from "../routines/cargoMoverCoordination.js";
+import {
+  getFleetFtSummary,
+  resetCoordinationTracking as resetFtCoordinationTracking,
+  resetInTransitData as resetFtInTransitData,
+  flushAllCoordinationData as flushAllFtCoordinationData,
+} from "../routines/fuelTransferCoordination.js";
+import { setEnabled as setPerfEnabled } from "../perf.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -32,7 +46,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring" | "bulkSetHunterMode";
   bot?: string;
   routine?: string;
   username?: string;
@@ -44,6 +58,24 @@ export interface WebAction {
   settings?: Record<string, unknown>;
   command?: string;
   params?: Record<string, unknown>;
+  /** Toggled value for the `setPerformanceMonitoring` action (live, no full save). */
+  enabled?: boolean;
+  /** Clerk API key supplied from Settings → General (replaces env SPACEMOLT_CLERK_API_KEY). */
+  clerkApiKey?: string;
+  /** Optional second Clerk API key, for adding bots owned by a different Clerk account. */
+  clerkApiKey2?: string;
+  /** Player ids selected to add as bots. */
+  ids?: string[];
+  /**
+   * Clerk player selection state to persist alongside a General-settings save.
+   * `displayed` is the set of player ids currently shown in the Add-Bots list;
+   * `checked` is the subset the user left ticked. Any id in `displayed` that is
+   * NOT in `checked` is removed from the persisted `clerk.bots` list (so
+   * unchecking a bot and saving really removes it), while ids not in
+   * `displayed` are left untouched (so bots added from an account the user
+   * hasn't listed aren't accidentally wiped).
+   */
+  clerkSelection?: { checked?: string[]; displayed?: string[] };
 }
 
 export interface WebActionResult {
@@ -70,6 +102,7 @@ const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
 const FLOCK_FILE = join(DATA_DIR, "flock.json");
 const LAST_USED_ROUTINE_FILE = join(DATA_DIR, "lastUsedRoutine.json");
+const ACTIVE_BOTS_FILE = join(DATA_DIR, "activeBots.json");
 
 interface MainLogs {
   activity: string[];
@@ -105,7 +138,95 @@ function loadSettings(): RoutineSettings {
   return {};
 }
 
-export { loadSettings };
+export { loadSettings, saveSettings };
+
+// ── Market query handler ───────────────────────────────────
+// Called by the sync master (via peerRequest) when a trader on another client
+// wants to know the best deal for an item. Reads local marketDetails.json,
+// computes the best match, and returns a tiny response (~200 bytes) instead
+// of transferring the full file (10MB+).
+//
+// The lookup itself lives in market_local_source.ts so this remote path and
+// the in-client local path (used when the traders run in the SAME client as
+// the market routines) can never diverge, and so both share one cached,
+// item-indexed copy of the file instead of re-parsing 10MB per query.
+
+export async function handleMarketQueryHandler(query: MarketQueryRequest): Promise<MarketQueryResult> {
+  return queryLocalMarket(query);
+}
+
+// The WebServer keeps an in-memory copy of settings (`this.settings`) that most
+// save paths write back to disk wholesale via `saveSettings(this.settings)`.
+// `setClerkConfig` writes `clerk.bots` to disk directly, so we must keep this
+// in-memory copy pointed at the same object and keep its `clerk` section in
+// sync — otherwise the next routine/settings save silently clobbers the
+// selected-bot list (added bots vanish on restart). `activeSettings` tracks the
+// live in-memory object even when `this.settings` is reassigned on reload.
+let activeSettings: RoutineSettings | null = null;
+
+// ── Clerk (headless client) config persistence ─────────────
+// Stored separately from `general` so the per-routine settings save (which
+// replaces the whole `general` object) can't clobber the selected-bot list.
+
+export interface ClerkConfig {
+  /** Primary Clerk API key — headless-client credential that owns the player accounts. */
+  apiKey: string;
+  /** Optional second Clerk API key — lets you add bots owned by a different Clerk account. */
+  apiKey2: string;
+  /** Player ids the user has chosen to run as bots (a Clerk account can own hundreds). */
+  bots: string[];
+}
+
+export function getClerkConfig(): ClerkConfig {
+  const s = loadSettings();
+  const c = (s.clerk as Record<string, unknown>) || {};
+  return {
+    apiKey: typeof c.apiKey === "string" ? c.apiKey : "",
+    apiKey2: typeof c.apiKey2 === "string" ? c.apiKey2 : "",
+    bots: Array.isArray(c.bots) ? (c.bots as string[]) : [],
+  };
+}
+
+/**
+ * Resolve every configured Clerk API key: env vars take precedence (kept for
+ * the CLI / headless deployments), then the dashboard-supplied keys in
+ * settings. Returns a de-duplicated, order-preserving list (env first).
+ */
+export function getClerkApiKeys(): string[] {
+  const keys: string[] = [];
+  if (process.env.SPACEMOLT_CLERK_API_KEY) keys.push(process.env.SPACEMOLT_CLERK_API_KEY);
+  if (process.env.SPACEMOLT_CLERK_API_KEY_2) keys.push(process.env.SPACEMOLT_CLERK_API_KEY_2);
+  const cfg = getClerkConfig();
+  if (cfg.apiKey) keys.push(cfg.apiKey);
+  if (cfg.apiKey2) keys.push(cfg.apiKey2);
+  return [...new Set(keys)];
+}
+
+/**
+ * Resolve the primary Clerk API key (env var takes precedence, kept for the
+ * CLI / headless deployments, then the dashboard-supplied keys). Backward
+ * compatible with callers that expect a single key.
+ */
+export function getClerkApiKey(): string | undefined {
+  const keys = getClerkApiKeys();
+  return keys[0] || undefined;
+}
+
+/** Merge a partial Clerk config into settings and persist it. */
+export function setClerkConfig(partial: Partial<ClerkConfig>): ClerkConfig {
+  const s = loadSettings();
+  const c = (s.clerk as Record<string, unknown>) || {};
+  if (typeof partial.apiKey === "string") c.apiKey = partial.apiKey;
+  if (typeof partial.apiKey2 === "string") c.apiKey2 = partial.apiKey2;
+  if (Array.isArray(partial.bots)) c.bots = partial.bots;
+  s.clerk = c;
+  // Keep the in-memory settings copy (used by every other save path) in sync so
+  // a later `saveSettings(this.settings)` doesn't overwrite clerk.bots with a
+  // stale version and drop freshly-added/removed bots.
+  if (activeSettings) activeSettings.clerk = c;
+  saveSettings(s);
+  return c as unknown as ClerkConfig;
+}
 
 export interface LastUsedRoutineData {
   [botUsername: string]: string;
@@ -139,6 +260,82 @@ function getAllLastUsedRoutines(): LastUsedRoutineData {
 }
 
 export { loadLastUsedRoutines, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines };
+
+// ── Active bots snapshot (survives client restarts) ──────────
+// The dashboard's bot list is driven by `latestStatuses`, which is empty until
+// the library reconnects the selected bots. That made the fleet "pop in" one
+// card at a time after every restart (and the window resize with each). We
+// persist a snapshot of the last-known statuses to disk and rehydrate
+// `latestStatuses` from it at startup, so the last-active bots appear
+// immediately — flagged `offline` (Reconnecting…) until a live status arrives.
+// Only bots that are still in the selected-bot list (`clerk.bots`) are seeded,
+// so a bot that was removed never lingers as a ghost card.
+
+interface ActiveBotsFile {
+  bots: BotStatus[];
+}
+
+function loadActiveBots(): BotStatus[] {
+  if (!existsSync(ACTIVE_BOTS_FILE)) return [];
+  try {
+    const data = JSON.parse(readFileSync(ACTIVE_BOTS_FILE, "utf-8")) as ActiveBotsFile;
+    const list = Array.isArray(data.bots) ? data.bots : [];
+    const selected = new Set(getClerkConfig().bots);
+    // Keep only bots we still intend to reconnect, and flag them offline.
+    const seeded = list
+      .filter((b) => b && typeof b.username === "string" && selected.has(b.username))
+      .map((b) => ({ ...b, offline: true }));
+    return seeded;
+  } catch (err) {
+    console.warn(`Warning: corrupt activeBots.json, starting fresh —`, err);
+    return [];
+  }
+}
+
+let activeBotsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let activeBotsDirty = false;
+let latestActiveStatuses: BotStatus[] = [];
+
+// Snapshot is only used to rehydrate the dashboard on restart, so a long
+// debounce is fine and greatly reduces SSD wear (was 5s).
+const ACTIVE_BOTS_SAVE_DEBOUNCE_MS = 120_000;
+
+function scheduleActiveBotsSave(statuses: BotStatus[]): void {
+  // Persist a clean (non-offline) snapshot of the live fleet so the next
+  // restart rehydrates from real last-known data rather than stale ghosts.
+  latestActiveStatuses = statuses;
+  activeBotsDirty = true;
+  if (activeBotsSaveTimer) return;
+  activeBotsSaveTimer = setTimeout(() => {
+    activeBotsSaveTimer = null;
+    if (!activeBotsDirty) return;
+    activeBotsDirty = false;
+    try {
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
+      writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+    } catch (err) {
+      console.warn(`Warning: failed to save activeBots.json —`, err);
+    }
+  }, ACTIVE_BOTS_SAVE_DEBOUNCE_MS);
+}
+
+/** Write any pending activeBots snapshot to disk immediately (call on shutdown). */
+function flushActiveBotsSave(): void {
+  if (activeBotsSaveTimer) {
+    clearTimeout(activeBotsSaveTimer);
+    activeBotsSaveTimer = null;
+  }
+  if (!activeBotsDirty) return;
+  activeBotsDirty = false;
+  try {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
+    writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.warn(`Warning: failed to flush activeBots.json —`, err);
+  }
+}
 
 const STOPPED_STATE_FILE = join(DATA_DIR, "stoppedState.json");
 
@@ -177,6 +374,13 @@ export function clearStoppedState(botUsername: string): void {
   }
 }
 
+/** Whether customs stopping and lockouts are globally disabled (Settings → General). */
+export function isCustomsDisabled(): boolean {
+  const settings = loadSettings();
+  const general = (settings.general as Record<string, unknown>) || {};
+  return general.disableCustoms === true;
+}
+
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
   const settings = loadSettings();
@@ -191,6 +395,24 @@ export function getSystemBlacklist(): string[] {
   }
   if (raw && typeof raw === 'object' && Array.isArray(raw.systemBlacklist)) {
     return raw.systemBlacklist;
+  }
+  return [];
+}
+
+/** Get the global station blacklist from settings. These are POI ids (or
+ *  "system|poiId" keys) that must never be treated as a usable station —
+ *  e.g. outposts the bot cannot dock at because they can never be set public. */
+export function getStationBlacklist(): string[] {
+  const settings = loadSettings();
+  const raw = (settings.station_blacklist as any)
+           || (settings.stationBlacklist as any)
+           || [];
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object' && Array.isArray(raw.station_blacklist)) {
+    return raw.station_blacklist;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.stationBlacklist)) {
+    return raw.stationBlacklist;
   }
   return [];
 }
@@ -276,6 +498,11 @@ function pruneOldDates(daily: Record<string, Record<string, DayStats>>, maxAgeDa
 // ── WebServer ──────────────────────────────────────────────
 
 const MAX_LOG_BUFFER = 200;
+
+/** How long a built creature snapshot may be reused before it is rebuilt. */
+const WILDLIFE_JSON_TTL_MS = 10_000;
+/** Drop the snapshot entirely once nothing has asked for it for this long. */
+const WILDLIFE_JSON_IDLE_MS = 60_000;
 const MAIN_LOG_SAVE_DEBOUNCE_MS = 5000;
 
 export class WebServer {
@@ -283,6 +510,13 @@ export class WebServer {
   private server: ReturnType<typeof Bun.serve> | null = null;
   private clients = new Set<ServerWebSocket<WSData>>();
   private nextClientId = 1;
+
+  // Cached serialized payloads so we don't re-stringify the ~1.1MB map on
+  // every connection (reconnect storms / multiple tabs would otherwise
+  // multiply the cost and stall the single-threaded event loop).
+  private mapDataCache: string | null = null;
+  private catalogCache: string | null = null;
+  private statsCache: string | null = null;
 
   // Log buffers for scrollback on reconnect (persisted to disk)
   private activityLog: string[];
@@ -298,6 +532,12 @@ export class WebServer {
   // Latest bot statuses for initial page load
   private latestStatuses: BotStatus[] = [];
 
+  // Bots rehydrated from the persisted snapshot at startup (offline /
+  // "Reconnecting…"). Kept separate so live statuses can replace them
+  // one-by-one as each bot reconnects, instead of the whole list being wiped
+  // by a `refreshStatusTable` tick while the fleet is still connecting.
+  private seededOffline = new Map<string, BotStatus>();
+
   // Persisted routine settings
   settings: RoutineSettings;
 
@@ -307,8 +547,9 @@ export class WebServer {
   // Action callback — set by botmanager
   onAction: ((action: WebAction) => Promise<WebActionResult>) | null = null;
 
-  // Shutdown callback — set by botmanager
-  onShutdown: (() => Promise<void>) | null = null;
+  // Shutdown callback — set by botmanager. `restart` is true when the user
+  // asked to restart the client (re-pull updates) rather than fully shut down.
+  onShutdown: ((restart?: boolean) => Promise<void>) | null = null;
 
   // Empire official alert callback — set by botmanager
   onEmpireAlert: ((sender: string, content: string) => void) | null = null;
@@ -319,9 +560,18 @@ export class WebServer {
   // Client sync state
   private syncMaster: ClientSyncMaster | null = null;
 
+  // Bandwidth tracking
+  private wsBytesByType = new Map<string, number>();
+  private wsTotalBytes = 0;
+  private wsBytesTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Memoized creature snapshot (see getWildlifeJson)
+  private wildlifeJsonCache: { json: string; builtAt: number; lastUsed: number } | null = null;
+
 constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
+    activeSettings = this.settings;
     delete (this.settings as Record<string, unknown>).flock;
     if (!this.settings.module_seller) {
       this.settings.module_seller = {
@@ -373,6 +623,8 @@ if (!this.settings.fuel_service) {
         allowRemoteBotsInDropdowns: true,
         remoteBotNameStyle: "prefix",
         pushLocalDiscoveries: true,
+        selfUrl: "",
+        disabledSyncFiles: [],
       };
       saveSettings(this.settings);
     }
@@ -381,8 +633,26 @@ if (!this.settings.fuel_service) {
       this.settings.clientSync.apiKey = generatedKey;
       saveSettings(this.settings);
     }
+    // When this node is the client-sync MASTER, bring the master up eagerly at
+    // startup (not just on the first inbound /api/client-sync request). This
+    // publishes it on globalThis so botmanager.getCombinedFleetStatus — which
+    // the rescue routine uses for its cross-client fleet poll — can find it
+    // immediately, and it lets slaves register before the rescue bot runs its
+    // first scan. Without this, a rescue bot on the master node never saw the
+    // connected slaves' pushed bot statuses.
+    if (this.settings.clientSync.mode === "master") {
+      if (!this.syncMaster) {
+        this.syncMaster = new ClientSyncMaster(this.settings.clientSync);
+        (globalThis as unknown as { syncMaster: ClientSyncMaster }).syncMaster = this.syncMaster;
+        this.syncMaster.saveSettings();
+      }
+      this.syncMaster.startFileSync((this.settings.clientSync.pollIntervalSec as number) || 15);
+    }
     // Initialize periodic refresh setting in general
-    if ((this.settings.general as Record<string, unknown>)?.periodicRefreshSec === undefined) {
+    if (!this.settings.general || typeof this.settings.general !== "object") {
+      this.settings.general = {};
+    }
+    if ((this.settings.general as Record<string, unknown>).periodicRefreshSec === undefined) {
       (this.settings.general as Record<string, unknown>).periodicRefreshSec = 30;
       saveSettings(this.settings);
     }
@@ -392,7 +662,64 @@ if (!this.settings.fuel_service) {
     this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
     this.systemLog = mainLogs.system.slice(-MAX_LOG_BUFFER);
     this.factionLog = mainLogs.faction.slice(-MAX_LOG_BUFFER);
+    // Rehydrate the last-active bot list so the dashboard shows the fleet
+    // immediately on restart instead of starting blank and popping in cards.
+    const seeded = loadActiveBots();
+    this.seededOffline = new Map(seeded.map((b) => [b.username, b]));
+    this.latestStatuses = seeded;
     this.applyInitialLogSettings();
+
+    this.wsBytesTimer = setInterval(() => {
+      this.logWsBytesSummary();
+      this.evictWildlifeJson();
+    }, 10000);
+  }
+
+  /**
+   * Serialized creature snapshot for the creatures page / sync pull.
+   *
+   * The page polls every 5s and the store now reads cold systems from disk on
+   * demand, so both the read and the ~6MB stringify are memoized briefly and
+   * dropped again once nobody is looking.
+   */
+  private getWildlifeJson(): string {
+    const now = Date.now();
+    if (this.wildlifeJsonCache && now - this.wildlifeJsonCache.builtAt < WILDLIFE_JSON_TTL_MS) {
+      this.wildlifeJsonCache.lastUsed = now;
+      return this.wildlifeJsonCache.json;
+    }
+    const json = JSON.stringify(wildlifeStore.getFullData());
+    this.wildlifeJsonCache = { json, builtAt: now, lastUsed: now };
+    return json;
+  }
+
+  private evictWildlifeJson(): void {
+    if (!this.wildlifeJsonCache) return;
+    if (Date.now() - this.wildlifeJsonCache.lastUsed > WILDLIFE_JSON_IDLE_MS) {
+      this.wildlifeJsonCache = null;
+    }
+  }
+
+  /** Account for an outbound WS payload. Callers pass the already-serialized
+   *  string so nothing is ever stringified twice just to be measured. */
+  private trackWsBytesRaw(jsonStr: string, fallbackType: string): void {
+    const len = Buffer.byteLength(jsonStr, "utf8");
+    this.wsTotalBytes += len;
+    this.wsBytesByType.set(fallbackType, (this.wsBytesByType.get(fallbackType) || 0) + len);
+  }
+
+  private logWsBytesSummary(): void {
+    if (this.wsTotalBytes === 0) return;
+    const lines: string[] = [
+      `[WS_BW] 10s summary: ${(this.wsTotalBytes / 1024 / 1024).toFixed(2)} MB total`,
+    ];
+    const sorted = [...this.wsBytesByType.entries()].sort((a, b) => b[1] - a[1]);
+    for (const [type, bytes] of sorted) {
+      lines.push(`  ${type}: ${(bytes / 1024 / 1024).toFixed(2)} MB`);
+    }
+    console.log(lines.join("\n"));
+    this.wsTotalBytes = 0;
+    this.wsBytesByType.clear();
   }
 
   applyInitialLogSettings(): void {
@@ -442,6 +769,10 @@ if (!this.settings.fuel_service) {
       if (s.disableActivityLog !== undefined) {
         setActivityLog(!s.disableActivityLog);
       }
+      // Performance monitoring is default-OFF; only enable when explicitly true.
+      if (s.performanceMonitoring !== undefined) {
+        setPerfEnabled(!!s.performanceMonitoring);
+      }
     }
   }
 
@@ -454,14 +785,19 @@ if (!this.settings.fuel_service) {
     const memJson = JSON.stringify(this.settings);
     if (diskJson !== memJson) {
       this.settings = diskSettings;
+      activeSettings = this.settings;
+      const dead: ServerWebSocket<WSData>[] = [];
       for (const ws of this.clients) {
         try {
           ws.send(JSON.stringify({
             type: "settings_updated",
             settings: this.settings,
           }));
-        } catch { /* ignore dead connections */ }
+        } catch {
+          dead.push(ws);
+        }
       }
+      for (const ws of dead) this.clients.delete(ws);
     }
   }
 
@@ -607,6 +943,61 @@ if (!this.settings.fuel_service) {
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
+        }
+        if (url.pathname === "/api/cargo_mover/status") {
+          return Response.json({ items: getCargoMoverItemStatuses() });
+        }
+        if (url.pathname === "/api/cargo_mover/reconcile" && req.method === "POST") {
+          try {
+            const body = await req.json() as { bot?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot name required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            const settings = getCargoMoverSettings(body.bot);
+            const ctx = { bot: botInstance, log: (cat: string, msg: string) => botInstance.log(cat, msg) } as any;
+            const result = await reconcileDeliveredWithDestination(ctx, settings);
+            return Response.json({ ok: true, ...result });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
+        }
+        if (url.pathname === "/api/cargo_mover/reset-intransit" && req.method === "POST") {
+          try {
+            const inTransit = resetInTransitData();
+            const coord = resetCoordinationTracking(true);
+            return Response.json({ ok: true, inTransit, coordination: coord });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
+        }
+
+        // Force AI Chat daily updates (status / color / captain's log) for all bots.
+        // These run in the background; the response returns immediately.
+        const forceUpdateEndpoints: Record<string, () => Promise<{ triggered: boolean; message: string }>> = {
+          "/api/aichat/force-status-update": () => (globalThis as any).aiChatService?.forceStatusUpdate?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+          "/api/aichat/force-color-update": () => (globalThis as any).aiChatService?.forceColorUpdate?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+          "/api/aichat/force-captain-log": () => (globalThis as any).aiChatService?.forceCaptainLog?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+        };
+        if (req.method === "POST" && forceUpdateEndpoints[url.pathname]) {
+          try {
+            const result = await forceUpdateEndpoints[url.pathname]();
+            return Response.json(result);
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
         }
         if (url.pathname === "/api/stationRef") {
           const stationRefPath = join(DATA_DIR, "stationRef.json");
@@ -790,7 +1181,7 @@ if (!this.settings.fuel_service) {
             const raw = readFileSync(taxesPath, "utf-8");
             const taxes = JSON.parse(raw);
             const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
-            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0;
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0, totalTaxDue = 0;
             for (const [botName, data] of Object.entries(taxes)) {
               const botData = data as { lastTaxEstimate?: any; history: any[] };
               bots[botName] = botData;
@@ -800,6 +1191,7 @@ if (!this.settings.fuel_service) {
                 totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
                 totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
                 totalTaxPrepaid += botData.lastTaxEstimate.tax_prepaid || 0;
+                totalTaxDue += (botData.lastTaxEstimate.income_tax_total || 0) + (botData.lastTaxEstimate.property_tax_total || 0);
               }
             }
             return Response.json({
@@ -810,6 +1202,7 @@ if (!this.settings.fuel_service) {
                 totalPropertyTax,
                 totalAssessedValue,
                 totalTaxPrepaid,
+                totalTaxDue,
                 botCount: Object.keys(taxes).length
               }
             });
@@ -853,7 +1246,7 @@ if (!this.settings.fuel_service) {
             return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
-if (url.pathname === "/data/shipsForSale.json") {
+        if (url.pathname === "/data/shipsForSale.json") {
           const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
           if (existsSync(shipsForSalePath)) {
             return new Response(readFileSync(shipsForSalePath, "utf-8"), {
@@ -863,6 +1256,18 @@ if (url.pathname === "/data/shipsForSale.json") {
             });
           } else {
             return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/marketDetails.json") {
+          const marketDetailsPath = join(DATA_DIR, "marketDetails.json");
+          if (existsSync(marketDetailsPath)) {
+            return new Response(readFileSync(marketDetailsPath, "utf-8"), {
+              headers: {
+                "Content-Type": "application/json",
+              },
+            });
+          } else {
+            return Response.json({ error: "Market details file not found" }, { status: 404 });
           }
         }
         if (url.pathname === "/data/rawMissions.json") {
@@ -878,10 +1283,12 @@ if (url.pathname === "/data/shipsForSale.json") {
           }
         }
         if (url.pathname === "/api/wildlife") {
-          return Response.json(wildlifeStore.getFullData());
+          return new Response(this.getWildlifeJson(), {
+            headers: { "Content-Type": "application/json" },
+          });
         }
         if (url.pathname === "/data/wildlifeInfo.json") {
-          return Response.json(wildlifeStore.getFullData(), {
+          return new Response(this.getWildlifeJson(), {
             headers: { "Content-Type": "application/json" },
           });
         }
@@ -897,7 +1304,45 @@ if (url.pathname === "/data/shipsForSale.json") {
         if (url.pathname === "/api/faction-storage") {
           const station = url.searchParams.get("station") || "";
           const factionName = url.searchParams.get("faction") || "";
-          
+          const live = url.searchParams.get("live") === "1";
+          const liveBot = url.searchParams.get("bot") || "";
+
+          // Live mode: perform an actual remote read via the selected bot so the
+          // viewer reflects current server inventory instead of the (often stale)
+          // on-disk cache. refreshFactionStorage(true, station) does the live
+          // view_faction_storage call AND rewrites the disk cache, so afterwards
+          // we can fall through to the normal cache read to build the response.
+          if (live && liveBot) {
+            const bot = getBot(liveBot);
+            if (!bot) {
+              return Response.json({ error: { code: "not_found", message: `Bot ${liveBot} not found` }, items: [] });
+            }
+            try {
+              await bot.refreshFactionStorage(true, station || undefined);
+              // Return the freshly-read inventory directly from the bot instance.
+              // The disk cache is keyed on the RESOLVED hex POI id (not the raw
+              // `system|poi` string the viewer sends), so re-reading disk here
+              // could miss the just-written file. bot.factionStorage was populated
+              // by the live read above, so it is authoritative for this response.
+              const items = (bot.factionStorage || []).map((e) => ({
+                itemId: e.itemId,
+                item_id: e.itemId,
+                name: e.name || e.itemId,
+                quantity: e.quantity,
+              }));
+              return Response.json({
+                items,
+                factionFuelReserve: bot.factionFuelReserve || 0,
+                factionFuelCapacity: bot.factionFuelCapacity || 0,
+                factionName: bot.faction || factionName,
+                station,
+                live: true,
+              });
+            } catch (err) {
+              return Response.json({ error: { code: "refresh_failed", message: err instanceof Error ? err.message : String(err) }, items: [] });
+            }
+          }
+
           const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
           
           if (!existsSync(CACHE_DIR)) {
@@ -1017,6 +1462,27 @@ if (url.pathname === "/data/shipsForSale.json") {
           }
         }
 
+        if (url.pathname === "/api/station-facilities") {
+          // Per-station facility list cache (faction + empire facilities).
+          const station = url.searchParams.get("station") || "";
+          try {
+            const { getStationFacilityCache, getAllStationFacilityCacheStations } =
+              await import("../stationFacilityCache.js");
+            if (station) {
+              const data = getStationFacilityCache(station);
+              if (!data) {
+                return Response.json({ station, factionFacilities: [], empireFacilities: [], lastUpdated: 0 });
+              }
+              return Response.json(data);
+            }
+            const stations = getAllStationFacilityCacheStations();
+            const all = stations.map((st) => getStationFacilityCache(st)).filter(Boolean);
+            return Response.json({ stations: all });
+          } catch (e) {
+            return Response.json({ error: String(e) });
+          }
+        }
+
         if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
           const settings = this.settings;
           const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
@@ -1096,11 +1562,14 @@ if (url.pathname === "/data/shipsForSale.json") {
           return Response.json({ stations: stationsData });
         }
 
-        // Shutdown endpoint
+        // Shutdown endpoint. `?restart=true` means the user asked to restart
+        // the client (re-pull updates) rather than fully shut it down — the
+        // watchdog will bring it back up after a git pull.
         if (url.pathname === "/api/shutdown" && req.method === "POST") {
           if (this.onShutdown) {
-            await this.onShutdown();
-            return Response.json({ ok: true, message: "Shutting down..." });
+            const restart = url.searchParams.get("restart") === "true";
+            await this.onShutdown(restart);
+            return Response.json({ ok: true, message: "Shutting down...", restart });
           }
           return Response.json({ ok: false, error: "No shutdown handler" });
         }
@@ -1193,9 +1662,21 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (!this.syncMaster) {
             const csSettings = this.settings.clientSync || {};
             this.syncMaster = new ClientSyncMaster(csSettings);
+            // Expose the master on globalThis so botmanager.getCombinedFleetStatus
+            // (used by rescue's cross-client fleet poll) can find it. The slave and
+            // light slave already publish themselves on globalThis; the master must
+            // too, otherwise a rescue bot running ON the master node only ever sees
+            // its own local bots and never the connected slaves' pushed statuses.
+            (globalThis as unknown as { syncMaster: ClientSyncMaster }).syncMaster = this.syncMaster;
             this.syncMaster.saveSettings();
+            // Persist any key the master lazily generated so disk matches memory.
+            saveSettings(this.settings);
+            if (this.syncMaster.getMode() === "master") {
+              this.syncMaster.startFileSync((csSettings.pollIntervalSec as number) || 15);
+            }
           }
           const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+          const syncCfg = (this.settings.clientSync || {}) as Record<string, unknown>;
 
           if (url.pathname === "/api/client-sync/hello" && req.method === "GET") {
             const clientId = req.headers.get("x-client-id") || "unknown";
@@ -1216,11 +1697,30 @@ if (url.pathname === "/data/shipsForSale.json") {
             const history = botChatChannel.getHistory(undefined, 100);
             return Response.json(history, { headers: cors });
           }
-          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
-            return Response.json(this.latestStatuses, { headers: cors });
-          }
           if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
             return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
+            // Combined fleet: this node's own bots plus every connected client's
+            // bots (full name + status). Works for both full slaves and the
+            // lightweight "light" connect, since both push bot-status updates.
+            const combined = [...this.latestStatuses];
+            for (const b of (this.syncMaster?.getBots() ?? [])) {
+              const u = (b as unknown as Record<string, unknown>).username;
+              if (!u || combined.some((x) => (x as unknown as Record<string, unknown>).username === u)) continue;
+              combined.push(b as any);
+            }
+            return Response.json(combined, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/fleet-poll" && req.method === "GET") {
+            // Cross-client fleet rescue poll: ask every connected client for its
+            // local bots' fuel status + positions and return the union. Used by
+            // rescue bots to see the whole connected fleet without each stranded
+            // bot having to request a rescue itself. Also returns the client
+            // roster so a rescue bot can see which clients are connected (and
+            // which one is missing from the combined fleet).
+            const poll = await this.syncMaster?.requestFleetRescuePoll();
+            return Response.json(poll ?? { bots: [], clients: [] }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
             return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });
@@ -1229,18 +1729,24 @@ if (url.pathname === "/data/shipsForSale.json") {
             const body = await req.json() as { password: string };
             this.syncMaster?.setPassword(body.password);
             this.syncMaster?.saveSettings();
+            saveSettings(this.settings);
             return Response.json({ ok: true }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/set-api-key" && req.method === "POST") {
             const body = await req.json() as { apiKey: string };
             this.syncMaster?.setApiKey(body.apiKey);
             this.syncMaster?.saveSettings();
+            saveSettings(this.settings);
             return Response.json({ ok: true }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/slave-state" && req.method === "GET") {
             const syncSlave = (globalThis as any).syncSlave;
             if (syncSlave) {
               return Response.json(syncSlave.getState(), { headers: cors });
+            }
+            const syncLight = (globalThis as any).syncLight;
+            if (syncLight) {
+              return Response.json({ ...syncLight.getState(), mode: "light" }, { headers: cors });
             }
             return Response.json({ connected: false, lastError: "Slave not running" }, { headers: cors });
           }
@@ -1260,7 +1766,9 @@ if (url.pathname === "/data/shipsForSale.json") {
             return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/wildlife" && req.method === "GET") {
-            return Response.json(wildlifeStore.getFullData(), { headers: cors });
+            return new Response(this.getWildlifeJson(), {
+              headers: { ...cors, "Content-Type": "application/json" },
+            });
           }
           if (url.pathname === "/api/client-sync/wildlife-update" && req.method === "POST") {
             try {
@@ -1272,48 +1780,51 @@ if (url.pathname === "/data/shipsForSale.json") {
             }
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
-            const body = await req.json() as { apiKey: string; label: string; password?: string };
+            const body = await req.json() as { apiKey: string; label: string; password?: string; url?: string };
             if (!this.syncMaster) {
               return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: cors });
             }
             const result = await this.syncMaster.register(body);
+            if (result.ok && this.syncMaster.getMode() === "master") {
+              // Start (idempotent) the periodic re-poll of slaves, then pull
+              // this freshly-connected slave immediately so its files are
+              // seeded into the combined repository right away.
+              this.syncMaster.startFileSync((syncCfg.pollIntervalSec as number) || 15);
+              const cid = result.clientId;
+              if (body.url) {
+                this.syncMaster.pullFromSlave(cid).catch(() => {});
+              }
+            }
             return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/test-register" && req.method === "POST") {
-            const body = await req.json() as { masterUrl: string; apiKey: string; label: string; password?: string };
+            const body = await req.json() as { masterUrl: string; apiKey: string; label?: string; password?: string };
             const testCors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
-            if (!body.masterUrl) {
-              return Response.json({ ok: false, error: "masterUrl required" }, { headers: testCors });
+            // Validate the master is reachable and the credentials are correct,
+            // but do NOT permanently register a client here — that's what made the
+            // connected-clients list pile up with one-shot "Test Connection" pings.
+            if (!this.syncMaster) {
+              return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: testCors });
             }
-            try {
-              const testUrl = `${body.masterUrl}/api/client-sync/register`;
-              const res = await fetch(testUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ apiKey: body.apiKey, label: body.label || "test", password: body.password })
-              });
-              let payload: { ok: boolean; clientId?: string; error?: string };
-              try { 
-                payload = await res.json(); 
-              } catch { 
-                payload = { ok: false, error: "invalid response" }; 
-              }
-              return Response.json(payload, { headers: testCors });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              return Response.json({ ok: false, error: msg }, { headers: testCors });
-            }
+            const result = this.syncMaster.validateConnection({ apiKey: body.apiKey, password: body.password });
+            return Response.json(result, { headers: testCors });
           }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
             const body = await req.json() as { channel: string; content: string; sender?: string };
             const clientId = req.headers.get("x-client-id") || "";
-            const result = this.syncMaster?.chatRelay(body);
+            const result = this.syncMaster?.chatRelay({ ...body, clientId });
             return Response.json(result ?? { ok: false }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/bot-status" && req.method === "POST") {
             const body = await req.json() as { clientId?: string; statuses: BotStatusPush[] };
             const cid = body.clientId || req.headers.get("x-client-id") || "";
             const ok = this.syncMaster?.botStatusPush(cid, body.statuses);
+            if (!ok && cid) {
+              // Client pushed statuses but isn't a registered client — usually
+              // the master restarted and forgot it, or the slave is pushing with
+              // a stale clientId. The slave detects ok:false and re-registers.
+              console.warn(`[ClientSync] bot-status push rejected: unknown clientId "${cid}" (master has ${this.syncMaster?.getClients().length} clients)`);
+            }
             return Response.json({ ok: !!ok }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/poi-update" && req.method === "POST") {
@@ -1341,11 +1852,130 @@ if (url.pathname === "/data/shipsForSale.json") {
             const ok = this.syncMaster?.civilianTransportUpdate(body);
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/catalog-version" && req.method === "POST") {
+            // A connected client reports its local catalog.json version. The
+            // master runs the single-download election (only ONE node fetches
+            // from the gameserver) and tells this client what to do next.
+            const body = await req.json() as { version?: string | null; lastFetched?: string | null };
+            const cid = req.headers.get("x-client-id") || "";
+            const result = await this.syncMaster?.reportCatalogVersion(
+              cid,
+              typeof body.version === "string" ? body.version : null,
+              typeof body.lastFetched === "string" ? body.lastFetched : null,
+            ) ?? { ok: false, gameServerVersion: null, action: "none" };
+            // When no client has the new gameserver version (the common post-patch
+            // case), the master itself downloads catalog.json ONCE and relays it to
+            // the fleet — so clients never hammer the gameserver and stay connected.
+            if (result.action === "master_fetch") {
+              try {
+                await catalogStore.fetchFromLib(true);
+                const res = this.syncMaster?.masterCatalogFetched(catalogStore.getAll()) ?? { ok: false, version: null };
+                console.log(`[ClientSync] Master fetched catalog v${res.version ?? "?"} from gameserver — relaying to fleet`);
+              } catch (err) {
+                this.syncMaster?.masterCatalogFetched(null);
+                console.error(`[ClientSync] Master catalog fetch failed:`, err);
+              }
+            }
+            return Response.json(result, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog-upload" && req.method === "POST") {
+            // A designated client uploads its (freshly fetched) catalog so the
+            // master can relay the single copy to every other connected client.
+            const body = await req.json() as { catalog?: Record<string, unknown> };
+            const cid = req.headers.get("x-client-id") || "";
+            const res = this.syncMaster?.catalogUpload(cid, body.catalog ?? null) ?? { ok: false, version: null };
+            // Keep the master node's own catalog store fresh so /api/catalog
+            // reflects the fleet-converged copy instead of a stale local one.
+            if (res.ok && body.catalog) {
+              try { catalogStore.replaceWith(body.catalog); } catch { /* non-fatal */ }
+            }
+            return Response.json(res, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog-sync-state" && req.method === "GET") {
+            return Response.json(this.syncMaster?.getCatalogSyncState() ?? {}, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-data-status" && req.method === "POST") {
+            const body = await req.json() as { clientId?: string; hasMarketData?: boolean };
+            const cid = body.clientId || req.headers.get("x-client-id") || "";
+            const ok = this.syncMaster?.setMarketDataAvailability(cid, !!body.hasMarketData);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-query" && req.method === "POST") {
+            if (!this.syncMaster || this.syncMaster.getMode() !== "master") {
+              return Response.json({ ok: false, error: "Not in master mode" }, { headers: cors });
+            }
+            const body = await req.json() as MarketQueryRequest;
+            const result = await this.syncMaster.handleMarketQuery(body);
+            return Response.json(result, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-query-handler" && req.method === "POST") {
+            const body = await req.json() as MarketQueryRequest;
+            const result = await handleMarketQueryHandler(body);
+            return Response.json(result, { headers: cors });
+          }
+          // Diagnostics: which market data source is this client actually using
+          // right now (local file vs a remote client), and why.
+          if (url.pathname === "/api/client-sync/market-source" && req.method === "GET") {
+            const source = await resolveMarketSource(url.searchParams.get("refresh") === "1");
+            const local = getLocalMarketStatus();
+            return Response.json({ source, local }, { headers: cors });
+          }
           if (url.pathname.startsWith("/api/client-sync/clients/") && req.method === "DELETE") {
             const id = decodeURIComponent(url.pathname.slice("/api/client-sync/clients/".length));
             const ok = this.syncMaster?.disconnect(id);
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+
+          // ── File sync (shared by master + slave; the master's local data dir
+          //    IS the combined repository) ──────────────────────────────────
+          const cfgApiKey = (syncCfg.apiKey as string) || "";
+          const cfgPassword = (syncCfg.password as string) || "";
+          const apiKeyMatch = !cfgApiKey
+            || req.headers.get("x-api-key") === cfgApiKey
+            || (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") === cfgApiKey;
+          const passwordMatch = !cfgPassword || req.headers.get("x-password") === cfgPassword;
+          const fileAuthOk = apiKeyMatch && passwordMatch;
+
+          if (url.pathname === "/api/client-sync/local-files" && req.method === "GET") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const files: FileEntry[] = listSyncedFiles(dataDir);
+            return Response.json({ files }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/local-file" && req.method === "GET") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const relPath = url.searchParams.get("path") || "";
+            if (!isPathSynced(relPath)) return new Response("not allowed", { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const content = readSyncedFile(dataDir, relPath);
+            if (content === null) return new Response("not found", { status: 404, headers: cors });
+            return new Response(content, { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
+          }
+          if (url.pathname === "/api/client-sync/file-update" && req.method === "POST") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const body = await req.json() as { path?: string; content?: string };
+            if (!body.path || body.content === undefined) {
+              return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
+            }
+            if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const hash = mergeIntoFile(dataDir, body.path, body.content);
+            if (hash === null) return Response.json({ ok: false, error: "merge failed" }, { status: 500, headers: cors });
+            return Response.json({ ok: true, hash }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/file-seed" && req.method === "POST") {
+            if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
+            const body = await req.json() as { path?: string; content?: string };
+            if (!body.path || body.content === undefined) {
+              return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
+            }
+            if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
+            const dataDir = join(process.cwd(), "data");
+            const hash = seedIntoFile(dataDir, body.path, body.content);
+            if (hash === null) return Response.json({ ok: false, error: "seed failed" }, { status: 500, headers: cors });
+            return Response.json({ ok: true, hash, seeded: true }, { headers: cors });
+          }
+
           return new Response("not found", { status: 404, headers: cors });
         }
 
@@ -1768,7 +2398,7 @@ if (url.pathname === "/data/shipsForSale.json") {
 
           // POST /api/facility-transfer-loadouts - Save a facility transfer loadout
           if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "POST") {
-            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }> };
+            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }>; forceFullDelivery?: boolean };
             if (!body?.name || !Array.isArray(body.items)) {
               return Response.json({ error: "Missing name or items" }, { status: 400 });
             }
@@ -1776,8 +2406,9 @@ if (url.pathname === "/data/shipsForSale.json") {
               name: body.name,
               items: body.items,
               createdAt: new Date().toISOString(),
+              forceFullDelivery: body.forceFullDelivery ?? false,
             };
-            saveFacilityTransferLoadout(body.name, { items: body.items });
+            saveFacilityTransferLoadout(body.name, { items: body.items, forceFullDelivery: body.forceFullDelivery ?? false });
             return Response.json({ ok: true, name: body.name });
           }
 
@@ -1799,6 +2430,14 @@ if (url.pathname === "/data/shipsForSale.json") {
             return Response.json({ ok: true, name, active: body.active });
           }
 
+          // PATCH /api/facility-transfer-loadouts/:name/force-full-delivery - Set loadout force full delivery state
+          if (url.pathname.match(/^\/api\/facility-transfer-loadouts\/[^/]+\/force-full-delivery$/) && req.method === "PATCH") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length, -"/force-full-delivery".length));
+            const body = await req.json() as { forceFullDelivery: boolean };
+            setLoadoutForceFullDelivery(name, body.forceFullDelivery);
+            return Response.json({ ok: true, name, forceFullDelivery: body.forceFullDelivery });
+          }
+
           // GET /api/facility-transfer-completions?station=X - Get completions for a station
           if (url.pathname === "/api/facility-transfer-completions" && req.method === "GET") {
             const station = url.searchParams.get("station") || "";
@@ -1817,6 +2456,20 @@ if (url.pathname === "/data/shipsForSale.json") {
           if (url.pathname === "/api/facility-transfer-completions" && req.method === "DELETE") {
             clearAllCompletions();
             return Response.json({ ok: true, cleared: "all" });
+          }
+
+          // GET /api/fuel_transport/coop-status - Inspect fuel transport co-op locks / in-transit
+          if (url.pathname === "/api/fuel_transport/coop-status" && req.method === "GET") {
+            return Response.json(getFleetFtSummary());
+          }
+
+          // POST /api/fuel_transport/reset-coop - Drop all fuel transport locks and
+          // in-transit claims (recovery hatch for stuck "waiting on other bots" state)
+          if (url.pathname === "/api/fuel_transport/reset-coop" && req.method === "POST") {
+            const coordination = resetFtCoordinationTracking();
+            const inTransit = resetFtInTransitData();
+            flushAllFtCoordinationData();
+            return Response.json({ ok: true, coordination, inTransit });
           }
 
           // Serve index.css
@@ -2084,7 +2737,7 @@ if (url.pathname === "/data/shipsForSale.json") {
               }
 
               // Send basic init data first (small)
-              ws.send(JSON.stringify({
+              const initPayload = {
                 type: "init",
                 bots: this.latestStatuses,
                 routines: this.routines,
@@ -2101,23 +2754,29 @@ if (url.pathname === "/data/shipsForSale.json") {
                 botLogs: botLogsObj,
                 flockSettings: loadFlockSettings(),
                 lastUsedRoutines: getAllLastUsedRoutines(),
-              }));
+              };
+              const initJson = JSON.stringify(initPayload);
+              this.trackWsBytesRaw(initJson, "init");
+              ws.send(initJson);
 
-              // Send large data separately to avoid blocking with JSON serialization
+              // Send large data separately to avoid blocking with JSON serialization.
+              // These payloads are cached (built once, reused for every connection)
+              // so reconnect storms / multiple tabs don't re-serialize ~1.1MB each time.
               setImmediate(() => {
                 try {
-                  const mapData = mapStore.getAllSystems();
-                  const mapJson = JSON.stringify({ type: "mapData", data: mapData });
+                  const mapJson = this.getMapDataMessage();
                   console.log(`Sending mapData, size: ${mapJson.length} chars`);
+                  this.trackWsBytesRaw(mapJson, "mapData");
                   ws.send(mapJson);
 
-                  const catalogData = catalogStore.getAll();
-                  const catalogJson = JSON.stringify({ type: "catalog", data: catalogData });
+                  const catalogJson = this.getCatalogMessage();
                   console.log(`Sending catalog, size: ${catalogJson.length} chars`);
+                  this.trackWsBytesRaw(catalogJson, "catalog");
                   ws.send(catalogJson);
 
-                  const statsJson = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+                  const statsJson = this.getStatsMessage();
                   console.log(`Sending statsDaily, size: ${statsJson.length} chars`);
+                  this.trackWsBytesRaw(statsJson, "statsDaily");
                   ws.send(statsJson);
                 } catch (err) {
                   console.warn('Failed to send large data:', err);
@@ -2135,6 +2794,15 @@ if (url.pathname === "/data/shipsForSale.json") {
           let isExec = false;
           try {
             const raw = JSON.parse(typeof msg === "string" ? msg : msg.toString());
+            // Heartbeat: the client pings to prove the socket is alive (and to
+            // keep it from being reaped); reply with a pong so the client's
+            // data watchdog sees activity.
+            if (raw && raw.type === "ping") {
+              const pong = JSON.stringify({ type: "pong" });
+              this.trackWsBytesRaw(pong, "pong");
+              try { ws.send(pong); } catch {}
+              return;
+            }
             seq = raw._seq;
             isExec = raw.type === "exec";
             const data = raw as WebAction;
@@ -2144,13 +2812,14 @@ if (url.pathname === "/data/shipsForSale.json") {
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
-              // Include bot, command, and params fields in execResult for processing in frontend
-              const responseData = { type: resType, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
-              ws.send(JSON.stringify(responseData));
+              const responseData = { type: resType, action: data.type, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
+              const responseJson = JSON.stringify(responseData);
+              this.trackWsBytesRaw(responseJson, resType);
+              ws.send(responseJson);
             }
           } catch (err) {
             const rawData = JSON.parse(typeof msg === "string" ? msg : msg.toString());
-            ws.send(JSON.stringify({
+            const errorResponse = {
               type: isExec ? "execResult" : "actionResult",
               _seq: seq,
               bot: rawData.bot,
@@ -2158,7 +2827,10 @@ if (url.pathname === "/data/shipsForSale.json") {
               params: rawData.params,
               ok: false,
               error: err instanceof Error ? err.message : String(err),
-            }));
+            };
+            const errorJson = JSON.stringify(errorResponse);
+            this.trackWsBytesRaw(errorJson, errorResponse.type);
+            ws.send(errorJson);
           }
         },
 
@@ -2185,8 +2857,37 @@ if (url.pathname === "/data/shipsForSale.json") {
   // ── Interface matching TUI ─────────────────────────────────
 
   updateBotStatus(bots: BotStatus[]): void {
-    this.latestStatuses = bots;
-    this.broadcast({ type: "status", bots });
+    // Merge live statuses with any rehydrated (offline) bots that haven't
+    // produced a live status yet, so the dashboard list stays stable across
+    // restarts instead of being wiped while the fleet is still reconnecting.
+    const liveByUser = new Map(bots.map((b) => [b.username, b]));
+    const merged: BotStatus[] = bots.slice();
+    for (const [name, offlineStatus] of [...this.seededOffline]) {
+      if (liveByUser.has(name)) {
+        // This bot has now (re)connected — drop its offline placeholder.
+        this.seededOffline.delete(name);
+        continue;
+      }
+      merged.push(offlineStatus);
+    }
+    this.latestStatuses = merged;
+    // Persist a snapshot (live only) so a future restart rehydrates from real
+    // last-known data rather than stale ghosts.
+    scheduleActiveBotsSave(bots);
+    this.broadcast({ type: "status", bots: merged });
+  }
+
+  /** Flush pending activeBots snapshot to disk immediately (call on shutdown). */
+  flushActiveBots(): void {
+    flushActiveBotsSave();
+  }
+
+  /** Drop a rehydrated offline placeholder (e.g. when its bot is removed). */
+  clearSeededOffline(username: string): void {
+    if (this.seededOffline.delete(username)) {
+      this.latestStatuses = this.latestStatuses.filter((b) => b.username !== username);
+      this.broadcast({ type: "status", bots: this.latestStatuses });
+    }
   }
 
   logActivity(line: string): void {
@@ -2222,7 +2923,33 @@ if (url.pathname === "/data/shipsForSale.json") {
     this.broadcast({ type: "botLog", username, line });
   }
 
+  // ── Cached, pre-serialized large payloads ──────────────────
+  // Built once and reused for every connection; invalidated when the
+  // underlying data changes. Avoids re-stringifying ~1.1MB maps per connect.
+
+  private getMapDataMessage(): string {
+    if (this.mapDataCache === null) {
+      this.mapDataCache = JSON.stringify({ type: "mapData", data: mapStore.getAllSystems() });
+    }
+    return this.mapDataCache;
+  }
+
+  private getCatalogMessage(): string {
+    if (this.catalogCache === null) {
+      this.catalogCache = JSON.stringify({ type: "catalog", data: catalogStore.getAll() });
+    }
+    return this.catalogCache;
+  }
+
+  private getStatsMessage(): string {
+    if (this.statsCache === null) {
+      this.statsCache = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+    }
+    return this.statsCache;
+  }
+
   updateMapData(): void {
+    this.mapDataCache = null;
     this.broadcast({
       type: "mapUpdate",
       mapData: mapStore.getAllSystems(),
@@ -2288,6 +3015,7 @@ if (url.pathname === "/data/shipsForSale.json") {
     if (changed) {
       pruneOldDates(this.statsData.daily);
       saveStats(this.statsData);
+      this.statsCache = null;
       this.broadcast({ type: "statsUpdate", statsDaily: this.statsData.daily });
     }
   }
@@ -2318,18 +3046,31 @@ if (url.pathname === "/data/shipsForSale.json") {
   }
 
   private broadcast(data: unknown): void {
-    const msg = JSON.stringify(data);
-    for (const ws of this.clients) {
-      try {
-        ws.send(msg);
-      } catch {
-        this.clients.delete(ws);
+    perf.timeSync("server.broadcast", () => {
+      // Stringify once: trackWsBytes used to re-serialize the same payload just
+      // to measure it, doubling the cost of every dashboard broadcast.
+      const msg = JSON.stringify(data);
+      const type = (data as Record<string, unknown>)?.type;
+      this.trackWsBytesRaw(msg, typeof type === "string" && type ? type : "unknown");
+      const dead: ServerWebSocket<WSData>[] = [];
+      for (const ws of this.clients) {
+        try {
+          ws.send(msg);
+        } catch {
+          dead.push(ws);
+        }
       }
-    }
+      for (const ws of dead) this.clients.delete(ws);
+    });
   }
 
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {
     this.broadcast({ type: "empireAlert", sender, content, botUsername });
+  }
+
+  /** Broadcast an arbitrary structured event to all connected dashboard clients. */
+  broadcastJson(data: unknown): void {
+    this.broadcast(data);
   }
 
   broadcastSkillsUpdate(bot: string, skills: Record<string, { level: number; xp: number; nextLevelXp: number }>): void {

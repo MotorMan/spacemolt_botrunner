@@ -1,10 +1,30 @@
 import { debugLogForBot } from "./debug.js";
-import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync } from "fs";
+import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync, unlinkSync } from "fs";
+import { writeFile, unlink } from "fs/promises";
 import { join } from "path";
-import { onWildlifeUpdate } from "./client_sync_hooks.js";
+import { onWildlifeUpdate, isSyncPushEnabled } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 const CREATURES_DIR = join(process.cwd(), "data", "creatures");
 const LEGACY_WILDLIFE_FILE = join(process.cwd(), "data", "wildlifeInfo.json");
+
+/**
+ * How often dirty systems are written to disk. Sightings used to write the
+ * whole per-system file synchronously on EVERY creature seen, which was the
+ * single biggest CPU cost on a 90+ bot client.
+ */
+const FLUSH_INTERVAL_MS = 120_000;
+/** Systems untouched for this long are flushed and dropped from the hot cache. */
+const EVICT_IDLE_MS = 120_000;
+/**
+ * Grace period before a creature type that was NOT seen in a reconcile scan is
+ * pruned. Several bots can sit in the same POI and scan at slightly different
+ * moments; without a grace window one bot's scan would delete what another bot
+ * saw a second earlier.
+ */
+const VISIT_GAP_MS = 45_000;
+/** At most one wildlife sync push per system per this interval. */
+const PUSH_INTERVAL_MS = 5_000;
 
 // Minimal per-creature entry. One entry per (lowercase name + maxHull) within a POI.
 // `ids` holds every unique creatureId seen of that type, so its length is the count.
@@ -76,18 +96,84 @@ export interface WildlifeFullData {
   counts: WildlifeCounts;
 }
 
+/** One creature as reported by a single `get_nearby` scan. */
+export interface ObservedCreature {
+  name: string;
+  creatureId: string;
+  species: string;
+  role: string;
+  maxHull: number;
+}
+
+/** What a reconcile pass changed, for logging. */
+export interface ReconcileResult {
+  /** Creature types (name+maxHull) never seen in this POI before. */
+  newTypes: number;
+  /** Individual creatureIds dropped because they were no longer present. */
+  prunedIds: number;
+  /** Whole entries dropped because none of their creatures are around anymore. */
+  prunedTypes: number;
+}
+
+/** One hot (recently touched) system held in memory. */
+interface CacheEntry {
+  sys: SystemWildlife;
+  /** Has unsaved data. */
+  dirty: boolean;
+  /** Has changes that have not been pushed to sync clients yet. */
+  pushPending: boolean;
+  lastAccess: number;
+  lastPush: number;
+}
+
 function sanitizeSystemName(system: string): string {
   const cleaned = (system || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
   return cleaned || "unknown";
 }
 
+/**
+ * Per-system creature store.
+ *
+ * Hot path (bots scanning): memory only. `add()`/`reconcile()` mutate the
+ * in-memory copy of the visited system and mark it dirty; a 2-minute timer
+ * writes the dirty systems to disk and evicts the ones nobody touched since.
+ *
+ * Cold path (creatures page, sync push): reads `data/creatures/*.json` on
+ * demand and overlays the hot cache, so a page load still shows every system
+ * even though only recently-visited systems live in RAM.
+ */
 export class WildlifeStore {
-  private cache: Map<string, SystemWildlife> = new Map();
+  private cache: Map<string, CacheEntry> = new Map();
   private _botName: string | null = null;
+  /** Every creature name ever recorded (lowercase). Cheap `isCreatureName`. */
+  private nameIndex: Set<string> = new Set();
+  private nameIndexBuilt = false;
+  private flushTimer: ReturnType<typeof setInterval> | null = null;
+  private pushTimer: ReturnType<typeof setInterval> | null = null;
+  private flushing = false;
 
   constructor() {
     this.migrateIfNeeded();
-    this.loadAllIntoCache();
+    this.startTimers();
+  }
+
+  private startTimers(): void {
+    if (this.flushTimer || this.pushTimer) return;
+    this.flushTimer = setInterval(() => {
+      void this.flush().then(() => this.evictCold());
+    }, FLUSH_INTERVAL_MS);
+    this.pushTimer = setInterval(() => this.drainPushes(), PUSH_INTERVAL_MS);
+    // Never keep the process alive just for housekeeping.
+    (this.flushTimer as unknown as { unref?: () => void }).unref?.();
+    (this.pushTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** Stop the housekeeping timers (tests / shutdown). */
+  stopTimers(): void {
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    if (this.pushTimer) clearInterval(this.pushTimer);
+    this.flushTimer = null;
+    this.pushTimer = null;
   }
 
   private ensureDir(): void {
@@ -101,7 +187,7 @@ export class WildlifeStore {
   // whatever was recorded.
   private migrateIfNeeded(): void {
     this.ensureDir();
-    const hasNew = readdirSync(CREATURES_DIR).some((f) => f.endsWith(".json"));
+    const hasNew = this.listSystemKeys().length > 0;
     if (hasNew || !existsSync(LEGACY_WILDLIFE_FILE)) {
       return;
     }
@@ -132,7 +218,7 @@ export class WildlifeStore {
             seen: (entry.lastSeen as string) || new Date().toISOString(),
           });
         }
-        this.writeSystemFile(sys);
+        this.writeSystemFileSync(sys);
       }
       debugLogForBot(this._botName || "unknown", "wildlife:migrate", `${this._botName || "unknown"}`, "Migrated legacy wildlifeInfo.json into per-system files");
     } catch (err) {
@@ -149,6 +235,17 @@ export class WildlifeStore {
     return join(CREATURES_DIR, `${sanitizeSystemName(system)}.json`);
   }
 
+  /** Every system that has a file on disk. Names starting with `_` are reserved. */
+  private listSystemKeys(): string[] {
+    try {
+      return readdirSync(CREATURES_DIR)
+        .filter((f) => f.endsWith(".json") && !f.startsWith("_"))
+        .map((f) => f.slice(0, -".json".length));
+    } catch {
+      return [];
+    }
+  }
+
   private readSystem(system: string): SystemWildlife | null {
     const path = this.systemFilePath(system);
     if (!existsSync(path)) return null;
@@ -162,37 +259,38 @@ export class WildlifeStore {
     }
   }
 
+  /** Hot-cache accessor: loads from disk on first touch, then keeps it in RAM. */
+  private loadEntry(system: string): CacheEntry {
+    const key = sanitizeSystemName(system);
+    let entry = this.cache.get(key);
+    if (!entry) {
+      const sys = this.readSystem(key) ?? this.blankSystem(key);
+      entry = { sys, dirty: false, pushPending: false, lastAccess: Date.now(), lastPush: 0 };
+      this.cache.set(key, entry);
+      this.indexSystemNames(sys);
+    } else {
+      entry.lastAccess = Date.now();
+    }
+    return entry;
+  }
+
   // Returns from cache or disk; never null (cached as blank when missing).
   private loadSystem(system: string): SystemWildlife {
-    const key = sanitizeSystemName(system);
-    let sys = this.cache.get(key);
-    if (!sys) {
-      sys = this.readSystem(key) ?? this.blankSystem(key);
-      this.cache.set(key, sys);
-    }
-    return sys;
+    return this.loadEntry(system).sys;
   }
 
-  private writeSystemFile(sys: SystemWildlife): void {
-    this.ensureDir();
-    const path = this.systemFilePath(sys.system);
-    writeFileSync(path, JSON.stringify(sys, null, 2) + "\n", "utf-8");
+  private markChanged(entry: CacheEntry, stamp: string): void {
+    entry.sys.lastUpdated = stamp;
+    entry.dirty = true;
+    entry.pushPending = true;
+    entry.lastAccess = Date.now();
   }
 
-  private loadAllIntoCache(): void {
+  private writeSystemFileSync(sys: SystemWildlife): void {
     this.ensureDir();
-    try {
-      for (const file of readdirSync(CREATURES_DIR)) {
-        if (!file.endsWith(".json")) continue;
-        const sysName = file.slice(0, -".json".length);
-        if (!this.cache.has(sysName)) {
-          const sys = this.readSystem(sysName);
-          if (sys) this.cache.set(sysName, sys);
-        }
-      }
-    } catch {
-      // No creatures yet; nothing to load.
-    }
+    // No pretty-print: these files are machine-read only and `null, 2` tripled
+    // their size (and the write cost) for nothing.
+    writeFileSync(this.systemFilePath(sys.system), JSON.stringify(sys) + "\n", "utf-8");
   }
 
   setBotName(name: string): void {
@@ -203,10 +301,44 @@ export class WildlifeStore {
     return name.trim().toLowerCase();
   }
 
+  // ── Name index ──────────────────────────────────────────────────────────
+  // `isCreatureName()` is called from the combat path for every battle
+  // participant. It used to walk every entry of every system; now it is a Set
+  // lookup over a lazily-built index that live sightings keep up to date.
+
+  private indexSystemNames(sys: SystemWildlife): void {
+    for (const list of Object.values(sys.pois)) {
+      for (const e of list) if (e.n) this.nameIndex.add(e.n);
+    }
+  }
+
+  private ensureNameIndex(): void {
+    if (this.nameIndexBuilt) return;
+    this.nameIndexBuilt = true;
+    for (const key of this.listSystemKeys()) {
+      const cached = this.cache.get(key);
+      const sys = cached?.sys ?? this.readSystem(key);
+      if (sys) this.indexSystemNames(sys);
+    }
+  }
+
+  /** Cheap "is this the name of a creature we have ever seen?" check. */
+  hasCreatureName(name: string | undefined): boolean {
+    if (!name) return false;
+    const normalized = this.normalize(name);
+    if (!normalized) return false;
+    if (this.nameIndex.has(normalized)) return true;
+    this.ensureNameIndex();
+    return this.nameIndex.has(normalized);
+  }
+
   /**
    * Record a creature sighting. Dedups within a POI by (name + maxHull); if the
    * same type is seen again its creatureId is appended (so `ids.length` == count).
    * Returns true when a brand new type was discovered in that POI.
+   *
+   * Memory only — the 2-minute flush timer persists it. Use `reconcile()` when
+   * you hold the complete creature list for a POI, so dead creatures get pruned.
    */
   add(
     name: string,
@@ -225,44 +357,163 @@ export class WildlifeStore {
     if (!system) system = "unknown";
     if (!poi) poi = "unknown";
 
-    const sys = this.loadSystem(system);
-    const list = (sys.pois[poi] = sys.pois[poi] || []);
+    return perf.timeSync("wildlivestore.add", () => {
+      const entry = this.loadEntry(system);
+      const sys = entry.sys;
+      const list = (sys.pois[poi] = sys.pois[poi] || []);
 
-    const now = new Date().toISOString();
-    const existing = list.find((e) => e.n === normalized && e.h === maxHull);
+      const now = new Date().toISOString();
+      const existing = list.find((e) => e.n === normalized && e.h === maxHull);
 
-    let newType = false;
-    if (existing) {
-      if (creatureId && !existing.ids.includes(creatureId)) {
-        existing.ids.push(creatureId);
+      let newType = false;
+      if (existing) {
+        if (creatureId && !existing.ids.includes(creatureId)) {
+          existing.ids.push(creatureId);
+        }
+        existing.seen = now;
+        if (species) existing.s = species;
+        if (role) existing.r = role;
+      } else {
+        list.push({
+          n: normalized,
+          h: maxHull || 0,
+          s: species || "",
+          r: role || "",
+          ids: creatureId ? [creatureId] : [],
+          seen: now,
+        });
+        newType = true;
       }
-      existing.seen = now;
-      if (species) existing.s = species;
-      if (role) existing.r = role;
-    } else {
-      list.push({
-        n: normalized,
-        h: maxHull || 0,
-        s: species || "",
-        r: role || "",
-        ids: creatureId ? [creatureId] : [],
-        seen: now,
-      });
-      newType = true;
-    }
+      this.nameIndex.add(normalized);
+      this.markChanged(entry, now);
 
-    sys.lastUpdated = now;
-    this.writeSystemFile(sys);
-    void onWildlifeUpdate({ system: sys.system, data: sys });
+      if (newType) {
+        debugLogForBot(this._botName || "unknown", "wildlife:add", `${this._botName || "unknown"}`, `Added wildlife: "${name}" (${species}) in ${system}/${poi}`);
+      }
+      return newType;
+    });
+  }
 
-    if (newType) {
-      debugLogForBot(this._botName || "unknown", "wildlife:add", `${this._botName || "unknown"}`, `Added wildlife: "${name}" (${species}) in ${system}/${poi}`);
+  /**
+   * Reconcile one POI against a complete `get_nearby` creature list: add what we
+   * see, remove what we don't.
+   *
+   * A scan is authoritative for the creature types it contains, so any stored
+   * creatureId of a type that IS present but whose id is NOT in the scan is
+   * dead/despawned and gets dropped immediately. A type that is missing from
+   * the scan entirely is only dropped after `VISIT_GAP_MS`, so two bots
+   * scanning the same POI a second apart can't delete each other's findings.
+   *
+   * Memory only; the 2-minute flush timer persists the result.
+   */
+  reconcile(system: string, poi: string, observed: ObservedCreature[]): ReconcileResult {
+    if (!system) system = "unknown";
+    if (!poi) poi = "unknown";
+
+    return perf.timeSync("wildlivestore.reconcile", () => {
+      const result: ReconcileResult = { newTypes: 0, prunedIds: 0, prunedTypes: 0 };
+      const entry = this.loadEntry(system);
+      const sys = entry.sys;
+      const nowMs = Date.now();
+      const now = new Date(nowMs).toISOString();
+
+      // Group the scan by (name + maxHull) — the same key the store uses.
+      const present = new Map<string, { n: string; h: number; s: string; r: string; ids: Set<string> }>();
+      for (const o of observed) {
+        const n = this.normalize(o.name || "");
+        if (!n) continue;
+        const h = o.maxHull || 0;
+        const key = `${n}\u0000${h}`;
+        let group = present.get(key);
+        if (!group) {
+          group = { n, h, s: o.species || "", r: o.role || "", ids: new Set<string>() };
+          present.set(key, group);
+        }
+        if (o.species) group.s = o.species;
+        if (o.role) group.r = o.role;
+        if (o.creatureId) group.ids.add(o.creatureId);
+      }
+
+      const list = sys.pois[poi] || [];
+      const kept: CreatureEntry[] = [];
+      for (const e of list) {
+        const key = `${e.n}\u0000${e.h}`;
+        const group = present.get(key);
+        if (group) {
+          // Present: this scan is the truth for this creature type, so stored
+          // ids that it does not mention are dead/despawned.
+          if (group.ids.size > 0) {
+            for (const id of e.ids) if (!group.ids.has(id)) result.prunedIds++;
+            e.ids = [...group.ids];
+          }
+          e.seen = now;
+          if (group.s) e.s = group.s;
+          if (group.r) e.r = group.r;
+          present.delete(key);
+          kept.push(e);
+          continue;
+        }
+        // Absent from this scan: prune once the grace window has passed.
+        const seenMs = Date.parse(e.seen);
+        const stale = !Number.isFinite(seenMs) || nowMs - seenMs > VISIT_GAP_MS;
+        if (stale) {
+          result.prunedTypes++;
+          result.prunedIds += e.ids.length;
+        } else {
+          kept.push(e);
+        }
+      }
+
+      // Whatever is left in `present` was never recorded in this POI before.
+      for (const group of present.values()) {
+        kept.push({
+          n: group.n,
+          h: group.h,
+          s: group.s,
+          r: group.r,
+          ids: [...group.ids],
+          seen: now,
+        });
+        this.nameIndex.add(group.n);
+        result.newTypes++;
+        debugLogForBot(this._botName || "unknown", "wildlife:add", `${this._botName || "unknown"}`, `Added wildlife: "${group.n}" (${group.s}) in ${system}/${poi}`);
+      }
+
+      if (kept.length > 0) {
+        sys.pois[poi] = kept;
+      } else {
+        delete sys.pois[poi];
+      }
+
+      const changed =
+        result.newTypes > 0 ||
+        result.prunedIds > 0 ||
+        result.prunedTypes > 0 ||
+        kept.length > 0;
+      if (changed) this.markChanged(entry, now);
+      return result;
+    });
+  }
+
+  // ── Read paths (creatures page / sync) ──────────────────────────────────
+  // These deliberately read from disk and overlay the hot cache, so evicting
+  // cold systems from RAM never makes the page incomplete.
+
+  private *iterateSystems(): Generator<SystemWildlife> {
+    const seen = new Set<string>();
+    for (const [key, entry] of this.cache) {
+      seen.add(key);
+      yield entry.sys;
     }
-    return newType;
+    for (const key of this.listSystemKeys()) {
+      if (seen.has(key)) continue;
+      const sys = this.readSystem(key);
+      if (sys) yield sys;
+    }
   }
 
   private *iterateEntries(): Generator<{ system: string; poi: string; entry: CreatureEntry }> {
-    for (const sys of this.cache.values()) {
+    for (const sys of this.iterateSystems()) {
       for (const [poi, list] of Object.entries(sys.pois)) {
         for (const entry of list) {
           yield { system: sys.system, poi, entry };
@@ -293,8 +544,15 @@ export class WildlifeStore {
     return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  /**
+   * Most recent sighting of a creature by name, or null.
+   *
+   * NOTE: this walks every system (hot cache + disk). For a plain "is this a
+   * creature?" test use `hasCreatureName()` — it is a Set lookup.
+   */
   getWildlifeDetail(name: string): WildlifeDetail | null {
     const normalized = this.normalize(name);
+    if (!this.hasCreatureName(normalized)) return null;
     let best: WildlifeDetail | null = null;
     for (const { system, poi, entry } of this.iterateEntries()) {
       if (entry.n === normalized) {
@@ -317,38 +575,41 @@ export class WildlifeStore {
     return out.sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  getCounts(): WildlifeCounts {
-    let systems = 0;
-    let pois = 0;
-    let creatures = 0;
-    let individuals = 0;
-    let surveySystems = 0;
-    let surveySpecies = 0;
-    for (const sys of this.cache.values()) {
-      systems++;
-      for (const list of Object.values(sys.pois)) {
-        if (list.length > 0) pois++;
-        for (const e of list) {
-          creatures++;
-          individuals += e.ids.length;
-        }
-      }
-      if (sys.survey && sys.survey.wildlife.length > 0) {
-        surveySystems++;
-        surveySpecies += sys.survey.wildlife.length;
+  private countSystem(sys: SystemWildlife, counts: WildlifeCounts): void {
+    counts.systems++;
+    for (const list of Object.values(sys.pois)) {
+      if (list.length > 0) counts.pois++;
+      for (const e of list) {
+        counts.creatures++;
+        counts.individuals += e.ids.length;
       }
     }
-    return { systems, pois, creatures, individuals, surveySystems, surveySpecies };
+    if (sys.survey && sys.survey.wildlife.length > 0) {
+      counts.surveySystems++;
+      counts.surveySpecies += sys.survey.wildlife.length;
+    }
+  }
+
+  getCounts(): WildlifeCounts {
+    const counts: WildlifeCounts = {
+      systems: 0, pois: 0, creatures: 0, individuals: 0, surveySystems: 0, surveySpecies: 0,
+    };
+    for (const sys of this.iterateSystems()) this.countSystem(sys, counts);
+    return counts;
   }
 
   getFullData(): WildlifeFullData {
     const systems: Record<string, SystemWildlife> = {};
+    const counts: WildlifeCounts = {
+      systems: 0, pois: 0, creatures: 0, individuals: 0, surveySystems: 0, surveySpecies: 0,
+    };
     let lastUpdated = "";
-    for (const sys of this.cache.values()) {
+    for (const sys of this.iterateSystems()) {
       systems[sys.system] = sys;
       if (sys.lastUpdated > lastUpdated) lastUpdated = sys.lastUpdated;
+      this.countSystem(sys, counts);
     }
-    return { systems, lastUpdated, counts: this.getCounts() };
+    return { systems, lastUpdated, counts };
   }
 
   getSystemData(system: string): SystemWildlife {
@@ -385,21 +646,21 @@ export class WildlifeStore {
         difficulty: s.difficulty || undefined,
       }));
 
-    const sys = this.loadSystem(system);
-    sys.survey = {
-      lastUpdated: new Date().toISOString(),
+    const entry = this.loadEntry(system);
+    const stamp = new Date().toISOString();
+    entry.sys.survey = {
+      lastUpdated: stamp,
       wildlife: normalized,
       faintSignatures: signatures,
     };
-    sys.lastUpdated = sys.survey.lastUpdated;
-    this.writeSystemFile(sys);
-    void onWildlifeUpdate({ system: sys.system, data: sys });
+    this.markChanged(entry, stamp);
   }
 
   /** Latest survey_system-derived potential-creature snapshot for a system, if any. */
   getSurvey(system: string): SystemSurveyWildlife | null {
     return this.loadSystem(system).survey ?? null;
   }
+
   /**
    * Merge an aggregated snapshot into this store. Unlike a replace, this unions
    * creatures by (system, poi, name, maxHull) and unions their `ids`, keeping the
@@ -412,12 +673,12 @@ export class WildlifeStore {
     for (const sys of Object.values(data.systems)) {
       if (!sys || !sys.system) continue;
       const key = sanitizeSystemName(sys.system);
-      const target = this.loadSystem(key);
+      const target = this.loadEntry(key);
       let changed = false;
 
       for (const [poi, list] of Object.entries(sys.pois || {})) {
         if (!list || list.length === 0) continue;
-        const tlist = (target.pois[poi] = target.pois[poi] || []);
+        const tlist = (target.sys.pois[poi] = target.sys.pois[poi] || []);
         for (const entry of list) {
           if (!entry || !entry.n) continue;
           const existing = tlist.find((e) => e.n === entry.n && e.h === entry.h);
@@ -442,14 +703,17 @@ export class WildlifeStore {
             });
             changed = true;
           }
+          this.nameIndex.add(entry.n);
         }
       }
 
       if (changed) {
-        target.lastUpdated = new Date().toISOString();
-        this.writeSystemFile(target);
+        // A merge is remote data: persist it on the normal cadence, but don't
+        // echo it straight back to the network.
+        target.sys.lastUpdated = new Date().toISOString();
+        target.dirty = true;
+        target.lastAccess = Date.now();
       }
-      this.cache.set(key, target);
     }
   }
 
@@ -460,6 +724,117 @@ export class WildlifeStore {
   importAll(data: WildlifeFullData): void {
     this.mergeFrom(data);
   }
+
+  // ── Persistence / housekeeping ──────────────────────────────────────────
+
+  /** Systems currently held in RAM (diagnostics). */
+  getCacheSize(): number {
+    return this.cache.size;
+  }
+
+  /**
+   * Write every dirty system. Async and sequential on purpose: a sync slave can
+   * dirty hundreds of systems at once and writing them all in one synchronous
+   * burst would stall the event loop exactly like the old per-sighting writes.
+   */
+  async flush(): Promise<number> {
+    if (this.flushing) return 0;
+    this.flushing = true;
+    let written = 0;
+    try {
+      this.ensureDir();
+      for (const [key, entry] of this.cache) {
+        if (!entry.dirty) continue;
+        entry.dirty = false;
+        const empty = Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey;
+        const path = this.systemFilePath(key);
+        try {
+          if (empty) {
+            // Everything in this system was pruned — drop the file too.
+            if (existsSync(path)) await unlink(path);
+          } else {
+            await writeFile(path, JSON.stringify(entry.sys) + "\n", "utf-8");
+          }
+          written++;
+        } catch (err) {
+          entry.dirty = true;
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[WildlifeStore] Failed to write ${key}.json: ${msg}`);
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+    return written;
+  }
+
+  /** Blocking flush for shutdown paths. */
+  flushSync(): number {
+    let written = 0;
+    this.ensureDir();
+    for (const [key, entry] of this.cache) {
+      if (!entry.dirty) continue;
+      entry.dirty = false;
+      try {
+        const path = this.systemFilePath(key);
+        if (Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey) {
+          if (existsSync(path)) unlinkSync(path);
+        } else {
+          writeFileSync(path, JSON.stringify(entry.sys) + "\n", "utf-8");
+        }
+        written++;
+      } catch (err) {
+        entry.dirty = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[WildlifeStore] Failed to write ${key}.json: ${msg}`);
+      }
+    }
+    return written;
+  }
+
+  /** Drop clean, untouched systems so RAM stays proportional to activity. */
+  private evictCold(): number {
+    const cutoff = Date.now() - EVICT_IDLE_MS;
+    let evicted = 0;
+    for (const [key, entry] of this.cache) {
+      if (entry.dirty || entry.pushPending) continue;
+      if (entry.lastAccess > cutoff) continue;
+      this.cache.delete(key);
+      evicted++;
+    }
+    return evicted;
+  }
+
+  /**
+   * Push at most one wildlife update per system per PUSH_INTERVAL_MS. Sightings
+   * used to fire a push (and a full deep clone) per creature, which flooded
+   * light slaves and burned more CPU than the sightings themselves.
+   */
+  private drainPushes(): void {
+    if (!isSyncPushEnabled()) {
+      // Nothing is listening — don't accumulate work for a push that never happens.
+      for (const entry of this.cache.values()) entry.pushPending = false;
+      return;
+    }
+    const now = Date.now();
+    for (const entry of this.cache.values()) {
+      if (!entry.pushPending) continue;
+      if (now - entry.lastPush < PUSH_INTERVAL_MS) continue;
+      entry.pushPending = false;
+      entry.lastPush = now;
+      void onWildlifeUpdate({ system: entry.sys.system, data: entry.sys });
+    }
+  }
 }
 
 export const wildlifeStore = new WildlifeStore();
+
+// Last-resort safety net: a normal `process.exit()` that skipped the graceful
+// shutdown path must not throw away up to 2 minutes of sightings.
+process.on("exit", () => {
+  try {
+    wildlifeStore.flushSync();
+  } catch {
+    // nothing useful to do while exiting
+  }
+});

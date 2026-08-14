@@ -1,4 +1,5 @@
-import { SpaceMoltAPI } from './api.js';
+import type { Account } from '@spacemolt/lib';
+import { libExecute } from './commandBridge.js';
 
 export const MINING_DEPOSIT_SCRIPT = `IF traveling()
   WAIT
@@ -64,26 +65,26 @@ ELSE
   SURVEY
 END`;
 
-export async function uploadDroneScript(api: SpaceMoltAPI, droneId: string, script: string) {
-  return api.execute('upload_drone_script', { drone_id: droneId, script });
+export async function uploadDroneScript(account: Account, droneId: string, script: string) {
+  return libExecute(account, 'upload_drone_script', { drone_id: droneId, script });
 }
 
-export async function loadDrone(api: SpaceMoltAPI, itemId: string) {
-  return api.execute('load_drone', { item_id: itemId });
+export async function loadDrone(account: Account, itemId: string) {
+  return libExecute(account, 'load_drone', { item_id: itemId });
 }
 
-export async function deployDrone(api: SpaceMoltAPI, droneId: string) {
-  return api.execute('deploy_drone', { drone_id: droneId });
+export async function deployDrone(account: Account, droneId: string) {
+  return libExecute(account, 'deploy_drone', { drone_id: droneId });
 }
 
-export async function recallDrone(api: SpaceMoltAPI, droneId: string) {
-  return api.execute('recall_drone', { drone_id: droneId });
+export async function recallDrone(account: Account, droneId: string) {
+  return libExecute(account, 'recall_drone', { drone_id: droneId });
 }
 
-export async function getDrones(api: SpaceMoltAPI) {
-  return api.execute('get_drones', {});
+export async function getDrones(account: Account) {
+  return libExecute(account, 'get_drones', {});
 }
 
-export async function getDrone(api: SpaceMoltAPI, droneId: string) {
-  return api.execute('get_drone', { drone_id: droneId });
+export async function getDrone(account: Account, droneId: string) {
+  return libExecute(account, 'get_drone', { drone_id: droneId });
 }

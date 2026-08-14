@@ -1,9 +1,17 @@
+import { join } from "path";
 import { type SyncSettings, type CoordinationPayload } from "./client_sync_types.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 import { onCoordinationUpdate } from "./client_sync_hooks.js";
 import { wildlifeStore } from "./wildlivestore.js";
+import {
+  listSyncedFiles,
+  readSyncedFile,
+  mergeIntoFile,
+  seedIntoFile,
+  type FileEntry,
+} from "./client_sync_files.js";
 
 export class ClientSyncSlave {
   private settings: SyncSettings;
@@ -11,9 +19,23 @@ export class ClientSyncSlave {
   private running = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastSync = 0;
+  /** How long since the last *successful* sync before we treat the connection as
+   *  stale and force a re-register. Catches the "master restarted, our pushes are
+   *  silently failing, but settings still says Connected" case. */
+  private staleMs = 60000;
   private lastError: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private lastConnectAttempt = 0;
+  /** Reason the last cross-client fleet pull fell back to local-only. Surfaced
+   *  to the rescue routine so a connectivity failure is visible in the rescue
+   *  log (otherwise it's only on this node's console). */
+  private lastPullError: string | null = null;
+  /** Roster of clients the master reported in the last fleet poll. */
+  private lastClients: Array<Record<string, unknown>> = [];
+  /** Hash of the last content we pushed to master for each file (loop guard). */
+  private lastPushed = new Map<string, string>();
+  /** Hash of the last content we pulled from master for each file (loop guard). */
+  private lastPulled = new Map<string, string>();
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -24,6 +46,9 @@ export class ClientSyncSlave {
     this.running = true;
     console.log(`[ClientSync] Starting slave mode`);
     const intervalMs = Math.max(5, this.settings.pollIntervalSec * 1000);
+    // Treat the link as stale after ~4 missed poll cycles (min 30s). The master
+    // prunes silent clients at 10min, so this self-heals well before then.
+    this.staleMs = Math.max(30000, intervalMs * 4);
     this.timer = setInterval(() => this.pollCycle(), intervalMs);
     this.pollCycle();
   }
@@ -63,10 +88,13 @@ export class ClientSyncSlave {
     if (this.settings.password) headers["X-Password"] = this.settings.password;
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
-    const url = `${this.settings.masterUrl}${path}`;
+    // Normalize masterUrl so a trailing slash can't produce a malformed
+    // double-slash path (register() uses new URL() which already normalizes).
+    const base = (this.settings.masterUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
-    
+
     try {
       const res = await fetch(url, { ...init, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: controller.signal });
       clearTimeout(timeoutId);
@@ -83,8 +111,35 @@ export class ClientSyncSlave {
     }
   }
 
-  private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<void> {
-    await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload);
+  /** Like `request` but returns the raw response text (for file bodies). */
+  private async requestText(path: string): Promise<string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    };
+    if (this.settings.apiKey) headers["X-API-Key"] = this.settings.apiKey;
+    if (this.settings.password) headers["X-Password"] = this.settings.password;
+    if (this.clientId) headers["X-Client-Id"] = this.clientId;
+
+    // Normalize masterUrl so a trailing slash can't produce a malformed
+    // double-slash path (register() uses new URL() which already normalizes).
+    const base = (this.settings.masterUrl || "").replace(/\/+$/, "");
+    const url = `${base}${path}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    try {
+      const res = await fetch(url, { method: "GET", headers, signal: controller.signal });
+      clearTimeout(timeoutId);
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+      return await res.text();
+    } catch (err) {
+      clearTimeout(timeoutId);
+      throw err;
+    }
+  }
+
+  private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<{ ok?: boolean }> {
+    return (await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload)) as { ok?: boolean };
   }
 
 private async register(): Promise<{ ok: boolean; error?: string }> {
@@ -93,7 +148,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     this.lastConnectAttempt = Date.now();
     
     try {
-      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password, url: this.settings.selfUrl || "" }) });
       let payload: { ok: boolean; clientId?: string; error?: string };
       try { 
         payload = await res.json(); 
@@ -116,6 +171,15 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       this.lastError = msg;
       return { ok: false, error: msg };
     }
+  }
+
+  /** Force (re)registration with the master. Used by one-shot fleet pulls so a
+   *  rescue scan always reaches a registered state even if the normal poll cycle
+   *  hasn't run yet (e.g. right after a client restart). */
+  public async forceRegister(): Promise<void> {
+    if (this.running) return; // poll cycle will register on its own
+    const reg = await this.register();
+    if (reg.ok) this.connectionState = "connected";
   }
 
   private async pullMap(): Promise<void> {
@@ -164,8 +228,11 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     const data = await this.request<Record<string, unknown>>("/api/client-sync/wildlife");
     if (data && typeof data === "object" && "systems" in data) {
       wildlifeStore.mergeFrom(data as any);
-      const counts = wildlifeStore.getCounts();
-      this.log(`Updated wildlife: ${counts.creatures} types across ${counts.systems} systems`);
+      // Count from the payload, not from the store: the store now reads cold
+      // systems from disk on demand, so getCounts() would re-scan every file
+      // on every sync cycle just to produce this log line.
+      const systems = Object.keys((data as { systems?: Record<string, unknown> }).systems || {}).length;
+      this.log(`Merged wildlife from master: ${systems} system(s)`);
     }
   }
 
@@ -178,18 +245,180 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     await this.request<{ ok: boolean }>("/api/client-sync/wildlife-update", { method: "POST" }, data);
   }
 
-private async pushStatuses(): Promise<void> {
-    const statuses: Record<string, unknown>[] = [];
-    await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
+  /** Push this node's bot statuses to the master. Returns true if the master
+   *  accepted the push (client known), false if rejected (e.g. master restarted
+   *  and forgot this clientId) — caller should then force a re-register. */
+  private async pushStatuses(): Promise<boolean> {
+    let statuses: Record<string, unknown>[] = [];
+    try {
+      const { getBotStatuses } = await import("./botmanager.js");
+      statuses = (getBotStatuses() as unknown[]) as Record<string, unknown>[];
+    } catch {
+      // best-effort: ignore if bot manager is unavailable
+    }
+    try {
+      const res = await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
+      return !!(res && (res as { ok?: boolean }).ok);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Pull the master's cross-client fleet rescue poll: a single request that asks
+   * every connected client for its local bots' fuel status + positions and
+   * returns the union. This is how a rescue bot running on a *slave* node sees
+   * the whole connected fleet — it polls the master once instead of each bot
+   * needing to request its own rescue over the synced bot-chat channel.
+   *
+   * Returns this node's own local bot statuses on failure (so a rescue bot on a
+   * disconnected slave still sees its own fleet). Never throws.
+   */
+  public async pullFleetRescue(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
+    this.lastPullError = null;
+    // If we aren't registered yet (e.g. this runs from a rescue scan that fired
+    // before our poll cycle completed a register after a client restart), try a
+    // one-shot register now so we still pull the master's full combined fleet
+    // instead of silently falling back to local-only. Never throws.
+    if (!this.clientId) {
+      try {
+        const reg = await this.register();
+        if (reg.ok) this.connectionState = "connected";
+      } catch (err) {
+        this.lastPullError = `register failed: ${err instanceof Error ? err.message : String(err)}`;
+        this.logError(`pullFleetRescue: ${this.lastPullError}`);
+        return this.localFleetStatuses();
+      }
+    }
+    if (!this.clientId) {
+      this.lastPullError = "not registered (no clientId)";
+      return this.localFleetStatuses();
+    }
+    try {
+      const data = await this.request<{ bots?: Array<Record<string, unknown>>; clients?: Array<Record<string, unknown>> }>("/api/client-sync/fleet-poll");
+      if (data && Array.isArray(data.bots)) {
+        this.lastClients = Array.isArray(data.clients) ? data.clients : [];
+        return { bots: data.bots, clients: this.lastClients };
+      }
+      this.lastPullError = `master returned unexpected shape (${typeof data})`;
+    } catch (err) {
+      this.lastPullError = `fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    return this.localFleetStatuses();
+  }
+
+  public getLastPullError(): string | null {
+    return this.lastPullError;
+  }
+
+  public getLastClients(): Array<Record<string, unknown>> {
+    return this.lastClients;
+  }
+
+  /** This node's own local bot statuses (used as a fallback for fleet rescue). */
+  private async localFleetStatuses(): Promise<{ bots: Array<Record<string, unknown>>; clients: Array<Record<string, unknown>> }> {
+    try {
+      const { getBotStatuses } = await import("./botmanager.js");
+      return { bots: (getBotStatuses() as unknown[]) as Array<Record<string, unknown>>, clients: [] };
+    } catch {
+      return { bots: [], clients: [] };
+    }
+  }
+
+  /**
+   * Two-way file sync against the master.
+   *
+   * PULL: fetch the master's combined repository listing and merge any file
+   * that differs from what we last pulled. Missing files (incl. at first
+   * connect) are seeded locally so this client gains the master's existing
+   * data. After merging a master file we record its hash as both "pulled" and
+   * "pushed" so we never echo it straight back.
+   *
+   * PUSH: diff our local synced files against the last content we sent to the
+   * master and POST any that changed. The master deep-merges them into the
+   * combined repo, so every other client converges on our writes.
+   */
+  /** True if this file path has been opted out of sync via settings. */
+  private isFileSyncDisabled(relPath: string): boolean {
+    const disabled = this.settings.disabledSyncFiles;
+    if (!Array.isArray(disabled) || disabled.length === 0) return false;
+    return disabled.includes(relPath);
+  }
+
+  private async syncFiles(): Promise<void> {
+    if (!this.clientId) return;
+    const dataDir = join(process.cwd(), "data");
+
+    // ── PULL from master ──
+    const masterList = await this.request<{ files: FileEntry[] }>("/api/client-sync/local-files");
+    if (masterList && Array.isArray(masterList.files)) {
+      for (const f of masterList.files) {
+        // Skip files the user opted out of: don't let the combined repo
+        // overwrite this client's personal copy.
+        if (this.isFileSyncDisabled(f.path)) continue;
+        const last = this.lastPulled.get(f.path);
+        if (last === f.hash) continue;
+        const content = await this.requestText(`/api/client-sync/local-file?path=${encodeURIComponent(f.path)}`);
+        if (typeof content !== "string" || !content) continue;
+        const localContent = readSyncedFile(dataDir, f.path);
+        // Missing locally → seed with master's content; present → merge master
+        // into our local copy so we gain every other client's data too.
+        const hash = localContent === null
+          ? seedIntoFile(dataDir, f.path, content)
+          : mergeIntoFile(dataDir, f.path, content);
+        if (hash) {
+          this.lastPulled.set(f.path, f.hash);
+          // If the merge produced exactly what master already has, mark it
+          // pushed so we don't echo master's own data back. Otherwise leave it
+          // unset so the push phase uploads our (superset) version once.
+          if (hash === f.hash) this.lastPushed.set(f.path, f.hash);
+        }
+      }
+    }
+
+    // ── PUSH to master ──
+    const localList = listSyncedFiles(dataDir);
+    for (const f of localList) {
+      // Skip files the user opted out of: don't upload this client's personal
+      // copy into the combined repo either.
+      if (this.isFileSyncDisabled(f.path)) continue;
+      const last = this.lastPushed.get(f.path);
+      if (last === f.hash) continue;
+      const content = readSyncedFile(dataDir, f.path);
+      if (content === null) continue;
+      try {
+        await this.request<{ ok: boolean }>("/api/client-sync/file-update", { method: "POST" }, { path: f.path, content, mtime: f.mtime });
+        this.lastPushed.set(f.path, f.hash);
+      } catch {
+        // leave lastPushed unchanged so we retry next cycle
+      }
+    }
   }
 
   private async pollCycle(): Promise<void> {
     if (!this.running) return;
     try {
+      // Stale-connection self-heal: if we had synced before but haven't pushed
+      // successfully in staleMs (e.g. the master restarted and now silently
+      // rejects/ignores our pushes), force a re-register so we don't sit there
+      // "connected" forever while actually dead.
+      if (this.clientId && this.lastSync !== 0 && Date.now() - this.lastSync > this.staleMs) {
+        this.log(`Connection stale (last sync ${Math.round((Date.now() - this.lastSync) / 1000)}s ago) — forcing re-register`);
+        this.clientId = null;
+        this.connectionState = 'disconnected';
+      }
       if (!this.clientId) {
         this.log('Registering with master...');
         const reg = await this.register();
-        if (!reg.ok) throw new Error(reg.error || "register failed");
+        if (!reg.ok) {
+          // Registration failed — only now drop our client id so we retry next
+          // cycle. A transient failure must not poison an already-registered
+          // client.
+          this.clientId = null;
+          this.connectionState = 'disconnected';
+          throw new Error(reg.error || "register failed");
+        }
+        this.connectionState = 'connected';
       }
       if (this.settings.syncMap) await this.pullMap();
       if (this.settings.syncCatalog) await this.pullCatalog();
@@ -199,17 +428,31 @@ private async pushStatuses(): Promise<void> {
         await this.pushWildlife();
         await this.pullWildlife();
       }
-      await this.pushStatuses();
+      const pushed = await this.pushStatuses();
+      if (!pushed) {
+        // Master rejected the push (client not found — e.g. master restarted, or
+        // this slave is pointed at a different master instance than the one it
+        // registered with). Force a re-register next cycle instead of pushing to
+        // a stale id. Log the masterUrl so a misconfigured URL (e.g. localhost
+        // when the real master is on another host) is obvious.
+        this.clientId = null;
+        this.connectionState = 'disconnected';
+        this.logError(`Status push rejected by master at ${this.settings.masterUrl} — will re-register next cycle`);
+      }
       if (this.settings.pushLocalDiscoveries) {
         await this.pushLocal("poi-update", { systemId: "", poi: {} });
         await this.pushLocal("market-update", { station: "", orders: [] });
       }
+      await this.syncFiles();
       this.lastSync = Date.now();
       this.lastError = null;
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
-      this.clientId = null;
-      this.connectionState = 'disconnected';
+      // NB: do NOT null clientId on a generic error (chat pull, file sync,
+      // transient blip). Nuking the id on every blip churned re-registrations
+      // and left clients "connected" but never pushing. Only register failure
+      // / rejected push drops the id.
+      if (!this.clientId) this.connectionState = 'disconnected';
       this.logError(`Sync failed: ${this.lastError}`);
     }
   }

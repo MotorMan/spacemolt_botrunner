@@ -65,11 +65,20 @@
 
   <script>
     let mapData = {};
+    let marketDetails = { items: [] };
     let catalogData = {};
     let currentItemType = 'all';
     let currentSortCol = null;
     let currentSortDir = 'asc';
     let mobileCapitol = null;
+    let ws = null;
+    let reconnectDelay = 1000;
+    let wsManualClose = false;
+    let wsConnectTimer = null;
+    let wsInitTimer = null;
+    let wsHeartbeatTimer = null;
+    let wsWatchdogTimer = null;
+    let wsLastMsg = Date.now();
 
     async function loadCatalog() {
       try {
@@ -181,20 +190,67 @@ function getItemCategory(itemId, itemName) {
     }
 
     function connect() {
+      if (wsManualClose) return;
+      clearTimeout(wsConnectTimer);
+
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${location.host}/ws`);
-      
+      let host = location.host;
+      if (!host) host = (location.hostname || 'localhost') + (location.port ? ':' + location.port : '');
+      let url;
+      try {
+        url = `${proto}//${host}/ws`;
+        ws = new WebSocket(url);
+      } catch (err) {
+        console.warn('WebSocket constructor failed, retrying in 1s:', err);
+        wsConnectTimer = setTimeout(connect, 1000);
+        return;
+      }
+
+      wsLastMsg = Date.now();
+
+      clearTimeout(wsInitTimer);
+      wsInitTimer = setTimeout(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          console.warn('WebSocket not open after 4s — REST fallback + reconnect');
+          try { loadData(); } catch (e) {}
+          try { ws && ws.close(); } catch {}
+        }
+      }, 4000);
+
       ws.onopen = () => {
+        clearTimeout(wsInitTimer);
+        reconnectDelay = 1000;
         loadData();
+        clearInterval(wsHeartbeatTimer);
+        wsHeartbeatTimer = setInterval(() => {
+          try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+        }, 15000);
+        clearInterval(wsWatchdogTimer);
+        wsWatchdogTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+            console.warn('WebSocket silent for 30s, forcing reconnect');
+            try { ws.close(); } catch {}
+          }
+        }, 5000);
       };
-      
+
       ws.onclose = () => {
-        setTimeout(connect, 2000);
+        clearTimeout(wsInitTimer);
+        clearInterval(wsHeartbeatTimer);
+        clearInterval(wsWatchdogTimer);
+        if (wsManualClose) return;
+        wsConnectTimer = setTimeout(connect, 1000);
       };
-      
+
+      ws.onerror = () => {
+        try { ws && ws.close(); } catch {}
+      };
+
       ws.onmessage = (ev) => {
         let msg;
         try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'pong') return;
+        wsLastMsg = Date.now();
         if (msg.type === 'init') {
           loadData();
         }
@@ -206,6 +262,12 @@ function getItemCategory(itemId, itemName) {
         const mapRes = await fetch('/data/map.json');
         mapData = await mapRes.json();
         mobileCapitol = mapData.mobile_capitol || null;
+        const mdRes = await fetch('/data/marketDetails.json');
+        if (mdRes.ok) {
+          marketDetails = await mdRes.json();
+        } else {
+          marketDetails = { items: [] };
+        }
         await loadCatalog();
         renderMarket();
       } catch (e) {
@@ -273,57 +335,58 @@ function getItemCategory(itemId, itemName) {
       const searchTerm = document.getElementById('itemSearch')?.value?.toLowerCase() || '';
       
       const itemMap = new Map();
-      const systems = mapData.systems || {};
+      const items = marketDetails.items || [];
       
-      for (const [sysId, sys] of Object.entries(systems)) {
-        const sysName = sys.name || sysId;
-        for (const poi of sys.pois || []) {
-          if (isMobileCapitol(poi.id)) continue;
-          if (poi.market && Array.isArray(poi.market)) {
-            for (const m of poi.market) {
-              const itemId = m.item_id;
-              if (!itemId) continue;
-              
-              const category = getItemCategory(itemId, m.item_name);
-              
-              if (currentItemType !== 'all' && category !== currentItemType) continue;
-              if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && 
-                  !(m.item_name && m.item_name.toLowerCase().includes(searchTerm))) continue;
-              
-              if (!itemMap.has(itemId)) {
-                itemMap.set(itemId, {
-                  name: m.item_name || itemId,
-                  category: category,
-                  stations: [],
-                  totalBuy: 0,
-                  totalSell: 0,
-                  bestBuyPrice: 0,
-                  bestSellPrice: 0
-                });
-              }
-              
-              const entry = itemMap.get(itemId);
-              const stationName = poi.name || poi.id;
-              const faction = getFactionForStation(poi.id);
-              
-              entry.stations.push({
-                sysName,
-                stationName,
-                faction,
-                buyPrice: m.best_sell || 0,
-                sellPrice: m.best_buy || 0,
-                demand: m.buy_quantity || 0,
-                supply: m.sell_quantity || 0,
-                updated: m.last_updated
-              });
-              
-              entry.totalBuy += m.buy_quantity || 0;
-              entry.totalSell += m.sell_quantity || 0;
-              if (m.best_sell > entry.bestBuyPrice) entry.bestBuyPrice = m.best_sell;
-              if (m.best_buy > entry.bestSellPrice) entry.bestSellPrice = m.best_buy;
-            }
-          }
+      for (const m of items) {
+        const itemId = m.itemId;
+        if (!itemId) continue;
+        
+        const category = getItemCategory(itemId, m.itemName);
+        
+        if (currentItemType !== 'all' && category !== currentItemType) continue;
+        if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && 
+            !(m.itemName && m.itemName.toLowerCase().includes(searchTerm))) continue;
+        
+        const buyOrders = Array.isArray(m.buyOrders) ? m.buyOrders : [];
+        const sellOrders = Array.isArray(m.sellOrders) ? m.sellOrders : [];
+        
+        const bestBuy = buyOrders.length > 0 ? Math.max(...buyOrders.map(o => o.price)) : 0;
+        const bestSell = sellOrders.length > 0 ? Math.min(...sellOrders.map(o => o.price)) : 0;
+        const demand = buyOrders.reduce((sum, o) => sum + (o.quantity || 0), 0);
+        const supply = sellOrders.reduce((sum, o) => sum + (o.quantity || 0), 0);
+        
+        if (!itemMap.has(itemId)) {
+          itemMap.set(itemId, {
+            name: m.itemName || itemId,
+            category: category,
+            stations: [],
+            totalBuy: 0,
+            totalSell: 0,
+            bestBuyPrice: 0,
+            bestSellPrice: 0
+          });
         }
+        
+        const entry = itemMap.get(itemId);
+        const stationName = m.stationName || m.stationPoiId;
+        const sysName = m.systemId || '';
+        const faction = getFactionForStation(m.stationPoiId);
+        
+        entry.stations.push({
+          sysName,
+          stationName,
+          faction,
+          buyPrice: bestSell,
+          sellPrice: bestBuy,
+          demand,
+          supply,
+          updated: m.lastUpdated
+        });
+        
+        entry.totalBuy += demand;
+        entry.totalSell += supply;
+        if (bestSell > entry.bestBuyPrice) entry.bestBuyPrice = bestSell;
+        if (bestBuy > entry.bestSellPrice) entry.bestSellPrice = bestBuy;
       }
 
       const factionAverages = {};
@@ -354,9 +417,10 @@ function getItemCategory(itemId, itemName) {
         return (aIdx === -1 ? 999 : aIdx) - (bIdx === -1 ? 999 : bIdx);
       });
 
+      const uniqueSystems = new Set(items.map(m => m.systemId).filter(Boolean));
       let html = `
         <div class="stats-bar">
-          ${itemMap.size} items across ${Object.keys(systems).length} systems | Mobile Capitol: ${mobileCapitol ? (mobileCapitol.systemName || mobileCapitol.systemId) : 'not discovered'}
+          ${itemMap.size} items across ${uniqueSystems.size} systems | Mobile Capitol: ${mobileCapitol ? (mobileCapitol.systemName || mobileCapitol.systemId) : 'not discovered'}
         </div>
         <table class="market-table">
           <thead>

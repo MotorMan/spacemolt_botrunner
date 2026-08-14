@@ -15,6 +15,7 @@ import {
 } from "./craft-goals.js";
 import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 import { catalogStore } from "../catalogstore.js";
+import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -64,6 +65,13 @@ async function getCrafterSettings(): Promise<{
   allowRentalPurchase: boolean;
   rentalSpendingLimit: number;
   cycleTimeSec: number;
+  craftingHomeBase: string;
+  // Explicit recipe -> facility-type links for "facility only" recipes that the
+  // catalog may not auto-associate (or where we want to pin the venue). e.g.
+  // { "breed_plutonium": ["breeder_reactor_core", "enhanced_breeder_reactor",
+  // "industrial_breeder_complex", "advanced_breeder_array"] }. These unblock the
+  // recipe in the planner and let the crafter route it to the correct facility.
+  recipeFacilityLinks: Record<string, string[]>;
 }> {
   const { join } = require("path");
   const { readFileSync, existsSync } = require("fs");
@@ -71,6 +79,8 @@ async function getCrafterSettings(): Promise<{
   const text = existsSync(file) ? readFileSync(file, "utf-8") : "";
   const raw = JSON.parse(text || "{}");
   const c = (raw.crafter as Record<string, unknown>) || {};
+  const general = (raw.general as Record<string, unknown>) || {};
+  const generalFactionStorageStation = (general.factionStorageStation as string) || "";
 
   const blacklistedRecipes: string[] = ((c.blacklistedRecipes as string[]) || [
     "basic_silicon_refinement",
@@ -81,6 +91,19 @@ async function getCrafterSettings(): Promise<{
   ]) as string[];
 
   const useQueuedCrafting = (c.useQueuedCrafting as boolean) ?? true;
+
+  // Recipe -> facility-type links for facility-only recipes (see CrafterSettings).
+  const rawRecipeFacilityLinks = (c.recipeFacilityLinks as Record<string, unknown>) || {};
+  const recipeFacilityLinks: Record<string, string[]> = {};
+  for (const [recipeId, facTypes] of Object.entries(rawRecipeFacilityLinks)) {
+    if (typeof recipeId !== "string" || !recipeId) continue;
+    const list = Array.isArray(facTypes)
+      ? (facTypes as unknown[]).filter(t => typeof t === "string").map(t => t as string)
+      : (typeof facTypes === "string" ? [facTypes as string] : []);
+    if (list.length > 0) {
+      recipeFacilityLinks[recipeId] = list;
+    }
+  }
 
   let crafters: CrafterProfile[] = [];
   if (Array.isArray(c.crafters)) {
@@ -167,10 +190,33 @@ async function getCrafterSettings(): Promise<{
     allowRentalPurchase: (c.allowRentalPurchase as boolean) ?? false,
     rentalSpendingLimit: (c.rentalSpendingLimit as number) || 0,
     cycleTimeSec: (c.cycleTimeSec as number) || 30,
+    // The faction-storage station the crafter reads its materials from. A
+    // crafter can roam away from the faction home base, so this must be set
+    // explicitly (falling back to general.factionStorageStation) — otherwise it
+    // reads the wrong station and "loses" its stock, holding the whole chain.
+    craftingHomeBase: (c.craftingHomeBase as string) || generalFactionStorageStation || "",
+    recipeFacilityLinks,
   };
 }
 
 // ── Recipe helpers ────────────────────────────────────────────
+
+export interface RecipeOutput {
+  item_id: string;
+  name: string;
+  quantity: number;
+}
+
+function isFuelReserveItem(itemId: string): boolean {
+  return itemId.toLowerCase() === "fuel_reserve";
+}
+
+function outputsFuelReserve(recipe: Recipe): boolean {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return isFuelReserveItem(recipe.output_item_id);
+  }
+  return recipe.outputs.some(o => isFuelReserveItem(o.item_id));
+}
 
 export interface Recipe {
   recipe_id: string;
@@ -179,8 +225,38 @@ export interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
+  // All outputs of the recipe (1+ entries). `output_item_id`/`output_quantity`
+  // keep pointing at the FIRST output for backward compatibility; `outputs`
+  // carries every produced item so multi-output recipes (e.g. electrolyze_water
+  // -> hydrogen_gas + oxygen_gas) are tracked and requested correctly.
+  outputs: RecipeOutput[];
   category?: string;
   effective_time_per_run?: number;
+}
+
+// The output with the LOWEST quantity per run is the limiting factor: a recipe
+// that yields 4x hydrogen and 2x oxygen only advances both by runs, so the
+// effective throughput is bounded by the smaller output. Requests must be sized
+// against this item, otherwise the high-output item (hydrogen) alone makes the
+// planner think the goal is already satisfied while the other (oxygen) stays at
+// zero.
+export function lowestOutputItem(recipe: Recipe): RecipeOutput {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return { item_id: recipe.output_item_id, name: recipe.output_name, quantity: recipe.output_quantity || 1 };
+  }
+  return recipe.outputs.reduce((min, o) =>
+    (o.quantity || 1) < (min.quantity || 1) ? o : min
+  );
+}
+
+// Human-readable list of all outputs, e.g. "4x hydrogen_gas, 2x oxygen_gas".
+export function formatOutputs(recipe: Recipe): string {
+  if (!recipe.outputs || recipe.outputs.length === 0) {
+    return `${recipe.output_quantity || 1}x ${recipe.output_name || recipe.output_item_id}`;
+  }
+  return recipe.outputs
+    .map(o => `${o.quantity}x ${o.name || o.item_id}`)
+    .join(", ");
 }
 
 export function parseRecipes(data: unknown): Recipe[] {
@@ -202,9 +278,15 @@ export function parseRecipes(data: unknown): Recipe[] {
   return raw.map(r => {
     const comps = (r.components || r.ingredients || r.inputs || r.materials || []) as Array<Record<string, unknown>>;
     const rawOutputs = r.outputs || r.output || r.result || r.produces;
-    const output: Record<string, unknown> = Array.isArray(rawOutputs)
-      ? (rawOutputs[0] as Record<string, unknown>) || {}
-      : (rawOutputs as Record<string, unknown>) || {};
+    const outputList: Array<Record<string, unknown>> = Array.isArray(rawOutputs)
+      ? (rawOutputs as Array<Record<string, unknown>>)
+      : (rawOutputs ? [rawOutputs as Record<string, unknown>] : []);
+    const output: Record<string, unknown> = outputList[0] || {};
+    const outputs: RecipeOutput[] = outputList.map(o => ({
+      item_id: (o.item_id as string) || (o.id as string) || (o.item as string) || "",
+      name: (o.name as string) || (o.item_name as string) || (o.item_id as string) || (o.id as string) || "",
+      quantity: (o.quantity as number) || (o.amount as number) || (o.count as number) || 1,
+    })).filter(o => o.item_id);
     return {
       recipe_id: (r.recipe_id as string) || (r.id as string) || "",
       name: (r.name as string) || (r.recipe_id as string) || "",
@@ -213,9 +295,10 @@ export function parseRecipes(data: unknown): Recipe[] {
         name: (c.name as string) || (c.item_name as string) || (c.item_id as string) || (c.id as string) || "",
         quantity: (c.quantity as number) || (c.amount as number) || (c.count as number) || 1,
       })),
-      output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || "",
-      output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || "",
-      output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || 1,
+      output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || (outputs[0]?.item_id ?? ""),
+      output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || (outputs[0]?.name ?? ""),
+      output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || (outputs[0]?.quantity ?? 1),
+      outputs,
       category: (r.category as string) || "",
     };
   }).filter(r => r.recipe_id);
@@ -312,9 +395,23 @@ export function getFacilityRecipeMap(): FacilityRecipeMap[] {
   return map;
 }
 
+// Normalize a recipeFacilityLinks config into a facility-type -> recipeId index.
+// This is what lets an explicit link (e.g. breed_plutonium -> breeder_reactor_core)
+// drive venue resolution even when the catalog doesn't carry the recipe_id.
+function buildLinkIndex(recipeFacilityLinks: Record<string, string[]>): Map<string, string> {
+  const idx = new Map<string, string>();
+  for (const [recipeId, facTypes] of Object.entries(recipeFacilityLinks || {})) {
+    for (const ft of facTypes || []) {
+      idx.set(ft, recipeId);
+    }
+  }
+  return idx;
+}
+
 function getRecipesAvailableAtFacilities(
   factionFacilities: FactionFacility[],
-  facilityRecipeMap: FacilityRecipeMap[]
+  facilityRecipeMap: FacilityRecipeMap[],
+  recipeFacilityLinks: Record<string, string[]> = {},
 ): Set<string> {
   const facilityTypes = new Set(
     factionFacilities
@@ -326,6 +423,13 @@ function getRecipesAvailableAtFacilities(
     if (facilityTypes.has(entry.facilityType)) {
       availableRecipes.add(entry.recipeId);
     }
+  }
+  // Also count any explicitly linked facility we own, even if the catalog has
+  // no recipe_id for it (the whole point of the linking feature).
+  const linkIdx = buildLinkIndex(recipeFacilityLinks);
+  for (const ft of facilityTypes) {
+    const linkedRecipe = linkIdx.get(ft);
+    if (linkedRecipe) availableRecipes.add(linkedRecipe);
   }
   return availableRecipes;
 }
@@ -343,22 +447,52 @@ function getRecipesAvailableAtFacilities(
 
 export type OwnFacilityMap = Map<string, FactionFacility[]>;
 
-export function buildOwnFacilityRecipeMap(factionFacilities: FactionFacility[]): OwnFacilityMap {
+export function buildOwnFacilityRecipeMap(
+  factionFacilities: FactionFacility[],
+  recipeFacilityLinks: Record<string, string[]> = {},
+): OwnFacilityMap {
   const map: OwnFacilityMap = new Map();
   const catalogFacilities = catalogStore.getAll().facilities;
+  const linkIdx = buildLinkIndex(recipeFacilityLinks);
   for (const f of factionFacilities) {
     if (f.faction_service !== "") continue; // only facilities we personally own
     if (f.status && f.status.toLowerCase() === "inactive") continue; // skip non-functional ones
     if (!f.facility_id || !f.type) continue;
     const catFac = catalogFacilities[f.type] as Record<string, unknown> | undefined;
-    if (!catFac) continue;
-    const recipeId = (catFac.recipe_id as string) || "";
+    // Prefer the catalog's recipe_id, then fall back to an explicit link so a
+    // facility-only recipe (e.g. breed_plutonium) still maps to its facility
+    // even when the catalog doesn't carry the association.
+    const recipeId = ((catFac?.recipe_id as string) || linkIdx.get(f.type) || "");
     if (!recipeId) continue;
     const list = map.get(recipeId) || [];
     list.push(f);
     map.set(recipeId, list);
   }
   return map;
+}
+
+// Re-query the live faction facility list and rebuild the derived maps. The
+// crafter can run for a long time (the active plan loop below waits on jobs for
+// hours), and a facility can be upgraded mid-run — which changes its level and
+// possibly its type/recipe. Callers must re-resolve these every pass so a
+// freshly upgraded facility is actually used instead of the stale snapshot.
+async function refreshFacilityMaps(
+  bot: any,
+  settings: CrafterSettings,
+): Promise<{
+  factionFacilities: FactionFacility[];
+  facilityAvailableRecipes: Set<string>;
+  ownFacilityMap: OwnFacilityMap;
+}> {
+  const factionFacilities = await fetchFactionFacilities(bot);
+  const facilityRecipeMap = getFacilityRecipeMap();
+  const facilityAvailableRecipes = getRecipesAvailableAtFacilities(
+    factionFacilities,
+    facilityRecipeMap,
+    settings.recipeFacilityLinks,
+  );
+  const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities, settings.recipeFacilityLinks);
+  return { factionFacilities, facilityAvailableRecipes, ownFacilityMap };
 }
 
 // Distribute jobs across multiple owned facilities of the same type by
@@ -403,6 +537,8 @@ export interface CrafterSettings {
   allowRentalPurchase: boolean;
   rentalSpendingLimit: number;
   cycleTimeSec: number;
+  craftingHomeBase: string;
+  recipeFacilityLinks: Record<string, string[]>;
 }
 
 function isRentalAllowed(settings: CrafterSettings): boolean {
@@ -522,12 +658,15 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
   }
   const progressSummaries: string[] = [];
   for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
-    const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
-    const completed = progress.completed * outputQty;
-    const queued = progress.queued * outputQty;
-    const remaining = progress.remaining;
+    const recipe = recipes.find(r => r.recipe_id === recipeId);
+    const completedOutputs = (recipe && recipe.outputs.length > 0)
+      ? recipe.outputs.map(o => `${o.quantity * progress.completed}x ${o.name || o.item_id}`).join("+")
+      : `${progress.completed * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
+    const queuedOutputs = (recipe && recipe.outputs.length > 0)
+      ? recipe.outputs.map(o => `${o.quantity * progress.queued}x ${o.name || o.item_id}`).join("+")
+      : `${progress.queued * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
     const name = recipeNames.get(recipeId) || recipeId;
-    progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+    progressSummaries.push(`${completedOutputs}/${queuedOutputs} ${name} (${progress.remaining} runs remaining)`);
   }
   if (progressSummaries.length > 0) {
     log("craft", `[Queue Status] ${progressSummaries.join(", ")}`);
@@ -540,6 +679,10 @@ async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker
   const { bot } = ctx;
   const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
   tracker.syncWithServer(serverJobs);
+  // Drop any job we track locally whose recipe no longer resolves to a known
+  // catalog recipe — these are phantom jobs (stale session state, or jobs the
+  // queue poller couldn't match) that would otherwise inflate "pending" output.
+  tracker.prunePhantomJobs(new Set(recipes.map(r => r.recipe_id)));
   tracker.save();
 }
 
@@ -569,6 +712,12 @@ interface CraftQuote {
   fee: number;
   labor: number;
   creditsTotal: number;
+  // Server-authoritative affordability for the whole quoted job. This already
+  // accounts for faction storage/treasury coverage (when deliver_to is omitted
+  // the server auto-draws from the faction when personal funds can't cover it),
+  // so it is the correct signal to gate on — not a naive fee-vs-limit compare.
+  haveCredits: boolean;
+  haveInputs: boolean;
   venue: string;
   venueType: string;
   recipe: string;
@@ -582,10 +731,25 @@ function parseCraftQuote(result: unknown): CraftQuote {
     fee: typeof cost.fee === "number" ? (cost.fee as number) : 0,
     labor: typeof cost.labor === "number" ? (cost.labor as number) : 0,
     creditsTotal: typeof r.credits_total === "number" ? (r.credits_total as number) : 0,
+    // Only treat the job as affordable/faction-covered when the server says so
+    // explicitly. Absence must NOT auto-cover a paid rental (that would bypass
+    // the personal spending limit), so default to false when the field is missing.
+    haveCredits: r.have_credits === true,
+    haveInputs: r.have_inputs === true,
     venue: (r.venue as string) || "",
     venueType: (r.venue_type as string) || "",
     recipe: (r.recipe as string) || "",
   };
+}
+
+// Some recipes can only be produced at a real facility and error out when we
+// try preset=workshop (hand-crafting). Detect that specific server error so we
+// don't treat an impossible workshop fallback as a hard block.
+function isFacilityOnlyError(msg: string | undefined): boolean {
+  const m = (msg || "").toLowerCase();
+  return m.includes("can only be made at a facility") ||
+    (m.includes("can't be hand-crafted") || m.includes("cant be hand-crafted")) ||
+    m.includes("drop preset=workshop");
 }
 
 interface FinalVenue {
@@ -613,11 +777,12 @@ export async function resolveFinalVenue(
   runs: number,
   v: ResolvedVenue,
   settings: CrafterSettings,
+  primaryOutputQty: number = 1,
 ): Promise<FinalVenue> {
   const { log } = ctx;
 
   const dryRun = async (preset?: string, facilityId?: string) => {
-    const payload: Record<string, unknown> = { id: recipeId, quantity: runs, dry_run: true };
+    const payload: Record<string, unknown> = { id: recipeId, quantity: runs * primaryOutputQty, dry_run: true };
     if (preset) payload.preset = preset;
     if (facilityId) payload.facility_id = facilityId;
     let r = await bot.exec("craft", payload);
@@ -675,6 +840,12 @@ export async function resolveFinalVenue(
     attemptedPreset = "workshop";
     const ws = await dryRun("workshop", undefined);
     if (ws.error) {
+      // Facility-only recipes can't be hand-crafted, so the workshop fallback is
+      // impossible. Since rental is disabled by config, we can't run this here.
+      if (isFacilityOnlyError(ws.error.message)) {
+        log("warn", `${recipeName} can only be made at a facility and rental is disabled - skipping (enable allowRentalPurchase/allowExternalFacilities to craft it).`);
+        return { blocked: true, rentalFee: 0, label: "facility-only (rental disabled)" };
+      }
       log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
       return { blocked: true, rentalFee: 0, label: "workshop-failed" };
     }
@@ -682,22 +853,39 @@ export async function resolveFinalVenue(
     return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (rental avoided)" };
   }
 
-  // External rental is allowed — enforce the spending limit.
+    // External rental is allowed — enforce the spending limit.
   let rentalFee = 0;
   if (!attemptedFacility && quote.external && v.allowRental) {
     rentalFee = quote.fee;
     if (settings.allowRentalPurchase && settings.rentalSpendingLimit > 0) {
       if (rentalSpentThisSession + rentalFee > settings.rentalSpendingLimit) {
-        log("warn", `Rental fee ${rentalFee}cr would exceed spending limit ${settings.rentalSpendingLimit}cr for ${recipeName} - falling back to workshop (hand-crafting)`);
-        attemptedFacility = undefined;
-        attemptedPreset = "workshop";
+        log("warn", `Rental fee ${rentalFee}cr would exceed spending limit ${settings.rentalSpendingLimit}cr for ${recipeName} - trying workshop (hand-crafting)`);
         const ws = await dryRun("workshop", undefined);
         if (ws.error) {
-          log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
-          return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+          // Facility-only recipe: hand-crafting is impossible, so there is no
+          // cheaper venue. Rather than hard-blocking the whole crafting chain,
+          // honor the auto-routed facility when the server confirms the job is
+          // actually affordable (have_credits — this already includes faction
+          // storage/treasury coverage when personal funds fall short). The
+          // spending limit still applies to recipes that CAN hand-craft.
+          if (isFacilityOnlyError(ws.error.message)) {
+            if (quote.haveCredits) {
+              log("warn", `${recipeName} can only be made at a facility (${rentalFee}cr) and exceeds the rental spending limit (${settings.rentalSpendingLimit}cr), but the job is affordable (faction/treasury may cover it) - proceeding at the facility.`);
+              // Don't count faction-covered facility jobs against the personal
+              // rental spend; the limit is about capping bot-initiated rentals.
+              rentalFee = 0;
+            } else {
+              log("warn", `${recipeName} can only be made at a facility (${rentalFee}cr), exceeds the rental spending limit (${settings.rentalSpendingLimit}cr, spent ${rentalSpentThisSession}cr), and isn't affordable - blocking. Raise rentalSpendingLimit or fund the faction treasury to craft it.`);
+              return { blocked: true, rentalFee: 0, label: "facility-only (limit reached)" };
+            }
+          } else {
+            log("error", `🔴 CRAFT VENUE UNVERIFIED: workshop dry_run failed for ${recipeName} (${ws.error.message}). Blocking.`);
+            return { blocked: true, rentalFee: 0, label: "workshop-failed" };
+          }
+        } else {
+          quote = parseCraftQuote(ws.result);
+          return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
         }
-        quote = parseCraftQuote(ws.result);
-        return { facilityId: undefined, preset: "workshop", blocked: false, rentalFee: 0, label: "workshop (limit reached)" };
       }
     }
   }
@@ -756,34 +944,50 @@ export async function queueCraftJob(
   venue: ResolvedVenue,
   settings: CrafterSettings,
   ownFacilityMap: OwnFacilityMap = new Map(),
+  // Per-run quantity of the OUTPUT we are sizing the request against. For
+  // multi-output recipes the caller must pass the limiting output's quantity
+  // (lowestOutputItem().quantity); otherwise runs are mis-sized against the
+  // first output and the smaller secondary outputs never get produced.
+  outputPerRun: number = 0,
+  rawCountItemFn?: (itemId: string) => number,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
-  const recipe = recipes?.find(r => r.recipe_id === recipeId);
-  const outputQty = recipe?.output_quantity || 1;
-  const originalRuns = Math.ceil(quantity / outputQty);
+   const recipe = recipes?.find(r => r.recipe_id === recipeId);
+   // Prefer the explicitly-passed limiting output quantity; fall back to the
+   // recipe's first output for single-output recipes.
+   const outputQty = outputPerRun > 0
+     ? outputPerRun
+     : (recipe?.output_quantity || 1);
+   const originalRuns = Math.ceil(quantity / outputQty);
 
-  if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-  }
+   if (tracker.hasPendingJob(recipeId, originalRuns)) {
+     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+   }
 
-  const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
-  tracker.syncWithServer(serverJobs);
-  if (tracker.hasPendingJob(recipeId, originalRuns)) {
-    return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-  }
+   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
+   tracker.syncWithServer(serverJobs);
+   if (tracker.hasPendingJob(recipeId, originalRuns)) {
+     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+   }
 
-  const maxCraftable = calculateMaxCraftable(recipe, countItemFn);
-  const runs = Math.min(originalRuns, maxCraftable);
+    const maxCraftable = calculateMaxCraftable(recipe, rawCountItemFn || countItemFn);
+   const runs = Math.min(originalRuns, maxCraftable);
 
-  if (runs <= 0) {
-    log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
-    return { success: false, error: "insufficient_inputs" };
-  }
+   if (runs <= 0) {
+     log("craft", `Cannot craft ${recipeId}: need materials but storage empty or insufficient`);
+     return { success: false, error: "insufficient_inputs" };
+   }
 
-  if (runs < originalRuns) {
-    log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
-  }
+   if (runs < originalRuns) {
+     log("craft", `Only ${runs}/${originalRuns} runs possible due to materials - queuing what's available`);
+   }
+
+   // The craft command's `quantity` is the TOTAL OUTPUT of the PRIMARY output,
+   // not a run count. Convert runs -> output units so the server sizes the job
+   // correctly, especially for recipes with high per-run output (e.g. 200x).
+   const primaryOutputQty = recipe?.output_quantity || 1;
+   const craftCommandQuantity = runs * primaryOutputQty;
 
   // Notify (once per recipe per run) when we wanted our own facility but lack one.
   if (venue.missingFacility) {
@@ -813,14 +1017,14 @@ export async function queueCraftJob(
       missingFacility: false,
     };
 
-    const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, chunk.runs, chunkVenue, settings);
+    const finalVenue = await resolveFinalVenue(ctx, bot, recipeId, recipe?.name || recipeId, chunk.runs, chunkVenue, settings, primaryOutputQty);
     if (finalVenue.blocked) {
       firstError = firstError || "external_facility_blocked";
       continue;
     }
 
     log("craft", `Queueing ${chunk.runs} runs of ${recipeId} (${finalVenue.label})...`);
-    const craftPayload: Record<string, unknown> = { id: recipeId, quantity: chunk.runs };
+    const craftPayload: Record<string, unknown> = { id: recipeId, quantity: craftCommandQuantity };
     if (finalVenue.facilityId) craftPayload.facility_id = finalVenue.facilityId;
     if (finalVenue.preset) craftPayload.preset = finalVenue.preset;
 
@@ -945,6 +1149,7 @@ async function waitForAllCompletions(
    tracker: CraftQueueTracker,
    bot: any,
    recipes: Recipe[],
+   settings?: CrafterSettings | null,
 ): Promise<string[]> {
    const { log } = ctx;
    const crafted: string[] = [];
@@ -954,20 +1159,33 @@ async function waitForAllCompletions(
      recipeNames.set(r.recipe_id, r.name);
    }
 
-    let lastSync = 0;
-    let lastStatusReport = Date.now();
-    let remainingItems = [...initialQueuedItems];
+     let lastSync = 0;
+     let lastStatusReport = Date.now();
+     let lastBaseCheck = 0;
+     const BASE_CHECK_COOLDOWN = 60000;
+     let remainingItems = [...initialQueuedItems];
 
-    while (bot.state === "running" && remainingItems.length > 0) {
-      await ctx.sleep(5000);
+     while (bot.state === "running" && remainingItems.length > 0) {
+       await ctx.sleep(5000);
 
-      const now = Date.now();
-      if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-        const serverJobs = await checkCraftingQueue(bot, recipes);
-        tracker.syncWithServer(serverJobs);
-        tracker.save();
-        lastSync = now;
-      }
+       const now = Date.now();
+       if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
+         const serverJobs = await checkCraftingQueue(bot, recipes);
+         tracker.syncWithServer(serverJobs);
+         tracker.save();
+         lastSync = now;
+       }
+
+       if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
+         const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+         if (!baseResp.error && baseResp.result) {
+           const baseObj = baseResp.result as Record<string, unknown>;
+           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+           bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+         }
+         lastBaseCheck = now;
+       }
 
       const stillQueued: typeof remainingItems = [];
       for (const item of remainingItems) {
@@ -999,6 +1217,7 @@ async function queueAllRecipesOnce(
     availableFn: (itemId: string) => number,
     ownFacilityMap: OwnFacilityMap,
     settings: CrafterSettings,
+    rawCountItemFn: (itemId: string) => number,
 ): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
     const { bot } = ctx;
     const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
@@ -1009,20 +1228,28 @@ async function queueAllRecipesOnce(
     for (const item of allPlanItems) {
       if (bot.state !== "running") break;
 
-      const outputQty = item.recipe.output_quantity || 1;
+      // Size everything in RUNS and against the LIMITING output so multi-output
+      // recipes produce every output (e.g. electrolyze_water -> both hydrogen and
+      // oxygen), instead of letting the largest output mask the deficit.
+      const limiter = lowestOutputItem(item.recipe);
+      const outputPerRun = limiter.quantity || 1;
       const progress = tracker.getProgress(item.recipe.recipe_id);
-      const queuedItems = progress.queued * outputQty;
-      const completedItems = progress.completed * outputQty;
+      const pendingRuns = progress.remaining;
+      const completedRuns = progress.completed;
 
-      const remainingItems = item.quantityToCraft - completedItems - queuedItems;
-      if (remainingItems <= 0) {
-        const actualQueued = Math.ceil(item.quantityToCraft / outputQty);
-        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
+      // item.quantityToCraft is expressed in the recipe's first-output items;
+      // convert to the limiting-output frame so the run count is correct.
+      const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
+      const remainingRuns = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
+      const runsToQueue = Math.max(0, remainingRuns);
+      if (runsToQueue <= 0) {
+        const actualQueued = progress.queued;
+        queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
         continue;
       }
 
        const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
-       const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, remainingItems, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap);
+        const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun, rawCountItemFn);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
            ctx.log("craft", `Holding ${item.recipe.name}: awaiting sub-materials, will retry next pass`);
@@ -1036,10 +1263,10 @@ async function queueAllRecipesOnce(
        }
 
       const actualQueued = queueResult.queuedRuns || 0;
-      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputQty, outputQty });
-      queuedItemsTotal += actualQueued * outputQty;
-      if (actualQueued * outputQty < remainingItems) {
-        ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued * outputQty}/${remainingItems}x (awaiting sub-materials)`);
+      queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
+      queuedItemsTotal += actualQueued * outputPerRun;
+      if (actualQueued * outputPerRun < runsToQueue * outputPerRun) {
+        ctx.log("craft", `Partially queued ${item.recipe.name}: ${actualQueued} runs / ${runsToQueue} (limits: ${formatOutputs(item.recipe)}) (awaiting sub-materials)`);
       }
     }
 
@@ -1062,12 +1289,19 @@ async function executeCraftingPlan(
    const crafted: string[] = [];
    const prereqs: string[] = [];
 
+   // Facility-only recipes that have been explicitly linked to a facility via
+   // recipeFacilityLinks are permitted in the planner (otherwise breed_plutonium
+   // and friends are rejected by isRecipeCraftable as "facility only").
+   const allowedFacilityRecipeIds = new Set(
+     Object.keys(settings?.recipeFacilityLinks || {})
+   );
+
    const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
    const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
 
    const recipeIdForGoal = (g: { itemId: string; recipe?: Recipe }): string => {
      if (g.recipe) return g.recipe.recipe_id;
-     const r = findRecipeForItem(g.itemId, recipes, countItemFn!, facilityAvailableRecipes);
+      const r = findRecipeForItem(g.itemId, recipes, countItemFn!, facilityAvailableRecipes, allowedFacilityRecipeIds);
      return r ? r.recipe_id : "";
    };
 
@@ -1082,14 +1316,28 @@ async function executeCraftingPlan(
     const accountPending = (): { hasPending: boolean; produced: Map<string, number> } => {
       let hasPending = false;
       const produced = new Map<string, number>();
-      for (const [recipeId, prog] of tracker.getProgressByRecipe()) {
-        const pending = prog.queued - prog.completed;
+      // Iterate the actual jobs (not just the aggregated progress) so we can use
+      // each job's server-reported `runsRemaining` directly. A job can only still
+      // produce what the server says is left to run; crediting the full
+      // `quantity - completed` would let a stale/over-reported job (e.g. one the
+      // server already finished but still echoes a huge runs_total) flood the
+      // planner with fake stock — that's what made water ice read as ~299k.
+      for (const job of tracker.getActiveJobs()) {
+        const r = recipeIndex.get(job.recipeId);
+        if (!r) continue;
+        const pending = Math.max(
+          0,
+          Math.min(job.quantity - job.completed, job.runsRemaining),
+        );
         if (pending <= 0) continue;
         hasPending = true;
-        const r = recipeIndex.get(recipeId);
-        if (!r) continue;
-        const outId = r.output_item_id.toLowerCase();
-        produced.set(outId, (produced.get(outId) || 0) + (r.output_quantity || 1) * pending);
+        const outs = (r.outputs && r.outputs.length > 0)
+          ? r.outputs
+          : [{ item_id: r.output_item_id, name: r.output_name, quantity: r.output_quantity || 1 }];
+        for (const o of outs) {
+          const outId = o.item_id.toLowerCase();
+          produced.set(outId, (produced.get(outId) || 0) + (o.quantity || 1) * pending);
+        }
       }
       return { hasPending, produced };
     };
@@ -1106,22 +1354,54 @@ async function executeCraftingPlan(
     while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
       loopCount++;
       await syncCraftingQueue(ctx, tracker, recipes, true);
+      // Re-resolve the facility list each pass. A facility can be upgraded
+      // (level/type change) while the crafter is mid-plan, and routing must
+      // target the current facility rather than the snapshot taken at round
+      // start — otherwise it keeps using the old-level facility.
+      if (settings) {
+        const refreshed = await refreshFacilityMaps(bot, settings);
+        facilityAvailableRecipes = refreshed.facilityAvailableRecipes;
+        ownFacilityMap = refreshed.ownFacilityMap;
+      }
       // Re-read faction storage LIVE each pass. As queued jobs consume/produce
       // materials on the server, the holdings change continuously; a stale count
       // here is what makes the planner think it needs to re-refine materials it
-      // already has enough of (e.g. steel_plate).
-      await bot.refreshFactionStorage(true);
+      // already has enough of (e.g. steel_plate). Target the crafting home base
+      // station so a roaming crafter reads the right storage.
+       await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
+
+        // Refresh home station fuel via get_base every pass so fuel_reserve
+        // goals always see the actual station fuel level after jobs complete
+        // between loop iterations. Do this unconditionally when a home base is
+        // configured — it is the only source of truth for base.fuel and the
+        // crafter cannot recover from a stale value.
+        if (settings?.craftingHomeBase) {
+          const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+          if (!baseResp.error && baseResp.result) {
+            const baseObj = baseResp.result as Record<string, unknown>;
+            const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+            const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+            const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+            if (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel) {
+              ctx.log("craft", `[get_base] ${settings.craftingHomeBase}: fuel=${newFuel}/${newMaxFuel}`);
+            }
+            bot.homeBaseFuel = newFuel;
+            bot.homeBaseMaxFuel = newMaxFuel;
+          } else if (baseResp.error) {
+            ctx.log("warn", `[get_base] failed for ${settings.craftingHomeBase}: ${baseResp.error.message}`);
+          }
+        }
 
 
-     // Recompute which goals still need production using live stock + in-flight output.
+      // Recompute which goals still need production using live stock + in-flight output.
      const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
      for (const g of goalsToAchieve) {
        const recipeId = recipeIdForGoal(g);
        if (!recipeId) continue;
        const liveStock = countItemFn!(g.itemId.toLowerCase());
-       const prog = tracker.getProgress(recipeId);
-       const queuedOutput = prog.queued * outputQtyOf(recipeId);
-       if (liveStock + queuedOutput < g.limit) {
+        const prog = tracker.getProgress(recipeId);
+        const queuedOutput = prog.remaining * outputQtyOf(recipeId);
+        if (liveStock + queuedOutput < g.limit) {
          remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
        }
      }
@@ -1139,7 +1419,7 @@ async function executeCraftingPlan(
         return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
       };
 
-     const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes);
+      const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!, allowedFacilityRecipeIds);
      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
      for (const plan of plans) {
        log("craft", formatCraftingPlan(plan));
@@ -1154,7 +1434,7 @@ async function executeCraftingPlan(
      }
 
       const effectiveSettings = settings || await getCrafterSettings();
-      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings);
+      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!);
 
       // Progress is being made if we queued something this pass, or if the queue
       // still has jobs producing sub-materials we're waiting on.
@@ -1185,12 +1465,12 @@ async function executeCraftingPlan(
      const recipeId = recipeIdForGoal(g);
      if (!recipeId) return null;
      const outputQty = outputQtyOf(recipeId);
-     const prog = tracker.getProgress(recipeId);
-     const target = prog.queued * outputQty;
-     return { recipeId, quantity: target, outputQty };
+      const prog = tracker.getProgress(recipeId);
+      const target = prog.remaining * outputQty;
+      return { recipeId, quantity: target, outputQty };
    }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
 
-   const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes);
+    const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
    crafted.push(...completed);
 
    for (const g of goalsToAchieve) {
@@ -1235,7 +1515,7 @@ async function craftFromCategories(
     const blacklisted = new Set((await getCrafterSettings()).blacklistedRecipes);
     if (blacklisted.has(recipe.recipe_id)) continue;
     if (recipe.components.length === 0) continue;
-    if (!isRecipeCraftableNew(recipe).ok) continue;
+    if (!isRecipeCraftableNew(recipe, new Set(Object.keys(settings.recipeFacilityLinks || {}))).ok) continue;
 
     const priority = categoryPriority[recipeCategory] || 99;
     candidates.push({ recipe, priority });
@@ -1295,9 +1575,9 @@ async function craftFromCategories(
 
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
-    ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (category: ${target.category})`);
+    ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (outputs: ${formatOutputs(target)}; category: ${target.category})`);
     const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
-    const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap);
+     const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap, 0, countItemForCraft);
     if (!queueResult.success) {
       if (queueResult.error && queueResult.error.includes("aborted")) {
         ctx.log("warn", `Crafting halted: ${queueResult.error}`);
@@ -1308,7 +1588,7 @@ async function craftFromCategories(
       continue;
     }
 
-    crafted.push(`1x ${target.output_name}`);
+    crafted.push(formatOutputs(target));
     totalCrafted++;
     bot.stats.totalCrafted++;
 
@@ -1324,12 +1604,9 @@ async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
   const shipResp = await bot.exec("get_ship");
   if (shipResp.error || !shipResp.result) return false;
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const { modules } = extractShipModules(shipResp.result);
   for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const checkStr = `${(modObj?.id as string) || (modObj?.type_id as string) || ""} ${(modObj?.name as string) || ""} ${(modObj?.special as string) || ""}`.toLowerCase();
-    if (checkStr.includes("cloak")) return true;
+    if (moduleHaystack(mod).includes("cloak")) return true;
   }
   return false;
 }
@@ -1427,10 +1704,26 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const settings = await getCrafterSettings();
     const cycleWaitMs = (settings.cycleTimeSec || 30) * 1000;
 
+    // Facility-only recipes that have been explicitly linked to a facility via
+    // recipeFacilityLinks. These are allowed through isRecipeCraftable even
+    // though their category is "Facility Only" (e.g. breed_plutonium).
+    const allowedFacilityRecipeIds = new Set(Object.keys(settings.recipeFacilityLinks || {}));
+
     yield "scavenge";
 
     yield "dock";
     await ensureDocked(ctx);
+
+    // Refresh home station fuel via get_base so fuel_reserve goals compare against accurate data.
+    if (settings.craftingHomeBase) {
+      const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+      if (!baseResp.error && baseResp.result) {
+        const baseObj = baseResp.result as Record<string, unknown>;
+        const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+        bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+      }
+    }
 
     yield "fetch_recipes";
     const recipes = await fetchAllRecipes(ctx);
@@ -1448,7 +1741,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Force a LIVE view_faction_storage read every round. The crafter must never
     // plan against a stale snapshot — its own jobs are constantly changing the
     // station's holdings, so a cached read undercounts materials (e.g. steel).
-    await bot.refreshFactionStorage(true);
+    // Target the crafting home base station explicitly: a roaming crafter may be
+    // docked elsewhere, and reading the current station's (near-empty) storage
+    // would make the planner "lose" its stock and wrongly re-smelt everything.
+    const craftingHomeBase = settings.craftingHomeBase || undefined;
+    await bot.refreshFactionStorage(true, craftingHomeBase);
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {
@@ -1497,13 +1794,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Read bot.factionStorage live (do NOT capture a snapshot const) so that
       // re-refreshing it mid-loop in executeCraftingPlan is reflected here.
       for (const i of (bot.factionStorage || [])) { if (i.itemId.toLowerCase() === lowerId) total += i.quantity; }
+      if (isFuelReserveItem(lowerId)) {
+        total += (bot.homeBaseFuel || 0);
+      }
       return total;
     }
 
-    const factionFacilities = await fetchFactionFacilities(bot);
-    const facilityRecipeMap = getFacilityRecipeMap();
-    const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap);
-    const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities);
+    // Grab a FRESH facility list every round: facilities can be upgraded (new
+    // level/type) while the crafter runs, and we must route to the current one.
+    const { factionFacilities, facilityAvailableRecipes, ownFacilityMap } = await refreshFacilityMaps(bot, settings);
     ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
     ctx.log("craft", `Own facilities: ${[...ownFacilityMap.values()].reduce((n, l) => n + l.length, 0)} covering ${ownFacilityMap.size} recipes (forceOwnFacility=${settings.forceOwnFacility})`);
     if (settings.allowRentalPurchase) {
@@ -1534,7 +1833,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       const isItemGoal = recipe.output_item_id === recipeId || recipe.output_item_id.toLowerCase() === recipeId.toLowerCase();
-      const craftableCheck = isRecipeCraftableNew(recipe);
+      const craftableCheck = isRecipeCraftableNew(recipe, allowedFacilityRecipeIds);
       if (!craftableCheck.ok) {
         ctx.log("error", `Recipe "${recipeId}" (${recipe.name}) is not craftable: ${craftableCheck.reason}`);
         continue;
@@ -1546,18 +1845,28 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      const currentStock = countItem(recipe.output_item_id);
+      // Base the request on the LOWEST output (limiting factor): a multi-output
+      // recipe only advances all outputs by whole runs, so we must size the goal
+      // against the smallest per-run output. Otherwise the large output alone
+      // (e.g. 4x hydrogen) makes the planner think the goal is met while the
+      // other output (e.g. 2x oxygen) stays at zero.
+      const limiter = lowestOutputItem(recipe);
+      const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
+      const currentStock = countItem(limiter.item_id);
       const progress = tracker.getProgress(recipe.recipe_id);
-      const queuedItems = progress.queued * (recipe.output_quantity || 1);
-      const stockIncludingQueue = currentStock + queuedItems;
-      const needed = limit - stockIncludingQueue;
+      const pendingRuns = progress.remaining;
+      const pendingItems = pendingRuns * (limiter.quantity || 1);
+      const stockIncludingQueue = currentStock + pendingItems;
+      const needed = limitRuns * (limiter.quantity || 1) - stockIncludingQueue;
       if (needed <= 0) {
-        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} (plus ${queuedItems} in queue)`);
+        ctx.log("craft", `✓ ${recipe.name}: already have ${currentStock}/${limit} of limiting output ${limiter.name} (outputs: ${formatOutputs(recipe)}; plus ${pendingItems} pending)`);
         continue;
       }
 
-      ctx.log("craft", `Goal: ${needed}x ${recipe.name} (have ${currentStock}/${limit}, plus ${queuedItems} in queue)`);
-      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
+      ctx.log("craft", `Goal: ${limitRuns} runs of ${recipe.name} -> ${formatOutputs(recipe)} (limiting: ${limiter.quantity}x ${limiter.name}, have ${currentStock}/${limit}, plus ${pendingItems} pending)`);
+      // Track the goal by the limiting output item so every produced item
+      // (including the secondary ones) is actually requested and counted.
+      goalItems.push({ itemId: limiter.item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {
@@ -1608,12 +1917,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       const progressSummaries: string[] = [];
       for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
-        const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
-        const completed = progress.completed * outputQty;
-        const queued = progress.queued * outputQty;
-        const remaining = progress.remaining;
+        const recipe = recipes.find(r => r.recipe_id === recipeId);
+        const completedOutputs = (recipe && recipe.outputs.length > 0)
+          ? recipe.outputs.map(o => `${o.quantity * progress.completed}x ${o.name || o.item_id}`).join("+")
+          : `${progress.completed * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
+        const queuedOutputs = (recipe && recipe.outputs.length > 0)
+          ? recipe.outputs.map(o => `${o.quantity * progress.queued}x ${o.name || o.item_id}`).join("+")
+          : `${progress.queued * (recipe?.output_quantity || 1)}x ${recipe?.name || recipeId}`;
         const name = recipeNames.get(recipeId) || recipeId;
-        progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+        progressSummaries.push(`${completedOutputs}/${queuedOutputs} ${name} (${progress.remaining} runs remaining)`);
       }
       if (progressSummaries.length > 0) {
         ctx.log("craft", `In progress: ${progressSummaries.join(", ")}`);

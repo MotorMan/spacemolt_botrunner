@@ -6,6 +6,7 @@
     "start": "bun run src/botmanager.ts",
     "bots": "bun run src/botmanager.ts",
     "dashboard": "bun run src/botmanager.ts",
+    "fetch:openapi": "bun run scripts/fetch-openapi.ts",
     "test": "vitest run tests/",
     "test:node": "node --test tests/bot-chat-coordination.test.ts 2>&1",
     "test:simple": "node --test tests/ 2>&1",
@@ -27,6 +28,7 @@
     "vitest": "^3.2.0"
   },
   "dependencies": {
-    "@mariozechner/pi-ai": "^0.61.0"
+    "@mariozechner/pi-ai": "^0.61.0",
+    "@spacemolt/lib": "^4.6.0"
   }
 }

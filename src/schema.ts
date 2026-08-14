@@ -1,5 +1,5 @@
 import { log, logError } from "./ui.js";
-import { cachedFetch } from "./httpcache.js";
+import { fetchOpenApiV2Spec, saveOpenApiV2Spec } from "./openapi.js";
 
 export interface GameCommandInfo {
   name: string;
@@ -13,17 +13,19 @@ export interface GameCommandInfo {
  * tool schemas to save tokens.
  */
 export async function fetchGameCommands(baseUrl: string): Promise<GameCommandInfo[]> {
-  // baseUrl is like https://game.spacemolt.com/api/v2
+  // baseUrl is the gameserver origin, e.g. https://game.spacemolt.com
   // OpenAPI spec is at https://game.spacemolt.com/api/v2/openapi.json
-  const specUrl = baseUrl + "/openapi.json";
+  const specUrl = baseUrl.replace(/\/+$/, "") + "/api/v2/openapi.json";
 
   let spec: any;
   try {
-    spec = await cachedFetch(specUrl, 60 * 60_000); // 1hr fallback TTL
+    const result = await fetchOpenApiV2Spec();
+    spec = result.spec;
+    const { meta, path, saved } = saveOpenApiV2Spec(spec);
+    const changeNote = result.changed ? "changed" : result.throttled ? "throttled — reused cached" : "unchanged (304)";
+    log("system", `OpenAPI V2 spec ${meta.gameServerVersion} ${changeNote} ${saved ? "saved" : "already present"} -> ${path}`);
   } catch (err) {
-    logError(`Failed to fetch OpenAPI spec from ${specUrl}: ${err instanceof Error ? err.message : err}`);
-    log("system", "Falling back to empty command list — agent can use get_commands at runtime");
-    return [];
+    logError(`Failed to save OpenAPI spec: ${err instanceof Error ? err.message : err}`);
   }
 
   const paths: Record<string, any> = spec.paths ?? {};

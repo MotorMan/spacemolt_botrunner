@@ -347,6 +347,7 @@ export interface FacilityTransferLoadout {
   items: FacilityTransferLoadoutItem[];
   createdAt: string;
   active?: boolean;
+  forceFullDelivery?: boolean;
 }
 
 const LOADOUTS_FILE = join(DATA_DIR, "facilityTransferLoadouts.json");
@@ -367,11 +368,15 @@ function loadFacilityTransferLoadouts(): Record<string, FacilityTransferLoadout>
 export function saveFacilityTransferLoadout(name: string, loadout: Omit<FacilityTransferLoadout, "name" | "createdAt">): void {
   try {
     const loadouts = loadFacilityTransferLoadouts();
+    const existing = loadouts[name];
     loadouts[name] = {
       name,
       items: loadout.items,
-      createdAt: new Date().toISOString(),
-      active: loadout.active ?? false,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      // Editing a loadout must not silently switch it off / drop its
+      // force-full flag when the caller omits those fields.
+      active: loadout.active ?? existing?.active ?? false,
+      forceFullDelivery: loadout.forceFullDelivery ?? existing?.forceFullDelivery ?? false,
     };
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
@@ -412,6 +417,119 @@ export function setLoadoutActive(name: string, active: boolean): void {
   }
 }
 
+export function setLoadoutForceFullDelivery(name: string, forceFullDelivery: boolean): void {
+  try {
+    const loadouts = loadFacilityTransferLoadouts();
+    if (name in loadouts) {
+      loadouts[name].forceFullDelivery = forceFullDelivery;
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+    }
+  } catch (err) {
+    console.error("Error setting loadout force full delivery:", err);
+  }
+}
+
+// ── Facility Transfer delivery progress ────────────────────────
+//
+// `forceFullDelivery` loadouts mean "actually haul `targetQuantity` units to
+// this station", regardless of how much already sits in its faction storage.
+// Station stock levels therefore cannot be used to decide whether such a
+// loadout is satisfied — we have to remember how much WE delivered. That is
+// what this progress file is for: per station, per loadout, per item.
+//
+// The recorded `target` is stored alongside the counter so that editing a
+// loadout's target quantity restarts the count instead of silently inheriting
+// progress from the old target.
+
+export interface FacilityTransferProgressItem {
+  delivered: number;
+  target: number;
+  updatedAt: number;
+}
+
+export type FacilityTransferProgress = Record<string, Record<string, Record<string, FacilityTransferProgressItem>>>;
+
+const PROGRESS_FILE = join(DATA_DIR, "facilityTransferProgress.json");
+
+function loadProgressData(): FacilityTransferProgress {
+  try {
+    if (existsSync(PROGRESS_FILE)) {
+      return JSON.parse(readFileSync(PROGRESS_FILE, "utf-8")) as FacilityTransferProgress;
+    }
+  } catch (err) {
+    console.warn("Could not load facilityTransferProgress.json:", err);
+  }
+  return {};
+}
+
+function saveProgressData(data: FacilityTransferProgress): void {
+  try {
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(PROGRESS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("Error saving facilityTransferProgress.json:", err);
+  }
+}
+
+/**
+ * How much of `itemId` this fleet has already hauled to `stationId` for
+ * `loadoutName`. Returns 0 when the stored progress was recorded against a
+ * different target quantity (the loadout was edited since).
+ */
+export function getLoadoutDeliveredQty(stationId: string, loadoutName: string, itemId: string, target: number): number {
+  const entry = loadProgressData()[stationId]?.[loadoutName]?.[itemId];
+  if (!entry) return 0;
+  if (target > 0 && entry.target !== target) return 0;
+  return Math.max(0, entry.delivered || 0);
+}
+
+/** Record `qty` more units delivered for a force-full loadout. Returns the new total. */
+export function addLoadoutDeliveredQty(
+  stationId: string,
+  loadoutName: string,
+  itemId: string,
+  qty: number,
+  target: number
+): number {
+  if (qty <= 0) return getLoadoutDeliveredQty(stationId, loadoutName, itemId, target);
+  const data = loadProgressData();
+  if (!data[stationId]) data[stationId] = {};
+  if (!data[stationId][loadoutName]) data[stationId][loadoutName] = {};
+  const existing = data[stationId][loadoutName][itemId];
+  const entry: FacilityTransferProgressItem =
+    existing && (target <= 0 || existing.target === target)
+      ? existing
+      : { delivered: 0, target, updatedAt: Date.now() };
+  entry.delivered = Math.max(0, (entry.delivered || 0)) + qty;
+  entry.target = target;
+  entry.updatedAt = Date.now();
+  data[stationId][loadoutName][itemId] = entry;
+  saveProgressData(data);
+  return entry.delivered;
+}
+
+export function getStationLoadoutProgress(stationId: string): Record<string, Record<string, FacilityTransferProgressItem>> {
+  return loadProgressData()[stationId] || {};
+}
+
+export function clearLoadoutProgress(loadoutName: string): void {
+  const data = loadProgressData();
+  let changed = false;
+  for (const stationId of Object.keys(data)) {
+    if (data[stationId][loadoutName]) {
+      delete data[stationId][loadoutName];
+      changed = true;
+    }
+    if (Object.keys(data[stationId]).length === 0) delete data[stationId];
+  }
+  if (changed) saveProgressData(data);
+}
+
+export function clearAllProgress(): void {
+  saveProgressData({});
+}
+
 export interface FacilityTransferStationCompletion {
   stationId: string;
   loadoutName: string;
@@ -439,6 +557,9 @@ export function saveStationCompletion(stationId: string, loadoutName: string, it
   try {
     const completions = loadStationCompletions();
     if (!completions[stationId]) completions[stationId] = [];
+    // Replace any previous record for the same loadout so repeated completion
+    // checks cannot pile up duplicate entries for one station.
+    completions[stationId] = completions[stationId].filter(c => c.loadoutName !== loadoutName);
     completions[stationId].push({
       stationId,
       loadoutName,
@@ -476,6 +597,10 @@ export function clearLoadoutCompletions(loadoutName: string): void {
     const file = getStationCompletionFilePath();
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     writeFileSync(file, JSON.stringify(completions, null, 2) + "\n", "utf-8");
+    // Force-full loadouts are judged by hauled progress, so resetting a
+    // completion must also reset the haul counters or the loadout would be
+    // re-marked complete on the next check.
+    clearLoadoutProgress(loadoutName);
   } catch (err) {
     console.error("Error clearing loadout completions:", err);
   }
@@ -487,6 +612,7 @@ export function clearAllCompletions(): void {
     if (existsSync(file)) {
       writeFileSync(file, JSON.stringify({}, null, 2) + "\n", "utf-8");
     }
+    clearAllProgress();
   } catch (err) {
     console.error("Error clearing all completions:", err);
   }

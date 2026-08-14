@@ -4,12 +4,14 @@
  * Provides: docking, refueling, repairing, navigation, system parsing,
  * ore parsing, and safety checks.
  */
-import type { RoutineContext } from "../bot.js";
+import { combatDebugLog, combatDebugLogLine } from "../debug.js";
+import type { Bot, RoutineContext } from "../bot.js";
+import { isConnectionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist, isCustomsDisabled } from "../web/server.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
@@ -22,6 +24,45 @@ import {
 /** The exact log message produced when the Emergency Warp Stabilizer activates. */
 export const EMERGENCY_WARP_STABILIZER_MESSAGE =
   "Emergency Warp Stabilizer activated! Hull critical — warped to Confederacy Central Command. The module has been destroyed.";
+
+// ── Denied fuel stations ─────────────────────────────────────
+// Persistent (in-memory for the bot session) record of stations that rejected
+// docking with "Access denied". We must NEVER loop trying to dock at a station
+// that explicitly denied us — it strands the bot until fuel hits 0.
+const deniedStations = new Set<string>();
+
+/** Record that a station denied docking so we stop retrying it this session. */
+export function markStationDenied(stationId: string): void {
+  if (stationId) deniedStations.add(stationId.toLowerCase());
+}
+
+/** True if a station previously denied us docking access. */
+export function isStationDenied(stationId: string): boolean {
+  return stationId ? deniedStations.has(stationId.toLowerCase()) : false;
+}
+
+/** Combine the runtime-denied station set with the configured station blacklist
+ *  (Settings → General → stationBlacklist). Returns a lowercased set of POI ids
+ *  (and "system|poiId" keys) that must never be treated as a usable station. */
+export function buildDeniedStationSet(extra?: Set<string>): Set<string> {
+  const denied = new Set<string>(deniedStations);
+  for (const s of getStationBlacklist()) denied.add(s.toLowerCase());
+  if (extra) for (const s of extra) denied.add(s.toLowerCase());
+  return denied;
+}
+
+/** Build the approved-fuel-station lookup set from settings (matches isApprovedFuelStation). */
+export function buildApprovedStationSet(settings: any): Set<string> {
+  const approved: string[] | undefined = settings?.general?.approvedFuelStations;
+  const set = new Set<string>();
+  if (!approved || approved.length === 0) return set;
+  for (const entry of approved) {
+    set.add(entry);
+    const parts = entry.split("|");
+    if (parts.length === 2) set.add(parts[1]);
+  }
+  return set;
+}
 
 /**
  * Check if the bot's current state indicates it should stop (e.g., due to emergency warp).
@@ -38,7 +79,10 @@ export function shouldStopForEmergency(ctx: RoutineContext): boolean {
  * without heavy API traffic. Returns the notifications for processing.
  */
 export async function refreshNotifications(ctx: RoutineContext): Promise<unknown> {
-  const resp = await ctx.bot.api.execute("get_notifications", { limit: 1, clear: false });
+  // Library-backed bots receive notifications as push events (Bot.subscribeEvents),
+  // so the HTTP poll is skipped entirely.
+  if (ctx.bot.account) return { notifications: [] };
+  const resp = await ctx.bot.exec("get_notifications", { limit: 1, clear: false });
   if (resp.error) {
     ctx.log("system", `Notification refresh failed: ${resp.error.message}`);
     return { notifications: [] };
@@ -140,11 +184,70 @@ export function isScenicPoi(type: string): boolean {
 
 // ── Item size helpers ────────────────────────────────────────
 
-/** Get the cargo size (weight per unit) of an item from the catalog. Defaults to 1 if unknown. */
+/** Cargo size (weight per unit) of a dynamically-generated package. Package IDs
+ *  are NOT in the local catalog, and we must NOT `inspect` them (each inspect is a
+ *  network command and issuing many in a row trips the server's rate limiter and
+ *  gets the bot's IP banned). Per game knowledge every package occupies a fixed
+ *  100 cargo space, so we hardcode that and never hit the network for it. */
+export const PACKAGE_CARGO_SIZE = 100;
+
+/** Runtime size overrides learned from cargo_full errors at load time. The catalog
+ *  sometimes reports size 1 for items whose true in-game cargo weight is much larger
+ *  (e.g. 101); when we observe the real size we cache it so the rest of the routine
+ *  stops overbooking cargo. */
+const runtimeSizeCache = new Map<string, number>();
+
+/** Record the true per-unit cargo size observed for an item (e.g. from a cargo_full
+ *  error's "Need X but only Y available" math). Overrides the catalog value afterwards. */
+export function setItemSize(itemId: string, size: number): void {
+  if (size > 0) runtimeSizeCache.set(itemId, size);
+}
+
+/** Get the cargo size (weight per unit) of an item.
+ *
+ *  Sizes come from the LOCAL catalog (catalog.json) — no network call. Almost
+ *  every item exists there, so this is authoritative for 99.99% of cases.
+ *
+ *  Dynamically-generated `package:*` items are NOT in the catalog. We must never
+ *  `inspect` them (that's a rate-limited network command that gets us banned when
+ *  called in bulk), so we simply return the fixed PACKAGE_CARGO_SIZE.
+ *
+ *  Runtime overrides (learned from in-game cargo_full errors) take precedence. */
 export function getItemSize(itemId: string): number {
+  const runtime = runtimeSizeCache.get(itemId);
+  if (runtime !== undefined) return runtime;
+  if (itemId.startsWith("package:")) {
+    return PACKAGE_CARGO_SIZE;
+  }
   const item = catalogStore.getItem(itemId);
-  const size = item?.size as number | undefined;
+  const size = (item?.size as number | undefined) ?? undefined;
   return (size && size > 0) ? size : 1;
+}
+
+/** Async size lookup kept for API compatibility. Unlike the old implementation it
+ *  performs NO `inspect` network call (that risks a rate-limit ban); it resolves
+ *  sizes purely from the local catalog / the fixed package size. */
+export async function getItemSizeAsync(bot: Bot, itemId: string): Promise<number> {
+  return getItemSize(itemId);
+}
+
+/** No-op retained for API compatibility. Packages are no longer inspected (that
+ *  would spam rate-limited `inspect` commands and get us banned); their size is a
+ *  fixed constant, so there is nothing to pre-inspect. */
+export async function preInspectPackageSizes(_bot: Bot, _items: Array<{ itemId: string }>): Promise<void> {
+  return;
+}
+
+/** Authoritative count of cargo actually aboard, computed from the live inventory
+ *  (quantity × true item size) rather than a manually-incremented tracker that can
+ *  drift when an item's size estimate is wrong. Use this to re-anchor `cargoUsed`
+ *  after every load so free-space math never over-requests into a cargo_full. */
+export function cargoUsedFromInventory(bot: Bot): number {
+  let used = 0;
+  for (const item of bot.inventory) {
+    used += item.quantity * getItemSize(item.itemId);
+  }
+  return used;
 }
 
 /** How many units of an item fit in the given free cargo weight. */
@@ -166,14 +269,28 @@ export function isStationPoi(poi: SystemPOI): boolean {
   return poi.has_base || !!poi.base_id || (poi.type || "").toLowerCase() === "station";
 }
 
-/** Find the first station POI in a list. Optionally filter by required service. */
+/** True only when a station is KNOWN to offer a market. Avoids attempting buys at
+ *  stations whose services are undefined/unknown (which would error with no_market). */
+export function stationHasMarket(poi: SystemPOI | undefined): boolean {
+  if (!poi) return false;
+  const s = poi.services;
+  if (Array.isArray(s)) return s.includes("market");
+  return s?.market === true;
+}
+
+/** Find the first station POI in a list. Optionally filter by required service.
+ *  Skips POIs on the manual station blacklist (Settings → General → stationBlacklist),
+ *  since faction-owned deployable outposts cannot be distinguished from stations
+ *  automatically and must be excluded manually. */
 export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices, excludePirates: boolean = true): SystemPOI | null {
+  const blacklist = new Set(getStationBlacklist().map(s => s.toLowerCase()));
+  const isBlacklisted = (p: SystemPOI) => blacklist.size > 0 && blacklist.has(p.id.toLowerCase());
   if (requiredService) {
     // Prefer station with the required service
-    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
+    const withService = pois.find(p => isStationPoi(p) && !isBlacklisted(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
     if (withService) return withService;
   }
-  return pois.find(p => isStationPoi(p) && !(excludePirates && isPirateSystem(p.id))) || null;
+  return pois.find(p => isStationPoi(p) && !isBlacklisted(p) && !(excludePirates && isPirateSystem(p.id))) || null;
 }
 
 /** Check if a station POI is known to lack a specific service. */
@@ -418,6 +535,57 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
   return { oreId, oreName };
 }
 
+/**
+ * Fallback ore detection for mine responses that return the full game-state
+ * delta (top-level `ship,cargo,queue,skills`) instead of a `details`/`item`
+ * block. The mined ore is identified by diffing the post-mine `cargo` array
+ * against the previously known inventory and returning the item whose quantity
+ * increased. If no diff is found, falls back to `fallbackResourceId`.
+ */
+export function parseOreFromCargoDelta(
+  result: unknown,
+  prevInventory: Array<{ itemId: string; name: string; quantity: number }>,
+  fallbackResourceId?: string,
+): { oreId: string; oreName: string; quantity: number } {
+  if (!result || typeof result !== "object") return { oreId: "", oreName: "", quantity: 0 };
+  const mr = result as Record<string, unknown>;
+
+  // The cargo array lives either at top-level `cargo` or nested under `details`.
+  const cargoSrc = (Array.isArray(mr.cargo) ? mr.cargo : (mr.details as Record<string, unknown>)?.cargo) as
+    | Array<Record<string, unknown>>
+    | undefined;
+  if (!Array.isArray(cargoSrc) || cargoSrc.length === 0) {
+    const id = fallbackResourceId || "";
+    return { oreId: id, oreName: id, quantity: 0 };
+  }
+
+  const norm = (s: unknown) =>
+    String(s ?? "").replace(/ /g, "_").toLowerCase();
+
+  const prev = new Map<string, number>();
+  for (const it of prevInventory) prev.set(it.itemId, it.quantity);
+
+  let bestId = "";
+  let bestName = "";
+  let bestDelta = 0;
+  for (const raw of cargoSrc) {
+    const id = norm(raw.item_id ?? raw.resource_id ?? raw.id);
+    if (!id) continue;
+    const qty = (raw.quantity as number) ?? (raw.count as number) ?? (raw.amount as number) ?? 0;
+    const before = prev.get(id) ?? 0;
+    const delta = qty - before;
+    if (delta > bestDelta) {
+      bestDelta = delta;
+      bestId = id;
+      bestName = (raw.name as string) || (raw.item_name as string) || (raw.resource_name as string) || id;
+    }
+  }
+
+  if (bestId && bestDelta > 0) return { oreId: bestId, oreName: bestName || bestId, quantity: bestDelta };
+  const id = fallbackResourceId || "";
+  return { oreId: id, oreName: id, quantity: 0 };
+}
+
 // ── Docking ──────────────────────────────────────────────────
 
 /** Ensure the bot is docked at a station. Finds one in current system,
@@ -426,16 +594,24 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
  *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits).
  *  @param minBalance Minimum credits to keep on bot when collecting from storage (only withdraw if below this). If 0, withdraws all.
  */
-export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true, minBalance: number = 0): Promise<boolean> {
+export async function ensureDocked(
+  ctx: RoutineContext,
+  skipStorageCollection: boolean = true,
+  minBalance: number = 0,
+  opts?: { skipApprovedCheck?: boolean },
+): Promise<boolean> {
   const { bot } = ctx;
-  if (bot.docked) return true;
-
-  // Refresh location first to ensure we have the latest docked state
-  await bot.refreshLocation();
-  if (bot.docked) return true;
+  if (bot.docked) {
+    await bot.refreshStatus();
+    if (bot.docked) return true;
+  }
 
   const { pois } = await getSystemInfo(ctx);
-  const station = findStation(pois);
+  const stationBlacklist = buildDeniedStationSet();
+  const candidate = findStation(pois, undefined, true);
+  const station = candidate && !isStationDenied(candidate.id) && !stationBlacklist.has(candidate.id.toLowerCase())
+    ? candidate
+    : pois.find(p => isStationPoi(p) && !isStationDenied(p.id) && !stationBlacklist.has(p.id.toLowerCase())) ?? null;
 
   if (station) {
     if (bot.poi !== station.id) {
@@ -462,8 +638,12 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         await ensureInsured(ctx);
         return true;
       }
-      // Dock failed at current POI - check if it's "No base at this location"
-      if (dockResp.error?.message?.includes("No base at this location")) {
+      // A station that explicitly denied us must never be retried — remember it.
+      if (/access denied/i.test(dockResp.error?.message || "")) {
+        ctx.log("error", `Dock denied at ${station.name} — will not retry this station`);
+        markStationDenied(station.id);
+        // Fall through to search for a different (approved) station
+      } else if (dockResp.error?.message?.includes("No base at this location")) {
         ctx.log("error", `No dockable base at current POI (${bot.poi}) — searching for nearest station...`);
         // Don't fall through to "No station in current system" - we know we need a different station
         // Jump directly to the nearest station system
@@ -474,21 +654,25 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     }
   }
 
-  // No station in current system — find nearest station
-  ctx.log("system", "No station in current system — searching for nearest station...");
-  const blacklist = getSystemBlacklist();
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
-  if (!nearest) {
-    ctx.log("error", "No known station in mapped systems — cannot dock");
+  // No (usable) station in current system — find nearest station
+  ctx.log("system", "No usable station in current system — searching for nearest station...");
+  const dockTarget = await findReachableFuelStation(ctx, {
+    skipApprovedCheck: opts?.skipApprovedCheck,
+  });
+  if (!dockTarget) {
+    ctx.log("error", "No known approved station in mapped systems — cannot dock");
     return false;
   }
+  const nearest = dockTarget;
+  // Keep the blacklist bypass consistent for the route leg too (see ensureFueled).
+  const dockBlacklist = dockTarget.blacklistBypassed ? [] : getSystemBlacklist();
 
-  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} hops)`);
+  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} hops)${dockTarget.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
 
   // Navigate there
   if (nearest.systemId !== bot.system) {
     await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, dockBlacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -540,7 +724,13 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     return true;
   }
 
-  ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error?.message}`);
+  // A station that explicitly denied us must never be retried — remember it.
+  if (/access denied/i.test(dResp.error?.message || "")) {
+    ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
+    markStationDenied(nearest.poiId);
+  } else {
+    ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error?.message}`);
+  }
   return false;
 }
 
@@ -670,6 +860,18 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
   const { bot } = ctx;
   await bot.refreshLocation();
 
+  // ── COMBAT GUARD: While in battle, dock/jump/refuel are all rejected by the
+  // server with `in_battle`. Resolving the fight is the only thing that matters;
+  // fuel is irrelevant until we're free. Flee first, then attempt recovery. ──
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", "Emergency fuel recovery interrupted by battle — fleeing first (in battle, fuel does not matter!)");
+    await checkAndFleeFromBattle(ctx, "emergencyFuelRecovery");
+    if (ctx.bot.isInBattle()) {
+      ctx.log("combat", "Still in battle after flee attempt — cannot recover fuel now");
+      return false;
+    }
+  }
+
   ctx.log("error", "EMERGENCY: Fuel target not met — attempting recovery...");
 
   // First: scavenge nearby wrecks/containers for fuel cells
@@ -691,18 +893,28 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
 
   // Try to dock at current location
   if (!bot.docked) {
-    const dockResp = await bot.exec("dock");
-    if (!dockResp.error || dockResp.error.message.includes("already")) {
-      bot.docked = true;
-      ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
-      await collectFromStorage(ctx);
-      await ensureInsured(ctx);
-      await sellAllCargo(ctx);
-      await tryRefuel(ctx);
-      const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
-      if (!bot.docked || pct >= 30) {
-        ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
-        return true;
+    // Do not attempt to dock at a station that already denied us this session.
+    if (bot.poi && isStationDenied(bot.poi)) {
+      ctx.log("error", `Current station ${bot.poi} previously denied docking — not retrying`);
+    } else {
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error || dockResp.error.message.includes("already")) {
+        bot.docked = true;
+        ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
+        await collectFromStorage(ctx);
+        await ensureInsured(ctx);
+        await sellAllCargo(ctx);
+        await tryRefuel(ctx);
+        const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+        if (!bot.docked || pct >= 30) {
+          ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
+          return true;
+        }
+      } else if (/access denied/i.test(dockResp.error?.message || "")) {
+        // A station that explicitly denied us must never be retried — remember it.
+        const deniedId = bot.poi || ((dockResp as any)?.result?.poi ?? "");
+        ctx.log("error", `Dock denied during emergency recovery — will not retry this station`);
+        if (deniedId) markStationDenied(deniedId);
       }
     }
   }
@@ -749,6 +961,573 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
 const REFUEL_WAIT_RETRIES = 10;
 /** Seconds between refuel retries when waiting at station. */
 const REFUEL_WAIT_INTERVAL = 30_000;
+
+/**
+ * Fuel-cell items we can convert into fuel, ranked best-first by fuel-per-cell.
+ * Used when a docked station's fuel reserve is empty: we pull cells from
+ * faction/station storage or buy them from the market, then refuel from cargo.
+ */
+const FUEL_CELL_RANK: { id: string; fuel: number }[] = [
+  { id: "military_fuel_cell", fuel: 100 },
+  { id: "premium_fuel_cell", fuel: 50 },
+  { id: "fuel_cell", fuel: 20 },
+];
+
+/**
+ * Fuel restored by ONE unit of `itemId`, or 0 when the item is not a fuel cell.
+ *
+ * Catalog-driven (`effect.type === "fuel"`) so any future cell type is picked up
+ * automatically, with the three known cells as a fallback for the window before
+ * the catalog has loaded.
+ *
+ * Routines used to sniff fuel with `itemId.includes("fuel")`, which is wrong in
+ * both directions:
+ *   - it counts `fusion_fuel_rod`, `reactor_fuel_assembly`, `fuel_tank`… as fuel,
+ *     so those cargo items were never delivered and inflated the "we have fuel"
+ *     count;
+ *   - it treats every cell as interchangeable, so 3x military_fuel_cell (300
+ *     fuel) looked identical to 3x fuel_cell (60 fuel) and the bot went shopping
+ *     for 20-fuel cells at 20k–50k credits each while sitting on 300 free fuel.
+ */
+export function getFuelCellFuelValue(itemId: string): number {
+  if (!itemId) return 0;
+  const item = catalogStore.getItem(itemId);
+  const effect = item?.effect as { type?: string; amount?: number } | undefined;
+  if (effect?.type === "fuel" && typeof effect.amount === "number" && effect.amount > 0) {
+    return effect.amount;
+  }
+  return FUEL_CELL_RANK.find((f) => f.id === itemId.toLowerCase())?.fuel ?? 0;
+}
+
+/** True only for items the `refuel` command can actually burn. */
+export function isFuelCellItem(itemId: string): boolean {
+  return getFuelCellFuelValue(itemId) > 0;
+}
+
+function isFuelCellItemId(id: string): boolean {
+  return isFuelCellItem(id);
+}
+
+export interface CargoFuelCells {
+  /** Number of cells (all types) aboard. */
+  cells: number;
+  /** What those cells are worth in TANK FUEL — the number that actually matters. */
+  fuel: number;
+  /** Cargo weight they occupy. */
+  cargoUsed: number;
+  byItem: Array<{ itemId: string; name: string; quantity: number; fuelEach: number; fuel: number }>;
+  /** e.g. "3x Military Fuel Cell (300 fuel)" */
+  summary: string;
+}
+
+/** The fuel-cell reserve currently in cargo, measured in FUEL rather than in
+ *  cell count. Always prefer this over counting inventory entries. */
+export function getCargoFuelCells(bot: Bot): CargoFuelCells {
+  const byItem: CargoFuelCells["byItem"] = [];
+  let cells = 0;
+  let fuel = 0;
+  let cargoUsed = 0;
+  for (const item of bot.inventory) {
+    const fuelEach = getFuelCellFuelValue(item.itemId);
+    if (fuelEach <= 0 || item.quantity <= 0) continue;
+    cells += item.quantity;
+    fuel += item.quantity * fuelEach;
+    cargoUsed += item.quantity * getItemSize(item.itemId);
+    byItem.push({
+      itemId: item.itemId,
+      name: item.name || item.itemId,
+      quantity: item.quantity,
+      fuelEach,
+      fuel: item.quantity * fuelEach,
+    });
+  }
+  byItem.sort((a, b) => b.fuelEach - a.fuelEach);
+  const summary = byItem.length > 0
+    ? byItem.map((b) => `${b.quantity}x ${b.name} (${b.fuel} fuel)`).join(", ")
+    : "none";
+  return { cells, fuel, cargoUsed, byItem, summary };
+}
+
+/**
+ * Credits we are willing to pay per POINT of tank fuel when buying cells.
+ * Catalog base values are ~2.2cr/fuel (fuel_cell 43cr/20), ~2.4 (premium),
+ * ~3.9 (military), so 25cr/fuel is a ~10x-over-base ceiling that still blocks
+ * the player-driven 20 000–50 000cr-per-fuel_cell listings outright.
+ */
+export const DEFAULT_MAX_CREDITS_PER_FUEL = 25;
+
+export interface FuelCellReserveOptions {
+  /** How much TANK FUEL the cargo reserve must be able to deliver. */
+  fuelNeeded: number;
+  /** Short description for the log, e.g. "27-jump route home". */
+  reason?: string;
+  /** Allow buying cells from the docked station's market (default true). */
+  allowBuy?: boolean;
+  /** Price ceiling per point of fuel. Defaults to DEFAULT_MAX_CREDITS_PER_FUEL. */
+  maxCreditsPerFuel?: number;
+  /** Hard cap on total credits spent on cells this call. 0 / omitted = no cap. */
+  maxSpend?: number;
+}
+
+export interface FuelCellReserveResult {
+  /** Reserve is at (or above) the requested fuel. */
+  ok: boolean;
+  /** Fuel aboard in cells after sourcing. */
+  fuel: number;
+  cells: number;
+  /** Credits spent buying cells (0 when everything came from storage). */
+  spent: number;
+}
+
+/**
+ * Make sure the ship carries at least `fuelNeeded` worth of fuel CELLS, sourcing
+ * them in the only sane order: what we already carry → faction storage (free) →
+ * station storage (free) → a price-capped market buy as a last resort.
+ *
+ * Denser cells are preferred everywhere (military 100 fuel / 3 space beats plain
+ * 20 fuel / 1 space per unit of cargo), and a buy is only attempted after
+ * `estimate_purchase` confirms the station really is selling — so a ghost
+ * listing produces a quiet skip instead of a red `item_not_available`.
+ */
+export async function ensureFuelCellReserve(
+  ctx: RoutineContext,
+  opts: FuelCellReserveOptions,
+): Promise<FuelCellReserveResult> {
+  const { bot } = ctx;
+  const reason = opts.reason ? ` for ${opts.reason}` : "";
+  const maxPerFuel = opts.maxCreditsPerFuel && opts.maxCreditsPerFuel > 0
+    ? opts.maxCreditsPerFuel
+    : DEFAULT_MAX_CREDITS_PER_FUEL;
+
+  await bot.refreshCargo();
+  let have = getCargoFuelCells(bot);
+  const need = Math.max(0, Math.ceil(opts.fuelNeeded));
+
+  if (need <= 0 || have.fuel >= need) {
+    if (have.cells > 0) {
+      ctx.log("system", `Fuel reserve OK${reason}: carrying ${have.summary} = ${have.fuel} fuel (need ${need})`);
+    }
+    return { ok: true, fuel: have.fuel, cells: have.cells, spent: 0 };
+  }
+
+  ctx.log(
+    "system",
+    `Fuel reserve short${reason}: carrying ${have.summary} = ${have.fuel} fuel, need ${need} — sourcing ${need - have.fuel} more`,
+  );
+
+  let spent = 0;
+
+  // Densest cells first: more fuel per unit of cargo left for actual trade goods.
+  const ranked = [...FUEL_CELL_RANK].sort((a, b) => b.fuel - a.fuel);
+
+  /** Cells of `id` still required to close the gap, limited by free cargo. */
+  const cellsWanted = (id: string, fuelEach: number): number => {
+    const deficit = need - have.fuel;
+    if (deficit <= 0) return 0;
+    const freeWeight = Math.max(0, (bot.cargoMax || 0) - cargoUsedFromInventory(bot));
+    return Math.max(0, Math.min(Math.ceil(deficit / fuelEach), maxItemsForCargo(freeWeight, id)));
+  };
+
+  // ── 1) Free cells already sitting in faction storage ──
+  try {
+    await bot.refreshFactionStorage(false, undefined, true);
+  } catch { /* storage unavailable — fall through to the other sources */ }
+  for (const { id } of ranked) {
+    const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+    const want = cellsWanted(id, fuelEach);
+    if (want <= 0) continue;
+    const stock = bot.factionStorage.find((i) => i.itemId === id)?.quantity || 0;
+    if (stock <= 0) continue;
+    const qty = Math.min(stock, want);
+    const direct = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: id, quantity: qty });
+    let got = false;
+    if (!direct.error) {
+      got = true;
+    } else {
+      // Older two-step path: faction -> station storage -> cargo.
+      const move = await bot.exec("storage", { action: "deposit", target: "self", item_id: id, quantity: qty, source: "faction" });
+      if (!move.error) {
+        const w = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+        got = !w.error;
+      }
+    }
+    if (got) {
+      await bot.refreshCargo();
+      have = getCargoFuelCells(bot);
+      ctx.log("system", `Pulled ${qty}x ${id} from faction storage (free) — reserve now ${have.fuel} fuel`);
+    }
+    if (have.fuel >= need) break;
+  }
+
+  // ── 2) Free cells in this station's personal storage ──
+  if (have.fuel < need && bot.docked) {
+    try {
+      await bot.refreshStorage();
+    } catch { /* not docked / no storage here */ }
+    for (const { id } of ranked) {
+      const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+      const want = cellsWanted(id, fuelEach);
+      if (want <= 0) continue;
+      const stock = bot.storage.find((i) => i.itemId === id)?.quantity || 0;
+      if (stock <= 0) continue;
+      const qty = Math.min(stock, want);
+      const w = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+      if (!w.error) {
+        await bot.refreshCargo();
+        have = getCargoFuelCells(bot);
+        ctx.log("system", `Pulled ${qty}x ${id} from station storage (free) — reserve now ${have.fuel} fuel`);
+      }
+      if (have.fuel >= need) break;
+    }
+  }
+
+  // ── 3) Buy, but only at a sane price ──
+  if (have.fuel < need && opts.allowBuy !== false && bot.docked) {
+    let hasMarket = true;
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      hasMarket = stationHasMarket(station);
+    } catch { /* unknown — let estimate_purchase decide */ }
+
+    if (!hasMarket) {
+      ctx.log("system", `No market at this station — cannot top up the fuel reserve here (${have.fuel}/${need} fuel)`);
+    } else {
+      for (const { id } of ranked) {
+        const fuelEach = getFuelCellFuelValue(id) || FUEL_CELL_RANK.find((f) => f.id === id)!.fuel;
+        let want = cellsWanted(id, fuelEach);
+        if (want <= 0) continue;
+
+        // Ask BEFORE buying: a ghost listing then costs a log line, not a red error.
+        const est = await bot.exec("estimate_purchase", { item_id: id, quantity: want });
+        if (est.error) continue;
+        const e = (est.result || {}) as Record<string, unknown>;
+        const available = Math.max(0, Number(e.available ?? e.available_quantity ?? 0) || 0);
+        if (available <= 0) {
+          ctx.log("system", `No one is selling ${id} here — skipping`);
+          continue;
+        }
+        want = Math.min(want, available);
+        const cost = Number(e.total_cost ?? e.subtotal ?? 0) || 0;
+        const perUnit = cost > 0 ? cost / want : 0;
+        const perFuel = perUnit / fuelEach;
+        if (perFuel > maxPerFuel) {
+          ctx.log(
+            "trade",
+            `Refusing to buy ${id} at ${Math.round(perUnit)}cr each (${perFuel.toFixed(1)}cr per fuel, cap ${maxPerFuel}) — ` +
+            `military cells are free at home`,
+          );
+          continue;
+        }
+        const budget = opts.maxSpend && opts.maxSpend > 0 ? Math.min(opts.maxSpend - spent, bot.credits) : bot.credits;
+        if (perUnit > 0 && budget < perUnit) continue;
+        if (perUnit > 0) want = Math.min(want, Math.floor(budget / perUnit));
+        if (want <= 0) continue;
+
+        const creditsBefore = bot.credits;
+        const buy = await bot.exec("buy", { item_id: id, quantity: want });
+        if (buy.error) continue;
+        await bot.refreshStatus();
+        await bot.refreshCargo();
+        have = getCargoFuelCells(bot);
+        spent += Math.max(0, creditsBefore - bot.credits);
+        ctx.log("trade", `Bought ${want}x ${id} at ~${Math.round(perUnit)}cr each — reserve now ${have.fuel} fuel`);
+        if (have.fuel >= need) break;
+      }
+    }
+  }
+
+  const ok = have.fuel >= need;
+  if (!ok) {
+    ctx.log(
+      "system",
+      `Fuel reserve still short${reason}: ${have.fuel}/${need} fuel (${have.summary}) — continuing, the tank plus station refuelling may cover it`,
+    );
+  }
+  return { ok, fuel: have.fuel, cells: have.cells, spent };
+}
+
+/**
+ * Ask the server what a route actually costs in fuel. `find_route` is the only
+ * source that knows this ship's fuel burn, so it beats every "jumps × guess"
+ * estimate. Returns null when the route can't be resolved.
+ */
+export async function estimateRouteFuel(
+  ctx: RoutineContext,
+  targetSystem: string,
+): Promise<{ jumps: number; estimatedFuel: number; fuelAvailable: number; fuelPerJump: number } | null> {
+  if (!targetSystem) return null;
+  try {
+    const resp = await ctx.bot.exec("find_route", { target_system: targetSystem });
+    if (resp.error) return null;
+    const r = (resp.result || {}) as Record<string, unknown>;
+    if (r.found === false) return null;
+    const estimatedFuel = Number(r.estimated_fuel ?? 0) || 0;
+    if (estimatedFuel <= 0) return null;
+    return {
+      jumps: Number(r.total_jumps ?? 0) || 0,
+      estimatedFuel,
+      fuelAvailable: Number(r.fuel_available ?? ctx.bot.fuel) || 0,
+      fuelPerJump: Number(r.fuel_per_jump ?? 0) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface PurchaseEstimate {
+  /** Units the station can actually deliver right now. */
+  available: number;
+  /** Units of the request nobody can fill. */
+  unfilled: number;
+  totalCost: number;
+  message: string;
+  /** Who we would be buying from, when the server says. */
+  counterparties: string[];
+}
+
+/**
+ * Normalised view of an `estimate_purchase` reply.
+ *
+ * This is the only pre-flight check that talks to the live order book, and —
+ * critically — it does NOT return an error when nobody is selling: it answers
+ * `{ available: 0, unfilled: <asked>, fills: [] }` plus a message. Routines that
+ * tested only `resp.error` therefore treated a seller-less station as a good
+ * one, and the failure only surfaced on the `buy`, after the whole flight.
+ *
+ * `fills[].counterparty` is captured too: when the only orders in the book are
+ * our own the server refuses the trade with "No one is selling …", and the
+ * counterparty list is the one clue that explains why a listing we can plainly
+ * see is still unbuyable.
+ */
+export function readPurchaseEstimate(raw: unknown): PurchaseEstimate {
+  const e = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const num = (v: unknown): number => {
+    const n = typeof v === "string" ? parseFloat(v) : (v as number);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const fills = Array.isArray(e.fills) ? (e.fills as Array<Record<string, unknown>>) : [];
+  const counterparties = [
+    ...new Set(fills.map((f) => String(f.counterparty || f.source || "")).filter(Boolean)),
+  ];
+  return {
+    // `available` is the authoritative field; the others are legacy/defensive.
+    available: Math.max(0, num(e.available ?? e.available_quantity ?? e.max_quantity ?? 0)),
+    unfilled: Math.max(0, num(e.unfilled)),
+    totalCost: num(e.total_cost ?? e.subtotal),
+    message: typeof e.message === "string" ? e.message : "",
+    counterparties,
+  };
+}
+
+/** True when the bot is docked at its configured home system. Used to decide
+ *  whether plain fuel_cells are "free" (home) or a waste of credits (remote). */
+function isAtHomeStation(ctx: RoutineContext): boolean {
+  const homeSystem = ((readSettings().trader?.homeSystem as string) || "").toLowerCase();
+  if (!homeSystem) return false;
+  return ctx.bot.system.toLowerCase() === homeSystem;
+}
+
+/** How many fuel cells of the given id fit in available cargo (by weight). */
+function maxFuelCellsForCargo(ctx: RoutineContext, itemId: string): number {
+  const { bot } = ctx;
+  const free = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+  return maxItemsForCargo(free, itemId);
+}
+
+/**
+ * When docked at a station whose fuel RESERVE is empty (station_fuel_empty) and we
+ * have no fuel cells in cargo, obtain the best available fuel cells and refuel:
+ *   1. Pull from FACTION storage (military > premium > regular) into cargo.
+ *   2. Else pull from STATION storage.
+ *   3. Else BUY the best cell type from the station market.
+ * Then call refuel (which consumes cargo cells) to fill the tank.
+ *
+ * Returns true if fuel improved (tank topped up or at least some cells consumed),
+ * false if we could not source any fuel cells at all.
+ */
+export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.docked) return false;
+
+  // Quick check: already topped up — nothing to do.
+  const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (startFuel >= 95) return false;
+
+  await bot.refreshShip();
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+  await bot.refreshCargo();
+
+  const fuelNeeded = Math.max(0, bot.maxFuel - bot.fuel);
+
+  if (bot.fuel >= bot.maxFuel * 0.9) return false;
+
+  let sourced = 0;
+  // If we already carry ANY fuel cell, prefer refueling from cargo rather than
+  // buying inferior/expensive plain fuel_cells. This prevents the classic waste:
+  // a ship holding 10x military_fuel_cell (100 fuel each) still buying 6x plain
+  // fuel_cell (20 fuel each) for 20k at a remote station.
+  const haveAnyCell = bot.inventory.some((i) => isFuelCellItemId(i.itemId) && (i.quantity || 0) > 0);
+  for (const { id } of FUEL_CELL_RANK) {
+    const have = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+    if (have > 0) continue;
+    if (haveAnyCell) {
+      ctx.log("trade", `Carrying fuel cells already — will refuel from cargo instead of buying ${id}`);
+      continue;
+    }
+    // Never blow credits on plain fuel_cells at a remote station: military cells
+    // are free at home and give 5x the fuel per cell. Only buy plain fuel_cell at home.
+    if (id === "fuel_cell" && !isAtHomeStation(ctx)) {
+      ctx.log("trade", "Skipping expensive plain fuel_cell at remote station (military cells are free at home)");
+      continue;
+    }
+
+    const cellFuel = FUEL_CELL_RANK.find((f) => f.id === id)?.fuel || 20;
+    const cellsNeeded = Math.max(1, Math.ceil(fuelNeeded / cellFuel));
+    const pullLimit = cellsNeeded + 5;
+
+    // 1) Faction storage
+    const inFaction = bot.factionStorage.find((i) => i.itemId === id);
+    if (inFaction && inFaction.quantity > 0) {
+      const qty = Math.min(inFaction.quantity, maxFuelCellsForCargo(ctx, id) || inFaction.quantity, pullLimit);
+      if (qty > 0) {
+        const fResp = await bot.exec("storage", {
+          action: "deposit", target: "self", item_id: id, quantity: qty, source: "faction",
+        });
+        if (!fResp.error) {
+          await bot.refreshStorage();
+          const wResp = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+          if (!wResp.error) {
+            await bot.refreshCargo();
+            const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+            sourced += got;
+            ctx.log("system", `Pulled ${got}x ${id} from faction storage`);
+            continue;
+          }
+        }
+      }
+    }
+
+    // 2) Station storage
+    const inStation = bot.storage.find((i) => i.itemId === id);
+    if (inStation && inStation.quantity > 0) {
+      const qty = Math.min(inStation.quantity, maxFuelCellsForCargo(ctx, id) || inStation.quantity, pullLimit);
+      if (qty > 0) {
+        const wResp = await bot.exec("withdraw_items", { item_id: id, quantity: qty });
+        if (!wResp.error) {
+          await bot.refreshCargo();
+          const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+          sourced += got;
+          ctx.log("system", `Pulled ${got}x ${id} from station storage`);
+          continue;
+        }
+      }
+    }
+
+    // 3) Buy from market
+    try {
+      const { pois } = await getSystemInfo(ctx);
+      const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+      if (stationHasMarket(station)) {
+        const maxCanFit = maxFuelCellsForCargo(ctx, id);
+        if (maxCanFit <= 0) continue;
+        const buyQty = Math.min(maxCanFit, pullLimit);
+        if (buyQty > 0) {
+          const buyResp = await bot.exec("buy", { item_id: id, quantity: buyQty });
+          if (!buyResp.error) {
+            await bot.refreshCargo();
+            const got = bot.inventory.find((i) => i.itemId === id)?.quantity || 0;
+            if (got > 0) {
+              sourced += got;
+              ctx.log("system", `Bought ${got}x ${id} from market`);
+              continue;
+            }
+          }
+        }
+      } else {
+        ctx.log("trade", `Station has no market — skipping buy of ${id}`);
+      }
+    } catch { /* market unavailable — skip */ }
+  }
+
+  // 4) If we sourced any cells (or already had some), refuel from cargo.
+  const totalCells = bot.inventory
+    .filter((i) => isFuelCellItemId(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
+  if (totalCells <= 0) {
+    ctx.log("error", "No fuel cells available in faction storage, station storage, or market");
+    return false;
+  }
+
+  // Refuel consumes cargo fuel cells. Try in place first; if the lib requires
+  // undocking to draw from cargo, fall back to undock -> refuel -> redock.
+  let improved = false;
+  for (let attempt = 0; attempt < 12 && bot.state === "running"; attempt++) {
+    const resp = await bot.exec("refuel");
+    if (resp.error) {
+      const msg = resp.error.message.toLowerCase();
+      if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) break;
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) {
+        // Out of cargo cells — try buying one more of the best affordable type.
+        const bought = await tryBuyOneFuelCell(ctx);
+        if (!bought) break;
+        continue;
+      }
+      if (msg.includes("station") && (msg.includes("dock") || msg.includes("undock"))) {
+        // Refuel wants us undocked to use cargo cells.
+        await ensureUndocked(ctx);
+        const uResp = await bot.exec("refuel");
+        await bot.refreshShip();
+        if (!uResp.error) improved = true;
+        const tResp = await bot.exec("travel", { target_poi: bot.poi });
+        if (!tResp.error || tResp.error?.message.includes("already")) {
+          await bot.exec("dock");
+          bot.docked = true;
+        }
+        continue;
+      }
+      break;
+    }
+    improved = true;
+    await bot.refreshShip();
+    const fp = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fp >= 95) break;
+  }
+
+  await bot.refreshShip();
+  const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (endFuel > startFuel) {
+    ctx.log("system", `Recovered fuel via stored/bought cells: ${startFuel}% → ${endFuel}%`);
+    return true;
+  }
+  return improved || sourced > 0;
+}
+
+/** Buy a single (best affordable) fuel cell from the market as a last-ditch top-up. */
+async function tryBuyOneFuelCell(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const { pois } = await getSystemInfo(ctx);
+  const station = pois.find((p) => isStationPoi(p) && p.id === bot.poi);
+  if (!stationHasMarket(station)) return false;
+  for (const { id } of FUEL_CELL_RANK) {
+    // Don't waste credits on plain fuel_cells at remote stations — military cells
+    // are free at home and vastly more efficient (100 vs 20 fuel, 3 vs 1 space).
+    if (id === "fuel_cell" && !isAtHomeStation(ctx)) continue;
+    if (maxFuelCellsForCargo(ctx, id) <= 0) continue;
+    try {
+      const buyResp = await bot.exec("buy", { item_id: id, quantity: 1 });
+      if (!buyResp.error) {
+        await bot.refreshCargo();
+        if ((bot.inventory.find((i) => i.itemId === id)?.quantity || 0) > 0) {
+          ctx.log("system", `Bought 1x ${id} from market to top up`);
+          return true;
+        }
+      }
+    } catch { /* skip */ }
+  }
+  return false;
+}
 
 /** Attempt to refuel to full. Calls refuel repeatedly until tank is full.
  *  If broke, sells cargo. If still can't refuel, waits at station and retries.
@@ -809,6 +1588,14 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
       }
       // Sol Central is always assumed to have fuel
       if (!isSolCentralLoop && (msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
+        // Station reserve empty — try faction/station storage or market for fuel cells
+        // instead of giving up (a docked station often has cells even with 0 reserve).
+        if (bot.docked) {
+          const recovered = await acquireFuelCellsAndRefuel(ctx);
+          const fp = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (recovered && fp >= 95) return;
+          await bot.refreshShip();
+        }
         ctx.log("error", `Station out of fuel — cannot refuel here (${resp.error.message})`);
         return; // bail out immediately, do not wait
       }
@@ -845,13 +1632,20 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
     // Retry: sell + refuel
     await sellAllCargo(ctx);
     const refuelResp = await bot.exec("refuel");
-    if (refuelResp.error) {
-      const msg = refuelResp.error.message.toLowerCase();
-      if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
-        ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
-        break;
-      }
-    }
+     if (refuelResp.error) {
+       const msg = refuelResp.error.message.toLowerCase();
+       if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
+         // Reserve empty / no cargo cells — try faction/station storage or market before giving up.
+           if (bot.docked) {
+            const recovered = await acquireFuelCellsAndRefuel(ctx);
+            await bot.refreshShip();
+            fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+            if (recovered && fuelPct >= 50) return;
+          }
+         ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
+         break;
+       }
+     }
     await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= 50) {
@@ -1194,6 +1988,164 @@ export async function safetyCheck(
   return true;
 }
 
+// ── Fuel-station selection (with blacklist bypass) ───────────
+// The system blacklist is a *preference* (avoid sketchy systems). It must NEVER
+// be a hard wall that strands a low-fuel bot in a pocket where every exit is
+// blacklisted — that was the bug: the miner sat at 20% fuel for 40 minutes
+// spamming "No approved refuel station reachable" while a station ~10 jumps away
+// had room for it 3x over. When the blacklisted search finds nothing, we retry
+// without the blacklist (still skipping pirate systems) and, as a last resort,
+// ask the server for a reachable approved station we can actually afford to fly to.
+
+export interface FuelStationTarget {
+  systemId: string;
+  poiId: string;
+  poiName: string;
+  hops: number;
+  blacklistBypassed: boolean;
+  serverRoute?: RouteSegment[];
+}
+
+export interface RouteFuelCheck {
+  found: boolean;
+  route?: RouteSegment[];
+  totalJumps?: number;
+  estimatedFuel?: number;
+  fuelAvailable?: number;
+  hasWormhole?: boolean;
+  affordable?: boolean;
+}
+
+/** Ask the server for a route to a target system and whether we can afford it. */
+export async function checkRouteFuel(
+  ctx: RoutineContext,
+  targetSystemId: string,
+): Promise<RouteFuelCheck> {
+  const { bot } = ctx;
+  try {
+    const resp = await bot.exec("find_route", { target_system: targetSystemId });
+    const raw = resp.result as any;
+    if (resp.error || !raw || !raw.found) return { found: false };
+    const hasWormhole = routeHasWormhole(raw.route);
+    let affordable: boolean | undefined;
+    if (raw.fuel_available !== undefined && raw.estimated_fuel !== undefined && !hasWormhole) {
+      affordable = raw.fuel_available >= raw.estimated_fuel;
+    }
+    return {
+      found: true,
+      route: raw.route,
+      totalJumps: raw.total_jumps,
+      estimatedFuel: raw.estimated_fuel,
+      fuelAvailable: raw.fuel_available,
+      hasWormhole,
+      affordable,
+    };
+  } catch (e) {
+    ctx.log("debug", `checkRouteFuel(${targetSystemId}) failed: ${e}`);
+    return { found: false };
+  }
+}
+
+/** Candidate {system, poiId} pairs to fall back to when local map search fails. */
+function candidateApprovedStations(
+  approvedSet: Set<string>,
+  deniedSet: Set<string>,
+): Array<{ systemId: string; poiId: string }> {
+  const out: Array<{ systemId: string; poiId: string }> = [];
+  const seen = new Set<string>();
+  // 1) Explicit approvedFuelStations entries ("system|poi" or bare "poi")
+  for (const e of approvedSet) {
+    const parts = e.split("|");
+    if (parts.length === 2) out.push({ systemId: parts[0], poiId: parts[1] });
+  }
+  // 2) Any known station POI on the map (prefer ones explicitly approved)
+  for (const sys of mapStore.getSystems()) {
+    for (const p of sys.pois) {
+      if (!(p.has_base || (p as any).base_id)) continue;
+      const key = `${sys.id}|${p.id}`;
+      if (approvedSet.has(p.id) || approvedSet.has(key)) {
+        const sKey = `${sys.id}|${p.id}`.toLowerCase();
+        if (!seen.has(sKey) && !deniedSet.has(sKey) && !deniedSet.has(p.id.toLowerCase())) {
+          out.push({ systemId: sys.id, poiId: p.id });
+          seen.add(sKey);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Find a reachable approved fuel station, escalating through three strategies:
+ *   1. Local map BFS honouring the blacklist (normal behaviour).
+ *   2. Local map BFS ignoring the blacklist (recover from a blacklisted pocket).
+ *   3. Server `find_route` over known approved stations, keeping only routes we
+ *      can actually afford (enough fuel_available >= estimated_fuel).
+ * Returns null when nothing reachable was found (caller should give up / recover).
+ */
+export async function findReachableFuelStation(
+  ctx: RoutineContext,
+  opts: { skipBlacklist?: boolean; skipApprovedCheck?: boolean; excludePoiIds?: Set<string> } = {},
+): Promise<FuelStationTarget | null> {
+  const { bot } = ctx;
+  const approvedSet = opts.skipApprovedCheck ? new Set<string>() : buildApprovedStationSet(readSettings());
+  const deniedSet = buildDeniedStationSet(opts.excludePoiIds);
+  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
+
+  // Strategy 1: honour the blacklist (unless explicitly skipped)
+  if (blacklist.length > 0) {
+    const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, deniedSet);
+    if (nearest) {
+      return { ...nearest, blacklistBypassed: false };
+    }
+    ctx.log("system", "Blacklisted fuel search found no station — retrying without blacklist (avoiding pirate systems) before giving up");
+  }
+
+  // Strategy 2: ignore the blacklist (still skips pirate systems inside mapStore)
+  const bypass = mapStore.findNearestStationSystem(bot.system, [], approvedSet, deniedSet);
+  if (bypass) {
+    ctx.log("system", `Found station ${bypass.poiName} in ${bypass.systemId} by bypassing the blacklist — stranded is worse than an avoided system`);
+    return { ...bypass, blacklistBypassed: true };
+  }
+
+  // Strategy 3: ask the server for a reachable, affordable approved station.
+  const candidates = candidateApprovedStations(approvedSet, deniedSet)
+    .filter(c => c.systemId.toLowerCase() !== bot.system.toLowerCase());
+  // Prefer stations whose distance we already know from the map.
+  for (const c of candidates) {
+    try { (c as any)._hops = mapStore.findNearestStationSystem(bot.system, [], approvedSet, new Set([c.poiId.toLowerCase()]))?.hops ?? 999; }
+    catch { (c as any)._hops = 999; }
+  }
+  candidates.sort((a, b) => ((a as any)._hops as number) - ((b as any)._hops as number));
+
+  let best: FuelStationTarget | null = null;
+  let bestJumps = Infinity;
+  for (const c of candidates.slice(0, 12)) {
+    const check = await checkRouteFuel(ctx, c.systemId);
+    if (!check.found || check.hasWormhole) continue;
+    if (check.affordable === false) {
+      ctx.log("debug", `Server route to ${c.systemId} not affordable (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — skipping`);
+      continue;
+    }
+    const jumps = check.totalJumps ?? (check.route?.length ? check.route.length - 1 : 999);
+    if (jumps < bestJumps) {
+      bestJumps = jumps;
+      best = {
+        systemId: c.systemId,
+        poiId: c.poiId,
+        poiName: c.poiId,
+        hops: jumps,
+        blacklistBypassed: true,
+        serverRoute: check.route,
+      };
+    }
+  }
+  if (best) {
+    ctx.log("system", `Server routed to approved station in ${best.systemId} (${best.hops} jumps) — flying there to refuel`);
+  }
+  return best;
+}
+
 /**
  * Ensure the bot has adequate fuel.
  * If an approved fuel station list is configured and fuel is low,
@@ -1203,11 +2155,45 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
+
+  // ── COMBAT GUARD: In a battle, fuel is irrelevant — it's life or death.
+  // Every refuel/dock/jump/travel command is rejected by the server with
+  // `in_battle`, so attempting to fuel while fighting just deadlocks the bot
+  // forever (it keeps "navigating to refuel" and every command fails). Resolve
+  // the battle FIRST, then come back for fuel. ───────────────────────────────
   await bot.refreshShip();
   await bot.refreshLocation();
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", "Fuel check interrupted by battle — resolving combat before fueling (in battle, fuel does not matter!)");
+    if (!opts?.skipFleeCheck) {
+      const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
+      if (fled || !ctx.bot.isInBattle()) {
+        // Battle resolved (or was a stale flag) — re-evaluate fuel below.
+      } else {
+        // Still in battle and couldn't resolve it — bail so the caller can retry.
+        ctx.log("combat", "Still in battle after flee attempt — cannot fuel now, returning to caller");
+        return false;
+      }
+    } else {
+      // Combat routine: do not auto-flee from here. Clear stale state if the
+      // API disagrees, otherwise return control so the caller can handle the
+      // battle with proper analysis (fight / flee based on tier / hull).
+      const status = await getBattleStatus(ctx);
+      if (!status && ctx.bot.isInBattle()) {
+        ctx.log("combat", "Clearing stale WebSocket battle state (API reports no battle)");
+        ctx.bot.currentBattle.inBattle = false;
+        ctx.bot.currentBattle.battleId = null;
+        ctx.bot.currentBattle.participants = [];
+      } else if (status) {
+        ctx.log("combat", "Active battle detected during fuel check — returning to caller to handle combat");
+        return false;
+      }
+    }
+  }
+
   let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
@@ -1235,9 +2221,20 @@ export async function ensureFueled(
   // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
   // via the refuel command even while docked at a station.
   // Undock first so cargo fuel cells are used one at a time (refuel undocked = use cargo)
-  if (wasDocked) {
-    ctx.log("system", "Undocking to use cargo fuel cells before reaching for station fuel...");
+  //
+  // CRITICAL: Only undock if we actually HAVE fuel cells in cargo. Otherwise we
+  // pointlessly undock, fail the refuel, and then fall through to a market buy at a
+  // station that has no market. If cargo is empty, skip straight to the storage/market
+  // fallback which checks faction/station storage first and only buys where a market exists.
+  const cargoFuelCells = bot.inventory
+    .filter((i) => isFuelCellItemId(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
+
+  if (wasDocked && cargoFuelCells > 0) {
+    ctx.log("system", `Undocking to use ${cargoFuelCells} cargo fuel cells before reaching for station fuel...`);
     await ensureUndocked(ctx);
+  } else if (wasDocked && cargoFuelCells === 0) {
+    ctx.log("system", "No fuel cells in cargo — skipping cargo refuel, will source from storage/market");
   }
 
   let cargoFuelAttempts = 0;
@@ -1266,6 +2263,28 @@ export async function ensureFueled(
     return true;
   }
 
+  // Universal fallback: we're docked at some station whose reserve is empty and we
+  // have no cargo cells. Try to source fuel cells from faction/station storage or
+  // the market (NOT gated by the approved-fuel-station list) before giving up and
+  // wandering off to another station. The miner can otherwise deadlock here when
+  // the only station it's locked to has 0 reserve but plenty of cells in storage.
+  if (bot.docked) {
+    const recovered = await acquireFuelCellsAndRefuel(ctx);
+    await bot.refreshShip();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct >= thresholdPct) {
+      ctx.log("system", `Recovered fuel at docked station (${dockingStation?.name ?? bot.poi}) — fuel now ${fuelPct}%`);
+      return true;
+    }
+    if (recovered) {
+      // Fuel improved but still under threshold — re-run tryRefuel for any residual station reserve.
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      await bot.refreshShip();
+      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct >= thresholdPct) return true;
+    }
+  }
+
   // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
   if (opts?.skipBlacklist && opts?.homeSystem) {
     const homeSystem = opts.homeSystem;
@@ -1289,10 +2308,9 @@ export async function ensureFueled(
     // If we couldn't reach home or refuel there, continue to other options
   }
 
-  // Check for approved fuel stations - if empty/undefined, allow all stations (handled by isApprovedFuelStation)
-  const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
-
   // If we undocked and were previously docked, only return there if it's APPROVED
+  // NOTE: station-approval is independent of the system blacklist (skipBlacklist).
+  // A cloaked trader must still respect the approved-fuel-station allowlist.
   if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
     ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
     const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
@@ -1305,10 +2323,10 @@ export async function ensureFueled(
   }
 
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  const isCurrentStationApproved = currentStation && (opts?.skipBlacklist || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
+  const isCurrentStationApproved = currentStation && (opts?.skipApprovedCheck || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
   if (isCurrentStationApproved) {
     ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${currentStation.name}...`);
-    const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipBlacklist });
+    const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipApprovedCheck });
     if (ok) return true;
   } else if (currentStation) {
     ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — checking if can reach home...`);
@@ -1371,122 +2389,224 @@ if (looted > 0) {
     }
   }
 
-  // ── STEP 5: Find nearest known station with fuel ────────────────────────
-  ctx.log("system", "No station in current system — searching known map for nearest station...");
-  const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
-  const approvedSet = new Set<string>();
-  if (approvedFuelStations) {
-    for (const entry of approvedFuelStations) {
-      approvedSet.add(entry);
-      const parts = entry.split("|");
-      if (parts.length === 2) approvedSet.add(parts[1]);
+  // ── STEP 5: Find nearest known APPROVED station with fuel ────────────────
+  // Loop so a station that turns out to be empty/denied can be skipped and the
+  // next reachable candidate tried, instead of giving up on the first miss.
+  const haveCurrentStation = !!pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  ctx.log("system", haveCurrentStation
+    ? "Current station not approved for refuel — searching known map for nearest approved station..."
+    : "No approved station in current system — searching known map for nearest station...");
+
+  const rejected = new Set<string>();
+  let nearest: FuelStationTarget | null = null;
+  let unaffordableTarget: FuelStationTarget | null = null;
+
+  // Try several stations in turn. If the station we fly to turns out to be empty
+  // on arrival (reserve depleted / no fuel cells), remember it for THIS search
+  // and move on to the next reachable station instead of looping forever on a dead one.
+  for (let stationAttempt = 0; stationAttempt < 6; stationAttempt++) {
+    if (!nearest) {
+      for (let attempt = 0; attempt < 4 && !nearest; attempt++) {
+        const candidate = await findReachableFuelStation(ctx, {
+          skipBlacklist: opts?.skipBlacklist,
+          skipApprovedCheck: opts?.skipApprovedCheck,
+          excludePoiIds: rejected,
+        });
+        if (!candidate) break;
+
+        // Skip stations that explicitly report 0 fuel (Sol is always stocked).
+        if (candidate.poiId !== "sol_station" && candidate.poiId !== "sol_central") {
+          let fuelAtStation: number | null = null;
+          try {
+            const poiResp = await bot.exec("get_poi", { poi_id: candidate.poiId });
+            fuelAtStation = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+          } catch {}
+          if (fuelAtStation !== null && fuelAtStation !== undefined && fuelAtStation <= 0) {
+            ctx.log("system", `Skipping ${candidate.poiName} — station reports 0 fuel`);
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+        }
+
+        // Don't fly to a station we can't afford to reach — check the server route
+        // (unless we're already there, or we already validated it via checkRouteFuel).
+        if (candidate.systemId.toLowerCase() !== bot.system.toLowerCase() && !candidate.serverRoute) {
+          const check = await checkRouteFuel(ctx, candidate.systemId);
+          if (check.found && check.hasWormhole) {
+            ctx.log("system", `Route to ${candidate.poiName} uses a wormhole — skipping (bot cannot traverse it)`);
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+          if (check.affordable === false) {
+            ctx.log("system", `Cannot afford route to ${candidate.poiName} (have ${check.fuelAvailable}, need ${check.estimatedFuel}) — will retry further stations first`);
+            if (!unaffordableTarget) unaffordableTarget = { ...candidate, serverRoute: check.route };
+            rejected.add(candidate.poiId.toLowerCase());
+            continue;
+          }
+          candidate.serverRoute = check.route;
+        }
+
+        nearest = candidate;
+      }
     }
-  }
 
-  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
-  if (!nearest) {
-    ctx.log("error", "No approved refuel station reachable");
-    return false;
-  }
-
-  // Check if the nearest station has fuel before traveling there
-  // Sol Central is always assumed to have fuel (faction station with guaranteed supply)
-  if (nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
-    try {
-      const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-      const fuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
-      if (fuel !== null && fuel !== undefined && fuel <= 0) {
-        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+    if (!nearest) {
+      if (unaffordableTarget) {
+        ctx.log("error", `No affordable approved refuel station reachable — falling back to furthest-possible target`);
+        nearest = unaffordableTarget;
+        unaffordableTarget = null;
+      } else {
+        ctx.log("error", "No approved refuel station reachable");
         return false;
       }
-    } catch {}
-  }
+    }
 
-  ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
+    // A blacklist bypass is a last-resort escape from a blacklisted pocket: keep
+    // it bypassed for the route too, otherwise findRoute() returns null and the
+    // bot jumps blind or gets "stuck" again.
+    const routeBlacklist = nearest.blacklistBypassed ? [] : (opts?.skipBlacklist ? [] : getSystemBlacklist());
 
-  if (nearest.systemId !== bot.system) {
-    await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
-    if (route && route.length > 1) {
-      for (let i = 1; i < route.length; i++) {
-        if (bot.state !== "running") return false;
-        await bot.refreshLocation();
-        const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-        if (preFuel < 10) {
-          ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
+    ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)${nearest.blacklistBypassed ? " [blacklist bypassed]" : ""}`);
+
+    if (nearest.systemId.toLowerCase() !== bot.system.toLowerCase()) {
+      await ensureUndocked(ctx);
+      // Prefer the server-validated route (matches what return_home used: 10 jumps,
+      // 166 fuel available >= 50 needed). Fall back to the local map route.
+      let route: string[] | null = null;
+      if (nearest.serverRoute && nearest.serverRoute.length > 1) {
+        route = nearest.serverRoute.map(s => s.system_id);
+      } else {
+        route = mapStore.findRoute(bot.system, nearest.systemId, routeBlacklist);
+      }
+      // SANITY CHECK: findReachableFuelStation already told us how far the station
+      // is (BFS hops over the same map). If the planned route is wildly longer,
+      // the route is bogus (stale precalc entry / wormhole detour) and following
+      // it on low fuel strands the bot half a map away. Never fly it.
+      if (route && route.length - 1 > nearest.hops + 2) {
+        ctx.log("error", `Planned route to ${nearest.systemId} is ${route.length - 1} jumps but the station is only ${nearest.hops} away — rejecting bogus route`);
+        route = mapStore.findRouteWithMode(bot.system, nearest.systemId, routeBlacklist, false);
+        if (route && route.length - 1 > nearest.hops + 2) {
+          ctx.log("error", `Fallback route is still ${route.length - 1} jumps — refusing to burn fuel on it`);
           return await emergencyFuelRecovery(ctx);
         }
-        ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
-        const jumpResp = await bot.exec("jump", { target_system: route[i] });
+        ctx.log("travel", `Using direct ${route ? route.length - 1 : 0}-jump route instead`);
+      }
+      if (route && route.length > 1) {
+        for (let i = 1; i < route.length; i++) {
+          if (bot.state !== "running") return false;
+          await bot.refreshLocation();
+          const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (preFuel < 10) {
+            ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
+            return await emergencyFuelRecovery(ctx);
+          }
+          ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
+          const jumpResp = await bot.exec("jump", { target_system: route[i] });
+          if (jumpResp.error) {
+            ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+            return await emergencyFuelRecovery(ctx);
+          }
+        }
+      } else {
+        ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
+        const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
           return await emergencyFuelRecovery(ctx);
         }
       }
+    }
+
+    await bot.refreshLocation();
+    await ensureUndocked(ctx);
+    ctx.log("travel", `Traveling to ${nearest.poiName}...`);
+    const tResp = await bot.exec("travel", { target_poi: nearest.poiId });
+    if (tResp.error && !tResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to station failed: ${tResp.error.message}`);
+      return await emergencyFuelRecovery(ctx);
+    }
+    bot.poi = nearest.poiId;
+
+    const dResp = await bot.exec("dock");
+    if (!dResp.error || dResp.error.message.includes("already")) {
+      bot.docked = true;
+      await collectFromStorage(ctx);
+      await ensureInsured(ctx);
     } else {
-      ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
-      const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
-      if (jumpResp.error) {
-        ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        return await emergencyFuelRecovery(ctx);
+      // A station that explicitly denied us must never be retried — remember it.
+      if (/access denied/i.test(dResp.error?.message || "")) {
+        ctx.log("error", `Dock denied at ${nearest.poiName} — will not retry this station`);
+        markStationDenied(nearest.poiId);
+        rejected.add(nearest.poiId.toLowerCase());
+      } else {
+        ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
       }
+      await ensureUndocked(ctx);
+      nearest = null;
+      continue;
     }
-  }
 
-  await bot.refreshLocation();
-  await ensureUndocked(ctx);
-  ctx.log("travel", `Traveling to ${nearest.poiName}...`);
-  const tResp = await bot.exec("travel", { target_poi: nearest.poiId });
-  if (tResp.error && !tResp.error.message.includes("already")) {
-    ctx.log("error", `Travel to station failed: ${tResp.error.message}`);
-    return await emergencyFuelRecovery(ctx);
-  }
-  bot.poi = nearest.poiId;
+    await tryRefuel(ctx, { skipApprovedCheck: opts?.skipApprovedCheck });
+    await bot.refreshShip();
+    let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
 
-  const dResp = await bot.exec("dock");
-  if (!dResp.error || dResp.error.message.includes("already")) {
-    bot.docked = true;
-    await collectFromStorage(ctx);
-    await ensureInsured(ctx);
-  } else {
-    ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
-    return await emergencyFuelRecovery(ctx);
-  }
+    if (newFuel >= thresholdPct) return true;
 
-  await tryRefuel(ctx, { skipApprovedCheck: opts?.skipBlacklist });
-  await bot.refreshShip();
-  let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
+    // Below threshold — if the station itself is empty, don't loop on it: remember
+    // it for this search and try the next reachable station instead.
+    let stationEmpty = false;
+    if (nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
+      try {
+        const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
+        const f = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+        if (f !== null && f !== undefined && f <= 0) stationEmpty = true;
+      } catch {}
+    }
 
-  if (newFuel < thresholdPct) {
-    ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
-    for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
-      await sleep(REFUEL_WAIT_INTERVAL);
-      await bot.refreshShip();
-      const refuelResp = await bot.exec("refuel");
-      if (refuelResp.error) {
-        const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
-          ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
-          return false;
+    if (stationEmpty) {
+      ctx.log("error", `Station ${nearest.poiName} reports 0 fuel after arrival — moving to another station`);
+      rejected.add(nearest.poiId.toLowerCase());
+      await ensureUndocked(ctx);
+      nearest = null;
+      continue;
+    }
+
+    if (newFuel < thresholdPct) {
+      ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
+      for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
+        await sleep(REFUEL_WAIT_INTERVAL);
+        await bot.refreshShip();
+        const refuelResp = await bot.exec("refuel");
+        if (refuelResp.error) {
+          const msg = refuelResp.error.message.toLowerCase();
+          if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
+            ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
+            break;
+          }
         }
+        await bot.refreshShip();
+        newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuel >= thresholdPct) {
+          ctx.log("system", `Fuel recovered to ${newFuel}% — resuming`);
+          break;
+        }
+        ctx.log("system", `Still waiting for fuel (${newFuel}%)... (${w + 1}/${REFUEL_WAIT_RETRIES})`);
       }
-      await bot.refreshShip();
-      newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (newFuel >= thresholdPct) {
-        ctx.log("system", `Fuel recovered to ${newFuel}% — resuming`);
-        break;
-      }
-      ctx.log("system", `Still waiting for fuel (${newFuel}%)... (${w + 1}/${REFUEL_WAIT_RETRIES})`);
     }
+
+    await bot.refreshShip();
+    newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("system", "Undocking...");
+    await bot.exec("undock");
+    bot.docked = false;
+    // Preserve prior behaviour: report success if we at least have some fuel,
+    // otherwise signal the caller we're still short so it can re-plan.
+    return newFuel >= 10;
   }
 
-  await bot.refreshShip();
-  newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  ctx.log("system", "Undocking...");
-  await bot.exec("undock");
-  bot.docked = false;
-  return newFuel >= 10;
+  await ensureUndocked(ctx);
+  return false;
 }
 
 // ── Cargo deposit ──────────────────────────────────────────
@@ -1650,6 +2770,24 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 
 // ── Navigation ───────────────────────────────────────────────
 
+/**
+ * Explicitly pause the routine until the bot's socket is reconnected. The
+ * dispatch layer (bot.ts libExec) already survives a dropped socket by blocking
+ * and resending, but calling this at the top of a travel loop makes the routine
+ * *visibly* aware it can't act while disconnected, and avoids burning jump
+ * retries/route re-queries against a dead socket. Fast no-op when already
+ * connected. Returns true if connected (or reconnected), false if the routine
+ * should give up (stopped or the connection is terminal).
+ */
+export async function waitForReconnect(ctx: RoutineContext): Promise<boolean> {
+  if (ctx.bot.isConnected()) return true;
+  ctx.log("warn", "Socket not connected — waiting for reconnection before issuing commands...");
+  const ok = await ctx.bot.waitForSocket();
+  if (ok) ctx.log("system", "Socket reconnected — resuming routine.");
+  else ctx.log("error", "Socket could not be restored — ending routine.");
+  return ok;
+}
+
 /** Route segment from find_route API response */
 export interface RouteSegment {
   system_id: string;
@@ -1669,19 +2807,32 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
+  // A cloaked ship cannot be ambushed, so (by default) it may ignore both
+  // pirates and blacklisted systems while cloaked. Both behaviors are
+  // toggleable: a routine can pass either option as `false` to disable.
+  const ignorePiratesWhenCloaked = opts.ignorePiratesWhenCloaked !== false;
+  const ignoreBlacklistWhenCloaked = opts.ignoreBlacklistWhenCloaked !== false;
   // Fleet hunters BYPASS blacklist — they MUST enter pirate systems.
-  // A cloaked ship also bypasses the blacklist (cloaking alone is enough).
-  const blacklist = (opts.skipBlacklist || bot.isCloaked) ? [] : getSystemBlacklist();
+  // A cloaked ship also bypassses the blacklist (cloaking alone is enough)
+  // unless the routine explicitly opted out via ignoreBlacklistWhenCloaked.
+  const blacklist = (opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked)) ? [] : getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
+    // If the socket dropped (server restart / blip), pause here until it's back
+    // rather than hammering route queries / jumps against a dead connection.
+    // The dispatch layer also blocks per-command, so this is defense-in-depth.
+    if (!bot.isConnected()) {
+      const reconnected = await waitForReconnect(ctx);
+      if (!reconnected) return false;
+    }
     await bot.refreshLocation();
     // Case-insensitive comparison for system names (handle underscore vs space)
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
@@ -1723,9 +2874,9 @@ export async function navigateToSystem(
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
-        
-        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
-        
+
+        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
+
         if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
         } else if (blacklistedOnRoute && bypassBlacklist) {
@@ -1789,8 +2940,8 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-     const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || bot.isCloaked });
-     if (!fueled) {
+      const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+      if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }
@@ -1832,8 +2983,8 @@ export async function navigateToSystem(
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         const hasWormhole = routeHasWormhole(routeData.route);
-        
-        const bypassBlacklist = bot.isCloaked || !!opts.skipBlacklist;
+
+        const bypassBlacklist = (ignoreBlacklistWhenCloaked && bot.isCloaked) || !!opts.skipBlacklist;
         
         if (blacklistedOnRoute && !bypassBlacklist) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
@@ -1882,9 +3033,20 @@ export async function navigateToSystem(
     let inBattleDuringJump = false;
     while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
       retries++;
-      // Call onBeforeJump callback before jumping
+      // Call onBeforeJump callback before jumping (pre-jump setup that is
+      // allowed to be far in advance of the jump, e.g. re-cloaking).
       if (opts.onBeforeJump) {
         await opts.onBeforeJump(nextSystem, attempt + 1);
+      }
+      // `onPreJump` runs *immediately* before the jump. For library-backed bots
+      // that queue commands, the hook fires the time-sensitive mutation (e.g.
+      // afterburner fuel, a ~3-tick speed buff) WITHOUT awaiting, and we then
+      // issue `jump` straight away so BOTH mutations queue in the SAME server
+      // tick. That makes the buff active when the jump resolves; awaiting
+      // `use_item` first would push it a tick ahead and the buff would lapse
+      // before the jump acts (unboosted transit).
+      if (opts.onPreJump) {
+        opts.onPreJump(nextSystem, attempt + 1);
       }
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
@@ -2011,7 +3173,8 @@ export async function navigateToSystem(
         errorMsg.includes("you are already in") || // Already at destination - treat as success
         errorMsg.includes("mid-jump") || // Already in a jump - wait for it to complete
         errorMsg.includes("mid-travel") || // Already traveling - wait for it to complete
-        errorMsg.includes("already in transit"); // Generic in-transit error
+        errorMsg.includes("already in transit") || // Generic in-transit error
+        isConnectionError(errorMsg); // Socket dropped (server restart / blip) - wait + retry, never permanent-fail
 
       if (!isTransient) {
         // Permanent error - don't retry
@@ -2114,9 +3277,11 @@ export async function navigateToSystem(
       return false; // Aborted navigation due to battle
     }
 
-    // Check for pirates in the new system and flee if detected
-    // Hunters (skipBlacklist) intentionally enter pirate systems — do NOT flee
-    if (!opts.skipBlacklist) {
+    // Check for pirates in the new system and flee if detected.
+    // Cloaked ships cannot be ambushed, so (by default) a cloaked bot with
+    // ignorePiratesWhenCloaked ignores pirates. Hunters (skipBlacklist)
+    // intentionally enter pirate systems — do NOT flee.
+    if (!opts.skipBlacklist && !(ignorePiratesWhenCloaked && bot.isCloaked)) {
       const nearbyResp = await bot.exec("get_nearby");
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         bot.trackWildlife(nearbyResp.result);
@@ -2355,6 +3520,15 @@ export function parseWrecks(result: unknown): Wreck[] {
  * Prioritizes fuel cells, then loots everything if cargo space allows.
  * Returns number of items looted.
  */
+function shuffleArray<T>(arr: T[]): T[] {
+  const shuffled = [...arr];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
 export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: boolean }): Promise<number> {
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
@@ -2378,7 +3552,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   let totalLooted = 0;
   const lootedItems: string[] = [];
 
-  for (const wreck of wrecks) {
+  for (const wreck of shuffleArray(wrecks)) {
     if (bot.state !== "running") break;
 
     // Check cargo space
@@ -2401,7 +3575,8 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       if (candidates.length === 0) continue;
     }
 
-    // Sort: fuel cells first, then everything else
+    // Randomize item order to reduce cross-bot collisions, then sort: fuel cells first, then everything else
+    candidates = shuffleArray(candidates);
     candidates.sort((a, b) => {
       const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
       const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
@@ -2498,7 +3673,7 @@ export async function fullSalvageWrecks(
   const lootedItems: string[] = [];
   const towedWrecks: { wreck_id: string; name: string; salvage_value: number }[] = [];
 
-  for (const wreck of wrecks) {
+  for (const wreck of shuffleArray(wrecks)) {
     if (bot.state !== "running") break;
 
     await bot.refreshCargo();
@@ -2524,6 +3699,7 @@ export async function fullSalvageWrecks(
         );
       }
 
+      candidates = shuffleArray(candidates);
       candidates.sort((a, b) => {
         const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
         const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
@@ -3043,7 +4219,10 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
   const sys = mapStore.getSystem(bot.system);
   if (!sys || !isDangerousSystem(sys.security_level)) return false;
 
-  const resp = await bot.exec("cloak");
+  // IMPORTANT: always pass { enable: true }. A bare `cloak` command turns the
+  // cloak OFF (it cannot turn it on), so calling it here would kill an active
+  // cloak whenever bot.isCloaked is stale. enable=true is the only way on.
+  const resp = await bot.exec("cloak", { enable: true });
   if (!resp.error) {
     bot.isCloaked = true;
     ctx.log("system", `Cloaked in ${bot.system} (${sys.security_level})`);
@@ -3071,12 +4250,16 @@ export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boo
     const resp = await bot.exec("cloak", { enable: true });
     if (!resp.error) {
       bot.isCloaked = true;
+      // Cloaking always undocks the ship — clear the stale docked flag so
+      // downstream ensureDocked() actually re-docks (e.g. before analyze_market).
+      bot.docked = false;
       ctx.log("system", `Cloaking enabled in ${bot.system}`);
       return true;
     }
     const msg = String(resp.error.message || "").toLowerCase();
     if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
       bot.isCloaked = true;
+      bot.docked = false;
       return true;
     }
     ctx.log("warn", `Could not enable cloaking: ${resp.error.message}`);
@@ -3192,7 +4375,7 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
     return;
   }
   ctx.log("insurance", "Buying insurance for 7 days...");
-  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
+  const insureResp = await bot.exec("buy_insurance", { ticks: 60480 });
   if (!insureResp.error && insureResp.result) {
     const r = insureResp.result as Record<string, unknown>;
     const msg = (r?.message as string) || `Insurance purchased for 7 days`;
@@ -3328,6 +4511,12 @@ export function writeSettings(updates: Record<string, Record<string, unknown>>):
   }
 
   writeFileSync(file, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+}
+
+export function isCombatDebugEnabled(): boolean {
+  const all = readSettings();
+  const h = (all.hunter || {}) as Record<string, unknown>;
+  return (h.combatDebug as boolean) ?? false;
 }
 
 // ── Utilities ────────────────────────────────────────────────
@@ -3889,8 +5078,18 @@ export function parseNearbyEntities(result: unknown): NearbyEntitiesResult {
  */
 export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
   const { bot } = ctx;
-  
-  // Always check API first to get fresh data
+
+  // Library-backed bots receive battle state as push events (Bot.subscribeEvents:
+  // battle_update / battle_started / battle_ended / battle_damage / battle_alert).
+  // When those indicate we are NOT in a battle, polling get_battle_status is
+  // redundant and would only produce a benign "No active battle" error. Skip the
+  // poll and report "not in battle" directly. We still poll whenever push state
+  // says we're in a battle, to get live zone/stance/target data for combat loops.
+  if (bot.account && !bot.isInBattle()) {
+    return null;
+  }
+
+  // Otherwise check API for fresh data
   const resp = await bot.exec("get_battle_status");
   if (resp.error || !resp.result) {
     // On 502/524 errors, return null but don't log - rely on WebSocket state
@@ -3899,8 +5098,11 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
 
   const result = resp.result as Record<string, unknown>;
   if (result.error && (result.error as Record<string, unknown>).code === "not_in_battle") {
+    combatDebugLog(bot.username, "battle:get_status_not_in_battle", result);
     return null;
   }
+
+  combatDebugLog(bot.username, "battle:get_status", result);
 
   // Parse battle status
   const status: BattleStatus = {
@@ -4016,6 +5218,10 @@ export async function handleBattleNotifications(
 
   if (battleNotifications.length === 0) {
     return false;
+  }
+
+  if (isCombatDebugEnabled()) {
+    combatDebugLog(ctx.bot.username, "battle:notifications", notifications);
   }
 
   ctx.log("combat", `Processing ${battleNotifications.length} battle notification(s)...`);
@@ -4136,9 +5342,19 @@ export async function checkAndFleeFromBattle(
   ctx: RoutineContext,
   logPrefix?: string,
 ): Promise<boolean> {
-  // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call)
+  // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call, and
+  // works even when HTTP requests are hanging). This flag is now driven
+  // authoritatively by spacemolt-lib push events: battle_update / battle_damage
+  // set it, and battle_ended / battle_left immediately clear it (see
+  // Bot.handleNotifications), so it no longer lingers as a stale "still in
+  // battle" lock after the fight is actually over.
   if (ctx.bot.isInBattle()) {
     const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    const status = await getBattleStatus(ctx);
+    if (!status || !status.is_participant) {
+      ctx.bot.clearBattleState("stale-websocket-fallback");
+      return false;
+    }
     ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
     await fleeFromBattle(ctx, true, 35000);
     return true;
@@ -4535,6 +5751,13 @@ export async function checkCustomsInspection(
   chatMessages: string[];
 }> {
   const { bot } = ctx;
+
+  // If customs stopping/lockouts are globally disabled (Settings → General),
+  // skip the inspection entirely so bots never get stopped or locked out.
+  if (isCustomsDisabled()) {
+    ctx.log("customs", "Customs stopping disabled in settings - skipping inspection");
+    return { wasStopped: false, outcome: "none", chatMessages: [] };
+  }
 
   // Use targetSystem if provided, otherwise fall back to bot.system
   const systemToCheck = targetSystem || bot.system;

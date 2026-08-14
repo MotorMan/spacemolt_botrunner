@@ -1,8 +1,7 @@
 import { complete } from "@mariozechner/pi-ai";
 import type { Model, Context, AssistantMessage, ToolCall, Message, TextContent } from "@mariozechner/pi-ai";
-import type { SpaceMoltAPI } from "./api.js";
-import type { SessionManager } from "./session.js";
-import { executeTool } from "./tools.js";
+import type { Account } from "@spacemolt/lib";
+import { executeTool, type CliStore } from "./tools.js";
 import { log, logAgent, logDebug, logError, logLLMInput, logLLMOutput, logLLMPayload, logToolResultDebug, isDebug } from "./ui.js";
 
 const MAX_TOOL_ROUNDS = 30;
@@ -32,8 +31,8 @@ export interface CompactionState {
 export async function runAgentTurn(
   model: Model<any>,
   context: Context,
-  api: SpaceMoltAPI,
-  session: SessionManager,
+  account: Account,
+  store: CliStore,
   options?: LoopOptions,
   compaction?: CompactionState,
 ): Promise<void> {
@@ -103,7 +102,7 @@ export async function runAgentTurn(
 
       const callReason = !showedReason ? reason : undefined;
       showedReason = true;
-      const result = await executeTool(toolCall.name, toolCall.arguments, api, session, callReason);
+      const result = await executeTool(toolCall.name, toolCall.arguments, account, store, callReason);
       const isError = result.startsWith("Error");
 
       logToolResultDebug(toolCall.name, toolCall.id, result, isError);

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 RESTART_DELAY=30
+MANUAL_RESTART_DELAY=5
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "========================================"
@@ -13,13 +14,15 @@ echo "SpaceMolt BotRunner Watchdog"
 echo "========================================"
 echo "" 
 echo "Configuration:"
-echo "  - Restart delay: $RESTART_DELAY seconds"
+echo "  - Restart delay: $RESTART_DELAY seconds (mass disconnect)"
+echo "  - Manual restart delay: $MANUAL_RESTART_DELAY seconds (user-initiated)"
 echo "  - Working directory: $SCRIPT_DIR"
 echo "  - Git pull on start: enabled"
 echo ""
 echo "Exit codes:"
 echo "  - 0: Normal shutdown (no restart)"
 echo "  - 100: Restart requested (mass disconnect detected)"
+echo "  - 101: Restart requested (user-initiated, e.g. to apply updates)"
 echo "  - Other: Unexpected exit (no restart)"
 echo ""
 echo "Press Ctrl+C to stop the watchdog."
@@ -32,8 +35,11 @@ while true; do
 
     set +e
     cd "$SCRIPT_DIR"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running bun install..."
+    bun install || echo "Warning: bun install failed"
+    echo ""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running git pull..."
-    timeout 30 git pull || echo "Warning: git pull failed, timed out, or not a git repository"
+    git pull || echo "Warning: git pull failed or not a git repository"
     echo ""
     bun run src/botmanager.ts
     EXIT_CODE=$?
@@ -49,10 +55,19 @@ while true; do
         break
     elif [ "$EXIT_CODE" -eq 100 ]; then
         echo ""
-        echo "=== Restart requested ==="
+        echo "=== Restart requested (mass disconnect) ==="
         echo ""
         echo "Waiting $RESTART_DELAY seconds before restart..."
         sleep "$RESTART_DELAY"
+        echo ""
+        echo "=== Restarting BotRunner ==="
+        echo ""
+    elif [ "$EXIT_CODE" -eq 101 ]; then
+        echo ""
+        echo "=== Restart requested (user-initiated) ==="
+        echo ""
+        echo "Waiting $MANUAL_RESTART_DELAY seconds before restart..."
+        sleep "$MANUAL_RESTART_DELAY"
         echo ""
         echo "=== Restarting BotRunner ==="
         echo ""

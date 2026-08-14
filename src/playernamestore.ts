@@ -2,9 +2,17 @@ import { debugLogForBot } from "./debug.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { onPlayerNameUpdate } from "./client_sync_hooks.js";
+import { perf } from "./perf.js";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
+
+/**
+ * How often dirty player data is written to disk. Both files used to be
+ * rewritten on every single entity update; on a busy fleet that is thousands of
+ * full-file rewrites an hour for data nothing reads in real time.
+ */
+const PERSIST_INTERVAL_MS = 120_000;
 
 /**
  * Ship history entry for tracking previously seen ships.
@@ -62,6 +70,10 @@ export class PlayerNameStore {
   private empireNpcNormalizedMap = new Map<string, string>(); // normalized -> original (empire NPCs)
   private _botName: string | null = null;
   private _initialized = false;
+  /** Pending (unwritten) changes, flushed by the 2-minute timer / on shutdown. */
+  private _fullInfoDirty = false;
+  private _namesDirty = false;
+  private _persistTimer: ReturnType<typeof setInterval> | null = null;
 
   // Full detail tracking
   private fullPlayerInfo: FullPlayerInfoData = {
@@ -79,6 +91,26 @@ export class PlayerNameStore {
   constructor() {
     // Load will be called synchronously on first use if not already loaded
     this.loadFullPlayerInfo();
+    this.startAutoPersist();
+  }
+
+  private startAutoPersist(): void {
+    if (this._persistTimer) return;
+    this._persistTimer = setInterval(() => this.flush(), PERSIST_INTERVAL_MS);
+    // Housekeeping must never keep the process alive.
+    (this._persistTimer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  /** Stop the persist timer (tests / shutdown). */
+  stopAutoPersist(): void {
+    if (this._persistTimer) clearInterval(this._persistTimer);
+    this._persistTimer = null;
+  }
+
+  /** Write whatever changed since the last flush. Safe to call any time. */
+  flush(): void {
+    if (this._fullInfoDirty) this.writeFullPlayerInfo();
+    if (this._namesDirty) this.writeNames();
   }
 
   /** Load full player info from disk (lazy, called on first access) */
@@ -86,7 +118,7 @@ export class PlayerNameStore {
     try {
       if (!existsSync(FULL_PLAYER_INFO_FILE)) {
         debugLogForBot(this._botName || "unknown", "fullplayerinfo:load", `${this._botName || "unknown"}`, "No full player info file, starting fresh");
-        this.saveFullPlayerInfo();
+        this.writeFullPlayerInfo();
         return;
       }
       const text = readFileSync(FULL_PLAYER_INFO_FILE, "utf-8");
@@ -121,19 +153,28 @@ export class PlayerNameStore {
         lastUpdated: new Date().toISOString(),
         counts: { players: 0, pirates: 0, empire_npcs: 0 },
       };
-      this.saveFullPlayerInfo();
+      this.writeFullPlayerInfo();
     }
   }
 
-  /** Save full player info to disk */
+  /** Mark the full player info as changed; the 2-minute timer persists it. */
   private saveFullPlayerInfo(): void {
-    try {
-      this.fullPlayerInfo.lastUpdated = new Date().toISOString();
-      writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo, null, 2), "utf-8");
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[PlayerNameStore] Save full player info failed: ${msg}`);
-    }
+    this._fullInfoDirty = true;
+  }
+
+  /** Actually write fullPlayerInfo.json. */
+  private writeFullPlayerInfo(): void {
+    perf.timeSync("playernamestore.saveFullPlayerInfo", () => {
+      try {
+        this._fullInfoDirty = false;
+        this.fullPlayerInfo.lastUpdated = new Date().toISOString();
+        writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo), "utf-8");
+      } catch (err) {
+        this._fullInfoDirty = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[PlayerNameStore] Save full player info failed: ${msg}`);
+      }
+    });
   }
 
   /** Ensure data is loaded from disk (called lazily on first use) */
@@ -695,25 +736,34 @@ export class PlayerNameStore {
   }
 
   /**
-   * Save player names, pirates, and empire NPCs to disk.
+   * Mark player names / pirates / empire NPCs as changed. The 2-minute timer
+   * (or `flush()`) writes playerNames.json.
    */
   private save(): void {
-    try {
-      const data = {
-        names: this.getAll(),
-        pirates: this.getAllPirates(),
-        empire_npcs: this.getAllEmpireNpcs(),
-        lastUpdated: new Date().toISOString(),
-        count: this.names.size,
-        pirate_count: this.pirates.size,
-        empire_npc_count: this.empireNpcs.size,
-      };
-      writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data, null, 2), "utf-8");
-      // debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[PlayerNameStore] Save failed: ${msg}`);
-    }
+    this._namesDirty = true;
+  }
+
+  /** Actually write playerNames.json. */
+  private writeNames(): void {
+    perf.timeSync("playernamestore.save", () => {
+      try {
+        this._namesDirty = false;
+        const data = {
+          names: this.getAll(),
+          pirates: this.getAllPirates(),
+          empire_npcs: this.getAllEmpireNpcs(),
+          lastUpdated: new Date().toISOString(),
+          count: this.names.size,
+          pirate_count: this.pirates.size,
+          empire_npc_count: this.empireNpcs.size,
+        };
+        writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data), "utf-8");
+      } catch (err) {
+        this._namesDirty = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[PlayerNameStore] Save failed: ${msg}`);
+      }
+    });
   }
 
   /**
@@ -735,8 +785,18 @@ export class PlayerNameStore {
     };
     this.save();
     this.saveFullPlayerInfo();
+    this.flush();
   }
 }
 
 /** Singleton instance for global access */
 export const playerNameStore = new PlayerNameStore();
+
+// Safety net for exits that bypassed the graceful shutdown path.
+process.on("exit", () => {
+  try {
+    playerNameStore.flush();
+  } catch {
+    // nothing useful to do while exiting
+  }
+});

@@ -1,0 +1,1518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ORBITAL_NET — Station Monitors</title>
+<link rel="stylesheet" href="/station.css" />
+</head>
+<body>
+<div class="atmos-bg"></div>
+<div class="grid-overlay"></div>
+
+<!-- Top bar -->
+<nav class="topbar">
+  <a class="brand" href="/" title="Back to monitors">ORBITAL_NET_v4.0</a>
+  <div class="topbar-right">
+    <div class="counter-chip"><span class="pip pip-ok"></span><span id="cnt-ok">0 OK</span></div>
+    <div class="counter-chip"><span class="pip pip-alert"></span><span id="cnt-alert">0 ALERT</span></div>
+    <div class="counter-chip"><span class="pip pip-nodata"></span><span id="cnt-nodata">0 NO-DATA</span></div>
+    <button class="ghost-btn" id="refresh-btn" style="width:auto;padding:6px 14px;">REFRESH</button>
+    <button class="ghost-btn" id="rearrange-btn" style="width:auto;padding:6px 14px;">REARRANGE</button>
+    <button class="ghost-btn" id="settings-btn" style="width:auto;padding:6px 14px;">SETTINGS</button>
+  </div>
+</nav>
+
+<!-- Main workspace (grid mode) -->
+<main class="workspace scanline" id="workspace">
+  <div class="scanline-bar"></div>
+  <div id="grid-view">
+    <header class="workspace-head">
+      <div>
+        <h1 class="page-title">STATION MONITORS</h1>
+        <p class="page-sub">Live telemetry for active orbital assets.</p>
+      </div>
+      <div id="faction-counters" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+    </header>
+    <div class="grid" id="station-grid"></div>
+  </div>
+
+  <div id="detail-view" style="display:none;">
+    <div class="detail-wrap">
+      <a class="back-link" href="/">← BACK TO MONITORS</a>
+      <h1 class="page-title" id="detail-name" style="margin:16px 0;">STATION</h1>
+      <div id="detail-body">Loading…</div>
+    </div>
+  </div>
+</main>
+
+<!-- Settings drawer -->
+<div class="overlay" id="settings-overlay">
+  <div class="drawer">
+    <div class="drawer-head">
+      <span>STATION CONFIG</span>
+      <button class="primary-btn" id="settings-save-top" style="padding:6px 14px;">SAVE</button>
+      <button class="close-x" id="settings-close">×</button>
+    </div>
+    <div class="drawer-body">
+      <div class="field">
+        <label>Poll Interval (sec, min 15)</label>
+        <input class="term-input" type="number" id="poll-interval" min="15" value="60" />
+      </div>
+      <div class="field">
+        <label>Cards per row — <span id="card-size-val">5</span></label>
+        <input type="range" id="card-size" min="1" max="16" step="1" value="5" style="width:100%;accent-color:var(--primary-fixed-dim);" />
+        <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">
+          <span>1</span><span>16</span>
+        </div>
+      </div>
+      <div class="field">
+        <label>Frame Rate Cap (GPU)</label>
+        <select class="term-input" id="fps-cap">
+          <option value="0">Uncapped (smooth)</option>
+          <option value="60">60 FPS</option>
+          <option value="30">30 FPS</option>
+          <option value="15">15 FPS (low GPU)</option>
+          <option value="-1">Off (static, minimal GPU)</option>
+        </select>
+        <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Caps the decorative animations and background blur to reduce GPU usage.</div>
+      </div>
+      <div id="rows-editor" style="display:flex;flex-direction:column;gap:12px;"></div>
+      <button class="small-btn" id="add-row">+ ADD ROW</button>
+    </div>
+    <div class="drawer-foot">
+      <button class="small-btn danger" id="settings-cancel">CANCEL</button>
+      <button class="primary-btn" id="settings-save">SAVE</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const isDetail = location.pathname.startsWith("/station/");
+  const detailId = isDetail ? decodeURIComponent(location.pathname.slice("/station/".length)) : null;
+
+  // ── state ──
+  let config = { version: 1, pollIntervalSec: 60, cardCols: 5, rows: [], fpsCap: 0 };
+  let views = new Map();   // id -> StationView
+  let order = [];          // ids in display order
+  let bots = [];           // discovered bot names
+  let rearrangeMode = false;
+
+  // ── helpers ──
+  function num(v, fb) { fb = fb || 0; return (typeof v === "number" && isFinite(v)) ? v : fb; }
+  function kfmt(n) {
+    n = num(n);
+    if (n >= 1000) {
+      const k = n / 1000;
+      return (k >= 10 ? Math.round(k) : Math.round(k * 10) / 10) + "k";
+    }
+    return String(Math.round(n));
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+  function segClass(r) { return r > 0.5 ? "on-g" : (r >= 0.1 ? "on-a" : "on-r"); }
+
+  function bar(label, value, max) {
+    if (!max || max <= 0) {
+      return `<div class="bar-row"><div class="bar-label"><span>${label}</span><span class="bar-value">—</span></div></div>`;
+    }
+    const ratio = Math.max(0, Math.min(1, value / max));
+    const filled = Math.max(0, Math.min(10, Math.round(ratio * 10)));
+    let segs = "";
+    for (let i = 0; i < 10; i++) {
+      const on = i < filled;
+      segs += `<div class="${on ? "bar-seg " + segClass(ratio) : "bar-seg"}"></div>`;
+    }
+    return `<div class="bar-row">
+      <div class="bar-label"><span>${label}</span><span class="bar-value">${kfmt(value)}/${kfmt(max)}</span></div>
+      <div class="bar-track">${segs}</div>
+    </div>`;
+  }
+
+  function cell(k, v, vclass, sub) {
+    return `<div class="data-cell"><div class="k">${k}</div><div class="v ${vclass || ""}">${v}</div>${sub ? `<div class="k">${sub}</div>` : ""}</div>`;
+  }
+
+  function computeAlert(v) {
+    const c = v.condition || {};
+    if (num(c.satisfaction_pct) < 100) return true;
+    const p = v.power || {};
+    const supply = num(p.supply);
+    if (supply > 0 && num(p.current_draw) / supply >= 1) return true;
+    const b = v.base || {};
+    if (num(b.hull) < num(b.max_hull)) return true;
+    if (num(b.max_fuel) > 0 && num(b.fuel) < num(b.max_fuel) * 0.1) return true;
+    if (b.wrecked === true) return true;
+    // Nothing is making fuel for this station — flag it before the tanks run dry.
+    // "unknown" (queue unreadable) never alerts, so a hiccup can't red-flag every card.
+    if (fuelInfo(v).state === "none") return true;
+    return false;
+  }
+
+  // ── fuel production indicator ──
+  // Keyed off the produced item (`fuel_reserve`), not a recipe id: that item
+  // only ever feeds the station's fuel supply, so any present or future fuel
+  // recipe is picked up automatically.
+  function fuelInfo(v) {
+    const f = v.fuelCraft;
+    if (!f || !f.state || f.state === "unknown") {
+      return { state: "unknown", label: "FUEL ?", cls: "fuel-unknown", title: "Fuel production unknown — craft queue could not be read" };
+    }
+    const active = num(f.activeJobs), queued = num(f.queuedJobs);
+    const jobs = active + queued;
+    const detail = `${f.recipe || "fuel"} · ${active} active / ${queued} queued · ${kfmt(num(f.unitsRemaining))} fuel pending`;
+    if (f.state === "active") {
+      return { state: "active", label: "FUEL CRAFTING" + (jobs > 1 ? " x" + jobs : ""), cls: "fuel-ok", title: detail };
+    }
+    if (f.state === "queued") {
+      return { state: "queued", label: "FUEL QUEUED" + (jobs > 1 ? " x" + jobs : ""), cls: "fuel-warn", title: detail + " (nothing running yet)" };
+    }
+    return { state: "none", label: "NO FUEL CRAFT", cls: "fuel-bad", title: "No craft job producing fuel_reserve at this station" };
+  }
+
+  function classify(v) {
+    if (v.state === "NO_BOT" || v.state === "UNCONFIGURED") return "nodata";
+    if (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE") return "alert";
+    return computeAlert(v) ? "alert" : "ok";
+  }
+
+  function ageText(fetchedAt) {
+    if (!fetchedAt) return "never";
+    const s = Math.max(0, Math.round((Date.now() - fetchedAt) / 1000));
+    if (s < 60) return s + "s ago";
+    if (s < 3600) return Math.round(s / 60) + "m ago";
+    return Math.round(s / 3600) + "h ago";
+  }
+
+  // ── card render ──
+  function cardHTML(v) {
+    const base = v.base || {};
+    const cond = v.condition || {};
+    const ls = v.lifeSupport || {};
+    const p = v.power || {};
+
+    const name = v.label || v.stationName || v.stationId || v.bot || "UNNAMED";
+    const condText = (cond.condition ? String(cond.condition).toUpperCase() : "") || v.state;
+    let badgeCls = "badge-ok";
+    if (v.state !== "OK" || computeAlert(v)) {
+      badgeCls = (condText === "CRITICAL" || v.state === "MISMATCH" || v.state === "UNDOCKED" || v.state === "STALE" || v.state === "NO_BOT") ? "badge-crit" : "badge-warn";
+    }
+
+    const maxFuel = num(base.max_fuel);
+    const maxHull = num(base.max_hull);
+    const maxShield = num(base.max_shield);
+
+    let bars = "";
+    bars += bar("FUEL", num(base.fuel), maxFuel);
+    bars += bar("HULL", num(base.hull), maxHull);
+    if (maxShield > 0) bars += bar("SHIELD", num(base.shield), maxShield);
+
+    // power cell
+    const supply = num(p.supply);
+    let powerCellHTML;
+    if (supply <= 0) {
+      powerCellHTML = cell("POWER", "—", "neutral");
+    } else {
+      const pct = Math.round(num(p.current_draw) / supply * 100);
+      powerCellHTML = cell("POWER", pct + "%", pct >= 100 ? "bad" : "good", kfmt(p.current_draw) + "/" + kfmt(supply));
+    }
+
+    const wpnDps = num(base.weapon_dps);
+    const wpnHTML = wpnDps > 0 ? cell("WPN_DPS", kfmt(wpnDps), "bad") : cell("WPN_DPS", "—", "neutral");
+
+    const satPct = num(cond.satisfaction_pct);
+    const satHTML = cell("SATISFACTION", satPct + "%", satPct === 100 ? "good" : "bad");
+
+    const lsDemand = num(ls.demand), lsSupply = num(ls.supply);
+    const lsHTML = cell("LIFE_SUPP", lsDemand + "/" + lsSupply, "neutral", "slots");
+
+    const alert = classify(v) === "alert";
+    const dimmed = (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE" || v.state === "NO_BOT");
+    const classes = ["card"];
+    if (alert) classes.push("alert");
+    if (dimmed) classes.push("dimmed");
+    if (rearrangeMode) classes.push("draggable");
+
+    let chip = "";
+    if (v.state !== "OK") {
+      const neutral = v.state === "UNCONFIGURED";
+      const label = v.state === "STALE" ? "STALE " + ageText(v.fetchedAt) : v.state;
+      chip = `<span class="state-chip ${neutral ? "neutral" : ""}">${esc(label)}</span>`;
+    }
+
+    const fee = base.market_fee_bps != null ? (base.market_fee_bps + "bps") : "—";
+    const satFoot = satPct + "%";
+    const fuel = fuelInfo(v);
+
+    const href = v.stationId ? `/station/${encodeURIComponent(v.stationId)}` : "#";
+
+    return `<a class="${classes.join(" ")}" href="${href}" data-id="${esc(v.id)}" ${rearrangeMode ? 'draggable="true"' : ""}>
+      <div class="card-head">
+        <span class="card-name">${esc(name)}</span>
+        <span class="card-badge ${badgeCls}">${esc(condText)}</span>
+      </div>
+      <div class="card-body">
+        ${chip}
+        <div class="bar-row-wrap">${bars}</div>
+        <div class="data-grid">
+          ${cell("ARMOR", num(base.armor) ? kfmt(base.armor) : "—", "neutral")}
+          ${wpnHTML}
+          ${powerCellHTML}
+          ${lsHTML}
+        </div>
+        <div class="card-foot">
+          <div>SAT: <span class="${satPct === 100 ? "" : ""}" style="color:${satPct === 100 ? "var(--secondary-fixed-dim)" : "var(--error)"}">${satFoot}</span></div>
+          <div>FEE: <span style="color:var(--tertiary-fixed-dim)">${fee}</span></div>
+        </div>
+        <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);display:flex;align-items:center;justify-content:space-between;gap:6px;">
+          <span class="fuel-chip ${fuel.cls}" title="${esc(fuel.title)}"><span class="fuel-dot"></span>${esc(fuel.label)}</span>
+          <span class="card-age">${ageText(v.fetchedAt)}</span>
+        </div>
+      </div>
+    </a>`;
+  }
+
+  function renderGrid() {
+    if (isDetail) return;
+    const grid = document.getElementById("station-grid");
+    const ids = order.filter((id) => views.has(id));
+    // include any views not in order (safety)
+    for (const id of views.keys()) if (!ids.includes(id)) ids.push(id);
+
+    if (ids.length === 0) {
+      grid.innerHTML = `<div class="empty-state">No stations configured. Open <b>SETTINGS</b> to add a station row and press <b>DETECT</b> on a docked bot.</div>`;
+    } else {
+      grid.innerHTML = ids.map((id) => cardHTML(views.get(id))).join("");
+    }
+    attachDnD();
+    updateCounters();
+    collectAnimTargets();
+  }
+
+  function updateCounters() {
+    let ok = 0, alert = 0, nodata = 0;
+    const fac = {};
+    for (const v of views.values()) {
+      const c = classify(v);
+      if (c === "ok") ok++; else if (c === "alert") alert++; else nodata++;
+      const f = v.faction || "UNASSIGNED";
+      if (!fac[f]) fac[f] = { ok: 0, alert: 0, nodata: 0 };
+      fac[f][c]++;
+    }
+    document.getElementById("cnt-ok").textContent = ok + " OK";
+    document.getElementById("cnt-alert").textContent = alert + " ALERT";
+    document.getElementById("cnt-nodata").textContent = nodata + " NO-DATA";
+
+    const fc = document.getElementById("faction-counters");
+    fc.innerHTML = Object.keys(fac).map((f) => {
+      const d = fac[f];
+      return `<div class="counter-chip"><span class="pip pip-ok"></span><span style="font-size:11px;">${esc(f)}: ${d.ok} / ${d.alert}</span></div>`;
+    }).join("");
+  }
+
+  // ── data application ──
+  function applyStations(stations) {
+    views = new Map();
+    for (const s of stations) views.set(s.id, s);
+    order = stations.map((s) => s.id);
+    renderGrid();
+  }
+  function applyStation(v) {
+    views.set(v.id, v);
+    if (!order.includes(v.id)) order.push(v.id);
+    renderGrid();
+  }
+  function applyConfig(cfg) {
+    config = cfg;
+    const pi = document.getElementById("poll-interval");
+    if (pi) pi.value = cfg.pollIntervalSec;
+    const cs = document.getElementById("card-size");
+    if (cs) {
+      cs.value = cfg.cardCols;
+      const cv = document.getElementById("card-size-val");
+      if (cv) cv.textContent = cfg.cardCols;
+    }
+    document.documentElement.style.setProperty("--card-cols", cfg.cardCols);
+    const fc = document.getElementById("fps-cap");
+    if (fc) fc.value = String(num(cfg.fpsCap));
+    applyFrameCap(num(cfg.fpsCap));
+    renderSettingsRows();
+  }
+
+  // ── WebSocket ──
+  let ws = null, wsConnectTimer = null, wsInitTimer = null, wsHeartbeat = null, wsSilenceTimer = null, wsManualClose = false;
+  let wsLastMsg = 0;
+
+  function connectWebSocket() {
+    if (wsManualClose) return;
+    clearTimeout(wsConnectTimer);
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    let host = location.host;
+    if (!host) host = (location.hostname || "localhost") + (location.port ? ":" + location.port : "");
+    try {
+      ws = new WebSocket(`${proto}//${host}/ws`);
+    } catch (err) {
+      wsConnectTimer = setTimeout(connectWebSocket, 1000);
+      return;
+    }
+    wsLastMsg = Date.now();
+    clearTimeout(wsInitTimer);
+    wsInitTimer = setTimeout(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) { try { ws && ws.close(); } catch (e) {} }
+    }, 4000);
+    ws.onopen = () => {
+      clearTimeout(wsInitTimer);
+      clearInterval(wsHeartbeat);
+      wsHeartbeat = setInterval(() => { try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" })); } catch (e) {} }, 15000);
+      clearInterval(wsSilenceTimer);
+      wsSilenceTimer = setInterval(() => {
+        if (Date.now() - wsLastMsg > 45000) { try { ws && ws.close(); } catch (e) {} }
+      }, 10000);
+    };
+    ws.onmessage = (ev) => {
+      wsLastMsg = Date.now();
+      let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.type === "init") {
+        if (msg.config) applyConfig(msg.config);
+        if (msg.stations) applyStations(msg.stations);
+      } else if (msg.type === "stations") {
+        if (msg.stations) applyStations(msg.stations);
+      } else if (msg.type === "station") {
+        if (msg.station) applyStation(msg.station);
+      } else if (msg.type === "config") {
+        if (msg.config) applyConfig(msg.config);
+      } else if (msg.type === "pong") {
+        // heartbeat ack
+      }
+    };
+    ws.onclose = () => {
+      clearInterval(wsHeartbeat); clearInterval(wsSilenceTimer);
+      if (!wsManualClose) wsConnectTimer = setTimeout(connectWebSocket, 1500);
+    };
+    ws.onerror = () => { try { ws && ws.close(); } catch (e) {} };
+  }
+
+  // ── REST fallback (initial load if WS slow) ──
+  async function bootstrap() {
+    try {
+      const [cfgR, stR, botsR] = await Promise.all([
+        fetch("/api/config").then((r) => r.json()),
+        fetch("/api/stations").then((r) => r.json()),
+        fetch("/api/bots").then((r) => r.json()),
+      ]);
+      config = cfgR;
+      bots = botsR.bots || [];
+      const pi = document.getElementById("poll-interval");
+      if (pi) pi.value = cfgR.pollIntervalSec;
+      const cs = document.getElementById("card-size");
+      if (cs) {
+        cs.value = cfgR.cardCols;
+        const cv = document.getElementById("card-size-val");
+        if (cv) cv.textContent = cfgR.cardCols;
+      }
+      document.documentElement.style.setProperty("--card-cols", cfgR.cardCols);
+      const fc = document.getElementById("fps-cap");
+      if (fc) fc.value = String(num(cfgR.fpsCap));
+      applyFrameCap(num(cfgR.fpsCap));
+      applyStations(stR.stations || []);
+      renderSettingsRows();
+    } catch (e) { /* WS will fill in */ }
+  }
+
+  // ── refresh ──
+  function doRefresh() {
+    fetch("/api/refresh", { method: "POST" }).catch(() => {});
+  }
+  document.getElementById("refresh-btn").onclick = doRefresh;
+
+  // ── rearrange ──
+  const rearrangeBtn = document.getElementById("rearrange-btn");
+  rearrangeBtn.onclick = () => {
+    rearrangeMode = !rearrangeMode;
+    rearrangeBtn.style.background = rearrangeMode ? "var(--primary-fixed-dim)" : "transparent";
+    rearrangeBtn.style.color = rearrangeMode ? "var(--on-primary-container)" : "var(--primary-fixed-dim)";
+    document.getElementById("workspace").classList.toggle("rearrange", rearrangeMode);
+    if (!rearrangeMode) persistOrder();
+    renderGrid();
+  };
+
+  function persistOrder() {
+    const newRows = order
+      .map((id) => config.rows.find((r) => r.id === id))
+      .filter(Boolean);
+    // keep any rows not currently displayed
+    for (const r of config.rows) if (!order.includes(r.id)) newRows.push(r);
+    saveConfig(newRows, config.pollIntervalSec);
+  }
+
+  function attachDnD() {
+    if (!rearrangeMode) return;
+    const cards = document.querySelectorAll("#station-grid .card");
+    cards.forEach((card) => {
+      card.addEventListener("dragstart", (e) => {
+        card.classList.add("dragging");
+        e.dataTransfer.setData("text/plain", card.getAttribute("data-id"));
+      });
+      card.addEventListener("dragend", () => card.classList.remove("dragging"));
+      card.addEventListener("dragover", (e) => { e.preventDefault(); card.classList.add("drag-over"); });
+      card.addEventListener("dragleave", () => card.classList.remove("drag-over"));
+      card.addEventListener("drop", (e) => {
+        e.preventDefault();
+        card.classList.remove("drag-over");
+        const dragId = e.dataTransfer.getData("text/plain");
+        const targetId = card.getAttribute("data-id");
+        if (!dragId || dragId === targetId) return;
+        const from = order.indexOf(dragId);
+        const to = order.indexOf(targetId);
+        if (from < 0 || to < 0) return;
+        order.splice(from, 1);
+        order.splice(to, 0, dragId);
+        renderGrid();
+      });
+    });
+  }
+
+  // ── settings drawer ──
+  const overlay = document.getElementById("settings-overlay");
+  function openSettings() {
+    bootstrap().then(() => { overlay.classList.add("open"); });
+  }
+  function closeSettings() { overlay.classList.remove("open"); }
+  document.getElementById("settings-btn").onclick = openSettings;
+  document.getElementById("settings-close").onclick = closeSettings;
+  document.getElementById("settings-cancel").onclick = closeSettings;
+
+  const cardSizeInput = document.getElementById("card-size");
+  if (cardSizeInput) {
+    cardSizeInput.addEventListener("input", () => {
+      const v = Math.max(1, Math.min(16, parseInt(cardSizeInput.value, 10) || 5));
+      document.documentElement.style.setProperty("--card-cols", v);
+      const cv = document.getElementById("card-size-val");
+      if (cv) cv.textContent = v;
+    });
+  }
+
+  function renderSettingsRows() {
+    const pi = document.getElementById("poll-interval");
+    if (pi) pi.value = config.pollIntervalSec;
+    const editor = document.getElementById("rows-editor");
+    editor.innerHTML = "";
+    config.rows.forEach((row, idx) => {
+      const div = document.createElement("div");
+      div.className = "row-card" + (row.bot && !bots.includes(row.bot) ? " stale-bot" : "");
+      const botOptions = [row.bot, ...bots].filter(Boolean).filter((b, i, a) => a.indexOf(b) === i)
+        .map((b) => `<option value="${esc(b)}" ${b === row.bot ? "selected" : ""}>${esc(b)}${bots.includes(b) ? "" : " (offline)"}</option>`).join("");
+      div.innerHTML = `
+        <div class="row-head">
+          <span class="row-title">ROW ${idx + 1}${row.bot && !bots.includes(row.bot) ? " — BOT OFFLINE" : ""}</span>
+          <button class="small-btn danger" data-act="remove">REMOVE</button>
+        </div>
+        <div class="field">
+          <label>BOT</label>
+          <select data-field="bot">${botOptions}</select>
+        </div>
+        <div class="row-grid">
+          <div class="field">
+            <label>STATION ID</label>
+            <input class="term-input" data-field="stationId" value="${esc(row.stationId)}" placeholder="run Detect" readonly />
+          </div>
+          <div class="field">
+            <label>STATION NAME</label>
+            <input class="term-input" data-field="stationName" value="${esc(row.stationName)}" readonly />
+          </div>
+        </div>
+        <div class="field">
+          <label>LABEL (optional)</label>
+          <input class="term-input" data-field="label" value="${esc(row.label)}" placeholder="override card title" />
+        </div>
+        <div class="row-actions">
+          <button class="small-btn detect" data-act="detect">DETECT</button>
+          <span data-field="detect-msg" style="font-size:11px;color:var(--secondary-fixed-dim);align-self:center;"></span>
+        </div>`;
+      div.querySelector('[data-act="remove"]').onclick = () => {
+        config.rows = config.rows.filter((r) => r.id !== row.id);
+        renderSettingsRows();
+      };
+      div.querySelector('[data-act="detect"]').onclick = async (e) => {
+        const btn = e.target;
+        const msgEl = div.querySelector('[data-field="detect-msg"]');
+        const botName = div.querySelector('[data-field="bot"]').value;
+        if (!botName) { msgEl.textContent = "select a bot"; msgEl.style.color = "var(--error)"; return; }
+        btn.disabled = true; msgEl.textContent = "detecting…"; msgEl.style.color = "var(--on-surface-variant)";
+        try {
+          const r = await fetch("/api/detect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bot: botName }) });
+          const j = await r.json();
+          if (!r.ok) { msgEl.textContent = j.error || "failed"; msgEl.style.color = "var(--error)"; }
+          else {
+            row.bot = botName;
+            row.stationId = j.stationId;
+            row.stationName = j.stationName;
+            msgEl.textContent = "ok: " + j.stationName;
+            msgEl.style.color = "var(--secondary-fixed-dim)";
+            renderSettingsRows();
+          }
+        } catch (err) { msgEl.textContent = "error"; msgEl.style.color = "var(--error)"; }
+        finally { btn.disabled = false; }
+      };
+      editor.appendChild(div);
+    });
+  }
+
+  document.getElementById("add-row").onclick = () => {
+    const id = "row_" + (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
+    config.rows.push({ id, bot: "", stationId: "", stationName: "", label: "" });
+    renderSettingsRows();
+  };
+
+  function saveConfig(rows, pollIntervalSec, cardCols, fpsCap) {
+    return fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows, pollIntervalSec, cardCols, fpsCap }),
+    }).then((r) => r.json()).then((j) => {
+      if (j.error) throw new Error(j.error);
+      config = j;
+      return j;
+    });
+  }
+
+  async function doSave() {
+    const pi = document.getElementById("poll-interval");
+    const pollIntervalSec = Math.max(15, parseInt(pi.value, 10) || 60);
+    const cs = document.getElementById("card-size");
+    const cardCols = Math.max(1, Math.min(16, parseInt(cs.value, 10) || 5));
+    const fc = document.getElementById("fps-cap");
+    const fpsCap = parseInt(fc.value, 10) || 0;
+    // read edited rows from DOM
+    const rows = [];
+    document.querySelectorAll("#rows-editor .row-card").forEach((div) => {
+      const get = (f) => div.querySelector(`[data-field="${f}"]`).value;
+      const id = div.querySelector('[data-act="remove"]') && div.dataset.id;
+      // recover original id via config order (simpler: keep config row objects, update fields)
+      rows.push({
+        id: div.dataset.id,
+        bot: get("bot"),
+        stationId: get("stationId"),
+        stationName: get("stationName"),
+        label: get("label"),
+      });
+    });
+    // ensure ids present: map back to config rows
+    const finalRows = config.rows.map((orig) => {
+      const edited = rows.find((r) => r.id === orig.id) || {};
+      return { ...orig, ...edited };
+    });
+    try {
+      await saveConfig(finalRows, pollIntervalSec, cardCols, fpsCap);
+      closeSettings();
+    } catch (e) {
+      alert("Save failed: " + (e.message || e));
+    }
+  }
+
+  document.getElementById("settings-save").onclick = doSave;
+  document.getElementById("settings-save-top").onclick = doSave;
+
+  // attach row ids to DOM for save mapping
+  const origRender = renderSettingsRows;
+  renderSettingsRows = function () {
+    origRender();
+    document.querySelectorAll("#rows-editor .row-card").forEach((div, i) => {
+      div.dataset.id = config.rows[i] ? config.rows[i].id : "";
+    });
+  };
+
+  // ── detail view ──
+  // ── detail view (per-station) ──
+  const enc = encodeURIComponent;
+  const detailState = {
+    bot: null,
+    stationId: detailId,
+    base: null,
+    condition: {},
+    lifeSupport: {},
+    power: {},
+    facilities: [],
+    upgrades: {},
+    catCache: {},
+    itemCatalog: null,        // id -> { name }
+    facilityCatalog: null,    // id -> facility def (incl. ammo_item)
+    consumableInv: null,      // { items, storage, factionStorage }
+    consumableData: null,     // computed { rows, allGood, contributing }
+    buildCategory: "service",
+    buildSearch: "",
+    buildList: [],
+    msg: "",
+    msgCls: "",
+  };
+
+  function setMsg(text, cls) {
+    detailState.msg = text || "";
+    detailState.msgCls = cls || "";
+    const el = document.getElementById("detail-msg");
+    if (el) {
+      el.textContent = detailState.msg;
+      el.className = "detail-note" + (detailState.msgCls ? " " + detailState.msgCls : "");
+    }
+  }
+
+  async function apiAction(command, params) {
+    try {
+      const r = await fetch("/api/station/" + enc(detailState.stationId) + "/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command, params: params || {} }),
+      });
+      return await r.json();
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }
+
+  async function getCatalogFacility(id) {
+    if (!id) return null;
+    if (detailState.catCache[id]) return detailState.catCache[id];
+    try {
+      const r = await fetch("/api/catalog/facility/" + enc(id));
+      const j = await r.json();
+      detailState.catCache[id] = j.facility || null;
+    } catch {
+      detailState.catCache[id] = null;
+    }
+    return detailState.catCache[id];
+  }
+
+  async function refreshDetailBase() {
+    if (!detailState.bot) return;
+    const res = await apiAction("get_base", {});
+    if (res.ok && res.data) {
+      const r = res.data.structuredContent || res.data.result || res.data;
+      const base = r && (r.base || r);
+      if (base && typeof base === "object") {
+        detailState.base = base;
+        detailState.condition = base.condition || detailState.condition;
+        detailState.lifeSupport = base.life_support || detailState.lifeSupport;
+        detailState.power = base.power || detailState.power;
+      }
+    }
+  }
+
+  async function loadDetail() {
+    document.getElementById("grid-view").style.display = "none";
+    document.getElementById("detail-view").style.display = "block";
+    document.getElementById("detail-body").innerHTML =
+      '<div id="detail-msg" class="detail-note"></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Overview</div><div id="detail-overview"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Consumables / Maintenance</div><div id="detail-consumables"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Facilities</div><div id="detail-facilities"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Build Facility</div><div id="detail-build"><div class="detail-note">Loading…</div></div></div>';
+
+    try {
+      const cfg = await (await fetch("/api/config")).json();
+      const row = (cfg.rows || []).find((r) => r.stationId === detailId);
+      detailState.bot = row ? row.bot : null;
+    } catch { /* best effort */ }
+
+    try {
+      const r = await fetch("/api/station/" + enc(detailId));
+      const j = await r.json();
+      if (r.ok && j.snapshot) {
+        detailState.base = j.snapshot.base || {};
+        detailState.condition = j.snapshot.condition || {};
+        detailState.lifeSupport = j.snapshot.lifeSupport || {};
+        detailState.power = j.snapshot.power || {};
+        document.getElementById("detail-name").textContent = j.snapshot.stationName || detailId;
+      } else {
+        document.getElementById("detail-name").textContent = detailId;
+      }
+    } catch {
+      document.getElementById("detail-name").textContent = detailId;
+    }
+
+    if (!detailState.base) await refreshDetailBase();
+    await loadFacilities();
+    await loadBuildList();
+    renderOverview();
+    renderFacilities();
+    renderBuild();
+    await loadConsumables();
+    renderConsumables();
+  }
+
+  function barRow(label, value, max) {
+    const pct = max > 0 ? Math.max(0, Math.min(100, Math.round((value / max) * 100))) : 0;
+    let segs = "";
+    for (let i = 0; i < 10; i++) segs += `<div class="${i < Math.round(pct / 10) ? "bar-seg on-g" : "bar-seg"}"></div>`;
+    return `<div class="bar-row"><div class="bar-label"><span>${label}</span><span class="bar-value">${kfmt(value)}/${kfmt(max)}</span></div><div class="bar-track">${segs}</div></div>`;
+  }
+
+  function renderOverview() {
+    const b = detailState.base || {};
+    const cond = detailState.condition || {};
+    const ls = detailState.lifeSupport || {};
+    const p = detailState.power || {};
+
+    const maxFuel = num(b.max_fuel), maxHull = num(b.max_hull), maxShield = num(b.max_shield);
+    const bars =
+      barRow("FUEL", num(b.fuel), maxFuel) +
+      barRow("HULL", num(b.hull), maxHull) +
+      (maxShield > 0 ? barRow("SHIELD", num(b.shield), maxShield) : "");
+
+    const pub = b.public_access ? "Public" : "Private";
+    const satPct = num(cond.satisfaction_pct);
+    const condText = cond.condition ? String(cond.condition).toUpperCase() : (b.wrecked ? "WRECKED" : "?");
+    const feePct = b.market_fee_bps != null ? Math.round(b.market_fee_bps / 100) : "";
+
+    const stats =
+      `<div class="stat-grid">` +
+      statRow("Faction", esc(b.faction || detailState.bot || "?")) +
+      statRow("Armor", num(b.armor) ? kfmt(b.armor) : "—") +
+      statRow("Weapon DPS", num(b.weapon_dps) ? kfmt(b.weapon_dps) : "—") +
+      statRow("Weapon Reach", num(b.weapon_reach) ? kfmt(b.weapon_reach) : "—") +
+      statRow("Condition", condText) +
+      statRow("Satisfaction", satPct + "%") +
+      statRow("Services Met", `${num(cond.satisfied_count)}/${num(cond.total_service_infra)}`) +
+      lsRow(ls) +
+      pwrRow(p) +
+      batRow(p) +
+      statRow("Market Fee", b.market_fee_bps != null ? b.market_fee_bps + "bps (" + feePct + "%)" : "—") +
+      statRow("Refuel $/fuel", b.refuel_price_each != null ? num(b.refuel_price_each) : "—") +
+      statRow("Repair $/hull", b.repair_price_per_hull != null ? num(b.repair_price_per_hull) : "—") +
+      statRow("Access", pub) +
+      statRow("Auto-Buy Fuel", b.auto_buy_fuel ? "On" : "Off") +
+      statRow("Outsider Builds", b.allow_outsider_facilities ? "Allowed" : "Blocked") +
+      `</div>`;
+
+    const settings = `
+      <div class="detail-card collapsible" style="margin-top:12px;">
+        <button type="button" class="collapsible-head" id="settings-toggle" aria-expanded="false">
+          <span class="coll-arrow">▸</span>
+          <span>Station settings (owner/admin, docked bot required)</span>
+        </button>
+        <div class="collapsible-body" id="settings-body" style="display:none;">
+          <div class="setting-row"><label>Rename</label><input type="text" id="set-rename" value="${esc(b.name || "")}" placeholder="New name" /><button class="small-btn" id="btn-rename">Save</button></div>
+          <div class="setting-row"><label>Description</label><input type="text" id="set-desc" value="${esc(b.description || "")}" placeholder="Description" /><button class="small-btn" id="btn-desc">Save</button></div>
+          <div class="setting-row"><label>Access</label><span class="toggle-pill ${b.public_access ? "toggle-on" : "toggle-off"}" id="pill-public">${pub}</span><button class="small-btn" id="btn-public">${b.public_access ? "Make Private" : "Make Public"}</button></div>
+          <div class="setting-row"><label>Market Fee %</label><input type="number" id="set-fee" min="0" max="10" step="1" value="${feePct}" placeholder="0-10" /><button class="small-btn" id="btn-fee">Set</button></div>
+          <div class="setting-row"><label>Refuel $/fuel</label><input type="number" id="set-refuel" min="0" step="1" value="${b.refuel_price_each != null ? b.refuel_price_each : ""}" placeholder="cr/fuel" /><button class="small-btn" id="btn-refuel">Set</button></div>
+          <div class="setting-row"><label>Repair $/hull</label><input type="number" id="set-repair" min="0" step="1" value="${b.repair_price_per_hull != null ? b.repair_price_per_hull : ""}" placeholder="cr/hull" /><button class="small-btn" id="btn-repair">Set</button></div>
+          <div class="setting-row"><label>Auto-Buy Fuel</label><span class="toggle-pill ${b.auto_buy_fuel ? "toggle-on" : "toggle-off"}" id="pill-autobuy">${b.auto_buy_fuel ? "On" : "Off"}</span><button class="small-btn" id="btn-autobuy">${b.auto_buy_fuel ? "Turn Off" : "Turn On"}</button></div>
+          <div class="setting-row"><label>Outsider Builds</label><span class="toggle-pill ${b.allow_outsider_facilities ? "toggle-on" : "toggle-off"}" id="pill-outsider">${b.allow_outsider_facilities ? "Allowed" : "Blocked"}</span><button class="small-btn" id="btn-outsider">${b.allow_outsider_facilities ? "Block" : "Allow"}</button></div>
+        </div>
+      </div>`;
+
+    document.getElementById("detail-overview").innerHTML = bars + stats + settings;
+    wireOverview();
+  }
+
+  function statRow(label, value) {
+    return `<div class="stat-row"><span class="stat-label">${label}</span><span class="stat-val">${value}</span></div>`;
+  }
+  function lsRow(ls) {
+    if (!ls || ls.supply == null) return "";
+    const supply = num(ls.supply), demand = num(ls.demand);
+    const pct = supply ? Math.round((demand / supply) * 100) : 0;
+    const plants = ls.plants != null ? ls.plants : "?";
+    const free = supply != null && demand != null ? num(supply - demand) : "?";
+    const color = pct >= 100 ? "var(--error)" : pct >= 80 ? "var(--tertiary-fixed-dim)" : "var(--secondary-fixed-dim)";
+    return statRow("Life Support", `<span style="color:${color}">${demand}/${supply} (${pct}%) · ${plants} plant(s), ${free} free</span>`);
+  }
+  function pwrRow(p) {
+    if (!p || p.supply == null) return "";
+    const supply = num(p.supply), draw = num(p.current_draw);
+    const pct = supply ? Math.round((draw / supply) * 100) : 0;
+    const eff = p.efficiency != null ? Math.round(p.efficiency * 100) : "?";
+    const color = pct >= 100 ? "var(--error)" : pct >= 80 ? "var(--tertiary-fixed-dim)" : "var(--secondary-fixed-dim)";
+    return statRow("Power", `<span style="color:${color}">${draw}/${supply} (${pct}%) · eff ${eff}%</span>`);
+  }
+  function batRow(p) {
+    if (!p || p.battery_capacity == null) return "";
+    const cap = num(p.battery_capacity), stored = num(p.battery_stored != null ? p.battery_stored : 0);
+    const pct = cap ? Math.round((stored / cap) * 100) : 0;
+    const color = pct <= 0 ? "var(--error)" : pct < 20 ? "var(--tertiary-fixed-dim)" : "var(--secondary-fixed-dim)";
+    return statRow("Battery", `<span style="color:${color}">${stored}/${cap} (${pct}%)</span>`);
+  }
+
+  function wireOverview() {
+    const q = (id) => document.getElementById(id);
+
+    const toggle = q("settings-toggle");
+    if (toggle) {
+      toggle.onclick = () => {
+        const body = document.getElementById("settings-body");
+        const open = body.style.display !== "none";
+        body.style.display = open ? "none" : "block";
+        toggle.setAttribute("aria-expanded", open ? "false" : "true");
+        toggle.querySelector(".coll-arrow").textContent = open ? "▸" : "▾";
+      };
+    }
+
+    const refresh = async (okMsg) => {
+      await refreshDetailBase();
+      renderOverview();
+      setMsg(okMsg, "ok");
+    };
+    if (q("btn-rename")) q("btn-rename").onclick = async () => {
+      const v = q("set-rename").value.trim();
+      if (!v) return;
+      const r = await apiAction("facility", { action: "station_set_name", name: v });
+      if (r.ok) refresh("Station renamed.");
+      else setMsg("Rename failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-desc")) q("btn-desc").onclick = async () => {
+      const v = q("set-desc").value;
+      const r = await apiAction("facility", { action: "set_description", description: v });
+      if (r.ok) refresh("Description updated.");
+      else setMsg("Update failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-public")) q("btn-public").onclick = async () => {
+      const v = !(detailState.base && detailState.base.public_access);
+      const r = await apiAction("facility", { action: "set_public", public: v });
+      if (r.ok) refresh("Access updated.");
+      else setMsg("set_public failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-fee")) q("btn-fee").onclick = async () => {
+      const v = parseInt(q("set-fee").value, 10);
+      if (isNaN(v) || v < 0 || v > 10) { setMsg("Market fee must be 0-10.", "err"); return; }
+      const r = await apiAction("facility", { action: "set_market_fee", fee_percent: v });
+      if (r.ok) refresh("Market fee set.");
+      else setMsg("set_market_fee failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-refuel")) q("btn-refuel").onclick = async () => {
+      const v = parseInt(q("set-refuel").value, 10);
+      if (isNaN(v) || v < 0) { setMsg("Refuel price must be >= 0.", "err"); return; }
+      const r = await apiAction("facility", { action: "set_refuel_price", price: v });
+      if (r.ok) refresh("Refuel price set.");
+      else setMsg("set_refuel_price failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-repair")) q("btn-repair").onclick = async () => {
+      const v = parseInt(q("set-repair").value, 10);
+      if (isNaN(v) || v < 0) { setMsg("Repair price must be >= 0.", "err"); return; }
+      const r = await apiAction("facility", { action: "set_repair_price", price: v });
+      if (r.ok) refresh("Repair price set.");
+      else setMsg("set_repair_price failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-autobuy")) q("btn-autobuy").onclick = async () => {
+      const v = !(detailState.base && detailState.base.auto_buy_fuel);
+      const r = await apiAction("facility", { action: "set_auto_buy_fuel", auto_buy_fuel: v });
+      if (r.ok) refresh("Auto-buy fuel updated.");
+      else setMsg("set_auto_buy_fuel failed: " + (r.error || "unknown"), "err");
+    };
+    if (q("btn-outsider")) q("btn-outsider").onclick = async () => {
+      const v = !(detailState.base && detailState.base.allow_outsider_facilities);
+      const r = await apiAction("facility", { action: "set_build_policy", allow_outsiders: v });
+      if (r.ok) refresh("Build policy updated.");
+      else setMsg("set_build_policy failed: " + (r.error || "unknown"), "err");
+    };
+  }
+
+  async function loadFacilities() {
+    if (!detailState.bot) { detailState.facilities = []; return; }
+    const fl = await apiAction("facility", { action: "faction_list" });
+    const listRes = await apiAction("facility", { action: "list" });
+    const collect = (res, key) => {
+      if (!res || !res.ok || !res.data) return [];
+      const d = res.data.structuredContent || res.data.result || res.data;
+      const arr = Array.isArray(d) ? d : Array.isArray(d[key]) ? d[key] : Array.isArray(d.facilities) ? d.facilities : [];
+      return arr;
+    };
+    const ld = (listRes.ok && listRes.data) ? (listRes.data.structuredContent || listRes.data.result || listRes.data) : null;
+    const allLists = [
+      ...(Array.isArray(ld && ld.station_facilities) ? ld.station_facilities : []),
+      ...(Array.isArray(ld && ld.player_facilities) ? ld.player_facilities : []),
+      ...(Array.isArray(ld && ld.faction_facilities) ? ld.faction_facilities : []),
+      ...(Array.isArray(ld && ld.public_facilities) ? ld.public_facilities : []),
+    ];
+    const merged = {};
+    [...collect(fl, "faction_facilities"), ...allLists].forEach((f) => {
+      const fid = f.facility_id || f.id;
+      if (fid) merged[fid] = f;
+    });
+    // production map (public + price per run)
+    const prodMap = {};
+    allLists.forEach((f) => { if (f && f.facility_id && f.production) prodMap[f.facility_id] = f.production; });
+    Object.values(merged).forEach((f) => {
+      const fid = f.facility_id || f.id;
+      if (fid && prodMap[fid]) f.production = prodMap[fid];
+    });
+    detailState.facilities = Object.values(merged);
+    // upgrades (so we only show Upgrade when there is a real path)
+    detailState.upgrades = {};
+    const up = await apiAction("facility", { action: "upgrades" });
+    const upData = (up.ok && up.data) ? (up.data.structuredContent || up.data.result || up.data) : null;
+    if (upData) {
+      [...(Array.isArray(upData.upgrades) ? upData.upgrades : []), ...(Array.isArray(upData.faction_upgrades) ? upData.faction_upgrades : [])]
+        .forEach((u) => { const k = u.your_facility_id || u.facility_id; if (k) detailState.upgrades[k] = u; });
+    }
+  }
+
+  const STATION_CATS = ["service", "infrastructure", "defense", "ranch"];
+
+  function isStationType(f) {
+    const cat = (f.category || resolveCat(f) || "").toLowerCase();
+    if (STATION_CATS.includes(cat)) return true;
+    const c = detailState.catCache[f.facility_type || f.type || f.id];
+    return !!(c && c.player_station_buildable);
+  }
+
+  async function renderFacilities() {
+    const el = document.getElementById("detail-facilities");
+    if (!el) return;
+    if (!detailState.bot) {
+      el.innerHTML = '<div class="detail-note">No bot configured for this station (cannot list facilities).</div>';
+      return;
+    }
+    const facs = detailState.facilities;
+    if (!facs.length) {
+      el.innerHTML = '<div class="detail-note">No facilities at this station.</div>';
+      return;
+    }
+    await Promise.all(facs.map((f) => getCatalogFacility(f.facility_type || f.type || f.id)));
+
+    const groups = {};
+    facs.forEach((f) => {
+      const cat = (f.category || resolveCat(f) || "other").toLowerCase();
+      (groups[cat] = groups[cat] || []).push(f);
+    });
+
+    const orderCats = ["service", "infrastructure", "defense", "ranch", "faction", "production", "personal", "other"];
+    const cats = Object.keys(groups).sort((a, b) => orderCats.indexOf(a) - orderCats.indexOf(b));
+    el.innerHTML = cats.map((cat) => {
+      const items = groups[cat].map((f) => isStationType(f) ? facCard(f, cat) : facRowWide(f, cat)).join("");
+      return `<div style="margin-bottom:14px"><div class="fac-cat" style="margin-bottom:6px">${cat.toUpperCase()} (${groups[cat].length})</div>${items}</div>`;
+    }).join("");
+    wireFacilities();
+  }
+
+  function resolveCat(f) {
+    const c = detailState.catCache[f.facility_type || f.type || f.id];
+    return c ? c.category : null;
+  }
+
+  // A facility is "active" (built & running) unless it is explicitly under
+  // construction, or the server reports an inactive/offline status. The
+  // `facility list` payload has no `status: "active"` field, so we key off
+  // `under_construction` and any explicit status/active flag when present.
+  function isFacilityActive(f) {
+    if (f.under_construction === true) return false;
+    if (typeof f.active === "boolean") return f.active;
+    if (typeof f.status === "string") {
+      const s = f.status.toLowerCase();
+      if (s === "active" || s === "online" || s === "running") return true;
+      return false;
+    }
+    return true;
+  }
+
+  // Per-round maintenance needs. Prefer the facility's own `maintenance_per_cycle`
+  // (level-adjusted, actual), falling back to the catalog definition's
+  // `maintenance_inputs` for station-type facilities that only expose those.
+  function facilityMaintenance(f) {
+    const live = Array.isArray(f.maintenance_per_cycle) ? f.maintenance_per_cycle : [];
+    if (live.length) {
+      return live.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+    }
+    const cat = detailState.catCache[f.facility_type || f.type || f.id];
+    const mi = (cat && cat.maintenance_inputs) || [];
+    return Array.isArray(mi) ? mi.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name })) : [];
+  }
+
+  function facCard(f, cat) {
+    const name = f.name || f.facility_type || f.type || "?";
+    const fid = f.facility_id || f.id || "";
+    const active = isFacilityActive(f);
+    const status = active ? '<span style="color:var(--secondary-fixed-dim)">Active</span>' : '<span style="color:var(--error)">Inactive</span>';
+    const cat2 = detailState.catCache[f.facility_type || f.type || f.id];
+    const maint = facilityMaintenance(f);
+    const needs = STATION_CATS.includes(cat)
+      ? maint.map((m) => `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`).join(", ")
+      : "";
+    const desc = active
+      ? (cat2 && cat2.satisfied_description) || f.description || ""
+      : (cat2 && cat2.degraded_description) || f.description || "";
+    const damaged = f.damaged || f.status === "damaged";
+    const up = detailState.upgrades[fid];
+    const canUpgrade = !!(up && up.upgrade_to);
+    return `<div class="fac-card" data-fid="${esc(fid)}">
+      <div class="fac-head"><span class="fac-name">${esc(name)}</span><span>${status}</span></div>
+      ${desc ? `<div class="bc-meta">${esc(desc)}</div>` : ""}
+      ${needs ? `<div class="fac-needs">Needs/round: ${needs}</div>` : ""}
+      <div class="fac-actions">
+        <button class="small-btn sm" data-act="toggle">${active ? "Disable" : "Enable"}</button>
+        ${damaged ? `<button class="small-btn danger sm" data-act="repair">Repair</button>` : ""}
+        <button class="small-btn sm" data-act="rename">Rename</button>
+        ${canUpgrade ? `<button class="small-btn sm" data-act="upgrade">Upgrade</button>` : ""}
+      </div>
+      <div class="fac-rename" style="display:none;gap:6px;margin-top:4px">
+        <input type="text" class="set-rename-fac" value="${esc(f.custom_name || name)}" style="flex:1;background:rgba(12,14,18,.6);border:1px solid var(--outline-variant);color:var(--on-surface);padding:3px 6px;font-size:11px" />
+        <button class="small-btn sm" data-act="rename-save">Save</button>
+      </div>
+    </div>`;
+  }
+
+  function facRowWide(f, cat) {
+    const name = f.name || f.facility_type || f.type || "?";
+    const fid = f.facility_id || f.id || "";
+    const level = f.level != null ? f.level : (f.tier != null ? f.tier : "");
+    const levelStr = level ? ` (L${level})` : "";
+    const active = isFacilityActive(f);
+    const status = active ? '<span style="color:var(--secondary-fixed-dim)">Active</span>' : '<span style="color:var(--error)">Inactive</span>';
+    const prod = f.production || {};
+    const isPublic = prod.public === true;
+    const price = typeof prod.output_price_per_unit === "number"
+      ? prod.output_price_per_unit
+      : (typeof prod.rental_fee_per_run === "number" ? prod.rental_fee_per_run : 0);
+    const up = detailState.upgrades[fid];
+    const canUpgrade = !!(up && up.upgrade_to);
+    const damaged = f.damaged || f.status === "damaged";
+    return `<div class="fac-row" data-fid="${esc(fid)}">
+      <span class="fac-name">${esc(name)}${esc(levelStr)}</span>
+      <span class="fac-id" title="Click to copy facility_id" onclick="navigator.clipboard.writeText('${esc(fid)}')">${esc(fid)}</span>
+      <span class="status-dot">${status}</span>
+      <div class="fac-ctrl">
+        <span style="font-size:11px;color:${isPublic ? "var(--secondary-fixed-dim)" : "var(--on-surface-variant)"}">${isPublic ? "Public" : "Private"}</span>
+        <button class="small-btn sm" data-act="access">${isPublic ? "Make Private" : "Make Public"}</button>
+        <button class="small-btn sm" data-act="rename" title="Rename">✏️</button>
+        <span style="font-size:11px;color:var(--on-surface-variant)">PPR</span>
+        <input type="number" class="set-price" min="0" step="0.25" value="${price}" />
+        <button class="primary-btn sm" data-act="set-price">Set Price</button>
+        <button class="small-btn sm" data-act="toggle">${active ? "Disable" : "Enable"}</button>
+        ${damaged ? `<button class="small-btn danger sm" data-act="repair">Repair</button>` : ""}
+        ${canUpgrade ? `<button class="small-btn sm" data-act="upgrade">Upgrade</button>` : ""}
+      </div>
+      <div class="fac-rename" style="display:none;gap:6px;margin-top:4px;width:100%">
+        <input type="text" class="set-rename-fac" value="${esc(f.custom_name || name)}" style="flex:1;background:rgba(12,14,18,.6);border:1px solid var(--outline-variant);color:var(--on-surface);padding:3px 6px;font-size:11px" />
+        <button class="small-btn sm" data-act="rename-save">Save</button>
+      </div>
+    </div>`;
+  }
+
+  function wireFacilities() {
+    document.querySelectorAll("#detail-facilities [data-fid]").forEach((card) => {
+      const fid = card.getAttribute("data-fid");
+      const q = (a) => card.querySelector(`[data-act="${a}"]`);
+
+      if (q("toggle")) q("toggle").onclick = async () => {
+        const r = await apiAction("facility", { action: "toggle", facility_id: fid });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility toggled.", "ok"); }
+        else setMsg("Toggle failed: " + (r.error || "unknown"), "err");
+      };
+      const rep = q("repair");
+      if (rep) rep.onclick = async () => {
+        const r = await apiAction("facility", { action: "repair", facility_id: fid });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Repair initiated.", "ok"); }
+        else setMsg("Repair failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("rename")) q("rename").onclick = () => {
+        const box = card.querySelector(".fac-rename");
+        if (box) box.style.display = box.style.display === "none" ? "flex" : "none";
+      };
+      if (q("rename-save")) q("rename-save").onclick = async () => {
+        const inp = card.querySelector(".set-rename-fac");
+        const v = inp ? inp.value.trim() : "";
+        const r = await apiAction("facility", { action: "set_name", facility_id: fid, custom_name: v });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility renamed.", "ok"); }
+        else setMsg("Rename failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("access")) q("access").onclick = async () => {
+        const cur = (q("access").textContent || "").includes("Make Private");
+        const access = cur ? "private" : "public";
+        const r = await apiAction("facility", { action: "set_access", facility_id: fid, access });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Access updated.", "ok"); }
+        else setMsg("set_access failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("set-price")) q("set-price").onclick = async () => {
+        const inp = card.querySelector(".set-price");
+        const price = inp ? parseFloat(inp.value) : NaN;
+        if (isNaN(price) || price < 0) { setMsg("Enter a valid non-negative price.", "err"); return; }
+        const r = await apiAction("facility", { action: "set_output_price", facility_id: fid, price });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Price per run set.", "ok"); }
+        else setMsg("set_output_price failed: " + (r.error || "unknown"), "err");
+      };
+      if (q("upgrade")) q("upgrade").onclick = async () => {
+        const up = detailState.upgrades[fid];
+        if (up && up.upgrade_to) {
+          const type = up.upgrade_to.type_id || up.upgrade_to.facility_type || up.upgrade_to.type;
+          const r2 = await apiAction("facility", { action: "upgrade", facility_id: fid, facility_type: type });
+          if (r2.ok) { await loadFacilities(); renderFacilities(); setMsg("Facility upgraded.", "ok"); }
+          else setMsg("Upgrade failed: " + (r2.error || "unknown"), "err");
+        } else {
+          setMsg("No upgrade available for this facility.", "err");
+        }
+      };
+    });
+  }
+
+  const BUILD_TABS = [
+    { key: "faction", label: "Faction" },
+    { key: "production", label: "Production" },
+    { key: "service", label: "Service" },
+    { key: "infrastructure", label: "Infrastructure" },
+    { key: "defense", label: "Defense" },
+  ];
+
+  async function loadBuildList() {
+    const cat = detailState.buildCategory;
+    const q = detailState.buildSearch;
+    const url = "/api/catalog/facilities?category=" + enc(cat) + (q ? "&q=" + enc(q) : "");
+    try {
+      const r = await fetch(url);
+      const j = await r.json();
+      detailState.buildList = (j.facilities || []).filter((f) => !f.upgrades_from);
+    } catch {
+      detailState.buildList = [];
+    }
+  }
+
+  function matsHtml(mats) {
+    if (!Array.isArray(mats) || !mats.length) return "";
+    return '<div class="bc-meta">Build mats: ' +
+      mats.map((m) => `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`).join(", ") + "</div>";
+  }
+  function needsHtml(maint) {
+    if (!Array.isArray(maint) || !maint.length) return "";
+    return '<div class="bc-needs">Upkeep/round: ' +
+      maint.map((m) => `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`).join(", ") + "</div>";
+  }
+
+  async function renderBuild() {
+    const el = document.getElementById("detail-build");
+    if (!el) return;
+    const tabs = BUILD_TABS.map((t) =>
+      `<button class="build-tab ${t.key === detailState.buildCategory ? "active" : ""}" data-cat="${t.key}">${t.label}</button>`
+    ).join("");
+    const list = detailState.buildList.map((f) => `
+      <div class="build-card" data-type="${esc(f.id)}">
+        <div class="bc-name">${esc(f.name || f.id)}</div>
+        <div class="bc-meta">${esc(f.category)}${f.level ? " · Lv" + f.level : ""}${f.build_cost ? ' · <span class="bc-cost">' + Number(f.build_cost).toLocaleString() + "cr</span>" : ""}</div>
+        <div class="bc-meta">${esc(f.description || "")}</div>
+        ${matsHtml(f.build_materials)}
+        ${needsHtml(f.maintenance_inputs)}
+        <div style="margin-top:4px"><button class="primary-btn sm" data-act="build">Build</button></div>
+      </div>`).join("");
+    el.innerHTML =
+      '<div class="build-tabs">' + tabs + "</div>" +
+      '<input class="build-search" id="build-search" type="text" placeholder="Search ' + detailState.buildCategory + ' facilities…" value="' + esc(detailState.buildSearch) + '" />' +
+      '<div class="build-count">' + detailState.buildList.length + " shown (use search for large lists)</div>" +
+      '<div class="build-list">' + (list || '<div class="detail-note">None.</div>') + "</div>";
+
+    el.querySelectorAll(".build-tab").forEach((b) => {
+      b.onclick = async () => {
+        detailState.buildCategory = b.getAttribute("data-cat");
+        detailState.buildSearch = "";
+        await loadBuildList();
+        renderBuild();
+      };
+    });
+    const search = el.querySelector("#build-search");
+    if (search) {
+      let t;
+      search.oninput = () => {
+        clearTimeout(t);
+        t = setTimeout(async () => {
+          detailState.buildSearch = search.value;
+          await loadBuildList();
+          renderBuild();
+        }, 250);
+      };
+    }
+    el.querySelectorAll(".build-card").forEach((c) => {
+      c.querySelector('[data-act="build"]').onclick = async () => {
+        const type = c.getAttribute("data-type");
+        const r = await apiAction("facility", { action: "faction_build", facility_type: type });
+        if (r.ok) { await loadFacilities(); renderFacilities(); setMsg("Build started for " + type + ".", "ok"); }
+        else setMsg("Build failed: " + (r.error || "unknown"), "err");
+      };
+    });
+  }
+
+  // ── Consumables / maintenance display ───────────────────────
+  // Aggregates the per-round maintenance_inputs of every built & active station
+  // facility, then compares against the bot's cargo + personal station storage +
+  // local faction storage. Auto-populated whenever the station view opens.
+  function itemName(id) {
+    const c = detailState.itemCatalog;
+    const e = c && c[id];
+    if (e && e.name) return e.name;
+    return id.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
+  }
+
+  async function collectStationInventory() {
+    const inv = { items: {}, storage: {}, factionStorage: {} };
+    const addTo = (target, res) => {
+      if (!res || !res.ok || !res.data) return;
+      const d = res.data;
+      const arr = d.items || d.storage || d.cargo || d || [];
+      const list = Array.isArray(arr) ? arr : Object.values(arr);
+      list.forEach((c) => {
+        const id = c.item_id || c.id;
+        if (id) target[id] = (target[id] || 0) + (c.quantity || c.count || 0);
+      });
+    };
+    addTo(inv.items, await apiAction("get_cargo", {}));
+    addTo(inv.storage, await apiAction("view_storage", { target: "self" }));
+    addTo(inv.factionStorage, await apiAction("view_faction_storage", {}));
+    return inv;
+  }
+
+  async function loadConsumables() {
+    const el = document.getElementById("detail-consumables");
+    if (!el) return;
+    if (!detailState.bot) {
+      el.innerHTML = '<div class="detail-note">No bot configured for this station (cannot compute maintenance).</div>';
+      detailState.consumableData = null;
+      return;
+    }
+    if (!detailState.facilities || detailState.facilities.length === 0) {
+      await loadFacilities();
+    }
+    try {
+      if (!detailState.itemCatalog || !detailState.facilityCatalog) {
+        const c = await (await fetch("/api/catalog")).json();
+        detailState.itemCatalog = c.items || {};
+        detailState.facilityCatalog = c.facilities || {};
+      }
+    } catch {
+      detailState.itemCatalog = {};
+      detailState.facilityCatalog = {};
+    }
+
+    // Ensure catalog cache for each facility type is warm.
+    const types = new Set();
+    (detailState.facilities || []).forEach((f) => {
+      const t = f.facility_type || f.type || f.id;
+      if (t) types.add(t);
+    });
+    await Promise.all([...types].map((t) => getCatalogFacility(t)));
+
+    const inv = await collectStationInventory();
+
+    // Sum maintenance inputs across built & active facilities.
+    const totals = {};
+    const contributing = [];
+    (detailState.facilities || []).forEach((fac) => {
+      if (!isFacilityActive(fac)) return;
+      const id = fac.facility_type || fac.type || fac.id;
+      const maint = facilityMaintenance(fac);
+      if (!maint.length) return;
+      contributing.push({
+        name: fac.name || id || "?",
+        items: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
+      });
+      maint.forEach((m) => {
+        const key = m.item_id;
+        totals[key] = (totals[key] || 0) + (m.quantity || 1);
+      });
+    });
+
+    // Sum weapon-ammo requirements from active defense facilities. A defense
+    // facility goes silent/unarmed if its ammo box is empty, so we track it even
+    // though there's no per-round burn to estimate a depletion time from.
+    const ammo = {};
+    const ammoContributing = [];
+    (detailState.facilities || []).forEach((fac) => {
+      if (!isFacilityActive(fac)) return;
+      const id = fac.facility_type || fac.type || fac.id;
+      const cat = detailState.facilityCatalog && detailState.facilityCatalog[id];
+      const ammoItem = cat && cat.ammo_item;
+      if (!ammoItem) return;
+      ammo[ammoItem] = (ammo[ammoItem] || 0) + 1;
+      ammoContributing.push(fac.name || id || "?");
+    });
+
+    detailState.consumableInv = inv;
+    detailState.consumableData = { totals, ammo, contributing, ammoContributing, inv };
+  }
+
+  function renderConsumables() {
+    const el = document.getElementById("detail-consumables");
+    if (!el) return;
+    const data = detailState.consumableData;
+    if (!data) return;
+    const { totals, ammo, contributing, ammoContributing, inv } = data;
+
+    const ammoKeys = Object.keys(ammo || {});
+    if (Object.keys(totals).length === 0 && ammoKeys.length === 0) {
+      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance or ammo requirements.</div>';
+      return;
+    }
+
+    let allGood = true;
+    // Maintenance is checked every 100 ticks, but consumables are only actually
+    // withdrawn once per 1000 ticks — so the real burn cycle is 1000 ticks.
+    // 1 tick = 10s real time. Ammo rows have no ETA (no per-round burn).
+    const SECS_PER_CYCLE = 1000 * 10;
+    const fmtDuration = (secs) => {
+      if (secs === Infinity) return "—";
+      const d = Math.floor(secs / 86400);
+      const h = Math.floor((secs % 86400) / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      const s = Math.floor(secs % 60);
+      if (d > 0) return `${d}d ${h}h`;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${s}s`;
+      return `${s}s`;
+    };
+
+    const rowFor = (itemId, need, isAmmo) => {
+      const have =
+        (inv.items[itemId] || 0) +
+        (inv.storage[itemId] || 0) +
+        (inv.factionStorage[itemId] || 0);
+      const ok = have >= need;
+      if (!ok) allGood = false;
+      const color = ok ? "var(--secondary-fixed-dim)" : "var(--error)";
+      const cyclesLeft = need > 0 ? have / need : Infinity;
+      const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+      const depletion = isAmmo
+        ? "—"
+        : (have <= 0
+          ? "depleted"
+          : need <= 0
+            ? "—"
+            : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`);
+      const tag = isAmmo ? ' <span class="cons-tag">AMMO</span>' : "";
+      return `<tr>
+        <td class="cons-item">${esc(itemName(itemId))}${tag}</td>
+        <td class="cons-id">${esc(itemId)}</td>
+        <td class="cons-num">${num(need)}</td>
+        <td class="cons-num" style="color:${color}">${num(have)}</td>
+        <td class="cons-num" style="color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+        <td class="cons-eta">${depletion}</td>
+      </tr>`;
+    };
+
+    const maintRows = Object.entries(totals)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([itemId, need]) => rowFor(itemId, need, false))
+      .join("");
+
+    const ammoRows = ammoKeys
+      .sort((a, b) => a.localeCompare(b))
+      .map((itemId) => rowFor(itemId, ammo[itemId], true))
+      .join("");
+
+    const summary = allGood
+      ? '<div class="cons-summary ok">✓ All station requirements satisfied.</div>'
+      : '<div class="cons-summary bad">✗ Some station requirements are short — facilities will not run or defenses will be unarmed without them.</div>';
+
+    const contribHtml = contributing.length
+      ? `<div class="cons-contrib">Maintenance from: ${contributing.map((c) => esc(c.name)).join(", ")}</div>`
+      : "";
+    const ammoHtml = ammoContributing.length
+      ? `<div class="cons-contrib">Ammo for: ${ammoContributing.map((c) => esc(c)).join(", ")}</div>`
+      : "";
+
+    el.innerHTML = `
+      ${summary}
+      <table class="cons-table">
+        <thead>
+          <tr>
+            <th>Item</th>
+            <th>ID</th>
+            <th class="cons-num">Need</th>
+            <th class="cons-num">You have</th>
+            <th class="cons-num">Status</th>
+            <th class="cons-eta">Est. until depletion</th>
+          </tr>
+        </thead>
+        <tbody>${maintRows}${ammoRows}</tbody>
+      </table>
+      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Ammo rows show no depletion estimate — they only flag whether ammo is present (not 0).</div>
+      ${contribHtml}
+      ${ammoHtml}
+    `;
+  }
+
+  // ── Frame-rate cap (GPU) ──────────────────────────────────
+  // Decorative CSS animations (scanline, alert pulse, fuel pulse) re-composite at
+  // the display refresh rate, forcing the per-card backdrop blur to recompute every
+  // frame. Driving them from a throttled rAF loop caps how often the GPU composites.
+  let capFps = 0;            // -1 off, 0 uncapped, else max FPS
+  let animRaf = null;
+  let animTargets = { scan: null, alerts: [], fuelDots: [] };
+  let scanStart = 0;
+  let alertStart = 0;
+  let fuelStart = 0;
+
+  function collectAnimTargets() {
+    animTargets.scan = document.querySelector(".workspace .scanline-bar");
+    animTargets.alerts = Array.from(document.querySelectorAll(".card.alert"));
+    animTargets.fuelDots = Array.from(document.querySelectorAll(".fuel-ok .fuel-dot"));
+  }
+
+  function clearInlineAnim() {
+    if (animTargets.scan) {
+      animTargets.scan.style.transform = "";
+      animTargets.scan.style.opacity = "";
+    }
+    animTargets.alerts.forEach((el) => { el.style.boxShadow = ""; });
+    animTargets.fuelDots.forEach((el) => { el.style.opacity = ""; });
+  }
+
+  function renderAnimFrame(t) {
+    const scan = animTargets.scan;
+    if (scan) {
+      const p = ((t - scanStart) % 6000) / 6000;
+      const y = -10 + p * 1610;
+      scan.style.transform = "translateY(" + y + "px)";
+      scan.style.opacity = String(Math.sin(p * Math.PI) * 0.5);
+    }
+    const aPh = ((t - alertStart) % 2400) / 2400;
+    const aInt = (Math.sin(aPh * 2 * Math.PI - Math.PI / 2) + 1) / 2;
+    animTargets.alerts.forEach((el) => {
+      el.style.boxShadow = "0 0 " + (14 * aInt) + "px rgba(255,180,171," + (0.55 * aInt) + ")";
+    });
+    const fPh = ((t - fuelStart) % 1800) / 1800;
+    const fOp = 0.65 + 0.35 * Math.cos(fPh * 2 * Math.PI);
+    animTargets.fuelDots.forEach((el) => { el.style.opacity = String(fOp); });
+  }
+
+  function stopAnimLoop() {
+    if (animRaf != null) { cancelAnimationFrame(animRaf); animRaf = null; }
+  }
+
+  function startAnimLoop() {
+    stopAnimLoop();
+    if (capFps <= 0) return;        // uncapped: native CSS animations run
+    if (capFps === -1) return;      // off: fx-off class handles static state
+    const interval = 1000 / capFps;
+    let last = 0;
+    const loop = (t) => {
+      animRaf = requestAnimationFrame(loop);
+      if (t - last < interval) return;
+      last = t;
+      renderAnimFrame(t);
+    };
+    animRaf = requestAnimationFrame(loop);
+  }
+
+  function applyFrameCap(fps) {
+    capFps = fps;
+    document.body.classList.remove("fx-capped", "fx-off");
+    if (fps === -1) document.body.classList.add("fx-off");
+    else if (fps > 0) document.body.classList.add("fx-capped");
+    clearInlineAnim();
+    collectAnimTargets();
+    if (fps > 0) {
+      scanStart = alertStart = fuelStart = performance.now();
+    }
+    startAnimLoop();
+  }
+
+  // ── boot ──
+  if (isDetail) {
+    loadDetail();
+  } else {
+    bootstrap();
+    setInterval(() => { if (!isDetail) renderGrid(); }, 5000);
+  }
+  connectWebSocket();
+})();
+</script>
+</body>
+</html>

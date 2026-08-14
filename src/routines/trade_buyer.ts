@@ -22,6 +22,7 @@ import {
   readSettings,
   logFactionActivity,
   isPirateSystem,
+  buildDeniedStationSet,
   type BaseServices,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -30,6 +31,11 @@ import {
   handleBattleNotifications,
   sanitizeCredits,
   fleeFromBattle,
+  isFuelCellItem,
+  getCargoFuelCells,
+  ensureFuelCellReserve,
+  estimateRouteFuel,
+  readPurchaseEstimate,
 } from "./common.js";
 import {
   getActiveSession,
@@ -40,6 +46,8 @@ import {
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
+import { queryRemoteMarket, resolveMarketSource } from "../client_sync_hooks.js";
+import { noteLocalMarketUnavailable } from "../market_local_source.js";
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
@@ -56,16 +64,23 @@ function getTradeBuyerSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
+  homeStation: string;
   buyItems: string[];
   autoInsure: boolean;
   autoCloak: boolean;
   minQuantityToBuy: number;
+  maxBuyQuantity: number;
   maxPrices: Record<string, number>;
+  useRemoteMarketQuery: boolean;
+  maxMarketAgeHours: number;
+  maxFuelCreditsPerFuel: number;
+  homeFuelReserve: number;
 } {
   const all = readSettings();
   // Read from trade_buyer settings (not trader)
   const t = all.trade_buyer || {};
   const botOverrides = username ? (all[username] || {}) : {};
+  const rawAge = t.maxMarketAgeHours;
   return {
     maxSpendPerItem: (t.maxSpendPerItem as number) || 5000,
     maxTotalSpend: (t.maxTotalSpend as number) || 0,
@@ -73,12 +88,44 @@ function getTradeBuyerSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
+    // Explicit home station wins over "any station in the home system". The
+    // per-bot override is checked first so a single bot can be pointed at a
+    // different station than the rest of the fleet.
+    homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
     buyItems: Array.isArray(t.buyItems) ? (t.buyItems as string[]) : [],
     autoInsure: (t.autoInsure as boolean) !== false,
     autoCloak: (t.autoCloak as boolean) ?? false,
     minQuantityToBuy: (t.minQuantityToBuy as number) || 10,
+    // 0 = unlimited. Upper bound on how many of an item are bought per trip,
+    // independent of cargo/budget. Lets you grab tiny deals (min=1) without the
+    // bot draining a whole station into one over-long haul.
+    maxBuyQuantity: (t.maxBuyQuantity as number) || 0,
     maxPrices: (t.maxPrices as Record<string, number>) || {},
+    useRemoteMarketQuery: (t.useRemoteMarketQuery as boolean) ?? true,
+    // 0 = accept market data of any age (old behaviour). Default 24h: anything
+    // older is a ghost listing that will almost certainly fail on arrival.
+    maxMarketAgeHours: typeof rawAge === "number" && rawAge >= 0 ? rawAge : 24,
+    // Ceiling on what a point of tank fuel may cost when buying fuel cells.
+    // Base catalog value is ~2.2cr/fuel, so 25 is already 10x over — it exists
+    // purely to stop the bot paying 20 000cr for a 20-fuel plain fuel_cell when
+    // military cells (100 fuel) are free out of faction storage at home.
+    maxFuelCreditsPerFuel: (t.maxFuelCreditsPerFuel as number) ?? 25,
+    // Fuel (tank units) worth of cells to carry when leaving home, where cells
+    // are free. 0 = auto (2x the ship's tank). Two military cells already cover
+    // most routes; the reserve only has to bridge systems with no station.
+    homeFuelReserve: (t.homeFuelReserve as number) ?? 0,
   };
+}
+
+/**
+ * Effective credit budget for a single buy trip.
+ * `maxSpendPerItem` caps spend on one item type, `maxTotalSpend` caps the whole
+ * run — since a trip buys exactly one item type, the tighter of the two applies.
+ * Returns 0 when both are unlimited.
+ */
+function getSpendBudget(settings: ReturnType<typeof getTradeBuyerSettings>): number {
+  const caps = [settings.maxSpendPerItem, settings.maxTotalSpend].filter(v => typeof v === "number" && v > 0);
+  return caps.length > 0 ? Math.min(...caps) : 0;
 }
 
 // ── Trade Session Recovery ──────────────────────────────────
@@ -91,7 +138,7 @@ function getTradeBuyerSettings(username?: string): {
 async function recoverBuySession(
   ctx: RoutineContext,
   session: TradeSession,
-  settings: ReturnType<typeof getTradeBuyerSettings>,
+  homeSystem: string,
 ): Promise<TradeSession | null> {
   const { bot } = ctx;
 
@@ -126,7 +173,6 @@ async function recoverBuySession(
   // Check if we're at the destination (home station)
   if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
     // Verify we're heading to a valid home station
-    const homeSystem = settings.homeSystem;
     if (!homeSystem) {
       ctx.log("error", "No home system configured — cannot recover session");
       await failTradeSession(session.botUsername, "No home system configured");
@@ -164,6 +210,253 @@ interface BuyRoute {
   totalCost: number;
 }
 
+/** A "this item is for sale here" observation, normalised across data sources. */
+interface SellListing {
+  itemId: string;
+  itemName: string;
+  systemId: string;
+  poiId: string;
+  poiName: string;
+  price: number;
+  quantity: number;
+  /** Age of the observation in ms, or null when the source didn't say. */
+  ageMs: number | null;
+  /** `market` = market routine data (marketDetails.json / live observations),
+   *  `map`    = the galaxy map's cached market rows. */
+  origin: "market" | "map";
+}
+
+const HOUR_MS = 3_600_000;
+
+/** Fuel per jump assumed only when `find_route` can't tell us the real number. */
+const FALLBACK_FUEL_PER_JUMP = 10;
+
+// ── Failure memory ───────────────────────────────────────────
+//
+// A station that just refused to sell us an item must not be re-picked on the
+// very next 60s re-scan. The old routine only remembered failures for the
+// current cycle, so a ghost listing produced the same doomed round-trip over
+// and over.
+
+const RECENT_FAILURE_TTL_MS = 30 * 60 * 1000;
+const recentBuyFailures = new Map<string, number>();
+
+function failureKey(systemId: string, poiId: string, itemId: string): string {
+  return `${systemId}:${poiId}:${itemId}`.toLowerCase();
+}
+
+function noteBuyFailure(systemId: string, poiId: string, itemId: string): void {
+  recentBuyFailures.set(failureKey(systemId, poiId, itemId), Date.now());
+}
+
+function isRecentBuyFailure(systemId: string, poiId: string, itemId: string): boolean {
+  const key = failureKey(systemId, poiId, itemId);
+  const at = recentBuyFailures.get(key);
+  if (at === undefined) return false;
+  if (Date.now() - at > RECENT_FAILURE_TTL_MS) {
+    recentBuyFailures.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// ── Station validation ───────────────────────────────────────
+
+/** Blacklist lookups hit settings on every call, and route scanning resolves
+ *  thousands of listings, so cache them for the duration of a scan. */
+const BLACKLIST_CACHE_MS = 10_000;
+let blacklistCache: { at: number; systems: Set<string>; stations: Set<string> } | null = null;
+
+function getBlacklists(): { systems: Set<string>; stations: Set<string> } {
+  const now = Date.now();
+  if (blacklistCache && now - blacklistCache.at < BLACKLIST_CACHE_MS) return blacklistCache;
+  blacklistCache = {
+    at: now,
+    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    // Already folds in Settings → General → stationBlacklist plus any station
+    // that denied us docking this session.
+    stations: buildDeniedStationSet(),
+  };
+  return blacklistCache;
+}
+
+/**
+ * Resolve a market listing's location to a station the bot can actually dock at.
+ *
+ * The galaxy map carries market rows for POIs that have no base at all — ice
+ * fields, planets, asteroid belts — left over from older scans or seeded data.
+ * A route to one of those is unexecutable: the bot flies out, `ensureDocked()`
+ * quietly diverts it to the nearest real station, and the buy then fails
+ * against a market that never listed the item (exactly the
+ * "Kuiper Ice Fields → Sol Central → item_not_available" loop).
+ *
+ * Every listing must therefore prove it points at a dockable, non-pirate,
+ * non-blacklisted station before it is allowed to become a route.
+ */
+function resolveBuyStation(
+  systemId: string,
+  poiId: string,
+  fallbackName: string,
+): { systemId: string; poiId: string; poiName: string } | null {
+  if (!systemId || !poiId) return null;
+  if (isPirateSystem(systemId)) return null;
+  const { systems: systemBlacklist, stations: stationBlacklist } = getBlacklists();
+  if (systemBlacklist.has(systemId.toLowerCase())) return null;
+
+  const system = mapStore.getSystem(systemId);
+  if (!system) return null;
+
+  let poi = system.pois.find(p => p.id === poiId);
+  if (!poi) {
+    // Market data may name the station by base id / friendly name instead of
+    // POI id; resolve it against the map before giving up.
+    const resolved = mapStore.resolveStationIdentity(`${systemId}|${poiId}`);
+    if (resolved.matched && resolved.systemId === systemId && resolved.poiId) {
+      poi = system.pois.find(p => p.id === resolved.poiId);
+    }
+  }
+
+  // The mobile capital moves; only its currently tracked location is real.
+  if (!poi && poiId === "mobile_capital") {
+    const loc = mapStore.getMobileCapitolLocation();
+    if (!loc || loc.systemId !== systemId) return null;
+    return { systemId, poiId: loc.poiId || "mobile_capital", poiName: fallbackName || "Mobile Capital" };
+  }
+
+  if (!poi) return null;
+  // No base = nothing to dock with = nothing to buy from. Matches isStationPoi().
+  if (!(poi.has_base || poi.base_id || (poi.type || "").toLowerCase() === "station")) return null;
+  if (stationBlacklist.has(poi.id.toLowerCase())) return null;
+  if (stationBlacklist.has(`${systemId}|${poi.id}`.toLowerCase())) return null;
+
+  return { systemId, poiId: poi.id, poiName: poi.name || fallbackName || poi.id };
+}
+
+// ── Market data sourcing ─────────────────────────────────────
+
+function parseAgeMs(iso: string | undefined | null): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Date.now() - t);
+}
+
+function describeAge(ageMs: number | null): string {
+  if (ageMs === null) return "age unknown";
+  if (ageMs < 60_000) return `${Math.round(ageMs / 1000)}s old`;
+  if (ageMs < HOUR_MS) return `${Math.round(ageMs / 60_000)}min old`;
+  if (ageMs < 48 * HOUR_MS) return `${Math.round(ageMs / HOUR_MS)}h old`;
+  return `${Math.round(ageMs / (24 * HOUR_MS))}d old`;
+}
+
+/**
+ * Ask the market routine's data (this client's `data/marketDetails.json` plus
+ * its live in-memory observations, or a connected market client) where each
+ * wanted item is actually on sale right now.
+ *
+ * This is the authoritative source. The galaxy map's market cache is only a
+ * last-resort backfill: it is written opportunistically by every routine that
+ * happens to dock somewhere, it keeps rows for POIs that are not stations, and
+ * entries there can be months old.
+ */
+async function collectMarketListings(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTradeBuyerSettings>,
+  currentSystem: string,
+): Promise<SellListing[]> {
+  const out: SellListing[] = [];
+  if (settings.buyItems.length === 0) return out;
+
+  const source = await resolveMarketSource();
+  if (source.mode === "none") {
+    ctx.log("trade", `[Market] No market data source: ${source.reason}`);
+    return out;
+  }
+  ctx.log("trade", `[${source.label}] ${source.reason}`);
+
+  const wanted = settings.buyItems.slice(0, 20);
+  const perItem = await Promise.all(wanted.map(async (itemId) => {
+    try {
+      return { itemId, res: await queryRemoteMarket({ itemId, tradeType: "buy", requesterSystemId: currentSystem }) };
+    } catch (err) {
+      ctx.log("trade", `[${source.label}] Query failed for ${itemId}: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    }
+  }));
+
+  let rejectedStations = 0;
+  for (const entry of perItem) {
+    if (!entry || !entry.res.ok) continue;
+    for (const r of entry.res.results) {
+      if (!(r.price > 0) || !(r.quantity > 0)) continue;
+      const station = resolveBuyStation(r.systemId, r.stationPoiId, r.stationName);
+      if (!station) {
+        rejectedStations++;
+        continue;
+      }
+      out.push({
+        itemId: entry.itemId,
+        itemName: r.itemName || catalogStore.resolveItemName(entry.itemId) || entry.itemId,
+        systemId: station.systemId,
+        poiId: station.poiId,
+        poiName: station.poiName,
+        price: r.price,
+        quantity: r.quantity,
+        ageMs: parseAgeMs(r.lastUpdated),
+        origin: "market",
+      });
+    }
+  }
+
+  ctx.log(
+    "trade",
+    `[${source.label}] ${out.length} live sell listing(s) for ${wanted.length} item(s)` +
+    (rejectedStations > 0 ? ` (${rejectedStations} skipped: not a dockable station in our map)` : ""),
+  );
+  return out;
+}
+
+/** Sell listings from the galaxy map cache — station-filtered, used as backfill. */
+function collectMapListings(ctx: RoutineContext, settings: ReturnType<typeof getTradeBuyerSettings>): SellListing[] {
+  const wanted = new Set(settings.buyItems.map(i => i.toLowerCase()));
+  if (wanted.size === 0) return [];
+
+  const out: SellListing[] = [];
+  let nonStationRows = 0;
+
+  for (const [sysId, sys] of Object.entries(mapStore.getAllSystems())) {
+    if (isPirateSystem(sysId)) continue;
+    for (const poi of sys.pois) {
+      let stationChecked: ReturnType<typeof resolveBuyStation> | undefined;
+      for (const m of poi.market) {
+        if (!wanted.has(m.item_id.toLowerCase())) continue;
+        if (m.best_sell === null || m.best_sell <= 0 || m.sell_quantity <= 0) continue;
+        if (stationChecked === undefined) stationChecked = resolveBuyStation(sysId, poi.id, poi.name);
+        if (!stationChecked) {
+          nonStationRows++;
+          continue;
+        }
+        out.push({
+          itemId: m.item_id,
+          itemName: m.item_name || m.item_id,
+          systemId: stationChecked.systemId,
+          poiId: stationChecked.poiId,
+          poiName: stationChecked.poiName,
+          price: m.best_sell,
+          quantity: m.sell_quantity,
+          ageMs: parseAgeMs(m.last_updated),
+          origin: "map",
+        });
+      }
+    }
+  }
+
+  if (nonStationRows > 0) {
+    ctx.log("trade", `[MapCache] Ignored ${nonStationRows} cached sell row(s) at POIs with no dockable station`);
+  }
+  return out;
+}
+
 // ── Buy route discovery ────────────────────────────────────
 
 /** Estimate fuel cost between two systems using mapStore route data. */
@@ -176,97 +469,175 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
-/** Find the cheapest known market sell prices for items. */
+/**
+ * Find the cheapest place to buy each wanted item.
+ *
+ * `marketListings` (from the market routine) is authoritative; map-cache rows
+ * for the same station/item are discarded in its favour so a months-old cached
+ * price can never outbid a live one.
+ */
 function findCheapestSellers(
   ctx: RoutineContext,
   settings: ReturnType<typeof getTradeBuyerSettings>,
   currentSystem: string,
   cargoCapacity: number = 999,
+  marketListings: SellListing[] = [],
 ): BuyRoute[] {
   const routes: BuyRoute[] = [];
 
-  // Collect all sell listings from mapStore (where we can buy from NPC market)
-  const sellListings: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
-
-  for (const [sysId, sys] of Object.entries(mapStore.getAllSystems())) {
-    // Skip pirate systems
-    if (isPirateSystem(sysId)) continue;
-    for (const poi of sys.pois) {
-      for (const m of poi.market) {
-        if (m.best_sell !== null && m.best_sell > 0 && m.sell_quantity > 0) {
-          sellListings.push({
-            itemId: m.item_id,
-            itemName: m.item_name,
-            systemId: sysId,
-            poiId: poi.id,
-            poiName: poi.name,
-            price: m.best_sell,
-            quantity: m.sell_quantity,
-          });
-        }
-      }
-    }
+  if (settings.buyItems.length === 0) {
+    ctx.log("trade", "No items selected in \"Items to Buy\" — nothing to scan for");
+    return routes;
   }
 
-  ctx.log("trade", `Scanning ${sellListings.length} sell listings for items: ${settings.buyItems.join(", ") || "(none)"}`);
+  // Merge sources, one row per station+item, market data always wins.
+  const merged = new Map<string, SellListing>();
+  for (const l of collectMapListings(ctx, settings)) {
+    merged.set(`${l.systemId}/${l.poiId}/${l.itemId}`, l);
+  }
+  let overridden = 0;
+  for (const l of marketListings) {
+    const key = `${l.systemId}/${l.poiId}/${l.itemId}`;
+    if (merged.has(key)) overridden++;
+    merged.set(key, l);
+  }
+  const sellListings = [...merged.values()];
+
+  const fromMarket = sellListings.filter(l => l.origin === "market").length;
+  ctx.log(
+    "trade",
+    `Scanning ${sellListings.length} dockable sell listing(s) — ${fromMarket} from the market routine` +
+    `, ${sellListings.length - fromMarket} from the map cache` +
+    (overridden > 0 ? ` (${overridden} stale cache row(s) replaced by live data)` : ""),
+  );
   ctx.log("trade", `Max prices config: ${JSON.stringify(settings.maxPrices || {})}`);
 
+  const maxAgeMs = settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours * HOUR_MS : 0;
+
   // Group by item to find cheapest sources
-  const itemSellers = new Map<string, typeof sellListings>();
+  const itemSellers = new Map<string, SellListing[]>();
   for (const seller of sellListings) {
     const existing = itemSellers.get(seller.itemId) || [];
     existing.push(seller);
     itemSellers.set(seller.itemId, existing);
   }
 
-  ctx.log("trade", `Found ${itemSellers.size} unique items for sale in cache`);
+  for (const buyItem of settings.buyItems) {
+    const itemId = buyItem;
+    const sellers = itemSellers.get(itemId)
+      // Fall back to a case-insensitive lookup for legacy config entries.
+      || [...itemSellers.entries()].find(([k]) => k.toLowerCase() === itemId.toLowerCase())?.[1];
 
-  // For each item, find the cheapest seller
-  for (const [itemId, sellers] of itemSellers.entries()) {
-    // Filter by allowed items - MUST be explicitly selected in buyItems list
-    if (settings.buyItems.length === 0) {
-      // No items selected - skip this item (don't buy anything if nothing is configured)
+    if (!sellers || sellers.length === 0) {
+      ctx.log("trade", `>>> ${itemId}: no station is selling this in any known market data`);
       continue;
     }
-    
-    // Check if this item is in the buy list (exact match)
-    const match = settings.buyItems.some(t =>
-      t.toLowerCase() === itemId.toLowerCase()
-    );
-    if (!match) continue;
 
     ctx.log("trade", `>>> Found matching item: ${itemId} (${sellers.length} sellers)`);
+
+    // Freshness gate — a listing nobody has confirmed for weeks is a ghost, and
+    // chasing it costs a full round trip plus fuel.
+    let candidates = sellers;
+    if (maxAgeMs > 0) {
+      const fresh = candidates.filter(s => s.ageMs !== null && s.ageMs <= maxAgeMs);
+      if (fresh.length === 0) {
+        const best = candidates.reduce<number | null>(
+          (acc, s) => (s.ageMs === null ? acc : acc === null ? s.ageMs : Math.min(acc, s.ageMs)),
+          null,
+        );
+        ctx.log(
+          "trade",
+          `>>> ${itemId}: REJECTED all ${candidates.length} seller(s) — market data older than ` +
+          `${settings.maxMarketAgeHours}h (freshest is ${describeAge(best)}). Run the market routine at those ` +
+          `stations, or raise "Max Market Data Age" (0 = accept any age)`,
+        );
+        continue;
+      }
+      if (fresh.length < candidates.length) {
+        ctx.log("trade", `>>> ${itemId}: dropped ${candidates.length - fresh.length} seller(s) with market data older than ${settings.maxMarketAgeHours}h`);
+      }
+      candidates = fresh;
+    }
+
+    // Recently-failed stations are skipped so a bad listing can't produce the
+    // same doomed round trip every 60s.
+    const notRecentlyFailed = candidates.filter(s => !isRecentBuyFailure(s.systemId, s.poiId, s.itemId));
+    if (notRecentlyFailed.length < candidates.length) {
+      ctx.log("trade", `>>> ${itemId}: skipping ${candidates.length - notRecentlyFailed.length} station(s) that recently refused this buy`);
+    }
+    candidates = notRecentlyFailed;
+    if (candidates.length === 0) continue;
 
     // Check max price for this item
     const maxPrice = settings.maxPrices?.[itemId];
     if (maxPrice !== undefined && maxPrice > 0) {
       // Filter out sellers that are above the max price
-      const filteredSellers = sellers.filter(s => s.price <= maxPrice);
+      const filteredSellers = candidates.filter(s => s.price <= maxPrice);
       if (filteredSellers.length === 0) {
-        const cheapest = Math.min(...sellers.map(s => s.price));
+        const cheapest = Math.min(...candidates.map(s => s.price));
         ctx.log("trade", `>>> ${itemId}: No sellers at or below max price ${maxPrice}cr (cheapest available: ${cheapest}cr)`);
         continue;
       } // No sellers at acceptable price
-      sellers.length = 0;
-      sellers.push(...filteredSellers);
-      ctx.log("trade", `>>> ${itemId}: Filtered to ${sellers.length} sellers at or below ${maxPrice}cr`);
+      candidates = filteredSellers;
+      ctx.log("trade", `>>> ${itemId}: Filtered to ${candidates.length} sellers at or below ${maxPrice}cr`);
     }
 
     // Sort by price ascending (cheapest first)
-    sellers.sort((a, b) => a.price - b.price);
+    candidates = [...candidates].sort((a, b) => a.price - b.price);
 
-    for (const seller of sellers.slice(0, 3)) { // Top 3 cheapest per item
+    const itemSize = getItemSize(itemId);
+    const cargoFits = maxItemsForCargo(cargoCapacity, itemId);
+    const budget = getSpendBudget(settings);
+    const minQty = Math.max(1, settings.minQuantityToBuy);
+
+    // Cargo is a hard, seller-independent limit — report it once and move on
+    if (cargoFits < minQty) {
+      ctx.log("trade", `>>> ${itemId}: REJECTED — cargo holds only ${cargoFits}x (capacity ${cargoCapacity}, item size ${itemSize}), need at least ${minQty}x (minQuantityToBuy)`);
+      continue;
+    }
+
+    for (const seller of candidates.slice(0, 3)) { // Top 3 cheapest per item
+      const where = `${seller.poiName} (${seller.systemId}) @ ${seller.price}cr [${seller.origin}, ${describeAge(seller.ageMs)}]`;
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, seller.systemId, settings.fuelCostPerJump);
-      if (jumps >= 999) continue;
+      if (jumps >= 999) {
+        ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — no route from ${currentSystem} (unreachable or blacklisted)`);
+        continue;
+      }
 
-      const buyQty = Math.min(seller.quantity, maxItemsForCargo(cargoCapacity, itemId));
-      if (buyQty < settings.minQuantityToBuy) continue;
+      // Budget limits HOW MANY we buy — it must never silently discard the route
+      let buyQty = Math.min(seller.quantity, cargoFits);
+      if (settings.maxBuyQuantity > 0) {
+        if (settings.maxBuyQuantity < minQty) {
+          ctx.log(
+            "trade",
+            `>>> ${itemId}: REJECTED ${where} — max buy quantity ${settings.maxBuyQuantity} is below min quantity ${minQty}; raise "Max Buy Quantity"`,
+          );
+          continue;
+        }
+        buyQty = Math.min(buyQty, settings.maxBuyQuantity);
+      }
+      if (budget > 0) {
+        const affordable = Math.floor(budget / seller.price);
+        if (affordable < minQty) {
+          ctx.log(
+            "trade",
+            `>>> ${itemId}: REJECTED ${where} — spend budget ${budget}cr only affords ${affordable}x (need ${minQty}x). ` +
+            `Raise "Max Spend Per Item"${settings.maxTotalSpend > 0 && settings.maxTotalSpend <= settings.maxSpendPerItem ? ` / "Max Total Spend"` : ""} to at least ${seller.price * minQty}cr`,
+          );
+          continue;
+        }
+        buyQty = Math.min(buyQty, affordable);
+      }
+
+      if (buyQty < minQty) {
+        ctx.log("trade", `>>> ${itemId}: REJECTED ${where} — only ${buyQty}x obtainable (stock ${seller.quantity}, cargo fits ${cargoFits}), need ${minQty}x`);
+        continue;
+      }
 
       // Calculate total cost including fuel
       const itemCost = seller.price * buyQty;
-      if (settings.maxSpendPerItem > 0 && itemCost > settings.maxSpendPerItem) continue;
-
       const totalCost = itemCost + fuelCost;
+      ctx.log("trade", `>>> ${itemId}: ACCEPTED ${where} — ${buyQty}x for ${itemCost}cr + ${fuelCost}cr fuel (${jumps} jumps)`);
 
       routes.push({
         itemId: seller.itemId,
@@ -285,8 +656,15 @@ function findCheapestSellers(
     }
   }
 
-  // Sort by total cost ascending (cheapest to acquire first)
-  routes.sort((a, b) => a.totalCost - b.totalCost);
+  // Sort by effective cost per unit (item price + amortized fuel), then prefer
+  // the larger haul. Sorting by raw total cost would rank a 2x purchase above a
+  // cheaper-per-unit 20x purchase, which is wrong for a stockpiling routine.
+  routes.sort((a, b) => {
+    const aPer = a.totalCost / Math.max(1, a.buyQty);
+    const bPer = b.totalCost / Math.max(1, b.buyQty);
+    if (aPer !== bPer) return aPer - bPer;
+    return b.buyQty - a.buyQty;
+  });
   return routes;
 }
 
@@ -311,8 +689,8 @@ function getHomeStation(homeSystem: string): { id: string; name: string } | null
     return { id: station.id, name: station.name };
   }
 
-  // Fallback to any station
-  const anyStation = system.pois.find(p => p.type === "station" || p.has_base);
+  // Fallback to any station (outposts excluded — never dockable by non-faction members)
+  const anyStation = findStation(compatiblePois, undefined, false);
   if (anyStation) {
     return { id: anyStation.id, name: anyStation.name };
   }
@@ -320,84 +698,70 @@ function getHomeStation(homeSystem: string): { id: string; name: string } | null
   return null;
 }
 
-// ── Missions ─────────────────────────────────────────────────
-
 /**
- * Complete any active missions that are ready, then accept new market/trade
- * missions at the current station (up to 2 per visit, respecting the 5-mission cap).
- * Must be docked.
+ * Resolve where "home" actually is for this bot.
+ *
+ * Precedence:
+ *   1. An explicit `homeStation` setting (per-bot override first, then the
+ *      routine's own setting). Every format the UI writes is accepted:
+ *      "system|poi", a bare POI id/hex, a base id, or a station name.
+ *   2. Otherwise auto-pick a market station inside `homeSystem`.
+ *
+ * The system of an explicitly configured station is authoritative — without
+ * this, configuring a home station outside the (often stale) `homeSystem` value
+ * silently sent the bot back to whatever station the home system happened to
+ * resolve to, e.g. flying to Sol Central after Arneb had been configured.
  */
-async function tryMissions(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  if (!bot.docked) return;
+function resolveHomeStation(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getTradeBuyerSettings>,
+): { id: string; name: string; systemId: string } | null {
+  const raw = (settings.homeStation || "").trim();
+  let systemId = (settings.homeSystem || "").trim();
 
-  // Try to complete active missions
-  const activeResp = await bot.exec("get_active_missions");
-  let activeMissionCount = 0;
-  if (!activeResp.error && activeResp.result) {
-    const ar = activeResp.result as Record<string, unknown>;
-    const active = (
-      Array.isArray(ar.missions) ? ar.missions :
-      Array.isArray(ar) ? ar :
-      []
-    ) as Array<Record<string, unknown>>;
-    activeMissionCount = active.length;
+  if (raw) {
+    const resolved = mapStore.resolveStationIdentity(raw);
 
-    for (const mission of active) {
-      const missionId = (mission.mission_id as string) || (mission.id as string) || "";
-      if (!missionId) continue;
-      const status = ((mission.status as string) || "").toLowerCase();
-      if (status === "incomplete" || status === "in_progress") continue;
-      const completeResp = await bot.exec("complete_mission", { mission_id: missionId });
-      if (completeResp.error) {
-        if (completeResp.error.code === "mission_incomplete") continue;
+    if (resolved.systemId) {
+      if (systemId && resolved.systemId !== systemId) {
+        ctx.log(
+          "trade",
+          `Home station "${raw}" lives in ${resolved.systemId} — using that instead of homeSystem=${systemId}`,
+        );
       }
-      if (!completeResp.error && completeResp.result) {
-        const cr = completeResp.result as Record<string, unknown>;
-        const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
-        ctx.log("trade", `Mission complete! +${earned}cr`);
-        activeMissionCount--;
-        await bot.refreshStatus();
-      }
+      systemId = resolved.systemId;
     }
+
+    if (resolved.poiId) {
+      if (!systemId) {
+        ctx.log("error", `Home station "${raw}" is not in the galaxy map and no home system is set — cannot resolve home`);
+        return null;
+      }
+      if (!resolved.matched) {
+        ctx.log("trade", `Home station "${raw}" is not in the galaxy map yet — using it as-is in ${systemId}`);
+      }
+      return { id: resolved.poiId, name: resolved.poiName || resolved.poiId, systemId };
+    }
+    // `raw` named a bare system (or nothing usable) — fall through and auto-pick
+    // a station inside it.
   }
 
-  // Accept new market/trade missions (cap at 5 total active)
-  if (activeMissionCount >= 5) return;
+  if (!systemId) return null;
 
-  const availResp = await bot.exec("get_missions");
-  if (availResp.error || !availResp.result) return;
-
-  const vr = availResp.result as Record<string, unknown>;
-  const available = (
-    Array.isArray(vr.missions) ? vr.missions :
-    Array.isArray(vr) ? vr :
-    []
-  ) as Array<Record<string, unknown>>;
-
-  let accepted = 0;
-  for (const mission of available) {
-    if (activeMissionCount + accepted >= 5 || accepted >= 2) break;
-
-    const missionId = (mission.mission_id as string) || (mission.id as string) || "";
-    const type = ((mission.type as string) || "").toLowerCase();
-    const title = ((mission.title as string) || "").toLowerCase();
-
-    const isTradeRelated =
-      type === "market_participation" || type === "trade" || type === "delivery" ||
-      type === "procurement" ||
-      title.includes("market") || title.includes("trade") ||
-      title.includes("buy") || title.includes("purchase") || title.includes("deliver");
-
-    if (!isTradeRelated || !missionId) continue;
-
-    const acceptResp = await bot.exec("accept_mission", { mission_id: missionId });
-    if (!acceptResp.error) {
-      ctx.log("trade", `Accepted mission: ${(mission.title as string) || missionId}`);
-      accepted++;
-    }
-  }
+  const auto = getHomeStation(systemId);
+  if (!auto) return null;
+  return { id: auto.id, name: auto.name, systemId };
 }
+
+// ── Missions ─────────────────────────────────────────────────
+//
+// INTENTIONALLY NOT IMPLEMENTED. The trade buyer never accepts, completes or
+// tracks missions. It exists purely to buy items cheaply and stockpile them in
+// faction storage. Mission handling previously lived here and was harmful:
+// every station visit burned rate-limited `get_missions` / `accept_mission`
+// calls, and once the 5-mission cap was hit it spammed `too_many_missions`
+// errors for ~10s per attempt while blocking the buy loop.
+// Do not re-add mission logic to this routine.
 
 // ── Trade Buyer routine ─────────────────────────────────────
 
@@ -432,26 +796,40 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   // Load settings
   let settings = getTradeBuyerSettings(bot.username);
 
-  // Validate home system is configured
-  if (!settings.homeSystem) {
-    ctx.log("error", "No home system configured for trade buyer — please set homeSystem in settings");
+  // Validate a home destination is configured. The station itself is resolved
+  // once per cycle below so editing the setting takes effect without a restart.
+  if (!settings.homeSystem && !settings.homeStation) {
+    ctx.log("error", "No home configured for trade buyer — please set a home station (or at least a home system) in settings");
     await ctx.sleep(60000);
     return;
   }
 
-  // Get home station info
-  const homeStation = getHomeStation(settings.homeSystem);
-  if (!homeStation) {
-    ctx.log("error", `Cannot find station in home system ${settings.homeSystem}`);
-    await ctx.sleep(60000);
-    return;
-  }
+  let lastHomeKey = "";
 
   while (bot.state === "running") {
     // Refresh settings each cycle
     settings = getTradeBuyerSettings(bot.username);
 
-    ctx.log("trade", `Settings loaded: homeSystem=${settings.homeSystem || "(not set)"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}`);
+    // Re-resolve home every cycle — a settings change must not require a restart.
+    const home = resolveHomeStation(ctx, settings);
+    if (!home) {
+      ctx.log(
+        "error",
+        `Cannot resolve a home station (homeStation=${settings.homeStation || "(not set)"}, homeSystem=${settings.homeSystem || "(not set)"}) — check settings`,
+      );
+      await ctx.sleep(60000);
+      continue;
+    }
+    const homeStation = { id: home.id, name: home.name };
+    const homeSystemId = home.systemId;
+
+    const homeKey = `${homeSystemId}/${homeStation.id}`;
+    if (lastHomeKey && lastHomeKey !== homeKey) {
+      ctx.log("trade", `Home station changed to ${homeStation.name} (${homeSystemId}) — future deliveries go there`);
+    }
+    lastHomeKey = homeKey;
+
+    ctx.log("trade", `Settings loaded: home=${homeStation.name} (${homeSystemId})${settings.homeStation ? " [configured]" : " [auto-picked from home system]"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}, maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -510,7 +888,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;
     if (activeSession) {
-      recoveredSession = await recoverBuySession(ctx, activeSession, settings);
+      recoveredSession = await recoverBuySession(ctx, activeSession, homeSystemId);
       if (recoveredSession) {
         ctx.log("trade", `Resuming buy session: ${recoveredSession.itemName} (${recoveredSession.state})`);
       }
@@ -521,7 +899,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
     };
-    let extraSpent = 0;
     let route: BuyRoute | null = null;
     let buyQty = 0;
     let totalSpent = 0;
@@ -543,7 +920,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         sourcePoiName: recoveredSession.sourcePoiName,
         buyPrice: recoveredSession.buyPricePerUnit,
         buyQty: recoveredSession.quantityBought,
-        destSystem: settings.homeSystem,
+        destSystem: homeSystemId,
         destPoi: homeStation.id,
         destPoiName: homeStation.name,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
@@ -560,8 +937,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         continue;
       }
 
-      ctx.log("travel", `Resuming route to home...`);
-      const arrived = await navigateToSystem(ctx, settings.homeSystem, {
+      ctx.log("travel", `Resuming route to home (${homeStation.name} in ${homeSystemId})...`);
+      const arrived = await navigateToSystem(ctx, homeSystemId, {
         ...safetyOpts,
         noJettison: true,
         onJump: async (jumpNum) => {
@@ -581,9 +958,11 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
 
       await updateTradeSession(bot.username, { state: "at_destination" });
-      bot.system = settings.homeSystem;
+      bot.system = homeSystemId;
 
-      if (bot.poi !== homeStation.id) {
+      // `bot.poi` may report the friendly name while the config holds the hex id
+      // (or vice versa) — compare through the map so we don't re-travel in place.
+      if (!mapStore.sameStation(bot.poi, homeStation.id)) {
         ctx.log("travel", `Traveling to ${homeStation.name}...`);
         await bot.exec("travel", { target_poi: homeStation.id });
         bot.poi = homeStation.id;
@@ -596,9 +975,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // ── Ensure docked (also records market data) ──
     yield "dock";
     await ensureDocked(ctx);
-    if (bot.docked) {
-      await tryMissions(ctx);
-    }
 
     // ── Fuel + hull check + mods ──
     yield "maintenance";
@@ -606,6 +982,21 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     await repairShip(ctx);
     const modProfile = getModProfile("trader");
     if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+    // ── Stock the emergency fuel reserve while we are at home ──
+    // Military cells (100 fuel / 3 space) are free out of faction storage here,
+    // so leaving home with a full reserve is what keeps the bot from ever having
+    // to consider a 20 000cr plain fuel_cell at the far end of a 27-jump run.
+    if (bot.docked && bot.system === homeSystemId && mapStore.sameStation(bot.poi, homeStation.id)) {
+      await bot.refreshShip();
+      await ensureFuelCellReserve(ctx, {
+        fuelNeeded: settings.homeFuelReserve > 0
+          ? settings.homeFuelReserve
+          : Math.max(200, (bot.maxFuel || 100) * 2),
+        reason: "home reserve",
+        maxCreditsPerFuel: settings.maxFuelCreditsPerFuel,
+      });
+    }
 
     // ── Handle leftover cargo items ──
     yield "handle_cargo";
@@ -619,8 +1010,11 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     const cargoItems = bot.inventory.filter(i => {
       if (i.quantity <= 0) return false;
-      const lower = i.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+      // Keep real fuel cells (they are the ship's reserve). Note this is an
+      // exact, catalog-backed check: the old `itemId.includes("fuel")` test also
+      // matched fusion_fuel_rod / reactor_fuel_assembly / fuel_tank, so those
+      // never got delivered and rode around in cargo forever.
+      if (isFuelCellItem(i.itemId)) return false;
       if (protectedItemId && i.itemId === protectedItemId) {
         ctx.log("trade", `Skipping ${i.quantity}x ${i.name} - part of active buy session`);
         return false;
@@ -652,21 +1046,29 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshStatus();
     await bot.refreshCargo();
 
-    // Subtract fuel cell weight from cargo capacity
-    let fuelCellWeight = 0;
-    for (const item of bot.inventory) {
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) {
-        fuelCellWeight += item.quantity * getItemSize(item.itemId);
-      }
-    }
+    // Reserve the cargo weight the fuel cells occupy — trade goods only get
+    // what is left over.
+    const fuelCellWeight = getCargoFuelCells(bot).cargoUsed;
     const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
 
-    routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity);
+    // Market routine data (data/marketDetails.json + its live in-memory
+    // observations, or a connected market client) is the authoritative source
+    // for what is actually on sale where. The galaxy map cache is only used to
+    // backfill stations the market routine has never visited.
+    let marketListings: SellListing[] = [];
+    if (settings.useRemoteMarketQuery !== false) {
+      marketListings = await collectMarketListings(ctx, settings, bot.system);
+    } else {
+      ctx.log("trade", "Market query disabled in settings — falling back to the galaxy map cache only");
+    }
 
-    // Update routes with home station info
+    routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity, marketListings);
+
+    // Update routes with home station info (the resolved station is
+    // authoritative — findCheapestSellers only fills a placeholder)
     routes = routes.map(r => ({
       ...r,
+      destSystem: homeSystemId,
       destPoi: homeStation.id,
       destPoiName: homeStation.name,
     }));
@@ -680,7 +1082,14 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     if (routes.length === 0 && !recoveredSession) {
-      ctx.log("trade", "No profitable buy opportunities found — waiting 60s before re-scanning");
+      const budget = getSpendBudget(settings);
+      ctx.log(
+        "trade",
+        `No buy routes passed the filters (see REJECTED lines above) — ` +
+        `buyItems=[${settings.buyItems.join(", ") || "(none)"}], spend budget=${budget > 0 ? budget + "cr" : "unlimited"}, ` +
+        `minQty=${Math.max(1, settings.minQuantityToBuy)}, cargo=${cargoCapacity}, ` +
+        `maxMarketAge=${settings.maxMarketAgeHours > 0 ? settings.maxMarketAgeHours + "h" : "any"}. Waiting 60s before re-scanning`,
+      );
       await ctx.sleep(60000);
       continue;
     }
@@ -709,7 +1118,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         sourcePoiName: recoveredSession.sourcePoiName,
         buyPrice: recoveredSession.buyPricePerUnit,
         buyQty: recoveredSession.quantityBought,
-        destSystem: settings.homeSystem,
+        destSystem: homeSystemId,
         destPoi: homeStation.id,
         destPoiName: homeStation.name,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
@@ -719,7 +1128,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       buyQty = recoveredSession.quantityBought;
       totalSpent = recoveredSession.investedCredits;
 
-      if (bot.system === settings.homeSystem) {
+      if (bot.system === homeSystemId) {
         await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
         await updateTradeSession(bot.username, { state: "in_transit" });
@@ -848,6 +1257,30 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         await ensureDocked(ctx);
         bot.docked = true;
 
+        // ── Confirm we are standing where the route said to buy ──
+        // `ensureDocked()` silently diverts to the nearest usable station when
+        // the target POI turns out to have no base. Everything after this point
+        // (fuel top-up, estimate_purchase, buy) is written for the ROUTE's
+        // station, so buying at whatever station we happened to land on is
+        // always wrong — it is what produced the
+        // "flew to an ice field, docked at Sol Central, item_not_available" loop.
+        await bot.refreshLocation();
+        const atRightSystem = bot.system.toLowerCase() === candidate.sourceSystem.toLowerCase();
+        const atRightStation = atRightSystem && !!bot.poi && mapStore.sameStation(bot.poi, candidate.sourcePoi);
+        if (!atRightStation) {
+          failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+          // The listing pointed at somewhere we cannot dock — drop it from the
+          // map cache so it cannot be re-picked on the next scan.
+          mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+          ctx.log(
+            "error",
+            `Expected to dock at ${candidate.sourcePoiName} (${candidate.sourceSystem}) but ended up at ` +
+            `${bot.poi || "?"} (${bot.system}) — that listing has no dockable station. Dropping it and trying next route`,
+          );
+          continue;
+        }
+
         // Withdraw credits from storage
         await bot.refreshStorage();
         const storageResp = await bot.exec("view_storage");
@@ -861,67 +1294,80 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         }
 
         await recordMarketData(ctx);
-        await tryMissions(ctx);
 
         // Verify item is actually available
+        //
+        // `estimate_purchase` does NOT error when a station has no seller — it
+        // answers `available: 0, unfilled: <asked>`. Only checking `.error` let
+        // ghost listings through the gate, so the bot flew the whole route and
+        // then ate a red `item_not_available` on the buy. Read the numbers.
         yield "verify_availability";
         const estResp = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
-        if (estResp.error) {
+        const estCheckResult = readPurchaseEstimate(estResp.result);
+        if (estResp.error || estCheckResult.available <= 0) {
           failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
-          ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (stale data) — trying next route`);
+          // The market routine's own data said this was for sale seconds ago —
+          // correct it too, or every routine sharing that data keeps chasing it.
+          noteLocalMarketUnavailable(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+          const why = estResp.error
+            ? estResp.error.message
+            : `market reports 0 available${estCheckResult.message ? ` (${estCheckResult.message})` : ""}` +
+              (estCheckResult.counterparties.length > 0 ? ` — sellers seen: ${estCheckResult.counterparties.join(", ")}` : "");
+          ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName}: ${why} — trying next route`);
           continue;
         }
 
-        // Reserve fuel cells for the trip home
-        const maxFuelSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
-        const RESERVE_FUEL_CELLS = Math.min(Math.max(3, Math.ceil(candidate.jumps / 4)), maxFuelSlots);
-
-        // Clear cargo: keep fuel cells only
+        // ── Cargo clearing: never dump fuel cells at a remote station ──
+        // Fuel cells are the ship's lifeline and are free at home; the old code
+        // deposited every cell above a fixed COUNT, which happily left 3 military
+        // cells (300 fuel) behind at a random station. Only non-fuel cargo is
+        // deposited here; the buy quantity below already accounts for the space
+        // the cells occupy.
         await bot.refreshCargo();
         const depositSummary: string[] = [];
         for (const item of [...bot.inventory]) {
           if (item.itemId === candidate.itemId) continue;
-          const lower = item.itemId.toLowerCase();
-          const isFuel = lower.includes("fuel") || lower.includes("energy_cell");
-          if (isFuel) {
-            const excess = item.quantity - RESERVE_FUEL_CELLS;
-            if (excess > 0) {
-              await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
-              depositSummary.push(`${excess}x ${item.name}`);
-            }
-          } else {
-            await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-            depositSummary.push(`${item.quantity}x ${item.name}`);
-          }
+          if (isFuelCellItem(item.itemId)) continue;
+          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          depositSummary.push(`${item.quantity}x ${item.name}`);
         }
         if (depositSummary.length > 0) {
           ctx.log("trade", `Cleared cargo: ${depositSummary.join(", ")}`);
         }
 
-        // Ensure we have enough fuel cells
+        // ── Fuel reserve for the trip home, measured in FUEL not cell count ──
+        // 3x military_fuel_cell = 300 fuel and covers almost any route; counting
+        // cells made the bot "3 short" and sent it shopping for 20-fuel plain
+        // cells at 20 000–50 000cr each.
         await bot.refreshCargo();
         await bot.refreshStatus();
-        let fuelInCargo = 0;
-        for (const item of bot.inventory) {
-          const lower = item.itemId.toLowerCase();
-          if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-        }
-        if (fuelInCargo < RESERVE_FUEL_CELLS) {
-          const freeSpace = getFreeSpace(bot);
-          const needed = Math.min(RESERVE_FUEL_CELLS - fuelInCargo, maxItemsForCargo(freeSpace, "fuel_cell"));
-          if (needed > 0) {
-            ctx.log("trade", `Buying ${needed} fuel cells for ${candidate.jumps}-jump route...`);
-            await bot.exec("buy", { item_id: "fuel_cell", quantity: needed });
-          }
-        }
+        const routeFuel = await estimateRouteFuel(ctx, homeSystemId);
+        const tripFuel = routeFuel?.estimatedFuel ?? candidate.jumps * FALLBACK_FUEL_PER_JUMP;
+        const tankFuel = routeFuel?.fuelAvailable ?? bot.fuel;
+        // Reserve = what the trip home costs (plus a 25% margin for reroutes)
+        // minus what the tank already holds.
+        const reserveFuelNeeded = Math.max(0, Math.ceil(tripFuel * 1.25) - tankFuel);
+        const carried = getCargoFuelCells(bot);
+        ctx.log(
+          "trade",
+          `Trip home needs ~${Math.round(tripFuel)} fuel (${routeFuel ? `${routeFuel.jumps} jumps, live route` : `${candidate.jumps} jumps, estimated`}), ` +
+          `tank has ${tankFuel} — cargo cells: ${carried.summary} = ${carried.fuel} fuel`,
+        );
+        await ensureFuelCellReserve(ctx, {
+          fuelNeeded: reserveFuelNeeded,
+          reason: `${routeFuel?.jumps ?? candidate.jumps}-jump trip home`,
+          maxCreditsPerFuel: settings.maxFuelCreditsPerFuel,
+        });
 
         // Determine buy quantity
         await bot.refreshStatus();
         const freeSpace = getFreeSpace(bot);
         let qty = Math.min(candidate.buyQty, maxItemsForCargo(freeSpace, candidate.itemId));
-        if (settings.maxSpendPerItem > 0) {
-          qty = Math.min(qty, Math.floor(settings.maxSpendPerItem / candidate.buyPrice));
+        const tripBudget = getSpendBudget(settings);
+        if (tripBudget > 0) {
+          qty = Math.min(qty, Math.floor(tripBudget / candidate.buyPrice));
         }
         if (qty > 0) {
           qty = Math.min(qty, Math.floor(bot.credits / candidate.buyPrice));
@@ -932,12 +1378,27 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           const estCheck = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: qty });
           if (!estCheck.error && estCheck.result && typeof estCheck.result === "object") {
             const est = estCheck.result as Record<string, unknown>;
-            const avail = (est.available_quantity as number) || (est.available as number) || (est.max_quantity as number) || 0;
-            if (avail > 0 && avail < qty) {
+            const parsed = readPurchaseEstimate(est);
+            const avail = parsed.available;
+            // available === 0 means "nobody is actually selling" — the previous
+            // code only reacted to `avail > 0 && avail < qty`, so a zero sailed
+            // straight through into a failing buy.
+            if (avail <= 0) {
+              failedSources.add(sourceKey);
+              noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+              mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+              noteLocalMarketUnavailable(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+              ctx.log(
+                "trade",
+                `${candidate.itemName} shows 0 available at ${candidate.sourcePoiName}${parsed.message ? ` (${parsed.message})` : ""} — trying next route`,
+              );
+              continue;
+            }
+            if (avail < qty) {
               ctx.log("trade", `Market only has ${avail}x available (wanted ${qty}) — adjusting`);
               qty = avail;
             }
-            const totalCost = (est.total_cost as number) || (est.total as number) || (est.cost as number) || 0;
+            const totalCost = parsed.totalCost || (est.total as number) || (est.cost as number) || 0;
             if (totalCost > 0 && totalCost > bot.credits - 500) {
               const affordQty = Math.max(0, Math.floor(qty * ((bot.credits - 500) / totalCost)));
               if (affordQty < qty) {
@@ -987,8 +1448,12 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         }
         if (buyResp.error) {
           failedSources.add(sourceKey);
+          noteBuyFailure(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           if (buyResp.error.message.includes("item_not_available") || buyResp.error.message.includes("not_available")) {
             mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+            // Also drop it from the market routine's data — that is the source
+            // the scan actually trusts, so leaving it there re-picks the ghost.
+            noteLocalMarketUnavailable(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
           }
           ctx.log("error", `Buy failed: ${buyResp.error.message} — trying next route`);
           continue;
@@ -1003,6 +1468,93 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         buyQty = actualInCargo;
         totalSpent = actualSpent;
         ctx.log("trade", `Purchased ${actualInCargo}x ${candidate.itemName} for ${actualSpent}cr (${actualSpent > 0 ? Math.round(actualSpent / Math.max(actualInCargo, 1)) : candidate.buyPrice}cr/ea)`);
+
+        // ── Exhaust the sell order in one visit ──
+        // Multi-item sell orders cap each order item (e.g. max 1/order), so the
+        // first buy only chips away at it. Loop re-buys at the same station until
+        // the order is gone, the per-trip max is hit, cargo is full, or credits
+        // run out — instead of flying home and making wasteful return trips.
+        const maxQ = settings.maxBuyQuantity > 0 ? settings.maxBuyQuantity : Infinity;
+        let purchased = actualInCargo;
+        let spent = actualSpent;
+        let safety = 0;
+        while (purchased < maxQ) {
+          if (bot.state !== "running") break;
+          if (++safety > 100) {
+            ctx.log("trade", `Safety stop after 100 re-buys at ${candidate.sourcePoiName}`);
+            break;
+          }
+          // Battle can break out mid-drain — bail with what we have.
+          const rb = await getBattleStatus(ctx);
+          if (rb && rb.is_participant) {
+            ctx.log("combat", "Battle detected while draining order — fleeing with cargo");
+            battleState.inBattle = true;
+            battleState.battleId = rb.battle_id;
+            await fleeFromBattle(ctx, true, 35000);
+            break;
+          }
+
+          await bot.refreshStatus();
+          await bot.refreshCargo();
+          const freeSpaceRe = getFreeSpace(bot);
+          const fitsRe = maxItemsForCargo(freeSpaceRe, candidate.itemId);
+          if (fitsRe <= 0) {
+            ctx.log("trade", `Cargo full after ${purchased}x — stopping drain`);
+            break;
+          }
+
+          const estRe = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });
+          if (estRe.error) {
+            ctx.log("trade", `Order exhausted at ${candidate.sourcePoiName} (${purchased}x total)`);
+            break;
+          }
+          let avail = 0;
+          if (estRe.result && typeof estRe.result === "object") {
+            const est = estRe.result as Record<string, unknown>;
+            avail = (est.available_quantity as number) || (est.available as number) || (est.max_quantity as number) || 0;
+          }
+          if (avail <= 0) {
+            ctx.log("trade", `No more ${candidate.itemName} at ${candidate.sourcePoiName} — drained ${purchased}x`);
+            break;
+          }
+
+          let reQty = Math.min(avail, fitsRe, maxQ - purchased);
+          const tripBudgetRe = getSpendBudget(settings);
+          if (tripBudgetRe > 0) reQty = Math.min(reQty, Math.floor(tripBudgetRe / candidate.buyPrice));
+          if (reQty > 0) reQty = Math.min(reQty, Math.floor(bot.credits / candidate.buyPrice));
+          if (reQty <= 0) {
+            ctx.log("trade", `Cannot afford more ${candidate.itemName} (credits/full) — stopping drain at ${purchased}x`);
+            break;
+          }
+
+          const creditsBeforeRe = bot.credits;
+          const reResp = await bot.exec("buy", { item_id: candidate.itemId, quantity: reQty });
+          if (reResp.error) {
+            if (reResp.error.message.includes("item_not_available") || reResp.error.message.includes("not_available")) {
+              ctx.log("trade", `Order exhausted at ${candidate.sourcePoiName} (${purchased}x total)`);
+            } else {
+              ctx.log("error", `Re-buy failed: ${reResp.error.message} — stopping drain`);
+            }
+            if (reResp.error.message.includes("item_not_available") || reResp.error.message.includes("not_available")) {
+              mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
+            }
+            break;
+          }
+          await bot.refreshStatus();
+          await bot.refreshCargo();
+          const haveNow = bot.inventory.find(i => i.itemId === candidate.itemId)?.quantity ?? 0;
+          const reGot = Math.max(0, haveNow - purchased);
+          if (reGot <= 0) {
+            ctx.log("trade", `Re-buy returned 0 ${candidate.itemName} — order likely drained (${purchased}x total)`);
+            break;
+          }
+          purchased += reGot;
+          spent += Math.max(0, creditsBeforeRe - bot.credits);
+          ctx.log("trade", `Drained ${reGot}x more (${purchased}x total, ${spent}cr spent)`);
+        }
+
+        buyQty = purchased;
+        totalSpent = spent;
 
         // Start trade session tracking
         const session = createTradeSession({
@@ -1022,7 +1574,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         mapStore.reserveTradeQuantity(
           candidate.sourceSystem, candidate.sourcePoi,
-          settings.homeSystem, homeStation.id,
+          homeSystemId, homeStation.id,
           candidate.itemId, buyQty,
         );
         break;
@@ -1067,8 +1619,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
 
-    if (bot.system !== settings.homeSystem) {
-      ctx.log("travel", `Heading home to ${homeStation.name}...`);
+    if (bot.system !== homeSystemId) {
+      ctx.log("travel", `Heading home to ${homeStation.name} (${homeSystemId})...`);
 
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
@@ -1078,7 +1630,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         });
       }
 
-      const arrived2 = await navigateToSystem(ctx, settings.homeSystem, {
+      const arrived2 = await navigateToSystem(ctx, homeSystemId, {
         ...cargoSafetyOpts,
         onJump: async (jumpNum) => {
           if (jumpNum % 3 !== 0) return true;
@@ -1131,7 +1683,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
     
-    if (bot.poi !== homeStation.id) {
+    if (!mapStore.sameStation(bot.poi, homeStation.id)) {
       ctx.log("travel", `Traveling to ${homeStation.name}...`);
       const t2Resp = await bot.exec("travel", { target_poi: homeStation.id });
       // Check for battle notifications after travel
@@ -1167,7 +1719,6 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
     bot.docked = true;
-    await tryMissions(ctx);
 
     // ── Deposit items to faction storage ──
     yield "deposit";

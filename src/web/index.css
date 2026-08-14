@@ -282,6 +282,50 @@ table.bot-table tbody td:nth-child(8) {
   color: var(--green);
 }
 
+/* Red "no Emergency Warp Stabilizer" indicator appended to bot names */
+.ews-warning-dot {
+  color: var(--red);
+  margin-left: 4px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  text-shadow: 0 0 4px rgba(239, 68, 68, 0.8);
+}
+.bot-card-name-text .ews-warning-dot,
+.grid-bot-name .ews-warning-dot { margin-left: 4px; }
+
+/* Anchor (⚓) indicator appended to bot names when docked at a station */
+.docked-indicator {
+  color: var(--blue, #38bdf8);
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+}
+.bot-card-name-text .docked-indicator,
+.grid-bot-name .docked-indicator { margin-left: 4px; }
+
+/* ⚔️ Combat indicator appended to bot names when currently in battle */
+.combat-indicator {
+  color: #f44336;
+  margin-left: 4px;
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  vertical-align: middle;
+  animation: combat-pulse 1s ease-in-out infinite;
+  text-shadow: 0 0 4px rgba(244, 67, 54, 0.8);
+}
+.bot-card-name-text .combat-indicator,
+.grid-bot-name .combat-indicator { margin-left: 4px; }
+
+@keyframes combat-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(1.3); }
+}
+
 .state-badge {
   display: inline-block;
   font-size: 11px;
@@ -295,6 +339,17 @@ table.bot-table tbody td:nth-child(8) {
 .state-running { background: #0d2818; color: var(--green); }
 .state-stopping { background: #2d1b00; color: var(--yellow); }
 .state-error { background: #2d0000; color: var(--red); }
+.state-offline { background: #1a2330; color: var(--blue, #4a9eff); }
+/* Rehydrated (not-yet-reconnected) bot cards — last-active from prior run */
+.grid-bot-card.ghost,
+.bot-card.ghost {
+  opacity: 0.55;
+  border-style: dashed;
+}
+.grid-bot-card.ghost:hover,
+.bot-card.ghost:hover {
+  opacity: 0.8;
+}
 
 .row-actions {
   display: flex;
@@ -608,6 +663,8 @@ button.danger { background: #da3633; border-color: #f85149; color: #fff; }
 button.danger:hover { background: #f85149; }
 button.warning { background: #a371f7; border-color: #a371f7; color: #fff; }
 button.warning:hover { background: #b98cff; }
+button.warning-cargo { background: var(--cyan); border-color: var(--cyan); color: #fff; }
+button.warning-cargo:hover { background: #4de0d0; }
 button.sm { padding: 3px 10px; font-size: 11px; }
 
 /* ── Log panels ─────────────────────────────────── */
@@ -1129,11 +1186,20 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 }
 .settings-panel {
   flex: 1;
+  min-height: 0;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* Scrollable body below the persistent header bar. */
+.settings-content-scroll {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  padding: 16px 24px 20px;
 }
 .settings-panel h3 {
   font-size: 15px;
@@ -1145,6 +1211,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 20px;
+}
+/* The persistent header content (title/desc) has no bottom margin — the
+   header bar itself provides spacing. */
+.settings-header-bar .settings-desc {
+  margin-bottom: 0;
 }
 .setting-row {
   display: flex;
@@ -1184,9 +1255,70 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .settings-save-bar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-top: 20px;
   padding-top: 14px;
   border-top: 1px solid var(--border);
+}
+/* Persistent settings header bar: title + description on the left, save /
+   action buttons on the right. Lives outside the scrollable content area so
+   it never disappears or reflows when the page body re-renders. */
+.settings-header-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+}
+.settings-header-bar .settings-header-text {
+  flex: 1;
+  min-width: 0;
+}
+.settings-header-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+  align-items: center;
+}
+/* Hide any leftover in-content save bars (buttons are relocated to the
+   persistent header). Kept as a safety net for pages not yet migrated. */
+.settings-content-scroll .settings-save-bar {
+  display: none;
+}
+
+.approved-fuel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 3px 10px;
+  width: 100%;
+  max-width: 1400px;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.approved-fuel-grid label {
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.approved-fuel-grid input[type="checkbox"] {
+  accent-color: var(--accent);
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
 }
 
 /* ── Map page ───────────────────────────────────── */
@@ -2817,6 +2949,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .status-dot.idle { background: var(--text-dim); }
 .status-dot.error { background: var(--red); }
 .status-dot.stopping { background: var(--yellow); }
+.status-dot.offline { background: var(--blue, #4a9eff); animation: pulse 1s infinite; }
 
 .status-label {
   font-size: 9px;

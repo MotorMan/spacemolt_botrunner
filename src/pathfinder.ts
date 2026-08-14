@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join } from "path";
+import { perf } from "./perf.js";
 
 export const PATHFINDER_LANDING_MARGIN = 100.0;
 export const PATHFINDER_SPEED = 10.0;
@@ -294,16 +295,18 @@ function loadDirectJumps(): DirectPathfinderJump[] {
 
 function loadCorrectionJumps(): CorrectionPathfinderJump[] {
   if (correctionJumpsCache) return correctionJumpsCache;
-  try {
-    const file = join(DATA_DIR, "pathfinder_level2_1correction.json");
-    if (existsSync(file)) {
-      const raw = readFileSync(file, "utf-8");
-      correctionJumpsCache = JSON.parse(raw);
+  return perf.timeSync("pathfinder.loadCorrectionJumps", () => {
+    try {
+      const file = join(DATA_DIR, "pathfinder_level2_1correction.json");
+      if (existsSync(file)) {
+        const raw = readFileSync(file, "utf-8");
+        correctionJumpsCache = JSON.parse(raw);
+      }
+    } catch {
+      correctionJumpsCache = [];
     }
-  } catch {
-    correctionJumpsCache = [];
-  }
-  return correctionJumpsCache || [];
+    return correctionJumpsCache || [];
+  });
 }
 
 export function getDirectPathfinderJump(fromSystem: string, toSystem: string): DirectPathfinderJump | null {
@@ -314,10 +317,12 @@ export function getDirectPathfinderJump(fromSystem: string, toSystem: string): D
 }
 
 export function getCorrectionPathfinderJump(fromSystem: string, toSystem: string): CorrectionPathfinderJump | null {
-  const jumps = loadCorrectionJumps();
-  const fromLower = fromSystem.toLowerCase();
-  const toLower = toSystem.toLowerCase();
-  return jumps.find(j => j.from.toLowerCase() === fromLower && j.to.toLowerCase() === toLower) || null;
+  return perf.timeSync("pathfinder.getCorrectionPathfinderJump", () => {
+    const jumps = loadCorrectionJumps();
+    const fromLower = fromSystem.toLowerCase();
+    const toLower = toSystem.toLowerCase();
+    return jumps.find(j => j.from.toLowerCase() === fromLower && j.to.toLowerCase() === toLower) || null;
+  });
 }
 
 export function getCorrectionBearingAtTick(

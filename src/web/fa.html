@@ -173,6 +173,12 @@
   let ws = null;
   let bots = [];
   let reconnectDelay = 1000;
+  let wsManualClose = false;
+  let wsConnectTimer = null;
+  let wsInitTimer = null;
+  let wsHeartbeatTimer = null;
+  let wsWatchdogTimer = null;
+  let wsLastMsg = Date.now();
   let rawEntries = [];
   let filteredEntries = [];
   let creditsIn = 0;
@@ -241,31 +247,67 @@
 
   // ── WebSocket ───────────────────────────────────────────
   function connect() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    if (wsManualClose) return;
+    clearTimeout(wsConnectTimer);
 
-    let wsInitTimer = setTimeout(() => {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let host = location.host;
+    if (!host) host = (location.hostname || 'localhost') + (location.port ? ':' + location.port : '');
+    let url;
+    try {
+      url = `${proto}//${host}/ws`;
+      ws = new WebSocket(url);
+    } catch (err) {
+      console.warn('WebSocket constructor failed, retrying in 1s:', err);
+      wsConnectTimer = setTimeout(connect, 1000);
+      return;
+    }
+
+    wsLastMsg = Date.now();
+
+    clearTimeout(wsInitTimer);
+    wsInitTimer = setTimeout(() => {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
-        fetchInitialData();
+        console.warn('WebSocket not open after 4s — REST fallback + reconnect');
+        try { fetchInitialData(); } catch (e) {}
+        try { ws && ws.close(); } catch {}
       }
-    }, 500);
+    }, 4000);
 
     ws.onopen = () => {
       clearTimeout(wsInitTimer);
       reconnectDelay = 1000;
       fetchInitialData();
+      clearInterval(wsHeartbeatTimer);
+      wsHeartbeatTimer = setInterval(() => {
+        try { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+      }, 15000);
+      clearInterval(wsWatchdogTimer);
+      wsWatchdogTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN && Date.now() - wsLastMsg > 30000) {
+          console.warn('WebSocket silent for 30s, forcing reconnect');
+          try { ws.close(); } catch {}
+        }
+      }, 5000);
     };
 
     ws.onclose = () => {
-      setTimeout(connect, reconnectDelay);
-      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+      clearTimeout(wsInitTimer);
+      clearInterval(wsHeartbeatTimer);
+      clearInterval(wsWatchdogTimer);
+      if (wsManualClose) return;
+      wsConnectTimer = setTimeout(connect, 1000);
     };
 
-    ws.onerror = () => {};
+    ws.onerror = () => {
+      try { ws && ws.close(); } catch {}
+    };
 
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === 'pong') return;
+      wsLastMsg = Date.now();
       switch (msg.type) {
         case 'init':
           clearTimeout(wsInitTimer);

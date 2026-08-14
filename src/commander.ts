@@ -1,10 +1,11 @@
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
-import type { Context, Message } from "@mariozechner/pi-ai";
+import type { Context } from "@mariozechner/pi-ai";
 import { resolveModel } from "./model.js";
-import { SpaceMoltAPI } from "./api.js";
-import { SessionManager } from "./session.js";
-import { allTools } from "./tools.js";
+import { initSpacemoltClient, getConnectedAccount } from "./libClient.js";
+import type { Account } from "@spacemolt/lib";
+import { libExecute } from "./commandBridge.js";
+import { allTools, type CliStore } from "./tools.js";
 import { fetchGameCommands, formatCommandList } from "./schema.js";
 import { runAgentTurn, generateSessionHandoff, type CompactionState } from "./loop.js";
 import { log, logError, setDebug, logNotifications, formatNotifications } from "./ui.js";
@@ -21,8 +22,7 @@ Usage:
 
 Options:
   --model <id>     LLM model (e.g. ollama/qwen3:8b, anthropic/claude-sonnet-4-20250514)
-  --session <name> Session name for credentials/state (default: "default")
-  --url <url>      SpaceMolt API URL (default: production server)
+  --session <id>   Connected account id to drive (default: first connected account)
   --file <path>    Read instruction from a file instead of command line
   --debug          Show LLM call details (token counts, retries, etc.)
 
@@ -38,7 +38,6 @@ Examples:
 interface CLIArgs {
   model: string;
   session: string;
-  url?: string;
   debug: boolean;
   instruction: string;
 }
@@ -47,7 +46,6 @@ function parseArgs(argv: string[]): CLIArgs | null {
   const args = argv.slice(2); // skip bun and script path
   let model = "";
   let session = "default";
-  let url: string | undefined;
   let file: string | undefined;
   let debug = false;
   const positional: string[] = [];
@@ -58,14 +56,11 @@ function parseArgs(argv: string[]): CLIArgs | null {
       case "-m":
         model = args[++i] || "";
         break;
-      case "--session":
-      case "-s":
-        session = args[++i] || "default";
-        break;
-      case "--url":
-        url = args[++i] || undefined;
-        break;
-      case "--file":
+        case "--session":
+        case "-s":
+          session = args[++i] || "default";
+          break;
+        case "--file":
       case "-f":
         file = args[++i] || undefined;
         break;
@@ -103,7 +98,7 @@ function parseArgs(argv: string[]): CLIArgs | null {
     return null;
   }
 
-  return { model, session, url, debug, instruction };
+  return { model, session, debug, instruction };
 }
 
 // ─── System Prompt Builder ───────────────────────────────────
@@ -146,7 +141,6 @@ ${todo || "(empty)"}
 ## Rules
 - You are FULLY AUTONOMOUS. Never ask the human for input. All information you need is in this prompt.
 - Use the "game" tool for ALL game interactions. Pass the command name and args.
-- After registering, IMMEDIATELY save credentials with save_credentials — the password cannot be recovered!
 - Keep your TODO list updated with update_todo to track your goals and progress.
 - Use the status_log tool to show status messages to the human watching.
 - Query commands are free and unlimited — use them often to stay informed.
@@ -208,12 +202,12 @@ function formatStatusMarkdown(result: Record<string, unknown>): string {
   return lines.join("\n");
 }
 
-async function fetchInitialServerInfo(api: SpaceMoltAPI): Promise<string> {
+async function fetchInitialServerInfo(account: Account): Promise<string> {
   const parts: string[] = [];
 
   // Fetch status (triggers session creation + auto-login)
   try {
-    const statusResp = await api.execute("get_status");
+    const statusResp = await libExecute(account, "get_status");
     if (!statusResp.error && statusResp.result) {
       parts.push("Ship Status:\n" + formatStatusMarkdown(statusResp.result as Record<string, unknown>));
     }
@@ -223,7 +217,7 @@ async function fetchInitialServerInfo(api: SpaceMoltAPI): Promise<string> {
 
   // Fetch most recent captain's log entry only
   try {
-    const logResp = await api.execute("captains_log_get", { index: 0 });
+    const logResp = await libExecute(account, "captains_log_get", { index: 0 });
     if (!logResp.error && logResp.result) {
       const entry = logResp.result as Record<string, unknown>;
       if (entry.entry) {
@@ -236,7 +230,7 @@ async function fetchInitialServerInfo(api: SpaceMoltAPI): Promise<string> {
 
   // Fetch version/release notes
   try {
-    const versionResp = await api.execute("get_version");
+    const versionResp = await libExecute(account, "get_version");
     if (!versionResp.error && versionResp.result) {
       const v = versionResp.result as Record<string, unknown>;
       const notes = Array.isArray(v.notes) ? v.notes.map((n: string) => `- ${n}`).join("\n") : "";
@@ -274,49 +268,80 @@ async function main(): Promise<void> {
   // Resolve model
   const { model, apiKey } = resolveModel(cliArgs.model);
 
-  // Create session manager
-  const sessionMgr = new SessionManager(cliArgs.session, PROJECT_ROOT);
-
-  // Create API client
-  const api = new SpaceMoltAPI(cliArgs.url);
-
-  // Load credentials if they exist
-  const creds = sessionMgr.loadCredentials();
-  let credentialsPrompt: string;
-  if (creds) {
-    log("setup", `Found credentials for ${creds.username} (${creds.empire})`);
-    api.setCredentials(creds.username, creds.password);
-    credentialsPrompt = [
-      `- Username: ${creds.username}`,
-      `- Password: ${creds.password}`,
-      `- Empire: ${creds.empire}`,
-      `- Player ID: ${creds.playerId}`,
-      "",
-      "You are already logged in. Do NOT call the login tool — the session is already active. Start playing immediately.",
-    ].join("\n");
-  } else {
-    log("setup", "No credentials found — agent will need to register");
-    credentialsPrompt = "New player — you need to register first. You'll need a registration code from spacemolt.com/dashboard. Pick a creative username and empire, pass your registration_code, then IMMEDIATELY save_credentials.";
+  // Connect every account owned by the Clerk user (no per-account passwords).
+  log("setup", "Connecting owned SpaceMolt accounts via library client...");
+  const clerkKey = process.env.SPACEMOLT_CLERK_API_KEY;
+  if (!clerkKey) {
+    logError("No connected accounts — is SPACEMOLT_CLERK_API_KEY set and valid?");
+    process.exit(1);
+  }
+  const client = initSpacemoltClient(clerkKey);
+  const connected = await client.connectOwned();
+  if (connected.length === 0) {
+    logError("No connected accounts — is SPACEMOLT_CLERK_API_KEY set and valid?");
+    process.exit(1);
   }
 
-  // Load TODO
-  const todo = sessionMgr.loadTodo();
+  // Pick the account to drive (--session selects by id; default: first).
+  let account: Account;
+  if (cliArgs.session && cliArgs.session !== "default") {
+    const picked = getConnectedAccount(cliArgs.session);
+    if (!picked) {
+      logError(`No connected account for session "${cliArgs.session}". Available: ${connected.map(a => a.id ?? "?").join(", ")}`);
+      process.exit(1);
+    }
+    account = picked;
+  } else {
+    account = connected[0];
+  }
+  log("setup", `Driving account: ${account.id ?? "(unknown)"}`);
 
-  // Fetch game command list from OpenAPI spec
+  // Credentials are managed by the clerk-backed connection — the agent is
+  // already authenticated; no login/register/save_credentials is needed.
+  const credentialsPrompt = [
+    `You are already authenticated through the CLI connection (clerk) as ${account.id ?? "the connected account"}.`,
+    "Never call login, register, or save_credentials — your session is live. Start playing immediately.",
+  ].join("\n");
+
+  // File-backed TODO store (.session/<session>/todo.md)
+  const todoDir = join(PROJECT_ROOT, ".session", cliArgs.session);
+  mkdirSync(todoDir, { recursive: true });
+  const store: CliStore = {
+    loadTodo() {
+      try { return readFileSync(join(todoDir, "todo.md"), "utf-8"); } catch { return ""; }
+    },
+    saveTodo(content: string) {
+      writeFileSync(join(todoDir, "todo.md"), content, "utf-8");
+    },
+  };
+
+  // Buffer server pushes (chat, combat, broadcasts, ...) so the outer loop can
+  // surface them to the human watching. Notifications arrive via the library's
+  // event system, not piggybacked on a get_status query.
+  const notifications: unknown[] = [];
+  account.onAny((frame) => {
+    const f = frame as { type?: string; payload?: unknown };
+    const t = f.type;
+    if (!t) return;
+    if (t === "result" || t === "action_result" || t === "action_error" || t === "error" || t === "welcome" || t === "logged_in" || t === "registered") return;
+    notifications.push({ type: t, msg_type: t, data: f.payload });
+  });
+
+  // Fetch game command list from OpenAPI spec (HTTP base URL from the client).
   log("setup", "Fetching game commands from server...");
-  const gameCommands = await fetchGameCommands(api.baseUrl);
+  const gameCommands = await fetchGameCommands(client.httpBaseUrl);
   const commandList = formatCommandList(gameCommands);
   log("setup", `${gameCommands.length} game commands loaded (${allTools.length} tools: game + ${allTools.length - 1} local)`);
 
-  // Fetch initial server state (ship status, release notes) if we have credentials
-  let serverInfo = "";
-  if (creds) {
-    log("setup", "Fetching initial game state from server...");
-    serverInfo = await fetchInitialServerInfo(api);
-    if (serverInfo) {
-      log("setup", "Game state loaded into agent prompt");
-    }
+  // Fetch initial server state (ship status, release notes) once connected.
+  log("setup", "Fetching initial game state from server...");
+  const serverInfo = await fetchInitialServerInfo(account);
+  if (serverInfo) {
+    log("setup", "Game state loaded into agent prompt");
   }
+
+  // Load TODO
+  const todo = store.loadTodo();
 
   // Build initial context
   const systemPrompt = buildSystemPrompt(promptMd, cliArgs.instruction, credentialsPrompt, todo, commandList, serverInfo);
@@ -355,7 +380,7 @@ async function main(): Promise<void> {
 
   while (running) {
     try {
-      await runAgentTurn(model, context, api, sessionMgr, {
+      await runAgentTurn(model, context, account, store, {
         signal: abortController.signal,
         apiKey,
       }, compaction);
@@ -369,18 +394,14 @@ async function main(): Promise<void> {
     // Brief pause between turns
     await sleep(TURN_INTERVAL);
 
-    // Poll for pending server events (chats, combat, broadcasts, etc.) that
-    // arrived while the LLM was thinking.  get_status is an unlimited query
-    // and always returns piggybacked notifications.
+    // Surface server pushes that arrived while the LLM was thinking
+    // (chat, combat, broadcasts, ...). The library delivers these via the
+    // event system; we buffered them in `notifications`.
     let pendingEvents = "";
-    try {
-      const pollResp = await api.execute("get_status");
-      if (pollResp.notifications && Array.isArray(pollResp.notifications) && pollResp.notifications.length > 0) {
-        logNotifications(pollResp.notifications);
-        pendingEvents = formatNotifications(pollResp.notifications);
-      }
-    } catch {
-      // Polling is best-effort; don't break the loop
+    if (notifications.length > 0) {
+      logNotifications(notifications);
+      pendingEvents = formatNotifications(notifications);
+      notifications.length = 0;
     }
 
     // Add a continuation nudge so the LLM always has a user message to respond to.
@@ -396,28 +417,9 @@ async function main(): Promise<void> {
       timestamp: Date.now(),
     });
 
-    // Refresh system prompt with latest credentials/todo
-    const freshCreds = sessionMgr.loadCredentials();
-    const freshTodo = sessionMgr.loadTodo();
-    let freshCredsPrompt: string;
-    if (freshCreds) {
-      freshCredsPrompt = [
-        `- Username: ${freshCreds.username}`,
-        `- Empire: ${freshCreds.empire}`,
-        `- Player ID: ${freshCreds.playerId}`,
-        "",
-        "You are logged in.",
-      ].join("\n");
-
-      // Lazy-fetch server info if a new player just registered
-      if (!serverInfo) {
-        api.setCredentials(freshCreds.username, freshCreds.password);
-        serverInfo = await fetchInitialServerInfo(api);
-      }
-    } else {
-      freshCredsPrompt = credentialsPrompt;
-    }
-    context.systemPrompt = buildSystemPrompt(promptMd, cliArgs.instruction, freshCredsPrompt, freshTodo, commandList, serverInfo);
+    // Refresh system prompt with the latest TODO
+    const freshTodo = store.loadTodo();
+    context.systemPrompt = buildSystemPrompt(promptMd, cliArgs.instruction, credentialsPrompt, freshTodo, commandList, serverInfo);
   }
 
   // ─── Session Handoff ────────────────────────────────────────
@@ -429,7 +431,7 @@ async function main(): Promise<void> {
 
       // Persist to captain's log (server-side, survives across sessions)
       try {
-        await api.execute("captains_log_add", {
+        await libExecute(account, "captains_log_add", {
           entry: `[Session Handoff] ${handoff}`,
         });
         log("system", "Handoff saved to captain's log");
@@ -438,9 +440,9 @@ async function main(): Promise<void> {
       }
 
       // Prepend to TODO (local, read at next startup)
-      const existingTodo = sessionMgr.loadTodo();
+      const existingTodo = store.loadTodo();
       const todoHandoff = `## Session Handoff (${new Date().toISOString()})\n${handoff}\n\n---\n${existingTodo}`;
-      sessionMgr.saveTodo(todoHandoff);
+      store.saveTodo(todoHandoff);
       log("system", "Handoff prepended to TODO");
     } else {
       log("system", "No handoff generated (session too short)");

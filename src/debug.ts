@@ -1,5 +1,7 @@
 import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from "fs";
+import { appendFile } from "fs/promises";
 import { join } from "path";
+import { perf } from "./perf.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const LOGS_DIR = join(DATA_DIR, "logs");
@@ -27,29 +29,172 @@ if (!existsSync(OLD_ACTIVITY_LOGS_DIR)) {
   mkdirSync(OLD_ACTIVITY_LOGS_DIR, { recursive: true });
 }
 
-let debugEnabled = true;
-let activityEnabled = true;
+// ── Buffered log writer ───────────────────────────────────────────────────
+// Every log line used to cost an `appendFileSync` (plus an `existsSync` and a
+// `statSync` for rotation) on the main thread. With 90+ bots that is thousands
+// of blocking syscalls a second. Lines are now batched per file and written
+// asynchronously a few times a second; rotation is decided from a running byte
+// count and only stats a file once.
 
-function shouldRotateLog(logPath: string): boolean {
-  if (!existsSync(logPath)) return false;
+/** How often buffered lines are written out. */
+const LOG_FLUSH_INTERVAL_MS = 250;
+/** Force a flush when this much text is queued, so bursts can't balloon RAM. */
+const LOG_FLUSH_MAX_BYTES = 1024 * 1024;
+
+interface RotationSpec {
+  /** Directory rotated files are moved into. */
+  dir: string;
+  /** File name prefix, e.g. `Bob_debug`. */
+  prefix: string;
+}
+
+interface LogSink {
+  lines: string[];
+  bytes: number;
+  /** Approximate on-disk size, seeded from one stat and kept updated. */
+  fileBytes: number;
+  sized: boolean;
+  rotate: RotationSpec | null;
+}
+
+const sinks = new Map<string, LogSink>();
+let queuedBytes = 0;
+let flushTimer: ReturnType<typeof setInterval> | null = null;
+let flushing = false;
+
+function getSink(path: string, rotate: RotationSpec | null): LogSink {
+  let sink = sinks.get(path);
+  if (!sink) {
+    sink = { lines: [], bytes: 0, fileBytes: 0, sized: false, rotate };
+    sinks.set(path, sink);
+  }
+  return sink;
+}
+
+function enqueueLine(path: string, line: string, rotate: RotationSpec | null): void {
+  const sink = getSink(path, rotate);
+  sink.lines.push(line);
+  sink.bytes += line.length;
+  queuedBytes += line.length;
+  if (!flushTimer) {
+    flushTimer = setInterval(() => void flushLogs(), LOG_FLUSH_INTERVAL_MS);
+    (flushTimer as unknown as { unref?: () => void }).unref?.();
+  }
+  if (queuedBytes >= LOG_FLUSH_MAX_BYTES) void flushLogs();
+}
+
+function rotateIfNeeded(path: string, sink: LogSink): void {
+  if (!sink.rotate || sink.fileBytes < LOG_ROTATION_SIZE) return;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const rotatedPath = join(sink.rotate.dir, `${sink.rotate.prefix}_${timestamp}.log`);
   try {
-    const stats = statSync(logPath);
-    return stats.size >= LOG_ROTATION_SIZE;
+    renameSync(path, rotatedPath);
+    sink.fileBytes = 0;
   } catch {
-    return false;
+    // Rotation is best-effort; keep appending to the current file.
+    sink.fileBytes = 0;
   }
 }
 
-function rotateBotLog(botName: string): void {
-  const botLogFile = join(LOGS_DIR, `${botName}_debug.log`);
-  
-  if (shouldRotateLog(botLogFile)) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const rotatedPath = join(OLD_LOGS_DIR, `${botName}_debug_${timestamp}.log`);
-    try {
-      renameSync(botLogFile, rotatedPath);
-    } catch { /* ignore */ }
+/** Write every buffered line. Never throws. */
+export async function flushLogs(): Promise<void> {
+  if (flushing) return;
+  flushing = true;
+  try {
+    for (const [path, sink] of sinks) {
+      if (sink.lines.length === 0) continue;
+      const text = sink.lines.join("");
+      queuedBytes -= sink.bytes;
+      sink.lines = [];
+      sink.bytes = 0;
+      if (!sink.sized) {
+        sink.sized = true;
+        try {
+          sink.fileBytes = existsSync(path) ? statSync(path).size : 0;
+        } catch {
+          sink.fileBytes = 0;
+        }
+      }
+      try {
+        await appendFile(path, text);
+        sink.fileBytes += text.length;
+        rotateIfNeeded(path, sink);
+      } catch {
+        // ignore write errors (disk full, file locked, ...)
+      }
+    }
+    if (queuedBytes < 0) queuedBytes = 0;
+  } finally {
+    flushing = false;
   }
+}
+
+/** Blocking flush, for shutdown / exit handlers. */
+export function flushLogsSync(): void {
+  for (const [path, sink] of sinks) {
+    if (sink.lines.length === 0) continue;
+    const text = sink.lines.join("");
+    sink.lines = [];
+    sink.bytes = 0;
+    try {
+      appendFileSync(path, text);
+    } catch {
+      // ignore write errors
+    }
+  }
+  queuedBytes = 0;
+}
+
+process.on("exit", () => flushLogsSync());
+
+let debugEnabled = true;
+let activityEnabled = true;
+let combatDebugEnabled = false;
+
+export function setCombatDebugLog(on: boolean): void {
+  combatDebugEnabled = on;
+}
+
+export function getCombatDebugLog(): boolean {
+  return combatDebugEnabled;
+}
+
+export function shouldCombatDebugLog(botName: string): boolean {
+  return combatDebugEnabled;
+}
+
+/**
+ * Write raw combat JSON to data/logs/{botName}_combat_debug.log
+ * No filtering — dumps the entire object as-is for post-battle analysis.
+ */
+export function combatDebugLog(botName: string, source: string, data: unknown): void {
+  if (!shouldCombatDebugLog(botName)) return;
+  const timestamp = new Date().toISOString();
+  let line = `${timestamp} [${source}] `;
+  try {
+    line += JSON.stringify(data);
+  } catch {
+    line += "[unserializable]";
+  }
+  line += "\n";
+  enqueueLine(join(LOGS_DIR, `${botName}_combat_debug.log`), line, null);
+}
+
+/**
+ * Write raw combat JSON to data/logs/{botName}_combat_debug.log
+ * Auto-resolves botName from settings when only a username is provided.
+ */
+export function combatDebugLogForBot(username: string, source: string, data: unknown): void {
+  combatDebugLog(username, source, data);
+}
+
+/**
+ * Write a plain combat debug line to data/logs/{botName}_combat_debug.log
+ */
+export function combatDebugLogLine(botName: string, line: string): void {
+  if (!shouldCombatDebugLog(botName)) return;
+  const timestamp = new Date().toISOString();
+  enqueueLine(join(LOGS_DIR, `${botName}_combat_debug.log`), `${timestamp} ${line}\n`, null);
 }
 
 export function setDebugLog(on: boolean): void {
@@ -76,11 +221,7 @@ export function debugLog(source: string, message: string, data?: unknown): void 
     }
   }
   line += "\n";
-  try {
-    appendFileSync(GLOBAL_LOG_FILE, line);
-  } catch {
-    // ignore write errors
-  }
+  enqueueLine(GLOBAL_LOG_FILE, line, { dir: OLD_LOGS_DIR, prefix: "debug" });
 }
 
 /**
@@ -99,13 +240,13 @@ export function debugLogForBot(botName: string, source: string, message: string,
     }
   }
   line += "\n";
-  try {
-    const botLogFile = join(LOGS_DIR, `${botName}_debug.log`);
-    appendFileSync(botLogFile, line);
-    rotateBotLog(botName);
-  } catch {
-    // ignore write errors
-  }
+  perf.timeSync("debug.appendLine", () => {
+    enqueueLine(
+      join(LOGS_DIR, `${botName}_debug.log`),
+      line,
+      { dir: OLD_LOGS_DIR, prefix: `${botName}_debug` },
+    );
+  });
 }
 
 /**
@@ -117,17 +258,11 @@ export function logBotActivity(botName: string, category: string, message: strin
   if (!activityEnabled) return;
   const timestamp = new Date().toISOString();
   const line = `${timestamp} [${botName}] [${category}] ${message}\n`;
-  try {
-    const botLogFile = join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`);
-    appendFileSync(botLogFile, line);
-    if (shouldRotateLog(botLogFile)) {
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      const rotatedPath = join(OLD_ACTIVITY_LOGS_DIR, `${botName}_activity_${ts}.log`);
-      try {
-        renameSync(botLogFile, rotatedPath);
-      } catch { /* ignore rotation errors */ }
-    }
-  } catch {
-    // ignore write errors
-  }
+  perf.timeSync("debug.appendLine", () => {
+    enqueueLine(
+      join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`),
+      line,
+      { dir: OLD_ACTIVITY_LOGS_DIR, prefix: `${botName}_activity` },
+    );
+  });
 }

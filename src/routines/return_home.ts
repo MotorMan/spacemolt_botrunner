@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import { isConnectionError } from "../connection.js";
 import {
   getSystemInfo,
   ensureDocked,
@@ -45,6 +46,8 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
 
   if (bot.isCloaked) {
     ctx.log("travel", "Bot is already cloaked - no action needed");
+    // Cloaking always undocks the ship — keep the local flag in sync.
+    bot.docked = false;
     return true;
   }
 
@@ -60,11 +63,53 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
     const msg = resp.error.message.toLowerCase();
     if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
       ctx.log("warn", `Failed to enable cloak: ${resp.error.message}`);
+      return false;
     }
-    return false;
+    // Server reports we're already cloaked — treat as success and sync state.
+    bot.isCloaked = true;
+    bot.docked = false;
+    return true;
   }
 
+  // Cloaking always undocks the ship — clear the stale docked flag so a later
+  // ensureDocked() actually re-docks instead of believing we're still docked.
+  bot.isCloaked = true;
+  bot.docked = false;
   ctx.log("travel", "Cloaking enabled successfully");
+  return true;
+}
+
+/**
+ * Decloak (if currently cloaked) and wait for the cloak mutation to fully
+ * resolve before returning. Cloaking/decloaking is a server mutation that takes
+ * one tick to apply; issuing `dock` immediately after `decloak` is rejected with
+ * "action is already pending", and the local `docked` flag is stale (decloaking
+ * undocks the ship). We refresh status and poll until the cloak state settles so
+ * the caller's subsequent dock decision / dock command is accurate.
+ */
+async function decloakAndSettle(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.isCloaked) return true;
+
+  ctx.log("travel", "Decloaking before docking at home station...");
+  const resp = await bot.exec("cloak", { enable: false });
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (!msg.includes("already") && !msg.includes("cloaked")) {
+      ctx.log("warn", `Failed to decloak: ${resp.error.message}`);
+      return false;
+    }
+  }
+
+  // Wait for the 1-tick decloak mutation to resolve, refreshing so the local
+  // isCloaked/docked flags reflect reality before the caller issues dock.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await ctx.sleep(2000);
+    await bot.refreshStatus();
+    if (!bot.isCloaked) break;
+  }
+  // Decloaking undocks the ship — clear the stale flag so ensureDocked() re-docks.
+  bot.docked = false;
   return true;
 }
 
@@ -79,6 +124,8 @@ function getReturnHomeSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   enableCloak: boolean;
+  decloakBeforeDock: boolean;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const globalDefaults = all.return_home || {};
@@ -89,6 +136,8 @@ function getReturnHomeSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
     refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
     enableCloak: (botOverrides.enableCloak as boolean) ?? (globalDefaults.enableCloak as boolean) ?? true,
+    decloakBeforeDock: (botOverrides.decloakBeforeDock as boolean) ?? (globalDefaults.decloakBeforeDock as boolean) ?? false,
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (globalDefaults.ignoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -109,7 +158,6 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const { bot } = ctx;
 
   const routineParams = (bot as unknown as Record<string, unknown>).routineParams as Record<string, unknown> | undefined;
-  const ignoreBlacklist = routineParams?.ignoreBlacklist !== false;
 
   // Wait for any pending action from previous routine to clear
   // This is especially important for emergency return home scenarios
@@ -153,6 +201,8 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeStation = settings.homeStation;
   const refuelThreshold = settings.refuelThreshold;
   const enableCloak = settings.enableCloak;
+  const decloakBeforeDock = settings.decloakBeforeDock;
+  const ignoreBlacklist = routineParams?.ignoreBlacklist === true || settings.ignoreBlacklist === true;
 
   if (!homeSystem) {
     ctx.log("error", "No home system configured — cannot return home");
@@ -161,9 +211,34 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
 
+  // If already at the destination, handle cloak/dock BEFORE re-enabling cloak
+  await bot.refreshStatus();
+  if (bot.system === homeSystem) {
+    if (homeStation && bot.poi === homeStation) {
+      if (bot.isCloaked && decloakBeforeDock) {
+        await decloakAndSettle(ctx);
+      }
+      if (!bot.docked) {
+        ctx.log("travel", "At home station but not docked — docking now...");
+        const docked = await ensureDocked(ctx, true);
+        if (!docked) {
+          ctx.log("error", "Failed to dock at home station — routine cancelled");
+          return;
+        }
+      }
+      ctx.log("travel", "Already at home station — routine complete");
+      return;
+    }
+    if (!homeStation && bot.docked) {
+      ctx.log("travel", "Already docked in home system — routine complete");
+      return;
+    }
+  }
+
   // Enable cloaking if configured and module is available
-  if (enableCloak) {
-    await enableCloakingIfPossible(ctx);
+  let isCloaked = bot.isCloaked;
+  if (enableCloak && !isCloaked) {
+    isCloaked = await enableCloakingIfPossible(ctx);
   }
 
   // Battle check before starting return home
@@ -173,7 +248,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Check if already at home
-  await bot.refreshLocation();
+  await bot.refreshStatus();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
       ctx.log("travel", "Already at home station — checking dock/repair status...");
@@ -300,6 +375,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
 
   // Navigate to home system with retry logic for API timeouts
   yield "navigate";
+  await bot.refreshStatus();
   if (bot.system !== homeSystem) {
     ctx.log("travel", `Navigating to ${homeSystem}...`);
 
@@ -325,7 +401,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         arrived = await navigateToSystem(ctx, homeSystem, {
           fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
-          skipBlacklist: ignoreBlacklist,
+          skipBlacklist: ignoreBlacklist && isCloaked,
         });
 
         if (arrived) {
@@ -338,11 +414,15 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         const isTimeout = msg.includes("524") || msg.includes("timeout") || msg.includes("Timeout");
+        // A dropped socket (server restart / network blip) is never fatal — the
+        // dispatch layer pauses and resends, but if a connection error still
+        // surfaces here we retry the same as a timeout instead of cancelling.
+        const isConnectionLoss = isConnectionError(msg);
 
         ctx.log("error", `Navigation error (attempt ${navAttempts}/${MAX_NAV_ATTEMPTS}): ${msg}`);
 
-        if (!isTimeout) {
-          // Non-timeout error - don't retry
+        if (!isTimeout && !isConnectionLoss) {
+          // Non-timeout, non-connection error - don't retry
           ctx.log("error", `Failed to reach ${homeSystem} — routine cancelled`);
           return;
         }
@@ -404,10 +484,17 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
+  // A ship cannot be both cloaked and docked, and `cloak` is a 1-tick mutation.
+  // Decloak (if cloaked) and wait for the mutation to settle BEFORE docking so the
+  // dock command isn't rejected with "action pending" and the docked flag is accurate.
+  if (bot.isCloaked) {
+    await decloakAndSettle(ctx);
+  }
+
   // Dock at station (skip storage collection - return home doesn't need to manage items)
   // Refresh status first to ensure bot.docked is current before calling ensureDocked
   yield "dock";
-  await bot.refreshLocation();
+  await bot.refreshStatus();
   const docked = await ensureDocked(ctx, true);
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");

@@ -1,5 +1,5 @@
 import type { RoutineContext } from "../bot.js";
-import { readSettings, getSystemInfo, isStationPoi, isApprovedFuelStation, ensureUndocked, refuelAtStation, ensureInsured } from "./common.js";
+import { readSettings, getSystemInfo, isStationPoi, isApprovedFuelStation, ensureUndocked, refuelAtStation, ensureInsured, buildDeniedStationSet } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { mapStore } from "../mapstore.js";
 
@@ -36,7 +36,7 @@ if (approvedFuelStations) {
   }
 }
 
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet, buildDeniedStationSet());
   if (!nearest) {
     ctx.log("error", "No approved refuel station reachable");
     return false;

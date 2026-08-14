@@ -131,6 +131,11 @@ const reconnectingBots = new Set<string>();
  */
 const RECONNECT_BASE_MS = 5000;
 const RECONNECT_MAX_MS = 120_000; // cap at 2 minutes between attempts
+/** Random pre-reconnect delay applied to the FIRST forced reconnect, so a
+ *  fleet-wide simultaneous drop doesn't fire every bot's reconnect on the same
+ *  tick (which would be a synchronized session_replaced storm). Scaled up under
+ *  CPU load. */
+const FIRST_RECONNECT_JITTER_MS = 8000;
 const reconnectBackoff = new Map<string, { lastAttempt: number; attempts: number }>();
 
 /**
@@ -946,6 +951,19 @@ export async function forceReconnectBot(id: string): Promise<void> {
   // slips past the in-flight check still respects the window.
   if (!b) reconnectBackoff.set(id, { lastAttempt: now, attempts: 0 });
   else { b.lastAttempt = now; b.attempts++; }
+
+  // Desynchronize a fleet-wide drop. When a server restart / mass blip kills
+  // hundreds of bots at once, every one of them hits this first forced
+  // reconnect on the SAME tick. Firing 979 connects simultaneously is a
+  // synchronized reconnect storm that the server answers with session_replaced
+  // (4001) — which kills the very sockets we just opened. A per-bot random
+  // jitter before the FIRST reconnect spreads the fleet's attempts out so they
+  // don't all land at once. Scaled up under CPU load (so a saturated loop
+  // doesn't bunch them back up). Repeated drops already use exponential backoff.
+  if (!b) {
+    const jitter = FIRST_RECONNECT_JITTER_MS * loadScale(50);
+    await new Promise<void>((r) => setTimeout(r, Math.random() * jitter));
+  }
 
   const RECCONNECT_TIMEOUT_MS = 15_000;
   try {

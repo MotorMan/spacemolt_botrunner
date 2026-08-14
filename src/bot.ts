@@ -1097,17 +1097,24 @@ shipSpeed = 1;
    * explicit stop or a real terminal close.
    */
   private async runRecovery(): Promise<boolean> {
-    const POLL_MS = 250;
+    const POLL_MS = 500;
     // How long to let the library's own in-place reconnect work before we
     // escalate to a forced fresh socket. The library paces reconnects through
     // its rate-limited queue, so a post-restart mass reconnect can legitimately
     // take a while — but we don't wait forever without acting.
     //
+    // CRITICAL (do not regress): we force a fresh socket at MOST once per grace
+    // window — never on every poll. Forcing every poll evicts + reconnects the
+    // account continuously, which races @spacemolt/lib's own in-place reconnect
+    // and provokes `session_replaced`: the server sees two concurrent sessions
+    // for the same bot, kills the newest, and the recovery loop just fights
+    // itself forever (a per-second reconnect storm). So a forced reconnect is a
+    // *rare, last-resort nudge*, not the per-tick hammer.
+    //
     // Under heavy CPU (a 979-bot fleet all mining at once) the event loop lags
-    // and the library's reconnect runs SLOW, so a fixed grace races it and can
-    // wedge the bot behind a duplicate-login storm. We scale the grace by the
-    // measured loop lag (see loadMonitor) so we stay lenient under load and give
-    // the library room, instead of hammering it.
+    // and the library's reconnect runs SLOW, so we scale the grace + poll by the
+    // measured loop lag (see loadMonitor): we stay lenient under load and give
+    // the library room instead of hammering it.
     const LIBRARY_GRACE_MS = 30_000;
     let cycle = 0;
     for (;;) {
@@ -1116,55 +1123,28 @@ shipSpeed = 1;
         this.log("system", "Stop requested — aborting socket recovery.");
         return false;
       }
-      // Socket is back (library reconnected in place, or a forced reconnect
-      // succeeded). Resume.
+      // Recovered? Require the library to report authenticated AND the socket to
+      // actually be open (readyState 1). Don't resume on a half-open /
+      // reconnecting socket (readyState 0), or we'd declare victory a moment
+      // before it dies again.
       const acct = this.account;
       if (acct && acct.authenticated && this.getConnectionState() === "connected") {
         if (cycle > 0) this.log("system", "Socket reconnected — resuming routine.");
         return true;
       }
-      // Classify the socket state. `getConnectionState` distinguishes a socket
-      // the library is ACTIVELY rebuilding (readyState 0 === "reconnecting")
-      // from one that is genuinely CLOSED / not authenticated ("disconnected").
-      // The distinction is the whole ballgame under load:
-      //
-      //  - "reconnecting": the library owns the socket and is bringing it back.
-      //    TRUST it — wait a (load-scaled) grace before forcing our own socket,
-      //    because evicting mid-reconnect is what created the dupe-login storm.
-      //
-      //  - "disconnected": the socket is observably dead and won't reopen on its
-      //    own (the library already gave up, or its in-place reconnect failed).
-      //    Sitting on it just throws "cannot send on a closed socket" forever, so
-      //    escalate to ONE forced fresh socket IMMEDIATELY (it's deduped +
-      //    backed off inside forceReconnectBot — no storm). This is the fix for
-      //    "we KNOW it's closed but keep trying it": we stop hoping and act.
-      //
-      // The old code treated every non-terminal drop as "wait 30s", which is why
-      // a truly-closed socket (whose disconnect event was delayed by CPU
-      // starvation) kept failing commands for half a minute before we acted.
-      const state = this.getConnectionState();
-      const gaveUp = this._terminalClosed;
-      const observablyClosed = state === "disconnected";
-
-      if (gaveUp || observablyClosed) {
-        const why = gaveUp
-          ? "Library reported the socket gone for good"
-          : "Socket is observably closed (not just mid-reconnect)";
-        if (cycle === 0) {
-          this.log("warn", `${why} — requesting one fresh socket (backed off) and waiting for recovery...`);
-        }
+      // Escalate to ONE forced fresh socket only when:
+      //   - the library gave up (terminal close fired — _terminalClosed), OR
+      //   - a load-scaled grace window has elapsed with no recovery.
+      // Either way it happens at most once per window — see the note above.
+      const waited = cycle * (POLL_MS * loadScale(50));
+      const grace = LIBRARY_GRACE_MS * loadScale(50);
+      if (this._terminalClosed) {
+        this.log("warn", "Library reported the socket gone for good — requesting one fresh socket (backed off) and waiting for recovery...");
         this.clearTerminalClosed();
         await this.forceSocketReconnect();
-      } else {
-        // Library is actively reconnecting in place: trust it, but only for a
-        // *lenient, load-scaled* grace window. Under CPU pressure the library's
-        // reconnect is slow, so we wait proportionally longer before stepping in.
-        const grace = LIBRARY_GRACE_MS * loadScale(50);
-        const waited = cycle * (POLL_MS * loadScale(50));
-        if (waited > 0 && waited % grace === 0) {
-          this.log("warn", "Still reconnecting after grace window — nudging one fresh socket (backed off) and continuing to wait...");
-          await this.forceSocketReconnect();
-        }
+      } else if (waited > 0 && waited % grace === 0) {
+        this.log("warn", "Still disconnected after grace window — requesting one fresh socket (backed off) and waiting for recovery...");
+        await this.forceSocketReconnect();
       }
       await new Promise((r) => setTimeout(r, POLL_MS * loadScale(50)));
       cycle++;

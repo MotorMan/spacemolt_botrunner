@@ -471,6 +471,30 @@ export function buildOwnFacilityRecipeMap(
   return map;
 }
 
+// Re-query the live faction facility list and rebuild the derived maps. The
+// crafter can run for a long time (the active plan loop below waits on jobs for
+// hours), and a facility can be upgraded mid-run — which changes its level and
+// possibly its type/recipe. Callers must re-resolve these every pass so a
+// freshly upgraded facility is actually used instead of the stale snapshot.
+async function refreshFacilityMaps(
+  bot: any,
+  settings: CrafterSettings,
+): Promise<{
+  factionFacilities: FactionFacility[];
+  facilityAvailableRecipes: Set<string>;
+  ownFacilityMap: OwnFacilityMap;
+}> {
+  const factionFacilities = await fetchFactionFacilities(bot);
+  const facilityRecipeMap = getFacilityRecipeMap();
+  const facilityAvailableRecipes = getRecipesAvailableAtFacilities(
+    factionFacilities,
+    facilityRecipeMap,
+    settings.recipeFacilityLinks,
+  );
+  const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities, settings.recipeFacilityLinks);
+  return { factionFacilities, facilityAvailableRecipes, ownFacilityMap };
+}
+
 // Distribute jobs across multiple owned facilities of the same type by
 // round-robining through them in a stable order.
 function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[]): FactionFacility {
@@ -1330,6 +1354,15 @@ async function executeCraftingPlan(
     while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
       loopCount++;
       await syncCraftingQueue(ctx, tracker, recipes, true);
+      // Re-resolve the facility list each pass. A facility can be upgraded
+      // (level/type change) while the crafter is mid-plan, and routing must
+      // target the current facility rather than the snapshot taken at round
+      // start — otherwise it keeps using the old-level facility.
+      if (settings) {
+        const refreshed = await refreshFacilityMaps(bot, settings);
+        facilityAvailableRecipes = refreshed.facilityAvailableRecipes;
+        ownFacilityMap = refreshed.ownFacilityMap;
+      }
       // Re-read faction storage LIVE each pass. As queued jobs consume/produce
       // materials on the server, the holdings change continuously; a stale count
       // here is what makes the planner think it needs to re-refine materials it
@@ -1767,10 +1800,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       return total;
     }
 
-    const factionFacilities = await fetchFactionFacilities(bot);
-    const facilityRecipeMap = getFacilityRecipeMap();
-    const facilityAvailableRecipes = getRecipesAvailableAtFacilities(factionFacilities, facilityRecipeMap, settings.recipeFacilityLinks);
-    const ownFacilityMap = buildOwnFacilityRecipeMap(factionFacilities, settings.recipeFacilityLinks);
+    // Grab a FRESH facility list every round: facilities can be upgraded (new
+    // level/type) while the crafter runs, and we must route to the current one.
+    const { factionFacilities, facilityAvailableRecipes, ownFacilityMap } = await refreshFacilityMaps(bot, settings);
     ctx.log("craft", `Faction facilities: ${factionFacilities.length} total, ${facilityAvailableRecipes.size} production recipes available`);
     ctx.log("craft", `Own facilities: ${[...ownFacilityMap.values()].reduce((n, l) => n + l.length, 0)} covering ${ownFacilityMap.size} recipes (forceOwnFacility=${settings.forceOwnFacility})`);
     if (settings.allowRentalPurchase) {

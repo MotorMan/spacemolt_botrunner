@@ -19548,6 +19548,19 @@ function renderAiChatSettings(panel) {
         </div>
       </div>
 
+      <div class="setting-row" style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border);">
+        <div style="width:100%;">
+          <div class="setting-label">Force Updates</div>
+          <div class="setting-hint">Immediately run a status / color / captain's log update for ALL bots, regardless of the intervals above. Runs in the background — watch the system log for progress.</div>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+            <button id="btn-force-status" onclick="forceAiChatUpdate('status')">Force Status Update</button>
+            <button id="btn-force-color" onclick="forceAiChatUpdate('color')">Force Color Update</button>
+            <button id="btn-force-captain-log" onclick="forceAiChatUpdate('captainLog')">Force Captain's Log</button>
+          </div>
+          <div id="force-update-status" style="font-size:12px;color:var(--text-dim);margin-top:6px;"></div>
+        </div>
+      </div>
+
       <div class="settings-save-bar">
         <button class="primary" onclick="saveAiChatSettings()">Save Settings</button>
       </div>
@@ -19643,6 +19656,40 @@ respondToMentions: document.getElementById(
         settings.ai_chat = s;
         // Update toggle button state
         updateAiChatToggleButton();
+      }
+
+      async function forceAiChatUpdate(kind) {
+        const endpoints = {
+          status: "/api/aichat/force-status-update",
+          color: "/api/aichat/force-color-update",
+          captainLog: "/api/aichat/force-captain-log",
+        };
+        const labels = {
+          status: "status update",
+          color: "color update",
+          captainLog: "captain's log",
+        };
+        const statusEl = document.getElementById("force-update-status");
+        const btn = document.getElementById(
+          kind === "status" ? "btn-force-status" :
+          kind === "color" ? "btn-force-color" : "btn-force-captain-log"
+        );
+        if (!endpoints[kind] || !btn) return;
+        btn.disabled = true;
+        statusEl.textContent = `Triggering ${labels[kind]}...`;
+        try {
+          const resp = await fetch(endpoints[kind], { method: "POST" });
+          const data = await resp.json().catch(() => ({}));
+          if (data.triggered) {
+            statusEl.textContent = `✓ ${data.message} — check the system log for progress.`;
+          } else {
+            statusEl.textContent = `⚠ ${data.message || "Could not start update."}`;
+          }
+        } catch (err) {
+          statusEl.textContent = `⚠ Error: ${err.message || err}`;
+        } finally {
+          btn.disabled = false;
+        }
       }
 
       const DEFAULT_AI_CHAT_PERSONALITY = `You are a friendly and helpful AI assistant playing SpaceMolt.

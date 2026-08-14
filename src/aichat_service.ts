@@ -2644,7 +2644,7 @@ async sendRescueEnRouteNotification(
    * activity log and personality, then write it via captains_log_add.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetCaptainLog(bot: Bot): Promise<boolean> {
+  private async generateAndSetCaptainLog(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
     this.logFn("ai_chat_debug", `Captain's log: effective llmTimeoutSec=${settings.llmTimeoutSec}s, activityMinutes=${settings.autoCaptainLogActivityMinutes}, model=${settings.model || "(default)"}`);
 
@@ -2653,7 +2653,7 @@ async sendRescueEnRouteNotification(
       return false;
     }
 
-    if (!settings.autoCaptainLogEnabled) {
+    if (!force && !settings.autoCaptainLogEnabled) {
       this.logFn("ai_chat_debug", `Captain's log skipped: autoCaptainLogEnabled is false`);
       return false;
     }
@@ -2754,7 +2754,7 @@ Write a captain's log entry (personal journal) describing what you did during th
    * Generate and set a bot's status message using LLM and personality.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetBotStatus(bot: Bot): Promise<boolean> {
+  private async generateAndSetBotStatus(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
 
     if (!settings.enabled) {
@@ -2762,7 +2762,7 @@ Write a captain's log entry (personal journal) describing what you did during th
       return false;
     }
 
-    if (!settings.autoStatusUpdateEnabled) {
+    if (!force && !settings.autoStatusUpdateEnabled) {
       this.logFn("ai_chat_debug", `Status update skipped: autoStatusUpdateEnabled is false`);
       return false;
     }
@@ -2859,7 +2859,7 @@ Be creative but concise. Think like you're setting a social status that other pl
    * Generate and set a bot's ship colors using LLM and personality.
    * Returns true on success, false on failure.
    */
-  private async generateAndSetBotColors(bot: Bot): Promise<boolean> {
+  private async generateAndSetBotColors(bot: Bot, force: boolean = false): Promise<boolean> {
     const settings = getAiChatSettings();
 
     if (!settings.enabled) {
@@ -2867,7 +2867,7 @@ Be creative but concise. Think like you're setting a social status that other pl
       return false;
     }
 
-    if (!settings.autoColorUpdateEnabled) {
+    if (!force && !settings.autoColorUpdateEnabled) {
       this.logFn("ai_chat_debug", `Color update skipped: autoColorUpdateEnabled is false`);
       return false;
     }
@@ -2950,10 +2950,78 @@ No other text, formatting, or explanation.`;
   // Track daily update runs to prevent re-entry / concurrent queues.
   private dailyUpdateRunning = false;
 
+  // Tracks which forced update types are currently running (so the web UI
+  // buttons can't accidentally double-trigger the same one).
+  private forcedRuns = new Set<string>();
+
   // Track consecutive failures per update type so we don't busy-loop LLM calls
   // when something is permanently failing (auth, missing API, etc.).
   private consecutiveFailures = new Map<string, number>();
   private readonly MAX_CONSECUTIVE_FAILURES = 3;
+
+  /**
+   * Force a status/color/captain's-log update for ALL bots, regardless of the
+   * auto-update interval or the autoXEnabled flags. Runs in the background so
+   * the web UI call returns immediately. Used by the "Force update" buttons.
+   */
+  async forceStatusUpdate(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("status");
+  }
+
+  async forceColorUpdate(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("color");
+  }
+
+  async forceCaptainLog(): Promise<{ triggered: boolean; message: string }> {
+    return this.triggerForcedUpdate("captainLog");
+  }
+
+  private async triggerForcedUpdate(kind: "status" | "color" | "captainLog"): Promise<{ triggered: boolean; message: string }> {
+    if (this.forcedRuns.has(kind)) {
+      return { triggered: false, message: `Forced ${kind} update is already running` };
+    }
+    this.forcedRuns.add(kind);
+    void this.runForcedUpdate(kind).finally(() => this.forcedRuns.delete(kind));
+    return { triggered: true, message: `Forced ${kind} update started for all bots` };
+  }
+
+  private async runForcedUpdate(kind: "status" | "color" | "captainLog"): Promise<void> {
+    const settings = getAiChatSettings();
+    if (!settings.enabled) {
+      this.logFn("ai_chat", `🔧 Forced ${kind} update skipped: AI Chat is disabled`);
+      return;
+    }
+
+    const bots = AiChatService.getBots();
+    if (!bots || bots.length === 0) {
+      this.logFn("ai_chat", `🔧 Forced ${kind} update skipped: no bots available`);
+      return;
+    }
+
+    this.logFn("ai_chat", `🔧 Forcing ${kind} update for ${bots.length} bot(s)...`);
+    let success = 0;
+    for (const bot of bots) {
+      if (bot.state !== "running" || !bot.isConnected()) continue;
+      let ok = false;
+      try {
+        if (kind === "status") ok = await this.generateAndSetBotStatus(bot, true);
+        else if (kind === "color") ok = await this.generateAndSetBotColors(bot, true);
+        else ok = await this.generateAndSetCaptainLog(bot, true);
+      } catch (err) {
+        this.logFn("error", `Forced ${kind} update error for ${bot.username}: ${err}`);
+      }
+      if (ok) success++;
+    }
+
+    // Update the timestamp so the normal daily cycle doesn't immediately redo it.
+    const updates = loadDailyUpdates();
+    if (kind === "status") updates.lastStatusUpdate = Date.now();
+    else if (kind === "color") updates.lastColorUpdate = Date.now();
+    else updates.lastCaptainLogUpdate = Date.now();
+    saveDailyUpdates(updates);
+
+    this.logFn("ai_chat", `✅ Forced ${kind} update complete: ${success}/${bots.length} bots succeeded`);
+  }
 
   private async runDailyUpdates(): Promise<void> {
     if (this.dailyUpdateRunning) {

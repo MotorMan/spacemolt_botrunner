@@ -980,6 +980,25 @@ if (!this.settings.fuel_service) {
             );
           }
         }
+
+        // Force AI Chat daily updates (status / color / captain's log) for all bots.
+        // These run in the background; the response returns immediately.
+        const forceUpdateEndpoints: Record<string, () => Promise<{ triggered: boolean; message: string }>> = {
+          "/api/aichat/force-status-update": () => (globalThis as any).aiChatService?.forceStatusUpdate?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+          "/api/aichat/force-color-update": () => (globalThis as any).aiChatService?.forceColorUpdate?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+          "/api/aichat/force-captain-log": () => (globalThis as any).aiChatService?.forceCaptainLog?.() ?? Promise.resolve({ triggered: false, message: "AI Chat service unavailable" }),
+        };
+        if (req.method === "POST" && forceUpdateEndpoints[url.pathname]) {
+          try {
+            const result = await forceUpdateEndpoints[url.pathname]();
+            return Response.json(result);
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
+        }
         if (url.pathname === "/api/stationRef") {
           const stationRefPath = join(DATA_DIR, "stationRef.json");
           if (existsSync(stationRefPath)) {

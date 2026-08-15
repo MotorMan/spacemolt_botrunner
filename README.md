@@ -67,9 +67,9 @@ Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www
 **Architecture Highlights:**
 - Single Bun process — no database, no external services
 - File-based persistence in `data/` directory (JSON files, no database server needed)
-- HTTP API v2 client with response caching, mutation-based cache invalidation, exponential backoff
+- **@spacemolt/lib** headless client — WebSocket transport, auto-reconnection, session management, rate limiting
 - WebSocket push architecture from server to all connected browser tabs
-- Session token persistence for instant reconnection across restarts
+- Clerk API integration for multi-account bot management
 - Graceful shutdown with stats flush, bot stop, and optional session clearing on mass disconnect
 
 ---
@@ -125,8 +125,8 @@ Open `http://localhost:3000` in your browser. Use `PORT=8080 bun start` for a di
 │  └──────┬───────┘    └──────────────┘                   │
 │         │                                               │
 │  ┌──────▼───────┐    ┌──────────────┐                   │
-│  │  Bot (×N)    │───▶│ SpaceMoltAPI │──▶ Game Server   │
-│  │  (routines)  │    │  (HTTP v2)   │     (spacemolt)   │
+│  │  Bot (×N)    │───▶│ @spacemolt/lib │──▶ Game Server   │
+│  │  (routines)  │    │  (WS lib)   │     (spacemolt)   │
 │  └──────────────┘    └──────────────┘                   │
 │         │                                               │
 │  ┌──────▼───────┐    ┌──────────────┐                   │
@@ -140,15 +140,15 @@ Open `http://localhost:3000` in your browser. Use `PORT=8080 bun start` for a di
 
 | Module | File | Purpose |
 |--------|------|---------|
-| **BotManager** | `src/botmanager.ts` (~1050 lines) | Entry point — discovers bots, starts web server, routes actions, manages AI chat service, mass disconnect detector, registers all 20 routines |
-| **Bot** | `src/bot.ts` (~2525 lines) | Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking, pathfinder state |
-| **API Client** | `src/api.ts` (~841 lines) | SpaceMolt REST client (V2) — session management, response caching, rate limiting, 502/524 retry, bandwidth monitoring, command-to-tool mapping |
-| **Web Server** | `src/web/server.ts` (~1498 lines) | Bun.serve HTTP + WebSocket server, settings persistence, stats flushing, map data serving, fleet stats, bandwidth API |
+| **BotManager** | `src/botmanager.ts` (~1800 lines) | Entry point — discovers bots, starts web server, routes actions, manages AI chat service, mass disconnect detector, registers all 28 routines |
+| **Bot** | `src/bot.ts` (~4800 lines) | Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking, pathfinder state |
+| **Lib Client** | `src/libClient.ts` (~213 lines) | @spacemolt/lib headless client wrapper — multi-account connection management, session handling, reconnection |
+| **Command Bridge** | `src/commandBridge.ts` (~500 lines) | Command-to-tool mapping, response normalization for library integration |
+| **Web Server** | `src/web/server.ts` (~1498 lines) | Bun.serve HTTP + WebSocket server, settings persistence, stats flushing, map data serving, fleet stats |
 | **Dashboard SPA** | `src/web/index.html` (~877KB) | Single-page application — dashboard, map, market, faction, shipyard, missions, stats, settings, bot profiles |
 | **AI Chat Service** | `src/aichat_service.ts` (~2191 lines) | Global background service — monitors chat, per-bot personalities, conversation history, empire official filtering, map summary integration |
 | **Map Store** | `src/mapstore.ts` (~2131 lines) | Galaxy map persistence — systems, POIs, connections, resources, market data, wormholes, BFS pathfinding, pathfinder bearing calculations |
 | **Catalog Store** | `src/catalogstore.ts` (~362 lines) | Game catalog cache — items, ships, skills, recipes with 24h auto-refresh |
-| **Session Manager** | `src/session.ts` (~118 lines) | Credential and session token persistence per bot |
 | **Pathfinder** | `src/pathfinder.ts` | BFS pathfinding, bearing calculations, travel time estimates, landing predictions |
 | **UI** | `src/ui.ts` (~509 lines) | Log routing, notification parsing, LLM debug formatting, YAML output, color-coded categories |
 | **Debug** | `src/debug.ts` (~135 lines) | Per-bot and global debug logging, log rotation (200MB max) |
@@ -159,22 +159,28 @@ Open `http://localhost:3000` in your browser. Use `PORT=8080 bun start` for a di
 
 ### Data Flow
 
-1. **BotManager** discovers saved bot sessions from `sessions/` directory on startup
-2. Each **Bot** resumes its session (or performs full login) with staggered delays to avoid rate limiting
-3. Bots run their assigned **routines** (async generators), executing game commands via the API client
-4. The **API client** handles session creation, caching, retries, and error recovery automatically
+1. **BotManager** discovers saved bot credentials from `sessions/` directory on startup
+2. **Lib Client** (`@spacemolt/lib`) connects to SpaceMolt via WebSocket using Clerk API keys — handles authentication, session management, and auto-reconnection
+3. Each **Bot** wraps a library `Account` and runs its assigned **routines** (async generators), executing game commands via the typed `account.commands` facade
+4. **Command Bridge** normalizes library responses into `ApiResponse` format for routine compatibility
 5. **Log output** from each bot is routed through the Web Server to all connected browser tabs via WebSocket
 6. The **Dashboard SPA** renders real-time status, map data, market info, and provides manual controls
 7. All persistent data (map, catalog, settings, stats, player names) is saved to `data/` as JSON files
 
-### Session Management
+### Connection & Session Management
 
-- **Session tokens** persisted to `sessions/<username>/session.json` for instant reconnection
+- **@spacemolt/lib** handles WebSocket transport, authentication, and auto-reconnection transparently
+- **Clerk API keys** — Primary + secondary keys for multi-account bot management via dashboard
 - **Staggered startup** — 5s delay between session resumes, 13s between full logins (rate limit avoidance)
-- **Session recovery** — up to 10 automatic session renewals before forcing full login
-- **Failure tracking** — 3+ failures in 60 seconds triggers immediate full login (bypasses delay)
+- **Instant routine resume** — Large fleets (>100 bots): bots start routine immediately on connect, no fleet-wide sequential wait
+- **Load-aware reconnect backoff** — Exponential backoff (5s→120s) scaled by event loop lag
+- **Terminal close handling** — `session_replaced` (4001) / `auth_timeout` (4002) detection — bots connected elsewhere NOT auto-reconnected
+- **Old socket close wait** — Waits for old WebSocket to fully close (8s timeout + 750ms settle) before new login
+- **Reconnect deduplication** — In-flight guard prevents concurrent reconnect attempts per bot
+- **First-reconnect jitter** — Random 0-8s delay (load-scaled) to desynchronize fleet-wide reconnect storms
+- **Credentials** persisted to `sessions/<username>/credentials.json` for Clerk-based login
 - **Mass disconnect** — 5+ bots losing sessions within 5 seconds triggers graceful shutdown + restart
-- **Watchdog** (`watchdog.bat`) — restarts the process on exit code 100 (mass disconnect recovery), clears session files to force fresh logins
+- **Watchdog** (`watchdog.bat`) — restarts the process on exit code 100 (mass disconnect recovery)
 
 ### File-Based Persistence
 
@@ -219,7 +225,7 @@ No database required. All state is stored as JSON files in `data/`:
 
 ## Bot Routines
 
-The system includes **20 distinct automated routines**, each designed for specific gameplay roles. Bots can switch between routines at any time from the dashboard. Each routine is an async generator that yields state names as it progresses, allowing clean interruption and resumption.
+The system includes **28 distinct automated routines**, each designed for specific gameplay roles. Bots can switch between routines at any time from the dashboard. Each routine is an async generator that yields state names as it progresses, allowing clean interruption and resumption.
 
 ### Economic Routines
 
@@ -1144,17 +1150,22 @@ Drone script templates and API commands for automated drone deployment via `src/
 
 ## Adding Bots
 
-From the dashboard:
+**Via Clerk API (Headless):**
+1. Add Clerk API key(s) in Settings → General → Clerk API Key (supports multiple accounts)
+2. Click **Add Bots from Account** — lists all owned players across the configured Clerk accounts
+3. Select players to add — they connect via `@spacemolt/lib` headless client
+4. Bots auto-reconnect on restart
 
+**Legacy (Registration Code):**
 1. **Register New** — enter a registration code from [spacemolt.com/dashboard](https://www.spacemolt.com/dashboard), pick a username and empire
 2. **Add Existing** — enter username and password for an existing account
 
 **Credentials** are saved to `sessions/<username>/credentials.json`. Bots auto-discover on restart.
 
 **Auto-Resume:** Bot assignments persist across restarts via `botAssignments` in settings. On startup:
-1. BotManager discovers all saved sessions from `sessions/` directory
-2. Each bot attempts session resume (fast, 5s stagger)
-3. If resume fails, schedules full login (13s stagger for rate limit avoidance)
+1. BotManager discovers all saved credentials from `sessions/` directory
+2. **Lib Client** connects selected bots via `@spacemolt/lib` using Clerk API keys
+3. Each bot attempts session resume (fast, 5s stagger) — library handles auth/reconnection
 4. After successful login, auto-starts the bot's assigned routine
 5. Catalog data is fetched if stale (24h TTL)
 
@@ -1167,8 +1178,8 @@ spacemolt_botrunner/
 ├── src/
 │   ├── botmanager.ts              # Entry point — discovers bots, starts web server, routes actions, registers 28 routines
 │   ├── bot.ts                     # Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking
-│   ├── api.ts                     # SpaceMolt REST client (V2) with session management, caching, retry, bandwidth monitoring
-│   ├── session.ts                 # Credential and session token persistence
+│   ├── libClient.ts               # @spacemolt/lib headless client integration
+│   ├── commandBridge.ts           # Command-to-tool mapping, response normalization
 │   ├── ui.ts                      # Log routing, notification parsing, LLM debug formatting, YAML output
 │   ├── debug.ts                   # Per-bot and global debug logging, log rotation
 │   ├── mapstore.ts                # Galaxy map persistence with BFS pathfinding and pathfinder bearings
@@ -1195,7 +1206,6 @@ spacemolt_botrunner/
 │   ├── loop.ts                    # AI agent loop with context compaction and retry
 │   ├── schema.ts                  # Game command schema fetcher (OpenAPI spec parser)
 │   ├── model.ts                   # LLM model resolution (pi-ai integration)
-│   ├── libClient.ts               # @spacemolt/lib headless client integration
 │   ├── client_sync_master.ts      # Multi-instance sync master
 │   ├── client_sync_slave.ts       # Multi-instance sync slave
 │   ├── client_sync_light_slave.ts # Lightweight sync client
@@ -1298,7 +1308,7 @@ spacemolt_botrunner/
 │   │
 │   └── types/
 │       └── game.ts                # Comprehensive game type definitions (~631 lines)
-│
+```
 ├── tests/                         # Integration and battle interrupt tests
 │   ├── battle-interrupt-helpers.ts
 │   ├── BATTLE_INTERRUPT_TESTING.md
@@ -1316,8 +1326,8 @@ spacemolt_botrunner/
 │   ├── miner_flock.test.ts
 │   ├── salvage-api.test.ts
 │   └── salvager_flock.test.ts
-│
-├── data/                          # Runtime persistent data (created on first run)
+
+├── data/
 │   ├── settings.json              # Per-routine and per-bot settings
 │   ├── map.json                   # Galaxy map data
 │   ├── catalog.json               # Game catalog cache
@@ -1364,10 +1374,9 @@ spacemolt_botrunner/
 │   ├── factionStorage/            # Faction storage cache files
 │   └── bot_positions.csv          # Position change log
 │
-├── sessions/                      # Bot credentials and session tokens (gitignored)
+├── sessions/                      # Bot credentials (gitignored)
 │   └── <username>/
-│       ├── credentials.json       # Bot credentials
-│       ├── session.json           # Session tokens
+│       ├── credentials.json       # Bot credentials (username, password, Clerk linkage)
 │       └── TODO.md                # AI routine TODO tracking
 │
 ├── old-logs/                      # Rotated log files
@@ -1753,3 +1762,4 @@ npm test
 **Questions or need help?** See the SpaceMolt Discord and ask LT1428.
 
 **Like this project?** Show some love — it's built with ❤️ and zero frameworks.
+

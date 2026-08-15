@@ -344,6 +344,23 @@ export function isApprovedFuelStation(stationId: string, settings: any, systemId
   return approved.some(a => a.endsWith(`|${stationId}`));
 }
 
+/**
+ * True only when a station may be used for autonomous REFUELING: it must pass the
+ * approved-fuel check AND not sit on the configured station blacklist.
+ *
+ * The blacklist is intentionally NOT consulted when an explicit destination is in
+ * play (see `ensureDocked`'s `targetStationId`): a user-specified home station
+ * must remain dockable even if it is blacklisted (e.g. because it has no fuel of
+ * its own — the bot carries its own cells). The blacklist only restricts where we
+ * will *choose* to refuel.
+ */
+export function isUsableFuelStation(stationId: string, settings: any, systemId?: string): boolean {
+  if (!isApprovedFuelStation(stationId, settings, systemId)) return false;
+  const blacklist = getStationBlacklist();
+  if (blacklist.length > 0 && blacklist.map(s => s.toLowerCase()).includes(stationId.toLowerCase())) return false;
+  return true;
+}
+
 /** Find a station with a salvage yard service. Returns null if none found. */
 export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
   // First try: match known salvage yard station IDs (explicit list)
@@ -598,7 +615,7 @@ export async function ensureDocked(
   ctx: RoutineContext,
   skipStorageCollection: boolean = true,
   minBalance: number = 0,
-  opts?: { skipApprovedCheck?: boolean },
+  opts?: { skipApprovedCheck?: boolean; targetStationId?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) {
@@ -608,10 +625,25 @@ export async function ensureDocked(
 
   const { pois } = await getSystemInfo(ctx);
   const stationBlacklist = buildDeniedStationSet();
-  const candidate = findStation(pois, undefined, true);
-  const station = candidate && !isStationDenied(candidate.id) && !stationBlacklist.has(candidate.id.toLowerCase())
-    ? candidate
-    : pois.find(p => isStationPoi(p) && !isStationDenied(p.id) && !stationBlacklist.has(p.id.toLowerCase())) ?? null;
+  let station: SystemPOI | null = null;
+
+  // If the caller named a specific destination station (e.g. a user-specified
+  // home station), honor it even when it is on the configured station blacklist.
+  // The blacklist governs REFUEL choices, not an explicit destination — we must
+  // still be able to dock at a station the user told us to go to. We keep
+  // respecting the runtime "access denied" set, since an explicitly-denied
+  // station can never be docked at this session.
+  if (opts?.targetStationId) {
+    const target = pois.find(p => p.id === opts.targetStationId && isStationPoi(p));
+    if (target && !isStationDenied(target.id)) station = target;
+  }
+
+  if (!station) {
+    const candidate = findStation(pois, undefined, true);
+    station = candidate && !isStationDenied(candidate.id) && !stationBlacklist.has(candidate.id.toLowerCase())
+      ? candidate
+      : pois.find(p => isStationPoi(p) && !isStationDenied(p.id) && !stationBlacklist.has(p.id.toLowerCase())) ?? null;
+  }
 
   if (station) {
     if (bot.poi !== station.id) {

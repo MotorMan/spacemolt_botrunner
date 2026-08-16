@@ -1270,6 +1270,19 @@ if (!this.settings.fuel_service) {
             return Response.json({ error: "Market details file not found" }, { status: 404 });
           }
         }
+        if (url.pathname === "/data/lexSeller.json") {
+          const lexPath = join(DATA_DIR, "lexSeller.json");
+          if (existsSync(lexPath)) {
+            return new Response(readFileSync(lexPath, "utf-8"), {
+              headers: {
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+              },
+            });
+          } else {
+            return Response.json({ orders: [], items: [], bot: "", station: "", updatedAt: null });
+          }
+        }
         if (url.pathname === "/data/rawMissions.json") {
           const rawMissionsPath = join(process.cwd(), "data", "rawMissions.json");
           if (existsSync(rawMissionsPath)) {
@@ -2672,6 +2685,17 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/market.html") {
           const marketPath = join(import.meta.dir, "market.html");
           return new Response(readFileSync(marketPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve lexSeller.html for the LEx Seller (Local Exchange Seller) UI
+        if (url.pathname === "/lexSeller.html") {
+          const lexPath = join(import.meta.dir, "lexSeller.html");
+          return new Response(readFileSync(lexPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

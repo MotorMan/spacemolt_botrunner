@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LEx Seller — Local Exchange</title>
+<link rel="stylesheet" href="/index.css" />
+<style>
+  html, body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--text); }
+  body { padding:16px; font-family:var(--font, system-ui, sans-serif); }
+  h2 { margin:0 0 4px; color:var(--text-bright); }
+  .muted { color:var(--text-dim); font-size:12px; }
+  .toolbar { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:12px 0; }
+  select, input, button { background:#000; color:#fff; border:1px solid var(--border); border-radius:4px; padding:6px 10px; font-size:12px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger { background:#5a1d1d; color:#fff; }
+  button.sm { padding:3px 8px; font-size:11px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; margin-top:8px; }
+  th { text-align:left; padding:8px 10px; background:var(--card-bg); border-bottom:1px solid var(--border); color:var(--text-dim); font-weight:600; }
+  td { padding:6px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  tr:hover td { background:var(--hover); }
+  .filled { color:#4caf50; }
+  .empty { color:#f44336; }
+  .card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:14px; margin-top:14px; }
+  .card h3 { margin:0 0 10px; color:var(--text-bright); font-size:14px; }
+  .item-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+  .status { font-size:12px; padding:6px 10px; border-radius:4px; background:var(--card-bg); }
+  .status.ok { color:#4caf50; }
+  .status.err { color:#f44336; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px; }
+  .field { display:flex; flex-direction:column; gap:2px; }
+  .field label { font-size:11px; color:var(--text-dim); }
+  #settingsItems .srow { display:flex; gap:6px; align-items:center; margin-bottom:6px; flex-wrap:wrap; }
+  hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
+</style>
+</head>
+<body>
+  <h2>LEx Seller — Local Exchange</h2>
+  <div class="muted">Stationary vendor: lists your items at your home station, auto-reconciles sell orders, and lets you drive add / cancel / reprice / remove directly on the running bot.</div>
+
+  <div class="toolbar">
+    <label>Bot:</label>
+    <select id="botSelect"><option value="">— select —</option></select>
+    <span id="stationInfo" class="muted"></span>
+    <button class="sm" onclick="refreshSnapshot()">Refresh now</button>
+    <span id="statusMsg" class="status"></span>
+  </div>
+
+  <div class="card">
+    <h3>Live Sell Orders</h3>
+    <div id="ordersWrap"><div class="muted">Loading…</div></div>
+  </div>
+
+  <div class="card">
+    <h3>Add to Order</h3>
+    <div class="item-row">
+      <span class="field"><label>Item ID</label><input id="addItem" placeholder="e.g. fuel_cell" style="width:160px" /></span>
+      <span class="field"><label>Source</label>
+        <select id="addSource">
+          <option value="faction">faction (withdraw → cargo → list)</option>
+          <option value="cargo">cargo (already aboard)</option>
+        </select>
+      </span>
+      <span class="field"><label>Qty</label><input id="addQty" type="number" min="1" value="1" style="width:90px" /></span>
+      <span class="field"><label>Price (0 = auto)</label><input id="addPrice" type="number" min="0" value="0" style="width:110px" /></span>
+      <button class="primary" onclick="doAdd()">Add / List</button>
+    </div>
+    <div class="muted">If an order for the item already exists at the same price, the game appends to it. Otherwise a new order is created.</div>
+  </div>
+
+  <div class="card">
+    <h3>Settings (routine: lex_seller)</h3>
+    <div class="grid2">
+      <span class="field"><label>Home Station (system|poi)</label><input id="set-homeStation" placeholder="sol|sol_central" /></span>
+      <span class="field"><label>Home System</label><input id="set-homeSystem" placeholder="sol" /></span>
+      <span class="field"><label>Global Min Price (floor)</label><input id="set-globalMinPrice" type="number" min="0" /></span>
+      <span class="field"><label>Auto Min</label><input id="set-autoMin" type="number" min="0" /></span>
+      <span class="field"><label>Auto Max</label><input id="set-autoMax" type="number" min="0" /></span>
+      <span class="field"><label>Refuel Threshold %</label><input id="set-refuelThreshold" type="number" min="0" max="100" /></span>
+      <span class="field"><label>Repair Threshold %</label><input id="set-repairThreshold" type="number" min="0" max="100" /></span>
+      <span class="field"><label><input type="checkbox" id="set-useRemoteMarketQuery" /> Use Remote Market Query</label></span>
+      <span class="field"><label><input type="checkbox" id="set-preloadCredits" /> Preload Credits (empire fee)</label></span>
+      <span class="field"><label>Fee Credit Buffer</label><input id="set-feeCreditBuffer" type="number" min="0" /></span>
+    </div>
+    <hr />
+    <h3 style="font-size:13px">Items</h3>
+    <div id="settingsItems"></div>
+    <button class="sm" onclick="addItemRow()">+ Add Item</button>
+    <div style="margin-top:12px">
+      <button class="primary" onclick="saveSettings()">Save Settings</button>
+      <button class="sm" onclick="loadSettingsIntoForm()">Reload from snapshot</button>
+    </div>
+  </div>
+
+<script>
+let ws = null;
+let wsManualClose = false;
+let snapshot = { orders: [], items: [], bot: "", station: "", updatedAt: null };
+let pollTimer = null;
+
+function esc(s) {
+  if (s == null) return "";
+  const d = document.createElement("div");
+  d.textContent = String(s);
+  return d.innerHTML;
+}
+function setStatus(msg, cls) {
+  const el = document.getElementById("statusMsg");
+  el.textContent = msg || "";
+  el.className = "status" + (cls ? " " + cls : "");
+  if (msg) setTimeout(() => { if (el.textContent === msg) { el.textContent = ""; el.className = "status"; } }, 4000);
+}
+function botName() { return document.getElementById("botSelect").value; }
+
+// ── bot list ──
+async function loadBots() {
+  try {
+    const r = await fetch("/api/bots/discovered");
+    const j = await r.json();
+    const names = (j.usernames || []).filter(Boolean);
+    const sel = document.getElementById("botSelect");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">— select —</option>' + names.map(n => `<option value="${esc(n)}" ${n === cur ? "selected" : ""}>${esc(n)}</option>`).join("");
+  } catch (e) {
+    console.error("loadBots failed", e);
+  }
+}
+
+// ── websocket ──
+function connect() {
+  if (wsManualClose) return;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  let host = location.host || ((location.hostname || "localhost") + (location.port ? ":" + location.port : ""));
+  try { ws = new WebSocket(`${proto}//${host}/ws`); } catch (e) { setTimeout(connect, 1000); return; }
+  ws.onopen = () => { setStatus("WS connected", "ok"); };
+  ws.onclose = () => { setStatus("WS closed", "err"); if (!wsManualClose) setTimeout(connect, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch {} };
+  ws.onmessage = () => { /* result broadcast; we re-poll snapshot after actions */ };
+}
+function sendWs(obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { setStatus("WS not connected", "err"); return false; }
+  ws.send(JSON.stringify(obj));
+  return true;
+}
+function sendExec(command, params) {
+  const b = botName();
+  if (!b) { setStatus("Select a bot first", "err"); return; }
+  sendWs({ type: "exec", bot: b, command, params: params || {} });
+}
+
+// ── snapshot polling ──
+async function refreshSnapshot() {
+  try {
+    const r = await fetch("/data/lexSeller.json?_=" + Date.now());
+    snapshot = await r.json();
+  } catch (e) {
+    // empty snapshot allowed (404 path returns empty shape)
+    snapshot = { orders: [], items: [], bot: "", station: "", updatedAt: null };
+  }
+  renderSnapshot();
+}
+function renderSnapshot() {
+  const info = document.getElementById("stationInfo");
+  const age = snapshot.updatedAt ? new Date(snapshot.updatedAt).toLocaleString() : "never";
+  info.textContent = snapshot.bot
+    ? `bot: ${snapshot.bot} · station: ${snapshot.station} · updated: ${age}`
+    : "no snapshot yet (assign lex_seller to a docked bot)";
+
+  const wrap = document.getElementById("ordersWrap");
+  if (!snapshot.orders || snapshot.orders.length === 0) {
+    wrap.innerHTML = '<div class="muted">No active sell orders.</div>';
+    return;
+  }
+  let html = `<table><thead><tr>
+    <th>Item</th><th>Qty</th><th>Remaining</th><th>Filled</th><th>Price</th><th>Station</th><th>Age</th><th>Status</th><th>Actions</th>
+  </tr></thead><tbody>`;
+  for (const o of snapshot.orders) {
+    const filled = o.filledQuantity || (o.quantity - o.remaining);
+    const filledCls = filled > 0 ? "filled" : "";
+    const emptyCls = o.remaining <= 0 ? "empty" : "";
+    const ageSec = Math.max(0, Math.round((Date.now() - new Date(o.createdAt || snapshot.updatedAt || Date.now()).getTime()) / 1000));
+    const ageStr = ageSec < 60 ? ageSec + "s" : Math.round(ageSec / 60) + "m";
+    const status = o.remaining <= 0 ? '<span class="empty">SOLD OUT</span>' : (filled > 0 ? '<span class="filled">PARTIAL</span>' : "open");
+    html += `<tr>
+      <td>${esc(o.itemName)} <span class="muted">(${esc(o.itemId)})</span></td>
+      <td>${o.quantity}</td>
+      <td class="${emptyCls}">${o.remaining}</td>
+      <td class="${filledCls}">${filled}</td>
+      <td>${o.priceEach}cr</td>
+      <td>${esc(snapshot.station)}</td>
+      <td>${ageStr}</td>
+      <td>${status}</td>
+      <td>
+        <button class="sm" onclick="doReprice('${esc(o.orderId)}','${esc(o.itemId)}')">Reprice</button>
+        <button class="sm danger" onclick="doCancel('${esc(o.orderId)}')">Remove</button>
+      </td>
+    </tr>`;
+  }
+  html += "</tbody></table>";
+  wrap.innerHTML = html;
+}
+
+// ── actions ──
+function doCancel(orderId) {
+  if (!confirm("Cancel order " + orderId + "? (no relist)")) return;
+  sendExec("cancel_order", { order_id: orderId });
+  setStatus("Cancel sent", "ok");
+  setTimeout(refreshSnapshot, 2500);
+}
+function doReprice(orderId, itemId) {
+  const price = prompt("New price for " + itemId + " (cr):", "0");
+  if (price == null) return;
+  const p = parseInt(price, 10);
+  if (!isFinite(p) || p <= 0) { setStatus("Invalid price", "err"); return; }
+  // cancel + relist at new price
+  sendExec("cancel_order", { order_id: orderId });
+  setTimeout(() => {
+    sendExec("create_sell_order", { item_id: itemId, quantity: 1, price_each: p });
+    setStatus("Reprice sent (cancel + relist @ " + p + "cr)", "ok");
+    setTimeout(refreshSnapshot, 2500);
+  }, 1500);
+}
+async function doAdd() {
+  const b = botName();
+  if (!b) { setStatus("Select a bot first", "err"); return; }
+  const itemId = document.getElementById("addItem").value.trim();
+  const source = document.getElementById("addSource").value;
+  const qty = parseInt(document.getElementById("addQty").value, 10);
+  const price = parseInt(document.getElementById("addPrice").value, 10) || 0;
+  if (!itemId || !isFinite(qty) || qty <= 0) { setStatus("Item + qty required", "err"); return; }
+
+  if (source === "faction") {
+    // withdraw to cargo, then list
+    sendExec("storage", { action: "withdraw", target: "faction", item_id: itemId, quantity: qty });
+    setTimeout(() => {
+      sendExec("create_sell_order", { item_id: itemId, quantity: qty, price_each: price });
+      setStatus("Add (faction): withdraw + list " + qty + "x " + itemId, "ok");
+      setTimeout(refreshSnapshot, 3000);
+    }, 1500);
+  } else {
+    sendExec("create_sell_order", { item_id: itemId, quantity: qty, price_each: price });
+    setStatus("Add (cargo): list " + qty + "x " + itemId, "ok");
+    setTimeout(refreshSnapshot, 3000);
+  }
+}
+
+// ── settings ──
+function addItemRow(item) {
+  item = item || { itemId: "", source: "faction", askPrice: 0, minPrice: 0, maxQty: 0, autoPrice: true };
+  const div = document.createElement("div");
+  div.className = "srow";
+  div.innerHTML = `
+    <input class="s-itemId" placeholder="itemId" value="${esc(item.itemId)}" style="width:150px" />
+    <select class="s-source">
+      <option value="faction" ${item.source === "faction" ? "selected" : ""}>faction</option>
+      <option value="cargo" ${item.source === "cargo" ? "selected" : ""}>cargo</option>
+    </select>
+    <input class="s-askPrice" type="number" min="0" placeholder="ask" value="${item.askPrice}" style="width:80px" title="Ask price (0=auto)" />
+    <input class="s-minPrice" type="number" min="0" placeholder="floor" value="${item.minPrice}" style="width:80px" title="Min price floor" />
+    <input class="s-maxQty" type="number" min="0" placeholder="maxQty" value="${item.maxQty}" style="width:80px" title="0 = all" />
+    <label><input type="checkbox" class="s-autoPrice" ${item.autoPrice ? "checked" : ""} /> auto</label>
+    <button class="sm danger" onclick="this.parentNode.remove()">x</button>`;
+  document.getElementById("settingsItems").appendChild(div);
+}
+function loadSettingsIntoForm() {
+  const s = snapshot.settings || {};
+  const set = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
+  set("set-homeStation", s.homeStation);
+  set("set-homeSystem", s.homeSystem);
+  set("set-globalMinPrice", s.globalMinPrice);
+  set("set-autoMin", s.autoMin);
+  set("set-autoMax", s.autoMax);
+  set("set-refuelThreshold", s.refuelThreshold);
+  set("set-repairThreshold", s.repairThreshold);
+  set("set-feeCreditBuffer", s.feeCreditBuffer);
+  const cb = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  cb("set-useRemoteMarketQuery", s.useRemoteMarketQuery);
+  cb("set-preloadCredits", s.preloadCredits);
+  const box = document.getElementById("settingsItems");
+  box.innerHTML = "";
+  (s.items || []).forEach(addItemRow);
+}
+function saveSettings() {
+  const b = botName();
+  if (!b) { setStatus("Select a bot first", "err"); return; }
+  const num = (id) => { const v = parseFloat(document.getElementById(id).value); return isFinite(v) ? v : 0; };
+  const items = [];
+  document.querySelectorAll("#settingsItems .srow").forEach((row) => {
+    const itemId = row.querySelector(".s-itemId").value.trim();
+    if (!itemId) return;
+    items.push({
+      itemId,
+      source: row.querySelector(".s-source").value,
+      askPrice: parseInt(row.querySelector(".s-askPrice").value, 10) || 0,
+      minPrice: parseInt(row.querySelector(".s-minPrice").value, 10) || 0,
+      maxQty: parseInt(row.querySelector(".s-maxQty").value, 10) || 0,
+      autoPrice: row.querySelector(".s-autoPrice").checked,
+    });
+  });
+  const settings = {
+    homeStation: document.getElementById("set-homeStation").value.trim(),
+    homeSystem: document.getElementById("set-homeSystem").value.trim(),
+    globalMinPrice: num("set-globalMinPrice"),
+    autoMin: num("set-autoMin"),
+    autoMax: num("set-autoMax"),
+    refuelThreshold: num("set-refuelThreshold"),
+    repairThreshold: num("set-repairThreshold"),
+    feeCreditBuffer: num("set-feeCreditBuffer"),
+    useRemoteMarketQuery: document.getElementById("set-useRemoteMarketQuery").checked,
+    preloadCredits: document.getElementById("set-preloadCredits").checked,
+    items,
+  };
+  sendWs({ type: "saveSettings", routine: "lex_seller", settings });
+  setStatus("Settings sent for " + b, "ok");
+}
+
+// ── boot ──
+(async function boot() {
+  await loadBots();
+  connect();
+  await refreshSnapshot();
+  loadSettingsIntoForm();
+  pollTimer = setInterval(refreshSnapshot, 3000);
+  // keep bot list fresh
+  setInterval(loadBots, 15000);
+  document.getElementById("botSelect").addEventListener("change", refreshSnapshot);
+  window.addEventListener("beforeunload", () => { wsManualClose = true; if (ws) try { ws.close(); } catch {} });
+})();
+</script>
+</body>
+</html>

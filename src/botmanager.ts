@@ -22,6 +22,7 @@ import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordina
 import { escortRoutine } from "./routines/escort-fleet.js";
 import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
+import { lexSellerRoutine } from "./routines/lex_seller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { civilianTransportRoutine, unloadPassengersToLounge } from "./routines/civilianTransport.js";
 import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
@@ -498,6 +499,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   craft_trade: { name: "CraftTrade", fn: craftTradeRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
+  lex_seller: { name: "LExSeller", fn: lexSellerRoutine },
   fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },

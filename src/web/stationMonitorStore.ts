@@ -60,9 +60,55 @@ export interface StationSnapshot {
   wrecked: boolean;
   /** Optional: absent in snapshots written before fuel tracking existed. */
   fuelCraft?: FuelCraftStatus | null;
+  /** True when the station's docked drone reports an active battle involving this station. */
+  combatAlert?: boolean;
+  /** Battle id of the active (or most recent) combat alert. */
+  battleId?: string | null;
 }
 
 export type StationSnapshots = Record<string, StationSnapshot>;
+
+/**
+ * Persistent, reviewable log of combat events per station row. Keyed by the
+ * station row id (so each monitored station keeps its own history). Entries are
+ * appended by the station server whenever the docked drone's battle detection
+ * reports a battle that involves the station, and closed when the battle ends.
+ */
+export interface StationBattleLogEntry {
+  battleId: string;
+  startedAt: number;
+  /** null while the battle is still in progress. */
+  endedAt: number | null;
+  /** active = in progress; ended = battle_ended/cleared; superseded = a newer battle replaced this one. */
+  outcome: "active" | "ended" | "superseded";
+  /** Free-text reason from the battle_ended notification, when available. */
+  reason?: string;
+  /** Raw participant display names seen during the battle (for later review). */
+  participants: string[];
+  /** True when one of the participants matched our station (by id/name). */
+  stationInvolved: boolean;
+}
+
+export type StationBattleLog = Record<string, StationBattleLogEntry[]>;
+
+const BATTLE_LOG_FILE = join(DATA_DIR, "stationBattles.json");
+
+export function loadBattleLog(): StationBattleLog {
+  if (existsSync(BATTLE_LOG_FILE)) {
+    try {
+      const data = JSON.parse(readFileSync(BATTLE_LOG_FILE, "utf-8")) as StationBattleLog;
+      if (data && typeof data === "object") return data;
+    } catch (err) {
+      console.warn("[StationServer] Warning: corrupt stationBattles.json —", err);
+    }
+  }
+  return {};
+}
+
+export function saveBattleLog(log: StationBattleLog): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(BATTLE_LOG_FILE, JSON.stringify(log, null, 2) + "\n", "utf-8");
+}
 
 function genId(): string {
   let uuid: string;

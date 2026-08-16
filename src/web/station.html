@@ -5,6 +5,33 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ORBITAL_NET — Station Monitors</title>
 <link rel="stylesheet" href="/station.css" />
+<style>
+  .card.combat {
+    border-color: var(--error);
+    animation: combatPulse 1.05s ease-in-out infinite;
+  }
+  @keyframes combatPulse {
+    0%, 100% { box-shadow: 0 0 0 1px var(--error), 0 0 10px rgba(255,70,70,.22); }
+    50%      { box-shadow: 0 0 0 2px var(--error), 0 0 26px rgba(255,70,70,.6); }
+  }
+  .badge-combat { background: var(--error); color: #fff; }
+  .combat-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--error); color: #fff;
+    font-family: var(--font-data); font-size: 10px; font-weight: 700;
+    letter-spacing: .08em; padding: 2px 8px; border-radius: 3px; margin-top: 6px;
+  }
+  .combat-banner {
+    background: var(--error); color: #fff;
+    font-family: var(--font-data); font-weight: 700; letter-spacing: .06em;
+    padding: 8px 12px; border-radius: 6px; margin-bottom: 12px;
+  }
+  .battle-log { margin-top: 6px; }
+  .battle-row { border: 1px solid var(--outline-variant); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-family: var(--font-data); font-size: 12px; }
+  .battle-row.active { border-color: var(--error); }
+  .battle-meta { color: var(--on-surface-variant); font-size: 11px; margin-top: 2px; }
+  .battle-parts { margin-top: 4px; color: var(--secondary-fixed-dim); }
+</style>
 </head>
 <body>
 <div class="atmos-bg"></div>
@@ -175,6 +202,7 @@
   }
 
   function classify(v) {
+    if (v.combatAlert) return "alert";
     if (v.state === "NO_BOT" || v.state === "UNCONFIGURED") return "nodata";
     if (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE") return "alert";
     return computeAlert(v) ? "alert" : "ok";
@@ -196,9 +224,14 @@
     const p = v.power || {};
 
     const name = v.label || v.stationName || v.stationId || v.bot || "UNNAMED";
-    const condText = (cond.condition ? String(cond.condition).toUpperCase() : "") || v.state;
+    const combat = !!v.combatAlert;
+    const condText = combat
+      ? "COMBAT"
+      : (cond.condition ? String(cond.condition).toUpperCase() : "") || v.state;
     let badgeCls = "badge-ok";
-    if (v.state !== "OK" || computeAlert(v)) {
+    if (combat) {
+      badgeCls = "badge-combat";
+    } else if (v.state !== "OK" || computeAlert(v)) {
       badgeCls = (condText === "CRITICAL" || v.state === "MISMATCH" || v.state === "UNDOCKED" || v.state === "STALE" || v.state === "NO_BOT") ? "badge-crit" : "badge-warn";
     }
 
@@ -233,6 +266,7 @@
     const alert = classify(v) === "alert";
     const dimmed = (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE" || v.state === "NO_BOT");
     const classes = ["card"];
+    if (combat) classes.push("combat");
     if (alert) classes.push("alert");
     if (dimmed) classes.push("dimmed");
     if (rearrangeMode) classes.push("draggable");
@@ -242,6 +276,10 @@
       const neutral = v.state === "UNCONFIGURED";
       const label = v.state === "STALE" ? "STALE " + ageText(v.fetchedAt) : v.state;
       chip = `<span class="state-chip ${neutral ? "neutral" : ""}">${esc(label)}</span>`;
+    }
+    let combatChip = "";
+    if (combat) {
+      combatChip = `<span class="combat-chip">⚠ COMBAT${v.battleId ? " · " + esc(v.battleId) : ""}</span>`;
     }
 
     const fee = base.market_fee_bps != null ? (base.market_fee_bps + "bps") : "—";
@@ -257,6 +295,7 @@
       </div>
       <div class="card-body">
         ${chip}
+        ${combatChip}
         <div class="bar-row-wrap">${bars}</div>
         <div class="data-grid">
           ${cell("ARMOR", num(base.armor) ? kfmt(base.armor) : "—", "neutral")}
@@ -646,6 +685,8 @@
     buildCategory: "service",
     buildSearch: "",
     buildList: [],
+    combatAlert: false,
+    battleId: null,
     msg: "",
     msgCls: "",
   };
@@ -709,7 +750,8 @@
       '<div class="detail-section"><div class="detail-section-title">Overview</div><div id="detail-overview"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Consumables / Maintenance</div><div id="detail-consumables"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Facilities</div><div id="detail-facilities"><div class="detail-note">Loading…</div></div></div>' +
-      '<div class="detail-section"><div class="detail-section-title">Build Facility</div><div id="detail-build"><div class="detail-note">Loading…</div></div></div>';
+      '<div class="detail-section"><div class="detail-section-title">Build Facility</div><div id="detail-build"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Combat / Battle Log</div><div id="detail-battles"><div class="detail-note">Loading…</div></div></div>';
 
     try {
       const cfg = await (await fetch("/api/config")).json();
@@ -725,6 +767,8 @@
         detailState.condition = j.snapshot.condition || {};
         detailState.lifeSupport = j.snapshot.lifeSupport || {};
         detailState.power = j.snapshot.power || {};
+        detailState.combatAlert = !!j.snapshot.combatAlert;
+        detailState.battleId = j.snapshot.battleId || null;
         document.getElementById("detail-name").textContent = j.snapshot.stationName || detailId;
       } else {
         document.getElementById("detail-name").textContent = detailId;
@@ -741,6 +785,7 @@
     renderBuild();
     await loadConsumables();
     renderConsumables();
+    renderBattleLog();
   }
 
   function barRow(label, value, max) {
@@ -805,8 +850,42 @@
         </div>
       </div>`;
 
-    document.getElementById("detail-overview").innerHTML = bars + stats + settings;
+    document.getElementById("detail-overview").innerHTML =
+      (detailState.combatAlert
+        ? `<div class="combat-banner">⚠ STATION UNDER ATTACK${detailState.battleId ? " · " + esc(detailState.battleId) : ""}</div>`
+        : "") +
+      bars + stats + settings;
     wireOverview();
+  }
+
+  async function renderBattleLog() {
+    const el = document.getElementById("detail-battles");
+    if (!el) return;
+    try {
+      const r = await fetch("/api/station/" + enc(detailState.stationId) + "/battles");
+      const j = await r.json();
+      const battles = Array.isArray(j.battles) ? j.battles : [];
+      if (!battles.length) {
+        el.innerHTML = '<div class="detail-note">No battles recorded for this station.</div>';
+        return;
+      }
+      let html = "";
+      // Newest first.
+      for (const b of battles.slice().reverse()) {
+        const active = b.endedAt == null;
+        const start = new Date(b.startedAt).toLocaleString();
+        const end = b.endedAt ? new Date(b.endedAt).toLocaleString() : "—";
+        const parts = (b.participants || []).map((p) => esc(p)).join(", ") || "—";
+        html += `<div class="battle-row ${active ? "active" : ""}">
+          <div><b>${esc(b.battleId)}</b> ${active ? "● ACTIVE" : "○ ENDED"} ${b.stationInvolved ? "· station involved" : ""}</div>
+          <div class="battle-meta">start ${start} · end ${end} · outcome ${esc(b.outcome)}${b.reason ? " · " + esc(b.reason) : ""}</div>
+          <div class="battle-parts">participants: ${parts}</div>
+        </div>`;
+      }
+      el.innerHTML = html;
+    } catch {
+      el.innerHTML = '<div class="detail-note">Failed to load battle log.</div>';
+    }
   }
 
   function statRow(label, value) {

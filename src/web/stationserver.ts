@@ -19,6 +19,10 @@ import {
   type StationSnapshot,
   type StationSnapshots,
   type FuelCraftStatus,
+  type StationBattleLog,
+  type StationBattleLogEntry,
+  loadBattleLog,
+  saveBattleLog,
 } from "./stationMonitorStore.js";
 
 const GET_BASE_TIMEOUT_MS = 25_000;
@@ -74,6 +78,10 @@ export interface StationView {
   factionFuelReserve: number;
   factionFuelCapacity: number;
   fuelCraft: FuelCraftStatus | null;
+  /** True when the station's docked drone reports an active battle involving this station. */
+  combatAlert: boolean;
+  /** Battle id of the active (or most recent) combat alert. */
+  battleId: string | null;
   lastError: string | null;
   lastErrorAt: number | null;
   /** FetchedAt of the last successful get_base (last good snapshot). */
@@ -136,6 +144,7 @@ export class StationWebServer {
 
   private config: StationConfig;
   private snapshots: StationSnapshots;
+  private battleLog: StationBattleLog;
   private views: Record<string, StationView> = {};
 
   private pollInterval: ReturnType<typeof setInterval> | null = null;
@@ -148,6 +157,7 @@ export class StationWebServer {
     this.port = port;
     this.config = loadStationConfig();
     this.snapshots = loadSnapshots();
+    this.battleLog = loadBattleLog();
   }
 
   start(): void {
@@ -200,6 +210,13 @@ export class StationWebServer {
 
           if (url.pathname.startsWith("/api/station/")) {
             let stationId = decodeURIComponent(url.pathname.slice("/api/station/".length));
+            // Reviewable combat/battle log for a station row.
+            if (stationId.endsWith("/battles") && req.method === "GET") {
+              const sid = stationId.replace(/\/battles$/, "");
+              const row = this.config.rows.find((r) => r.stationId === sid);
+              const battles = row ? (this.battleLog[row.id] ?? []) : [];
+              return Response.json({ stationId: sid, battles }, { headers: corsHeaders });
+            }
             if (req.method === "GET") return this.handleStationGet(stationId, corsHeaders);
             if (req.method === "POST") {
               stationId = stationId.replace(/\/action$/, "");
@@ -554,6 +571,118 @@ export class StationWebServer {
     }
   }
 
+  /**
+   * Evaluate the station's combat state from its docked drone's passive battle
+   * detection (`Bot.currentBattle`, fed by the `battle_alert`/`battle_started`/
+   * `battle_update`/`battle_ended` WebSocket events). Returns whether the station
+   * is under attack (and the active battle id), and maintains the persistent
+   * battle log so the user can review engagements later and we know when a
+   * battle has ended (to clear the alert).
+   *
+   * The `battle_alert` event only sets `currentBattle` while the drone is docked
+   * at a station in the battle's system, so `inBattle && docked` already means
+   * "this station's location is under attack". We additionally scan the
+   * participants for our station (by id/name, or a `kind: "station"` flag when
+   * present) and record every participant name for later review — the exact way
+   * a station shows up in the participant list is still being learned, so we
+   * match leniently and log the raw data.
+   */
+  private evaluateCombat(
+    row: StationRow,
+    bot: Bot | null | undefined,
+    status: BotStatus | undefined,
+  ): { combatAlert: boolean; battleId: string | null; stationInvolved: boolean } {
+    const cb = bot?.currentBattle;
+    const battleId = (cb?.battleId as string | null) ?? null;
+    const inBattle = !!(cb?.inBattle && battleId);
+    const docked = !!status?.docked;
+    const participantsRaw = Array.isArray(cb?.participants)
+      ? (cb!.participants as Array<Record<string, unknown>>)
+      : [];
+    const participants = participantsRaw
+      .map((p) => String(p.username || p.player_id || p.ship_name || p.name || ""))
+      .filter(Boolean);
+    const stationInvolved = this.stationIsParticipant(row, participantsRaw);
+    const combatAlert = inBattle && docked;
+
+    const entries = (this.battleLog[row.id] = this.battleLog[row.id] ?? []);
+    const open = entries.find((e) => e.endedAt === null);
+
+    if (combatAlert) {
+      if (!open) {
+        entries.push({
+          battleId,
+          startedAt: Date.now(),
+          endedAt: null,
+          outcome: "active",
+          participants,
+          stationInvolved,
+        });
+        this.flushBattleLog();
+      } else if (open.battleId !== battleId) {
+        // A new battle started before the previous one was formally closed.
+        open.endedAt = Date.now();
+        open.outcome = "superseded";
+        entries.push({
+          battleId,
+          startedAt: Date.now(),
+          endedAt: null,
+          outcome: "active",
+          participants,
+          stationInvolved,
+        });
+        this.flushBattleLog();
+      } else {
+        let changed = false;
+        for (const p of participants) {
+          if (!open.participants.includes(p)) {
+            open.participants.push(p);
+            changed = true;
+          }
+        }
+        if (stationInvolved && !open.stationInvolved) {
+          open.stationInvolved = true;
+          changed = true;
+        }
+        if (changed) this.flushBattleLog();
+      }
+    } else if (open) {
+      open.endedAt = Date.now();
+      if (open.outcome === "active") open.outcome = "ended";
+      this.flushBattleLog();
+    }
+
+    return { combatAlert, battleId, stationInvolved };
+  }
+
+  /** Leniently check whether the station itself is among the battle participants. */
+  private stationIsParticipant(
+    row: StationRow,
+    participants: Array<Record<string, unknown>>,
+  ): boolean {
+    const sid = (row.stationId || "").toLowerCase();
+    const sname = (row.stationName || "").toLowerCase();
+    const match = (p: Record<string, unknown>): boolean => {
+      const pid = String(p.player_id || "").toLowerCase();
+      const uname = String(p.username || "").toLowerCase();
+      const snameP = String(p.ship_name || "").toLowerCase();
+      return !!(
+        (sid && (pid === sid || uname === sid)) ||
+        (sname && (uname === sname || snameP === sname))
+      );
+    };
+    for (const p of participants) {
+      const kind = String(p.kind || "").toLowerCase();
+      if (kind === "station" && (match(p) || !sid)) return true;
+      if (match(p)) return true;
+    }
+    return false;
+  }
+
+  private flushBattleLog(): void {
+    saveBattleLog(this.battleLog);
+  }
+
   private async readRow(
     row: StationRow,
     statusMap: Map<string, BotStatus>,
@@ -564,6 +693,10 @@ export class StationWebServer {
     const lastGood = this.snapshots[id];
     const status = statusMap.get(row.bot);
     const faction = status?.faction ?? lastGood?.faction ?? null;
+    // Combat detection is independent of the get_base read below — evaluate it
+    // up front from the drone's already-populated battle state.
+    const botForBattle = row.bot ? getBot(row.bot) : null;
+    const battle = this.evaluateCombat(row, botForBattle, status);
 
     let state = "OK";
     let lastError: string | null = prev?.lastError ?? null;
@@ -621,6 +754,8 @@ export class StationWebServer {
             faction: status?.faction ?? null,
             wrecked,
             fuelCraft,
+            combatAlert: battle.combatAlert,
+            battleId: battle.battleId,
           };
           this.snapshots[id] = snapshot;
           this.markSnapshotsDirty();
@@ -640,6 +775,8 @@ export class StationWebServer {
             factionFuelReserve: snapshot.factionFuelReserve,
             factionFuelCapacity: snapshot.factionFuelCapacity,
             fuelCraft,
+            combatAlert: battle.combatAlert,
+            battleId: battle.battleId,
             lastError: null,
             lastErrorAt: null,
             fetchedAt,
@@ -678,6 +815,8 @@ export class StationWebServer {
       // No fresh queue read this pass — carry the last known status forward
       // rather than reporting a fuel outage we did not actually observe.
       fuelCraft: prev?.fuelCraft ?? lastGood?.fuelCraft ?? null,
+      combatAlert: battle.combatAlert,
+      battleId: battle.battleId,
       lastError,
       lastErrorAt,
       fetchedAt,
@@ -822,6 +961,8 @@ export class StationWebServer {
         factionFuelReserve: snap?.factionFuelReserve ?? 0,
         factionFuelCapacity: snap?.factionFuelCapacity ?? 0,
         fuelCraft: snap?.fuelCraft ?? null,
+        combatAlert: snap?.combatAlert ?? false,
+        battleId: snap?.battleId ?? null,
         lastError: null,
         lastErrorAt: null,
         fetchedAt: snap?.fetchedAt ?? null,

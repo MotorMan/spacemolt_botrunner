@@ -7174,8 +7174,8 @@
         </div>
 
         <div class="cmd-group">
-          <label>Leave Fleet</label>
-          <button class="primary sm" onclick="mcFleetLeave()">Leave Fleet</button>
+          <label>Disembark (Leave Fleet)</label>
+          <button class="primary sm" onclick="mcFleetDisembark()">Disembark</button>
         </div>
 
         <div class="cmd-group">
@@ -10950,9 +10950,9 @@
         mcExec("fleet", { action: "board", player_id: playerId });
       }
 
-      function mcFleetLeave() {
+      function mcFleetDisembark() {
         if (!profileBot) return;
-        mcExec("fleet", { action: "leave" });
+        mcExec("fleet", { action: "disembark" });
       }
 
       function mcFleetStatus() {
@@ -14649,7 +14649,8 @@
         craftingHomeBaseStationList.sort((a, b) =>
           (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
         );
-        let craftingHomeBaseOpts = '<option value="">(use general.factionStorageStation)</option>';
+        let craftingHomeBaseOpts = `<option value="@current">📍 Use the station I'm docked at</option>`;
+        craftingHomeBaseOpts += '<option value="">(use general.factionStorageStation)</option>';
         for (const { val, label, sysName } of craftingHomeBaseStationList) {
           const sel = val === craftingHomeBase ? " selected" : "";
           craftingHomeBaseOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
@@ -14663,7 +14664,7 @@
     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg);border-color:#b8860b">
       <div style="font-weight:700;margin-bottom:4px;color:var(--text-bright)">🏠 Crafting Home Base Storage</div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
-        The faction-storage station the crafter reads its materials from. Set this if your crafter is crafting somewhere other than the faction home base — otherwise it may read the wrong station and think its stock (e.g. aluminum_sheet) is empty, holding the whole chain.
+        The faction-storage station the crafter reads its materials from. Pick "Use the station I'm docked at" so a roaming crafter reads the storage of whatever station it is currently docked at (lets multiple crafters at different stations each use their own station). Otherwise set this if your crafter is crafting somewhere other than the faction home base — otherwise it may read the wrong station and think its stock (e.g. aluminum_sheet) is empty, holding the whole chain.
       </div>
       <select id="set-crafter-craftingHomeBase" style="min-width:240px">${craftingHomeBaseOpts}</select>
       ${craftingHomeBaseInherited && generalFactionStorageStation ? `<div style="font-size:11px;color:var(--dim);margin-top:6px">inherited from general.factionStorageStation (${esc(generalFactionStorageStation)})</div>` : ``}

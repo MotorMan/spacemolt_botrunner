@@ -23,6 +23,58 @@ const QUEUE_REFRESH_COOLDOWN = 60000;
 let lastQueueCheck = 0;
 let cachedQueueJobs: ServerJobInfo[] = [];
 
+// Sentinel for the "crafting home base storage" setting. When a crafter's
+// craftingHomeBase equals this, it reads the faction storage of the station it
+// is CURRENTLY docked at instead of a fixed global station. This lets multiple
+// crafters stationed at different bases each pull materials from their own
+// station rather than all sharing one configured home base (which made roaming
+// crafters "lose" their stock and wrongly re-smelt everything).
+const CRAFTER_USE_DOCKED_STATION = "@current";
+
+// Resolve the args for refreshFactionStorage so a "@current" home base reads the
+// docked station, while a real station id (or empty -> bot default) reads that.
+function factionStorageRefreshArgs(homeBase: string): {
+  stationId?: string;
+  readCurrentStation: boolean;
+} {
+  if (homeBase === CRAFTER_USE_DOCKED_STATION) {
+    return { stationId: undefined, readCurrentStation: true };
+  }
+  return { stationId: homeBase || undefined, readCurrentStation: false };
+}
+
+// Read the docked/base station fuel into bot.homeBaseFuel so fuel_reserve goals
+// compare against accurate data. A "@current" home base reads the station the
+// bot is docked at (get_base with no base_id); a real id reads that station; an
+// empty string leaves the fuel untouched (preserving previous behavior).
+async function refreshCrafterBaseFuel(
+  bot: any,
+  homeBase: string,
+  log?: (level: string, msg: string) => void,
+): Promise<void> {
+  if (!homeBase) return;
+  const useCurrent = homeBase === CRAFTER_USE_DOCKED_STATION;
+  const baseResp = await (useCurrent
+    ? bot.exec("get_base", {})
+    : bot.exec("get_base", { base_id: homeBase })
+  ).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
+  if (baseResp.error || !baseResp.result) {
+    if (log && baseResp.error) {
+      log("warn", `[get_base] failed for ${useCurrent ? "docked station" : homeBase}: ${baseResp.error.message}`);
+    }
+    return;
+  }
+  const baseObj = baseResp.result as Record<string, unknown>;
+  const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
+  const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
+  const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
+  if (log && (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel)) {
+    log("craft", `[get_base] ${useCurrent ? "docked station" : homeBase}: fuel=${newFuel}/${newMaxFuel}`);
+  }
+  bot.homeBaseFuel = newFuel;
+  bot.homeBaseMaxFuel = newMaxFuel;
+}
+
 // Round-robin cursor per recipe so multiple same-type facilities share the load.
 const facilityRoundRobin = new Map<string, number>();
 // Recipes we've already warned about not having an owned facility for (dedupe per run).
@@ -1176,16 +1228,12 @@ async function waitForAllCompletions(
          lastSync = now;
        }
 
-       if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
-         const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-         if (!baseResp.error && baseResp.result) {
-           const baseObj = baseResp.result as Record<string, unknown>;
-           const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-           bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-           bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-         }
-         lastBaseCheck = now;
-       }
+      if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
+        await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, log);
+        lastBaseCheck = now;
+      }
+
+
 
       const stillQueued: typeof remainingItems = [];
       for (const item of remainingItems) {
@@ -1368,28 +1416,23 @@ async function executeCraftingPlan(
       // here is what makes the planner think it needs to re-refine materials it
       // already has enough of (e.g. steel_plate). Target the crafting home base
       // station so a roaming crafter reads the right storage.
-       await bot.refreshFactionStorage(true, settings?.craftingHomeBase || undefined);
+        // Re-read faction storage LIVE each pass. As queued jobs consume/produce
+        // materials on the server, the holdings change continuously; a stale count
+        // here is what makes the planner think it needs to re-refine materials it
+        // already has enough of (e.g. steel_plate). Target the crafting home base
+        // station so a roaming crafter reads the right storage — or, when the home
+        // base is set to "@current", the station the crafter is docked at.
+        const fsArgs = factionStorageRefreshArgs(settings?.craftingHomeBase || "");
+        await bot.refreshFactionStorage(true, fsArgs.stationId, fsArgs.readCurrentStation);
 
         // Refresh home station fuel via get_base every pass so fuel_reserve
         // goals always see the actual station fuel level after jobs complete
         // between loop iterations. Do this unconditionally when a home base is
         // configured — it is the only source of truth for base.fuel and the
-        // crafter cannot recover from a stale value.
+        // crafter cannot recover from a stale value. A "@current" home base reads
+        // the docked station instead of a fixed global station.
         if (settings?.craftingHomeBase) {
-          const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-          if (!baseResp.error && baseResp.result) {
-            const baseObj = baseResp.result as Record<string, unknown>;
-            const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-            const newFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-            const newMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-            if (newFuel !== bot.homeBaseFuel || newMaxFuel !== bot.homeBaseMaxFuel) {
-              ctx.log("craft", `[get_base] ${settings.craftingHomeBase}: fuel=${newFuel}/${newMaxFuel}`);
-            }
-            bot.homeBaseFuel = newFuel;
-            bot.homeBaseMaxFuel = newMaxFuel;
-          } else if (baseResp.error) {
-            ctx.log("warn", `[get_base] failed for ${settings.craftingHomeBase}: ${baseResp.error.message}`);
-          }
+          await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, ctx.log);
         }
 
 
@@ -1715,14 +1758,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureDocked(ctx);
 
     // Refresh home station fuel via get_base so fuel_reserve goals compare against accurate data.
+    // A "@current" home base reads the docked station; a fixed id reads that station; empty leaves
+    // the fuel untouched (preserving prior behavior).
     if (settings.craftingHomeBase) {
-      const baseResp = await bot.exec("get_base", { base_id: settings.craftingHomeBase }).catch(() => ({ error: { message: "get_base failed" }, result: undefined }));
-      if (!baseResp.error && baseResp.result) {
-        const baseObj = baseResp.result as Record<string, unknown>;
-        const baseInner = (baseObj.base as Record<string, unknown>) || baseObj;
-        bot.homeBaseFuel = (baseInner.fuel as number) ?? bot.homeBaseFuel ?? 0;
-        bot.homeBaseMaxFuel = (baseInner.max_fuel as number) ?? bot.homeBaseMaxFuel ?? 0;
-      }
+      await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, ctx.log);
     }
 
     yield "fetch_recipes";
@@ -1744,8 +1783,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Target the crafting home base station explicitly: a roaming crafter may be
     // docked elsewhere, and reading the current station's (near-empty) storage
     // would make the planner "lose" its stock and wrongly re-smelt everything.
-    const craftingHomeBase = settings.craftingHomeBase || undefined;
-    await bot.refreshFactionStorage(true, craftingHomeBase);
+    // A "@current" home base reads the station the crafter is docked at.
+    const fsArgs = factionStorageRefreshArgs(settings.craftingHomeBase || "");
+    await bot.refreshFactionStorage(true, fsArgs.stationId, fsArgs.readCurrentStation);
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {

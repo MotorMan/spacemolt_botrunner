@@ -2119,6 +2119,57 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
   }
 }
 
+/**
+ * Top up fuel cells from faction storage whenever the bot is docked.
+ *
+ * Faction storage is universal (accessible from ANY station the bot docks at),
+ * so this intentionally does NOT require being at the configured home system.
+ * Requiring home previously caused bots whose `bot.system` didn't match
+ * `homeSystem` while docked to silently undock without their fuel cell reserve
+ * even when thousands were available in storage.
+ *
+ * Preference order: military_fuel_cell (100 fuel / 3 space) → premium_fuel_cell
+ * (2 space) → basic fuel_cell (1 space, withdraw extra to compensate).
+ * No-op if already at/above the minimum or not docked.
+ */
+async function ensureFuelCellsStocked(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+
+  const settings = await getMinerSettings();
+  const minFuel = settings.minimumFuelCells;
+  if (!minFuel || minFuel <= 0) return;
+
+  await bot.refreshCargo();
+  let fuelInCargo = 0;
+  for (const item of bot.inventory) {
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+  }
+  if (fuelInCargo >= minFuel) return;
+
+  const cellsNeeded = minFuel - fuelInCargo;
+  const cargoMax = bot.cargoMax || 850;
+  const cargoUsed = bot.cargo || 0;
+
+  const tryWithdraw = async (itemId: string, spacePer: number, mult: number): Promise<boolean> => {
+    const qty = Math.min(cellsNeeded * mult, Math.floor((cargoMax - cargoUsed) / spacePer));
+    if (qty <= 0) return false;
+    try {
+      await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: itemId, quantity: qty });
+      ctx.log("mining", `Withdrew ${qty} ${itemId} from faction storage`);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (await tryWithdraw("military_fuel_cell", 3, 1)) return;
+  if (await tryWithdraw("premium_fuel_cell", 2, 1)) return;
+  if (await tryWithdraw("fuel_cell", 1, 2)) return;
+  ctx.log("warn", `Could not withdraw any fuel cells from faction storage (need ${cellsNeeded} more to reach ${minFuel})`);
+}
+
 // ── Deep core mining efficiency helpers ───────────────────────────────────
 
 /**
@@ -2546,33 +2597,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     // If not docked and not at home and not traveling - use cached data (safe for quota decisions)
 
-    // Top up fuel cells from faction storage when at home (runs every cycle)
-    // CRITICAL: Only attempt storage operations when DOCKED at home system
-    if (homeSystem && bot.system === homeSystem && bot.docked) {
-      await bot.refreshCargo();
-      let fuelInCargo = 0;
-      for (const item of bot.inventory) {
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-      }
-      const minFuel = settings.minimumFuelCells;
-      if (fuelInCargo < minFuel) {
-        try {
-          await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: minFuel });
-          ctx.log("mining", `Withdrew ${minFuel} military fuel cells from storage`);
-        } catch {
-          try {
-            await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: minFuel });
-            ctx.log("mining", `Withdrew ${minFuel} premium fuel cells from storage`);
-          } catch {
-            try {
-              await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: minFuel * 2 });
-              ctx.log("mining", `Withdrew fuel cells from storage`);
-            } catch { /* no fuel cells available */ }
-          }
-        }
-      }
-    }
+    // Top up fuel cells from faction storage before departing.
+    // Faction storage is universal, so this runs whenever we're docked (not just at home).
+    await ensureFuelCellsStocked(ctx);
 
     // ── Check for field_test mission (early game mining mission) ──
     const fieldTestActive = await hasFieldTestMission(ctx);
@@ -3382,6 +3409,10 @@ const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system,
     // Signal escorts that we're undocking (they should prepare to follow)
     ctx.log("escort", "Signaling escorts: miner undocking...");
       await signalEscort(ctx, "undock", undefined, "chat");
+
+    // Guarantee a fuel cell reserve is stocked before departing the station.
+    // Faction storage is universal, so we top up whenever docked (any station).
+    await ensureFuelCellsStocked(ctx);
 
     await ensureUndocked(ctx);
 
@@ -7744,52 +7775,9 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
         await updateMiningSession(bot.username, { state: "depositing" });
       }
 
-    // Exact fuel cells reserve for return home — prefer withdraw from faction storage at home base
-    // CRITICAL: Only withdraw from faction storage when DOCKED at home system
-    await bot.refreshCargo();
-    let fuelInCargo = 0;
-    for (const item of bot.inventory) {
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
-    }
-    try {
-      const routeResult = (await bot.commands.spacemolt.find_route({ id: homeSystem })).structuredContent;
-      const r = routeResult as any;
-      if (r?.estimated_fuel != null && r?.fuel_available != null) {
-        const minFuel = settings.minimumFuelCells;
-        if (fuelInCargo < minFuel) {
-          // CRITICAL: Only withdraw from faction storage if DOCKED at home system
-          const isAtHome = homeSystem && bot.system === homeSystem && bot.docked;
-          const cellsNeeded = minFuel - fuelInCargo;
-          if (isAtHome) {
-            // Prefer military_fuel_cell (100 fuel, 3 space)
-            try {
-              const qty = Math.min(cellsNeeded, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 3));
-              if (qty > 0) {
-                await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "military_fuel_cell", quantity: qty });
-                ctx.log("mining", `Withdrew ${qty} military fuel cells from storage`);
-              }
-            } catch {
-              try {
-                const qty = Math.min(cellsNeeded, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 2));
-                if (qty > 0) {
-                  await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "premium_fuel_cell", quantity: qty });
-                  ctx.log("mining", `Withdrew ${qty} premium fuel cells from storage`);
-                }
-              } catch {
-                try {
-                  const qty = Math.min(cellsNeeded * 5, Math.floor(((bot.cargoMax || 850) - bot.cargo) / 1));
-                  if (qty > 0) {
-                    await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: "fuel_cell", quantity: qty });
-                    ctx.log("mining", `Withdrew ${qty} fuel cells from storage`);
-                  }
-                } catch { /* no fuel cells available */ }
-              }
-            }
-          }
-        }
-      }
-    } catch {}
+    // Top up fuel cells from faction storage before departing.
+    // Faction storage is universal, so this runs whenever we're docked (not just at home).
+    await ensureFuelCellsStocked(ctx);
 
     await bot.refreshLocation();
     await bot.refreshStorage();

@@ -4277,7 +4277,21 @@ export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean
  */
 export async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  if (bot.isCloaked) return true;
+  // The in-memory `isCloaked` flag is reset on every routine (re)start, but the
+  // ship may ALREADY be cloaked on the gameserver from a previous run. Issuing
+  // `cloak { enable: true }` forces a re-cloak which UN-DOCKS the ship, so we
+  // must sync the real cloak state from the server before deciding to issue the
+  // command. Without this, a plain routine restart would un-dock a perfectly
+  // good docked + cloaked credit-top-off bot.
+  try {
+    await bot.refreshStatus();
+  } catch {
+    // best-effort: fall through to the local flag
+  }
+  if (bot.isCloaked) {
+    ctx.log("system", `Already cloaked in ${bot.system} (confirmed via get_status) — skipping re-cloak to avoid un-dock`);
+    return true;
+  }
   try {
     const resp = await bot.exec("cloak", { enable: true });
     if (!resp.error) {

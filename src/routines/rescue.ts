@@ -231,6 +231,16 @@ async function enableRescueCloak(ctx: RoutineContext, settings: ReturnType<typeo
     ctx.log("rescue", "🛡️ Cloaking enabled (enableCloak setting) — pirates can't ambush us");
   } else {
     ctx.log("rescue", "⚠️ enableCloak is set but no cloaking module is available on this ship");
+    return;
+  }
+
+  // A credit top-off bot must stay docked to send gifts / read faction storage.
+  // Cloaking un-docks the ship, so re-dock here. The server no longer drains
+  // fuel for a cloaked ship sitting at a station, so the ship ends up
+  // docked + cloaked, which is exactly what we want. Skip this for bots that
+  // don't run credit top-off (they're about to fly out anyway).
+  if (isCreditTopOffEnabledFor(ctx.bot.username)) {
+    await ensureDocked(ctx);
   }
 }
 
@@ -5382,6 +5392,10 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     const { homeSystem, homeStation } = getHomeBaseForRescueType(homeBaseType, bot.system);
     ctx.log("rescue", `Rescue role: ${homeBaseType} | home: ${homeSystem || bot.system}${homeStation ? '/' + homeStation.split('|')[1] : ''}`);
 
+    // Enable cloaking if configured (always on when set). Cloaking un-docks the
+    // ship; enableRescueCloak re-docks afterward when this bot runs credit
+    // top-off so the background loop stays docked+cloaked (the server no longer
+    // drains fuel for cloaked ships at a station).
     await enableRescueCloak(ctx, settings);
 
     // Check if this bot should ONLY do credit top-off (no rescue operations)

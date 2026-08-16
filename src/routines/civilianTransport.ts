@@ -20,7 +20,7 @@ import {
   getItemSize,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
-import { getSystemBlacklist } from "../web/server.js";
+import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
@@ -180,7 +180,17 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
 function isBlockedStation(stationId: string): boolean {
   const settings = getCivilianTransportSettings();
   const lower = stationId.toLowerCase();
-  return settings.blockedStationIds.some(id => id.toLowerCase() === lower);
+  const matchLower = (id: string) => {
+    const l = id.toLowerCase();
+    return l === lower || l.endsWith("|" + lower) || (lower.includes("|") && l === lower.split("|").pop());
+  };
+  if (settings.blockedStationIds.some(matchLower)) {
+    return true;
+  }
+  // Also honor the global station blacklist (Settings → General → stationBlacklist),
+  // which other routines/helpers consult via getStationBlacklist(). Entries may be
+  // plain POI ids or "system|poiId" keys.
+  return getStationBlacklist().some(matchLower);
 }
 
 const fs = require("fs");
@@ -2698,6 +2708,30 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       if (!alreadyDocked) {
         const dockResp = await bot.exec("dock");
         if (dockResp.error && !dockResp.error.message.includes("already")) {
+          const blockedHere = isBlockedStation(waypoint.poi) || isBlockedStation(waypoint.poiName);
+          if (blockedHere) {
+            ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Dropping passengers bound here and re-planning.`);
+            const boundHere = state.onboardPassengers.filter(
+              p => p.status === "boarded" && (p.destination.toLowerCase() === waypoint.poi.toLowerCase() || p.destinationName.toLowerCase() === waypoint.poiName.toLowerCase()),
+            );
+            for (const p of boundHere) {
+              const citizenId = p.citizenId || p.name;
+              const unloadResp = await bot.exec("unload_passenger", { id: citizenId, target: "space" });
+              if (unloadResp.error) {
+                ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
+              } else {
+                ctx.log("transport", `Dropped passenger ${p.name} bound for blacklisted station ${waypoint.poiName}`);
+              }
+              state.onboardPassengers = state.onboardPassengers.filter(op => op.citizenId !== citizenId);
+            }
+            // Force a route rebuild from the remaining passengers on the next loop.
+            state.route = [];
+            state.currentRouteIndex = 0;
+            state.status = "in_transit";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
           ctx.log("error", `Dock failed: ${dockResp.error.message}`);
           await ctx.sleep(30000);
           continue;

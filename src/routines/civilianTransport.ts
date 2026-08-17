@@ -177,20 +177,84 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
   return false;
 }
 
-function isBlockedStation(stationId: string): boolean {
+function isBlockedStation(poiId: string, stationName?: string): boolean {
   const settings = getCivilianTransportSettings();
-  const lower = stationId.toLowerCase();
-  const matchLower = (id: string) => {
-    const l = id.toLowerCase();
-    return l === lower || l.endsWith("|" + lower) || (lower.includes("|") && l === lower.split("|").pop());
+  const blocked = [...settings.blockedStationIds, ...getStationBlacklist()];
+  if (blocked.length === 0) return false;
+
+  const norm = (s: string): string =>
+    s.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+
+  const candidates = new Set<string>();
+  const add = (s?: string) => {
+    if (!s) return;
+    const l = s.toLowerCase();
+    candidates.add(l);
+    const bar = l.lastIndexOf("|");
+    if (bar >= 0) candidates.add(l.slice(bar + 1));
   };
-  if (settings.blockedStationIds.some(matchLower)) {
-    return true;
+
+  // The passenger `destination` and the blacklist may use different identifier
+  // spaces for the same station (e.g. station_id vs underline_station_name, or
+  // a human-readable name). Resolve the destination through stationRef and check
+  // the blacklist against every identifier the station has.
+  add(poiId);
+  add(stationName);
+
+  const stationRef = loadStationRef();
+  const lower = (poiId || "").toLowerCase();
+  const info =
+    (lower && (stationRef.by_underline_name[lower] || stationRef.by_station_id[lower])) ||
+    undefined;
+  if (info) {
+    add(info.station_id);
+    add(info.underline_station_name);
+    add(info.regular_station_name);
+    add(info.official_name);
+    if (info.system_id) {
+      add(`${info.system_id}|${info.station_id}`);
+      add(`${info.system_id}|${info.underline_station_name}`);
+    }
   }
-  // Also honor the global station blacklist (Settings → General → stationBlacklist),
-  // which other routines/helpers consult via getStationBlacklist(). Entries may be
-  // plain POI ids or "system|poiId" keys.
-  return getStationBlacklist().some(matchLower);
+
+  for (const entry of blocked) {
+    if (!entry) continue;
+    const e = entry.toLowerCase();
+    const en = norm(e);
+    for (const c of candidates) {
+      if (c === e) return true;
+      if (norm(c) === en) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Drop any passengers currently aboard whose destination is on the blacklist.
+ * Passengers can only be unloaded while docked, so this is a no-op unless the
+ * bot is currently docked — in which case they are dropped at the current
+ * station. Runs independently of routine status so a passenger whose
+ * destination was blacklisted after they boarded is always removed at the
+ * first opportunity.
+ */
+async function dropBlacklistedAboardPassengers(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+  const listResp = await bot.exec("list_passengers");
+  if (listResp.error || !listResp.result) return;
+  const parsed = parseListPassengers(listResp.result);
+  if (!parsed) return;
+  for (const p of parsed.passengers) {
+    if (isBlockedStation(p.destination, p.destination_name)) {
+      ctx.log("transport", `Passenger ${p.name} aboard but bound for blacklisted station ${p.destination_name} - dropping at current station`);
+      const unloadResp = await bot.exec("unload_passenger", { id: p.citizen_id || p.name });
+      if (unloadResp.error) {
+        ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
+      } else {
+        ctx.log("transport", `Dropped blacklisted passenger ${p.name} (${p.destination_name})`);
+      }
+    }
+  }
 }
 
 const fs = require("fs");
@@ -215,10 +279,19 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     ctx.log("transport", `resolveDestination: REJECTING pirate destination ${destinationId}`);
     return null;
   }
-  if (isBlockedStation(destinationId)) {
-    ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${destinationId}`);
+  if (isBlockedStation(destinationId, destinationName)) {
+    ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${destinationId} (${destinationName})`);
     return null;
   }
+
+  // Guard helper: reject any resolved destination whose poi id or name is blacklisted.
+  const emit = (r: RouteResult): RouteResult | null => {
+    if (isBlockedStation(r.poi, r.poiName)) {
+      ctx.log("transport", `resolveDestination: REJECTING blacklisted station ${r.poi} (${r.poiName})`);
+      return null;
+    }
+    return r;
+  };
   if (isMobileStation(destinationId)) {
     ctx.log("transport", `resolveDestination: ${destinationId} is mobile, using find_route directly`);
     const routeResp = await bot.exec("find_route", { target: destinationId });
@@ -232,12 +305,12 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
         if (destinationId === "mobile_capital" && resolvedSystem && resolvedPoi) {
           mapStore.updateMobileCapitolLocation(resolvedSystem, resolvedSystem, resolvedPoi);
         }
-        return {
+        return emit({
           system: resolvedSystem,
           poi: resolvedPoi,
           poiName: resolvedPoiName,
           origDest: destinationId,
-        };
+        });
       }
     }
     return null;
@@ -257,7 +330,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
     const result = { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
     ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-    return result;
+    return emit(result);
   }
 
   const byStationId = stationRef.by_station_id[destinationId.toLowerCase()];
@@ -269,7 +342,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
     const result = { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
     ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-    return result;
+    return emit(result);
   }
 
   for (const st of stationRef.stations) {
@@ -294,7 +367,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       }
       const result = { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
       ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
-      return result;
+      return emit(result);
     }
   }
   
@@ -309,7 +382,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       }
       const result = { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
       ctx.log("transport", `resolveDestination: SUCCESS (allSystems scan) system=${result.system}, poi=${result.poi}`);
-      return result;
+      return emit(result);
     }
   }
 
@@ -353,7 +426,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
             origDest: destinationId,
           };
           ctx.log("transport", `resolveDestination: SUCCESS (find_route fallback) system=${ret.system}, poi=${ret.poi}`);
-          return ret;
+          return emit(ret);
         }
         ctx.log("transport", `resolveDestination: REJECTING pirate destination from find_route fallback: ${targetPoi}`);
       }
@@ -398,7 +471,7 @@ if (!targetSystemId) {
               origDest: destinationId,
             };
             ctx.log("transport", `resolveDestination: SUCCESS (destinationSystem fallback) system=${ret.system}, poi=${ret.poi}`);
-            return ret;
+            return emit(ret);
           }
           ctx.log("transport", `resolveDestination: REJECTING pirate destination from destinationSystem fallback: ${targetPoi}`);
         }
@@ -434,7 +507,7 @@ if (!targetSystemId) {
     origDest: destinationId,
   };
   ctx.log("transport", `resolveDestination: SUCCESS (find_route) system=${ret.system}, poi=${ret.poi}`);
-  return ret;
+  return emit(ret);
 }
 
 interface CatalogShip {
@@ -1859,6 +1932,11 @@ if (state && state.status !== "idle") {
       }
     }
 
+    // Drop any aboard passengers whose destination was blacklisted (only
+    // possible while docked). Runs every cycle so they're removed at the first
+    // docked opportunity regardless of routine status.
+    await dropBlacklistedAboardPassengers(ctx);
+
     // --- State machine ---
     if (state.status === "idle") {
       // Check idle timeout - return home if stuck idle for too long
@@ -2081,7 +2159,7 @@ if (state && state.status !== "idle") {
           if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
           continue;
         }
-        if (isBlockedStation(p.destination)) {
+        if (isBlockedStation(p.destination, p.destination_name)) {
           ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
           continue;
         }
@@ -2482,7 +2560,29 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       }
 
       // Build onboard passenger records
-      const onboard: TransportPassenger[] = aboard.map(p => ({
+      // Drop any passengers already aboard whose destination is blacklisted
+      // (e.g. added to the blacklist after they boarded). This prevents the
+      // bot from carrying them to a station it must never visit. We can only
+      // unload while docked, so this runs in the loading phase (bot is docked
+      // here) and simply drops them at the current station.
+      const dropBlacklisted: AboardPassenger[] = [];
+      if (bot.docked) {
+        for (const p of aboard) {
+          if (isBlockedStation(p.destination, p.destination_name)) {
+            ctx.log("transport", `Passenger ${p.name} aboard but bound for blacklisted station ${p.destination_name} - dropping at current station`);
+            const unloadResp = await bot.exec("unload_passenger", { id: p.citizen_id || p.name });
+            if (unloadResp.error) {
+              ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
+            } else {
+              ctx.log("transport", `Dropped blacklisted passenger ${p.name} (${p.destination_name})`);
+              dropBlacklisted.push(p);
+            }
+          }
+        }
+      }
+      const aboardFiltered = aboard.filter(p => !dropBlacklisted.includes(p));
+
+      const onboard: TransportPassenger[] = aboardFiltered.map(p => ({
         citizenId: p.citizen_id || p.name,
         name: p.name,
         accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
@@ -2710,21 +2810,11 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         if (dockResp.error && !dockResp.error.message.includes("already")) {
           const blockedHere = isBlockedStation(waypoint.poi) || isBlockedStation(waypoint.poiName);
           if (blockedHere) {
-            ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Dropping passengers bound here and re-planning.`);
-            const boundHere = state.onboardPassengers.filter(
-              p => p.status === "boarded" && (p.destination.toLowerCase() === waypoint.poi.toLowerCase() || p.destinationName.toLowerCase() === waypoint.poiName.toLowerCase()),
-            );
-            for (const p of boundHere) {
-              const citizenId = p.citizenId || p.name;
-              const unloadResp = await bot.exec("unload_passenger", { id: citizenId, target: "space" });
-              if (unloadResp.error) {
-                ctx.log("error", `Could not drop blacklisted passenger ${p.name}: ${unloadResp.error.message}`);
-              } else {
-                ctx.log("transport", `Dropped passenger ${p.name} bound for blacklisted station ${waypoint.poiName}`);
-              }
-              state.onboardPassengers = state.onboardPassengers.filter(op => op.citizenId !== citizenId);
-            }
-            // Force a route rebuild from the remaining passengers on the next loop.
+            // We're not docked here, so we cannot unload the passenger (unload
+            // requires being docked). Skip this waypoint and re-plan without it;
+            // the passenger stays aboard and will be dropped at the next station
+            // the bot docks at via dropBlacklistedAboardPassengers().
+            ctx.log("transport", `Dock failed at ${waypoint.poiName} (${waypoint.poi}) which is now on the blacklist. Skipping waypoint and re-planning.`);
             state.route = [];
             state.currentRouteIndex = 0;
             state.status = "in_transit";
@@ -2874,3 +2964,4 @@ const routeDests = Array.from(destMap.values()).filter(d => {
     await ctx.sleep(5000);
   }
 };
+

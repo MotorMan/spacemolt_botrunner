@@ -87,6 +87,8 @@ export interface StationBattleLogEntry {
   participants: string[];
   /** True when one of the participants matched our station (by id/name). */
   stationInvolved: boolean;
+  /** True when the docked drone's own ship was a participant. */
+  droneInvolved?: boolean;
 }
 
 export type StationBattleLog = Record<string, StationBattleLogEntry[]>;

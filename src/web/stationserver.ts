@@ -594,8 +594,11 @@ export class StationWebServer {
   ): { combatAlert: boolean; battleId: string | null; stationInvolved: boolean } {
     const cb = bot?.currentBattle;
     const battleId = (cb?.battleId as string | null) ?? null;
-    const inBattle = !!(cb?.inBattle && battleId);
-    const docked = !!status?.docked;
+    // NOTE: `currentBattle.inBattle` is set by the bot's `battle_alert` handler for
+    // ANY battle in the drone's system while docked — it does NOT mean our station
+    // (or the drone) is involved. A player farming creatures elsewhere in-system
+    // trips it. The real signal is whether our station (or the docked drone) is an
+    // actual participant of the battle, so we gate on that, not on `inBattle`.
     const participantsRaw = Array.isArray(cb?.participants)
       ? (cb!.participants as Array<Record<string, unknown>>)
       : [];
@@ -603,7 +606,12 @@ export class StationWebServer {
       .map((p) => String(p.username || p.player_id || p.ship_name || p.name || ""))
       .filter(Boolean);
     const stationInvolved = this.stationIsParticipant(row, participantsRaw);
-    const combatAlert = inBattle && docked;
+    // The docked drone being a participant only counts as "station under attack"
+    // if it is still docked here — otherwise it flew off to fight somewhere else.
+    const docked = !!status?.docked;
+    const droneInvolved = docked && this.droneIsParticipant(bot, participantsRaw);
+    const involved = stationInvolved || droneInvolved;
+    const combatAlert = involved && !!battleId;
 
     const entries = (this.battleLog[row.id] = this.battleLog[row.id] ?? []);
     const open = entries.find((e) => e.endedAt === null);
@@ -617,6 +625,7 @@ export class StationWebServer {
           outcome: "active",
           participants,
           stationInvolved,
+          droneInvolved,
         });
         this.flushBattleLog();
       } else if (open.battleId !== battleId) {
@@ -630,6 +639,7 @@ export class StationWebServer {
           outcome: "active",
           participants,
           stationInvolved,
+          droneInvolved,
         });
         this.flushBattleLog();
       } else {
@@ -644,6 +654,10 @@ export class StationWebServer {
           open.stationInvolved = true;
           changed = true;
         }
+        if (droneInvolved && !open.droneInvolved) {
+          open.droneInvolved = true;
+          changed = true;
+        }
         if (changed) this.flushBattleLog();
       }
     } else if (open) {
@@ -653,6 +667,22 @@ export class StationWebServer {
     }
 
     return { combatAlert, battleId, stationInvolved };
+  }
+
+  /** True when the docked drone's own ship is a participant (someone pulled our
+   *  ship into the battle while it was docked at the station). */
+  private droneIsParticipant(
+    bot: Bot | null | undefined,
+    participants: Array<Record<string, unknown>>,
+  ): boolean {
+    const me = (bot?.username || "").toLowerCase();
+    if (!me) return false;
+    return participants.some((p) => {
+      const uname = String(p.username || "").toLowerCase();
+      const pid = String(p.player_id || "").toLowerCase();
+      const sname = String(p.ship_name || "").toLowerCase();
+      return uname === me || pid === me || sname === me;
+    });
   }
 
   /** Leniently check whether the station itself is among the battle participants. */

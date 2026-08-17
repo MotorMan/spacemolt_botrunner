@@ -7,12 +7,22 @@
  * - Uses auto-pricing (midpoint between min/max) or manual price
  * - Returns home to restock and repeat
  *
+ * Every station is screened BEFORE any network call is spent on it:
+ * - Settings → Station Blacklist (restricted stations that refuse docking, banned
+ *   faction outposts) and Settings → System Blacklist are always honoured, as is
+ *   the runtime "this station denied us docking" set from common.ts.
+ * - Faction deployable outposts are skipped — only the owning faction can dock
+ *   there, so both the remote order check and a visit are guaranteed waste.
+ * - Stations that answer "That station does not have a market" (or refuse to let
+ *   us dock) are remembered in data/fcStations.json and skipped until the relearn
+ *   window expires, instead of being re-queried on every pass.
+ *
  * Tracks placed orders in data/fcStations.json.
  */
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import type { Routine, RoutineContext } from "../bot.js";
-import { mapStore } from "../mapstore.js";
+import { mapStore, type StoredPOI } from "../mapstore.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -27,15 +37,36 @@ import {
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   travelToStationWithHint,
+  buildDeniedStationSet,
+  markStationDenied,
   type BattleState,
   getBattleStatus,
   fleeFromBattle,
 } from "./common.js";
+import { getSystemBlacklist } from "../web/server.js";
 import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
+/** Curated list of NPC stations. Used only as an exemption list: an NPC station
+ *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
+ *  station with a market and must never be mistaken for a faction outpost. */
+const STATION_REF_FILE = "data/stationRef.json";
+
+/** Pacing between remote `view_orders` queries. The server tolerates ~2/s, so 500ms
+ *  is both the default and the floor — the old 5s spacing made a full 57-station
+ *  sweep take five minutes. */
+const DEFAULT_REMOTE_CHECK_DELAY_MS = 500;
+const MIN_REMOTE_CHECK_DELAY_MS = 500;
+/** How long a learned "no market"/"docking denied" verdict is trusted before we
+ *  spend another query re-testing it (player stations can add a market later). */
+const DEFAULT_RELEARN_HOURS = 168; // 7 days
+/** A station the server does not know about may just be missing from our map, so
+ *  it is retried far sooner than a hard "no market" answer. */
+const UNKNOWN_STATION_RELEARN_MS = 24 * 60 * 60 * 1000;
+/** Blacklist lookups read settings from disk, so cache them for a sweep. */
+const FILTER_CACHE_MS = 10_000;
 
 interface FCOrder {
   orderId: string;
@@ -46,7 +77,34 @@ interface FCOrder {
   createdAt: string;
 }
 
-interface FCStationEntry {
+/** Why a station is not a usable fuel-cell sales target. */
+export type FCSkipReason =
+  | "pirate_system"
+  | "system_blacklisted"
+  | "station_blacklisted"
+  | "outpost"
+  | "no_market"
+  | "dock_denied"
+  | "unknown_station";
+
+const SKIP_LABELS: Record<FCSkipReason, string> = {
+  pirate_system: "pirate system",
+  system_blacklisted: "system blacklisted",
+  station_blacklisted: "station blacklisted",
+  outpost: "faction outpost",
+  no_market: "no market",
+  dock_denied: "docking denied",
+  unknown_station: "unknown station",
+};
+
+/** Skip reasons the bot can learn at runtime (the rest come from settings/map). */
+const LEARNABLE_SKIPS: ReadonlySet<FCSkipReason> = new Set<FCSkipReason>([
+  "no_market",
+  "dock_denied",
+  "unknown_station",
+]);
+
+export interface FCStationEntry {
   systemId: string;
   poiId: string;
   poiName: string;
@@ -55,9 +113,17 @@ interface FCStationEntry {
   activeOrders: FCOrder[];
   lastVisit: string | null;
   lastPrice: number | null;
+  /** Learned verdict from a real server answer ("no market", docking refused, …). */
+  learnedSkip?: FCSkipReason | null;
+  /** When the verdict was learned — drives the relearn window. */
+  learnedSkipAt?: string | null;
+  /** The server message that produced the verdict (diagnostics only). */
+  learnedSkipDetail?: string | null;
+  /** Last computed reason this station was skipped (diagnostics only). */
+  skipReason?: FCSkipReason | null;
 }
 
-interface FCStationsData {
+export interface FCStationsData {
   version: number;
   homeSystem: string;
   homeStation: string;
@@ -66,22 +132,27 @@ interface FCStationsData {
   lastStarted: string;
 }
 
+function emptyFCStationsData(): FCStationsData {
+  return {
+    version: 2,
+    homeSystem: "",
+    homeStation: "",
+    stations: [],
+    currentStationIndex: 0,
+    lastStarted: new Date().toISOString(),
+  };
+}
+
 function loadFCStationsData(): FCStationsData {
   try {
     if (!existsSync(FC_STATIONS_FILE)) {
-      return {
-        version: 1,
-        homeSystem: "",
-        homeStation: "",
-        stations: [],
-        currentStationIndex: 0,
-        lastStarted: new Date().toISOString(),
-      };
+      return emptyFCStationsData();
     }
     const rawData = readFileSync(FC_STATIONS_FILE, "utf-8");
     const data: FCStationsData = JSON.parse(rawData);
-    // Backward compatibility: only keep fields we want, add ordersUnsold and activeOrders if missing
-    data.stations = data.stations.map(station => ({
+    // Backward compatibility: only keep fields we want, add ordersUnsold, activeOrders
+    // and the learned-skip fields (added in version 2) if missing.
+    data.stations = (data.stations ?? []).map(station => ({
       systemId: station.systemId,
       poiId: station.poiId,
       poiName: station.poiName,
@@ -90,17 +161,15 @@ function loadFCStationsData(): FCStationsData {
       activeOrders: station.activeOrders ?? [],
       lastVisit: station.lastVisit ?? null,
       lastPrice: station.lastPrice ?? null,
+      learnedSkip: station.learnedSkip ?? null,
+      learnedSkipAt: station.learnedSkipAt ?? null,
+      learnedSkipDetail: station.learnedSkipDetail ?? null,
+      skipReason: station.skipReason ?? null,
     }));
+    data.version = 2;
     return data;
   } catch {
-    return {
-      version: 1,
-      homeSystem: "",
-      homeStation: "",
-      stations: [],
-      currentStationIndex: 0,
-      lastStarted: new Date().toISOString(),
-    };
+    return emptyFCStationsData();
   }
 }
 
@@ -108,37 +177,281 @@ function saveFCStationsData(data: FCStationsData): void {
   writeFileSync(FC_STATIONS_FILE, JSON.stringify(data, null, 2));
 }
 
+// ── Station eligibility ──────────────────────────────────────
+
+let filterCache: { at: number; systems: Set<string>; stations: Set<string> } | null = null;
+
+/** Current system + station exclusions. `buildDeniedStationSet()` already folds
+ *  Settings → Station Blacklist together with every station that refused us
+ *  docking during this process's lifetime. */
+function getBlacklistFilters(force = false): { systems: Set<string>; stations: Set<string> } {
+  const now = Date.now();
+  if (!force && filterCache && now - filterCache.at < FILTER_CACHE_MS) return filterCache;
+  filterCache = {
+    at: now,
+    systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
+    stations: buildDeniedStationSet(),
+  };
+  return filterCache;
+}
+
+export function isStationBlacklisted(systemId: string, poiId: string, stations: Set<string>): boolean {
+  if (stations.size === 0) return false;
+  return stations.has(poiId.toLowerCase()) || stations.has(`${systemId}|${poiId}`.toLowerCase());
+}
+
+let npcStationIds: Set<string> | null = null;
+
+/** POI ids of the game's own NPC stations (data/stationRef.json). */
+function getNpcStationIds(): Set<string> {
+  if (npcStationIds) return npcStationIds;
+  const ids = new Set<string>();
+  try {
+    if (existsSync(STATION_REF_FILE)) {
+      const ref = JSON.parse(readFileSync(STATION_REF_FILE, "utf-8")) as {
+        stations?: Array<{ station_id?: string }>;
+      };
+      for (const s of ref.stations ?? []) {
+        if (s.station_id) ids.add(s.station_id.toLowerCase());
+      }
+    }
+  } catch {
+    // The whitelist is only an exemption list — an unreadable file just means
+    // no exemptions, never a crash.
+  }
+  npcStationIds = ids;
+  return ids;
+}
+
+function findMapPoi(systemId: string, poiId: string): StoredPOI | undefined {
+  const sys = mapStore.getSystem(systemId);
+  if (!sys) return undefined;
+  const lower = poiId.toLowerCase();
+  return sys.pois.find(p => p.id === poiId) ?? sys.pois.find(p => p.id.toLowerCase() === lower);
+}
+
+/** True when a station is a faction outpost nobody outside the owning faction can
+ *  dock at. The only authoritative signal is `get_base` (which returns
+ *  `base_type: "outpost"`) — and we only get that for a POI we have physically
+ *  visited, so it lands in the map via get_poi/get_base. A player can name a
+ *  station anything, so the name is NEVER used. Stations with a recorded market
+ *  or an NPC id in stationRef are never treated as outposts. When the map has no
+ *  base_type for a POI we fall back to the learned dock-denied verdict at visit
+ *  time (see classifyStationError). */
+export function looksLikeOutpost(entry: Pick<FCStationEntry, "systemId" | "poiId" | "poiName">): boolean {
+  if (getNpcStationIds().has(entry.poiId.toLowerCase())) return false;
+  const poi = findMapPoi(entry.systemId, entry.poiId);
+  if (poi && poi.market && poi.market.length > 0) return false; // we have traded here before
+  const baseType = `${poi?.base_type ?? ""}`.toLowerCase();
+  if (baseType.includes("outpost")) return true;
+  // Last-resort: the map POI `type` is occasionally tagged too (rare for the
+  // deployed outposts, which ship as plain "station"), so only act on an explicit
+  // outpost type — never guess from the name.
+  const poiType = `${poi?.type ?? ""}`.toLowerCase();
+  return poiType === "outpost";
+}
+
+/** True only when the map explicitly lists this station's services and a market
+ *  is not among them. Unknown/empty service lists stay optimistic. */
+export function mapSaysNoMarket(poi: StoredPOI | undefined): boolean {
+  const svc = poi?.services;
+  if (!Array.isArray(svc) || svc.length === 0) return false;
+  return !svc.some(s => String(s).toLowerCase() === "market");
+}
+
+function ageMs(iso: string | null | undefined, now: number): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, now - t);
+}
+
+/** Record a server-proven verdict so this station is skipped from now on. */
+function markStationLearnedSkip(
+  ctx: RoutineContext,
+  entry: FCStationEntry,
+  reason: FCSkipReason,
+  detail?: string,
+): void {
+  const isNew = entry.learnedSkip !== reason;
+  entry.learnedSkip = reason;
+  entry.learnedSkipAt = new Date().toISOString();
+  entry.learnedSkipDetail = detail ? detail.slice(0, 200) : null;
+  entry.skipReason = reason;
+  if (reason === "dock_denied") {
+    // Also stop every other routine in this process from retrying the dock.
+    markStationDenied(entry.poiId);
+  }
+  if (isNew) {
+    ctx.log(
+      "fc",
+      `Marking ${entry.poiName} (${entry.poiId}) as ${SKIP_LABELS[reason]} — skipping it from now on. ` +
+        `Add "${entry.poiId}" to Settings → Station Blacklist to skip it permanently.`,
+    );
+  }
+}
+
+/**
+ * Decide whether a station may be used at all. Expired learned verdicts are
+ * cleared here (so a station that later builds a market gets retried), which is
+ * why callers persist the data after a sweep.
+ */
+export function evaluateStationSkip(
+  entry: FCStationEntry,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+  now: number = Date.now(),
+): FCSkipReason | null {
+  // The home station is explicitly configured by the user: it is where cargo is
+  // withdrawn, so config-based exclusions never apply to it. Server-proven
+  // verdicts (no market) still do — we simply cannot sell there.
+  const isHome = entry.systemId === data.homeSystem && entry.poiId === data.homeStation;
+
+  if (entry.learnedSkip && LEARNABLE_SKIPS.has(entry.learnedSkip)) {
+    const window = entry.learnedSkip === "unknown_station"
+      ? UNKNOWN_STATION_RELEARN_MS
+      : settings.relearnMs;
+    const age = ageMs(entry.learnedSkipAt, now);
+    if (age === null || age < window) {
+      entry.skipReason = entry.learnedSkip;
+      return entry.learnedSkip;
+    }
+    // Window elapsed — give the station one more chance.
+    entry.learnedSkip = null;
+    entry.learnedSkipAt = null;
+    entry.learnedSkipDetail = null;
+  }
+
+  if (!isHome) {
+    if (isPirateSystem(entry.systemId)) {
+      entry.skipReason = "pirate_system";
+      return "pirate_system";
+    }
+    if (filters.systems.has(entry.systemId.toLowerCase())) {
+      entry.skipReason = "system_blacklisted";
+      return "system_blacklisted";
+    }
+    if (isStationBlacklisted(entry.systemId, entry.poiId, filters.stations)) {
+      entry.skipReason = "station_blacklisted";
+      return "station_blacklisted";
+    }
+    if (settings.skipOutposts && looksLikeOutpost(entry)) {
+      entry.skipReason = "outpost";
+      return "outpost";
+    }
+    if (mapSaysNoMarket(findMapPoi(entry.systemId, entry.poiId))) {
+      entry.skipReason = "no_market";
+      return "no_market";
+    }
+  }
+
+  entry.skipReason = null;
+  return null;
+}
+
+/** Split the persisted list into usable stations and a per-reason skip tally. */
+export function partitionStations(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): { eligible: Array<{ entry: FCStationEntry; idx: number }>; skipped: Map<FCSkipReason, number> } {
+  const eligible: Array<{ entry: FCStationEntry; idx: number }> = [];
+  const skipped = new Map<FCSkipReason, number>();
+  const now = Date.now();
+  data.stations.forEach((entry, idx) => {
+    const reason = evaluateStationSkip(entry, data, settings, filters, now);
+    if (reason) {
+      skipped.set(reason, (skipped.get(reason) ?? 0) + 1);
+      return;
+    }
+    eligible.push({ entry, idx });
+  });
+  return { eligible, skipped };
+}
+
+export function describeSkips(skipped: Map<FCSkipReason, number>): string {
+  if (skipped.size === 0) return "none";
+  return [...skipped.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${count} ${SKIP_LABELS[reason]}`)
+    .join(", ");
+}
+
+/** Map a server error message onto a skip verdict, or null when it is unrelated. */
+export function classifyStationError(message: string | undefined | null): FCSkipReason | null {
+  const msg = (message || "").toLowerCase();
+  if (!msg) return null;
+  // Transient conditions ("docking restricted while in battle", rate limits, …)
+  // must never be recorded as a permanent verdict about the station.
+  if (
+    msg.includes("battle") ||
+    msg.includes("combat") ||
+    msg.includes("cooldown") ||
+    msg.includes("rate limit") ||
+    msg.includes("too many") ||
+    msg.includes("try again")
+  ) {
+    return null;
+  }
+  if (msg.includes("not have a market") || msg.includes("no market") || msg.includes("without a market")) {
+    return "no_market";
+  }
+  if (
+    msg.includes("access denied") ||
+    msg.includes("docking denied") ||
+    msg.includes("not public") ||
+    msg.includes("restricted") ||
+    msg.includes("no permission") ||
+    msg.includes("not permitted") ||
+    msg.includes("not allowed to dock")
+  ) {
+    return "dock_denied";
+  }
+  if (
+    msg.includes("station not found") ||
+    msg.includes("unknown station") ||
+    msg.includes("no such station") ||
+    msg.includes("invalid station")
+  ) {
+    return "unknown_station";
+  }
+  return null;
+}
+
 /**
  * Check orders at a specific station remotely using view_orders with station_id.
- * Updates the station entry with current active orders.
- * Returns true if successful.
+ * Updates the station entry with current active orders. Pacing is the caller's
+ * job so a single sweep can control its own rate.
+ * Returns whether the check succeeded and any verdict learned from the failure.
  */
 async function checkStationOrdersRemote(
   ctx: RoutineContext,
-  data: FCStationsData,
   stationEntry: FCStationEntry,
-  delayMs: number = 5000,
-): Promise<boolean> {
+): Promise<{ ok: boolean; learned: FCSkipReason | null }> {
   const { bot } = ctx;
-  
-  // Wait the specified delay before checking (to avoid spamming server)
-  await ctx.sleep(delayMs);
-  
+
   try {
     // Use station_id parameter to check orders at this station remotely
     const ordersResp = await bot.exec("view_orders", { station_id: stationEntry.poiId });
-    
+
     if (ordersResp.error || !ordersResp.result || typeof ordersResp.result !== "object") {
-      ctx.log("fc", `Remote check failed for ${stationEntry.poiName}: ${ordersResp.error?.message || "no result"}`);
-      return false;
+      const message = ordersResp.error?.message || "no result";
+      const learned = classifyStationError(message);
+      if (learned) {
+        markStationLearnedSkip(ctx, stationEntry, learned, message);
+      } else {
+        ctx.log("fc", `Remote check failed for ${stationEntry.poiName}: ${message.split("\n")[0]}`);
+      }
+      return { ok: false, learned };
     }
-    
+
     const ordersData = ordersResp.result as Record<string, unknown>;
     const orders = Array.isArray(ordersData.orders) ? ordersData.orders : [];
-    
+
     // Filter for fuel_cell sell orders
     const fcOrders = orders.filter((o: any) => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-    
+
     const activeOrders = fcOrders.map((o: any) => ({
       orderId: o.order_id,
       quantity: o.quantity,
@@ -147,65 +460,83 @@ async function checkStationOrdersRemote(
       priceEach: o.price_each,
       createdAt: o.created_at,
     }));
-    
+
     // Update station entry
     stationEntry.activeOrders = activeOrders;
     stationEntry.ordersUnsold = activeOrders.reduce((sum: number, o: any) => sum + o.remaining, 0);
     stationEntry.lastVisit = new Date().toISOString();
-    
+
     const totalPlaced = activeOrders.reduce((sum: any, o: any) => sum + o.quantity, 0);
     if (totalPlaced > 0) {
       stationEntry.ordersPlaced = totalPlaced;
     }
-    
+
     ctx.log("fc", `Remote check: ${stationEntry.poiName} - ${activeOrders.length} active orders, ${stationEntry.ordersUnsold} unsold`);
-    return true;
+    return { ok: true, learned: null };
   } catch (error) {
     ctx.log("error", `Remote check error for ${stationEntry.poiName}: ${error}`);
-    return false;
+    return { ok: false, learned: null };
   }
 }
 
 /**
- * Check all stations' orders remotely and update fcStations.json.
- * Processes stations sequentially with a delay between each to avoid spamming.
+ * Check all eligible stations' orders remotely and update fcStations.json.
+ *
+ * Blacklisted stations, faction outposts and stations already proven to have no
+ * market are never queried — they only produced guaranteed errors and burned
+ * `remoteCheckDelayMs` each.
  */
 async function updateAllStationsFromRemote(
   ctx: RoutineContext,
   data: FCStationsData,
-  minDelayMs: number = 5000,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): Promise<void> {
-  ctx.log("fc", `Starting remote update of all ${data.stations.length} stations (min delay: ${minDelayMs}ms)...`);
-  
+  const filters = getBlacklistFilters(true);
+  const { eligible, skipped } = partitionStations(data, settings, filters);
+  const skipCount = data.stations.length - eligible.length;
+
+  ctx.log(
+    "fc",
+    `Starting remote update of ${eligible.length}/${data.stations.length} stations ` +
+      `(${settings.remoteCheckDelayMs}ms apart; skipping ${skipCount}: ${describeSkips(skipped)})...`,
+  );
+
   let successCount = 0;
   let failCount = 0;
-  
-  for (let i = 0; i < data.stations.length; i++) {
+  let learnedCount = 0;
+
+  for (let i = 0; i < eligible.length; i++) {
     if (ctx.bot.state !== "running") {
       ctx.log("fc", "Bot stopped, aborting remote update");
       break;
     }
-    
-    const station = data.stations[i];
-    ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${data.stations.length})`);
-    
-    const success = await checkStationOrdersRemote(ctx, data, station, i === 0 ? 0 : minDelayMs);
-    
-    if (success) {
+
+    const station = eligible[i].entry;
+    if (i > 0) await ctx.sleep(settings.remoteCheckDelayMs);
+
+    ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${eligible.length})`);
+    const result = await checkStationOrdersRemote(ctx, station);
+
+    if (result.ok) {
       successCount++;
     } else {
       failCount++;
+      if (result.learned) learnedCount++;
     }
-    
+
     // Save after each station so we don't lose progress
     saveFCStationsData(data);
   }
-  
-  ctx.log("fc", `Remote update complete: ${successCount} succeeded, ${failCount} failed`);
+
+  ctx.log(
+    "fc",
+    `Remote update complete: ${successCount} succeeded, ${failCount} failed` +
+      (learnedCount > 0 ? ` (${learnedCount} newly excluded)` : ""),
+  );
   saveFCStationsData(data);
 }
 
-function getFuelCellSellerSettings(username?: string): {
+export function getFuelCellSellerSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
   fuelCostPerJump: number;
@@ -217,6 +548,14 @@ function getFuelCellSellerSettings(username?: string): {
   autoMaxPrice: number;
   maxFuelCellsPerStation: number;
   useRemoteMarketQuery: boolean;
+  /** Delay between remote `view_orders` queries during a sweep (ms). */
+  remoteCheckDelayMs: number;
+  /** How often a full remote order sweep runs (ms). */
+  remoteUpdateIntervalMs: number;
+  /** Skip faction deployable outposts (nobody outside the faction can dock). */
+  skipOutposts: boolean;
+  /** How long a learned "no market"/"docking denied" verdict is trusted (ms). */
+  relearnMs: number;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -225,6 +564,9 @@ function getFuelCellSellerSettings(username?: string): {
   const botOverrides = username ? (all[username] as Record<string, unknown>) : undefined;
   const priceModeVal = (fc.priceMode as string) || "auto";
   const priceMode: "manual" | "auto" = priceModeVal === "manual" ? "manual" : "auto";
+  const rawDelay = Number(fc.remoteCheckDelayMs ?? DEFAULT_REMOTE_CHECK_DELAY_MS);
+  const rawInterval = Number(fc.remoteUpdateIntervalMinutes ?? 60);
+  const rawRelearn = Number(fc.relearnHours ?? DEFAULT_RELEARN_HOURS);
   return {
     homeSystem: (botOverrides?.homeSystem as string) || (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
     homeStation: (botOverrides?.homeStation as string) || (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
@@ -237,6 +579,16 @@ function getFuelCellSellerSettings(username?: string): {
     autoMaxPrice: (fc.autoMaxPrice as number) || 50,
     maxFuelCellsPerStation: (fc.maxFuelCellsPerStation as number) || 20000,
     useRemoteMarketQuery: (fc.useRemoteMarketQuery as boolean) ?? true,
+    remoteCheckDelayMs: Number.isFinite(rawDelay)
+      ? Math.max(MIN_REMOTE_CHECK_DELAY_MS, Math.round(rawDelay))
+      : DEFAULT_REMOTE_CHECK_DELAY_MS,
+    remoteUpdateIntervalMs: Number.isFinite(rawInterval) && rawInterval > 0
+      ? Math.round(rawInterval * 60 * 1000)
+      : 60 * 60 * 1000,
+    skipOutposts: (fc.skipOutposts as boolean) ?? true,
+    relearnMs: Number.isFinite(rawRelearn) && rawRelearn > 0
+      ? Math.round(rawRelearn * 60 * 60 * 1000)
+      : DEFAULT_RELEARN_HOURS * 60 * 60 * 1000,
   };
 }
 
@@ -248,16 +600,34 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
+/**
+ * Build the candidate station list from the map, excluding everything we already
+ * know we can never sell at: pirate systems, blacklisted systems/stations and
+ * faction outposts. Learned verdicts are applied later (they live per entry).
+ */
 function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSettings>): FCStationEntry[] {
   const entries: FCStationEntry[] = [];
+  const seen = new Set<string>();
+  const filters = getBlacklistFilters(true);
   const systems = mapStore.getAllSystems();
+  const mobileCapital = mapStore.getMobileCapitolLocation();
 
   for (const [systemId, sys] of Object.entries(systems)) {
     if (isPirateSystem(systemId)) continue;
+    if (filters.systems.has(systemId.toLowerCase())) continue;
 
     for (const poi of sys.pois) {
-      if (!poi.has_base) continue;
-      if (isPirateSystem(systemId)) continue;
+      if (!poi.has_base && !poi.base_id) continue;
+      if (isStationBlacklisted(systemId, poi.id, filters.stations)) continue;
+      if (settings.skipOutposts && looksLikeOutpost({ systemId, poiId: poi.id, poiName: poi.name })) continue;
+      if (mapSaysNoMarket(poi)) continue;
+
+      // The mobile capital shows up in every system it has ever been seen in;
+      // only its currently tracked location is real.
+      const key = poi.id.toLowerCase();
+      if (seen.has(key)) continue;
+      if (poi.id === "mobile_capital" && mobileCapital && mobileCapital.systemId !== systemId) continue;
+      seen.add(key);
 
       entries.push({
         systemId,
@@ -268,11 +638,64 @@ function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSetti
         activeOrders: [],
         lastVisit: null,
         lastPrice: null,
+        learnedSkip: null,
+        learnedSkipAt: null,
+        learnedSkipDetail: null,
+        skipReason: null,
       });
     }
   }
 
   return entries;
+}
+
+/**
+ * Merge newly-mapped stations into the persisted list and retire dead rows.
+ *
+ * Order counts and learned verdicts of known stations are preserved. Entries that
+ * are now excluded (blacklisted, outpost, …) are only dropped when nothing is
+ * parked at them, so a blacklisted station that still holds our orders stays
+ * visible in the file.
+ */
+function syncFCStations(
+  ctx: RoutineContext,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): boolean {
+  const filters = getBlacklistFilters(true);
+  const discovered = initializeFCStations(settings);
+  const known = new Map(data.stations.map(s => [s.poiId.toLowerCase(), s]));
+
+  let added = 0;
+  for (const candidate of discovered) {
+    const existing = known.get(candidate.poiId.toLowerCase());
+    if (!existing) {
+      data.stations.push(candidate);
+      known.set(candidate.poiId.toLowerCase(), candidate);
+      added++;
+      continue;
+    }
+    // Keep names/locations current (stations get renamed, the capital moves).
+    if (candidate.poiName && existing.poiName !== candidate.poiName) existing.poiName = candidate.poiName;
+    if (existing.systemId !== candidate.systemId) existing.systemId = candidate.systemId;
+  }
+
+  const before = data.stations.length;
+  data.stations = data.stations.filter(entry => {
+    const isHome = entry.systemId === data.homeSystem && entry.poiId === data.homeStation;
+    if (isHome) return true;
+    const reason = evaluateStationSkip(entry, data, settings, filters);
+    if (!reason) return true;
+    // Config-based exclusions with nothing parked there are just noise.
+    const hasStake = entry.ordersUnsold > 0 || entry.activeOrders.length > 0;
+    return hasStake || LEARNABLE_SKIPS.has(reason);
+  });
+  const removed = before - data.stations.length;
+
+  if (added > 0 || removed > 0) {
+    ctx.log("fc", `Station list synced with map: +${added} new, -${removed} excluded (${data.stations.length} tracked)`);
+  }
+  return added > 0 || removed > 0;
 }
 
 async function getOptimalPrice(
@@ -319,27 +742,29 @@ async function getOptimalPrice(
   return settings.baseTargetPrice;
 }
 
+/**
+ * Pick the next station to sell at. Only stations that passed the eligibility
+ * screen are considered, so blacklisted stations, faction outposts and stations
+ * proven to have no market are never travelled to.
+ */
 function getNextStation(
   data: FCStationsData,
-  currentIndex: number,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
 ): number {
-  const totalStations = data.stations.length;
-  if (totalStations === 0) return -1;
+  const { eligible } = partitionStations(data, settings, filters);
+  if (eligible.length === 0) return -1;
 
   // Always prioritize the home station if it can accept more orders
-  const homeStationIdx = data.stations.findIndex(station =>
-    station.systemId === data.homeSystem && station.poiId === data.homeStation
+  const home = eligible.find(({ entry }) =>
+    entry.systemId === data.homeSystem && entry.poiId === data.homeStation
   );
-  if (homeStationIdx >= 0) {
-    const homeStation = data.stations[homeStationIdx];
-    if (homeStation.ordersUnsold < settings.maxFuelCellsPerStation) {
-      return homeStationIdx;
-    }
+  if (home && home.entry.ordersUnsold < settings.maxFuelCellsPerStation) {
+    return home.idx;
   }
 
   // Prioritize stations with lowest unsold (highest demand), then closest, then oldest visit
-  const stationPriority = data.stations.map((station, idx) => {
+  const stationPriority = eligible.map(({ entry: station, idx }) => {
     const cost = estimateFuelCost(data.homeSystem, station.systemId, settings.fuelCostPerJump).cost;
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
     const isNearCap = station.ordersUnsold >= settings.maxFuelCellsPerStation;
@@ -387,12 +812,24 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     fcData.currentStationIndex = 0;
     fcData.lastStarted = new Date().toISOString();
     saveFCStationsData(fcData);
+  } else {
+    // Fold in stations discovered since the list was built and retire rows that
+    // the blacklist / outpost screen now excludes.
+    syncFCStations(ctx, fcData, settings);
+    saveFCStationsData(fcData);
+  }
+
+  {
+    const { eligible, skipped } = partitionStations(fcData, settings, getBlacklistFilters(true));
+    ctx.log(
+      "fc",
+      `Tracking ${fcData.stations.length} stations: ${eligible.length} sellable, ` +
+        `${fcData.stations.length - eligible.length} skipped (${describeSkips(skipped)})`,
+    );
   }
 
   // Track last remote update time for periodic checks
   let lastRemoteUpdate: number = 0;
-  const REMOTE_UPDATE_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
-  const MIN_DELAY_BETWEEN_STATION_CHECKS = 5000; // 5 seconds
 
   // Persistent battle state across cycles
   const battleState: BattleState = {
@@ -432,17 +869,30 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
     }
 
-    // Periodic remote update of station orders (every hour)
+    // Periodic remote update of station orders
     const now = Date.now();
-    if (now - lastRemoteUpdate >= REMOTE_UPDATE_INTERVAL) {
+    if (now - lastRemoteUpdate >= settings.remoteUpdateIntervalMs) {
       ctx.log("fc", "Time for periodic remote update of station orders...");
-      await updateAllStationsFromRemote(ctx, fcData, MIN_DELAY_BETWEEN_STATION_CHECKS);
+      await updateAllStationsFromRemote(ctx, fcData, settings);
       lastRemoteUpdate = now;
       // Reload data after update to ensure we have latest
       fcData = loadFCStationsData();
     }
 
-    const allStationsFull = fcData.stations.every(station => station.ordersUnsold >= settings.maxFuelCellsPerStation);
+    // Capacity is judged over sellable stations only — a blacklisted station or
+    // one without a market must not keep the routine alive forever.
+    const cycleFilters = getBlacklistFilters();
+    const { eligible: sellable, skipped: cycleSkips } = partitionStations(fcData, settings, cycleFilters);
+    if (fcData.stations.length > 0 && sellable.length === 0) {
+      ctx.log(
+        "fc",
+        `No sellable stations left (${fcData.stations.length} tracked, all skipped: ${describeSkips(cycleSkips)}) — stopping routine`,
+      );
+      saveFCStationsData(fcData);
+      return;
+    }
+    const allStationsFull = sellable.length > 0
+      && sellable.every(({ entry }) => entry.ordersUnsold >= settings.maxFuelCellsPerStation);
     if (allStationsFull) {
       ctx.log("fc", "All stations are at or above capacity — stopping routine");
       return;
@@ -559,21 +1009,26 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
     }
 
-    let targetIdx = getNextStation(fcData, fcData.currentStationIndex, settings);
-    if (targetIdx < 0 || fcData.stations.length === 0) {
-      ctx.log("fc", "No stations available to visit");
-      ctx.log("fc", "Initializing station list from mapStore...");
-      fcData.stations = initializeFCStations(settings);
-      fcData.currentStationIndex = 0;
+    let targetIdx = getNextStation(fcData, settings, cycleFilters);
+    if (targetIdx < 0) {
+      if (fcData.stations.length === 0) {
+        ctx.log("fc", "No stations tracked — initializing station list from mapStore...");
+        fcData.stations = initializeFCStations(settings);
+        fcData.currentStationIndex = 0;
+      } else {
+        // Never rebuild a populated list here: that would throw away the learned
+        // "no market" / "docking denied" verdicts and every order count with them.
+        ctx.log("fc", "No sellable station selected — re-syncing station list with the map");
+        syncFCStations(ctx, fcData, settings);
+      }
       saveFCStationsData(fcData);
 
-      if (fcData.stations.length === 0) {
-        ctx.log("fc", "Still no stations — waiting");
+      targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true));
+      if (targetIdx < 0) {
+        ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
         await ctx.sleep(60000);
         continue;
       }
-
-      targetIdx = 0;
     }
 
     const target = fcData.stations[targetIdx];
@@ -640,7 +1095,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       if (!travelResult.success) {
         ctx.log("error", `Travel to ${target.poiName} failed${travelResult.usedHint ? ` after redirect to ${travelResult.hintSystem}` : ''} — skipping station`);
-        targetIdx = (targetIdx + 1) % fcData.stations.length;
         fcData.currentStationIndex = targetIdx;
         saveFCStationsData(fcData);
         continue;
@@ -653,8 +1107,14 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const dockResp = await bot.exec("dock");
 
     if (dockResp.error && !dockResp.error.message.includes("already")) {
+      // A restricted station (private / faction-only) answers with an access
+      // denial. Remember it so we never fly here again instead of retrying it
+      // on the next pass.
+      const dockSkip = classifyStationError(dockResp.error.message);
+      if (dockSkip) {
+        markStationLearnedSkip(ctx, target, dockSkip, dockResp.error.message);
+      }
       ctx.log("error", `Dock failed: ${dockResp.error.message} — skipping station`);
-      targetIdx = (targetIdx + 1) % fcData.stations.length;
       fcData.currentStationIndex = targetIdx;
       saveFCStationsData(fcData);
       continue;
@@ -690,6 +1150,17 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         priceEach: o.price_each,
         createdAt: o.created_at,
       }));
+    } else if (ordersResp.error) {
+      // "That station does not have a market" — the station is dockable but can
+      // never host a sell order. Remember it and move on with the cargo aboard.
+      const orderSkip = classifyStationError(ordersResp.error.message);
+      if (orderSkip) {
+        markStationLearnedSkip(ctx, target, orderSkip, ordersResp.error.message);
+        fcData.currentStationIndex = targetIdx;
+        saveFCStationsData(fcData);
+        continue;
+      }
+      ctx.log("fc", `view_orders failed at ${target.poiName}: ${ordersResp.error.message.split("\n")[0]}`);
     }
 
     const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
@@ -706,29 +1177,38 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
     if (!marketResp.error && marketResp.result) {
       marketData = marketResp.result;
-    } else if (settings.useRemoteMarketQuery !== false) {
-      // Fallback to remote market query if local view_market failed
-      ctx.log("fc", "[RemoteMarket] view_market failed, trying remote market query for fuel_cell pricing...");
-      try {
-        const result = await queryRemoteMarket({ itemId: FUEL_CELL_ITEM_ID, tradeType: "sell", requesterSystemId: bot.system });
-        if (result.ok && result.results.length > 0) {
-          const best = result.results[0];
-          ctx.log("fc", `[RemoteMarket] Got remote fuel_cell price: ${best.price}cr @ ${best.stationName} (qty: ${best.quantity})`);
-          // Build synthetic marketData for getOptimalPrice
-          marketData = {
-            items: [{
-              item_id: FUEL_CELL_ITEM_ID,
-              best_sell: best.price,
-              best_buy: best.price,
-              sell_quantity: best.quantity,
-              buy_quantity: best.quantity,
-            }],
-          };
-        } else {
-          ctx.log("fc", `[RemoteMarket] No remote fuel_cell data available: ${result.error || "no results"}`);
+    } else {
+      const marketSkip = classifyStationError(marketResp.error?.message);
+      if (marketSkip) {
+        markStationLearnedSkip(ctx, target, marketSkip, marketResp.error?.message);
+        fcData.currentStationIndex = targetIdx;
+        saveFCStationsData(fcData);
+        continue;
+      }
+      if (settings.useRemoteMarketQuery !== false) {
+        // Fallback to remote market query if local view_market failed
+        ctx.log("fc", "[RemoteMarket] view_market failed, trying remote market query for fuel_cell pricing...");
+        try {
+          const result = await queryRemoteMarket({ itemId: FUEL_CELL_ITEM_ID, tradeType: "sell", requesterSystemId: bot.system });
+          if (result.ok && result.results.length > 0) {
+            const best = result.results[0];
+            ctx.log("fc", `[RemoteMarket] Got remote fuel_cell price: ${best.price}cr @ ${best.stationName} (qty: ${best.quantity})`);
+            // Build synthetic marketData for getOptimalPrice
+            marketData = {
+              items: [{
+                item_id: FUEL_CELL_ITEM_ID,
+                best_sell: best.price,
+                best_buy: best.price,
+                sell_quantity: best.quantity,
+                buy_quantity: best.quantity,
+              }],
+            };
+          } else {
+            ctx.log("fc", `[RemoteMarket] No remote fuel_cell data available: ${result.error || "no results"}`);
+          }
+        } catch (err) {
+          ctx.log("fc", `[RemoteMarket] Remote query failed: ${err instanceof Error ? err.message : String(err)}`);
         }
-      } catch (err) {
-        ctx.log("fc", `[RemoteMarket] Remote query failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
 
@@ -747,6 +1227,13 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       if (createResp.error) {
         ctx.log("error", `Create sell order failed: ${createResp.error.message}`);
+        const createSkip = classifyStationError(createResp.error.message);
+        if (createSkip) {
+          markStationLearnedSkip(ctx, target, createSkip, createResp.error.message);
+          fcData.currentStationIndex = targetIdx;
+          saveFCStationsData(fcData);
+          continue;
+        }
       } else {
         ctx.log("fc", `Listed ${quantityToPlace}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
 

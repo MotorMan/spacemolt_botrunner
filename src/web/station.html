@@ -6,29 +6,31 @@
 <title>ORBITAL_NET — Station Monitors</title>
 <link rel="stylesheet" href="/station.css" />
 <style>
+  /* Combat alert — explicit deep-red so the white text stays readable
+     (the theme's --error renders too pink for white-on-color contrast). */
   .card.combat {
-    border-color: var(--error);
+    border-color: #ff3b3b;
     animation: combatPulse 1.05s ease-in-out infinite;
   }
   @keyframes combatPulse {
-    0%, 100% { box-shadow: 0 0 0 1px var(--error), 0 0 10px rgba(255,70,70,.22); }
-    50%      { box-shadow: 0 0 0 2px var(--error), 0 0 26px rgba(255,70,70,.6); }
+    0%, 100% { box-shadow: 0 0 0 1px #ff3b3b, 0 0 10px rgba(192,24,43,.25); }
+    50%      { box-shadow: 0 0 0 2px #ff3b3b, 0 0 26px rgba(192,24,43,.6); }
   }
-  .badge-combat { background: var(--error); color: #fff; }
+  .badge-combat { background: #c0182b; color: #fff; }
   .combat-chip {
     display: inline-flex; align-items: center; gap: 6px;
-    background: var(--error); color: #fff;
+    background: #c0182b; color: #fff;
     font-family: var(--font-data); font-size: 10px; font-weight: 700;
     letter-spacing: .08em; padding: 2px 8px; border-radius: 3px; margin-top: 6px;
   }
   .combat-banner {
-    background: var(--error); color: #fff;
+    background: #c0182b; color: #fff;
     font-family: var(--font-data); font-weight: 700; letter-spacing: .06em;
     padding: 8px 12px; border-radius: 6px; margin-bottom: 12px;
   }
   .battle-log { margin-top: 6px; }
   .battle-row { border: 1px solid var(--outline-variant); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-family: var(--font-data); font-size: 12px; }
-  .battle-row.active { border-color: var(--error); }
+  .battle-row.active { border-color: #c0182b; }
   .battle-meta { color: var(--on-surface-variant); font-size: 11px; margin-top: 2px; }
   .battle-parts { margin-top: 4px; color: var(--secondary-fixed-dim); }
 </style>
@@ -877,7 +879,7 @@
         const end = b.endedAt ? new Date(b.endedAt).toLocaleString() : "—";
         const parts = (b.participants || []).map((p) => esc(p)).join(", ") || "—";
         html += `<div class="battle-row ${active ? "active" : ""}">
-          <div><b>${esc(b.battleId)}</b> ${active ? "● ACTIVE" : "○ ENDED"} ${b.stationInvolved ? "· station involved" : ""}</div>
+          <div><b>${esc(b.battleId)}</b> ${active ? "● ACTIVE" : "○ ENDED"}${b.stationInvolved ? " · station involved" : ""}${b.droneInvolved ? " · drone involved" : ""}</div>
           <div class="battle-meta">start ${start} · end ${end} · outcome ${esc(b.outcome)}${b.reason ? " · " + esc(b.reason) : ""}</div>
           <div class="battle-parts">participants: ${parts}</div>
         </div>`;

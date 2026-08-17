@@ -19029,6 +19029,10 @@
         const autoMinPrice = fc.autoMinPrice || 30;
         const autoMaxPrice = fc.autoMaxPrice || 50;
         const maxFuelCellsPerStation = fc.maxFuelCellsPerStation || 20000;
+        const remoteCheckDelayMs = fc.remoteCheckDelayMs || 500;
+        const remoteUpdateIntervalMinutes = fc.remoteUpdateIntervalMinutes || 60;
+        const skipOutposts = fc.skipOutposts !== false;
+        const relearnHours = fc.relearnHours || 168;
 
         // Build home system dropdown options from mapData
         const sysOpts = ['<option value="">(select home system)</option>'];
@@ -19155,6 +19159,41 @@
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Order Check Delay (ms)</div>
+        <div class="setting-hint">Pause between remote order checks during a station sweep. 500ms is the minimum (and the default); lower values are clamped.</div>
+      </div>
+      <input type="number" id="set-fc-remoteCheckDelayMs" min="500" max="30000" step="100" value="${remoteCheckDelayMs}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Order Sweep Interval (minutes)</div>
+        <div class="setting-hint">How often every sellable station's orders are re-checked remotely.</div>
+      </div>
+      <input type="number" id="set-fc-remoteUpdateIntervalMinutes" min="5" max="1440" value="${remoteUpdateIntervalMinutes}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Skip Faction Outposts</div>
+        <div class="setting-hint">Skip faction deployable outposts — only the owning faction can dock there. The only reliable signal is <code>get_base</code> (base_type: "outpost"), which the map only carries for stations we have physically visited; stations without that signal are instead caught at visit time when docking is refused. Blacklisted stations and systems are always skipped.</div>
+      </div>
+      <select id="set-fc-skipOutposts">
+        <option value="true" ${skipOutposts ? "selected" : ""}>Enabled</option>
+        <option value="false" ${!skipOutposts ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Re-test Excluded Stations After (hours)</div>
+        <div class="setting-hint">A station that answered "does not have a market" or refused docking is skipped for this long before it gets one more chance (player stations can add a market later).</div>
+      </div>
+      <input type="number" id="set-fc-relearnHours" min="1" max="8760" value="${relearnHours}">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveFuelCellSellerSettings()">Save Settings</button>
     </div>
@@ -19222,6 +19261,22 @@
             ) || 20000,
           useRemoteMarketQuery:
             document.getElementById("set-fc-useRemoteMarketQuery")?.value === "true",
+          remoteCheckDelayMs: Math.max(
+            500,
+            parseInt(
+              document.getElementById("set-fc-remoteCheckDelayMs")?.value,
+            ) || 500,
+          ),
+          remoteUpdateIntervalMinutes:
+            parseInt(
+              document.getElementById("set-fc-remoteUpdateIntervalMinutes")
+                ?.value,
+            ) || 60,
+          skipOutposts:
+            document.getElementById("set-fc-skipOutposts")?.value !== "false",
+          relearnHours:
+            parseInt(document.getElementById("set-fc-relearnHours")?.value) ||
+            168,
         };
         send({
           type: "saveSettings",

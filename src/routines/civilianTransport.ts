@@ -9,6 +9,7 @@ import {
   ensureFueled,
   navigateToSystem,
   detectAndRecoverFromDeath,
+  buildDeniedStationSet,
   readSettings,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -179,7 +180,17 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
 
 function isBlockedStation(poiId: string, stationName?: string): boolean {
   const settings = getCivilianTransportSettings();
-  const blocked = [...settings.blockedStationIds, ...getStationBlacklist()];
+  // Mirror travel avoidance: a station is "blocked" if it is in the configured
+  // blacklist, the civilian-transport blockedStationIds list, OR it has
+  // explicitly denied us docking this session (the "docking restricted" case).
+  // Dropping any of these from the pickup filter is what previously let us load
+  // passengers bound for a station we can never deliver to — and eat the
+  // reputation penalty when their timer expired.
+  const blocked = [
+    ...settings.blockedStationIds,
+    ...getStationBlacklist(),
+    ...Array.from(buildDeniedStationSet()),
+  ];
   if (blocked.length === 0) return false;
 
   const norm = (s: string): string =>
@@ -221,9 +232,14 @@ function isBlockedStation(poiId: string, stationName?: string): boolean {
     if (!entry) continue;
     const e = entry.toLowerCase();
     const en = norm(e);
+    // Blocked entries may be stored as "system|poiId" (e.g. from
+    // buildDeniedStationSet). Compare the full key as well as its poi suffix.
+    const eSuffix = e.includes("|") ? e.slice(e.lastIndexOf("|") + 1) : e;
+    const enSuffix = norm(eSuffix);
     for (const c of candidates) {
-      if (c === e) return true;
-      if (norm(c) === en) return true;
+      if (c === e || c === eSuffix) return true;
+      const cn = norm(c);
+      if (cn === en || cn === enSuffix) return true;
     }
   }
   return false;

@@ -698,6 +698,14 @@ function syncFCStations(
   return added > 0 || removed > 0;
 }
 
+/** Keep an auto-computed price inside the user's safe band. A lowball order on
+ *  the market (or any garbage signal) must never drag our listing below the
+ *  configured minimum — that is exactly how a 40cr order got posted. */
+function clampToPriceBand(price: number, settings: ReturnType<typeof getFuelCellSellerSettings>): number {
+  const rounded = Math.round(price);
+  return Math.min(settings.autoMaxPrice, Math.max(settings.autoMinPrice, rounded));
+}
+
 async function getOptimalPrice(
   ctx: RoutineContext,
   marketData: unknown,
@@ -709,37 +717,41 @@ async function getOptimalPrice(
     return settings.baseTargetPrice;
   }
 
+  // Fallback when we have no market to price against: the midpoint of the safe
+  // band, NEVER the legacy baseTargetPrice default (which is 40cr).
+  const bandMidpoint = Math.round((settings.autoMinPrice + settings.autoMaxPrice) / 2);
+
   if (!marketData || typeof marketData !== "object") {
-    return settings.baseTargetPrice;
+    return clampToPriceBand(bandMidpoint, settings);
   }
 
   const md = marketData as Record<string, unknown>;
   const items = Array.isArray(md) ? md : Array.isArray(md.items) ? md.items : [];
   const fcItem = items.find(i => (i as Record<string, unknown>).item_id === FUEL_CELL_ITEM_ID);
   if (!fcItem) {
-    return settings.baseTargetPrice;
+    return clampToPriceBand(bandMidpoint, settings);
   }
 
   const fi = fcItem as Record<string, unknown>;
   const bestSell = (fi.best_sell as number) || 0;
   const bestBuy = (fi.best_buy as number) || 0;
 
+  // Prefer the market midpoint when we have both sides, then the nearest single
+  // side — but every candidate is clamped to the safe band so a lowball sell
+  // order can't be matched/undercut blindly.
   if (bestSell > 0 && bestBuy > 0) {
-    const midPrice = Math.round((bestBuy + bestSell) / 2);
-    if (midPrice >= settings.autoMinPrice && midPrice <= settings.autoMaxPrice) {
-      return midPrice;
-    }
+    return clampToPriceBand((bestBuy + bestSell) / 2, settings);
   }
 
-  if (bestSell >= settings.autoMinPrice && bestSell <= settings.autoMaxPrice) {
-    return bestSell;
+  if (bestSell > 0) {
+    return clampToPriceBand(bestSell, settings);
   }
 
-  if (bestBuy >= settings.autoMinPrice && bestBuy <= settings.autoMaxPrice) {
-    return bestBuy;
+  if (bestBuy > 0) {
+    return clampToPriceBand(bestBuy, settings);
   }
 
-  return settings.baseTargetPrice;
+  return clampToPriceBand(bandMidpoint, settings);
 }
 
 /**
@@ -1214,6 +1226,17 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     let price: number | null = null;
     price = await getOptimalPrice(ctx, marketData, settings);
+
+    // Hard safety net: auto-pricing must never produce an order outside the
+    // configured band (the 40cr incident). Clamp before posting.
+    if (settings.priceMode === "auto") {
+      const clamped = Math.min(settings.autoMaxPrice, Math.max(settings.autoMinPrice, Math.round(price!)));
+      if (clamped !== price) {
+        ctx.log("fc", `Price ${price}cr outside safe band [${settings.autoMinPrice}, ${settings.autoMaxPrice}] — clamping to ${clamped}cr`);
+      }
+      price = clamped;
+    }
+
     ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (current unsold: ${currentUnsold})`);
 
     let ordersPlacedCount = 0;

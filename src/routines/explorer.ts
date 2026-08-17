@@ -25,6 +25,7 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   writeSettings,
+  getGlobalHomeBase,
   isPirateSystem,
   checkCustomsInspection,
   checkAndFleeFromPirates,
@@ -1167,7 +1168,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield* visitOtherPoi(ctx, systemId, poi, fledFromSystems);
       }
 
-      // ── Check cargo — if full with non-fuel-cell items, return to Sol Central to deposit ──
+      // ── Check cargo — if full with non-fuel-cell items, return to the home base to deposit ──
       await bot.refreshCargoAndStorage();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
@@ -4394,60 +4395,34 @@ async function checkFuelCellInventory(ctx: RoutineContext): Promise<{
 }
 
 /**
- * Return to home base (Sol Central) to reload fuel cells.
- * Navigates to Sol, docks, and loads fuel cells to max cargo.
+ * Return to the configured global home base (Settings → General) to reload fuel
+ * cells. Navigates to the home system, docks at the home station, and loads fuel
+ * cells to max cargo. No longer hardcodes Sol Central / sol_station.
  */
 async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
 
-  ctx.log("system", "Returning to home base (Sol Central) to reload fuel cells...");
+  const home = getGlobalHomeBase();
+  const homeSystem = home.system || "sol";
+  const homeName = home.name || "home base";
 
-  // Navigate to Sol system
-  if (bot.system !== "sol") {
+  ctx.log("system", `Returning to home base (${homeName}) to reload fuel cells...`);
+
+  // Navigate to the configured home system
+  if (bot.system !== homeSystem) {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
     if (!arrived) {
-      ctx.log("error", "Could not reach Sol system — aborting fuel cell reload");
+      ctx.log("error", `Could not reach ${homeSystem} — aborting fuel cell reload`);
       return false;
     }
   }
 
-  // Travel to Sol Central station
-  const stationPoi = "sol_station";
-  if (bot.poi !== stationPoi) {
-    await ensureUndocked(ctx);
-    const tResp = await bot.exec("travel", { target_poi: stationPoi });
-
-    // Check for battle after travel
-    if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
-      ctx.log("combat", "Battle detected during travel - fleeing!");
-      await ctx.sleep(5000);
-      return false;
-    }
-
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Could not reach Sol Central: ${tResp.error.message}`);
-      return false;
-    }
-    bot.poi = stationPoi;
-  }
-
-  // Dock at station
-  if (!bot.docked) {
-    const dResp = await bot.exec("dock");
-
-    // Check for battle after dock
-    if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
-      ctx.log("combat", "Battle detected during dock - fleeing!");
-      await ctx.sleep(5000);
-      return false;
-    }
-
-    if (dResp.error && !dResp.error.message.includes("already")) {
-      ctx.log("error", `Could not dock at Sol Central: ${dResp.error.message}`);
-      return false;
-    }
-    bot.docked = true;
+  // Dock at the configured home station (or any station in the system as fallback)
+  const docked = await ensureDocked(ctx, true, 0, home.station ? { targetStationId: home.station } : undefined);
+  if (!docked) {
+    ctx.log("error", `Could not dock at home base (${homeName}) — aborting fuel cell reload`);
+    return false;
   }
 
   // Load fuel cells to max cargo

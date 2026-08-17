@@ -2643,29 +2643,71 @@ if (looted > 0) {
 
 // ── Cargo deposit ──────────────────────────────────────────
 
-/** Default home station for depositing cargo. */
-const HOME_SYSTEM = "sol";
-const HOME_STATION_POI = "sol_station";
-const HOME_STATION_NAME = "Sol Central";
+/** Legacy default home system/station — only used as a fallback when the global
+ *  home base has not been configured in Settings → General. Do NOT rely on these
+ *  for new logic; read the live home base via {@link getGlobalHomeBase} instead. */
+const HOME_SYSTEM_FALLBACK = "sol";
+const HOME_STATION_POI_FALLBACK = "sol_station";
+const HOME_STATION_NAME_FALLBACK = "Sol Central";
 
 /**
- * Robust travel to Sol Central (handles landing at distant planets like saturn after jump).
- * Uses live getSystemInfo + mapStore fallback for correct POI id, plus retries for "unknown destination".
- * Returns true if positioned at the home station POI.
+ * Resolve the configured global home base (Settings → General → factionStorageSystem /
+ * factionStorageStation). This is the single source of truth now that "Sol Central"
+ * is no longer the home base.
+ *
+ * `factionStorageStation` may be stored as a bare POI id ("grand_exchange_station")
+ * or as "system|poi" ("haven|grand_exchange_station"). When only a POI is stored we
+ * return it as `station` and leave `system` empty so the caller can discover the
+ * system from the live map. Returns empty strings when nothing is configured.
+ */
+export interface GlobalHomeBase {
+  /** System id, may be empty if only a station POI was configured. */
+  system: string;
+  /** POI id of the home station, may be empty. */
+  station: string;
+  /** Best-effort display name for logs. */
+  name: string;
+}
+
+export function getGlobalHomeBase(): GlobalHomeBase {
+  const all = readSettings();
+  const general = (all.general || {}) as Record<string, unknown>;
+  const rawSystem = (general.factionStorageSystem as string) || "";
+  let station = (general.factionStorageStation as string) || "";
+  let system = rawSystem;
+  if (station.includes("|")) {
+    const [sysPart, poiPart] = station.split("|");
+    if (!system && sysPart) system = sysPart;
+    station = poiPart || "";
+  }
+  const name = station || system || HOME_STATION_NAME_FALLBACK;
+  return { system, station, name };
+}
+
+/**
+ * Robust travel to the configured home station (handles landing at distant planets
+ * after a jump). Uses live getSystemInfo + mapStore fallback for the correct POI id,
+ * plus retries for "unknown destination". Returns true if positioned at the home
+ * station POI. Falls back to any station in the system when no POI is configured.
  */
 export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
+  const home = getGlobalHomeBase();
+  const homeStationPoi = home.station || HOME_STATION_POI_FALLBACK;
+  const homeSystem = home.system || HOME_SYSTEM_FALLBACK;
+  const homeName = home.name || HOME_STATION_NAME_FALLBACK;
+
   await bot.refreshLocation();
-  if (bot.poi === HOME_STATION_POI) return true;
+  if (bot.poi === homeStationPoi) return true;
 
   // Resolve POI id (live local first, fallback to stored map data)
-  let stationPoi = HOME_STATION_POI;
+  let stationPoi = homeStationPoi;
   try {
     const { pois } = await getSystemInfo(ctx);
-    const live = pois.find(p => isStationPoi(p) && (p.id === HOME_STATION_POI || /sol central/i.test(p.name || "")));
+    const live = pois.find(p => isStationPoi(p) && (p.id === homeStationPoi || new RegExp(homeName, "i").test(p.name || "")));
     if (live) stationPoi = live.id;
     else {
-      const stored = mapStore.getSystem(HOME_SYSTEM)?.pois?.find((p: any) => p.id === HOME_STATION_POI || /sol central/i.test(p.name || ""));
+      const stored = mapStore.getSystem(homeSystem)?.pois?.find((p: any) => p.id === homeStationPoi || new RegExp(homeName, "i").test(p.name || ""));
       if (stored) stationPoi = stored.id;
     }
   } catch {}
@@ -2680,13 +2722,13 @@ export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean>
 
   let { resp, unknown } = await attemptTravel(stationPoi);
   if (unknown) {
-    ctx.log("warn", `${HOME_STATION_NAME} not in local travel list from ${bot.poi} — settling position and retry...`);
+    ctx.log("warn", `${homeName} not in local travel list from ${bot.poi} — settling position and retry...`);
     await ctx.sleep(1500);
     await bot.refreshLocation();
     ({ resp, unknown } = await attemptTravel(stationPoi));
   }
   if (unknown) {
-    ctx.log("warn", `Still unknown for ${HOME_STATION_NAME} — dock/undock at local station to update position then retry...`);
+    ctx.log("warn", `Still unknown for ${homeName} — dock/undock at local station to update position then retry...`);
     if (await ensureDocked(ctx, true)) {
       await ensureUndocked(ctx);
       ({ resp, unknown } = await attemptTravel(stationPoi));
@@ -2694,7 +2736,7 @@ export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean>
   }
 
   if (resp.error && !resp.error.message.includes("already")) {
-    ctx.log("error", `Travel to ${HOME_STATION_NAME} failed: ${resp.error.message}`);
+    ctx.log("error", `Travel to ${homeName} failed: ${resp.error.message}`);
     return false;
   }
   bot.poi = stationPoi;
@@ -2702,8 +2744,10 @@ export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean>
 }
 
 /**
- * Navigate to Sol Central and deposit all non-fuel cargo to station storage.
- * Used when cargo is full during exploration. Returns true if deposit succeeded.
+ * Navigate to the configured home base and deposit all non-fuel cargo to station
+ * storage. Used when cargo is full during exploration. Returns true if deposit
+ * succeeded. The destination is read from the global home base (Settings → General)
+ * rather than hardcoded to Sol Central.
  */
 export async function depositCargoAtHome(
   ctx: RoutineContext,
@@ -2712,14 +2756,18 @@ export async function depositCargoAtHome(
   const { bot } = ctx;
   await bot.refreshCargoAndStorage();
 
-  ctx.log("trade", `Cargo full (${bot.cargo}/${bot.cargoMax}) — returning to ${HOME_STATION_NAME} to deposit...`);
+  const home = getGlobalHomeBase();
+  const homeSystem = home.system || HOME_SYSTEM_FALLBACK;
+  const homeName = home.name || HOME_STATION_NAME_FALLBACK;
 
-  // Navigate to Sol if not already there
-  if (bot.system !== HOME_SYSTEM) {
+  ctx.log("trade", `Cargo full (${bot.cargo}/${bot.cargoMax}) — returning to ${homeName} to deposit...`);
+
+  // Navigate to the home system if configured & not already there
+  if (homeSystem && bot.system !== homeSystem) {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, HOME_SYSTEM, opts);
+    const arrived = await navigateToSystem(ctx, homeSystem, opts);
     if (!arrived) {
-      ctx.log("error", `Could not reach ${HOME_SYSTEM} — will try depositing at nearest station`);
+      ctx.log("error", `Could not reach ${homeSystem} — will try depositing at nearest station`);
       // Fallback: dock at any local station
       await ensureDocked(ctx);
       if (!bot.docked) return false;
@@ -2727,19 +2775,11 @@ export async function depositCargoAtHome(
     }
   }
 
-  // Travel to Sol Central station (robust)
-  if (!(await travelToHomeStation(ctx))) {
+  // Dock at the configured home station (or any station in the system as fallback)
+  const docked = await ensureDocked(ctx, true, 0, home.station ? { targetStationId: home.station } : undefined);
+  if (!docked) {
+    ctx.log("error", `Could not dock at home base (${homeName})`);
     return false;
-  }
-
-  // Dock
-  if (!bot.docked) {
-    const dResp = await bot.exec("dock");
-    if (dResp.error && !dResp.error.message.includes("already")) {
-      ctx.log("error", `Dock failed at ${HOME_STATION_NAME}: ${dResp.error.message}`);
-      return false;
-    }
-    bot.docked = true;
   }
 
   await ensureInsured(ctx);

@@ -30641,23 +30641,23 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Disable Scan Command for Pirates</div>
-        <div class="setting-hint">Skip the scan command when engaging pirates to avoid delays if scanning fails. Bot will still detect and engage pirates normally.</div>
+        <div class="setting-label">Scan Pirates Before Attacking</div>
+        <div class="setting-hint">ON (recommended): The hunter runs a scan on pirates before attacking to confirm the target's tier. OFF: The hunter skips scanning and attacks immediately to avoid delays if scanning fails — it still detects and engages pirates normally.</div>
       </div>
       <select id="set-hunter-disableScanCommandForPirates">
-        <option value="false"${!disableScanCommandForPirates ? " selected" : ""}>Enabled</option>
-        <option value="true"${disableScanCommandForPirates ? " selected" : ""}>Disabled</option>
+        <option value="false"${!disableScanCommandForPirates ? " selected" : ""}>On — scan before attacking</option>
+        <option value="true"${disableScanCommandForPirates ? " selected" : ""}>Off — skip scan, attack now</option>
       </select>
     </div>
 
       <div class="setting-row">
         <div>
-          <div class="setting-label">Disable Wreck Salvaging</div>
-          <div class="setting-hint">Disable looting wrecks after kills to prevent blocking pirate hunting in areas with many wrecks.</div>
+          <div class="setting-label">Loot Wrecks After Kills</div>
+          <div class="setting-hint">ON (recommended): The hunter loots wreck cargo after every kill so loot is not left behind for others to steal. OFF: The hunter skips looting and keeps hunting — use this in wreck-heavy areas where looting would slow it down.</div>
         </div>
         <select id="set-hunter-disableWreckSalvaging">
-          <option value="false"${!(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Enabled</option>
-          <option value="true"${(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Disabled</option>
+          <option value="false"${!(h.disableWreckSalvaging ?? false) ? " selected" : ""}>On — loot after kills</option>
+          <option value="true"${(h.disableWreckSalvaging ?? false) ? " selected" : ""}>Off — skip looting</option>
         </select>
       </div>
 

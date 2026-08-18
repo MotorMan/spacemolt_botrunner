@@ -3605,10 +3605,19 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
 
-  // CRITICAL: Don't scavenge if we're in battle
+  // CRITICAL: Don't scavenge if we're in battle. The cached WebSocket battle
+  // flag can stay set after a won fight (no battle_end push), so confirm
+  // against the API before skipping — otherwise loot is left behind.
   if (bot.isInBattle()) {
-    ctx.log("combat", `Not scavenging while in battle`);
-    return 0;
+    const liveStatus = await getBattleStatus(ctx);
+    if (liveStatus) {
+      ctx.log("combat", `Not scavenging while in battle`);
+      return 0;
+    }
+    ctx.log("combat", `Clearing stale battle state (API reports no battle) before scavenging`);
+    bot.currentBattle.inBattle = false;
+    bot.currentBattle.battleId = null;
+    bot.currentBattle.participants = [];
   }
 
   // Skip if cargo is already full or nearly full (less than 5 free)

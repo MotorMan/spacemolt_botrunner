@@ -2501,42 +2501,42 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
         if (won) {
           totalKills++;
-        ctx.log("combat", `Kill #${totalKills} — checking for new threats...`);
-
-        // Safety check for new threats
-        yield "safety_check";
-        const safetyCheckResp = await bot.exec("get_nearby");
-        if (!safetyCheckResp.error) {
-          bot.trackNearbyPlayers(safetyCheckResp.result);
-          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
-          const nearbyEntities = parseNearby(safetyCheckResp.result);
-          const newThreats = nearbyEntities.filter(e =>
-            isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
-            !isStationEntity(e) &&
-            e.id !== target.id &&
-            e.name !== target.name
-          );
-
-          if (newThreats.length > 0) {
-            ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging!`);
-            for (const newThreat of newThreats) {
-              if (bot.state !== "running") break;
-
-                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
-                if (newWon) {
-                totalKills++;
-                ctx.log("combat", `Kill #${totalKills} (additional threat)`);
-              } else {
-                ctx.log("combat", "Retreated from new threat");
-                break;
-              }
-            }
-            }
-          }
+          ctx.log("combat", `Kill #${totalKills} — looting wreck before next target...`);
 
           if (!settings.disableWreckSalvaging) {
             yield "loot";
             await scavengeWrecks(ctx);
+          }
+
+          // Safety check for new threats
+          yield "safety_check";
+          const safetyCheckResp = await bot.exec("get_nearby");
+          if (!safetyCheckResp.error) {
+            bot.trackNearbyPlayers(safetyCheckResp.result);
+            await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+            const nearbyEntities = parseNearby(safetyCheckResp.result);
+            const newThreats = nearbyEntities.filter(e =>
+              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+              !isStationEntity(e) &&
+              e.id !== target.id &&
+              e.name !== target.name
+            );
+
+            if (newThreats.length > 0) {
+              ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected: ${newThreats.map(t => t.name).join(", ")} — engaging!`);
+              for (const newThreat of newThreats) {
+                if (bot.state !== "running") break;
+
+                  const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                  if (newWon) {
+                  totalKills++;
+                  ctx.log("combat", `Kill #${totalKills} (additional threat)`);
+                } else {
+                  ctx.log("combat", "Retreated from new threat");
+                  break;
+                }
+              }
+              }
           }
 
           // Post-kill reload

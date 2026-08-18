@@ -13058,15 +13058,19 @@
           descEl.style.display = "none";
         }
 
-        // Save / action buttons: move the buttons from the in-content save bar
-        // up into the persistent header actions area.
+        // Save / action buttons: lift the in-content save bar up into the
+        // persistent header actions area. We CLONE it and hide the original
+        // rather than moving it, so the save bar always remains in the panel.
+        // This keeps the header correct even when a single user action triggers
+        // two back-to-back renders (e.g. switchCrafterProfile / loadLoadout call
+        // saveCrafterSettings() AND then rerenderCurrentSettings()): both syncs
+        // still find the save bar in the panel and re-populate the header, so the
+        // Save button can never be left missing.
         const saveBar = panel ? panel.querySelector(".settings-save-bar") : null;
         actionsEl.innerHTML = "";
         if (saveBar) {
-          while (saveBar.firstChild) {
-            actionsEl.appendChild(saveBar.firstChild);
-          }
-          saveBar.remove();
+          actionsEl.appendChild(saveBar.cloneNode(true));
+          saveBar.style.display = "none";
         }
       }
 

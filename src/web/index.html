@@ -13042,34 +13042,46 @@
         }
         bar.style.display = "";
 
+        // Title / Description / Save bar: lift these out of the content and into
+        // the persistent header. We HIDE the originals (instead of removing them)
+        // and CLONE into the header. Because a single user action can trigger two
+        // back-to-back renders (e.g. switchCrafterProfile / loadLoadout call
+        // saveCrafterSettings() AND then rerenderCurrentSettings()), syncSettingsHeader
+        // can run twice against the SAME final panel DOM. The first run hides the
+        // originals; if we removed them the second run would find nothing and
+        // blank the header. By hiding (not removing) the originals, every sync can
+        // re-read them and re-populate the header, so the title, description and
+        // Save button can never be left missing.
+
         // Title
         const h3 = panel ? panel.querySelector("h3") : null;
-        titleEl.textContent = h3 ? h3.textContent : "";
-        if (h3) h3.remove();
+        if (h3) {
+          titleEl.textContent = h3.textContent;
+          h3.style.display = "none";
+        } else {
+          titleEl.textContent = "";
+        }
 
         // Description
         const desc = panel ? panel.querySelector(".settings-desc") : null;
         if (desc) {
           descEl.innerHTML = desc.innerHTML;
           descEl.style.display = "";
-          desc.remove();
+          desc.style.display = "none";
         } else {
           descEl.innerHTML = "";
           descEl.style.display = "none";
         }
 
-        // Save / action buttons: lift the in-content save bar up into the
-        // persistent header actions area. We CLONE it and hide the original
-        // rather than moving it, so the save bar always remains in the panel.
-        // This keeps the header correct even when a single user action triggers
-        // two back-to-back renders (e.g. switchCrafterProfile / loadLoadout call
-        // saveCrafterSettings() AND then rerenderCurrentSettings()): both syncs
-        // still find the save bar in the panel and re-populate the header, so the
-        // Save button can never be left missing.
+        // Save / action buttons
         const saveBar = panel ? panel.querySelector(".settings-save-bar") : null;
         actionsEl.innerHTML = "";
         if (saveBar) {
-          actionsEl.appendChild(saveBar.cloneNode(true));
+          const clone = saveBar.cloneNode(true);
+          // The original may already be hidden from a prior sync; make sure the
+          // clone shown in the header is visible.
+          clone.style.display = "";
+          actionsEl.appendChild(clone);
           saveBar.style.display = "none";
         }
       }

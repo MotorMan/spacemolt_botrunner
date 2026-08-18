@@ -44,6 +44,7 @@
   <a class="brand" href="/" title="Back to monitors">ORBITAL_NET_v4.0</a>
   <div class="topbar-right">
     <div class="counter-chip"><span class="pip pip-ok"></span><span id="cnt-ok">0 OK</span></div>
+    <div class="counter-chip"><span class="pip pip-warn"></span><span id="cnt-warn">0 LOW</span></div>
     <div class="counter-chip"><span class="pip pip-alert"></span><span id="cnt-alert">0 ALERT</span></div>
     <div class="counter-chip"><span class="pip pip-nodata"></span><span id="cnt-nodata">0 NO-DATA</span></div>
     <button class="ghost-btn" id="refresh-btn" style="width:auto;padding:6px 14px;">REFRESH</button>
@@ -106,6 +107,21 @@
         </select>
         <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Caps the decorative animations and background blur to reduce GPU usage.</div>
       </div>
+      <div class="field">
+        <label>Ammo LOW below (rounds)</label>
+        <input class="term-input" type="number" id="ammo-low" min="0" step="1" value="100" />
+        <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Per ammo type, counted in the station's faction storage. At or below this many rounds the station goes <span style="color:var(--tertiary-fixed-dim)">YELLOW</span>; 0 rounds is always <span style="color:var(--error)">RED</span> (guns cannot fire). Set to 0 to only warn when an ammo type is empty.</div>
+      </div>
+      <div class="field">
+        <label>Consumables LOW below (days left)</label>
+        <input class="term-input" type="number" id="cons-low-days" min="0" step="0.5" value="2" />
+        <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Facility maintenance stock, projected from the once-per-1000-tick (~2.78h) draw. At or below this many days the station goes <span style="color:var(--tertiary-fixed-dim)">YELLOW</span>; a depleted input is <span style="color:var(--error)">RED</span>. Set to 0 to only warn when an input is empty.</div>
+      </div>
+      <div class="field">
+        <label>Supply Re-Read (minutes)</label>
+        <input class="term-input" type="number" id="supply-refresh" min="1" max="1440" step="1" value="10" />
+        <div style="font-size:10px;color:var(--on-surface-variant);font-family:var(--font-data);">Ammo/consumable numbers come from the shared faction-storage and facility caches. The monitor only issues its own read when those are staler than this.</div>
+      </div>
       <div id="rows-editor" style="display:flex;flex-direction:column;gap:12px;"></div>
       <button class="small-btn" id="add-row">+ ADD ROW</button>
     </div>
@@ -166,6 +182,7 @@
     return `<div class="data-cell"><div class="k">${k}</div><div class="v ${vclass || ""}">${v}</div>${sub ? `<div class="k">${sub}</div>` : ""}</div>`;
   }
 
+  // Conditions that make a station critical (red).
   function computeAlert(v) {
     const c = v.condition || {};
     if (num(c.satisfaction_pct) < 100) return true;
@@ -179,7 +196,73 @@
     // Nothing is making fuel for this station — flag it before the tanks run dry.
     // "unknown" (queue unreadable) never alerts, so a hiccup can't red-flag every card.
     if (fuelInfo(v).state === "none") return true;
+    // A gun with an empty ammo box does not fire, and a facility with no
+    // maintenance inputs stops running — both are outages, not warnings.
+    if (supplyInfo(v).level === "out") return true;
     return false;
+  }
+
+  // Conditions that make a station low/degraded (yellow) without being critical.
+  function computeWarn(v) {
+    return supplyInfo(v).level === "low";
+  }
+
+  // ── ammo / consumable supply indicator ──
+  // The station's guns and facilities both draw from the station's FACTION
+  // storage (never the drone's cargo or personal storage). The server evaluates
+  // stock against the configured thresholds and hands us the levels.
+  function supplyInfo(v) {
+    const s = v.supplies;
+    if (!s) {
+      return {
+        level: "unknown", ammo: "unknown", cons: "unknown", guns: 0, items: [],
+        label: "SUPPLY ?", cls: "sup-unknown",
+        title: "Ammo/consumable stock not read yet for this station",
+      };
+    }
+    const ammo = s.ammo || "unknown";
+    const cons = s.maintenance || "unknown";
+    // Worst of the two categories drives the card colour.
+    const rank = { out: 3, low: 2, unknown: 1, ok: 0 };
+    const level = rank[ammo] >= rank[cons] ? ammo : cons;
+    const guns = num(s.guns);
+    const items = Array.isArray(s.items) ? s.items : [];
+
+    const parts = [];
+    const bad = items.filter((i) => i.level === "out" || i.level === "low");
+    for (const i of bad) {
+      const qty = i.kind === "ammo"
+        ? num(i.have) + " rnd"
+        : num(i.have) + " (" + (i.daysLeft == null ? "?" : fmtDays(i.daysLeft)) + ")";
+      parts.push((i.level === "out" ? "OUT " : "LOW ") + (i.name || i.itemId) + ": " + qty);
+    }
+    if (s.note) parts.push(s.note);
+    if (!parts.length) {
+      parts.push(guns > 0
+        ? guns + " gun(s) armed · maintenance stocked"
+        : "No guns; maintenance stocked");
+    }
+    const age = s.storageAt ? " · stock read " + ageText(s.storageAt) : "";
+
+    // Ammo is called out by name on the chip, because a silent gun is the
+    // failure people care about most.
+    let label, cls;
+    if (ammo === "out") { label = "NO AMMO"; cls = "sup-bad"; }
+    else if (ammo === "low") { label = "AMMO LOW"; cls = "sup-warn"; }
+    else if (cons === "out") { label = "NO SUPPLY"; cls = "sup-bad"; }
+    else if (cons === "low") { label = "SUPPLY LOW"; cls = "sup-warn"; }
+    else if (level === "unknown") { label = "SUPPLY ?"; cls = "sup-unknown"; }
+    else { label = guns > 0 ? "ARMED x" + guns : "SUPPLIED"; cls = "sup-ok"; }
+
+    return { level, ammo, cons, guns, items, label, cls, title: parts.join("\n") + age };
+  }
+
+  function fmtDays(d) {
+    d = num(d);
+    if (d >= 1) return (d >= 10 ? Math.round(d) : Math.round(d * 10) / 10) + "d";
+    const h = d * 24;
+    if (h >= 1) return Math.round(h) + "h";
+    return Math.round(h * 60) + "m";
   }
 
   // ── fuel production indicator ──
@@ -207,7 +290,8 @@
     if (v.combatAlert) return "alert";
     if (v.state === "NO_BOT" || v.state === "UNCONFIGURED") return "nodata";
     if (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE") return "alert";
-    return computeAlert(v) ? "alert" : "ok";
+    if (computeAlert(v)) return "alert";
+    return computeWarn(v) ? "warn" : "ok";
   }
 
   function ageText(fetchedAt) {
@@ -233,7 +317,7 @@
     let badgeCls = "badge-ok";
     if (combat) {
       badgeCls = "badge-combat";
-    } else if (v.state !== "OK" || computeAlert(v)) {
+    } else if (v.state !== "OK" || computeAlert(v) || computeWarn(v)) {
       badgeCls = (condText === "CRITICAL" || v.state === "MISMATCH" || v.state === "UNDOCKED" || v.state === "STALE" || v.state === "NO_BOT") ? "badge-crit" : "badge-warn";
     }
 
@@ -265,11 +349,14 @@
     const lsDemand = num(ls.demand), lsSupply = num(ls.supply);
     const lsHTML = cell("LIFE_SUPP", lsDemand + "/" + lsSupply, "neutral", "slots");
 
-    const alert = classify(v) === "alert";
+    const cls = classify(v);
+    const alert = cls === "alert";
+    const warn = cls === "warn";
     const dimmed = (v.state === "UNDOCKED" || v.state === "MISMATCH" || v.state === "STALE" || v.state === "NO_BOT");
     const classes = ["card"];
     if (combat) classes.push("combat");
     if (alert) classes.push("alert");
+    if (warn) classes.push("warn");
     if (dimmed) classes.push("dimmed");
     if (rearrangeMode) classes.push("draggable");
 
@@ -287,6 +374,7 @@
     const fee = base.market_fee_bps != null ? (base.market_fee_bps + "bps") : "—";
     const satFoot = satPct + "%";
     const fuel = fuelInfo(v);
+    const sup = supplyInfo(v);
 
     const href = v.stationId ? `/station/${encodeURIComponent(v.stationId)}` : "#";
 
@@ -313,6 +401,9 @@
           <span class="fuel-chip ${fuel.cls}" title="${esc(fuel.title)}"><span class="fuel-dot"></span>${esc(fuel.label)}</span>
           <span class="card-age">${ageText(v.fetchedAt)}</span>
         </div>
+        <div style="font-family:var(--font-data);font-size:10px;color:var(--on-surface-variant);display:flex;align-items:center;gap:6px;">
+          <span class="fuel-chip ${sup.cls}" title="${esc(sup.title)}"><span class="fuel-dot"></span>${esc(sup.label)}</span>
+        </div>
       </div>
     </a>`;
   }
@@ -335,23 +426,24 @@
   }
 
   function updateCounters() {
-    let ok = 0, alert = 0, nodata = 0;
+    let ok = 0, warn = 0, alert = 0, nodata = 0;
     const fac = {};
     for (const v of views.values()) {
       const c = classify(v);
-      if (c === "ok") ok++; else if (c === "alert") alert++; else nodata++;
+      if (c === "ok") ok++; else if (c === "warn") warn++; else if (c === "alert") alert++; else nodata++;
       const f = v.faction || "UNASSIGNED";
-      if (!fac[f]) fac[f] = { ok: 0, alert: 0, nodata: 0 };
+      if (!fac[f]) fac[f] = { ok: 0, warn: 0, alert: 0, nodata: 0 };
       fac[f][c]++;
     }
     document.getElementById("cnt-ok").textContent = ok + " OK";
+    document.getElementById("cnt-warn").textContent = warn + " LOW";
     document.getElementById("cnt-alert").textContent = alert + " ALERT";
     document.getElementById("cnt-nodata").textContent = nodata + " NO-DATA";
 
     const fc = document.getElementById("faction-counters");
     fc.innerHTML = Object.keys(fac).map((f) => {
       const d = fac[f];
-      return `<div class="counter-chip"><span class="pip pip-ok"></span><span style="font-size:11px;">${esc(f)}: ${d.ok} / ${d.alert}</span></div>`;
+      return `<div class="counter-chip"><span class="pip pip-ok"></span><span style="font-size:11px;">${esc(f)}: ${d.ok} / ${d.warn} / ${d.alert}</span></div>`;
     }).join("");
   }
 
@@ -381,7 +473,18 @@
     const fc = document.getElementById("fps-cap");
     if (fc) fc.value = String(num(cfg.fpsCap));
     applyFrameCap(num(cfg.fpsCap));
+    applySupplyFields(cfg);
     renderSettingsRows();
+  }
+
+  // Threshold inputs are shared by applyConfig() and the REST bootstrap.
+  function applySupplyFields(cfg) {
+    const al = document.getElementById("ammo-low");
+    if (al) al.value = num(cfg.ammoLowThreshold, 100);
+    const cl = document.getElementById("cons-low-days");
+    if (cl) cl.value = num(cfg.consumableLowDays, 2);
+    const sr = document.getElementById("supply-refresh");
+    if (sr) sr.value = num(cfg.supplyRefreshMin, 10);
   }
 
   // ── WebSocket ──
@@ -459,6 +562,7 @@
       const fc = document.getElementById("fps-cap");
       if (fc) fc.value = String(num(cfgR.fpsCap));
       applyFrameCap(num(cfgR.fpsCap));
+      applySupplyFields(cfgR);
       applyStations(stR.stations || []);
       renderSettingsRows();
     } catch (e) { /* WS will fill in */ }
@@ -609,11 +713,19 @@
     renderSettingsRows();
   };
 
-  function saveConfig(rows, pollIntervalSec, cardCols, fpsCap) {
+  function saveConfig(rows, pollIntervalSec, cardCols, fpsCap, supply) {
+    const body = { rows, pollIntervalSec, cardCols, fpsCap };
+    // Thresholds are only sent when the caller has them (persistOrder() reuses
+    // this to save just the card order and must not clobber them).
+    if (supply) {
+      body.ammoLowThreshold = supply.ammoLowThreshold;
+      body.consumableLowDays = supply.consumableLowDays;
+      body.supplyRefreshMin = supply.supplyRefreshMin;
+    }
     return fetch("/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows, pollIntervalSec, cardCols, fpsCap }),
+      body: JSON.stringify(body),
     }).then((r) => r.json()).then((j) => {
       if (j.error) throw new Error(j.error);
       config = j;
@@ -628,6 +740,14 @@
     const cardCols = Math.max(1, Math.min(16, parseInt(cs.value, 10) || 5));
     const fc = document.getElementById("fps-cap");
     const fpsCap = parseInt(fc.value, 10) || 0;
+    const al = document.getElementById("ammo-low");
+    const cl = document.getElementById("cons-low-days");
+    const sr = document.getElementById("supply-refresh");
+    const supply = {
+      ammoLowThreshold: Math.max(0, parseInt(al.value, 10) || 0),
+      consumableLowDays: Math.max(0, parseFloat(cl.value) || 0),
+      supplyRefreshMin: Math.max(1, Math.min(1440, parseInt(sr.value, 10) || 10)),
+    };
     // read edited rows from DOM
     const rows = [];
     document.querySelectorAll("#rows-editor .row-card").forEach((div) => {
@@ -648,7 +768,7 @@
       return { ...orig, ...edited };
     });
     try {
-      await saveConfig(finalRows, pollIntervalSec, cardCols, fpsCap);
+      await saveConfig(finalRows, pollIntervalSec, cardCols, fpsCap, supply);
       closeSettings();
     } catch (e) {
       alert("Save failed: " + (e.message || e));
@@ -680,10 +800,7 @@
     facilities: [],
     upgrades: {},
     catCache: {},
-    itemCatalog: null,        // id -> { name }
-    facilityCatalog: null,    // id -> facility def (incl. ammo_item)
-    consumableInv: null,      // { items, storage, factionStorage }
-    consumableData: null,     // computed { rows, allGood, contributing }
+    supplies: null,           // server-evaluated ammo/maintenance stock for this station
     buildCategory: "service",
     buildSearch: "",
     buildList: [],
@@ -750,7 +867,7 @@
     document.getElementById("detail-body").innerHTML =
       '<div id="detail-msg" class="detail-note"></div>' +
       '<div class="detail-section"><div class="detail-section-title">Overview</div><div id="detail-overview"><div class="detail-note">Loading…</div></div></div>' +
-      '<div class="detail-section"><div class="detail-section-title">Consumables / Maintenance</div><div id="detail-consumables"><div class="detail-note">Loading…</div></div></div>' +
+      '<div class="detail-section"><div class="detail-section-title">Ammo / Consumables</div><div id="detail-consumables"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Facilities</div><div id="detail-facilities"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Build Facility</div><div id="detail-build"><div class="detail-note">Loading…</div></div></div>' +
       '<div class="detail-section"><div class="detail-section-title">Combat / Battle Log</div><div id="detail-battles"><div class="detail-note">Loading…</div></div></div>';
@@ -759,6 +876,8 @@
       const cfg = await (await fetch("/api/config")).json();
       const row = (cfg.rows || []).find((r) => r.stationId === detailId);
       detailState.bot = row ? row.bot : null;
+      // The consumables footer quotes the configured LOW thresholds.
+      config = cfg;
     } catch { /* best effort */ }
 
     try {
@@ -769,6 +888,7 @@
         detailState.condition = j.snapshot.condition || {};
         detailState.lifeSupport = j.snapshot.lifeSupport || {};
         detailState.power = j.snapshot.power || {};
+        detailState.supplies = j.snapshot.supplies || null;
         detailState.combatAlert = !!j.snapshot.combatAlert;
         detailState.battleId = j.snapshot.battleId || null;
         document.getElementById("detail-name").textContent = j.snapshot.stationName || detailId;
@@ -1311,182 +1431,121 @@
     });
   }
 
-  // ── Consumables / maintenance display ───────────────────────
-  // Aggregates the per-round maintenance_inputs of every built & active station
-  // facility, then compares against the bot's cargo + personal station storage +
-  // local faction storage. Auto-populated whenever the station view opens.
-  function itemName(id) {
-    const c = detailState.itemCatalog;
-    const e = c && c[id];
-    if (e && e.name) return e.name;
-    return id.replace(/_/g, " ").replace(/\b\w/g, (ch) => ch.toUpperCase());
-  }
-
-  async function collectStationInventory() {
-    const inv = { items: {}, storage: {}, factionStorage: {} };
-    const addTo = (target, res) => {
-      if (!res || !res.ok || !res.data) return;
-      const d = res.data;
-      const arr = d.items || d.storage || d.cargo || d || [];
-      const list = Array.isArray(arr) ? arr : Object.values(arr);
-      list.forEach((c) => {
-        const id = c.item_id || c.id;
-        if (id) target[id] = (target[id] || 0) + (c.quantity || c.count || 0);
-      });
-    };
-    addTo(inv.items, await apiAction("get_cargo", {}));
-    addTo(inv.storage, await apiAction("view_storage", { target: "self" }));
-    addTo(inv.factionStorage, await apiAction("view_faction_storage", {}));
-    return inv;
-  }
-
+  // ── Consumables / ammo display ──────────────────────────────
+  // Rendered straight from the monitor's own supply evaluation (the `supplies`
+  // block on the station snapshot), so the table, the card colour and the
+  // configured LOW thresholds can never disagree. The server sources the numbers
+  // from the shared faction-storage + facility caches; nothing is recomputed
+  // here and no extra game calls are made when the detail view opens.
+  //
+  // Note "have" is FACTION storage only: station facilities and guns never draw
+  // from the docked drone's cargo or its personal station storage.
   async function loadConsumables() {
     const el = document.getElementById("detail-consumables");
     if (!el) return;
     if (!detailState.bot) {
-      el.innerHTML = '<div class="detail-note">No bot configured for this station (cannot compute maintenance).</div>';
-      detailState.consumableData = null;
+      el.innerHTML = '<div class="detail-note">No bot configured for this station (cannot read ammo/maintenance stock).</div>';
+      detailState.supplies = null;
       return;
     }
-    if (!detailState.facilities || detailState.facilities.length === 0) {
-      await loadFacilities();
+    // The snapshot fetched by loadDetail() already carries the evaluation; only
+    // re-fetch when we arrived without one (e.g. a direct page load race).
+    if (!detailState.supplies) {
+      try {
+        const r = await fetch("/api/station/" + enc(detailState.stationId));
+        const j = await r.json();
+        if (r.ok && j.snapshot) detailState.supplies = j.snapshot.supplies || null;
+      } catch { /* leave null — renderConsumables shows the pending note */ }
     }
-    try {
-      if (!detailState.itemCatalog || !detailState.facilityCatalog) {
-        const c = await (await fetch("/api/catalog")).json();
-        detailState.itemCatalog = c.items || {};
-        detailState.facilityCatalog = c.facilities || {};
-      }
-    } catch {
-      detailState.itemCatalog = {};
-      detailState.facilityCatalog = {};
-    }
-
-    // Ensure catalog cache for each facility type is warm.
-    const types = new Set();
-    (detailState.facilities || []).forEach((f) => {
-      const t = f.facility_type || f.type || f.id;
-      if (t) types.add(t);
-    });
-    await Promise.all([...types].map((t) => getCatalogFacility(t)));
-
-    const inv = await collectStationInventory();
-
-    // Sum maintenance inputs across built & active facilities.
-    const totals = {};
-    const contributing = [];
-    (detailState.facilities || []).forEach((fac) => {
-      if (!isFacilityActive(fac)) return;
-      const id = fac.facility_type || fac.type || fac.id;
-      const maint = facilityMaintenance(fac);
-      if (!maint.length) return;
-      contributing.push({
-        name: fac.name || id || "?",
-        items: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
-      });
-      maint.forEach((m) => {
-        const key = m.item_id;
-        totals[key] = (totals[key] || 0) + (m.quantity || 1);
-      });
-    });
-
-    // Sum weapon-ammo requirements from active defense facilities. A defense
-    // facility goes silent/unarmed if its ammo box is empty, so we track it even
-    // though there's no per-round burn to estimate a depletion time from.
-    const ammo = {};
-    const ammoContributing = [];
-    (detailState.facilities || []).forEach((fac) => {
-      if (!isFacilityActive(fac)) return;
-      const id = fac.facility_type || fac.type || fac.id;
-      const cat = detailState.facilityCatalog && detailState.facilityCatalog[id];
-      const ammoItem = cat && cat.ammo_item;
-      if (!ammoItem) return;
-      ammo[ammoItem] = (ammo[ammoItem] || 0) + 1;
-      ammoContributing.push(fac.name || id || "?");
-    });
-
-    detailState.consumableInv = inv;
-    detailState.consumableData = { totals, ammo, contributing, ammoContributing, inv };
   }
 
   function renderConsumables() {
     const el = document.getElementById("detail-consumables");
     if (!el) return;
-    const data = detailState.consumableData;
-    if (!data) return;
-    const { totals, ammo, contributing, ammoContributing, inv } = data;
-
-    const ammoKeys = Object.keys(ammo || {});
-    if (Object.keys(totals).length === 0 && ammoKeys.length === 0) {
+    const s = detailState.supplies;
+    if (!s) {
+      el.innerHTML = '<div class="detail-note">Ammo/consumable stock has not been read for this station yet. It is evaluated on the monitor\'s poll sweep — press REFRESH on the monitor page if you need it now.</div>';
+      return;
+    }
+    const items = Array.isArray(s.items) ? s.items : [];
+    if (!items.length) {
       el.innerHTML = '<div class="detail-note">No active station facilities with maintenance or ammo requirements.</div>';
       return;
     }
 
-    let allGood = true;
-    // Maintenance is checked every 100 ticks, but consumables are only actually
-    // withdrawn once per 1000 ticks — so the real burn cycle is 1000 ticks.
-    // 1 tick = 10s real time. Ammo rows have no ETA (no per-round burn).
-    const SECS_PER_CYCLE = 1000 * 10;
-    const fmtDuration = (secs) => {
-      if (secs === Infinity) return "—";
-      const d = Math.floor(secs / 86400);
-      const h = Math.floor((secs % 86400) / 3600);
-      const m = Math.floor((secs % 3600) / 60);
-      const s = Math.floor(secs % 60);
-      if (d > 0) return `${d}d ${h}h`;
-      if (h > 0) return `${h}h ${m}m`;
-      if (m > 0) return `${m}m ${s}s`;
-      return `${s}s`;
+    const LEVEL_COLOR = {
+      ok: "var(--secondary-fixed-dim)",
+      low: "var(--tertiary-fixed-dim)",
+      out: "var(--error)",
+      unknown: "var(--on-surface-variant)",
     };
+    const LEVEL_TEXT = { ok: "✓ Good", low: "▲ Low", out: "✗ Out", unknown: "? Unknown" };
 
-    const rowFor = (itemId, need, isAmmo) => {
-      const have =
-        (inv.items[itemId] || 0) +
-        (inv.storage[itemId] || 0) +
-        (inv.factionStorage[itemId] || 0);
-      const ok = have >= need;
-      if (!ok) allGood = false;
-      const color = ok ? "var(--secondary-fixed-dim)" : "var(--error)";
-      const cyclesLeft = need > 0 ? have / need : Infinity;
-      const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+    const rowFor = (i) => {
+      const color = LEVEL_COLOR[i.level] || LEVEL_COLOR.unknown;
+      const isAmmo = i.kind === "ammo";
+      // Ammo has no per-cycle burn, so there is nothing to project a run-out
+      // time from — only the round count matters.
       const depletion = isAmmo
         ? "—"
-        : (have <= 0
-          ? "depleted"
-          : need <= 0
-            ? "—"
-            : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`);
+        : i.level === "unknown"
+          ? "?"
+          : num(i.have) <= 0
+            ? "depleted"
+            : i.daysLeft == null
+              ? "—"
+              : "≈ " + fmtDays(i.daysLeft);
       const tag = isAmmo ? ' <span class="cons-tag">AMMO</span>' : "";
-      return `<tr>
-        <td class="cons-item">${esc(itemName(itemId))}${tag}</td>
-        <td class="cons-id">${esc(itemId)}</td>
-        <td class="cons-num">${num(need)}</td>
-        <td class="cons-num" style="color:${color}">${num(have)}</td>
-        <td class="cons-num" style="color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
-        <td class="cons-eta">${depletion}</td>
+      const need = isAmmo
+        ? num(i.need) + (num(i.need) === 1 ? " gun" : " guns")
+        : num(i.need) + "/cycle";
+      return `<tr title="${esc((i.facilities || []).join(", "))}">
+        <td class="cons-item">${esc(i.name || i.itemId)}${tag}</td>
+        <td class="cons-id">${esc(i.itemId)}</td>
+        <td class="cons-num">${esc(need)}</td>
+        <td class="cons-num" style="color:${color}">${num(i.have)}</td>
+        <td class="cons-num" style="color:${color}">${LEVEL_TEXT[i.level] || LEVEL_TEXT.unknown}</td>
+        <td class="cons-eta">${esc(depletion)}</td>
       </tr>`;
     };
 
-    const maintRows = Object.entries(totals)
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .map(([itemId, need]) => rowFor(itemId, need, false))
-      .join("");
+    const rows = items.map(rowFor).join("");
 
-    const ammoRows = ammoKeys
-      .sort((a, b) => a.localeCompare(b))
-      .map((itemId) => rowFor(itemId, ammo[itemId], true))
-      .join("");
+    const worstRank = { out: 3, low: 2, unknown: 1, ok: 0 };
+    const worst = items.reduce(
+      (acc, i) => (worstRank[i.level] > worstRank[acc] ? i.level : acc),
+      "ok",
+    );
+    const summary =
+      worst === "out"
+        ? '<div class="cons-summary bad">✗ Something is OUT — facilities will not run and any gun with an empty ammo box will not fire.</div>'
+        : worst === "low"
+          ? '<div class="cons-summary warn">▲ Running low — restock before the guns fall silent or facilities stall.</div>'
+          : worst === "unknown"
+            ? '<div class="cons-summary unknown">? Stock could not be read for some items.</div>'
+            : '<div class="cons-summary ok">✓ All station requirements satisfied.</div>';
 
-    const summary = allGood
-      ? '<div class="cons-summary ok">✓ All station requirements satisfied.</div>'
-      : '<div class="cons-summary bad">✗ Some station requirements are short — facilities will not run or defenses will be unarmed without them.</div>';
-
-    const contribHtml = contributing.length
-      ? `<div class="cons-contrib">Maintenance from: ${contributing.map((c) => esc(c.name)).join(", ")}</div>`
+    const maintFacs = [];
+    const ammoFacs = [];
+    for (const i of items) {
+      for (const f of i.facilities || []) {
+        const bucket = i.kind === "ammo" ? ammoFacs : maintFacs;
+        if (!bucket.includes(f)) bucket.push(f);
+      }
+    }
+    const contribHtml = maintFacs.length
+      ? `<div class="cons-contrib">Maintenance from: ${maintFacs.map((c) => esc(c)).join(", ")}</div>`
       : "";
-    const ammoHtml = ammoContributing.length
-      ? `<div class="cons-contrib">Ammo for: ${ammoContributing.map((c) => esc(c)).join(", ")}</div>`
+    const ammoHtml = ammoFacs.length
+      ? `<div class="cons-contrib">Ammo for: ${ammoFacs.map((c) => esc(c)).join(", ")}</div>`
       : "";
+
+    const thresholds =
+      `LOW at ≤${num(config.ammoLowThreshold, 100)} rounds (ammo) and ≤${num(config.consumableLowDays, 2)}d left (maintenance).`;
+    const read = s.storageAt
+      ? `Faction storage read ${ageText(s.storageAt)}${s.source === "cache" ? " (shared cache)" : ""}.`
+      : "Faction storage not read yet.";
+    const noteHtml = s.note ? `<div class="cons-contrib" style="color:var(--tertiary-fixed-dim)">${esc(s.note)}</div>` : "";
 
     el.innerHTML = `
       ${summary}
@@ -1496,14 +1555,15 @@
             <th>Item</th>
             <th>ID</th>
             <th class="cons-num">Need</th>
-            <th class="cons-num">You have</th>
+            <th class="cons-num">In faction storage</th>
             <th class="cons-num">Status</th>
             <th class="cons-eta">Est. until depletion</th>
           </tr>
         </thead>
-        <tbody>${maintRows}${ammoRows}</tbody>
+        <tbody>${rows}</tbody>
       </table>
-      <div class="cons-foot">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Ammo rows show no depletion estimate — they only flag whether ammo is present (not 0).</div>
+      <div class="cons-foot">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Maintenance is withdrawn once per 1000-tick (10000s ≈ 2.78h) cycle, so the depletion estimate does not account for unknown cycle start timing. Ammo has no per-shot rate to project from, so it is judged on rounds remaining. ${esc(thresholds)} ${esc(read)}</div>
+      ${noteHtml}
       ${contribHtml}
       ${ammoHtml}
     `;
@@ -1515,7 +1575,7 @@
   // frame. Driving them from a throttled rAF loop caps how often the GPU composites.
   let capFps = 0;            // -1 off, 0 uncapped, else max FPS
   let animRaf = null;
-  let animTargets = { scan: null, alerts: [], fuelDots: [] };
+  let animTargets = { scan: null, alerts: [], warns: [], fuelDots: [] };
   let scanStart = 0;
   let alertStart = 0;
   let fuelStart = 0;
@@ -1523,7 +1583,8 @@
   function collectAnimTargets() {
     animTargets.scan = document.querySelector(".workspace .scanline-bar");
     animTargets.alerts = Array.from(document.querySelectorAll(".card.alert"));
-    animTargets.fuelDots = Array.from(document.querySelectorAll(".fuel-ok .fuel-dot"));
+    animTargets.warns = Array.from(document.querySelectorAll(".card.warn"));
+    animTargets.fuelDots = Array.from(document.querySelectorAll(".fuel-ok .fuel-dot, .sup-ok .fuel-dot"));
   }
 
   function clearInlineAnim() {
@@ -1532,6 +1593,7 @@
       animTargets.scan.style.opacity = "";
     }
     animTargets.alerts.forEach((el) => { el.style.boxShadow = ""; });
+    animTargets.warns.forEach((el) => { el.style.boxShadow = ""; });
     animTargets.fuelDots.forEach((el) => { el.style.opacity = ""; });
   }
 
@@ -1547,6 +1609,9 @@
     const aInt = (Math.sin(aPh * 2 * Math.PI - Math.PI / 2) + 1) / 2;
     animTargets.alerts.forEach((el) => {
       el.style.boxShadow = "0 0 " + (14 * aInt) + "px rgba(255,180,171," + (0.55 * aInt) + ")";
+    });
+    animTargets.warns.forEach((el) => {
+      el.style.boxShadow = "0 0 " + (12 * aInt) + "px rgba(255,185,82," + (0.45 * aInt) + ")";
     });
     const fPh = ((t - fuelStart) % 1800) / 1800;
     const fOp = 0.65 + 0.35 * Math.cos(fPh * 2 * Math.PI);

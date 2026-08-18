@@ -136,6 +136,7 @@ body {
 }
 .counter-chip .pip { width: 8px; height: 8px; border-radius: 50%; }
 .pip-ok { background: var(--secondary-fixed-dim); box-shadow: 0 0 6px var(--secondary-fixed-dim); }
+.pip-warn { background: var(--tertiary-fixed-dim); box-shadow: 0 0 6px var(--tertiary-fixed-dim); }
 .pip-alert { background: var(--error); box-shadow: 0 0 6px var(--error); }
 .pip-nodata { background: var(--outline); }
 
@@ -242,6 +243,12 @@ h1.page-title {
   border-color: var(--error);
   animation: alertPulse 2.4s ease-in-out infinite;
 }
+/* Low (not yet out) — e.g. ammo or facility maintenance stock running down.
+   classify() picks exactly one tier, so .alert and .warn never co-occur. */
+.card.warn {
+  border-color: var(--tertiary-fixed-dim);
+  animation: warnPulse 2.4s ease-in-out infinite;
+}
 .card.dimmed { opacity: 0.55; }
 .card.dragging { opacity: 0.4; }
 .card.drag-over { border-color: var(--primary-fixed-dim); box-shadow: 0 0 12px rgba(0, 219, 231, 0.4); }
@@ -249,6 +256,10 @@ h1.page-title {
 @keyframes alertPulse {
   0%, 100% { box-shadow: 0 0 0 rgba(255, 180, 171, 0); }
   50% { box-shadow: 0 0 14px rgba(255, 180, 171, 0.55); }
+}
+@keyframes warnPulse {
+  0%, 100% { box-shadow: 0 0 0 rgba(255, 185, 82, 0); }
+  50% { box-shadow: 0 0 12px rgba(255, 185, 82, 0.45); }
 }
 @keyframes scanline {
   0% { transform: translateY(-100%); opacity: 0; }
@@ -402,6 +413,14 @@ h1.page-title {
 .fuel-warn { color: var(--tertiary-fixed-dim); }
 .fuel-bad { color: var(--error); }
 .fuel-unknown { color: var(--on-surface-variant); opacity: 0.7; }
+
+/* ammo / consumable supply indicator (reuses the .fuel-chip layout) */
+.sup-ok { color: var(--secondary-fixed-dim); }
+.sup-ok .fuel-dot { animation: fuelPulse 1.8s ease-in-out infinite; }
+.sup-warn { color: var(--tertiary-fixed-dim); }
+.sup-bad { color: var(--error); }
+.sup-unknown { color: var(--on-surface-variant); opacity: 0.7; }
+
 .card-age { flex: none; white-space: nowrap; opacity: 0.75; }
 
 @keyframes fuelPulse {
@@ -414,13 +433,17 @@ h1.page-title {
    throttled rAF loop in station.html instead. */
 body.fx-capped .workspace.scanline .scanline-bar,
 body.fx-capped .card.alert,
-body.fx-capped .fuel-ok .fuel-dot { animation: none; }
+body.fx-capped .card.warn,
+body.fx-capped .fuel-ok .fuel-dot,
+body.fx-capped .sup-ok .fuel-dot { animation: none; }
 
 /* "Off" = static: no animations and drop the per-card backdrop blur, which is
    the single largest GPU cost on this page. */
 body.fx-off .workspace.scanline .scanline-bar { display: none; }
 body.fx-off .card.alert { animation: none; box-shadow: none; }
+body.fx-off .card.warn { animation: none; box-shadow: none; }
 body.fx-off .fuel-ok .fuel-dot { animation: none; opacity: 1; }
+body.fx-off .sup-ok .fuel-dot { animation: none; opacity: 1; }
 body.fx-off .card,
 body.fx-off .detail-card,
 body.fx-off .fac-card,
@@ -628,6 +651,8 @@ pre.snap {
 /* Consumables / maintenance table */
 .cons-summary { font-weight: 600; margin-bottom: 8px; font-size: 12px; }
 .cons-summary.ok { color: var(--secondary-fixed-dim); }
+.cons-summary.warn { color: var(--tertiary-fixed-dim); }
+.cons-summary.unknown { color: var(--on-surface-variant); }
 .cons-summary.bad { color: var(--error); }
 .cons-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .cons-table thead tr { border-bottom: 1px solid var(--outline-variant); color: var(--on-surface-variant); font-family: var(--font-data); }

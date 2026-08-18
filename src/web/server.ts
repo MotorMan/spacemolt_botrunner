@@ -1107,6 +1107,24 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/api/routines") {
           return Response.json(this.routines);
         }
+        /**
+         * Station supply LOW thresholds, owned by the station monitor's config
+         * (data/stationMonitor.json). Exposed here so the faction/station
+         * maintenance table grades ammo and consumables exactly like the station
+         * monitor cards do, instead of keeping a second set of numbers.
+         */
+        if (url.pathname === "/api/station-thresholds" && req.method === "GET") {
+          try {
+            const { loadStationConfig } = await import("./stationMonitorStore.js");
+            const cfg = loadStationConfig();
+            return Response.json({
+              ammoLowThreshold: cfg.ammoLowThreshold,
+              consumableLowDays: cfg.consumableLowDays,
+            });
+          } catch {
+            return Response.json({ ammoLowThreshold: 100, consumableLowDays: 2 });
+          }
+        }
         if (url.pathname === "/api/settings") {
           // GET: Return current settings
           if (req.method === "GET") {

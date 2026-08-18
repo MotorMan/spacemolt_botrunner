@@ -23875,8 +23875,11 @@ When responding:
       }
 
       // ── Station maintenance requirement calculator ───────────────
-      // Sums maintenance_inputs of every built & active station facility,
-      // then compares against the bot's cargo + personal station storage.
+      // Sums maintenance_inputs of every built & active station facility, then
+      // grades them (and active defense guns' ammo) against THIS station's
+      // FACTION storage only — station facilities and guns never draw from the
+      // drone's cargo or its personal station storage. Red = out, yellow = low
+      // (shared thresholds from the station monitor's settings).
       async function fetchStationMaintenance(username) {
         const container = document.getElementById("stationMaintenanceSummary");
         if (!container) return;
@@ -23888,8 +23891,9 @@ When responding:
           await fetchStationFacilities(username);
         }
 
-        // 2) Gather the bot's inventory: cargo + personal station storage.
+        // 2) Gather the stock the station can draw from: its faction storage.
         const inv = await collectStationInventory(username);
+        const thresholds = await getStationThresholds();
 
         // 3) Sum maintenance inputs across built & active facilities.
         const totals = {};
@@ -23938,12 +23942,14 @@ When responding:
         }
 
         let allGood = true;
+        let anyLow = false;
         // Cycle timing: maintenance is checked every 100 ticks, but consumables
         // are only actually withdrawn once per 1000 ticks — so the real burn
         // cycle is 1000 ticks; 1 tick = 10s real time.
         const TICKS_PER_CYCLE = 1000;
         const SECONDS_PER_TICK = 10;
         const SECS_PER_CYCLE = TICKS_PER_CYCLE * SECONDS_PER_TICK;
+        const SECS_PER_DAY = 86400;
         const fmtDuration = (secs) => {
           if (secs === Infinity) return "—";
           const d = Math.floor(secs / 86400);
@@ -23956,18 +23962,36 @@ When responding:
           return `${s}s`;
         };
         const rowFor = (itemId, need, isAmmo) => {
-          const have =
-            (inv.items[itemId] || 0) +
-            (inv.storage[itemId] || 0) +
-            (inv.factionStorage[itemId] || 0);
-          const ok = have >= need;
-          if (!ok) allGood = false;
-          const haveStr = num(have);
-          const color = ok ? "var(--green)" : "var(--red)";
-          // Estimate until depletion at the current per-cycle burn. Excess stock
-          // (have above this round's need) is consumed first, then it goes short.
+          // FACTION storage only — station facilities/guns draw from nothing else.
+          const have = inv.factionStorage[itemId] || 0;
           const cyclesLeft = need > 0 ? have / need : Infinity;
           const secsLeft = cyclesLeft * SECS_PER_CYCLE;
+          const daysLeft = secsLeft / SECS_PER_DAY;
+          // Out = the facility stops / the gun cannot fire. Low = still running,
+          // but close enough to warrant a restock. Same rules as the monitor.
+          let level;
+          if (have <= 0) level = "out";
+          else if (isAmmo)
+            level = thresholds.ammoLowThreshold > 0 && have <= thresholds.ammoLowThreshold ? "low" : "ok";
+          else
+            level =
+              thresholds.consumableLowDays > 0 && daysLeft <= thresholds.consumableLowDays
+                ? "low"
+                : "ok";
+          if (level === "out") allGood = false;
+          if (level === "low") anyLow = true;
+          const haveStr = num(have);
+          const color =
+            level === "ok" ? "var(--green)" : level === "low" ? "var(--yellow)" : "var(--red)";
+          const statusText =
+            level === "ok"
+              ? "✓ Good"
+              : level === "low"
+                ? isAmmo
+                  ? "▲ Low"
+                  : "▲ Low (" + fmtDuration(secsLeft) + ")"
+                : "✗ Out";
+          // Ammo burns per shot, so there is no cycle rate to project from.
           const depletion = isAmmo
             ? "—"
             : (have <= 0
@@ -23978,12 +24002,15 @@ When responding:
           const tag = isAmmo
             ? ' <span style="font-size:9px;color:var(--text-dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;margin-left:4px">AMMO</span>'
             : "";
+          const needStr = isAmmo
+            ? num(need) + (num(need) === 1 ? " gun" : " guns")
+            : num(need) + "/cycle";
           return `<tr>
           <td style="padding:4px 8px">${esc(catalogName(itemId))}${tag}</td>
           <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim)">${esc(itemId)}</td>
-          <td style="padding:4px 8px;text-align:right;font-weight:600">${num(need)}</td>
+          <td style="padding:4px 8px;text-align:right;font-weight:600">${esc(needStr)}</td>
           <td style="padding:4px 8px;text-align:right;color:${color}">${haveStr}</td>
-          <td style="padding:4px 8px;text-align:right;color:${color}">${ok ? "✓ Good" : "✗ Short " + num(need - have)}</td>
+          <td style="padding:4px 8px;text-align:right;color:${color}">${statusText}</td>
           <td style="padding:4px 8px;text-align:right;color:var(--text-dim);font-size:11px">${depletion}</td>
         </tr>`;
         };
@@ -23998,9 +24025,11 @@ When responding:
           .map((itemId) => rowFor(itemId, ammo[itemId], true))
           .join("");
 
-        const summary = allGood
-          ? '<div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ All station requirements satisfied.</div>'
-          : '<div style="color:var(--red);font-weight:600;margin-bottom:8px">✗ Some station requirements are short — facilities will not run or defenses will be unarmed without them.</div>';
+        const summary = !allGood
+          ? '<div style="color:var(--red);font-weight:600;margin-bottom:8px">✗ Something is OUT — facilities will not run and any gun with an empty ammo box will not fire.</div>'
+          : anyLow
+            ? '<div style="color:var(--yellow);font-weight:600;margin-bottom:8px">▲ Running low — restock before the guns fall silent or facilities stall.</div>'
+            : '<div style="color:var(--green);font-weight:600;margin-bottom:8px">✓ All station requirements satisfied.</div>';
 
         const contribHtml = contributing.length
           ? `<div style="margin-top:10px;font-size:11px;color:var(--text-dim)">Maintenance from: ${contributing
@@ -24021,23 +24050,24 @@ When responding:
             <th style="padding:4px 8px;text-align:left">Item</th>
             <th style="padding:4px 8px;text-align:left">ID</th>
             <th style="padding:4px 8px;text-align:right">Need</th>
-            <th style="padding:4px 8px;text-align:right">You have</th>
+            <th style="padding:4px 8px;text-align:right">In faction storage</th>
             <th style="padding:4px 8px;text-align:right">Status</th>
             <th style="padding:4px 8px;text-align:right">Est. until depletion</th>
           </tr>
         </thead>
         <tbody>${rows}${ammoRows}</tbody>
       </table>
-       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">"You have" = cargo + personal station storage + local faction storage (this docked station). Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it is an estimate and does not account for unknown cycle start timing. Ammo rows show no depletion estimate — they only flag whether ammo is present (not 0). Refresh after delivering items.</div>
+       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it does not account for unknown cycle start timing. Ammo burns per shot, so it is judged on rounds remaining rather than a projected time. LOW at ≤${num(thresholds.ammoLowThreshold)} rounds (ammo) and ≤${num(thresholds.consumableLowDays)}d left (maintenance) — configurable in the station monitor's settings. Refresh after delivering items.</div>
       ${contribHtml}
       ${ammoHtml}
     `;
       }
 
-      // Collect cargo + personal station storage + local faction storage for the given bot.
+      // Collect the stock a station's facilities can actually draw from, i.e. the
+      // local FACTION storage. Station facilities and station guns never consume
+      // the drone's cargo or its personal station storage, so counting those
+      // would overstate what the station really has.
       async function collectStationInventory(username) {
-        const items = {};
-        const storage = {};
         const factionStorage = {};
         const addTo = (target, res) => {
           if (!res || !res.ok || !res.data) return;
@@ -24054,16 +24084,6 @@ When responding:
               target[id] = (target[id] || 0) + (c.quantity || c.count || 0);
           });
         };
-        // Cargo items via get_cargo.
-        const cargoRes = await new Promise((resolve) => {
-          sendExec(username, "get_cargo", {}, resolve);
-        });
-        addTo(items, cargoRes);
-        // Personal station storage.
-        const storeRes = await new Promise((resolve) => {
-          sendExec(username, "view_storage", { target: "self" }, resolve);
-        });
-        addTo(storage, storeRes);
         // Local faction storage (view_faction_storage: { items: [...] }). The bot
         // must be docked to the station to read it, which is also required to see
         // the station facilities, so this is always valid here.
@@ -24071,7 +24091,24 @@ When responding:
           sendExec(username, "view_faction_storage", undefined, resolve);
         });
         addTo(factionStorage, facRes);
-        return { items, storage, factionStorage };
+        return { factionStorage };
+      }
+
+      // Station supply LOW thresholds, shared with the station monitor.
+      let stationThresholds = null;
+      async function getStationThresholds() {
+        if (stationThresholds) return stationThresholds;
+        try {
+          const r = await fetch("/api/station-thresholds");
+          const j = await r.json();
+          stationThresholds = {
+            ammoLowThreshold: Number(j.ammoLowThreshold) || 0,
+            consumableLowDays: Number(j.consumableLowDays) || 0,
+          };
+        } catch {
+          stationThresholds = { ammoLowThreshold: 100, consumableLowDays: 2 };
+        }
+        return stationThresholds;
       }
 
       function renderFactionQueueUsage(f, username) {

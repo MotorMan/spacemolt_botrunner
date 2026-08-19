@@ -846,11 +846,10 @@ export async function fightFreshBattle(
     // Enter the combat loop so we can advance and close the distance.
     ctx.log("combat", `⚠️ Attack command errored ("${attackErrMsg}") but battle ${preAttackStatus?.battle_id} is active — entering combat loop to advance/engage`);
   } else if (preAttackStatus) {
-    ctx.log("combat", `⚔️ Battle already active with ${target.name} — setting initial stance`);
+    ctx.log("combat", `⚔️ Battle already active with ${target.name} — closing to engaged`);
   } else {
-    ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
+    ctx.log("combat", `⚔️ Battle started with ${target.name} — closing to engaged`);
   }
-  await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 
   // Ensure we're at engaged zone before entering combat loop
@@ -1043,9 +1042,8 @@ export async function fightFreshBattle(
       ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${target.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
       await attackTarget(ctx, target);
       await bot.exec("battle", { action: "target", target_id: target.id });
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      
-      // Refresh status to get current zone after stance change
+
+      // Refresh status to get current zone after targeting
       const currentStatus = await getBattleStatus(ctx);
       if (!currentStatus) {
         ctx.log("combat", `✅ Battle ended during enemy tracking - ${target.name} eliminated!`);
@@ -1192,7 +1190,6 @@ export async function fightFreshBattle(
       }
       await ctx.sleep(10000);
     } else {
-      await bot.exec("battle", { action: "stance", stance: "fire" });
       await ctx.sleep(10000);
     }
   }
@@ -1451,7 +1448,6 @@ export async function fightJoinedBattle(
     await attackTarget(ctx, currentTarget);
     await bot.exec("battle", { action: "target", target_id: currentTarget.id });
   }
-  await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
 
   // Ensure we're at engaged zone before entering combat loop
@@ -1677,7 +1673,6 @@ export async function fightJoinedBattle(
         return false;
       }
       await bot.exec("battle", { action: "target", target_id: currentTarget.id });
-      await bot.exec("battle", { action: "stance", stance: "fire" });
       const ourZoneNow = status.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
         const adv = await bot.exec("battle", { action: "advance" });
@@ -1752,17 +1747,7 @@ export async function fightJoinedBattle(
       }
       await ctx.sleep(10000);
     } else {
-      // Within range - set fire stance
-      const stanceResp = await bot.exec("battle", { action: "stance", stance: "fire" });
-      if (stanceResp.error) {
-        const errMsg = stanceResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (stance failed: not in battle) - victory!`);
-          await checkAndPraiseMorgThar(ctx, true);
-          return true;
-        }
-        ctx.log("error", `Stance failed: ${stanceResp.error.message}`);
-      }
+      // Already in range and fire stance (default) — server auto-fires each tick
       await ctx.sleep(10000);
     }
   }

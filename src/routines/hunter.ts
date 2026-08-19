@@ -2996,8 +2996,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   let gotAnyAmmo = false;
   const desiredAmmoBoxes = hs.desiredAmmoBoxes ?? -1;
-  let totalAmmoGotten = 0;
   for (const ammoType of weaponAmmoTypes) {
+    let typeAmmoGotten = 0;
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
     ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
@@ -3030,14 +3030,9 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
        ammoToGet = Math.max(0, 20 - currentAmmoForType);
      }
 
-     if (desiredAmmoBoxes > 0) {
-       const remaining = desiredAmmoBoxes - totalAmmoGotten;
-       if (remaining <= 0) {
-         ctx.log("trade", `Ammo cap reached (${desiredAmmoBoxes} boxes) — skipping remaining ammo types`);
-         break;
-       }
-       ammoToGet = Math.min(ammoToGet, remaining);
-     }
+      if (desiredAmmoBoxes > 0) {
+        ammoToGet = Math.min(ammoToGet, desiredAmmoBoxes);
+      }
 
     // Prefer currently loaded ammo if available
     let chosenAmmoId: string | null = null;
@@ -3063,7 +3058,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       const ammoSize = getItemSize(ammoId);
       let actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
       if (desiredAmmoBoxes > 0) {
-        actualQty = Math.min(actualQty, desiredAmmoBoxes - totalAmmoGotten);
+        actualQty = Math.min(actualQty, desiredAmmoBoxes - typeAmmoGotten);
       }
       if (actualQty <= 0) {
         continue;
@@ -3078,7 +3073,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       if (!wResp.error) {
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
-        totalAmmoGotten += actualQty;
+        typeAmmoGotten += actualQty;
         gotAnyAmmo = true;
         break;
       } else {

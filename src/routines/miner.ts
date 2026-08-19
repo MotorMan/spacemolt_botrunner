@@ -1985,8 +1985,8 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
   const desiredAmmoBoxes = settings.desiredAmmoBoxes ?? -1;
-  let totalAmmoGotten = 0;
   for (const ammoType of weaponAmmoTypes) {
+    let typeAmmoGotten = 0;
     const ammoIndex = catalogStore.getAmmoTypeIndex();
     const possibleAmmo = ammoIndex[ammoType] || [];
     ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
@@ -2019,12 +2019,7 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
     }
 
     if (desiredAmmoBoxes > 0) {
-      const remaining = desiredAmmoBoxes - totalAmmoGotten;
-      if (remaining <= 0) {
-        ctx.log("trade", `Ammo cap reached (${desiredAmmoBoxes} boxes) — skipping remaining ammo types`);
-        break;
-      }
-      ammoToGet = Math.min(ammoToGet, remaining);
+      ammoToGet = Math.min(ammoToGet, desiredAmmoBoxes);
     }
 
     let chosenAmmoId: string | null = null;
@@ -2048,7 +2043,7 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
       const ammoSize = getItemSize(ammoId);
       let actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
       if (desiredAmmoBoxes > 0) {
-        actualQty = Math.min(actualQty, desiredAmmoBoxes - totalAmmoGotten);
+        actualQty = Math.min(actualQty, desiredAmmoBoxes - typeAmmoGotten);
       }
       if (actualQty <= 0) {
         continue;
@@ -2058,7 +2053,7 @@ async function ensureMinerResupply(ctx: RoutineContext): Promise<void> {
         await bot.commands.spacemolt_storage.withdraw({ target: "faction", item_id: ammoId, quantity: actualQty });
         ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
         freeSpace -= actualQty * ammoSize;
-        totalAmmoGotten += actualQty;
+        typeAmmoGotten += actualQty;
         break;
       } catch (e) {
         ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${e}`);

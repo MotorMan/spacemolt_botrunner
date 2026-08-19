@@ -240,9 +240,22 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   for (const mod of modulesArray) {
     if (!mod || typeof mod !== "object") continue;
 
+    const modCategory = ((mod.category as string) || "").toLowerCase();
     const modType = ((mod.type as string) || (mod.module_type as string) || "").toLowerCase();
     const modId = ((mod.module_id as string) || (mod.mod_id as string) || (mod.id as string) || "").toLowerCase();
-    const isWeapon = modType.includes("weapon") || modType.includes("missile") || modType.includes("launcher") || modType.includes("torpedo") || modId.includes("weapon") || modId.includes("missile") || modId.includes("launcher");
+    const isWeapon =
+      modCategory === "weapon" ||
+      modCategory.includes("weapon") ||
+      modCategory.includes("cannon") ||
+      modCategory.includes("gun") ||
+      modCategory.includes("laser") ||
+      modType.includes("weapon") ||
+      modType.includes("missile") ||
+      modType.includes("launcher") ||
+      modType.includes("torpedo") ||
+      modId.includes("weapon") ||
+      modId.includes("missile") ||
+      modId.includes("launcher");
     if (!isWeapon) continue;
 
     // V2 API provides ammo_type directly, fall back to catalog lookup
@@ -264,7 +277,7 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
     const currentAmmo = (mod.current_ammo as number) ?? 0;
     const maxAmmo = (mod.magazine_size as number) ?? 0;
 
-    if (instanceId && moduleId) {
+    if (instanceId) {
       weapons.push({
         instanceId,
         moduleId,

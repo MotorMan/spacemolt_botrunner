@@ -33926,6 +33926,24 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-civilian_transport-factionDepositThreshold" min="0" value="${esc(String(ct.factionDepositThreshold ?? 1000000))}">
     </div>
 
+    <div style="margin-top:18px;padding:10px;border:1px solid #5a3a3a;border-radius:6px;background:#2a1d1d">
+      <div class="setting-label" style="color:#ff9b9b">Fuel cell purchasing (read carefully)</div>
+      <div class="setting-desc" style="margin-bottom:8px">By default the routine <b>never buys fuel cells</b>. It only draws them from faction storage (your home stockpile) and returns home to restock when the reserve runs low. This is intentional: market fuel-cell prices are currently so high that a single purchase can erase an entire multi-station run's profit.</div>
+      <label style="display:block;margin-bottom:6px">
+        <input type="checkbox" id="set-civilian_transport-buyFuelCells" ${ct.buyFuelCells ? "checked" : ""}>
+        Allow buying fuel cells on the market if faction storage is empty
+      </label>
+      <div class="setting-hint" style="margin-top:4px;color:#ff9b9b">DANGER: enabling this will buy fuel cells at whatever the market charges when the stockpile runs dry. Leave it OFF unless you accept the cost.</div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min fuel cells to depart home</div>
+        <div class="setting-hint">The bot will not leave the home base unless it is carrying MORE than this many fuel cells (recommended: 6). Set 0 to disable the guard.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-minFuelCellsToDepart" min="0" max="200" value="${esc(String(ct.minFuelCellsToDepart ?? 6))}">
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -34003,6 +34021,13 @@ ignoreBlacklist: document.getElementById(
           document.getElementById("set-civilian_transport-factionDepositThreshold")
             ?.value || 1000000,
         );
+        const buyFuelCells =
+          document.getElementById("set-civilian_transport-buyFuelCells")
+            ?.checked ?? false;
+        const minFuelCellsToDepart = Number(
+          document.getElementById("set-civilian_transport-minFuelCellsToDepart")
+            ?.value || 6,
+        );
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -34029,6 +34054,8 @@ ignoreBlacklist: document.getElementById(
         s.disableFactionMessage = disableFactionMessage;
         s.enableCloak = enableCloak;
         s.factionDepositThreshold = factionDepositThreshold;
+        s.buyFuelCells = buyFuelCells;
+        s.minFuelCellsToDepart = minFuelCellsToDepart;
 
         send({
           type: "saveSettings",

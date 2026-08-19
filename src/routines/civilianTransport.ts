@@ -19,6 +19,7 @@ import {
   type BattleState,
   isPirateSystem,
   getItemSize,
+  getCargoFuelCells,
 } from "./common.js";
 import { logTransportProfit } from "./transportProfitDebug.js";
 import { getSystemBlacklist, getStationBlacklist } from "../web/server.js";
@@ -686,6 +687,8 @@ interface CivilianTransportSettings {
   disableFactionMessage: boolean;
   enableCloak: boolean;
   factionDepositThreshold: number;
+  buyFuelCells: boolean;
+  minFuelCellsToDepart: number;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -717,6 +720,8 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
     enableCloak: (t.enableCloak as boolean) ?? false,
     factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
+    buyFuelCells: (t.buyFuelCells as boolean) ?? false,
+    minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
   };
 }
 
@@ -999,6 +1004,21 @@ export async function unloadPassengersToLounge(
   };
 }
 
+/**
+ * Stock the cargo with fuel cells for the upcoming run.
+ *
+ * Fuel cells are ONLY ever sourced from faction storage (the home stockpile) by
+ * default. Buying them on the open market is disabled unless
+ * `settings.buyFuelCells` is explicitly enabled — current market prices are so
+ * high that a single fuel_cell purchase can wipe out an entire multi-station
+ * run's profit. When the reserve runs low mid-run the routine routes *home* to
+ * restock from faction storage rather than paying market rates.
+ *
+ * Passengers occupy berths, not cargo, so the entire free cargo hold is fair
+ * game for fuel cells. We fill it densest-first (military 100 fuel / 3 space,
+ * premium 50 / 2, regular 20 / 1) regardless of current tank level — the cells
+ * are the ship's fuel reserve for the whole tour, not just an immediate refill.
+ */
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
   await bot.refreshCargo();
@@ -1006,24 +1026,6 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
 
   const cargoFree = (bot.cargoMax || 0) - (bot.cargo || 0);
   if (cargoFree <= 0) {
-    return;
-  }
-
-  if ((bot.maxFuel || 0) > 0 && (bot.fuel / bot.maxFuel) >= 0.9) {
-    return;
-  }
-
-  const cellFuelValues: Record<string, number> = {
-    military_fuel_cell: 100,
-    premium_fuel_cell: 50,
-    fuel_cell: 20,
-  };
-
-  const existingCellFuel = bot.inventory
-    .filter(i => cellFuelValues[i.itemId])
-    .reduce((sum, i) => sum + (i.quantity * (cellFuelValues[i.itemId] || 0)), 0);
-
-  if (existingCellFuel >= (bot.maxFuel || 0) - (bot.fuel || 0)) {
     return;
   }
 
@@ -1042,6 +1044,7 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
 
   const tryAcquire = async (fuelId: string, qty: number) => {
     if (qty <= 0) return true;
+    // Preferred: pull free cells from faction storage (the home stockpile).
     const resp = await bot.exec("storage", {
       action: "withdraw",
       target: "faction",
@@ -1051,13 +1054,66 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
     if (!resp.error) {
       return true;
     }
-    const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
-    return !buyResp.error;
+    // Last resort (and OFF by default): buy on the open market. Market fuel-cell
+    // prices are currently ruinous, so this must be an explicit opt-in.
+    if (settings.buyFuelCells) {
+      const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
+      return !buyResp.error;
+    }
+    return false;
   };
 
   await tryAcquire("military_fuel_cell", milCap);
   await tryAcquire("premium_fuel_cell", premCap);
   await tryAcquire("fuel_cell", regCap);
+}
+
+/** Number of fuel cells currently in cargo. */
+function countFuelCells(ctx: RoutineContext): number {
+  return getCargoFuelCells(ctx.bot).cells;
+}
+
+/** True only when the bot is currently docked at its configured home base. */
+function isAtHomeBase(ctx: RoutineContext, settings: CivilianTransportSettings): boolean {
+  if (!settings.homeSystem || !settings.homeStation) return false;
+  const sys = (ctx.bot.system || "").toLowerCase();
+  const poi = (ctx.bot.poi || "").toLowerCase();
+  return sys === settings.homeSystem.toLowerCase() && poi === settings.homeStation.toLowerCase();
+}
+
+/**
+ * Return to the home base to replenish the fuel-cell reserve from faction
+ * storage. Used when the reserve runs low mid-tour instead of buying cells.
+ * Passengers stay aboard and the route is preserved, so the routine simply
+ * resumes the tour after restocking.
+ */
+async function returnHomeForFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  if (!settings.homeSystem) return;
+  const { bot } = ctx;
+
+  if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+    await ensureUndocked(ctx);
+    const ok = await navigateToSystem(ctx, settings.homeSystem, {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: true,
+    });
+    if (!ok) {
+      ctx.log("transport", "Could not navigate home to restock fuel cells — will retry next cycle");
+      return;
+    }
+  }
+
+  if (settings.homeStation && (bot.poi || "").toLowerCase() !== settings.homeStation.toLowerCase()) {
+    const tr = await bot.exec("travel", { target_poi: settings.homeStation });
+    if (tr.error) {
+      ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
+      return;
+    }
+  }
+
+  await ensureDocked(ctx);
+  await collectFuelCells(ctx, settings);
 }
 
 // ── Parsers ──────────────────────────────────────────────────
@@ -1952,6 +2008,36 @@ if (state && state.status !== "idle") {
     // possible while docked). Runs every cycle so they're removed at the first
     // docked opportunity regardless of routine status.
     await dropBlacklistedAboardPassengers(ctx);
+
+    // ── Fuel-cell logistics ─────────────────────────────────────
+    // The routine NEVER pays market prices for fuel cells (a single purchase can
+    // erase a whole tour's profit). Cells come from faction storage only, and
+    // when the reserve runs low the bot returns HOME to restock rather than buy.
+    // It is also forbidden from leaving the home base unless it is carrying more
+    // than `minFuelCellsToDepart` cells. With no home configured this is a no-op
+    // and behaviour falls back to the old (storage-only) collection.
+    if (settings.homeSystem && settings.homeStation) {
+      await bot.refreshCargo();
+      const fuelCellCount = countFuelCells(ctx);
+      if (isAtHomeBase(ctx, settings)) {
+        if (fuelCellCount <= settings.minFuelCellsToDepart) {
+          ctx.log("transport", `Home base: only ${fuelCellCount} fuel cells (need >${settings.minFuelCellsToDepart}) — topping up from faction storage before departing`);
+          await collectFuelCells(ctx, settings);
+          await bot.refreshCargo();
+          const after = countFuelCells(ctx);
+          if (after <= settings.minFuelCellsToDepart) {
+            ctx.log("transport", `Home stockpile still insufficient (${after} cells) — waiting for it to refill before departing`);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+      } else if (fuelCellCount <= settings.minFuelCellsToDepart) {
+        ctx.log("transport", `Low on fuel cells (${fuelCellCount} <= ${settings.minFuelCellsToDepart}) away from home — returning to base to restock instead of buying`);
+        await returnHomeForFuelCells(ctx, settings);
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
 
     // --- State machine ---
     if (state.status === "idle") {

@@ -647,6 +647,7 @@ export async function engageTarget(
   repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
   onlyNPCs: boolean = false,     // if true, flee when encountering players
   cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
+  shieldRechargePct: number = 80, // shield % to top up to in combat (e.g. 80 for 80%)
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -751,7 +752,7 @@ export async function engageTarget(
   }
 
   ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
@@ -781,6 +782,7 @@ export async function fightFreshBattle(
   maxAttackTier: PirateTier,
   repairThreshold: number = 0,
   cloakOnStart: boolean = false,
+  shieldRechargePct: number = 80,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -1024,7 +1026,7 @@ export async function fightFreshBattle(
       }
       if (shieldPct <= repairThreshold) {
         ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, 1.0)) didAction = true;
+        if (await topUpShields(ctx, shieldRechargePct / 100)) didAction = true;
       }
       if (didAction) {
         await ctx.sleep(10000);
@@ -1632,7 +1634,7 @@ export async function fightJoinedBattle(
       }
       if (shieldPct <= repairThreshold) {
         ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, 1.0)) didAction = true;
+        if (await topUpShields(ctx, shieldRechargePct / 100)) didAction = true;
       }
       if (didAction) {
         await ctx.sleep(10000);

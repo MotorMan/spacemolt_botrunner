@@ -783,7 +783,8 @@ async function hunterEngage(
   if (!coordResponding) {
     broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
   }
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart);
+  const hsettings = getHunterSettings(ctx.bot.username);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80);
 }
 
 /** Register the bot's coordination listener once. */

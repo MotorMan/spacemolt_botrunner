@@ -1345,6 +1345,12 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
   await bot.refreshLocation();
   let totalKills = 0;
+  // Guard against an infinite resupply loop: if the home base cannot fully
+  // restock (e.g. no shield charges in faction storage), isLowOnFieldConsumables
+  // stays true and would otherwise send us home every single loop iteration
+  // without ever farming. After a resupply we set this and skip the consumable
+  // return-home check once so the bot actually leaves for the target system.
+  let justResupplied = false;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -1395,6 +1401,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — returning home to repair`);
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
       continue;
     }
 
@@ -1404,6 +1411,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (cargoPct0 >= cargoFullPct) {
       ctx.log("system", `Cargo ${Math.round(cargoPct0 * 100)}% — returning home to deposit loot + restock ammo`);
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
       continue;
     }
 
@@ -1412,13 +1420,17 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (!hasAmmo && !settings.meatShield) {
       ctx.log("combat", "Out of ammo — returning home to restock");
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
       continue;
     }
 
     // ── Field consumables ──
-    if (isLowOnFieldConsumables(bot.inventory)) {
+    // Gated by !justResupplied so a home base that can't fully restock (e.g. no
+    // shield charges in faction storage) doesn't trap us in a return-home loop.
+    if (isLowOnFieldConsumables(bot.inventory) && !justResupplied) {
       ctx.log("combat", "Low on repair kits / shield charges — returning home to resupply");
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      justResupplied = true;
       continue;
     }
 
@@ -1438,6 +1450,11 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       }
       await resubscribeObservationAfterMove(bot);
     }
+
+    // We've left home and are committed to farming — clear the resupply guard so
+    // a genuinely depleted consumable stash will trigger a real resupply trip
+    // after this farm session rather than being suppressed forever.
+    justResupplied = false;
 
     // ── Farm: sweep the system repeatedly until cargo full (creatures respawn) ──
     let sweeps = 0;

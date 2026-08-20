@@ -30532,11 +30532,17 @@ ignoreBlacklist: document.getElementById(
                   <div style="display:flex;justify-content:space-between;align-items:center">
                     <span class="blacklist-name">${esc(l.name)}</span>
                     <div>
-                      <button class="small" onclick="editCreatureFarmLoadout(${idx})">Edit</button>
                       <button class="small danger" onclick="deleteCreatureFarmLoadout(${idx})">Delete</button>
                     </div>
                   </div>
-                  <div style="font-size:12px;color:var(--dim)">Home: ${esc(l.homeSystem || "(default)")} / ${esc(l.homeStation || "(nearest)")} · Target: ${esc(l.targetSystem || "?")}${l.targetPois && l.targetPois.length ? " · POIs: " + esc(l.targetPois.join(", ")) : ""}</div>
+                  <div style="margin-top:4px">
+                    <div class="setting-label" style="font-size:11px;margin-bottom:2px">Home base (ammo + loot):</div>
+                    <select id="cf-home-${idx}" onchange="updateCreatureFarmLoadoutHome(${idx})" style="width:100%">${cfHomeOpts(l.homeStation)}</select>
+                  </div>
+                  <div style="margin-top:6px">
+                    <div class="setting-label" style="font-size:11px;margin-bottom:2px">Target creature system:</div>
+                    <select id="cf-target-${idx}" onchange="updateCreatureFarmLoadoutTarget(${idx})" style="width:100%">${cfTargetOpts(l.targetSystem)}</select>
+                  </div>
                 </div>`,
                   )
                   .join("")
@@ -30910,6 +30916,11 @@ ignoreBlacklist: document.getElementById(
             : [],
           botHunterPatrolAssignments:
             settings.hunter?.botHunterPatrolAssignments || {},
+          creatureFarmLoadouts: Array.isArray(settings.hunter?.creatureFarmLoadouts)
+            ? settings.hunter.creatureFarmLoadouts
+            : [],
+          botCreatureFarmAssignments:
+            settings.hunter?.botCreatureFarmAssignments || {},
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;
@@ -31124,13 +31135,6 @@ ignoreBlacklist: document.getElementById(
       function addCreatureFarmLoadout() {
         const name = prompt("Loadout name:");
         if (!name || !name.trim()) return;
-        const homeSystem = prompt("Home system ID (where to get ammo / deposit loot):", "");
-        const homeStation = prompt("Home station ('system|poi' or poi id):", "");
-        const targetSystem = prompt("Target creature system ID:", "");
-        if (!targetSystem || !targetSystem.trim()) {
-          alert("Target system is required.");
-          return;
-        }
         if (!settings.hunter) settings.hunter = {};
         if (!Array.isArray(settings.hunter.creatureFarmLoadouts)) {
           settings.hunter.creatureFarmLoadouts = [];
@@ -31145,9 +31149,9 @@ ignoreBlacklist: document.getElementById(
         }
         settings.hunter.creatureFarmLoadouts.push({
           name: name.trim(),
-          homeSystem: (homeSystem || "").trim(),
-          homeStation: (homeStation || "").trim(),
-          targetSystem: targetSystem.trim(),
+          homeSystem: "",
+          homeStation: "",
+          targetSystem: "",
           targetPois: [],
         });
         rerenderCurrentSettings();
@@ -31158,28 +31162,52 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
-      function editCreatureFarmLoadout(index) {
+      function cfHomeOpts(selected) {
+        let opts = '<option value="">(use nearest / default home)</option>';
+        for (const { val, label, sysName } of stationList) {
+          const sel = val === selected ? " selected" : "";
+          opts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+        }
+        if (selected && !stationList.some((s) => s.val === selected)) {
+          opts += `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`;
+        }
+        return opts;
+      }
+
+      function cfTargetOpts(selected) {
+        let opts = '<option value="">(select target system)</option>';
+        for (const sys of [...knownSystems].sort((a, b) =>
+          (a.name || a.id || "").localeCompare(b.name || b.id || ""),
+        )) {
+          const sel = sys.id === selected ? " selected" : "";
+          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+          opts += `<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`;
+        }
+        if (selected && !knownSystems.find((s) => s.id === selected)) {
+          opts += `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`;
+        }
+        return opts;
+      }
+
+      function updateCreatureFarmLoadoutHome(index) {
         const l = settings.hunter?.creatureFarmLoadouts?.[index];
         if (!l) return;
-        const name = prompt("Loadout name:", l.name);
-        if (!name || !name.trim()) return;
-        const homeSystem = prompt("Home system ID:", l.homeSystem || "");
-        const homeStation = prompt("Home station ('system|poi' or poi id):", l.homeStation || "");
-        const targetSystem = prompt("Target creature system ID:", l.targetSystem || "");
-        if (!targetSystem || !targetSystem.trim()) {
-          alert("Target system is required.");
-          return;
-        }
-        l.name = name.trim();
-        l.homeSystem = (homeSystem || "").trim();
-        l.homeStation = (homeStation || "").trim();
-        l.targetSystem = targetSystem.trim();
+        const sel = document.getElementById("cf-home-" + index);
+        if (!sel) return;
+        l.homeStation = sel.value;
+        if (sel.value && sel.value.includes("|")) l.homeSystem = sel.value.split("|")[0];
         rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
+        send({ type: "saveSettings", routine: "hunter", settings: settings.hunter });
+      }
+
+      function updateCreatureFarmLoadoutTarget(index) {
+        const l = settings.hunter?.creatureFarmLoadouts?.[index];
+        if (!l) return;
+        const sel = document.getElementById("cf-target-" + index);
+        if (!sel) return;
+        l.targetSystem = sel.value;
+        rerenderCurrentSettings();
+        send({ type: "saveSettings", routine: "hunter", settings: settings.hunter });
       }
 
       function deleteCreatureFarmLoadout(index) {

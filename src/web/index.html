@@ -31164,11 +31164,24 @@ ignoreBlacklist: document.getElementById(
 
       function cfHomeOpts(selected) {
         let opts = '<option value="">(use nearest / default home)</option>';
-        for (const { val, label, sysName } of stationList) {
+        const list = [];
+        for (const [sysId, sys] of Object.entries(mapData || {})) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(b.base_name || b.name || b.id || ""),
+          )) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const val = sysId + "|" + poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            list.push({ val, label, sysName });
+          }
+        }
+        list.sort((a, b) => (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName));
+        for (const { val, label, sysName } of list) {
           const sel = val === selected ? " selected" : "";
           opts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
         }
-        if (selected && !stationList.some((s) => s.val === selected)) {
+        if (selected && !list.some((s) => s.val === selected)) {
           opts += `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`;
         }
         return opts;

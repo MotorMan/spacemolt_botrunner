@@ -214,7 +214,25 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm";
+
+/**
+ * A Creature Farm "loadout". Each bot is assigned (per-bot) to one named loadout.
+ * The loadout defines where the bot banks: a home base used to draw ammo and
+ * deposit loot, plus the single target system it farms creatures in.
+ *
+ * Designed to be expanded later:
+ *   - targetSystems: string[]  (farm multiple systems in one loadout)
+ *   - targetPois:    string[]  (only farm specific POIs within the system)
+ * For now a single target system + optional targetPois is supported.
+ */
+export interface CreatureFarmLoadout {
+  name: string;
+  homeSystem: string;
+  homeStation: string;
+  targetSystem: string;
+  targetPois?: string[];
+}
 
 export type PatrolCycleMode = "random" | "sequential";
 
@@ -271,6 +289,12 @@ function getHunterSettings(username?: string): {
   targetRandomly: boolean;
   combatDebug: boolean;
   maxCreaturesPerScan: number;
+  creatureFarmLoadouts: CreatureFarmLoadout[];
+  botCreatureFarmAssignments: Record<string, string>;
+  creatureFarmAssignment: string;
+  creatureFarmCargoFullPct: number;
+  creatureFarmMaxPassesPerPoi: number;
+  creatureFarmMaxSystemSweeps: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -289,6 +313,14 @@ function getHunterSettings(username?: string): {
   } else if (Array.isArray(h.patrolSystems)) {
     // Legacy single list
     resolvedPatrolSystems = h.patrolSystems;
+  }
+
+  // Creature Farm loadouts (named, per-bot assigned — same shape as hunterPatrols)
+  const creatureFarmLoadouts: CreatureFarmLoadout[] = Array.isArray(h.creatureFarmLoadouts) ? h.creatureFarmLoadouts : [];
+  const botCreatureFarmAssignments: Record<string, string> = (h.botCreatureFarmAssignments as Record<string, string>) || {};
+  let resolvedCreatureFarmAssignment = "";
+  if (creatureFarmLoadouts.length > 0 && username) {
+    resolvedCreatureFarmAssignment = botCreatureFarmAssignments[username] || creatureFarmLoadouts[0]?.name || "";
   }
 
   return {
@@ -331,6 +363,12 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   targetRandomly: (h.targetRandomly as boolean) ?? false,
   combatDebug: (h.combatDebug as boolean) ?? false,
   maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
+  creatureFarmLoadouts,
+  botCreatureFarmAssignments,
+  creatureFarmAssignment: resolvedCreatureFarmAssignment,
+  creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
+  creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
+  creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
 };
 }
 
@@ -368,6 +406,27 @@ export function assignBotToHunterPatrol(username: string, patrolProfileName: str
   const h = (all.hunter || {}) as any;
   if (!h.botHunterPatrolAssignments) h.botHunterPatrolAssignments = {};
   h.botHunterPatrolAssignments[username] = patrolProfileName;
+  writeSettings({ hunter: h });
+}
+
+/** Resolve the Creature Farm loadout assigned to a bot (falls back to first loadout). */
+export function getCreatureFarmLoadout(username: string): CreatureFarmLoadout | null {
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  const loadouts: CreatureFarmLoadout[] = Array.isArray(h.creatureFarmLoadouts) ? h.creatureFarmLoadouts : [];
+  if (loadouts.length === 0) return null;
+  const assignments: Record<string, string> = (h.botCreatureFarmAssignments as Record<string, string>) || {};
+  const name = assignments[username] || loadouts[0].name;
+  return loadouts.find(l => l.name === name) || loadouts[0] || null;
+}
+
+/** Assign a bot to a named Creature Farm loadout. */
+export function assignBotToCreatureFarmLoadout(username: string, loadoutName: string): void {
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  if (!Array.isArray(h.creatureFarmLoadouts)) h.creatureFarmLoadouts = [];
+  if (!h.botCreatureFarmAssignments) h.botCreatureFarmAssignments = {};
+  h.botCreatureFarmAssignments[username] = loadoutName;
   writeSettings({ hunter: h });
 }
 
@@ -1197,12 +1256,330 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
+    if (initialSettings.mode === "creature_farm") {
+      yield* creatureFarmRoutine(ctx);
+      return;
+    }
+
     // Default to roam_systems
     yield* roamSystemsRoutine(ctx);
 } finally {
      // Clean up observation subscription (replaced with polling)
    }
 };
+
+// ── Creature Farm Routine ───────────────────────────────────────
+//
+// Creature-SPECIFIC hunter sub-routine. Differences from the pirate-focused
+// roam modes:
+//   * It does NOT treat a POI as "empty" after engaging a single creature. It
+//     repeatedly re-scans the same POI (up to `maxPassesPerPoi` passes) to mop
+//     up respawns, then moves on. The goal is to clear as many creatures as
+//     possible for their loot (used to make food).
+//   * It farms until the cargo is full (or field consumables / ammo run low),
+//     then returns to the loadout's home base to deposit loot and restock ammo.
+//   * It is driven by a per-bot "loadout" (named profile) so many bots in one
+//     client can each farm a different system while sharing the same home base.
+
+/** Navigate to the loadout's home base, deposit loot, and restock ammo/shields/repair. */
+async function returnToCreatureFarmHome(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  homeSystem: string,
+  homeStation: string,
+): Promise<void> {
+  const { bot } = ctx;
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking ammo...`);
+  try {
+    if (homeSystem && bot.system !== homeSystem) {
+      await ensureUndocked(ctx);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("warn", `Could not navigate to home system ${homeSystem} — docking wherever possible`);
+      }
+    }
+
+    let docked = false;
+    if (homeStation && homeStation.includes("|")) {
+      const parts = homeStation.split("|");
+      const poi = parts[1] || parts[0];
+      docked = await ensureDocked(ctx, true, 0, poi ? { targetStationId: poi } : undefined);
+    } else if (homeStation) {
+      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+    } else {
+      docked = await ensureDocked(ctx);
+    }
+
+    if (!docked) {
+      ctx.log("error", "Could not dock at home base — loot not deposited");
+      return;
+    }
+
+    // ensureHunterResupply deposits non-protected loot to (faction) storage and
+    // withdraws ammo / repair kits / shield charges / fuel cells from storage.
+    await ensureHunterResupply(ctx);
+    await collectFromStorage(ctx);
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    await ensureInsured(ctx);
+    await bot.checkSkills();
+    await ensureUndocked(ctx);
+    ctx.log("info", "Resupplied at home base — heading back to creature farm");
+  } catch (e) {
+    ctx.log("error", `Error returning to home base: ${e}`);
+  }
+}
+
+async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await ensureHunterCoordListener(bot.username);
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const loadout = getCreatureFarmLoadout(bot.username);
+    if (!loadout || !loadout.targetSystem) {
+      ctx.log("error", "creature_farm mode but no Creature Farm loadout assigned (set hunter.creatureFarmLoadouts + hunter.botCreatureFarmAssignments). Waiting 60s...");
+      await ctx.sleep(60000);
+      continue;
+    }
+
+    const homeSystem = loadout.homeSystem || settings.homeSystem || "";
+    const homeStation = loadout.homeStation || settings.homeStation || "";
+    const targetSystem = loadout.targetSystem;
+    const cargoFullPct = (settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 95) / 100;
+    const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
+    const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+      joinBattles: true,
+    };
+
+    // ── Death recovery ──
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // ── Status ──
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    // ── Fuel ──
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (!fueled) {
+      ctx.log("error", "Cannot secure fuel — waiting 30s...");
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // ── Hull ──
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% — returning home to repair`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      continue;
+    }
+
+    // ── Cargo full? ──
+    await bot.refreshCargo();
+    const cargoPct0 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (cargoPct0 >= cargoFullPct) {
+      ctx.log("system", `Cargo ${Math.round(cargoPct0 * 100)}% — returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      continue;
+    }
+
+    // ── Ammo ──
+    const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!hasAmmo && !settings.meatShield) {
+      ctx.log("combat", "Out of ammo — returning home to restock");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      continue;
+    }
+
+    // ── Field consumables ──
+    if (isLowOnFieldConsumables(bot.inventory)) {
+      ctx.log("combat", "Low on repair kits / shield charges — returning home to resupply");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+      continue;
+    }
+
+    // ── Navigate to target system ──
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Creature farm: heading to target system ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} — retrying next cycle`);
+          await ctx.sleep(5000);
+        }
+        continue;
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+
+    // ── Farm: sweep the system repeatedly until cargo full (creatures respawn) ──
+    let sweeps = 0;
+    let cargoFull = false;
+    while (bot.state === "running" && sweeps < maxSweeps && !cargoFull) {
+      sweeps++;
+      yield "scan_system";
+      const { pois } = await getSystemInfo(ctx);
+      let patrolPois = pois.filter(p => !isStationPoi(p));
+      if (loadout.targetPois && loadout.targetPois.length > 0) {
+        patrolPois = patrolPois.filter(p => loadout.targetPois!.includes(p.id) || loadout.targetPois!.includes(p.name));
+      }
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No non-station POIs in target system — waiting 30s");
+        await ctx.sleep(30000);
+        break;
+      }
+
+      ctx.log("info", `Creature farm sweep ${sweeps}/${maxSweeps} — ${patrolPois.length} POI(s) in ${targetSystem}`);
+      let sweepKills = 0;
+
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+
+        // Mid-loop safety checks
+        await bot.refreshShip();
+        const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (midHull <= settings.repairThreshold) {
+          ctx.log("system", "Hull low — aborting sweep to return home");
+          break;
+        }
+        await bot.refreshCargo();
+        const midCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        if (midCargo >= cargoFullPct) { cargoFull = true; break; }
+        const midAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!midAmmo && !settings.meatShield) {
+          ctx.log("combat", "Out of ammo mid-farm — aborting sweep to home");
+          break;
+        }
+
+        if (await checkAndHandleExistingBattle(ctx, settings)) {
+          // Got pulled into a battle — re-evaluate next iteration
+        }
+
+        // Travel to POI
+        yield "travel_to_poi";
+        ctx.log("travel", `Farming ${poi.name}...`);
+        const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+          continue;
+        }
+        bot.poi = poi.id;
+        bot.clearObservationState();
+        await ctx.sleep(1000);
+
+        // Repeatedly scan + engage ALL creatures here to mop up respawns.
+        let passes = 0;
+        while (bot.state === "running" && passes < maxPasses && !cargoFull) {
+          passes++;
+          yield "scan_for_targets";
+          const obsResult = await getObservationOrNearby(bot);
+          const nearbyData = obsResult.result;
+          if (!nearbyData) {
+            ctx.log("error", `No nearby data at ${poi.name}`);
+            break;
+          }
+          bot.trackNearbyPlayers(nearbyData);
+          bot.trackWildlife(nearbyData);
+
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+
+          const entities = parseNearby(nearbyData);
+          const creatures = prioritizeRainbowLeviathan(
+            entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e)),
+          );
+
+          if (creatures.length === 0) {
+            // POI currently clear — stop re-scanning this POI for now
+            break;
+          }
+
+          ctx.log("combat", `Found ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+
+          for (const target of creatures) {
+            if (bot.state !== "running") break;
+
+            await bot.refreshShip();
+            const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+            if (preHull <= settings.repairThreshold) break;
+
+            await useRepairKits(ctx);
+            const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+            if (!ammo && !settings.meatShield) {
+              ctx.log("combat", "Out of ammo mid-farm — aborting");
+              break;
+            }
+
+            yield "engage";
+            const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+            if (won) {
+              totalKills++;
+              sweepKills++;
+              ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting before next...`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              const cset = getHunterSettings(bot.username);
+              await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              if (isLowOnFieldConsumables(bot.inventory)) {
+                ctx.log("combat", "Low on consumables — ending sweep to resupply");
+                break;
+              }
+              const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+              if (cp >= cargoFullPct) { cargoFull = true; break; }
+            }
+          }
+          if (cargoFull) break;
+          // Re-scan shortly to catch respawns before moving on
+          await ctx.sleep(1500);
+        }
+        if (cargoFull) break;
+      }
+
+      // After a full sweep, loop again to catch respawns across the system
+      await bot.refreshCargo();
+      const afterCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      if (afterCargo >= cargoFullPct) break; // top of loop routes home
+      if (sweepKills === 0) {
+        ctx.log("info", "Sweep found no creatures — waiting for respawns...");
+        await ctx.sleep(10000);
+      }
+    }
+
+    if (cargoFull) {
+      await bot.refreshCargo();
+      const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      ctx.log("system", `Cargo full (${Math.round(cp * 100)}%) — returning home to deposit loot + restock ammo`);
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+  }
+}
 
 // ── Roam Systems Routine (original behavior) ────────────────────
 

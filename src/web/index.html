@@ -5245,6 +5245,7 @@
         <option value="cycle_patrols"${hunterMode === "cycle_patrols" ? " selected" : ""}>Cycle patrols</option>
         <option value="patrol_radius"${hunterMode === "patrol_radius" ? " selected" : ""}>Patrol radius</option>
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
+        <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
       </select>`;
 
           const patrolCycleMode = botSettings.patrolCycleMode || "random";
@@ -5259,6 +5260,7 @@
 
           // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems)
           const hunterSettings = settings.hunter || {};
+          if (hunterMode !== "creature_farm") {
           const hunterPatrols = Array.isArray(hunterSettings.hunterPatrols)
             ? hunterSettings.hunterPatrols
             : [];
@@ -5284,6 +5286,19 @@
           actions += `
       <span class="profile-ore-label" style="margin-left:8px">Patrol Profile:</span>
       <select id="profile-hunterPatrol" onchange="saveProfileHunterPatrolProfile()">${hunterPatrolOpts}</select>`;
+          } else {
+            // Creature Farm loadout selector
+            const cfLoadouts = Array.isArray(hunterSettings.creatureFarmLoadouts) ? hunterSettings.creatureFarmLoadouts : [];
+            const cfAssign = hunterSettings.botCreatureFarmAssignments || {};
+            const currentCf = cfAssign[bot.username] || cfLoadouts[0]?.name || "Default Creature Farm";
+            let cfOpts = cfLoadouts
+              .map((p) => `<option value="${esc(p.name)}"${p.name === currentCf ? " selected" : ""}>${esc(p.name)}</option>`)
+              .join("");
+            if (cfLoadouts.length === 0) cfOpts = '<option value="Default Creature Farm" selected>Default Creature Farm</option>';
+            actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Farm Loadout:</span>
+      <select id="profile-creatureFarmLoadout" onchange="saveProfileCreatureFarmLoadout()">${cfOpts}</select>`;
+          }
 
           const singleLoop = botSettings.singleLoop ?? false;
           actions += `
@@ -30290,6 +30305,9 @@ ignoreBlacklist: document.getElementById(
         const hunterPatrols = Array.isArray(h.hunterPatrols)
           ? h.hunterPatrols
           : [];
+        const creatureFarmLoadouts = Array.isArray(h.creatureFarmLoadouts)
+          ? h.creatureFarmLoadouts
+          : [];
         const singleLoop = h.singleLoop ?? false;
         const hunterHomeSystem = h.homeSystem || "";
         const hunterHomeStation = h.homeStation || "";
@@ -30378,6 +30396,7 @@ ignoreBlacklist: document.getElementById(
           <option value="cycle_patrols">Cycle patrols</option>
           <option value="patrol_radius">Patrol radius</option>
           <option value="station_protection">Station Protection</option>
+          <option value="creature_farm">Creature Farm</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>
@@ -30488,6 +30507,42 @@ ignoreBlacklist: document.getElementById(
               })()
             : ""
         }
+      </div>
+    </div>
+
+    <!-- Creature Farm Loadouts (multi-bot, like hunter patrol profiles) -->
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Creature Farm Loadouts</div>
+        <div class="setting-hint">Named loadouts for the Creature Farm sub-routine. Assign each bot to a loadout in its profile. A loadout defines the home base (draw ammo + deposit loot) and the single target creature system. Currently one target system per loadout.</div>
+      </div>
+
+      <div class="blacklist-section">
+        <div class="blacklist-header">
+          <span>Loadouts (${creatureFarmLoadouts.length})</span>
+          <button class="sm primary" onclick="addCreatureFarmLoadout()">+ New Loadout</button>
+        </div>
+        <div class="blacklist-list" style="max-height:240px">
+          ${
+            creatureFarmLoadouts.length > 0
+              ? creatureFarmLoadouts
+                  .map(
+                    (l, idx) => `
+                <div class="blacklist-item" style="flex-direction:column;align-items:stretch;gap:6px">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span class="blacklist-name">${esc(l.name)}</span>
+                    <div>
+                      <button class="small" onclick="editCreatureFarmLoadout(${idx})">Edit</button>
+                      <button class="small danger" onclick="deleteCreatureFarmLoadout(${idx})">Delete</button>
+                    </div>
+                  </div>
+                  <div style="font-size:12px;color:var(--dim)">Home: ${esc(l.homeSystem || "(default)")} / ${esc(l.homeStation || "(nearest)")} · Target: ${esc(l.targetSystem || "?")}${l.targetPois && l.targetPois.length ? " · POIs: " + esc(l.targetPois.join(", ")) : ""}</div>
+                </div>`,
+                  )
+                  .join("")
+              : '<div class="blacklist-empty">No creature farm loadouts yet. Create one above.</div>'
+          }
+        </div>
       </div>
     </div>
 
@@ -31058,6 +31113,98 @@ ignoreBlacklist: document.getElementById(
         }
 
         rerenderCurrentSettings();
+        send({
+          type: "saveSettings",
+          routine: "hunter",
+          settings: settings.hunter,
+        });
+      }
+
+      // ── Creature Farm Loadout Management ───────────────────────
+      function addCreatureFarmLoadout() {
+        const name = prompt("Loadout name:");
+        if (!name || !name.trim()) return;
+        const homeSystem = prompt("Home system ID (where to get ammo / deposit loot):", "");
+        const homeStation = prompt("Home station ('system|poi' or poi id):", "");
+        const targetSystem = prompt("Target creature system ID:", "");
+        if (!targetSystem || !targetSystem.trim()) {
+          alert("Target system is required.");
+          return;
+        }
+        if (!settings.hunter) settings.hunter = {};
+        if (!Array.isArray(settings.hunter.creatureFarmLoadouts)) {
+          settings.hunter.creatureFarmLoadouts = [];
+        }
+        if (
+          settings.hunter.creatureFarmLoadouts.some(
+            (l) => l.name.toLowerCase() === name.trim().toLowerCase(),
+          )
+        ) {
+          alert("A loadout with that name already exists.");
+          return;
+        }
+        settings.hunter.creatureFarmLoadouts.push({
+          name: name.trim(),
+          homeSystem: (homeSystem || "").trim(),
+          homeStation: (homeStation || "").trim(),
+          targetSystem: targetSystem.trim(),
+          targetPois: [],
+        });
+        rerenderCurrentSettings();
+        send({
+          type: "saveSettings",
+          routine: "hunter",
+          settings: settings.hunter,
+        });
+      }
+
+      function editCreatureFarmLoadout(index) {
+        const l = settings.hunter?.creatureFarmLoadouts?.[index];
+        if (!l) return;
+        const name = prompt("Loadout name:", l.name);
+        if (!name || !name.trim()) return;
+        const homeSystem = prompt("Home system ID:", l.homeSystem || "");
+        const homeStation = prompt("Home station ('system|poi' or poi id):", l.homeStation || "");
+        const targetSystem = prompt("Target creature system ID:", l.targetSystem || "");
+        if (!targetSystem || !targetSystem.trim()) {
+          alert("Target system is required.");
+          return;
+        }
+        l.name = name.trim();
+        l.homeSystem = (homeSystem || "").trim();
+        l.homeStation = (homeStation || "").trim();
+        l.targetSystem = targetSystem.trim();
+        rerenderCurrentSettings();
+        send({
+          type: "saveSettings",
+          routine: "hunter",
+          settings: settings.hunter,
+        });
+      }
+
+      function deleteCreatureFarmLoadout(index) {
+        const l = settings.hunter?.creatureFarmLoadouts?.[index];
+        if (!l) return;
+        if (!confirm(`Delete creature farm loadout "${l.name}"?`)) return;
+        settings.hunter.creatureFarmLoadouts.splice(index, 1);
+        rerenderCurrentSettings();
+        send({
+          type: "saveSettings",
+          routine: "hunter",
+          settings: settings.hunter,
+        });
+      }
+
+      function saveProfileCreatureFarmLoadout() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-creatureFarmLoadout");
+        if (!sel) return;
+        const loadoutName = sel.value;
+        if (!settings.hunter) settings.hunter = {};
+        if (!settings.hunter.botCreatureFarmAssignments)
+          settings.hunter.botCreatureFarmAssignments = {};
+        settings.hunter.botCreatureFarmAssignments[bot.username] = loadoutName;
         send({
           type: "saveSettings",
           routine: "hunter",
@@ -34832,13 +34979,15 @@ ignoreBlacklist: document.getElementById(
             shipyardActivePanel !== "fleet"
           )
             return;
-          // Build a map of listed ship_id -> listing_id so the fleet rows can
-          // show a "listed" indicator and offer a cancel action.
+          // Build a map of listed ship_id -> { listingId, price } so the fleet
+          // rows can show a "listed" indicator, pre-fill the price field, and
+          // offer a cancel action.
           shipyardListingMap = new Map();
           for (const l of listings) {
             const sid = l.ship_id || l.id;
             const lid = l.listing_id || l.listingId || l.id;
-            if (sid) shipyardListingMap.set(sid, lid);
+            if (sid)
+              shipyardListingMap.set(sid, { listingId: lid, price: l.price });
           }
           const combined = [...ownedShips, ...commissions];
           shipyardFleetData = combined;
@@ -35397,7 +35546,9 @@ ignoreBlacklist: document.getElementById(
             const storedInCarrierDisplay = storedInCarrierName || "";
 
             const isListed = id && shipyardListingMap.has(id);
-            const listingId = isListed ? shipyardListingMap.get(id) : null;
+            const listingEntry = isListed ? shipyardListingMap.get(id) : null;
+            const listingId = listingEntry ? listingEntry.listingId : null;
+            const listingPrice = listingEntry ? listingEntry.price : null;
             const shipIdDisplay = id
               ? ` <span class="ship-id" style="color:var(--text-dim);font-size:11px;font-weight:400">(${typeof id === "number" ? id.toString(16) : id})</span>${isListed ? ` <span title="Listed for sale" style="font-size:11px">🏷️</span>` : ""}`
               : "";
@@ -35410,7 +35561,7 @@ ignoreBlacklist: document.getElementById(
         <div class="ssc-actions">
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ""}
            ${loadBtn}${towBtn}${unloadBtn}${untowBtn}
-           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<input type="number" id="sell-price-${id}" placeholder="Price" min="1" style="width:90px;font-size:11px;padding:2px 6px" title="Listing price in credits"> <button class="sm" style="color:var(--red)" onclick="shipListForSale('${esc(username)}','${esc(id)}','${escJs(name)}')">List for Sale</button>` : ""}
+           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<input type="number" id="sell-price-${id}" placeholder="Price" min="1" value="${listingPrice != null ? esc(String(listingPrice)) : ""}" style="width:90px;font-size:11px;padding:2px 6px" title="${isListed ? "Current listing price (re-list to change)" : "Listing price in credits"}"> <button class="sm" style="color:var(--red)" onclick="shipListForSale('${esc(username)}','${esc(id)}','${escJs(name)}')">${isListed ? "Re-list" : "List for Sale"}</button>` : ""}
            ${isListed && !isActive ? `<button class="sm" style="color:var(--orange)" onclick="shipCancelListing('${esc(username)}','${esc(listingId)}','${escJs(name)}')" title="Cancel sale listing">Cancel Listing</button>` : ""}
            ${giftDropdown}${nameBtn}
         </div>

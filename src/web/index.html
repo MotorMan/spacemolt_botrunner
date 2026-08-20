@@ -34409,6 +34409,7 @@ ignoreBlacklist: document.getElementById(
       let shipyardActivePanel = "overview";
       let shipyardShipData = null;
       let shipyardFleetData = null;
+      let shipyardListingMap = new Map(); // ship_id -> listing_id (ships currently listed for sale)
       let shipyardCatalogData = null;
       let shipyardMode = "bots"; // 'bots', 'simulator', 'engineeringCalc', or 'comparison'
 
@@ -34821,14 +34822,24 @@ ignoreBlacklist: document.getElementById(
       function fetchFleetList(username) {
         let ownedShips = null;
         let commissions = null;
+        let listings = null;
 
         function mergeFleet() {
-          if (ownedShips === null || commissions === null) return;
+          if (ownedShips === null || commissions === null || listings === null)
+            return;
           if (
             shipyardSelectedBot !== username ||
             shipyardActivePanel !== "fleet"
           )
             return;
+          // Build a map of listed ship_id -> listing_id so the fleet rows can
+          // show a "listed" indicator and offer a cancel action.
+          shipyardListingMap = new Map();
+          for (const l of listings) {
+            const sid = l.ship_id || l.id;
+            const lid = l.listing_id || l.listingId || l.id;
+            if (sid) shipyardListingMap.set(sid, lid);
+          }
           const combined = [...ownedShips, ...commissions];
           shipyardFleetData = combined;
           renderFleetInline(username, combined);
@@ -34867,6 +34878,18 @@ ignoreBlacklist: document.getElementById(
             commissions = orders.map((o) => ({ ...o, _commission: true }));
           } else {
             commissions = [];
+          }
+          mergeFleet();
+        });
+
+        // 3. Browse ships currently listed for sale at this base so we can
+        //    flag listed ships in the fleet and offer a cancel action.
+        sendExec(username, "browse_ships", undefined, (result) => {
+          if (result.ok && result.data) {
+            const d = result.data;
+            listings = Array.isArray(d) ? d : d.listings || d.ships || [];
+          } else {
+            listings = [];
           }
           mergeFleet();
         });
@@ -35373,8 +35396,10 @@ ignoreBlacklist: document.getElementById(
 
             const storedInCarrierDisplay = storedInCarrierName || "";
 
+            const isListed = id && shipyardListingMap.has(id);
+            const listingId = isListed ? shipyardListingMap.get(id) : null;
             const shipIdDisplay = id
-              ? ` <span class="ship-id" style="color:var(--text-dim);font-size:11px;font-weight:400">(${typeof id === "number" ? id.toString(16) : id})</span>`
+              ? ` <span class="ship-id" style="color:var(--text-dim);font-size:11px;font-weight:400">(${typeof id === "number" ? id.toString(16) : id})</span>${isListed ? ` <span title="Listed for sale" style="font-size:11px">🏷️</span>` : ""}`
               : "";
             html += `<div class="shipyard-ship-card">
         <div style="flex:1">
@@ -35386,6 +35411,7 @@ ignoreBlacklist: document.getElementById(
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ""}
            ${loadBtn}${towBtn}${unloadBtn}${untowBtn}
            ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<input type="number" id="sell-price-${id}" placeholder="Price" min="1" style="width:90px;font-size:11px;padding:2px 6px" title="Listing price in credits"> <button class="sm" style="color:var(--red)" onclick="shipListForSale('${esc(username)}','${esc(id)}','${escJs(name)}')">List for Sale</button>` : ""}
+           ${isListed && !isActive ? `<button class="sm" style="color:var(--orange)" onclick="shipCancelListing('${esc(username)}','${esc(listingId)}','${escJs(name)}')" title="Cancel sale listing">Cancel Listing</button>` : ""}
            ${giftDropdown}${nameBtn}
         </div>
       </div>`;
@@ -36092,6 +36118,35 @@ ignoreBlacklist: document.getElementById(
               appendLine(
                 "system",
                 `List for sale failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
+      }
+
+      function shipCancelListing(username, listingId, name) {
+        if (!listingId) return;
+        if (
+          !confirm(
+            `Cancel the sale listing for ${name || "this ship"}? The listing fee is not refunded.`,
+          )
+        )
+          return;
+        sendExec(
+          username,
+          "cancel_ship_listing",
+          { id: listingId },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username} cancelled the sale listing for ${name || "a ship"}`,
+              );
+              if (shipyardActivePanel === "fleet") fetchFleetList(username);
+            } else {
+              appendLine(
+                "system",
+                `Cancel listing failed: ${result.error || "unknown"}`,
               );
             }
           },

@@ -35385,8 +35385,8 @@ ignoreBlacklist: document.getElementById(
         <div class="ssc-actions">
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ""}
            ${loadBtn}${towBtn}${unloadBtn}${untowBtn}
-          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${escJs(name)}')">Sell</button>` : ""}
-          ${giftDropdown}${nameBtn}
+           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<input type="number" id="sell-price-${id}" placeholder="Price" min="1" style="width:90px;font-size:11px;padding:2px 6px" title="Listing price in credits"> <button class="sm" style="color:var(--red)" onclick="shipListForSale('${esc(username)}','${esc(id)}','${escJs(name)}')">List for Sale</button>` : ""}
+           ${giftDropdown}${nameBtn}
         </div>
       </div>`;
           }
@@ -36059,21 +36059,43 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
-      function shipSell(username, shipId, name) {
+      function shipListForSale(username, shipId, name) {
         if (!shipId) return;
-        if (!confirm(`Sell ${name || "this ship"}? This cannot be undone.`))
+        const priceInput = document.getElementById(`sell-price-${shipId}`);
+        const price = priceInput ? parseInt(priceInput.value, 10) : NaN;
+        if (!Number.isFinite(price) || price <= 0) {
+          appendLine(
+            "system",
+            `Enter a valid price before listing ${name || "this ship"} for sale`,
+          );
+          if (priceInput) priceInput.focus();
           return;
-        sendExec(username, "sell_ship", { ship_id: shipId }, (result) => {
-          if (result.ok) {
-            appendLine("system", `${username} sold ${name || "a ship"}`);
-            if (shipyardActivePanel === "fleet") fetchFleetList(username);
-          } else {
-            appendLine(
-              "system",
-              `Sell ship failed: ${result.error || "unknown"}`,
-            );
-          }
-        });
+        }
+        if (
+          !confirm(
+            `List ${name || "this ship"} for sale at ${price.toLocaleString()} credits? A 1% listing fee (non-refundable) will be charged.`,
+          )
+        )
+          return;
+        sendExec(
+          username,
+          "list_ship_for_sale",
+          { id: shipId, price },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username} listed ${name || "a ship"} for sale at ${price.toLocaleString()} cr`,
+              );
+              if (shipyardActivePanel === "fleet") fetchFleetList(username);
+            } else {
+              appendLine(
+                "system",
+                `List for sale failed: ${result.error || "unknown"}`,
+              );
+            }
+          },
+        );
       }
 
       function shipSwitch(username, shipId) {

@@ -14432,6 +14432,232 @@
   `;
       }
 
+      function renderGoToSettings(panel) {
+        const goTo = settings.goto || {};
+        const destinationSystem = goTo.destinationSystem || "";
+        const destinationPoi = goTo.destinationPoi || "";
+        const refuelThreshold = goTo.refuelThreshold ?? 50;
+
+        // Build system options from mapData (and knownSystems fallback so the
+        // dropdown isn't empty before full map discovery).
+        let sysOpts = '<option value="">(not set)</option>';
+        const sysList = [];
+        for (const [sysId, sys] of Object.entries(mapData)) {
+          sysList.push({ id: sysId, name: sys.name || sysId });
+        }
+        for (const s of knownSystems) {
+          const sid = s.id || s;
+          if (sid && !sysList.find((x) => x.id === sid)) {
+            sysList.push({ id: sid, name: s.name || sid });
+          }
+        }
+        sysList.sort((a, b) => a.name.localeCompare(b.name));
+        for (const { id, name } of sysList) {
+          const sel = id === destinationSystem ? " selected" : "";
+          sysOpts += `<option value="${esc(id)}"${sel}>${esc(name)}</option>`;
+        }
+
+        // Build POI options for a given system (stations + any POI), tagged.
+        function buildPoiOptions(sysId, selectedPoi) {
+          let opts = '<option value="">(any station)</option>';
+          const sys = mapData[sysId];
+          if (sys && sys.pois) {
+            const poiList = [...sys.pois].sort((a, b) =>
+              (a.base_name || a.name || a.id || "").localeCompare(
+                b.base_name || b.name || b.id || "",
+              ),
+            );
+            for (const poi of poiList) {
+              const val = poi.id;
+              const label = poi.base_name || poi.name || poi.id;
+              const isStation = poi.has_base || poi.base_id;
+              const tag = isStation ? " [station]" : "";
+              const sel = val === selectedPoi ? " selected" : "";
+              opts += `<option value="${esc(val)}"${sel}>${esc(label)}${esc(tag)}</option>`;
+            }
+          }
+          return opts;
+        }
+
+        // Per-bot overrides
+        const botOverrides = {};
+        for (const bot of bots) {
+          const botSettings = settings[bot.username] || {};
+          if (botSettings.destinationSystem || botSettings.destinationPoi) {
+            botOverrides[bot.username] = botSettings;
+          }
+        }
+
+        let perBotHtml = "";
+        if (Object.keys(botOverrides).length > 0) {
+          perBotHtml = `<div class="setting-section">
+      <div class="setting-label">Per-Bot Overrides</div>
+      <div class="setting-hint">Individual bot destinations override the global defaults above.</div>
+      <table class="settings-table">
+        <thead><tr><th>Bot</th><th>System</th><th>POI</th><th>Action</th></tr></thead>
+        <tbody>`;
+          for (const [botName, botSettings] of Object.entries(botOverrides)) {
+            const bSys = botSettings.destinationSystem || "-";
+            const bPoi = botSettings.destinationPoi || "-";
+            perBotHtml += `<tr>
+        <td>${esc(botName)}</td>
+        <td>${esc(bSys)}</td>
+        <td>${esc(bPoi)}</td>
+        <td><button class="danger sm" onclick="clearGoToBotOverride('${esc(botName)}')">Clear Override</button></td>
+      </tr>`;
+          }
+          perBotHtml += `</tbody></table></div>`;
+        }
+
+        panel.innerHTML = `
+    <h3>GoTo Settings</h3>
+    <div class="settings-desc">Configure a destination (system + POI) for the GoTo routine — a generalized Return Home that can send bots to any station or POI. Individual bots can have overrides below.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Destination System</div>
+        <div class="setting-hint">System the bot should travel to.</div>
+      </div>
+      <select id="set-goto-system" onchange="gotoRepopulatePois()">${sysOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Destination POI</div>
+        <div class="setting-hint">POI within the system to travel to. Pick a station to dock there, or any other POI (belt, cloud, …). Leaving "(any station)" sends the bot to the first station found.</div>
+      </div>
+      <select id="set-goto-poi">${buildPoiOptions(destinationSystem, destinationPoi)}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel if fuel below this % before/after journeys. 0-99.</div>
+      </div>
+      <input type="number" id="set-goto-refuelThreshold" min="0" value="${refuelThreshold}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Dock if destination is a station</div>
+        <div class="setting-hint">When the chosen POI is a station, dock at it. Disable to just travel there (e.g. orbit) without docking.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-goto-dockIfStation"${goTo.dockIfStation !== false ? " checked" : ""}> Dock at station</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore blacklist while cloaked</div>
+        <div class="setting-hint">When enabled, GoTo can pass through blacklisted systems while cloaked. Safe because cloaked ships cannot be attacked.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-goto-ignoreBlacklist"${goTo.ignoreBlacklist ? " checked" : ""}> Ignore blacklist</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Decloak before docking</div>
+        <div class="setting-hint">When enabled, the bot will decloak just before docking at the destination station.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-goto-decloakBeforeDock"${goTo.decloakBeforeDock ? " checked" : ""}> Decloak before docking</label>
+    </div>
+
+    ${perBotHtml}
+
+    <div class="setting-section">
+      <div class="setting-label">Set Per-Bot Override</div>
+      <div class="setting-hint">Override the global destination for a specific bot.</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <select id="set-goto-bot" style="flex:1">
+          <option value="">(select bot)</option>
+          ${[...bots]
+            .sort((a, b) => (a.username || "").localeCompare(b.username || ""))
+            .map((b) => `<option value="${esc(b.username)}">${esc(b.username)}</option>`)
+            .join("")}
+        </select>
+        <select id="set-goto-bot-system" style="flex:1" onchange="gotoRepopulateBotPois()">${sysOpts}</select>
+        <select id="set-goto-bot-poi" style="flex:1"></select>
+        <button class="primary" onclick="saveGoToBotOverride()">Set Override</button>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveGoToSettings()">Save Settings</button>
+    </div>
+  `;
+      }
+
+      function gotoRepopulatePois() {
+        const sysSel = document.getElementById("set-goto-system");
+        const poiSel = document.getElementById("set-goto-poi");
+        if (!sysSel || !poiSel) return;
+        poiSel.innerHTML = gotoBuildPoiOptions(sysSel.value);
+      }
+
+      function gotoRepopulateBotPois() {
+        const sysSel = document.getElementById("set-goto-bot-system");
+        const poiSel = document.getElementById("set-goto-bot-poi");
+        if (!sysSel || !poiSel) return;
+        poiSel.innerHTML = gotoBuildPoiOptions(sysSel.value);
+      }
+
+      function gotoBuildPoiOptions(sysId) {
+        let opts = '<option value="">(any station)</option>';
+        const sys = mapData[sysId];
+        if (sys && sys.pois) {
+          const poiList = [...sys.pois].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(
+              b.base_name || b.name || b.id || "",
+            ),
+          );
+          for (const poi of poiList) {
+            const val = poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            const isStation = poi.has_base || poi.base_id;
+            const tag = isStation ? " [station]" : "";
+            opts += `<option value="${esc(val)}">${esc(label)}${esc(tag)}</option>`;
+          }
+        }
+        return opts;
+      }
+
+      function saveGoToSettings() {
+        const sysVal = document.getElementById("set-goto-system").value;
+        const poiVal = document.getElementById("set-goto-poi").value;
+        const refuelThreshold =
+          parseInt(
+            document.getElementById("set-goto-refuelThreshold").value,
+          ) || 50;
+        const dockIfStation = document.getElementById("set-goto-dockIfStation").checked;
+        const ignoreBlacklist = document.getElementById("set-goto-ignoreBlacklist").checked;
+        const decloakBeforeDock = document.getElementById("set-goto-decloakBeforeDock").checked;
+        const s = { destinationSystem: sysVal, destinationPoi: poiVal, refuelThreshold, dockIfStation, ignoreBlacklist, decloakBeforeDock };
+        send({ type: "saveSettings", routine: "goto", settings: s });
+        settings.goto = Object.assign(settings.goto || {}, s);
+      }
+
+      function saveGoToBotOverride() {
+        const botName = document.getElementById("set-goto-bot").value;
+        const sysVal = document.getElementById("set-goto-bot-system").value;
+        const poiVal = document.getElementById("set-goto-bot-poi").value;
+        if (!botName || !sysVal) {
+          alert("Please select both a bot and a system");
+          return;
+        }
+        const s = { destinationSystem: sysVal, destinationPoi: poiVal };
+        send({ type: "saveSettings", routine: botName, settings: s });
+        settings[botName] = Object.assign(settings[botName] || {}, s);
+        rerenderCurrentSettings();
+      }
+
+      function clearGoToBotOverride(botName) {
+        if (!confirm(`Clear GoTo destination override for ${botName}?`)) return;
+        const s = { destinationSystem: undefined, destinationPoi: undefined };
+        send({ type: "saveSettings", routine: botName, settings: s });
+        delete settings[botName].destinationSystem;
+        delete settings[botName].destinationPoi;
+        rerenderCurrentSettings();
+      }
+
       function saveReturnHomeSettings() {
         const stationVal = document.getElementById(
           "set-returnhome-station",

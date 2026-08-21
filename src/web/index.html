@@ -25235,6 +25235,9 @@ When responding:
         if (!container) return;
 
         factionFacilityTypes = getCatalogFacilitiesByCategory(factionFacilityCategory);
+        if (factionFacilityCategory === "faction" || factionFacilityCategory === "production") {
+          factionFacilityTypes = factionFacilityTypes.filter((f) => !f.upgrades_from);
+        }
         console.log(
           "Using catalog faction facility types:",
           factionFacilityTypes.length,
@@ -26201,6 +26204,9 @@ When responding:
       function switchFactionFacilityCategory(category, username) {
         factionFacilityCategory = category;
         factionFacilityTypes = getCatalogFacilitiesByCategory(category);
+        if (category === "faction" || category === "production") {
+          factionFacilityTypes = factionFacilityTypes.filter((f) => !f.upgrades_from);
+        }
         const factionBtn = document.getElementById("ff-cat-faction");
         const productionBtn = document.getElementById("ff-cat-production");
         if (factionBtn) {

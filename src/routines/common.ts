@@ -2179,30 +2179,123 @@ export async function findReachableFuelStation(
 }
 
 /**
+ * Outcome of a fuel check.
+ *   "fueled"    — tank is at/above the threshold, carry on.
+ *   "in_battle" — a battle is live, so the fuel subsystem was SKIPPED ENTIRELY.
+ *                 This is NOT a fuel failure. The caller must go fight.
+ *   "failed"    — genuinely could not secure fuel (no reachable station, broke, etc).
+ */
+export type FuelCheckOutcome = "fueled" | "in_battle" | "failed";
+
+/**
+ * Fuel check with an explicit outcome, so callers can tell "I'm out of fuel"
+ * apart from "I'm busy being shot at".
+ *
+ * ── HARD COMBAT GUARD ───────────────────────────────────────────────────────
+ * If a battle is live we do not care about fuel AT ALL, and we bail out before
+ * touching a single line of the fuel machinery. Two independent reasons:
+ *
+ *   1. Fuel is NOT consumed while fighting. The tank physically cannot get
+ *      worse during the battle, so there is nothing to protect against.
+ *   2. Every fuel-acquiring action (refuel, dock, travel, jump) is rejected by
+ *      the server with `in_battle` anyway.
+ *
+ * So there is literally nothing to gain and a fight to lose. Fighting is the
+ * only thing that matters — OR WE DIE. We hand control straight back to the
+ * caller's combat handling instead of grinding through station searches,
+ * route planning and 30s sleeps while an enemy chews through our hull.
+ */
+export async function ensureFueledEx(
+  ctx: RoutineContext,
+  thresholdPct: number,
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+): Promise<FuelCheckOutcome> {
+  const { bot } = ctx;
+
+  if (bot.isInBattle()) {
+    if (opts?.skipFleeCheck) {
+      // Combat bot (hunter/fleet/escort). Confirm against the API first so a
+      // stale WebSocket flag can never strand us in a phantom battle, then get
+      // out of the way so the caller can fight.
+      const status = await getBattleStatus(ctx);
+      if (status) {
+        ctx.log("combat", "⚔️ In battle — fuel check SKIPPED entirely (fuel is not consumed in combat). Fight first!");
+        return "in_battle";
+      }
+      ctx.log("combat", "Clearing stale WebSocket battle state (API reports no battle)");
+      bot.currentBattle.inBattle = false;
+      bot.currentBattle.battleId = null;
+      bot.currentBattle.participants = [];
+    } else {
+      // Non-combat bot (hauler/miner/trader). Running away IS its combat
+      // response, so let it flee first — but still never fuel while in battle.
+      ctx.log("combat", "Fuel check interrupted by battle — fleeing first (fuel is not consumed in combat)");
+      const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
+      if (!fled && bot.isInBattle()) {
+        ctx.log("combat", "Still in battle after flee attempt — cannot fuel now, returning to caller");
+        return "in_battle";
+      }
+    }
+  }
+
+  return (await ensureFueledCore(ctx, thresholdPct, opts)) ? "fueled" : "failed";
+}
+
+/**
  * Ensure the bot has adequate fuel.
  * If an approved fuel station list is configured and fuel is low,
  * go directly to the nearest approved station and refuel.
  * Returns true when fuel is adequate, false otherwise.
+ *
+ * NOTE: a `false` return can mean either "out of fuel" OR "in a battle, go
+ * fight". Callers that have combat handling should prefer `ensureFueledEx()`
+ * so they can tell the two apart.
  */
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
   opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
+  return (await ensureFueledEx(ctx, thresholdPct, opts)) === "fueled";
+}
+
+/**
+ * Core refuelling implementation. Assumes the caller already handled the
+ * in-battle case (see `ensureFueledEx`).
+ */
+async function ensureFueledCore(
+  ctx: RoutineContext,
+  thresholdPct: number,
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+): Promise<boolean> {
   const { bot } = ctx;
 
-  // ── COMBAT GUARD: In a battle, fuel is irrelevant — it's life or death.
-  // Every refuel/dock/jump/travel command is rejected by the server with
-  // `in_battle`, so attempting to fuel while fighting just deadlocks the bot
-  // forever (it keeps "navigating to refuel" and every command fails). Resolve
-  // the battle FIRST, then come back for fuel. ───────────────────────────────
+  // ── FUEL-FIRST SHORT-CIRCUIT (must stay ABOVE the combat guard!) ───────────
+  // If the tank is already above the threshold there is nothing to do, so bail
+  // out immediately and NEVER touch the battle logic below.
+  //
+  // This ordering is load-bearing: the combat guard returns `false` while a
+  // battle is active, and plain-boolean callers treat a `false` return as
+  // "cannot secure fuel — wait 30s and retry". If the fuel level were checked
+  // *after* the guard, a ship with a full tank (e.g. 95%) that gets jumped
+  // would spin forever — "battle active" → "returning to caller" → "Cannot
+  // secure fuel — waiting 30s" → repeat — never reaching the combat handling
+  // in the caller's loop, so it just sits there being shot.
   await bot.refreshShip();
   await bot.refreshLocation();
-  if (ctx.bot.isInBattle()) {
-    ctx.log("combat", "Fuel check interrupted by battle — resolving combat before fueling (in battle, fuel does not matter!)");
+  let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPct >= thresholdPct) return true;
+
+  // ── COMBAT GUARD (second line of defence) ─────────────────────────────────
+  // ensureFueledEx() already bailed out if we were in a battle on entry, but
+  // this core routine jumps, travels and docks — a battle can start at any
+  // point during that. Fuel is not consumed in combat and every fuel action is
+  // rejected with `in_battle`, so stop immediately and let the caller fight.
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Battle started mid-refuel (fuel ${fuelPct}%) — abandoning fuel run to fight (fuel is not consumed in combat)`);
     if (!opts?.skipFleeCheck) {
       const fled = await checkAndFleeFromBattle(ctx, "ensureFueled");
-      if (fled || !ctx.bot.isInBattle()) {
+      if (fled || !bot.isInBattle()) {
         // Battle resolved (or was a stale flag) — re-evaluate fuel below.
       } else {
         // Still in battle and couldn't resolve it — bail so the caller can retry.
@@ -2214,11 +2307,11 @@ export async function ensureFueled(
       // API disagrees, otherwise return control so the caller can handle the
       // battle with proper analysis (fight / flee based on tier / hull).
       const status = await getBattleStatus(ctx);
-      if (!status && ctx.bot.isInBattle()) {
+      if (!status && bot.isInBattle()) {
         ctx.log("combat", "Clearing stale WebSocket battle state (API reports no battle)");
-        ctx.bot.currentBattle.inBattle = false;
-        ctx.bot.currentBattle.battleId = null;
-        ctx.bot.currentBattle.participants = [];
+        bot.currentBattle.inBattle = false;
+        bot.currentBattle.battleId = null;
+        bot.currentBattle.participants = [];
       } else if (status) {
         ctx.log("combat", "Active battle detected during fuel check — returning to caller to handle combat");
         return false;
@@ -2226,7 +2319,10 @@ export async function ensureFueled(
     }
   }
 
-  let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  // Re-read fuel: the combat guard above may have fled or otherwise changed
+  // our state before falling through.
+  await bot.refreshShip();
+  fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
   ctx.log("system", `Fuel low (${fuelPct}%) — need to refuel (threshold: ${thresholdPct}%)...`);
@@ -3012,8 +3108,15 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-      const fueled = await ensureFueled(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
-      if (!fueled) {
+      const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+      if (fueled === "in_battle") {
+        // Not a fuel problem — we're in a fight, and jumps are rejected while in
+        // battle anyway. Abort navigation so the caller resolves combat first
+        // (hunters call handleNavigationBattleInterrupt on a false return).
+        ctx.log("combat", "In battle — aborting navigation so combat can be resolved first");
+        return false;
+      }
+      if (fueled !== "fueled") {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }

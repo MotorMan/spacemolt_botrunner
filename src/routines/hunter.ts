@@ -61,7 +61,8 @@ import {
   ensureUndocked,
   tryRefuel,
   repairShip,
-  ensureFueled,
+  ensureFueledEx,
+  type FuelCheckOutcome,
   navigateToSystem,
   fetchSecurityLevel,
   scavengeWrecks,
@@ -210,6 +211,51 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
   }
   
   return false;
+}
+
+/**
+ * Handle a fuel check that did not come back "fueled".
+ *
+ * A non-"fueled" outcome is NOT always a fuel problem:
+ *
+ *   "in_battle" — the fuel subsystem deliberately skipped itself because a
+ *                 battle is live. Fuel is not consumed in combat, so there is
+ *                 nothing to fix. GO FIGHT, immediately.
+ *   "failed"    — genuinely could not secure fuel. But a battle may still have
+ *                 started part-way through the fuel run, so check for that
+ *                 before deciding to idle.
+ *
+ * Blindly sleeping 30s here is exactly the wrong move: the hunter sits there
+ * absorbing hits while the battle-handling code further down the loop is never
+ * reached, and the next iteration hits the same guard — forever. That is how a
+ * hunter with a 95% tank and a hold full of military_fuel_cells ended up
+ * logging "Cannot secure fuel — waiting 30s..." for 40 minutes straight while
+ * being shot at.
+ *
+ * So: if a battle is live, FIGHT IT. Only wait when fuel is genuinely the problem.
+ */
+async function handleFuelCheckFailure(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  outcome: FuelCheckOutcome,
+): Promise<void> {
+  // Straight into the fighting functions — no fuel logic, no sleep, no delay.
+  if (await checkAndHandleExistingBattle(ctx, settings)) {
+    ctx.log("combat", "Fuel check yielded to combat — battle handled, resuming patrol");
+    return;
+  }
+
+  if (outcome === "in_battle") {
+    // Battle flag was set but has already resolved (or was stale). Loop straight
+    // back around and re-check fuel rather than burning 30s for nothing.
+    ctx.log("combat", "Battle already resolved — re-checking fuel immediately");
+    return;
+  }
+
+  await ctx.bot.refreshShip();
+  const fuelPct = ctx.bot.maxFuel > 0 ? Math.round((ctx.bot.fuel / ctx.bot.maxFuel) * 100) : 100;
+  ctx.log("error", `Cannot secure fuel (at ${fuelPct}%, threshold ${settings.refuelThreshold}%) — waiting 30s...`);
+  await ctx.sleep(30000);
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -1388,10 +1434,9 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     logStatus(ctx);
 
     // ── Fuel ──
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
@@ -1636,10 +1681,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
@@ -2269,10 +2313,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 
@@ -2756,10 +2799,9 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
-    if (!fueled) {
-      ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await ctx.sleep(30000);
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
 

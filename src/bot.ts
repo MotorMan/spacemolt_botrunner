@@ -9,7 +9,7 @@ import { perf } from "./perf.js";
 import { mapStore } from "./mapstore.js";
 import type { NotificationMarketUpdate } from "@spacemolt/lib";
 import { marketStreamStore } from "./marketstreamstore.js";
-import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
+import { addMaydayRequest, parseMaydayMessage, isIgnoredMaydaySender, shouldLogIgnoredMayday } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { wildlifeStore, type SurveyWildlifeEntry, type FaintSignature, type ObservedCreature } from "./wildlivestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
@@ -3727,9 +3727,21 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
           if (channel === "emergency" || content.includes("MAYDAY")) {
             const mayday = parseMaydayMessage(content, sender, Date.now(), this.username, this.system, this.poi);
             if (mayday) {
-              const added = addMaydayRequest(mayday);
-              if (added) {
-                this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+              if (isIgnoredMaydaySender(mayday.sender)) {
+                // Settings → FuelRescue → "Ignore MAYDAYs from Wexler pilots".
+                // addMaydayRequest() also rejects these, so the call is skipped
+                // entirely here and only reported (throttled to one line per
+                // sender per minute) — the flood is precisely why it is filtered.
+                const { log: shouldLog, suppressed } = shouldLogIgnoredMayday(mayday.sender);
+                if (shouldLog) {
+                  const extra = suppressed > 0 ? ` (+${suppressed} more suppressed)` : "";
+                  this.log("mayday", `🚫 Ignoring MAYDAY from ${mayday.sender} — sender ignored by the FuelRescue Wexler filter${extra}`);
+                }
+              } else {
+                const added = addMaydayRequest(mayday);
+                if (added) {
+                  this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+                }
               }
             } else {
               this.log("warn", `MAYDAY parse failed - message format may have changed. Content: "${content}"`);

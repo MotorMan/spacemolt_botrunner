@@ -17045,6 +17045,15 @@
         const enableCloak = r.enableCloak === true;
         const ignorePirateFleeWhenCloaked = r.ignorePirateFleeWhenCloaked ?? true;
         const dontRejectMaydaysInBlacklistSystems = r.dontRejectMaydaysInBlacklistSystems === true;
+        const ignoreWexlerMaydays = r.ignoreWexlerMaydays === true;
+        // These default to enabled/reserved when absent in settings, so treat
+        // undefined as the default rather than as "off".
+        const creditTopOffEnabled = r.creditTopOffEnabled !== false;
+        const fleetRescueEnabled = r.fleetRescueEnabled !== false;
+        const maydayRescueEnabled = r.maydayRescueEnabled !== false;
+        const premiumFuelReserve = r.premiumFuelReserve ?? 1;
+        const maydayPirateProximityThreshold = r.maydayPirateProximityThreshold ?? 5;
+        const maydayPirateLockoutMinutes = r.maydayPirateLockoutMinutes ?? 30;
         const disableFactionAnnouncements = r.disableFactionAnnouncements === true;
         const disablePrivateMessages = r.disablePrivateMessages === true;
 
@@ -17188,6 +17197,12 @@
     </div>
 
     <div class="settings-group">
+      <label>Premium fuel reserve (cells)</label>
+      <input type="number" id="set-rescue-premiumFuelReserve" value="${premiumFuelReserve}" min="0" max="50" style="width:80px">
+      <small style="color:var(--dim)">Premium fuel cells kept in reserve for this bot's own emergencies (never delivered to rescues)</small>
+    </div>
+
+    <div class="settings-group">
       <label>Credits to send</label>
       <input type="number" id="set-rescue-credits" value="${rescueCredits}" min="0" max="10000" style="width:80px">
       <small style="color:var(--dim)">Credits to gift when fuel cells unavailable (0 = disabled)</small>
@@ -17245,6 +17260,21 @@
     </div>
 
     <div class="settings-group">
+      <label style="color:var(--text-bright);font-weight:600;margin-bottom:8px;display:block">⚙️ Rescue Type Toggles</label>
+      <small style="color:var(--dim);display:block;margin-bottom:12px">Master enable/disable flags for each rescue type. Disabling a type stops the assigned bot from handling it; with no bot assigned, a rescue type is considered enabled for all bots.</small>
+
+      <div style="margin-bottom:10px">
+        <label><input type="checkbox" id="set-rescue-creditTopOffEnabled" ${creditTopOffEnabled ? "checked" : ""}> Credit top-off enabled</label>
+      </div>
+      <div style="margin-bottom:10px">
+        <label><input type="checkbox" id="set-rescue-fleetRescueEnabled" ${fleetRescueEnabled ? "checked" : ""}> Fleet rescue enabled</label>
+      </div>
+      <div style="margin-bottom:0">
+        <label><input type="checkbox" id="set-rescue-maydayRescueEnabled" ${maydayRescueEnabled ? "checked" : ""}> MAYDAY rescue enabled</label>
+      </div>
+    </div>
+
+    <div class="settings-group">
       <label>💰 Credit top-off amount (0 = disabled)</label>
       <input type="number" id="set-rescue-creditTopOffAmount" value="${creditTopOffAmount}" min="0" max="100000" step="1000" style="width:100px">
       <small style="color:var(--dim)">Automatically top up all fleet bots (including self) to this credit amount from faction treasury (default: 10000)</small>
@@ -17274,8 +17304,25 @@
     </div>
 
     <div class="settings-group">
+      <label>MAYDAY pirate proximity threshold (jumps)</label>
+      <input type="number" id="set-rescue-maydayPirateProximityThreshold" value="${maydayPirateProximityThreshold}" min="0" max="50" style="width:80px">
+      <small style="color:var(--dim)">Decline MAYDAYs this many jumps or fewer from a known pirate base (0 = never decline for proximity)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>MAYDAY pirate lockout (minutes)</label>
+      <input type="number" id="set-rescue-maydayPirateLockoutMinutes" value="${maydayPirateLockoutMinutes}" min="0" max="1440" style="width:80px">
+      <small style="color:var(--dim)">How long a pilot stays locked out after a pirate-proximity decline (prevents repeated processing of the same MAYDAY)</small>
+    </div>
+
+    <div class="settings-group">
       <label><input type="checkbox" id="set-rescue-ignorePirateFleeWhenCloaked" ${ignorePirateFleeWhenCloaked ? "checked" : ""}> Ignore pirate flee when cloaked</label>
       <small style="color:var(--dim)">When cloaking is enabled AND active, do not flee from detected pirates (cloaked ships cannot be ambushed). Default: enabled.</small>
+    </div>
+
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-ignoreWexlerMaydays" ${ignoreWexlerMaydays ? "checked" : ""}> Ignore MAYDAYs from "Wexler" pilots</label>
+      <small style="color:var(--dim)">Never respond to a MAYDAY whose pilot name starts with "wexler" (case-insensitive). Their calls are dropped before they enter the rescue queue, so a flood from them can't crowd out regular players waiting for rescue.</small>
     </div>
 
     <div class="settings-group">
@@ -17311,6 +17358,10 @@
             parseInt(
               document.getElementById("set-rescue-maxFuelDelivery").value,
             ) || 1000,
+          premiumFuelReserve:
+            parseInt(
+              document.getElementById("set-rescue-premiumFuelReserve").value,
+            ) || 1,
           rescueCredits:
             parseInt(document.getElementById("set-rescue-credits").value) ||
             500,
@@ -17383,6 +17434,28 @@
           dontRejectMaydaysInBlacklistSystems: document.getElementById(
             "set-rescue-dontRejectMaydaysInBlacklistSystems",
           ).checked,
+          ignoreWexlerMaydays: document.getElementById(
+            "set-rescue-ignoreWexlerMaydays",
+          ).checked,
+          creditTopOffEnabled: document.getElementById(
+            "set-rescue-creditTopOffEnabled",
+          ).checked,
+          fleetRescueEnabled: document.getElementById(
+            "set-rescue-fleetRescueEnabled",
+          ).checked,
+          maydayRescueEnabled: document.getElementById(
+            "set-rescue-maydayRescueEnabled",
+          ).checked,
+          maydayPirateProximityThreshold:
+            parseInt(
+              document.getElementById("set-rescue-maydayPirateProximityThreshold")
+                .value,
+            ) || 5,
+          maydayPirateLockoutMinutes:
+            parseInt(
+              document.getElementById("set-rescue-maydayPirateLockoutMinutes")
+                .value,
+            ) || 30,
           disableFactionAnnouncements: document.getElementById(
             "set-rescue-disableFactionAnnouncements",
           ).checked,

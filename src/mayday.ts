@@ -1,5 +1,8 @@
 // ── MAYDAY Emergency Rescue Parser ──────────────────────────
 
+import { existsSync, readFileSync } from "fs";
+import { join } from "path";
+
 export interface MaydayRequest {
   sender: string;
   system: string;
@@ -54,6 +57,109 @@ export function isLegitimateMayday(mayday: MaydayRequest, fuelThresholdPct: numb
   return mayday.fuelPct <= fuelThresholdPct;
 }
 
+// ── Flooding-sender filter ──────────────────────────────────
+//
+// Settings → FuelRescue → "Ignore MAYDAYs from Wexler pilots"
+// (`rescue.ignoreWexlerMaydays`).
+//
+// The Wexler pilots spam the emergency channel hard enough to starve everyone
+// else: the queue below is capped and evicts its OLDEST entry, so a burst of
+// their calls pushes genuinely stranded pilots out before a rescue bot can even
+// look at them. When the setting is on their MAYDAYs are dropped at intake and
+// skipped by the queue readers, so no rescue bot spends a cycle on them and the
+// queue stays free for real distress calls.
+//
+// The match is a NAME PREFIX on purpose: the flood comes from a whole family of
+// accounts ("Wexler V6U-PA", "Wexler …"), not a single one.
+
+const IGNORED_SENDER_PREFIXES = ["wexler"];
+
+const SETTINGS_FILE = join(process.cwd(), "data", "settings.json");
+
+/**
+ * MAYDAYs arrive per chat message (that's the whole problem), so the on-disk
+ * setting is cached briefly instead of re-read and re-parsed for every call.
+ *
+ * The file is read directly rather than through the web server's `loadSettings`:
+ * this module sits underneath `bot.ts` in the import graph and pulling the
+ * server module in here would add an import cycle just to read one boolean.
+ */
+const IGNORE_SETTING_TTL_MS = 5000;
+let ignoreSettingCache: { enabled: boolean; readAt: number } | null = null;
+
+function isSenderFilterEnabled(): boolean {
+  const now = Date.now();
+  if (ignoreSettingCache && now - ignoreSettingCache.readAt < IGNORE_SETTING_TTL_MS) {
+    return ignoreSettingCache.enabled;
+  }
+
+  let enabled = false;
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      const parsed = JSON.parse(readFileSync(SETTINGS_FILE, "utf-8")) as Record<string, Record<string, unknown> | undefined>;
+      enabled = parsed.rescue?.ignoreWexlerMaydays === true;
+    }
+  } catch {
+    // A missing/corrupt/half-written settings file must never silently block
+    // real rescues — fail open (filter off).
+    enabled = false;
+  }
+
+  ignoreSettingCache = { enabled, readAt: now };
+  return enabled;
+}
+
+/**
+ * Is this MAYDAY sender currently filtered out by the FuelRescue
+ * "ignore Wexler MAYDAYs" setting?
+ *
+ * Matched against the sender name parsed out of the MAYDAY text itself (the
+ * stranded pilot), case- and whitespace-insensitively.
+ */
+export function isIgnoredMaydaySender(sender: string): boolean {
+  if (!sender) return false;
+  if (!isSenderFilterEnabled()) return false;
+  const name = sender.trim().toLowerCase();
+  return IGNORED_SENDER_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
+/** Throttle state for reporting ignored MAYDAYs: sender -> last log + skipped count. */
+const ignoredLogState = new Map<string, { lastLoggedAt: number; suppressed: number }>();
+const IGNORED_LOG_INTERVAL_MS = 60000;
+const IGNORED_LOG_STATE_MAX = 200;
+
+function pruneIgnoredLogState(now: number): void {
+  if (ignoredLogState.size <= IGNORED_LOG_STATE_MAX) return;
+  for (const [sender, state] of ignoredLogState) {
+    if (now - state.lastLoggedAt > IGNORED_LOG_INTERVAL_MS) ignoredLogState.delete(sender);
+  }
+  // Still oversized (a very wide flood across many names): start fresh rather
+  // than let the throttle map grow without bound.
+  if (ignoredLogState.size > IGNORED_LOG_STATE_MAX) ignoredLogState.clear();
+}
+
+/**
+ * Should an ignored MAYDAY be written to the log right now?
+ *
+ * Throttled to one line per sender per minute, returning how many of that
+ * sender's calls were swallowed since the last line — otherwise a MAYDAY flood
+ * simply becomes a log flood, which is the problem this filter exists to stop.
+ */
+export function shouldLogIgnoredMayday(sender: string): { log: boolean; suppressed: number } {
+  const now = Date.now();
+  const state = ignoredLogState.get(sender);
+
+  if (state && now - state.lastLoggedAt < IGNORED_LOG_INTERVAL_MS) {
+    state.suppressed++;
+    return { log: false, suppressed: state.suppressed };
+  }
+
+  const suppressed = state?.suppressed ?? 0;
+  ignoredLogState.set(sender, { lastLoggedAt: now, suppressed: 0 });
+  pruneIgnoredLogState(now);
+  return { log: true, suppressed };
+}
+
 // ── MAYDAY Queue ────────────────────────────────────────────
 
 const maydayQueue: MaydayRequest[] = [];
@@ -64,9 +170,18 @@ const MAYDAY_EXPIRY_MS = 300000;
 
 /**
  * Add a MAYDAY request to the queue.
- * Returns true if added, false if duplicate or invalid.
+ * Returns true if added, false if duplicate, invalid, or from a sender that the
+ * FuelRescue "ignore Wexler MAYDAYs" setting filters out.
  */
 export function addMaydayRequest(mayday: MaydayRequest): boolean {
+  // Filtered senders are rejected BEFORE anything else: the queue is capped and
+  // drops its oldest entry when full, so letting a flood in here is exactly how
+  // regular players stop getting rescued. Callers report the drop (throttled)
+  // via shouldLogIgnoredMayday().
+  if (isIgnoredMaydaySender(mayday.sender)) {
+    return false;
+  }
+
   // Create unique ID to prevent duplicates
   const maydayId = `${mayday.sender}-${mayday.system}-${mayday.poi}-${Math.floor(mayday.timestamp / 60000)}`; // Unique per minute
 
@@ -88,11 +203,15 @@ export function addMaydayRequest(mayday: MaydayRequest): boolean {
  * Count how many MAYDAY requests are currently pending (not yet expired).
  * Used by the rescue routines to decide whether a backup (non-primary) bot
  * should step in — only when there is a genuine surge (2+ at once).
+ *
+ * Senders filtered by the "ignore Wexler MAYDAYs" setting are not counted, so a
+ * flood can't fake a surge and pull the backup bots off their own work.
  */
 export function getPendingMaydayCount(): number {
   const now = Date.now();
   let count = 0;
   for (const mayday of maydayQueue) {
+    if (isIgnoredMaydaySender(mayday.sender)) continue;
     if (now - mayday.timestamp <= MAYDAY_EXPIRY_MS) {
       count++;
     }
@@ -102,7 +221,9 @@ export function getPendingMaydayCount(): number {
 
 /**
  * Get the next pending MAYDAY request (oldest first).
- * Filters out expired MAYDAYs automatically.
+ * Filters out expired MAYDAYs automatically, along with senders blocked by the
+ * FuelRescue "ignore Wexler MAYDAYs" setting (which catches anything queued
+ * before the setting was switched on).
  * Returns null if no pending requests.
  */
 export function getNextMayday(): MaydayRequest | null {
@@ -117,6 +238,18 @@ export function getNextMayday(): MaydayRequest | null {
       // This MAYDAY is expired - remove it
       const ageMinutes = Math.round(age / 60000);
       console.log(`[mayday] ⏰ Expiring MAYDAY from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${ageMinutes} minutes old)`);
+      maydayQueue.shift();
+      continue;
+    }
+
+    if (isIgnoredMaydaySender(mayday.sender)) {
+      // Queued before the filter was enabled — drop it so it can't block the
+      // head of the queue, and never hand it to a rescue bot.
+      const { log, suppressed } = shouldLogIgnoredMayday(mayday.sender);
+      if (log) {
+        const extra = suppressed > 0 ? ` (+${suppressed} more suppressed)` : "";
+        console.log(`[mayday] 🚫 Dropping queued MAYDAY from ${mayday.sender} — sender ignored by the FuelRescue Wexler filter${extra}`);
+      }
       maydayQueue.shift();
       continue;
     }

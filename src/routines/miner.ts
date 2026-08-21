@@ -1557,6 +1557,9 @@ export function findFirstAvailableQuotaTarget(
   skipPirateSystems?: boolean,
   totalMiningPower?: number,
   botUsername?: string,
+  blacklist?: string[],
+  botSystem?: string,
+  maxJumps?: number,
 ): string {
   const excludeSet = new Set<string>();
   if (excludeTargets) {
@@ -1596,54 +1599,32 @@ export function findFirstAvailableQuotaTarget(
   // Sort: biggest deficit first, then smallest surplus (closest to deficit)
   entries.sort((a, b) => b.deficit - a.deficit);
 
-  // Check each ore in priority order to see if it has available locations
+  // Check each ore in priority order (biggest deficit first). For every ore we
+  // only accept it if it has at least one location that is REACHABLE from our
+  // current system WITHOUT routing through a blacklisted system. This makes the
+  // picker honour the routing rule: an ore whose only systems are reachable only
+  // via a blacklisted system is skipped, and we fall through to the next ore in
+  // the quota priority list.
+  const effBlacklist = blacklist ?? [];
+  const effBotSystem = botSystem ?? "";
+  const effMaxJumps = maxJumps ?? 9999;
+
   for (const entry of entries) {
-    const rawLocations = mapStore.findOreLocations(entry.resourceId, undefined, skipPirateSystems);
-    if (rawLocations.length === 0) {
-      continue;
-    }
-    const poiFiltered = rawLocations.filter((loc: any) => {
-      const sys = mapStore.getSystem(loc.systemId);
-      const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
-      if (!poi) return true;
-      // No filtering by POI type - trust map data for ore/gas/ice types
-      if (miningType === "ore") return true;
-      if (miningType === "radioactive") {
-        if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-        return true;
-      }
-      if (miningType === "gas") return true;
-      if (miningType === "ice") {
-        if (poi.hidden === true && !canMineHiddenIce) return false;
-        return true;
-      }
-      return true;
-    });
-    // No depletion filtering - trust the map data
-    const depletionFiltered = poiFiltered;
-
-  // Apply power filter to ensure locations aren't rejected later as "too sparse"
-    const powerFiltered = depletionFiltered.filter((loc: any) => {
-      // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-      // This prevents high-power miners from wasting time on low-density deposits
-      const hasScanData = loc.minutesSinceScan !== Infinity;
-      const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-      if (isLowRemainingWithUnknownPower) {
-        return false;
-      }
-      // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-      if (totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-        return false;
-      }
-      if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
-        if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) {
-          return false;
-        }
-      }
-      return true;
-    });
-
-    if (powerFiltered.length > 0) {
+    const reachable = getReachableOreLocations(
+      entry.resourceId,
+      miningType,
+      effBotSystem,
+      effBlacklist,
+      effMaxJumps,
+      settings,
+      depletionTimeoutMs,
+      canMineHiddenRadioactive,
+      canMineHiddenIce,
+      totalMiningPower ?? 0,
+      botUsername,
+      skipPirateSystems ?? true,
+    );
+    if (reachable.length > 0) {
       return entry.resourceId;
     }
   }
@@ -1652,6 +1633,139 @@ export function findFirstAvailableQuotaTarget(
   // This signals to the caller that no targets are available
   // The caller will then try the next ore in the quota list on the next cycle
   return "";
+}
+
+/**
+ * Route-aware location filter: returns the locations for `oreId` that are
+ * actually REACHABLE from `botSystem` WITHOUT passing through a blacklisted
+ * system.
+ *
+ * This is the heart of the targeting rule:
+ *   "look up where the ore is → get the route → if it goes through a
+ *    blacklisted system, pick the next best system for that ore."
+ * A POI sitting in a system that is only reachable via a blacklisted system is
+ * treated as unreachable and skipped in favour of another system that holds the
+ * same ore (or, if none, the next ore in the quota priority list).
+ */
+function getReachableOreLocations(
+  oreId: string,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  botSystem: string,
+  blacklist: string[],
+  maxJumps: number,
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
+  depletionTimeoutMs: number,
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+  totalMiningPower: number,
+  botUsername: string | undefined,
+  skipPirateSystems: boolean,
+  excludeSystems?: Set<string>,
+): Array<{
+  systemId: string; systemName: string; poiId: string; poiName: string;
+  remaining: number; maxRemaining: number; richness: number;
+  supportedPower: number; isHidden: boolean; jumps: number; resourceId: string;
+}> {
+  const jettisonSet = new Set(getJettisonListForMiningType(settings, miningType).map(o => o.toLowerCase()));
+  if (jettisonSet.has(oreId.toLowerCase())) return [];
+
+  const raw = mapStore.findOreLocations(oreId, blacklist, skipPirateSystems);
+  const out: any[] = [];
+
+  for (const loc of raw) {
+    if (excludeSystems && excludeSystems.has(loc.systemId)) continue;
+    const sys = mapStore.getSystem(loc.systemId);
+    const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+    if (!poi) continue;
+
+    // POI type / hidden-access checks
+    if (miningType === "radioactive") {
+      if (poi.hidden === true && !canMineHiddenRadioactive) continue;
+    } else if (miningType === "ice") {
+      if (poi.hidden === true && !canMineHiddenIce) continue;
+    }
+
+    // Depletion (skip if still under lockout)
+    if (!settings.ignoreDepletion) {
+      const oreEntry = poi?.ores_found?.find((o: any) => o.item_id === oreId);
+      const resourceEntry = poi?.resources?.find((r: any) => r.resource_id === oreId);
+      if (resourceEntry?.depleted) {
+        if (!isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs)) continue;
+      } else if (oreEntry?.depleted) {
+        if (!isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+      }
+    }
+
+    // Power compatibility (skip deposits too sparse for our mining power)
+    const hasScanData = loc.minutesSinceScan !== Infinity;
+    const lowRemUnknown = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+    if (lowRemUnknown) continue;
+    if (totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) continue;
+
+    // Coordination: skip over capacity systems
+    if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
+      if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, botUsername)) continue;
+    }
+
+    // ROUTE REACHABILITY — the key gate. If every path from our current system
+    // to this POI's system runs through a blacklisted system, findRoute returns
+    // null and the location is unreachable for our purposes.
+    if (!botSystem) continue;
+    const route = mapStore.findRoute(botSystem, loc.systemId, blacklist);
+    if (!route) continue;
+    const jumps = route.length - 1;
+    if (jumps > maxJumps) continue;
+
+    out.push({ ...loc, jumps, resourceId: oreId });
+  }
+  return out;
+}
+
+/** True when every configured quota ore (target>0, not jettisoned) is already at/above its quota. */
+function allQuotaOresFull(
+  quotas: Record<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+  jettisonSet: Set<string>,
+): boolean {
+  const active = Object.entries(quotas).filter(([o, t]) => t > 0 && !jettisonSet.has(o.toLowerCase()));
+  if (active.length === 0) return true; // nothing to mine → local mining is acceptable
+  return active.every(([o, t]) => (factionStorage.find(i => i.itemId === o)?.quantity || 0) >= t);
+}
+
+/**
+ * Decide what to do when no reachable target was found for the current mining type.
+ * Per the targeting rule, local mining is ONLY acceptable when EVERY quota ore is
+ * already at/above its quota. If any quota ore still has a deficit but is simply
+ * unreachable (blacklisted / depleted / out of jump range), we deep-sleep and
+ * retry on the next cycle instead of mining locally.
+ *
+ * Returns "local" when the bot should mine locally, "retry" when it should
+ * deep-sleep and retry.
+ */
+async function handleNoReachableTarget(
+  ctx: RoutineContext,
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  totalMiningPower: number,
+  blacklist: string[],
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+  botUsername: string | undefined,
+  candidateOres: string[],
+  quotas: Record<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+): Promise<"local" | "retry"> {
+  const jettisonSet = new Set(getJettisonListForMiningType(settings, miningType).map(o => o.toLowerCase()));
+  if (allQuotaOresFull(quotas, factionStorage, jettisonSet)) {
+    ctx.log("mining", "All quota ores are at/above their quota — falling back to local mining (rare case)");
+    return "local";
+  }
+  ctx.log("mining", "No reachable target for any deficit quota ore (blacklisted / depleted / out of jump range) — will retry after deep sleep instead of mining locally");
+  await reportNoViableTargetsAndDeepSleep(
+    ctx, settings, miningType, totalMiningPower, blacklist,
+    canMineHiddenRadioactive, canMineHiddenIce, botUsername, candidateOres,
+  );
+  return "retry";
 }
 
 /**
@@ -2489,6 +2603,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // Systems we've tried to navigate to this run but couldn't reach (blacklisted
+    // route / unreachable). When navigation to a target fails we add it here and
+    // re-run target selection so the miner picks the next best system/ore instead
+    // of falling back to local mining. Cleared whenever a navigation succeeds.
+    const excludedNavSystems = new Set<string>();
+
     while (bot.state === "running") {
       // ── Death recovery ──
       const alive = await detectAndRecoverFromDeath(ctx);
@@ -2924,6 +3044,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // CRITICAL FIX: Always refresh faction storage before quota evaluation
       // (also refreshed above when docked at home, but ensure it's fresh here too)
       await bot.refreshFactionStorage();
+
+      // DEBUG: Show the quota evaluation in lowest-filled (biggest-deficit) order
+      // so we can see the miner is genuinely considering each ore before picking.
+      {
+        const jettisonLower = new Set(getJettisonListForMiningType(settings, miningType).map(j => j.toLowerCase()));
+        const quotaEval = Object.entries(quotas)
+          .filter(([o, t]) => t > 0 && !jettisonLower.has(o.toLowerCase()))
+          .map(([o, t]) => {
+            const cur = bot.factionStorage.find(i => i.itemId === o)?.quantity || 0;
+            return { o, t, cur, def: t - cur };
+          })
+          .sort((a, b) => b.def - a.def)
+          .map(e => `${e.o}=${e.cur}/${e.t}${e.def > 0 ? ` (deficit ${e.def})` : " (full)"}`);
+        ctx.log("debug", `Quota evaluation (lowest-filled first): ${quotaEval.join(", ") || "(no active quotas)"}`);
+      }
 
 // When docked at home, use enhanced selection that always picks a target
        // This ensures the miner keeps cycling through ores even when all quotas are met
@@ -3605,7 +3740,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 // Ignore depletion for alternative targets to allow selection of POIs that may have respawned
             const availableQuotaTarget = findFirstAvailableQuotaTarget(
               quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-              canMineHiddenRadioactive, canMineHiddenIce, originalTarget, true, totalMiningPower, bot.username
+              canMineHiddenRadioactive, canMineHiddenIce, originalTarget, true, totalMiningPower, bot.username,
+              blacklist, bot.system, maxJumps
             );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
@@ -3668,16 +3804,36 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           } else if (availableQuotaTarget === originalTarget) {
             ctx.log("mining", `Quota target "${originalTarget}" is the only available option — proceeding`);
           } else {
-            ctx.log("warn", `No quota targets have available locations — mining locally without specific target`);
+            ctx.log("warn", `No quota targets have available locations for "${originalTarget}"`);
           }
-          // If still no locations, target locally (either no quotas configured or no available quota targets)
+          // If we still have no concrete location, decide local vs retry.
+          // Local mining is ONLY acceptable when every quota ore is full; otherwise
+          // we deep-sleep and retry (we keep searching rather than mine locally).
           if (locations.length === 0) {
+            const candidateOres = [originalTarget, ...Object.keys(quotas)];
             if (!hasLocalMiningPoiOfType(bot.system, miningType, canMineHiddenRadioactive, canMineHiddenIce)) {
-              const candidateOres = [originalTarget, ...Object.keys(quotas)];
+              const decision = await handleNoReachableTarget(
+                ctx, settings, miningType, totalMiningPower, blacklist,
+                canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+                candidateOres, quotas, bot.factionStorage,
+              );
+              if (decision === "retry") {
+                excludedNavSystems.clear();
+                continue;
+              }
               await reportNoViableTargetsAndDeepSleep(
                 ctx, settings, miningType, totalMiningPower, blacklist,
                 canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
               );
+              continue;
+            }
+            const decision = await handleNoReachableTarget(
+              ctx, settings, miningType, totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+              candidateOres, quotas, bot.factionStorage,
+            );
+            if (decision === "retry") {
+              excludedNavSystems.clear();
               continue;
             }
             targetSystemId = bot.system;
@@ -3716,14 +3872,27 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-              const jumps = route ? route.length - 1 : 999;
+              const jumps = route ? route.length - 1 : Infinity;
               return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
-            });
+            })
+            .filter(loc => loc.jumps !== Infinity && loc.jumps <= maxJumps && !excludedNavSystems.has(loc.systemId));
 
           if (systemLocations.length > 0) {
             scoredLocations = systemLocations;
           } else {
-            ctx.log("warn", `Configured system ${configuredSystem} has no valid ${effectiveTarget} POIs — mining locally instead`);
+            // Configured system has no REACHABLE valid POI for this ore. Fall back
+            // to the same local-vs-retry rule: only mine locally when every quota
+            // ore is full, otherwise retry (keep searching other systems/ores).
+            const decision = await handleNoReachableTarget(
+              ctx, settings, miningType, totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+              [effectiveTarget, ...Object.keys(quotas)], quotas, bot.factionStorage,
+            );
+            if (decision === "retry") {
+              excludedNavSystems.clear();
+              continue;
+            }
+            ctx.log("warn", `Configured system ${configuredSystem} has no valid ${effectiveTarget} POIs — mining locally (all quotas full)`);
             scoredLocations = [];
             targetSystemId = bot.system;
           }
@@ -3736,10 +3905,13 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             })
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-              const jumps = route ? route.length - 1 : -1;
+              // A null route means every path to this system runs through a
+              // blacklisted system — treat it as unreachable so we pick the next
+              // best system for this ore instead of "mining locally".
+              const jumps = route ? route.length - 1 : Infinity;
               return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
-.filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
+.filter(loc => loc.jumps !== Infinity && loc.jumps <= maxJumps && !excludedNavSystems.has(loc.systemId))
              .filter(loc => {
                // Coordination: reject systems that are already at max bot capacity
                if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
@@ -3772,13 +3944,18 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                  if (aMinerCount !== bMinerCount) return aMinerCount - bMinerCount;
                }
                return 0;
-             });
-           scoredLocations = scoredLocationsLocal;
-        }
+              });
+            // DEBUG: show exactly which systems hold this ore and how reachable
+            // each is, so we can see the bot is genuinely trying alternatives
+            // rather than blindly mining locally.
+            const reachableSummary = [...new Set(scoredLocationsLocal.map(l => `${l.systemId}(${l.jumps}j)`))].join(", ");
+            ctx.log("debug", `Ore ${effectiveTarget}: reachable systems from ${bot.system} = [${reachableSummary || "NONE — all routes blacklisted/depleted/out of range"}]${excludedNavSystems.size ? ` (excluded: ${[...excludedNavSystems].join(", ")})` : ""}`);
+            scoredLocations = scoredLocationsLocal;
+         }
 
         const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
 
-        if (!chosenLoc && !configuredSystem) {
+        if (!chosenLoc) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps`);
           
           // Loop through ALL quota ores to find one with locations within range
@@ -3850,12 +4027,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                  }
                  return true;
                })
-               .map(loc => {
-                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                const jumps = route ? route.length - 1 : 999;
-                return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
-              })
-              .filter(loc => loc.jumps <= maxJumps)
+                .map(loc => {
+                 const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                 const jumps = route ? route.length - 1 : Infinity;
+                 return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
+               })
+               .filter(loc => loc.jumps !== Infinity && loc.jumps <= maxJumps && !excludedNavSystems.has(loc.systemId))
               .sort((a, b) => {
                 if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
                 if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
@@ -3890,7 +4067,18 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           }
           
           if (!foundAlternative) {
-            ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally without specific target`);
+            const candidateOres = [effectiveTarget, ...allQuotaOres];
+            const decision = await handleNoReachableTarget(
+              ctx, settings, miningType, totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+              candidateOres, quotas, bot.factionStorage,
+            );
+            if (decision === "retry") {
+              excludedNavSystems.clear();
+              continue;
+            }
+            // Local mining is acceptable only when every quota ore is at/above quota.
+            ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally (all quotas full)`);
             targetSystemId = bot.system;
             const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
             if (localPoi) {
@@ -3899,11 +4087,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
             } else {
               ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available`);
-              const candidateOres = [effectiveTarget, ...allQuotaOres];
-              await reportNoViableTargetsAndDeepSleep(
-                ctx, settings, miningType, totalMiningPower, blacklist,
-                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-              );
+              await ctx.sleep(30000);
               continue;
             }
           }
@@ -4159,11 +4343,24 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 
       const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
       if (!arrived) {
-        ctx.log("error", "Failed to reach target system — mining locally instead");
-        targetSystemId = bot.system;
-        targetPoiId = "";
-        targetPoiName = "";
+        // CRITICAL: do NOT fall back to local mining here. The whole point of the
+        // quota-driven targeting is to keep searching for a reachable ore/system.
+        // Exclude this system and re-run target selection next cycle so we pick the
+        // next best system for this ore, or the next ore if every system for this
+        // one is blacklisted/depleted. We only ever "mine locally" when EVERY quota
+        // ore is at/above its quota (handled in handleNoReachableTarget).
+        ctx.log("error", `Failed to reach target system ${targetSystemId} — excluding it and retrying with the next best ore/system instead of mining locally`);
+        excludedNavSystems.add(targetSystemId);
+        if (recoveredSession) {
+          await failMiningSession(bot.username, `Navigation failed to ${targetSystemId} (blacklisted/unreachable)`);
+          recoveredSession = null;
+        }
+        await ctx.sleep(5000);
+        continue;
       }
+      // Navigation succeeded — clear past exclusions so future cycles re-evaluate
+      // all systems freely (a system may become reachable again later).
+      excludedNavSystems.clear();
       
       // CRITICAL FIX: Check cargo after traveling to target system (both success and failure cases)
       // If cargo is full, return home to deposit before traveling to POI
@@ -4471,7 +4668,8 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const excludeTarget = effectiveTarget ? [effectiveTarget] : undefined;
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username
+            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username,
+            blacklist, bot.system, maxJumps
           );
           if (newTarget && newTarget !== effectiveTarget) {
             searchTarget = newTarget;

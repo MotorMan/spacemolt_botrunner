@@ -16,6 +16,7 @@ import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
 import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { returnHomeRoutine } from "./routines/return_home.js";
+import { goToRoutine } from "./routines/goto.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
@@ -505,6 +506,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
+  goto: { name: "GoTo", fn: goToRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
   escort: { name: "Escort (Fleet)", fn: escortRoutine },
   escort_flock: { name: "Escort (Flock)", fn: escortFlockRoutine },

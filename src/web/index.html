@@ -650,6 +650,12 @@
             >
               Return Home
             </div>
+            <div
+              class="sidebar-item"
+              onclick="switchSettingsTab('goto')"
+            >
+              GoTo
+            </div>
             <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
             <div class="sidebar-item" onclick="switchSettingsTab('ai_chat')">
               AI Chat Service
@@ -13132,6 +13138,7 @@
           salvager: renderSalvagerSettings,
           cleanup: renderCleanupSettings,
           return_home: renderReturnHomeSettings,
+          goto: renderGoToSettings,
           ai: renderAiSettings,
           ai_chat: renderAiChatSettings,
           hunter: renderHunterSettings,

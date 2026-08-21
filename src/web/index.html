@@ -21377,6 +21377,14 @@ When responding:
         if (panel === "queueusage" && factionSelectedBot) {
           startFactionQueueUsageAutoRefresh(factionSelectedBot);
         }
+        if (panel === "facilities" && factionSelectedBot) {
+          const fbot = bots.find((b) => b.username === factionSelectedBot);
+          if (fbot && fbot.docked) {
+            // Auto-load the station's facilities so the build list can show
+            // which bases/upgraded versions we already own (saves a manual click).
+            fetchFactionFacilities(factionSelectedBot);
+          }
+        }
         if (panel === "station" && factionSelectedBot) {
           const bot = bots.find((b) => b.username === factionSelectedBot);
           const docked = bot ? bot.docked : false;
@@ -22763,6 +22771,9 @@ When responding:
           : "";
 
         factionFacilityTypes = getCatalogFacilitiesByCategory(factionFacilityCategory);
+        if (factionFacilityCategory === "faction" || factionFacilityCategory === "production") {
+          factionFacilityTypes = factionFacilityTypes.filter((f) => !f.upgrades_from);
+        }
 
         const types = factionFacilityTypes;
         const factionCount = types.length;
@@ -24432,7 +24443,13 @@ When responding:
                       });
                     }
                     factionFacilitiesData = facilities;
+                    computeFactionOwned();
                     container.innerHTML = renderCards();
+                    // Refresh the bottom faction/production build list so the
+                    // "already owned" badges reflect the just-loaded facilities.
+                    if (factionActivePanel === "facilities" && factionSelectedBot) {
+                      renderFactionBuildableTypesList(factionSelectedBot);
+                    }
                   },
                 );
               },
@@ -25155,6 +25172,51 @@ When responding:
       let factionFacilityPublic = {};
       let factionFacilityPrice = {};
       let stationCompetitorPrices = {};
+      // Base facility ids we already have at this station: `ownedBases` covers a
+      // base we built directly OR any facility that upgrades from it; `ownedBasesLiteral`
+      // is only bases we built directly (a facility upgraded in-place is no longer
+      // present as its literal base). Drives the "already have this" badge on the
+      // faction/production build list.
+      let factionOwnedBases = new Set();
+      let factionOwnedBasesLiteral = new Set();
+
+      // Walk an (upgraded) facility type id up its `upgrades_from` chain to the
+      // base facility id, so an upgraded facility maps back to the base it came from.
+      function factionBaseOfType(typeId) {
+        let cur = typeId;
+        const seen = new Set();
+        while (cur && !seen.has(cur)) {
+          seen.add(cur);
+          const c = getCatalogFacility(cur);
+          if (c && c.upgrades_from) cur = c.upgrades_from;
+          else break;
+        }
+        return cur;
+      }
+
+      function computeFactionOwned() {
+        factionOwnedBases = new Set();
+        factionOwnedBasesLiteral = new Set();
+        for (const fac of factionFacilitiesData || []) {
+          const L = fac.facility_type || fac.type || fac.id;
+          if (!L) continue;
+          const base = factionBaseOfType(L);
+          if (!base) continue;
+          factionOwnedBases.add(base);
+          if (base === L) factionOwnedBasesLiteral.add(base);
+        }
+      }
+
+      function factionOwnedBadge(typeId) {
+        if (!typeId) return "";
+        if (factionOwnedBasesLiteral.has(typeId)) {
+          return `<span title="You already have this facility built" style="font-size:10px;font-weight:600;color:#0b3d1f;background:#4ade80;padding:2px 7px;border-radius:10px;white-space:nowrap">✓ Owned</span>`;
+        }
+        if (factionOwnedBases.has(typeId)) {
+          return `<span title="You have an upgraded version of this facility" style="font-size:10px;font-weight:600;color:#3d2a0b;background:#fbbf24;padding:2px 7px;border-radius:10px;white-space:nowrap">↑ Upgraded</span>`;
+        }
+        return "";
+      }
       let factionFacilityRenameOpen = {}; // facId -> bool
       let factionFacilitiesData = [];
       let factionQueueUsageData = null;
@@ -25267,6 +25329,7 @@ When responding:
       <div class="fc-name">${esc(detail.name || typeId)}</div>
       <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
+        ${factionOwnedBadge(typeId)}
         <button class="sm" onclick="showFactionBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
       </div>
     </div>`;
@@ -25286,6 +25349,7 @@ When responding:
       <div class="fc-name">${esc(detail.name || typeId)}</div>
       <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
+        ${factionOwnedBadge(typeId)}
         <button class="sm" onclick="showFactionBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
       </div>
     </div>`;

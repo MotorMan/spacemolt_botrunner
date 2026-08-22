@@ -8,6 +8,7 @@
  *   - patrol_systems: Cycle through a configured list of systems
  *   - cycle_patrols: Cycle through named patrol profiles
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
+ *   - fleet: Do nothing until pulled into a battle (fleet wingman), fight, then stand down
  *
  * Loop:
  *   1. Navigate to configured patrol system
@@ -43,6 +44,14 @@
  *   stopOnDeath     — stop the routine on death instead of respawning into a new hunt (default: false)
  *   combatDebug     — log all raw battle JSON to data/logs/combat_debug/{botName}_combat_debug.log (default: false)
  *   targetRandomly  — shuffle target order each scan (default: false)
+ *
+ * Fleet mode settings (mode = "fleet"):
+ *   fleetIdlePollSeconds      — standby tick length in seconds (default: 2)
+ *   fleetBattleConfirmSeconds — get_battle_status fallback poll interval, in case a
+ *                               battle push event is missed (default: 10, 0 = push only)
+ *   fleetFightPlayers         — fight players too, since the fleet leader picked the
+ *                               target (default: true; false = honour onlyNPCs and flee players)
+ *   fleetUndockToFight        — undock when a battle starts while docked (default: true)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -85,6 +94,7 @@ import {
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
+import { fleetStatus } from "./fleet.js";
 import type { PirateTier, NearbyEntity } from "./battle.js";
 import {
   parseNearby,
@@ -260,7 +270,7 @@ async function handleFuelCheckFailure(
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet";
 
 /**
  * A Creature Farm "loadout". Each bot is assigned (per-bot) to one named loadout.
@@ -341,6 +351,10 @@ function getHunterSettings(username?: string): {
   creatureFarmCargoFullPct: number;
   creatureFarmMaxPassesPerPoi: number;
   creatureFarmMaxSystemSweeps: number;
+  fleetIdlePollSeconds: number;
+  fleetBattleConfirmSeconds: number;
+  fleetFightPlayers: boolean;
+  fleetUndockToFight: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -415,6 +429,10 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
   creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
   creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
+  fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
+  fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
+  fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
+  fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
 };
 }
 
@@ -1266,7 +1284,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       await repairShip(ctx);
       await tryRefuel(ctx, { skipApprovedCheck: true });
       await ensureHunterResupply(ctx);
-      if (initialSettings.mode !== "station_protection") {
+      // station_protection stays docked on purpose; fleet mode never moves itself
+      // (the fleet leader owns dock/undock/jump), so it also stays put.
+      if (initialSettings.mode !== "station_protection" && initialSettings.mode !== "fleet") {
         await ensureUndocked(ctx);
       }
       await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
@@ -1304,6 +1324,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (initialSettings.mode === "creature_farm") {
       yield* creatureFarmRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "fleet") {
+      yield* fleetModeRoutine(ctx);
       return;
     }
 
@@ -3220,6 +3245,470 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
     // isInBattle() the instant a fight breaks out — no polling needed.
     yield "waiting";
     await ctx.sleep(2000);
+  }
+}
+
+// ── Fleet Mode Routine ────────────────────────────────────────
+//
+// "Wingman" sub-routine for a hunter flying in an in-game fleet.
+//
+// The problem it solves: when the fleet leader opens fire, the server pulls the
+// fleet members into the battle but does NOT give them a target. Without an
+// explicit order the bot just sits in the battle doing nothing (soaking damage)
+// while the leader fights alone.
+//
+// Fleet mode does NOTHING until it detects it has joined a battle:
+//
+//   1. Standby   — no scanning, no patrolling, no navigation, no dock/undock.
+//                  Detection is free: spacemolt-lib push events flip
+//                  bot.isInBattle() the instant a battle we are in starts. A slow
+//                  get_battle_status poll runs as a fallback in case a push is
+//                  missed (benign "not in battle" errors are not logged).
+//   2. Wake up   — undock if docked (a docked ship cannot fight), uncloak, pick
+//                  the enemy (whoever is shooting at us first, then whatever the
+//                  fleet leader is shooting at, then the focus-fired target),
+//                  attack it, advance to engaged range and fight it out via the
+//                  standard hunter combat loop (fightJoinedBattle).
+//   3. Stand down — loot wrecks, top up shields, use repair kits, reload ammo,
+//                  then go straight back to standby. It never travels on its own:
+//                  fleet movement stays the leader's job (fleet jump/dock/undock).
+//
+// Everything else (flee threshold, in-combat repair kits/shield charges, salvage,
+// death handling) reuses the normal hunter settings.
+
+/** Battle snapshot shape returned by common.getBattleStatus. */
+type FleetBattleSnapshot = NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>;
+
+/** Refresh the dashboard status line this often while standing by. */
+const FLEET_STANDBY_STATUS_REFRESH_MS = 60 * 1000;
+
+/** How often standby checks for death (a death can only happen in a battle). */
+const FLEET_DEATH_CHECK_MS = 30 * 1000;
+
+/**
+ * Battle probe that does NOT depend on push state.
+ *
+ * `getBattleStatus` short-circuits to null for library-backed bots whenever
+ * `isInBattle()` is false, which is exactly the case we must double-check in
+ * fleet mode (a missed battle_started push would otherwise leave the bot asleep
+ * inside a live fight). So we hit the API directly. A "not in battle" response is
+ * a benign, unlogged error (see Bot.libExec), so this is safe to poll.
+ */
+async function probeFleetBattle(ctx: RoutineContext): Promise<FleetBattleSnapshot | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_battle_status");
+  if (resp.error || !resp.result) return null;
+
+  const result = resp.result as Record<string, unknown>;
+  const innerErr = result.error as Record<string, unknown> | undefined;
+  if (innerErr && innerErr.code === "not_in_battle") return null;
+
+  const battleId = (result.battle_id as string) || "";
+  if (!battleId) return null;
+
+  return {
+    battle_id: battleId,
+    tick: (result.tick as number) ?? undefined,
+    system_id: (result.system_id as string) || undefined,
+    sides: (result.sides as FleetBattleSnapshot["sides"]) || [],
+    participants: (result.participants as FleetBattleSnapshot["participants"]) || [],
+    your_side_id: (result.your_side_id as number) ?? undefined,
+    your_zone: result.your_zone as FleetBattleSnapshot["your_zone"],
+    your_stance: result.your_stance as FleetBattleSnapshot["your_stance"],
+    your_target_id: (result.your_target_id as string) || undefined,
+    auto_pilot: (result.auto_pilot as boolean) ?? undefined,
+    // Kept as undefined when the server omits it so we can tell "not our battle"
+    // (false) apart from "the server didn't say" (absent).
+    is_participant: (result.is_participant as boolean | undefined),
+  };
+}
+
+/** Keep bot.currentBattle in sync with what the API just told us. */
+function syncFleetBattleState(bot: Bot, status: FleetBattleSnapshot | null): void {
+  if (status) {
+    bot.currentBattle.inBattle = true;
+    bot.currentBattle.battleId = status.battle_id;
+    if (status.participants?.length) {
+      bot.currentBattle.participants = status.participants as unknown as Array<Record<string, unknown>>;
+    }
+    bot.currentBattle.lastUpdate = Date.now();
+    return;
+  }
+  if (bot.currentBattle.inBattle) {
+    bot.clearBattleState("fleet mode probe: API reports no active battle");
+  }
+}
+
+/**
+ * True when this battle is actually ours to fight (not just a battle we can see).
+ *
+ * `pushDetected` is bot.isInBattle() from BEFORE the probe: the lib only pushes
+ * battle_started/update/damage for battles we are involved in, so it is a valid
+ * last-resort signal when the API response omits the participation fields. The
+ * one push that can fire for someone else's fight is battle_alert (a raid on the
+ * station we are docked at) — and that case is caught by an explicit
+ * `is_participant: false` from the API.
+ */
+function isFleetBattleParticipant(
+  status: FleetBattleSnapshot,
+  username: string,
+  pushDetected: boolean,
+): boolean {
+  if (status.is_participant === true) return true;
+  if (status.is_participant === false) return false;
+  if (status.your_side_id !== undefined && status.your_side_id !== null) return true;
+  const lower = (username || "").toLowerCase();
+  if (lower && (status.participants || []).some(p => (p.username || "").toLowerCase() === lower)) {
+    return true;
+  }
+  return pushDetected;
+}
+
+interface FleetRoster {
+  /** Lowercased usernames of every fleet member (including us). */
+  members: Set<string>;
+  leader: string;
+  inFleet: boolean;
+}
+
+/** Read the in-game fleet roster so we can tell friend from foe in a battle. */
+async function getFleetRoster(ctx: RoutineContext): Promise<FleetRoster> {
+  const me = (ctx.bot.username || "").toLowerCase();
+  const empty: FleetRoster = { members: new Set(me ? [me] : []), leader: "", inFleet: false };
+  try {
+    const status = await fleetStatus(ctx);
+    if (!status || !status.in_fleet) return empty;
+    const members = new Set<string>(me ? [me] : []);
+    for (const m of status.members || []) {
+      const name = (m.username || "").toLowerCase();
+      if (name) members.add(name);
+    }
+    const leader = status.leader || (status.members || []).find(m => m.is_leader)?.username || "";
+    return { members, leader, inFleet: true };
+  } catch {
+    return empty;
+  }
+}
+
+/** Our own side in this battle (API value first, then roster inference). */
+function resolveFleetBattleSide(
+  status: FleetBattleSnapshot,
+  username: string,
+  roster: FleetRoster,
+): number | undefined {
+  if (status.your_side_id !== undefined && status.your_side_id !== null) return status.your_side_id;
+
+  const lower = (username || "").toLowerCase();
+  const mine = (status.participants || []).find(p => (p.username || "").toLowerCase() === lower);
+  if (mine) return mine.side_id;
+
+  // Not listed (the server sometimes trims the roster) — fall back to whichever
+  // side a fleet-mate is on. That is the side the leader is fighting for.
+  const mate = (status.participants || []).find(p => roster.members.has((p.username || "").toLowerCase()));
+  return mate?.side_id;
+}
+
+/**
+ * Choose who to shoot in a fleet battle, in priority order:
+ *   1. Whoever is currently targeting US (the attacker).
+ *   2. Whatever the fleet leader is shooting at (follow the leader's call).
+ *   3. The enemy our side is focus-firing (most friendly targets pointed at it).
+ *   4. The weakest remaining enemy, to finish it off.
+ */
+function pickFleetBattleEnemy(
+  status: FleetBattleSnapshot,
+  ourSideId: number | undefined,
+  ourIds: string[],
+  roster: FleetRoster,
+): { id: string; name: string; reason: string } | null {
+  const participants = status.participants || [];
+
+  // Friendly = a fleet-mate, or anyone sharing a side with us or a fleet-mate.
+  // Allies who joined the same side (police, faction-mates) must never be shot at.
+  const friendlySides = new Set<number>();
+  if (ourSideId !== undefined) friendlySides.add(ourSideId);
+  for (const p of participants) {
+    if (roster.members.has((p.username || "").toLowerCase()) && typeof p.side_id === "number") {
+      friendlySides.add(p.side_id);
+    }
+  }
+  const isFriendly = (p: FleetBattleSnapshot["participants"][number]): boolean => {
+    if (roster.members.has((p.username || "").toLowerCase())) return true;
+    return typeof p.side_id === "number" && friendlySides.has(p.side_id);
+  };
+
+  const enemies = participants.filter(p => !p.is_destroyed && (p.player_id || p.username) && !isFriendly(p));
+  if (enemies.length === 0) return null;
+
+  const asTarget = (p: FleetBattleSnapshot["participants"][number], reason: string) => ({
+    id: p.player_id || p.username || "",
+    name: p.username || p.player_id || "enemy",
+    reason,
+  });
+  const matches = (p: FleetBattleSnapshot["participants"][number], id: string | undefined): boolean =>
+    !!id && (p.player_id === id || p.username === id);
+
+  // 1. The attacker: an enemy whose target is us.
+  const ourIdSet = new Set(ourIds.filter(Boolean));
+  if (ourIdSet.size > 0) {
+    const onUs = enemies.find(p => p.target_id && ourIdSet.has(p.target_id));
+    if (onUs) return asTarget(onUs, "attacking us");
+  }
+
+  // With no side information at all we cannot prove who is hostile, so only the
+  // "attacking us" case above is safe. Bail out and let fightJoinedBattle
+  // re-acquire a hostile from the nearby scan instead of risking friendly fire.
+  if (friendlySides.size === 0) return null;
+
+  // 2. The leader's target.
+  const leaderLower = (roster.leader || "").toLowerCase();
+  const leader = leaderLower
+    ? participants.find(p => (p.username || "").toLowerCase() === leaderLower)
+    : undefined;
+  if (leader?.target_id) {
+    const leaderTarget = enemies.find(p => matches(p, leader.target_id));
+    if (leaderTarget) return asTarget(leaderTarget, `fleet leader ${leader.username} is on it`);
+  }
+
+  // 3. Focus fire with whoever is already shooting.
+  const targetCounts = new Map<string, number>();
+  for (const p of participants) {
+    if (!isFriendly(p) || !p.target_id) continue;
+    targetCounts.set(p.target_id, (targetCounts.get(p.target_id) ?? 0) + 1);
+  }
+  let focused: FleetBattleSnapshot["participants"][number] | null = null;
+  let focusedCount = 0;
+  for (const e of enemies) {
+    const count = Math.max(
+      e.player_id ? targetCounts.get(e.player_id) ?? 0 : 0,
+      e.username ? targetCounts.get(e.username) ?? 0 : 0,
+    );
+    if (count > focusedCount) {
+      focusedCount = count;
+      focused = e;
+    }
+  }
+  if (focused) return asTarget(focused, `focus fire (${focusedCount} ally target${focusedCount === 1 ? "" : "s"})`);
+
+  // 4. Weakest enemy.
+  const hullOf = (p: FleetBattleSnapshot["participants"][number]): number =>
+    p.hull_pct ?? p.hull_percent ?? 100;
+  const weakest = [...enemies].sort((a, b) => hullOf(a) - hullOf(b))[0];
+  return asTarget(weakest ?? enemies[0], "weakest hostile on the other side");
+}
+
+/**
+ * Wake up and fight the battle the fleet dragged us into.
+ * Returns true if the battle ended in our favour (or simply ended).
+ */
+async function fleetModeFight(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  status: FleetBattleSnapshot,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  // A docked ship cannot participate in a battle.
+  if (bot.docked) {
+    if (!settings.fleetUndockToFight) {
+      ctx.log("combat", "In a fleet battle while docked, but fleetUndockToFight is disabled — holding at the station");
+      return false;
+    }
+    ctx.log("combat", "Fleet battle started while docked — undocking to fight!");
+    const undockResp = await bot.exec("undock");
+    const undockMsg = (undockResp.error?.message || "").toLowerCase();
+    if (undockResp.error && !undockMsg.includes("already") && !undockMsg.includes("not docked")) {
+      ctx.log("error", `Failed to undock for the fleet battle: ${undockResp.error.message}`);
+      return false;
+    }
+    bot.docked = false;
+  }
+
+  // Guns don't fire through a cloak. fightJoinedBattle re-cloaks after the fight
+  // when cloakOnStart is enabled.
+  if (bot.isCloaked) {
+    const uncloakResp = await bot.exec("cloak", { enable: false });
+    if (!uncloakResp.error) ctx.log("combat", "Uncloaked to join the fleet's battle");
+  }
+
+  const roster = await getFleetRoster(ctx);
+  const ourSideId = resolveFleetBattleSide(status, bot.username, roster);
+  const ourParticipant = (status.participants || [])
+    .find(p => (p.username || "").toLowerCase() === (bot.username || "").toLowerCase());
+
+  const enemy = pickFleetBattleEnemy(status, ourSideId, [ourParticipant?.player_id || "", bot.username], roster);
+  if (enemy) {
+    ctx.log("combat", `🎯 Fleet target: ${enemy.name} (${enemy.reason})${ourSideId !== undefined ? ` | our side ${ourSideId}` : ""}`);
+  } else {
+    ctx.log("combat", "No hostile listed in the battle roster — fightJoinedBattle will re-acquire the attacker from a nearby scan");
+  }
+
+  // Top off the magazines from cargo before shooting. Unlike patrol modes we never
+  // abandon the fleet over ammo — we are already in the fight.
+  const hasAmmo = await ensureAmmoLoaded(
+    ctx,
+    settings.ammoThreshold,
+    settings.maxReloadAttempts,
+    settings.ammoReloadAbsoluteThreshold,
+    settings.ammoReloadPercentThreshold,
+  );
+  if (!hasAmmo) {
+    ctx.log("combat", "⚠️ No ammo loaded for this fleet battle — fighting anyway (fleet mode never abandons the fleet mid-battle)");
+  }
+
+  return await fightJoinedBattle(
+    ctx,
+    enemy ? ({ id: enemy.id, name: enemy.name } as NearbyEntity) : null,
+    settings.fleeThreshold,
+    settings.fleeFromTier,
+    settings.maxAttackTier,
+    settings.repairThreshold,
+    true,                               // canFlee — bail out when hull hits fleeThreshold
+    settings.shieldRechargePct ?? 80,   // percentage; fightJoinedBattle divides by 100
+    !settings.fleetFightPlayers,        // onlyNPCs — the leader picked the target, so default off
+    settings.cloakOnStart,
+  );
+}
+
+async function* fleetModeRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+
+  const roster = await getFleetRoster(ctx);
+  if (roster.inFleet) {
+    ctx.log("info", `Fleet mode: in fleet (leader ${roster.leader || "unknown"}, ${roster.members.size} member(s)).`);
+  } else {
+    ctx.log("warn", "Fleet mode: not currently in a fleet — standing by anyway; the bot still reacts to any battle it gets pulled into.");
+  }
+  ctx.log(
+    "info",
+    `Fleet mode: standby at ${bot.poi || "(no POI)"} in ${bot.system || "(unknown system)"} — doing nothing until a battle starts, then engaging the fleet's target.`,
+  );
+
+  let battleCount = 0;
+  let lastProbe = 0;
+  let lastStatusRefresh = Date.now();
+  let lastDeathCheck = Date.now();
+  let standbyLogged = true;
+  let ignoredBattleId = "";
+  let consecutiveReengages = 0;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const idleMs = Math.max(1000, (settings.fleetIdlePollSeconds || 2) * 1000);
+    const confirmSeconds = settings.fleetBattleConfirmSeconds ?? 10;
+    const confirmMs = confirmSeconds > 0 ? Math.max(5000, confirmSeconds * 1000) : 0;
+
+    // ── Death recovery (respects stopOnDeath) ──
+    // Throttled: standby must stay quiet on the wire. A death can only happen in
+    // a battle, and the post-battle path forces a check by clearing lastDeathCheck.
+    if (Date.now() - lastDeathCheck >= FLEET_DEATH_CHECK_MS) {
+      lastDeathCheck = Date.now();
+      const death = await handleDeath(ctx, settings);
+      if (death === "stop") return;
+      if (death === "wait") continue;
+    }
+
+    // ── Detect: push flag first (free), slow API probe as missed-push insurance ──
+    const pushDetected = bot.isInBattle();
+    let status: FleetBattleSnapshot | null = null;
+    if (pushDetected) {
+      status = await probeFleetBattle(ctx);
+      lastProbe = Date.now();
+      syncFleetBattleState(bot, status);
+    } else if (confirmMs > 0 && Date.now() - lastProbe >= confirmMs) {
+      lastProbe = Date.now();
+      status = await probeFleetBattle(ctx);
+      if (status) {
+        ctx.log("combat", "Battle found by fallback poll (no push event arrived) — waking up");
+        syncFleetBattleState(bot, status);
+      }
+    }
+
+    // ── Standby: genuinely do nothing ──
+    if (!status || !isFleetBattleParticipant(status, bot.username, pushDetected)) {
+      if (status && ignoredBattleId !== status.battle_id) {
+        ignoredBattleId = status.battle_id;
+        ctx.log("combat", `Battle ${status.battle_id} visible but we are not a participant — staying on standby.`);
+      }
+      if (!standbyLogged) {
+        ctx.log("info", "Fleet mode: standby — waiting for the fleet's next fight.");
+        standbyLogged = true;
+      }
+      if (Date.now() - lastStatusRefresh >= FLEET_STANDBY_STATUS_REFRESH_MS) {
+        lastStatusRefresh = Date.now();
+        yield "get_status";
+        await bot.refreshStatus();
+        logStatus(ctx);
+      }
+      yield "waiting";
+      await ctx.sleep(idleMs);
+      continue;
+    }
+
+    // ── Wake up and fight ──
+    battleCount++;
+    standbyLogged = false;
+    ignoredBattleId = "";
+    ctx.log("combat", `⚔️ Fleet mode wake-up: joined battle ${status.battle_id} (fleet battle #${battleCount}) — engaging!`);
+
+    yield "engage";
+    const won = await fleetModeFight(ctx, settings, status);
+
+    // ── Stand down ──
+    // Force a death check on the next iteration: this is the only place a fleet
+    // wingman can actually die.
+    lastDeathCheck = 0;
+    await ctx.sleep(1000);
+    const after = await probeFleetBattle(ctx);
+    lastProbe = Date.now();
+    syncFleetBattleState(bot, after);
+    if (after && isFleetBattleParticipant(after, bot.username, bot.isInBattle())) {
+      // Still in it: either the fight is genuinely ongoing or we could not act
+      // (e.g. the server refused the undock). Back off progressively so a stuck
+      // battle can never turn into a hot loop of engage attempts.
+      consecutiveReengages++;
+      const backoffMs = Math.min(30000, 3000 * consecutiveReengages);
+      ctx.log("combat", `Battle ${after.battle_id} still active after the combat loop — re-engaging in ${Math.round(backoffMs / 1000)}s.`);
+      await ctx.sleep(backoffMs);
+      continue;
+    }
+    consecutiveReengages = 0;
+
+    if (bot.hull <= 0 || bot.isDead) {
+      // Dead — let the throttled death handler take over on the next iteration
+      // instead of trying to loot/reload a destroyed ship.
+      continue;
+    }
+
+    ctx.log(
+      "combat",
+      won
+        ? `✅ Fleet battle #${battleCount} over — standing down.`
+        : `Fleet battle #${battleCount} ended (retreated or disengaged) — standing down.`,
+    );
+
+    if (!settings.disableWreckSalvaging && !bot.docked) {
+      yield "loot";
+      await scavengeWrecks(ctx);
+    }
+    await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+    await useRepairKits(ctx);
+    await ensureAmmoLoaded(
+      ctx,
+      settings.ammoThreshold,
+      settings.maxReloadAttempts,
+      settings.ammoReloadAbsoluteThreshold,
+      settings.ammoReloadPercentThreshold,
+    );
+    await bot.refreshShip();
+    ctx.log(
+      "info",
+      `Fleet mode: back on standby — hull ${bot.hull}/${bot.maxHull} | shields ${bot.shield}/${bot.maxShield} | ammo ${bot.ammo}`,
+    );
+    lastStatusRefresh = Date.now();
+    standbyLogged = true;
   }
 }
 

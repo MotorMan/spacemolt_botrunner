@@ -5252,6 +5252,7 @@
         <option value="patrol_radius"${hunterMode === "patrol_radius" ? " selected" : ""}>Patrol radius</option>
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
+        <option value="fleet"${hunterMode === "fleet" ? " selected" : ""}>Fleet Mode (idle until battle)</option>
       </select>`;
 
           const patrolCycleMode = botSettings.patrolCycleMode || "random";
@@ -5264,9 +5265,14 @@
         </select>`;
           }
 
-          // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems)
+          // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems).
+          // Fleet mode never patrols (it idles until the fleet pulls it into a battle),
+          // so neither the patrol profile nor the farm loadout selector is shown for it.
           const hunterSettings = settings.hunter || {};
-          if (hunterMode !== "creature_farm") {
+          if (hunterMode === "fleet") {
+            actions += `
+      <span class="profile-ore-label" style="margin-left:8px" title="Fleet mode idles until the fleet leader starts a battle, then targets the attacker and fights. It never patrols or travels on its own.">Idle until fleet battle</span>`;
+          } else if (hunterMode !== "creature_farm") {
           const hunterPatrols = Array.isArray(hunterSettings.hunterPatrols)
             ? hunterSettings.hunterPatrols
             : [];
@@ -30773,6 +30779,7 @@ ignoreBlacklist: document.getElementById(
           <option value="patrol_radius">Patrol radius</option>
           <option value="station_protection">Station Protection</option>
           <option value="creature_farm">Creature Farm</option>
+          <option value="fleet">Fleet Mode (idle until battle)</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>

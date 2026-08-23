@@ -1410,14 +1410,15 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
   let justResupplied = false;
 
   // Routing state across the whole run: which profile system we're currently
-  // farming, and how many farm "loops" we've done there. A loop = one full
-  // iteration of the outer while body (i.e. farm the system until cargo is full
-  // or all sweeps are exhausted, then route home / re-evaluate). After
-  // `creatureFarmLoopsPerSystem` loops we advance to the next system in the
-  // assigned Hunter Patrol Profile, cycling back to the first when we reach the
-  // end. These persist for the lifetime of the generator (the routine run).
+  // farming. A "loop" = one full sweep of every POI in the system (re-scanning
+  // each POI up to creatureFarmMaxPassesPerPoi times to mop up respawns). We do
+  // `creatureFarmLoopsPerSystem` loops in the current system, then advance to
+  // the next system in the assigned Hunter Patrol Profile, cycling back to the
+  // first when we reach the end. Whether we cycle systems forever (singleLoop =
+  // false) or return home to restock after each full profile cycle (singleLoop =
+  // true) is governed by the hunter.singleLoop setting. These persist for the
+  // lifetime of the generator (the routine run).
   let sysIndex = 0;
-  let loopsInSystem = 0;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -1434,10 +1435,16 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const homeStation = settings.homeStation || "";
     const targetSystem = profile.patrolSystems[sysIndex];
     const targetPois = profile.targetPois || [];
+    // `loopsPerSystem` is the number of full POI sweeps to perform in this system
+    // before advancing to the next profile system. This is the "loops" setting
+    // the user configures (creatureFarmLoopsPerSystem); it drives the inner
+    // sweep loop directly. `maxSweeps` is a hidden, non-UI safety ceiling so the
+    // loop can never run away even if a bad loopsPerSystem value is supplied.
     const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
     const cargoFullPct = (settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 95) / 100;
     const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
     const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
+    const loopCap = Math.min(loopsPerSystem, maxSweeps);
 
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
@@ -1526,10 +1533,12 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     // after this farm session rather than being suppressed forever.
     justResupplied = false;
 
-    // ── Farm: sweep the system repeatedly until cargo full (creatures respawn) ──
+    // ── Farm: sweep the system `loopCap` times (creatureFarmLoopsPerSystem),
+    //    re-scanning each POI to catch respawns, then advance to the next
+    //    profile system. ──
     let sweeps = 0;
     let cargoFull = false;
-    while (bot.state === "running" && sweeps < maxSweeps && !cargoFull) {
+    while (bot.state === "running" && sweeps < loopCap && !cargoFull) {
       sweeps++;
       yield "scan_system";
       const { pois } = await getSystemInfo(ctx);
@@ -1543,7 +1552,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
         break;
       }
 
-      ctx.log("info", `Creature farm sweep ${sweeps}/${maxSweeps} — ${patrolPois.length} POI(s) in ${targetSystem}`);
+      ctx.log("info", `Creature farm sweep ${sweeps}/${loopCap} — ${patrolPois.length} POI(s) in ${targetSystem}`);
       let sweepKills = 0;
 
       for (const poi of patrolPois) {
@@ -1666,20 +1675,26 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
     }
 
-    // ── Routing: count this loop, then advance to the next profile system ──
-    // after `loopsPerSystem` loops in the current one (cycling). A cargo-full
-    // home trip above still counts as one loop.
-    loopsInSystem++;
-    if (loopsInSystem >= loopsPerSystem) {
-      loopsInSystem = 0;
-      const prevSystem = targetSystem;
-      sysIndex = (sysIndex + 1) % profile.patrolSystems.length;
-      const nextSystem = profile.patrolSystems[sysIndex];
-      if (nextSystem !== prevSystem) {
-        ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${profile.patrolSystems.length})`);
-      } else {
-        ctx.log("debug", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
-      }
+    // ── Routing: advance to the next profile system ──
+    // The inner loop above already performed `creatureFarmLoopsPerSystem`
+    // (loopCap) sweeps in the current system, so one "loop" of the system is
+    // complete. Advance to the next system in the profile, cycling back to the
+    // first at the end. We cycle systems forever; when singleLoop is enabled we
+    // additionally return home to restock after finishing a full profile cycle
+    // (mirrors the patrol_systems Single Loop Mode behaviour).
+    const prevSystem = targetSystem;
+    const wasLastSystem = (sysIndex + 1) >= profile.patrolSystems.length;
+    sysIndex = (sysIndex + 1) % profile.patrolSystems.length;
+    const nextSystem = profile.patrolSystems[sysIndex];
+    if (nextSystem !== prevSystem) {
+      ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${profile.patrolSystems.length})`);
+    } else {
+      ctx.log("debug", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
+    }
+
+    if (settings.singleLoop && wasLastSystem) {
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
     }
   }
 }

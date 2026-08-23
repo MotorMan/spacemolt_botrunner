@@ -8,6 +8,7 @@
  *   - patrol_systems: Cycle through a configured list of systems
  *   - cycle_patrols: Cycle through named patrol profiles
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
+ *   - creature_farm: Farm creatures across a Hunter Patrol Profile's systems
  *   - fleet: Do nothing until pulled into a battle (fleet wingman), fight, then stand down
  *
  * Loop:
@@ -273,28 +274,26 @@ async function handleFuelCheckFailure(
 export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet";
 
 /**
- * A Creature Farm "loadout". Each bot is assigned (per-bot) to one named loadout.
- * The loadout defines where the bot banks: a home base used to draw ammo and
- * deposit loot, plus the single target system it farms creatures in.
+ * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
+ * Each bot is assigned (per-bot) to one named profile via
+ * hunter.botHunterPatrolAssignments. The profile's `patrolSystems` is the list of
+ * systems the creature-farm bot routes across, farming `creatureFarmLoopsPerSystem`
+ * loops in each before advancing to the next system (cycling back to the first).
  *
- * Designed to be expanded later:
- *   - targetSystems: string[]  (farm multiple systems in one loadout)
- *   - targetPois:    string[]  (only farm specific POIs within the system)
- * For now a single target system + optional targetPois is supported.
+ * The home base used to bank loot and restock ammo comes from the hunter
+ * homeSystem / homeStation settings (same as every other hunter mode). Optional
+ * per-profile `targetPois` restrict farming to specific POIs.
  */
-export interface CreatureFarmLoadout {
-  name: string;
-  homeSystem: string;
-  homeStation: string;
-  targetSystem: string;
-  targetPois?: string[];
-}
 
 export type PatrolCycleMode = "random" | "sequential";
 
 export interface HunterPatrolProfile {
   name: string;
   patrolSystems: string[];
+  /** Optional per-profile POI filter. When set, only these POIs are farmed /
+   *  patrolled (matched by POI id or name). Used by the creature_farm sub-routine
+   *  to restrict a profile to specific creature spawns. */
+  targetPois?: string[];
 }
 
 function seededRandom(seed: number): () => number {
@@ -345,9 +344,7 @@ function getHunterSettings(username?: string): {
   targetRandomly: boolean;
   combatDebug: boolean;
   maxCreaturesPerScan: number;
-  creatureFarmLoadouts: CreatureFarmLoadout[];
-  botCreatureFarmAssignments: Record<string, string>;
-  creatureFarmAssignment: string;
+  creatureFarmLoopsPerSystem: number;
   creatureFarmCargoFullPct: number;
   creatureFarmMaxPassesPerPoi: number;
   creatureFarmMaxSystemSweeps: number;
@@ -373,14 +370,6 @@ function getHunterSettings(username?: string): {
   } else if (Array.isArray(h.patrolSystems)) {
     // Legacy single list
     resolvedPatrolSystems = h.patrolSystems;
-  }
-
-  // Creature Farm loadouts (named, per-bot assigned — same shape as hunterPatrols)
-  const creatureFarmLoadouts: CreatureFarmLoadout[] = Array.isArray(h.creatureFarmLoadouts) ? h.creatureFarmLoadouts : [];
-  const botCreatureFarmAssignments: Record<string, string> = (h.botCreatureFarmAssignments as Record<string, string>) || {};
-  let resolvedCreatureFarmAssignment = "";
-  if (creatureFarmLoadouts.length > 0 && username) {
-    resolvedCreatureFarmAssignment = botCreatureFarmAssignments[username] || creatureFarmLoadouts[0]?.name || "";
   }
 
   return {
@@ -423,9 +412,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   targetRandomly: (h.targetRandomly as boolean) ?? false,
   combatDebug: (h.combatDebug as boolean) ?? false,
   maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
-  creatureFarmLoadouts,
-  botCreatureFarmAssignments,
-  creatureFarmAssignment: resolvedCreatureFarmAssignment,
+  creatureFarmLoopsPerSystem: ((botOverrides.creatureFarmLoopsPerSystem as number) || (h.creatureFarmLoopsPerSystem as number) || 3),
   creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
   creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
   creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
@@ -473,25 +460,20 @@ export function assignBotToHunterPatrol(username: string, patrolProfileName: str
   writeSettings({ hunter: h });
 }
 
-/** Resolve the Creature Farm loadout assigned to a bot (falls back to first loadout). */
-export function getCreatureFarmLoadout(username: string): CreatureFarmLoadout | null {
+/**
+ * Resolve the Hunter Patrol Profile assigned to a bot (falls back to the first
+ * profile). The creature_farm sub-routine reuses this structure as its route:
+ * `patrolSystems` is the ordered list of systems to farm across, and optional
+ * `targetPois` restricts which POIs are visited.
+ */
+export function getHunterPatrolProfile(username: string): HunterPatrolProfile | null {
   const all = readSettings();
   const h = (all.hunter || {}) as any;
-  const loadouts: CreatureFarmLoadout[] = Array.isArray(h.creatureFarmLoadouts) ? h.creatureFarmLoadouts : [];
-  if (loadouts.length === 0) return null;
-  const assignments: Record<string, string> = (h.botCreatureFarmAssignments as Record<string, string>) || {};
-  const name = assignments[username] || loadouts[0].name;
-  return loadouts.find(l => l.name === name) || loadouts[0] || null;
-}
-
-/** Assign a bot to a named Creature Farm loadout. */
-export function assignBotToCreatureFarmLoadout(username: string, loadoutName: string): void {
-  const all = readSettings();
-  const h = (all.hunter || {}) as any;
-  if (!Array.isArray(h.creatureFarmLoadouts)) h.creatureFarmLoadouts = [];
-  if (!h.botCreatureFarmAssignments) h.botCreatureFarmAssignments = {};
-  h.botCreatureFarmAssignments[username] = loadoutName;
-  writeSettings({ hunter: h });
+  const profiles: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  if (profiles.length === 0) return null;
+  const assignments: Record<string, string> = (h.botHunterPatrolAssignments as Record<string, string>) || {};
+  const name = assignments[username] || profiles[0].name;
+  return profiles.find(p => p.name === name) || profiles[0] || null;
 }
 
 /** Returns true if the bot is low on field repair consumables and should return to resupply. */
@@ -1348,11 +1330,15 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 //     up respawns, then moves on. The goal is to clear as many creatures as
 //     possible for their loot (used to make food).
 //   * It farms until the cargo is full (or field consumables / ammo run low),
-//     then returns to the loadout's home base to deposit loot and restock ammo.
-//   * It is driven by a per-bot "loadout" (named profile) so many bots in one
-//     client can each farm a different system while sharing the same home base.
+//     then returns to the home base (hunter homeSystem / homeStation) to deposit
+//     loot and restock ammo.
+//   * Its route is a Hunter Patrol Profile (hunter.hunterPatrols) assigned to the
+//     bot. The profile's `patrolSystems` is the ordered list of systems farmed;
+//     the bot does `creatureFarmLoopsPerSystem` loops in each system before
+//     advancing to the next (cycling back to the first). Optional per-profile
+//     `targetPois` restricts farming to specific POIs.
 
-/** Navigate to the loadout's home base, deposit loot, and restock ammo/shields/repair. */
+/** Navigate to the home base, deposit loot, and restock ammo/shields/repair. */
 async function returnToCreatureFarmHome(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
@@ -1423,18 +1409,32 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
   // return-home check once so the bot actually leaves for the target system.
   let justResupplied = false;
 
+  // Routing state across the whole run: which profile system we're currently
+  // farming, and how many farm "loops" we've done there. A loop = one full
+  // iteration of the outer while body (i.e. farm the system until cargo is full
+  // or all sweeps are exhausted, then route home / re-evaluate). After
+  // `creatureFarmLoopsPerSystem` loops we advance to the next system in the
+  // assigned Hunter Patrol Profile, cycling back to the first when we reach the
+  // end. These persist for the lifetime of the generator (the routine run).
+  let sysIndex = 0;
+  let loopsInSystem = 0;
+
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
-    const loadout = getCreatureFarmLoadout(bot.username);
-    if (!loadout || !loadout.targetSystem) {
-      ctx.log("error", "creature_farm mode but no Creature Farm loadout assigned (set hunter.creatureFarmLoadouts + hunter.botCreatureFarmAssignments). Waiting 60s...");
+    const profile = getHunterPatrolProfile(bot.username);
+    if (!profile || !profile.patrolSystems || profile.patrolSystems.length === 0) {
+      ctx.log("error", "creature_farm mode but no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments). Waiting 60s...");
       await ctx.sleep(60000);
       continue;
     }
+    // Re-clamp the index if the assigned profile changed underneath us.
+    if (sysIndex >= profile.patrolSystems.length) sysIndex = 0;
 
-    const homeSystem = loadout.homeSystem || settings.homeSystem || "";
-    const homeStation = loadout.homeStation || settings.homeStation || "";
-    const targetSystem = loadout.targetSystem;
+    const homeSystem = settings.homeSystem || "";
+    const homeStation = settings.homeStation || "";
+    const targetSystem = profile.patrolSystems[sysIndex];
+    const targetPois = profile.targetPois || [];
+    const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
     const cargoFullPct = (settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 95) / 100;
     const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
     const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
@@ -1534,8 +1534,8 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       yield "scan_system";
       const { pois } = await getSystemInfo(ctx);
       let patrolPois = pois.filter(p => !isStationPoi(p));
-      if (loadout.targetPois && loadout.targetPois.length > 0) {
-        patrolPois = patrolPois.filter(p => loadout.targetPois!.includes(p.id) || loadout.targetPois!.includes(p.name));
+      if (targetPois && targetPois.length > 0) {
+        patrolPois = patrolPois.filter(p => targetPois.includes(p.id) || targetPois.includes(p.name));
       }
       if (patrolPois.length === 0) {
         ctx.log("info", "No non-station POIs in target system — waiting 30s");
@@ -1664,6 +1664,22 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       ctx.log("system", `Cargo full (${Math.round(cp * 100)}%) — returning home to deposit loot + restock ammo`);
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+    }
+
+    // ── Routing: count this loop, then advance to the next profile system ──
+    // after `loopsPerSystem` loops in the current one (cycling). A cargo-full
+    // home trip above still counts as one loop.
+    loopsInSystem++;
+    if (loopsInSystem >= loopsPerSystem) {
+      loopsInSystem = 0;
+      const prevSystem = targetSystem;
+      sysIndex = (sysIndex + 1) % profile.patrolSystems.length;
+      const nextSystem = profile.patrolSystems[sysIndex];
+      if (nextSystem !== prevSystem) {
+        ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${profile.patrolSystems.length})`);
+      } else {
+        ctx.log("debug", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
+      }
     }
   }
 }

@@ -5265,14 +5265,15 @@
         </select>`;
           }
 
-          // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems).
-          // Fleet mode never patrols (it idles until the fleet pulls it into a battle),
-          // so neither the patrol profile nor the farm loadout selector is shown for it.
+          // Per-bot hunter patrol profile selector. Used by patrol_systems,
+          // cycle_patrols, and the creature_farm sub-routine (its route is a
+          // Hunter Patrol Profile). Fleet mode idles until the fleet pulls it
+          // into a battle, so no selector is shown for it.
           const hunterSettings = settings.hunter || {};
           if (hunterMode === "fleet") {
             actions += `
       <span class="profile-ore-label" style="margin-left:8px" title="Fleet mode idles until the fleet leader starts a battle, then targets the attacker and fights. It never patrols or travels on its own.">Idle until fleet battle</span>`;
-          } else if (hunterMode !== "creature_farm") {
+          } else {
           const hunterPatrols = Array.isArray(hunterSettings.hunterPatrols)
             ? hunterSettings.hunterPatrols
             : [];
@@ -5298,18 +5299,6 @@
           actions += `
       <span class="profile-ore-label" style="margin-left:8px">Patrol Profile:</span>
       <select id="profile-hunterPatrol" onchange="saveProfileHunterPatrolProfile()">${hunterPatrolOpts}</select>`;
-          } else {
-            // Creature Farm loadout selector
-            const cfLoadouts = Array.isArray(hunterSettings.creatureFarmLoadouts) ? hunterSettings.creatureFarmLoadouts : [];
-            const cfAssign = hunterSettings.botCreatureFarmAssignments || {};
-            const currentCf = cfAssign[bot.username] || cfLoadouts[0]?.name || "Default Creature Farm";
-            let cfOpts = cfLoadouts
-              .map((p) => `<option value="${esc(p.name)}"${p.name === currentCf ? " selected" : ""}>${esc(p.name)}</option>`)
-              .join("");
-            if (cfLoadouts.length === 0) cfOpts = '<option value="Default Creature Farm" selected>Default Creature Farm</option>';
-            actions += `
-      <span class="profile-ore-label" style="margin-left:8px">Farm Loadout:</span>
-      <select id="profile-creatureFarmLoadout" onchange="saveProfileCreatureFarmLoadout()">${cfOpts}</select>`;
           }
 
           const singleLoop = botSettings.singleLoop ?? false;
@@ -30687,9 +30676,6 @@ ignoreBlacklist: document.getElementById(
         const hunterPatrols = Array.isArray(h.hunterPatrols)
           ? h.hunterPatrols
           : [];
-        const creatureFarmLoadouts = Array.isArray(h.creatureFarmLoadouts)
-          ? h.creatureFarmLoadouts
-          : [];
         const singleLoop = h.singleLoop ?? false;
         const hunterHomeSystem = h.homeSystem || "";
         const hunterHomeStation = h.homeStation || "";
@@ -30797,7 +30783,7 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px">
       <div style="margin-bottom:8px">
         <div class="setting-label">Hunter Patrol Profiles</div>
-        <div class="setting-hint">Create named patrol profiles. Each profile has its own list of systems. Assign bots to profiles in their manual control panel.</div>
+        <div class="setting-hint">Create named patrol profiles. Each profile has its own list of systems (used by patrol_systems / cycle_patrols). The Creature Farm sub-routine also routes across a profile's systems — set the per-bot loop count below, and optionally restrict to specific POIs for creature farming. Assign bots to profiles in their manual control panel.</div>
       </div>
 
       <div class="blacklist-section">
@@ -30885,53 +30871,16 @@ ignoreBlacklist: document.getElementById(
                     <input type="text" id="hunter-patrol-manual-entry" placeholder="sys_xxx, Another System, ..." style="flex:1">
                     <button onclick="addSystemToCurrentHunterProfileFromText()">Add</button>
                   </div>
+                  <div class="blacklist-divider">creature farm target POIs (optional)</div>
+                  <div class="blacklist-add-row">
+                    <input type="text" id="hunter-patrol-targetpois-entry" value="${esc((p.targetPois || []).join(', '))}" placeholder="poi_id or POI name, comma separated" style="flex:1">
+                    <button onclick="saveCurrentHunterProfileTargetPois()">Save POIs</button>
+                  </div>
                 </div>
               </div>`;
               })()
             : ""
         }
-      </div>
-    </div>
-
-    <!-- Creature Farm Loadouts (multi-bot, like hunter patrol profiles) -->
-    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px">
-      <div style="margin-bottom:8px">
-        <div class="setting-label">Creature Farm Loadouts</div>
-        <div class="setting-hint">Named loadouts for the Creature Farm sub-routine. Assign each bot to a loadout in its profile. A loadout defines the home base (draw ammo + deposit loot) and the single target creature system. Currently one target system per loadout.</div>
-      </div>
-
-      <div class="blacklist-section">
-        <div class="blacklist-header">
-          <span>Loadouts (${creatureFarmLoadouts.length})</span>
-          <button class="sm primary" onclick="addCreatureFarmLoadout()">+ New Loadout</button>
-        </div>
-        <div class="blacklist-list" style="max-height:240px">
-          ${
-            creatureFarmLoadouts.length > 0
-              ? creatureFarmLoadouts
-                  .map(
-                    (l, idx) => `
-                <div class="blacklist-item" style="flex-direction:column;align-items:stretch;gap:6px">
-                  <div style="display:flex;justify-content:space-between;align-items:center">
-                    <span class="blacklist-name">${esc(l.name)}</span>
-                    <div>
-                      <button class="small danger" onclick="deleteCreatureFarmLoadout(${idx})">Delete</button>
-                    </div>
-                  </div>
-                  <div style="margin-top:4px">
-                    <div class="setting-label" style="font-size:11px;margin-bottom:2px">Home base (ammo + loot):</div>
-                    <select id="cf-home-${idx}" onchange="updateCreatureFarmLoadoutHome(${idx})" style="width:100%">${cfHomeOpts(l.homeStation)}</select>
-                  </div>
-                  <div style="margin-top:6px">
-                    <div class="setting-label" style="font-size:11px;margin-bottom:2px">Target creature system:</div>
-                    <select id="cf-target-${idx}" onchange="updateCreatureFarmLoadoutTarget(${idx})" style="width:100%">${cfTargetOpts(l.targetSystem)}</select>
-                  </div>
-                </div>`,
-                  )
-                  .join("")
-              : '<div class="blacklist-empty">No creature farm loadouts yet. Create one above.</div>'
-          }
-        </div>
       </div>
     </div>
 
@@ -31197,6 +31146,14 @@ ignoreBlacklist: document.getElementById(
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Creature Farm Loops / System</div>
+        <div class="setting-hint">When in creature_farm mode, farm this many full loops in each Hunter Patrol Profile system before routing to the next system (cycles). A loop = one farm pass until cargo is full or all sweeps are exhausted.</div>
+      </div>
+      <input type="number" id="set-hunter-creatureFarmLoopsPerSystem" min="1" max="100" value="${h.creatureFarmLoopsPerSystem ?? 3}">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -31299,11 +31256,11 @@ ignoreBlacklist: document.getElementById(
             : [],
           botHunterPatrolAssignments:
             settings.hunter?.botHunterPatrolAssignments || {},
-          creatureFarmLoadouts: Array.isArray(settings.hunter?.creatureFarmLoadouts)
-            ? settings.hunter.creatureFarmLoadouts
-            : [],
-          botCreatureFarmAssignments:
-            settings.hunter?.botCreatureFarmAssignments || {},
+          creatureFarmLoopsPerSystem:
+            parseInt(
+              document.getElementById("set-hunter-creatureFarmLoopsPerSystem")
+                .value,
+            ) || 3,
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;
@@ -31490,6 +31447,26 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
+      function saveCurrentHunterProfileTargetPois() {
+        const idx = window._currentHunterPatrolIndex;
+        if (idx === undefined) return;
+        const input = document.getElementById("hunter-patrol-targetpois-entry");
+        if (!input) return;
+        const profile = settings.hunter.hunterPatrols[idx];
+        if (!profile) return;
+        const pois = input.value
+          .split(",")
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        profile.targetPois = pois;
+        rerenderCurrentSettings();
+        send({
+          type: "saveSettings",
+          routine: "hunter",
+          settings: settings.hunter,
+        });
+      }
+
       function removeSystemFromCurrentHunterProfile(systemId) {
         const idx = window._currentHunterPatrolIndex;
         if (idx === undefined) return;
@@ -31507,128 +31484,6 @@ ignoreBlacklist: document.getElementById(
         }
 
         rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
-      }
-
-      // ── Creature Farm Loadout Management ───────────────────────
-      function addCreatureFarmLoadout() {
-        const name = prompt("Loadout name:");
-        if (!name || !name.trim()) return;
-        if (!settings.hunter) settings.hunter = {};
-        if (!Array.isArray(settings.hunter.creatureFarmLoadouts)) {
-          settings.hunter.creatureFarmLoadouts = [];
-        }
-        if (
-          settings.hunter.creatureFarmLoadouts.some(
-            (l) => l.name.toLowerCase() === name.trim().toLowerCase(),
-          )
-        ) {
-          alert("A loadout with that name already exists.");
-          return;
-        }
-        settings.hunter.creatureFarmLoadouts.push({
-          name: name.trim(),
-          homeSystem: "",
-          homeStation: "",
-          targetSystem: "",
-          targetPois: [],
-        });
-        rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
-      }
-
-      function cfHomeOpts(selected) {
-        let opts = '<option value="">(use nearest / default home)</option>';
-        const list = [];
-        for (const [sysId, sys] of Object.entries(mapData || {})) {
-          const sysName = sys.name || sysId;
-          for (const poi of [...(sys.pois || [])].sort((a, b) =>
-            (a.base_name || a.name || a.id || "").localeCompare(b.base_name || b.name || b.id || ""),
-          )) {
-            if (!(poi.has_base || poi.base_id)) continue;
-            const val = sysId + "|" + poi.id;
-            const label = poi.base_name || poi.name || poi.id;
-            list.push({ val, label, sysName });
-          }
-        }
-        list.sort((a, b) => (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName));
-        for (const { val, label, sysName } of list) {
-          const sel = val === selected ? " selected" : "";
-          opts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
-        }
-        if (selected && !list.some((s) => s.val === selected)) {
-          opts += `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`;
-        }
-        return opts;
-      }
-
-      function cfTargetOpts(selected) {
-        let opts = '<option value="">(select target system)</option>';
-        for (const sys of [...knownSystems].sort((a, b) =>
-          (a.name || a.id || "").localeCompare(b.name || b.id || ""),
-        )) {
-          const sel = sys.id === selected ? " selected" : "";
-          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
-          opts += `<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`;
-        }
-        if (selected && !knownSystems.find((s) => s.id === selected)) {
-          opts += `<option value="${esc(selected)}" selected>${esc(selected)} (custom)</option>`;
-        }
-        return opts;
-      }
-
-      function updateCreatureFarmLoadoutHome(index) {
-        const l = settings.hunter?.creatureFarmLoadouts?.[index];
-        if (!l) return;
-        const sel = document.getElementById("cf-home-" + index);
-        if (!sel) return;
-        l.homeStation = sel.value;
-        if (sel.value && sel.value.includes("|")) l.homeSystem = sel.value.split("|")[0];
-        rerenderCurrentSettings();
-        send({ type: "saveSettings", routine: "hunter", settings: settings.hunter });
-      }
-
-      function updateCreatureFarmLoadoutTarget(index) {
-        const l = settings.hunter?.creatureFarmLoadouts?.[index];
-        if (!l) return;
-        const sel = document.getElementById("cf-target-" + index);
-        if (!sel) return;
-        l.targetSystem = sel.value;
-        rerenderCurrentSettings();
-        send({ type: "saveSettings", routine: "hunter", settings: settings.hunter });
-      }
-
-      function deleteCreatureFarmLoadout(index) {
-        const l = settings.hunter?.creatureFarmLoadouts?.[index];
-        if (!l) return;
-        if (!confirm(`Delete creature farm loadout "${l.name}"?`)) return;
-        settings.hunter.creatureFarmLoadouts.splice(index, 1);
-        rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
-      }
-
-      function saveProfileCreatureFarmLoadout() {
-        const bot = getProfileBot();
-        if (!bot) return;
-        const sel = document.getElementById("profile-creatureFarmLoadout");
-        if (!sel) return;
-        const loadoutName = sel.value;
-        if (!settings.hunter) settings.hunter = {};
-        if (!settings.hunter.botCreatureFarmAssignments)
-          settings.hunter.botCreatureFarmAssignments = {};
-        settings.hunter.botCreatureFarmAssignments[bot.username] = loadoutName;
         send({
           type: "saveSettings",
           routine: "hunter",

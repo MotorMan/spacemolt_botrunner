@@ -735,6 +735,15 @@ async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker
   // catalog recipe — these are phantom jobs (stale session state, or jobs the
   // queue poller couldn't match) that would otherwise inflate "pending" output.
   tracker.prunePhantomJobs(new Set(recipes.map(r => r.recipe_id)));
+  // Drop jobs the server still lists but that have made NO progress for a long
+  // time (e.g. a fuel job the station drone never actually crafts). Left alone
+  // these sit as phantom "pending" until a process restart. 30 min with no
+  // deposit/run-complete is far longer than any single legitimate craft run.
+  const STUCK_JOB_MAX_MS = 30 * 60 * 1000;
+  const dropped = tracker.pruneStaleInactiveJobs(STUCK_JOB_MAX_MS);
+  if (dropped.length > 0) {
+    ctx.log("warn", `Dropped ${dropped.length} stuck crafting job(s) with no progress (likely phantom pending): ${dropped.join(", ")}`);
+  }
   tracker.save();
 }
 

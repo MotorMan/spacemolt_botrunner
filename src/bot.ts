@@ -4004,12 +4004,19 @@ if (this.craftQueueTracker && jobId && recipeId) {
                if (completed) {
                  this.craftQueueTracker.markCompleted(jobId);
                  this.craftQueueTracker.save();
-               } else if (deposited.length > 0) {
-                 const depositedQty = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
-                 const runsRemaining = (job.runs_remaining as number) || 0;
-                 this.craftQueueTracker.updateDeposited(jobId, depositedQty, runsRemaining);
-                 this.craftQueueTracker.save();
-               }
+                } else if (deposited.length > 0) {
+                  const runsRemaining = (job.runs_remaining as number) || 0;
+                  const tracked = this.craftQueueTracker.getJob(jobId);
+                  // job.quantity is stored in RUNS, but the deposited payload
+                  // carries OUTPUT ITEM quantities (e.g. 200 fuel_reserve per
+                  // run). Adding those to `completed` corrupts the run-based
+                  // progress and produces phantom "pending". Derive the completed
+                  // RUN count from the server's authoritative runs_remaining.
+                  const completedRuns = tracked ? Math.max(0, tracked.quantity - runsRemaining) : 0;
+                  const delta = tracked ? Math.max(0, completedRuns - tracked.completed) : 0;
+                  this.craftQueueTracker.updateDeposited(jobId, delta, runsRemaining);
+                  this.craftQueueTracker.save();
+                }
              }
 
             if (recipeId && deposited.length > 0) {

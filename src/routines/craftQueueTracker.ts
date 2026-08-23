@@ -9,6 +9,11 @@ export interface QueuedJob {
   runsRemaining: number;
   startedAt: number;
   lastUpdate: number;
+  // Last time the job actually made progress (a deposit/completion or a server
+  // sync showing runs_remaining drop). Used to detect STUCK jobs that the
+  // server keeps listing but never advances — without this the planner trusts
+  // a phantom "pending" forever (e.g. 500k fuel_reserve that was never crafted).
+  lastProgressAt: number;
 }
 
 export interface ServerJobInfo {
@@ -31,6 +36,7 @@ export class CraftQueueTracker {
   }
 
   trackJob(jobId: string, recipeId: string, quantity: number): void {
+    const now = Date.now();
     const job: QueuedJob = {
       jobId,
       recipeId,
@@ -38,8 +44,9 @@ export class CraftQueueTracker {
       completed: 0,
       deposited: 0,
       runsRemaining: quantity,
-      startedAt: Date.now(),
-      lastUpdate: Date.now(),
+      startedAt: now,
+      lastUpdate: now,
+      lastProgressAt: now,
     };
     this.jobs.set(jobId, job);
     const existing = this.recipeIndex.get(recipeId) || [];
@@ -55,6 +62,9 @@ export class CraftQueueTracker {
     job.completed += depositedQuantity;
     job.deposited += depositedQuantity;
     if (runsRemaining !== undefined) {
+      // Only bump lastProgressAt when the server actually reports fewer runs
+      // left — a sync that echoes the same runsRemaining is not progress.
+      if (runsRemaining < job.runsRemaining) job.lastProgressAt = Date.now();
       job.runsRemaining = runsRemaining;
     }
     job.lastUpdate = Date.now();
@@ -65,6 +75,7 @@ export class CraftQueueTracker {
     const job = this.jobs.get(jobId);
     if (!job) return;
     job.completed = job.quantity;
+    job.lastProgressAt = Date.now();
     job.lastUpdate = Date.now();
     this.bot.clearCraftingJobByRecipe(job.recipeId);
     this.jobs.delete(jobId);
@@ -78,14 +89,42 @@ export class CraftQueueTracker {
     const ids = this.recipeIndex.get(recipeId) || [];
     let queued = 0;
     let completed = 0;
+    let remainingCap = 0;
     for (const id of ids) {
       const job = this.jobs.get(id);
       if (job) {
         queued += job.quantity;
         completed += job.completed;
+        remainingCap += Math.max(0, job.runsRemaining);
       }
     }
-    return { queued, completed, remaining: queued - completed };
+    // Bound the reported remaining by the server-authoritative runsRemaining so
+    // a stalled/over-counted `completed` (from the item-vs-runs unit bug) cannot
+    // inflate phantom "pending" output forever.
+    return { queued, completed, remaining: Math.min(queued - completed, remainingCap) };
+  }
+
+  // Drop jobs that the server lists but that have made NO progress for longer
+  // than `maxInactiveMs`. A stuck fuel job that the station drone never actually
+  // crafts would otherwise sit as phantom "pending" until a process restart.
+  pruneStaleInactiveJobs(maxInactiveMs: number): string[] {
+    const now = Date.now();
+    const toRemove: string[] = [];
+    for (const [jobId, job] of Array.from(this.jobs.entries())) {
+      if (job.completed >= job.quantity) continue;
+      if (now - job.lastProgressAt > maxInactiveMs) {
+        toRemove.push(jobId);
+      }
+    }
+    for (const jobId of toRemove) {
+      this.jobs.delete(jobId);
+      this.cleanupIndex(jobId);
+    }
+    return toRemove;
+  }
+
+  getJob(jobId: string): QueuedJob | undefined {
+    return this.jobs.get(jobId);
   }
 
   getProgressByRecipe(): Map<string, { queued: number; completed: number; remaining: number }> {
@@ -121,6 +160,7 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
     }
     for (const serverJob of serverJobs) {
       if (!this.jobs.has(serverJob.jobId)) {
+        const now = Date.now();
         const job: QueuedJob = {
           jobId: serverJob.jobId,
           recipeId: serverJob.recipeId,
@@ -128,8 +168,9 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
           completed: serverJob.runsDone,
           deposited: serverJob.runsDone,
           runsRemaining: serverJob.runsRemaining,
-          startedAt: Date.now(),
-          lastUpdate: Date.now(),
+          startedAt: now,
+          lastUpdate: now,
+          lastProgressAt: now,
         };
         this.jobs.set(serverJob.jobId, job);
         const existing = this.recipeIndex.get(serverJob.recipeId) || [];
@@ -142,6 +183,9 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
         job.quantity = serverJob.quantity;
         job.completed = serverJob.runsDone;
         job.deposited = serverJob.runsDone;
+        if (serverJob.runsRemaining < job.runsRemaining) {
+          job.lastProgressAt = Date.now();
+        }
         job.runsRemaining = serverJob.runsRemaining;
         job.lastUpdate = Date.now();
       }
@@ -202,6 +246,7 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
         runsRemaining: job.runsRemaining,
         startedAt: job.startedAt,
         lastUpdate: job.lastUpdate,
+        lastProgressAt: job.lastProgressAt,
       })),
       recipeIndex: Array.from(this.recipeIndex.entries()).map(([recipeId, ids]) => ({
         recipeId,
@@ -224,7 +269,7 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
       if (!existsSync(path)) return;
       const raw = readFileSync(path, "utf-8");
       const data = JSON.parse(raw);
-      const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: number; completed: number; deposited?: number; runsRemaining?: number; startedAt: number; lastUpdate: number }>) || [];
+      const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: number; completed: number; deposited?: number; runsRemaining?: number; startedAt: number; lastUpdate: number; lastProgressAt?: number }>) || [];
       for (const j of loaded) {
         const job: QueuedJob = {
           jobId: j.jobId,
@@ -235,6 +280,7 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
           runsRemaining: j.runsRemaining ?? j.quantity,
           startedAt: j.startedAt,
           lastUpdate: j.lastUpdate,
+          lastProgressAt: j.lastProgressAt ?? j.lastUpdate,
         };
         this.jobs.set(job.jobId, job);
         const existing = this.recipeIndex.get(job.recipeId) || [];

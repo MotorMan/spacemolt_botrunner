@@ -39,6 +39,8 @@ const CASES: Array<[string, Record<string, unknown> | undefined]> = [
   ['prepay_tax', { amount: 5 }],
   ['faction_prepay_tax', { amount: 5 }],
   ['send_gift', { credits: 10, recipient: 'bob' }],
+  ['send_gift', { item_id: 'fuel_cell', quantity: 3, recipient: 'bob' }],
+  ['send_gift', { ship_id: 'ship-uuid', recipient: 'faction' }],
   ['faction_deposit_credits', { amount: 5 }],
   ['faction_deposit_items', { item_id: 'ore', quantity: 2 }],
   ['view_faction_storage', {}],

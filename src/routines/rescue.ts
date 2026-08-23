@@ -3,7 +3,7 @@ import type { BotChatMessage } from "../bot_chat_channel.js";
 import * as fs from 'fs';
 import * as path from 'path';
 import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
-import { getLastFleetRoster, getLastFleetPullError } from "../botmanager.js";
+import { getLastFleetRoster, getLastFleetPullError, getBotStatuses } from "../botmanager.js";
 import { updateFactionStorageCache, getFactionStorageCache } from "../factionStorageCache.js";
 import {
   findStation,
@@ -86,11 +86,14 @@ import {
 import {
   getCooperationSettings,
   isCooperationEnabled,
+  broadcastRescueClaim,
+  processBotChatClaim,
   sendRescueClaim,
   processBotChatMessage,
-  calculateJumpsToTarget,
   shouldProceedOrYield,
+  calculateJumpsToTarget,
   isRescueClaimedByPartner,
+  decideMaydayHandler,
   registerCooperationHandler,
   unregisterCooperationHandler,
   recordRoundRobinComplete,
@@ -338,11 +341,90 @@ function isPrimaryFleetRescueBot(botUsername: string): boolean {
   return botUsername === settings.fleetRescueBot;
 }
 
+// ── Cross-client MAYDAY primary election ───────────────────────────────
+// Elects exactly ONE mayday-primary across EVERY connected client using the
+// master's combined fleet (not just this client's local settings). This is the
+// real fix for "all 3 rescue bots on 3 separate clients answered the same
+// MAYDAY": with a single elected primary, the other bots only step in on a
+// surge (2+ pending MAYDAYs = "go on a 2nd MAYDAY only if the first bot is
+// busy"). The election is deterministic from the master's fleet list, so every
+// connected client computes the SAME primary — no real-time handshake needed
+// (the poll-based bot-chat relay can't guarantee sub-second delivery anyway).
+//
+// A user-set `maydayRescueBot` is honored as the primary provided that bot is
+// actually present in the combined fleet — this finally lets you nominate a bot
+// that lives in ANOTHER client. Set `maydayRescueBot` to the SAME username on
+// every connected client, or leave it blank and let the deterministic fallback
+// pick one automatically.
+let crossClientMaydayPrimary: string | null = null;
+let crossClientMaydayPrimaryAt = 0;
+/** True only when the combined fleet includes bots from OTHER clients. The
+ *  cross-client election + handshake are only active then — single-client
+ *  setups keep their legacy "any bot may answer a MAYDAY" behavior. */
+let crossClientMaydayActive = false;
+const PRIMARY_ELECTION_TTL_MS = 30000;
+
+async function refreshMaydayPrimary(ctx: RoutineContext): Promise<void> {
+  const now = Date.now();
+  if (crossClientMaydayPrimary && now - crossClientMaydayPrimaryAt < PRIMARY_ELECTION_TTL_MS) {
+    return;
+  }
+  const settings = getRescueSettings();
+  const configured = (settings.maydayRescueBot || "").trim();
+  try {
+    const fleet = (await ctx.getFleetStatusAsync?.()) || ctx.getFleetStatus?.() || [];
+    const eligible = fleet.filter(
+      (b) => !!b.username && (b.state === "running" || b.state === "idle"),
+    );
+
+    // Detect remote bots (a client other than this one contributes to the
+    // combined fleet). Only then do we override the legacy local primary logic.
+    const localNames = new Set((getBotStatuses() || []).map((b) => b.username));
+    const hasRemote = eligible.some((b) => !localNames.has(b.username));
+    crossClientMaydayActive = hasRemote;
+
+    if (!hasRemote) {
+      // Single-client: keep the legacy behavior (unset `maydayRescueBot` means
+      // every local bot may answer; a set value is honored locally). Don't
+      // elect a single primary that could be a bot not running mayday rescue.
+      crossClientMaydayPrimary = null;
+      crossClientMaydayPrimaryAt = now;
+      return;
+    }
+
+    if (configured && eligible.some((b) => b.username === configured)) {
+      // User-selected primary, validated to be in the connected fleet — this
+      // finally lets you nominate a bot that lives in ANOTHER client.
+      crossClientMaydayPrimary = configured;
+    } else if (eligible.length > 0) {
+      // Deterministic fallback: lexicographically-first running bot becomes the
+      // single global primary. Guarantees exactly one primary across all
+      // clients even when `maydayRescueBot` is left blank everywhere.
+      crossClientMaydayPrimary = [...eligible]
+        .sort((a, b) => a.username.localeCompare(b.username))[0].username;
+    } else {
+      crossClientMaydayPrimary = null;
+    }
+    crossClientMaydayPrimaryAt = now;
+  } catch {
+    // Keep the last elected primary (or null). Never throw out of a scan loop.
+  }
+}
+
 /**
  * Check if this bot is the primary assigned for MAYDAY rescue operations.
  * Returns true if this bot is the primary MAYDAY rescue bot, or if no assignment exists (legacy behavior).
  */
 function isPrimaryMaydayRescueBot(botUsername: string): boolean {
+  // Prefer the cross-client election (see refreshMaydayPrimary). It is aware of
+  // bots running in OTHER connected clients, so a bot in a different client can
+  // legitimately be the mayday primary and this bot yields to it — this is what
+  // stops N rescue bots on N separate clients all answering the same MAYDAY.
+  // Only active when remote clients are present; single-client setups keep the
+  // legacy local behavior (unset `maydayRescueBot` => every bot may answer).
+  if (crossClientMaydayActive && crossClientMaydayPrimary) {
+    return botUsername === crossClientMaydayPrimary;
+  }
   const settings = getRescueSettings();
   if (!settings.maydayRescueBot) {
     return true;
@@ -2172,14 +2254,14 @@ function stopCreditTopOffBackground(): void {
 
   // ── Register Bot Chat handler for rescue cooperation ──
   // This enables coordination with other rescue bots via Bot Chat Channel
-  const botChatHandler = (message: BotChatMessage) => {
-    if (message.sender === bot.username) return; // Ignore own messages
-    
-    const result = processBotChatMessage(message);
-    if (result.isClaim && result.claim) {
-      ctx.log("coop", `📥 Received rescue claim from ${result.claim.botName}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps)`);
-    }
-  };
+   const botChatHandler = (message: BotChatMessage) => {
+     if (message.sender === bot.username) return; // Ignore own messages
+
+     const result = processBotChatClaim(message);
+     if (result.isClaim && result.claim) {
+       ctx.log("coop", `📥 Received cross-client claim from ${result.claim.botName}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps)`);
+     }
+   };
 
   // Always register cooperation handler - Bot Chat Channel handles coordination automatically
   registerCooperationHandler(bot.username, botChatHandler);
@@ -2211,6 +2293,11 @@ function stopCreditTopOffBackground(): void {
 
     // ── Clean up expired MAYDAY pirate lockouts ──
     cleanupExpiredPirateLockouts();
+
+    // ── Elect the cross-client MAYDAY primary (cached per TTL) ──
+    // Resolves a single mayday-primary across every connected client so the
+    // other rescue bots only step in on a surge (2+ pending MAYDAYs).
+    await refreshMaydayPrimary(ctx);
 
     // ── Monitor faction chat for rescue announcements from other bots ──
     // This helps coordinate with other rescue bots to avoid duplicate responses
@@ -2406,7 +2493,7 @@ skipToReturnHome = true;
           if (pendingMaydays >= 2) {
             ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
           } else {
-            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot (elected primary: ${crossClientMaydayPrimary || settings.maydayRescueBot || 'primary bot'}) - leaving MAYDAYs for it`);
           }
         }
 
@@ -2417,7 +2504,7 @@ skipToReturnHome = true;
          if (!shouldProcessMayday) {
            const ignoredMayday = getNextMayday();
            if (ignoredMayday) {
-             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+              ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for elected primary ${crossClientMaydayPrimary || settings.maydayRescueBot || 'primary bot'}`);
              await ctx.sleep(5000);
              continue;
            }
@@ -2736,8 +2823,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ─-
-          if (isCooperationEnabled()) {
+          // ── CROSS-CLIENT MAYDAY CLAIM: coordinate with EVERY connected rescue
+          // bot via the non-API bot chat channel (relayed through the master).
+          // This is the cross-client mutex: a single MAYDAY must launch from
+          // exactly one bot no matter how many clients are connected. The elected
+          // primary (see refreshMaydayPrimary) normally handles MAYDAYs alone, so
+          // this handshake mainly deconflicts the surge case (2+ pending). It
+          // only yields when another bot is STRICTLY closer, so relay latency can
+          // never make a bot false-yield and drop the distress call.
+          if (crossClientMaydayActive) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -2748,38 +2842,29 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               botName: bot.username,
             };
 
-            // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
-            const sendResult = await sendRescueClaim(bot, myClaim);
+            // Broadcast my claim to all connected clients, then wait briefly for
+            // theirs to arrive via the master relay.
+            ctx.log("coop", `📧 Broadcasting MAYDAY claim via Bot Chat Channel (${jumpsAway} jumps)...`);
+            const sendResult = await broadcastRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Broadcast MAYDAY claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
-              ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
+              ctx.log("coop", `⚠️ Failed to broadcast MAYDAY claim: ${sendResult.error}`);
             }
 
-            // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use default 3 second delay
             const cooperationDelay = 3000;
-            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
+            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for cross-client claims...`);
             await ctx.sleep(cooperationDelay);
 
-            // Re-check for partner claims after delay
-            partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
-            
-            // Check if we should yield to partner
-            if (partnerClaim) {
-              const decision = shouldProceedOrYield(myClaim, partnerClaim);
-              if (decision === "yield") {
-                ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
-                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
-                maydayTarget = null; // Cancel this rescue
-                markMaydayHandled(mayday);
-                continue;
-              } else if (decision === "proceed") {
-                ctx.log("coop", `🤝 Proceeding with rescue (closer than partner: ${jumpsAway} vs ${partnerClaim.jumps} jumps)`);
-              }
+            const decision = decideMaydayHandler(myClaim);
+            if (decision === "yield") {
+              ctx.log("coop", `🤝 Yielding MAYDAY — another connected bot is strictly closer`);
+              releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
+              maydayTarget = null; // Cancel this rescue
+              markMaydayHandled(mayday);
+              continue;
             } else {
-              ctx.log("coop", `🤝 No partner claim received - proceeding with rescue`);
+              ctx.log("coop", `🤝 Proceeding with MAYDAY (no strictly-closer bot claimed it)`);
             }
           }
         }
@@ -4631,6 +4716,10 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       continue;
     }
 
+    // ── Elect the cross-client MAYDAY primary (cached per TTL) ── it is what
+    // stops the 3 separate clients each answering the same MAYDAY.
+    await refreshMaydayPrimary(ctx);
+
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
       inBattle: false,
@@ -4703,7 +4792,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       // ── PRIMARY MAYDAY BOT CHECK ──
       const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
       if (!isMaydayRescuePrimary) {
-        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - ignoring this MAYDAY`);
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot (elected primary: ${crossClientMaydayPrimary || settings.maydayRescueBot || 'none configured'}) - ignoring this MAYDAY`);
         markMaydayHandled(nextMayday);
         continue;
       }
@@ -5419,9 +5508,9 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
   // ── Register cooperation handler for Bot Chat Channel coordination ──
   if (isCooperationEnabled()) {
     const cooperationHandler = (message: BotChatMessage) => {
-      const result = processBotChatMessage(message);
+      const result = processBotChatClaim(message);
       if (result.isClaim && result.claim) {
-        // The claim is already recorded by processBotChatMessage via recordRescueClaim
+        // The claim is already recorded by processBotChatClaim via recordRescueClaim
         ctx.log("coop", `📥 Processed incoming rescue claim: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps) by ${result.claim.botName}`);
       }
     };
@@ -5546,6 +5635,11 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
 
     // ── Clean up expired MAYDAY pirate lockouts ──
     cleanupExpiredPirateLockouts();
+
+    // ── Elect the cross-client MAYDAY primary (cached per TTL) ──
+    // Resolves a single mayday-primary across every connected client so the
+    // other rescue bots only step in on a surge (2+ pending MAYDAYs).
+    await refreshMaydayPrimary(ctx);
 
     // ── Monitor faction chat for rescue announcements from other bots ──
     // This helps coordinate with other rescue bots to avoid duplicate responses
@@ -5797,7 +5891,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
           if (pendingMaydays >= 2) {
             ctx.log("mayday", `🤝 ${pendingMaydays} MAYDAYs pending - covering overflow MAYDAYs`);
           } else {
-            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - leaving MAYDAYs for ${settings.maydayRescueBot || 'primary bot'}`);
+            ctx.log("mayday", `📡 Not primary MAYDAY rescue bot (elected primary: ${crossClientMaydayPrimary || settings.maydayRescueBot || 'primary bot'}) - leaving MAYDAYs for it`);
           }
         }
 
@@ -5808,7 +5902,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
          if (!shouldProcessMayday) {
            const ignoredMayday = getNextMayday();
            if (ignoredMayday) {
-             ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for ${settings.maydayRescueBot || 'primary bot'}`);
+              ctx.log("mayday", `📡 Not handling MAYDAY from ${ignoredMayday.sender} - leaving for elected primary ${crossClientMaydayPrimary || settings.maydayRescueBot || 'primary bot'}`);
              await ctx.sleep(5000);
              continue;
            }
@@ -6065,8 +6159,15 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ─-
-          if (isCooperationEnabled()) {
+          // ── CROSS-CLIENT MAYDAY CLAIM: coordinate with EVERY connected rescue
+          // bot via the non-API bot chat channel (relayed through the master).
+          // This is the cross-client mutex: a single MAYDAY must launch from
+          // exactly one bot no matter how many clients are connected. The elected
+          // primary (see refreshMaydayPrimary) normally handles MAYDAYs alone, so
+          // this handshake mainly deconflicts the surge case (2+ pending). It
+          // only yields when another bot is STRICTLY closer, so relay latency can
+          // never make a bot false-yield and drop the distress call.
+          if (crossClientMaydayActive) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -6077,38 +6178,29 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               botName: bot.username,
             };
 
-            // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
-            const sendResult = await sendRescueClaim(bot, myClaim);
+            // Broadcast my claim to all connected clients, then wait briefly for
+            // theirs to arrive via the master relay.
+            ctx.log("coop", `📧 Broadcasting MAYDAY claim via Bot Chat Channel (${jumpsAway} jumps)...`);
+            const sendResult = await broadcastRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Broadcast MAYDAY claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
-              ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
+              ctx.log("coop", `⚠️ Failed to broadcast MAYDAY claim: ${sendResult.error}`);
             }
 
-            // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use default 3 second delay
             const cooperationDelay = 3000;
-            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
+            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for cross-client claims...`);
             await ctx.sleep(cooperationDelay);
 
-            // Re-check for partner claims after delay
-            partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
-            
-            // Check if we should yield to partner
-            if (partnerClaim) {
-              const decision = shouldProceedOrYield(myClaim, partnerClaim);
-              if (decision === "yield") {
-                ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
-                releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
-                maydayTarget = null; // Cancel this rescue
-                markMaydayHandled(mayday);
-                continue;
-              } else if (decision === "proceed") {
-                ctx.log("coop", `🤝 Proceeding with rescue (closer than partner: ${jumpsAway} vs ${partnerClaim.jumps} jumps)`);
-              }
+            const decision = decideMaydayHandler(myClaim);
+            if (decision === "yield") {
+              ctx.log("coop", `🤝 Yielding MAYDAY — another connected bot is strictly closer`);
+              releaseMayday(mayday.sender, mayday.system, mayday.poi, bot.username);
+              maydayTarget = null; // Cancel this rescue
+              markMaydayHandled(mayday);
+              continue;
             } else {
-              ctx.log("coop", `🤝 No partner claim received - proceeding with rescue`);
+              ctx.log("coop", `🤝 Proceeding with MAYDAY (no strictly-closer bot claimed it)`);
             }
           }
         }

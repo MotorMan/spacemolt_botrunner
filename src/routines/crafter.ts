@@ -1340,12 +1340,12 @@ async function executeCraftingPlan(
    // Facility-only recipes that have been explicitly linked to a facility via
    // recipeFacilityLinks are permitted in the planner (otherwise breed_plutonium
    // and friends are rejected by isRecipeCraftable as "facility only").
-   const allowedFacilityRecipeIds = new Set(
-     Object.keys(settings?.recipeFacilityLinks || {})
-   );
+    let allowedFacilityRecipeIds = new Set(
+      Object.keys(settings?.recipeFacilityLinks || {})
+    );
 
-   const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
-   const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
+    let recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+    const outputQtyOf = (recipeId: string) => recipeIndex.get(recipeId)?.output_quantity || 1;
 
    const recipeIdForGoal = (g: { itemId: string; recipe?: Recipe }): string => {
      if (g.recipe) return g.recipe.recipe_id;
@@ -1396,11 +1396,46 @@ async function executeCraftingPlan(
     const STAGNATION_BUDGET_MS = 60000;
     const ACTIVE_LOOP_CAP = 600;
     let loopCount = 0;
-    const cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
+    let cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
 
-   // Active loop: keep re-planning and queueing as sub-materials become available.
+    // Long-running active loops (e.g. 5-minute cycle configs) can run for many
+    // passes during which the operator may ADD/EDIT recipes, adjust the loadout
+    // (craftLimits / recipeFacilityLinks), or otherwise change the world. The
+    // plan below must not keep operating on a snapshot taken at the start of the
+    // run, so we periodically re-read recipes + settings and rebuild the derived
+    // indexes. Without this the crafter plans against an "ancient" recipe/loadout
+    // list and never picks up new storage targets until a full process restart.
+    // (Faction storage, facilities, queue and base-fuel are already re-read every
+    // pass below — only recipes/settings were being held stale.)
+    let lastRevalidate = Date.now();
+    const REVALIDATE_COOLDOWN_MS = 60000;
+    const revalidateInputs = async () => {
+      const now = Date.now();
+      if (now - lastRevalidate < REVALIDATE_COOLDOWN_MS) return;
+      lastRevalidate = now;
+      try {
+        const freshRecipes = await fetchAllRecipes(ctx);
+        if (freshRecipes.length > 0) {
+          recipes = freshRecipes;
+          recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+        }
+      } catch (e) {
+        log("warn", `Recipe revalidation failed, keeping previous recipe list: ${(e as Error)?.message || e}`);
+      }
+      try {
+        const freshSettings = await getCrafterSettings();
+        settings = freshSettings;
+        allowedFacilityRecipeIds = new Set(Object.keys(freshSettings.recipeFacilityLinks || {}));
+        cycleWaitMs = (freshSettings.cycleTimeSec || 30) * 1000;
+      } catch (e) {
+        log("warn", `Settings revalidation failed, keeping previous settings: ${(e as Error)?.message || e}`);
+      }
+    };
+
+    // Active loop: keep re-planning and queueing as sub-materials become available.
     while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
       loopCount++;
+      await revalidateInputs();
       await syncCraftingQueue(ctx, tracker, recipes, true);
       // Re-resolve the facility list each pass. A facility can be upgraded
       // (level/type change) while the crafter is mid-plan, and routing must
@@ -1741,6 +1776,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.initCraftQueueTracker();
 
   while (bot.state === "running") {
+    // Re-evaluate missing-facility warnings each cycle. The dedupe set is
+    // process-lifetime, so clearing it lets a facility that became available
+    // (e.g. after an upgrade) stop being silently treated as permanently missing.
+    notifiedMissingFacilities.clear();
     await detectAndRecoverFromDeath(ctx);
     if (bot.state !== "running") break;
 

@@ -66,6 +66,13 @@ export class ClientSyncMaster {
   private apiKey: string;
   private password: string;
   private mode: string;
+  /**
+   * The MAYDAY rescue primary designated by the user, shared across every
+   * connected client. A single selection on any client is stored here on the
+   * master and read by all clients' rescue routines, so they all agree on the
+   * same primary even though each client only knows its own local settings.
+   */
+  private designatedMaydayPrimary: string | null = null;
 
   // ── Catalog orchestration ──────────────────────────────────
   // Instead of every connected client independently downloading the gameserver's
@@ -268,6 +275,20 @@ export class ClientSyncMaster {
 
   public getSettings(): Record<string, unknown> {
     return this.settings;
+  }
+
+  /** The user-designated MAYDAY primary, shared across all connected clients. */
+  public getDesignatedMaydayPrimary(): string | null {
+    const s = this.settings as Record<string, unknown>;
+    return typeof s.designatedMaydayPrimary === "string" ? (s.designatedMaydayPrimary as string) : null;
+  }
+
+  /** Set (or clear, with `null`) the shared MAYDAY primary. Persisted via the
+   *  master settings so it survives a restart. */
+  public setDesignatedMaydayPrimary(username: string | null): void {
+    const s = this.settings as Record<string, unknown>;
+    s.designatedMaydayPrimary = username || null;
+    this.saveSettings();
   }
 
   /**

@@ -17331,6 +17331,11 @@
             `<option value="${esc(bot.username)}">${esc(bot.username)}</option>`,
           );
         }
+        // Include bots from OTHER connected clients (via the master's combined
+        // fleet) so a primary can be assigned cross-client — e.g. pick a bot that
+        // lives on another client as the MAYDAY rescue primary. Requires
+        // clientSync.allowRemoteBotsInDropdowns (ON by default).
+        botOpts.push(getRemoteBotOptions("", ""));
 
         const createSelect = (id, selected, label) =>
           `<select id="${id}" style="width:100%;max-width:250px">${botOpts
@@ -17480,8 +17485,8 @@
       </div>
 
       <div style="margin-bottom:12px">
-        <label style="display:block;margin-bottom:4px"><strong>MAYDAY Rescue Bot</strong> <span style="color:var(--dim)">(handles emergency MAYDAY calls)</span></label>
-        <select id="set-rescue-maydayRescueBot" style="width:100%;max-width:250px">
+        <label style="display:block;margin-bottom:4px"><strong>MAYDAY Rescue Bot</strong> <span style="color:var(--dim)">(handles emergency MAYDAY calls — shared across all connected clients)</span></label>
+        <select id="set-rescue-maydayRescueBot" style="width:100%;max-width:250px" onchange="setSharedMaydayPrimary(this.value)">
           ${botOpts.map((o) => o.replace(`value="${esc(maydayRescueBot)}"`, `value="${esc(maydayRescueBot)}" selected`)).join("")}
         </select>
       </div>
@@ -17565,6 +17570,18 @@
 
     <button class="btn" onclick="saveRescueSettings()">Save</button>
     `;
+
+        // Pre-select the MAYDAY primary from the shared (master) designation so
+        // the dropdown reflects the cross-client choice, not just local settings.
+        try {
+          fetchSharedMaydayPrimary().then((u) => {
+            if (u) {
+              const sel = document.getElementById("set-rescue-maydayRescueBot");
+              if (sel) sel.value = u;
+            }
+          });
+        } catch (e) {}
+
       }
 
       function saveRescueSettings() {
@@ -17632,8 +17649,11 @@
             document.getElementById("set-rescue-creditTopOffBot").value || "",
           fleetRescueBot:
             document.getElementById("set-rescue-fleetRescueBot").value || "",
-          maydayRescueBot:
-            document.getElementById("set-rescue-maydayRescueBot").value || "",
+          maydayRescueBot: (() => {
+            const v = document.getElementById("set-rescue-maydayRescueBot").value || "";
+            setSharedMaydayPrimary(v);
+            return v;
+          })(),
           creditTopOffHomeStation:
             document.getElementById("set-rescue-creditTopOffHomeStation").value || "",
           creditTopOffHomeSystem: (() => {
@@ -37792,6 +37812,42 @@ ignoreBlacklist: document.getElementById(
           .catch(() => {
             remoteBots = [];
           });
+      }
+
+      // ── Shared MAYDAY primary (client sync) ──
+      // The MAYDAY primary is designated ONCE on the master and shared with every
+      // connected client, so a single selection in this UI is authoritative
+      // everywhere. These mirror the rescue routine's getSharedMaydayPrimary().
+      function sharedMaydayPrimaryUrl() {
+        const cs = (settings && settings.clientSync) || {};
+        if (cs.mode === "master") return "/api/client-sync/mayday-primary";
+        if ((cs.mode === "slave" || cs.mode === "light") && cs.masterUrl)
+          return cs.masterUrl.replace(/\/+$/, "") + "/api/client-sync/mayday-primary";
+        return "";
+      }
+
+      // Push the chosen MAYDAY primary to the master (called on dropdown change
+      // and on settings save). Best-effort; ignored if not connected.
+      function setSharedMaydayPrimary(username) {
+        const url = sharedMaydayPrimaryUrl();
+        if (!url) return;
+        fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: username || "" }),
+        }).catch(() => {});
+      }
+
+      // Read the currently-shared MAYDAY primary (for pre-selecting the dropdown).
+      function fetchSharedMaydayPrimary() {
+        return new Promise((resolve) => {
+          const url = sharedMaydayPrimaryUrl();
+          if (!url) return resolve(null);
+          fetch(url)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((j) => resolve(j && j.username ? j.username : null))
+            .catch(() => resolve(null));
+        });
       }
 
       function remoteBotDisplayName(username, label, style) {

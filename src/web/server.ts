@@ -1883,6 +1883,25 @@ if (!this.settings.fuel_service) {
             }
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/mayday-primary" && req.method === "GET") {
+            // Shared MAYDAY primary: the single bot (across ALL connected
+            // clients) designated to handle MAYDAYs. Read by every client's
+            // rescue routine so they agree on the same primary.
+            return Response.json({ username: this.syncMaster?.getDesignatedMaydayPrimary() ?? null }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/mayday-primary" && req.method === "POST") {
+            // Set (or clear with "") the shared MAYDAY primary. The browser UI
+            // posts the selected bot here; the master persists it and every
+            // client reads it back, so one selection is authoritative everywhere.
+            try {
+              const body = await req.json() as { username?: string };
+              this.syncMaster?.setDesignatedMaydayPrimary((body.username || "").trim() || null);
+              saveSettings(this.settings);
+              return Response.json({ ok: true, username: this.syncMaster?.getDesignatedMaydayPrimary() ?? null }, { headers: cors });
+            } catch {
+              return Response.json({ ok: false, error: "invalid json" }, { status: 500, headers: cors });
+            }
+          }
           if (url.pathname === "/api/client-sync/poi-update" && req.method === "POST") {
             const body = await req.json() as PoiPayload;
             const ok = this.syncMaster?.poiUpdate(body);

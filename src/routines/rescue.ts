@@ -392,14 +392,21 @@ async function refreshMaydayPrimary(ctx: RoutineContext): Promise<void> {
       return;
     }
 
-    if (configured && eligible.some((b) => b.username === configured)) {
+    // Preference order for the single cross-client primary:
+    //   1. The SHARED designation stored on the master — one UI selection on ANY
+    //      client is authoritative for every connected client, so all clients
+    //      agree on the same primary even with only-local settings.
+    //   2. This client's local `maydayRescueBot` setting, if it's in the fleet.
+    //   3. Deterministic lexicographic-first over the combined fleet (so leaving
+    //      the assignment blank still yields exactly one global primary).
+    const designated = await getSharedMaydayPrimary();
+    if (designated && eligible.some((b) => b.username === designated)) {
+      crossClientMaydayPrimary = designated;
+    } else if (configured && eligible.some((b) => b.username === configured)) {
       // User-selected primary, validated to be in the connected fleet — this
       // finally lets you nominate a bot that lives in ANOTHER client.
       crossClientMaydayPrimary = configured;
     } else if (eligible.length > 0) {
-      // Deterministic fallback: lexicographically-first running bot becomes the
-      // single global primary. Guarantees exactly one primary across all
-      // clients even when `maydayRescueBot` is left blank everywhere.
       crossClientMaydayPrimary = [...eligible]
         .sort((a, b) => a.username.localeCompare(b.username))[0].username;
     } else {
@@ -408,6 +415,35 @@ async function refreshMaydayPrimary(ctx: RoutineContext): Promise<void> {
     crossClientMaydayPrimaryAt = now;
   } catch {
     // Keep the last elected primary (or null). Never throw out of a scan loop.
+  }
+}
+
+/**
+ * Read the MAYDAY primary designated on the master (shared across all clients).
+ * On the master process this is read directly; on a slave/light client we fetch
+ * it from the master's `/api/client-sync/mayday-primary` endpoint. Returns null
+ * if none is designated or the master is unreachable.
+ */
+async function getSharedMaydayPrimary(): Promise<string | null> {
+  try {
+    const masterGlobal = (globalThis as { syncMaster?: { getDesignatedMaydayPrimary?: () => string | null } }).syncMaster;
+    if (masterGlobal?.getDesignatedMaydayPrimary) {
+      return masterGlobal.getDesignatedMaydayPrimary() || null;
+    }
+    const sync = (globalThis as { syncLight?: any; syncSlave?: any }).syncLight
+      || (globalThis as { syncLight?: any; syncSlave?: any }).syncSlave;
+    const masterUrl: string =
+      (sync?.settings?.masterUrl as string)
+      || (sync?.settings?.selfUrl as string)
+      || "";
+    if (!masterUrl) return null;
+    const url = masterUrl.replace(/\/+$/, "") + "/api/client-sync/mayday-primary";
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = (await r.json()) as { username?: string };
+    return (j.username || "").trim() || null;
+  } catch {
+    return null;
   }
 }
 

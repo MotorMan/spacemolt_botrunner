@@ -28,15 +28,6 @@ export class CraftQueueTracker {
   private jobs: Map<string, QueuedJob> = new Map();
   private recipeIndex: Map<string, string[]> = new Map();
   private bot: Bot;
-  // Job IDs this PROCESS actually queued via the `craft` command. Only these are
-  // trusted as "credible pending" for goal coverage / duplicate detection. Jobs
-  // the server still lists but that we did NOT queue this session (e.g. an
-  // orphaned, long-running batch from a previous run that the station drone is
-  // no longer actually fulfilling) must NOT satisfy a goal — otherwise the
-  // crafter believes the item is "in flight", stops topping up, and the station
-  // drains while a phantom "pending" (e.g. 148600 fuel_reserve) is credited
-  // forever. See getProgress / hasPendingJob.
-  private sessionQueued: Set<string> = new Set();
 
   private static CRAFTING_STATE_FILE = "crafting-state.json";
 
@@ -58,7 +49,6 @@ export class CraftQueueTracker {
       lastProgressAt: now,
     };
     this.jobs.set(jobId, job);
-    this.sessionQueued.add(jobId);
     const existing = this.recipeIndex.get(recipeId) || [];
     if (!existing.includes(jobId)) {
       existing.push(jobId);
@@ -88,7 +78,6 @@ export class CraftQueueTracker {
     job.lastProgressAt = Date.now();
     job.lastUpdate = Date.now();
     this.bot.clearCraftingJobByRecipe(job.recipeId);
-    this.sessionQueued.delete(jobId);
     this.jobs.delete(jobId);
   }
 
@@ -96,17 +85,16 @@ export class CraftQueueTracker {
     return Array.from(this.jobs.values());
   }
 
-  // Core progress calculator. When `sessionOnly` is true, only jobs THIS process
-  // actually queued (see `sessionQueued`) are counted as "pending". Orphaned jobs
-  // the server still lists from a prior session are excluded so they can't
-  // fabricate phantom "pending" output and block re-queuing (the fuel bug).
-  private progressFor(recipeId: string, sessionOnly: boolean): { queued: number; completed: number; remaining: number } {
+  // Progress across the bot's OWN crafting queue (the `craft` command only ever
+  // returns this bot's jobs, since each bot has its own websocket — see
+  // bot.craftQueueCache). Every job in here is legitimately this bot's pending
+  // output, so it is all counted toward "pending" for goal coverage / dedup.
+  getProgress(recipeId: string): { queued: number; completed: number; remaining: number } {
     const ids = this.recipeIndex.get(recipeId) || [];
     let queued = 0;
     let completed = 0;
     let remainingCap = 0;
     for (const id of ids) {
-      if (sessionOnly && !this.sessionQueued.has(id)) continue;
       const job = this.jobs.get(id);
       if (job) {
         queued += job.quantity;
@@ -120,24 +108,10 @@ export class CraftQueueTracker {
     return { queued, completed, remaining: Math.min(queued - completed, remainingCap) };
   }
 
-  // Progress crediting ONLY jobs queued this session. This is what goal coverage
-  // and duplicate detection use, so an old/orphaned server job can never satisfy
-  // a goal or block a fresh top-up.
-  getProgress(recipeId: string): { queued: number; completed: number; remaining: number } {
-    return this.progressFor(recipeId, true);
-  }
-
-  // Progress across ALL known jobs (including orphaned ones) — used purely for
-  // display in [Queue Status] so the operator still sees the real live queue.
-  getProgressAll(recipeId: string): { queued: number; completed: number; remaining: number } {
-    return this.progressFor(recipeId, false);
-  }
-
-  // Drop jobs that the server lists but that have made NO progress for longer
-  // than `maxInactiveMs`. A stuck fuel job that the station drone never actually
-  // crafts would otherwise sit as phantom "pending" until a process restart.
-  // (Note: orphaned jobs are ALSO excluded from coverage via `sessionQueued`,
-  // so this is now just hygiene/display cleanup rather than the sole guard.)
+  // Clean up any job the server still lists that has made NO progress for longer
+  // than `maxInactiveMs` (e.g. a fuel job the station drone never actually
+  // fulfills). This keeps "pending" honest so a genuinely stuck job can't sit
+  // forever and block a fresh top-up.
   pruneStaleInactiveJobs(maxInactiveMs: number): string[] {
     const now = Date.now();
     const toRemove: string[] = [];
@@ -148,7 +122,6 @@ export class CraftQueueTracker {
       }
     }
     for (const jobId of toRemove) {
-      this.sessionQueued.delete(jobId);
       this.jobs.delete(jobId);
       this.cleanupIndex(jobId);
     }
@@ -159,30 +132,21 @@ export class CraftQueueTracker {
     return this.jobs.get(jobId);
   }
 
-  // Display-only view of the live (shared/account-wide) queue — shows EVERY job
-  // the `craft` command returns, including other bots' jobs, so the operator can
-  // see the real queue. Do NOT use this for goal coverage/duplicate detection:
-  // those must use getProgress() (session-only) so one drone never credits
-  // another drone's jobs as its own pending.
   getProgressByRecipe(): Map<string, { queued: number; completed: number; remaining: number }> {
     const result = new Map<string, { queued: number; completed: number; remaining: number }>();
     for (const [recipeId] of Array.from(this.recipeIndex.entries())) {
-      result.set(recipeId, this.getProgressAll(recipeId));
+      result.set(recipeId, this.getProgress(recipeId));
     }
     return result;
   }
 
-  // Only counts jobs THIS bot actually queued this session. A shared/account-wide
-  // `craft` queue means every drone sees every other drone's jobs; crediting those
-  // as our own pending would make us think an item is "in flight" (and stop
-  // topping up) when another drone's job is the one producing it. This is the
-  // core guard against drone 006 believing drone 001's 148k fuel_reserve is its
-  // own pending.
+  // True when this bot already has enough pending runs of `recipeId` queued to
+  // cover `quantity`. Every job in the tracker is this bot's own (the `craft`
+  // command only returns this bot's queue), so all are counted.
   hasPendingJob(recipeId: string, quantity: number): boolean {
     const ids = this.recipeIndex.get(recipeId) || [];
     let remainingRuns = 0;
     for (const id of ids) {
-      if (!this.sessionQueued.has(id)) continue;
       const job = this.jobs.get(id);
       if (job) {
         remainingRuns += job.quantity - job.completed;
@@ -191,14 +155,13 @@ export class CraftQueueTracker {
     return remainingRuns >= quantity;
   }
 
-syncWithServer(serverJobs: ServerJobInfo[]): void {
+  syncWithServer(serverJobs: ServerJobInfo[]): void {
     if (serverJobs.length === 1 && serverJobs[0].jobId === "error") {
       return;
     }
     const currentIds = new Set(serverJobs.map(j => j.jobId));
     for (const [jobId, job] of Array.from(this.jobs.entries())) {
       if (!currentIds.has(jobId)) {
-        this.sessionQueued.delete(jobId);
         this.jobs.delete(jobId);
         this.cleanupIndex(jobId);
       }

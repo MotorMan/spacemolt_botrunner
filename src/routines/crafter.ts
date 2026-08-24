@@ -20,8 +20,11 @@ import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 // ── Settings ─────────────────────────────────────────────────
 
 const QUEUE_REFRESH_COOLDOWN = 60000;
-let lastQueueCheck = 0;
-let cachedQueueJobs: ServerJobInfo[] = [];
+// NOTE: the queue cache used to live here at MODULE level (lastQueueCheck /
+// cachedQueueJobs). Because all drones share one module scope when run in a
+// single process, that leaked one drone's queue into every other drone (the
+// "148k phantom fuel pending" bug). The cache now lives PER-BOT on
+// `bot.craftQueueCache` — see checkCraftingQueue().
 
 // Sentinel for the "crafting home base storage" setting. When a crafter's
 // craftingHomeBase equals this, it reads the faction storage of the station it
@@ -75,11 +78,14 @@ async function refreshCrafterBaseFuel(
   bot.homeBaseMaxFuel = newMaxFuel;
 }
 
-// Round-robin cursor per recipe so multiple same-type facilities share the load.
-const facilityRoundRobin = new Map<string, number>();
-// Recipes we've already warned about not having an owned facility for (dedupe per run).
-const notifiedMissingFacilities = new Set<string>();
+// Round-robin cursor and missing-facility dedupe used to live at MODULE level
+// here, but that shared them across every drone in a process. They are now
+// per-bot on `bot.facilityRoundRobin` / `bot.notifiedMissingFacilities`
+// (see pickRoundRobinFacility / queueCraftJob / the main routine).
+
 // Cumulative rental spend since the bot started (gated by rentalSpendingLimit).
+// NOTE: this is intentionally shared/session-wide is NOT per-bot; if multiple
+// drones each rent, the cap should be the operator's global budget anyway.
 let rentalSpentThisSession = 0;
 
 interface CraftLimit {
@@ -548,10 +554,13 @@ async function refreshFacilityMaps(
 }
 
 // Distribute jobs across multiple owned facilities of the same type by
-// round-robining through them in a stable order.
-function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[]): FactionFacility {
-  const idx = (facilityRoundRobin.get(recipeId) || 0) % facilities.length;
-  facilityRoundRobin.set(recipeId, idx + 1);
+// round-robining through them in a stable order. The cursor is per-bot
+// (bot.facilityRoundRobin) so drones in a shared process don't collide on the
+// same facility index for the same recipe.
+function pickRoundRobinFacility(recipeId: string, facilities: FactionFacility[], bot: any): FactionFacility {
+  const cursor = bot.facilityRoundRobin;
+  const idx = (cursor.get(recipeId) || 0) % facilities.length;
+  cursor.set(recipeId, idx + 1);
   return facilities[idx];
 }
 
@@ -607,11 +616,12 @@ export function resolveVenueForRecipe(
   recipeName: string,
   ownFacilityMap: OwnFacilityMap,
   settings: CrafterSettings,
+  bot?: any,
 ): ResolvedVenue {
   if (settings.forceOwnFacility) {
     const facs = ownFacilityMap.get(recipeId) || [];
     if (facs.length > 0) {
-      const fac = pickRoundRobinFacility(recipeId, facs);
+      const fac = pickRoundRobinFacility(recipeId, facs, bot);
       return {
         facilityId: fac.facility_id,
         preset: settings.craftingPreset,
@@ -651,15 +661,16 @@ export function resolveVenueForRecipe(
 
 async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
   const now = Date.now();
-  if (!forceRefresh && now - lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
-    return cachedQueueJobs;
+  const cache = bot.craftQueueCache;
+  if (!forceRefresh && now - cache.lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
+    return cache.jobs;
   }
   
   const resp = await bot.exec("craft", { action: "queue" });
   if (resp.error) {
     return [];
   }
-  lastQueueCheck = now;
+  cache.lastQueueCheck = now;
   
   const result = resp.result as Record<string, unknown> | undefined;
   const details = (result as Record<string, unknown>)?.details as Record<string, unknown> | undefined;
@@ -678,7 +689,7 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
     }
     recipeIdToId.set(r.recipe_id, r.recipe_id);
   }
-  cachedQueueJobs = jobs.map((job: Record<string, unknown>) => {
+  cache.jobs = jobs.map((job: Record<string, unknown>) => {
     const recipeName = ((job.recipe as string) || "").toLowerCase();
     const recipeFromId = (job.recipe as string) || "";
     const recipeId = recipeNameToId.get(recipeName) 
@@ -694,7 +705,7 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
       runsRemaining: (job.runs_remaining as number) || 0,
     };
   }).filter(j => j.jobId && j.recipeId);
-  return cachedQueueJobs;
+  return cache.jobs;
 }
 
 async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Promise<number> {
@@ -1051,10 +1062,12 @@ export async function queueCraftJob(
    const craftCommandQuantity = runs * primaryOutputQty;
 
   // Notify (once per recipe per run) when we wanted our own facility but lack one.
+  // Per-bot (bot.notifiedMissingFacilities) so one drone's dedup doesn't silence
+  // the warning for every other drone.
   if (venue.missingFacility) {
     const key = recipe?.name || recipeId;
-    if (!notifiedMissingFacilities.has(key)) {
-      notifiedMissingFacilities.add(key);
+    if (!bot.notifiedMissingFacilities.has(key)) {
+      bot.notifiedMissingFacilities.add(key);
       log("warn", `⚠ No OWNED facility produces "${key}" - falling back per noFacilityFallback=${settings.noFacilityFallback}`);
     }
   }
@@ -1177,7 +1190,7 @@ async function waitForCompletion(
     await ctx.sleep(5000);
 
     const now = Date.now();
-    if (now - lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
+    if (now - bot.craftQueueCache.lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
       const currentJobIds = await checkCraftingQueue(bot, recipes);
       tracker.syncWithServer(currentJobIds);
       tracker.save();
@@ -1305,7 +1318,7 @@ async function queueAllRecipesOnce(
         continue;
       }
 
-       const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings);
+       const venue = resolveVenueForRecipe(item.recipe.recipe_id, item.recipe.name, ownFacilityMap, settings, bot);
         const queueResult = await queueCraftJob(ctx, item.recipe.recipe_id, runsToQueue * outputPerRun, bot, tracker, availableFn, recipes, venue, settings, ownFacilityMap, outputPerRun, rawCountItemFn);
        if (!queueResult.success) {
          if (queueResult.error === "insufficient_inputs") {
@@ -1663,7 +1676,7 @@ async function craftFromCategories(
     const outputQty = target.output_quantity || 1;
     const runs = Math.ceil(1 / outputQty);
     ctx.log("craft", `Queueing ${runs} run(s) of ${target.name} (outputs: ${formatOutputs(target)}; category: ${target.category})`);
-    const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings);
+    const venue = resolveVenueForRecipe(target.recipe_id, target.name, ownFacilityMap, settings, bot);
      const queueResult = await queueCraftJob(ctx, target.recipe_id, 1, bot, tracker, countItemForCraft, recipes, venue, settings, ownFacilityMap, 0, countItemForCraft);
     if (!queueResult.success) {
       if (queueResult.error && queueResult.error.includes("aborted")) {
@@ -1788,7 +1801,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Re-evaluate missing-facility warnings each cycle. The dedupe set is
     // process-lifetime, so clearing it lets a facility that became available
     // (e.g. after an upgrade) stop being silently treated as permanently missing.
-    notifiedMissingFacilities.clear();
+    // Per-bot now (bot.notifiedMissingFacilities), so clearing one drone's dedupe
+    // doesn't affect the others.
+    bot.notifiedMissingFacilities.clear();
     await detectAndRecoverFromDeath(ctx);
     if (bot.state !== "running") break;
 

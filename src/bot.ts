@@ -394,6 +394,24 @@ shipSpeed = 1;
   /** Tracks active crafting queue jobs with server-assigned job IDs. */
   craftQueueTracker: import("./routines/craftQueueTracker.js").CraftQueueTracker | null = null;
 
+  // Per-bot cache of the last `craft` queue fetch. CRITICAL: the crafter routine
+  // used to cache the queue at MODULE level, which is shared by every bot running
+  // in this process — so one drone would receive ANOTHER drone's queue (and its
+  // phantom "pending", e.g. 148k fuel_reserve) whenever the refresh cooldown was
+  // still active. Storing it per-bot guarantees each bot only ever sees its OWN
+  // crafting queue from its own `craft` command.
+  craftQueueCache: {
+    lastQueueCheck: number;
+    jobs: import("./routines/craftQueueTracker.js").ServerJobInfo[];
+  } = { lastQueueCheck: 0, jobs: [] };
+
+  // Per-bot facility round-robin cursor. Module-level sharing would make every
+  // drone route the same recipe to the same facility index.
+  facilityRoundRobin: Map<string, number> = new Map();
+
+  // Per-bot dedupe of "no owned facility" warnings.
+  notifiedMissingFacilities: Set<string> = new Set();
+
   /**
    * Generate a unique job ID for a crafting job.
    * Uses recipe_id (as returned in notifications) to prevent duplicates.

@@ -257,53 +257,43 @@ syncWithServer(serverJobs: ServerJobInfo[]): void {
 
   static async create(bot: Bot): Promise<CraftQueueTracker> {
     const tracker = new CraftQueueTracker(bot);
-    await tracker.load();
+    // We deliberately do NOT rehydrate job state from disk. `craft` is an
+    // instant (non-mutating) command that returns the authoritative live
+    // queue, so the ONLY valid source of "pending" / "remaining runs" is a
+    // fresh `craft` read reconciled via syncWithServer(). Persisting queue
+    // state to a file (as the old load()/save() did) is always stale the
+    // instant it is written: a job can complete or be cancelled on the server
+    // seconds later, and a stale file would then report phantom "pending"
+    // output that survives even a full client restart — which is exactly the
+    // bug where the crafter believed thousands of fuel_reserve were "in flight"
+    // when no such job ever existed. See also the no-op save() below.
+    //
+    // Best-effort cleanup of any legacy crafting-state.json so it can't be
+    // mistaken for live state by operators or future code.
+    try {
+      const { join } = require("path");
+      const { existsSync, unlinkSync } = require("fs");
+      const path = join(process.cwd(), "data", CraftQueueTracker.CRAFTING_STATE_FILE);
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      // ignore cleanup failures
+    }
     return tracker;
   }
 
+  // Rehydrating persisted queue state is intentionally a no-op. The live `craft`
+  // command is the single source of truth and is reconciled every pass via
+  // syncWithServer(); rebuilding from a file reintroduces the stale "phantom
+  // pending" data this class previously suffered from.
   private async load(): Promise<void> {
-    try {
-      const { join } = require("path");
-      const { existsSync, readFileSync } = require("fs");
-      const path = join(process.cwd(), "data", CraftQueueTracker.CRAFTING_STATE_FILE);
-      if (!existsSync(path)) return;
-      const raw = readFileSync(path, "utf-8");
-      const data = JSON.parse(raw);
-      const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: number; completed: number; deposited?: number; runsRemaining?: number; startedAt: number; lastUpdate: number; lastProgressAt?: number }>) || [];
-      for (const j of loaded) {
-        const job: QueuedJob = {
-          jobId: j.jobId,
-          recipeId: j.recipeId,
-          quantity: j.quantity,
-          completed: j.completed,
-          deposited: j.deposited ?? 0,
-          runsRemaining: j.runsRemaining ?? j.quantity,
-          startedAt: j.startedAt,
-          lastUpdate: j.lastUpdate,
-          lastProgressAt: j.lastProgressAt ?? j.lastUpdate,
-        };
-        this.jobs.set(job.jobId, job);
-        const existing = this.recipeIndex.get(job.recipeId) || [];
-        if (!existing.includes(job.jobId)) {
-          existing.push(job.jobId);
-          this.recipeIndex.set(job.recipeId, existing);
-        }
-      }
-    } catch {
-      // ignore corrupted state
-    }
+    // Intentionally does nothing — see create().
   }
 
+  // Persisting queue state to disk is intentionally a no-op for the same reason
+  // as load(): the moment it is written it is outdated, and re-reading it would
+  // resurrect phantom "pending" output. All truth lives in the live `craft`
+  // command, which syncWithServer() applies to this in-memory tracker.
   save(): void {
-    try {
-      const { join, dirname } = require("path");
-      const { writeFileSync, mkdirSync, existsSync } = require("fs");
-      const path = join(process.cwd(), "data", CraftQueueTracker.CRAFTING_STATE_FILE);
-      if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true });
-      const payload = JSON.stringify(this.toJSON(), null, 2);
-      writeFileSync(path, payload);
-    } catch {
-      // ignore write failures
-    }
+    // Intentionally does nothing — see load()/create().
   }
 }

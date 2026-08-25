@@ -435,6 +435,7 @@ async function getSharedMaydayPrimary(): Promise<string | null> {
     const masterUrl: string =
       (sync?.settings?.masterUrl as string)
       || (sync?.settings?.selfUrl as string)
+      || (globalThis as { clientSyncMasterUrl?: string }).clientSyncMasterUrl
       || "";
     if (!masterUrl) return null;
     const url = masterUrl.replace(/\/+$/, "") + "/api/client-sync/mayday-primary";

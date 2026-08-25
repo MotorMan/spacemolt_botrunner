@@ -383,6 +383,34 @@ export async function getCombinedFleetStatus(): Promise<BotStatus[]> {
     // fall back to local-only fleet
   }
 
+  // Robust fallback: the dashboard reaches the master's /api/client-sync/bots
+  // (which returns the combined fleet) even when the in-process sync pull came
+  // back empty — e.g. this node just started, the master was restarted, or
+  // fleet-poll returned nothing. If we still have no remote bots, try the /bots
+  // endpoint directly so the rescue routine sees the WHOLE connected fleet
+  // instead of just this client's own bots. Never throws.
+  if (remote.length === 0) {
+    const masterUrl: string =
+      ((light as unknown as { settings?: { masterUrl?: string } })?.settings?.masterUrl)
+      || ((slave as unknown as { settings?: { masterUrl?: string } })?.settings?.masterUrl)
+      || (globalThis as { clientSyncMasterUrl?: string }).clientSyncMasterUrl
+      || "";
+    if (masterUrl) {
+      try {
+        const r = await fetch(masterUrl.replace(/\/+$/, "") + "/api/client-sync/bots");
+        if (r.ok) {
+          const j = (await r.json()) as Array<Record<string, unknown>>;
+          if (Array.isArray(j) && j.length > 0) {
+            remote = j;
+            pullError = null;
+          }
+        }
+      } catch (err) {
+        pullError = pullError || `direct /bots fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+  }
+
   // Surface a cross-client pull failure to the rescue routine's log so a
   // connectivity problem is visible where the user is actually looking (the
   // rescue scan), not only on this node's console.
@@ -2647,6 +2675,12 @@ async function main(): Promise<void> {
       selfUrl: (csSettings.selfUrl as string) || "",
       disabledSyncFiles: Array.isArray(csSettings.disabledSyncFiles) ? (csSettings.disabledSyncFiles as string[]) : [],
     };
+    if (clientSyncSettings.enabled && clientSyncSettings.masterUrl) {
+      // Expose the configured master URL globally so cross-client fleet helpers
+      // (e.g. getCombinedFleetStatus) can reach the master's /api/client-sync/bots
+      // directly even when the in-process sync pull returns nothing.
+      (globalThis as { clientSyncMasterUrl?: string }).clientSyncMasterUrl = clientSyncSettings.masterUrl;
+    }
     if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
       const syncSlave = new ClientSyncSlave(clientSyncSettings);
       syncSlave.start();

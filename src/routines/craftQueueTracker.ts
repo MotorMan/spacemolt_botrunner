@@ -1,5 +1,11 @@
 import type { Bot } from "../bot.js";
 
+// How many consecutive `craft queue` syncs a job may be absent from before we
+// consider it genuinely gone (completed/cancelled) and drop it. A single fetch
+// is often transiently incomplete, so deleting on first absence caused the
+// tracker to "forget" in-flight work and the crafter to re-queue it forever.
+const MAX_MISSING_SYNCS = 3;
+
 export interface QueuedJob {
   jobId: string;
   recipeId: string;
@@ -14,6 +20,13 @@ export interface QueuedJob {
   // server keeps listing but never advances — without this the planner trusts
   // a phantom "pending" forever (e.g. 500k fuel_reserve that was never crafted).
   lastProgressAt: number;
+  // How many consecutive server syncs have NOT included this job. A single
+  // `craft queue` fetch can be transiently incomplete (it is an instant command
+  // and doesn't always echo every in-flight job), which previously caused
+  // syncWithServer to delete the local record and "forget" pending work — the
+  // crafter then re-queued the same recipe every pass and blew past its limit.
+  // We only drop a job after it has been missing for several consecutive syncs.
+  missingSyncs: number;
 }
 
 export interface ServerJobInfo {
@@ -47,6 +60,7 @@ export class CraftQueueTracker {
       startedAt: now,
       lastUpdate: now,
       lastProgressAt: now,
+      missingSyncs: 0,
     };
     this.jobs.set(jobId, job);
     const existing = this.recipeIndex.get(recipeId) || [];
@@ -160,10 +174,21 @@ export class CraftQueueTracker {
       return;
     }
     const currentIds = new Set(serverJobs.map(j => j.jobId));
+    // A job absent from this fetch is NOT immediately deleted: a single `craft
+    // queue` read is often incomplete. We only retire it once it has been
+    // missing for MAX_MISSING_SYNCS consecutive syncs — by then it is genuinely
+    // gone (the server would have echoed it otherwise). This prevents the
+    // tracker from losing track of pending runs and the planner from re-queueing
+    // the same recipe past its limit.
     for (const [jobId, job] of Array.from(this.jobs.entries())) {
       if (!currentIds.has(jobId)) {
-        this.jobs.delete(jobId);
-        this.cleanupIndex(jobId);
+        job.missingSyncs = (job.missingSyncs || 0) + 1;
+        if (job.missingSyncs > MAX_MISSING_SYNCS) {
+          this.jobs.delete(jobId);
+          this.cleanupIndex(jobId);
+        }
+      } else {
+        job.missingSyncs = 0;
       }
     }
     for (const serverJob of serverJobs) {
@@ -179,6 +204,7 @@ export class CraftQueueTracker {
           startedAt: now,
           lastUpdate: now,
           lastProgressAt: now,
+          missingSyncs: 0,
         };
         this.jobs.set(serverJob.jobId, job);
         const existing = this.recipeIndex.get(serverJob.recipeId) || [];

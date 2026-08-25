@@ -692,10 +692,20 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
   cache.jobs = jobs.map((job: Record<string, unknown>) => {
     const recipeName = ((job.recipe as string) || "").toLowerCase();
     const recipeFromId = (job.recipe as string) || "";
-    const recipeId = recipeNameToId.get(recipeName) 
-      || recipeOutputNameToId.get(recipeName) 
+    // The `craft` queue response carries an authoritative server `recipe_id`
+    // (the same id the crafting_update websocket events use). Prefer it over the
+    // display `recipe` name: matching on the display name is fragile — when it
+    // fails (e.g. "Fuel Reserve" vs "Manufacture Fuel (H2O2)") the job gets
+    // keyed under a junk string, so `tracker.getProgress(recipeId)` reports 0
+    // pending even though the job is live. That was the root cause of the
+    // crafter endlessly re-queuing the same recipe and blowing past its limit.
+    const serverRecipeId = (job.recipe_id as string) || "";
+    const recipeId = (serverRecipeId && (recipeIdToId.get(serverRecipeId.toLowerCase()) || recipeIdToId.get(serverRecipeId)))
+      || recipeNameToId.get(recipeName)
+      || recipeOutputNameToId.get(recipeName)
       || recipeOutputItemToId.get(recipeName)
       || recipeIdToId.get(recipeFromId)
+      || serverRecipeId
       || recipeFromId;
     return {
       jobId: (job.job_id as string) || "",
@@ -706,6 +716,28 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
     };
   }).filter(j => j.jobId && j.recipeId);
   return cache.jobs;
+}
+
+// Aggregate, per recipe_id, how many RUNS are still pending in the live `craft`
+// queue (server-authoritative). This is the single source of truth for "how much
+// is already in flight" and must NOT depend on the in-memory tracker's
+// recipeIndex (which can be wiped by a transiently-incomplete fetch — see
+// syncWithServer). Everything that needs pending (goal deficits, dedup, the
+// hard limit clamp) should read from here so the crafter always "respects the
+// live queue info from craft".
+async function computeLivePendingRuns(
+  bot: any,
+  recipes: Recipe[],
+  forceRefresh = true,
+): Promise<Map<string, number>> {
+  const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
+  const pending = new Map<string, number>();
+  for (const j of serverJobs) {
+    if (!j.recipeId) continue;
+    const remain = Math.max(0, Math.min(j.quantity - j.runsDone, j.runsRemaining));
+    pending.set(j.recipeId, (pending.get(j.recipeId) || 0) + remain);
+  }
+  return pending;
 }
 
 async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Promise<number> {
@@ -1288,12 +1320,25 @@ async function queueAllRecipesOnce(
     ownFacilityMap: OwnFacilityMap,
     settings: CrafterSettings,
     rawCountItemFn: (itemId: string) => number,
+    // Live in-flight pending, per recipe_id (RUNS), read authoritatively from the
+    // `craft` queue. When omitted we re-derive it here. This is what stops the
+    // crafter from ignoring already-queued work and re-queueing past the limit.
+    livePendingRuns?: Map<string, number>,
+    // Hard ceiling per recipe_id (in limiting-output ITEMS) from the craftLimit.
+    // When set, the total queued runs for a recipe are clamped so completed +
+    // pending + queued can never exceed it.
+    limitByRecipe?: Map<string, number>,
 ): Promise<{ queued: Array<{ recipeId: string; quantity: number; outputQty: number }>; queuedItems: number }> {
     const { bot } = ctx;
     const queued: Array<{ recipeId: string; quantity: number; outputQty: number }> = [];
     let queuedItemsTotal = 0;
 
     await syncCraftingQueue(ctx, tracker, recipes, true);
+    // Authoritative in-flight pending, straight from the live `craft` queue —
+    // never trust the in-memory tracker's recipeIndex alone (it can be wiped by a
+    // transiently-incomplete fetch, which is what let the crafter stack 28M fuel
+    // against a 275k limit).
+    const livePending = livePendingRuns ?? await computeLivePendingRuns(bot, recipes, true);
 
     for (const item of allPlanItems) {
       if (bot.state !== "running") break;
@@ -1303,17 +1348,38 @@ async function queueAllRecipesOnce(
       // oxygen), instead of letting the largest output mask the deficit.
       const limiter = lowestOutputItem(item.recipe);
       const outputPerRun = limiter.quantity || 1;
-      const progress = tracker.getProgress(item.recipe.recipe_id);
-      const pendingRuns = progress.remaining;
-      const completedRuns = progress.completed;
+      // Prefer the authoritative live pending; only fall back to the in-memory
+      // tracker if the live read lacks this recipe.
+      const pendingRuns = livePending.get(item.recipe.recipe_id) ?? tracker.getProgress(item.recipe.recipe_id).remaining;
+      const completedRuns = tracker.getProgress(item.recipe.recipe_id).completed;
 
       // item.quantityToCraft is expressed in the recipe's first-output items;
       // convert to the limiting-output frame so the run count is correct.
       const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
-      const remainingRuns = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
-      const runsToQueue = Math.max(0, remainingRuns);
+      let runsToQueue = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
+
+      // HARD LIMIT CLAMP: never queue so much that completed + pending + queued
+      // exceeds the configured craftLimit (in limiting-output items). This is the
+      // guaranteed safety net — even if pending is somehow miscounted, a recipe
+      // can never blow past its cap (e.g. 275k fuel_reserve).
+      const limitItems = limitByRecipe?.get(item.recipe.recipe_id);
+      if (limitItems !== undefined) {
+        const limitRuns = Math.ceil(limitItems / outputPerRun);
+        const maxQueueable = Math.max(0, limitRuns - completedRuns - pendingRuns);
+        if (runsToQueue > maxQueueable) {
+          if (maxQueueable <= 0) {
+            ctx.log("craft", `✓ ${item.recipe.name}: at/over limit (completed ${completedRuns} + pending ${pendingRuns} runs >= ${limitRuns} run limit) - not queueing more`);
+            // nothing to do; record what's already in flight so waiters still see it
+            const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
+            queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
+            continue;
+          }
+          ctx.log("craft", `Capping ${item.recipe.name}: ${runsToQueue} runs requested but only ${maxQueueable} fit under the ${limitItems}-item limit (completed ${completedRuns} + pending ${pendingRuns} runs, limit ${limitRuns} runs)`);
+          runsToQueue = maxQueueable;
+        }
+      }
       if (runsToQueue <= 0) {
-        const actualQueued = progress.queued;
+        const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
         queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
         continue;
       }
@@ -1454,6 +1520,20 @@ async function executeCraftingPlan(
       }
     };
 
+    // Per-recipe hard ceiling (in limiting-output ITEMS) taken from the
+    // configured craftLimit. Used by queueAllRecipesOnce to clamp how much we
+    // ever queue, so a recipe can NEVER exceed its limit even if pending tracking
+    // glitches (this is the safety net that prevents the 28M-fuel disaster).
+    const limitByRecipe = new Map<string, number>();
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (recipeId && g.limit > 0) {
+        // Keep the smallest limit if a recipe is targeted by multiple goals.
+        const prev = limitByRecipe.get(recipeId);
+        limitByRecipe.set(recipeId, prev === undefined ? g.limit : Math.min(prev, g.limit));
+      }
+    }
+
     // Active loop: keep re-planning and queueing as sub-materials become available.
     while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
       loopCount++;
@@ -1493,18 +1573,22 @@ async function executeCraftingPlan(
         }
 
 
-      // Recompute which goals still need production using live stock + in-flight output.
-     const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
-     for (const g of goalsToAchieve) {
-       const recipeId = recipeIdForGoal(g);
-       if (!recipeId) continue;
-       const liveStock = countItemFn!(g.itemId.toLowerCase());
-        const prog = tracker.getProgress(recipeId);
-        const queuedOutput = prog.remaining * outputQtyOf(recipeId);
+      // Recompute which goals still need production using live stock + in-flight
+      // output. Read pending straight from the authoritative `craft` queue so a
+      // transiently-stale tracker (which would report 0 pending) can never make
+      // us think we're short and re-queue past the limit.
+      const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
+      const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
+      for (const g of goalsToAchieve) {
+        const recipeId = recipeIdForGoal(g);
+        if (!recipeId) continue;
+        const liveStock = countItemFn!(g.itemId.toLowerCase());
+        const pendingRuns = livePendingRuns.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
+        const queuedOutput = pendingRuns * outputQtyOf(recipeId);
         if (liveStock + queuedOutput < g.limit) {
-         remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
-       }
-     }
+          remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
+        }
+      }
 
      if (remainingGoals.length === 0) {
        log("craft", "All goals covered by stock + in-flight queue - waiting for production to finish");
@@ -1534,7 +1618,7 @@ async function executeCraftingPlan(
      }
 
       const effectiveSettings = settings || await getCrafterSettings();
-      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!);
+      const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!, livePendingRuns, limitByRecipe);
 
       // Progress is being made if we queued something this pass, or if the queue
       // still has jobs producing sub-materials we're waiting on.
@@ -1561,14 +1645,18 @@ async function executeCraftingPlan(
     }
 
    // Wait for the final goal items to actually be produced before returning.
+   // Read the authoritative live pending once up front (a `.map` callback isn't
+   // async, so we can't `await` inside it) so we correctly wait for genuinely
+   // in-flight jobs even if the in-memory tracker briefly lost them.
+   const liveFinalPending = await computeLivePendingRuns(bot, recipes, true);
    const finalItems = goalsToAchieve.map(g => {
      const recipeId = recipeIdForGoal(g);
-     if (!recipeId) return null;
-     const outputQty = outputQtyOf(recipeId);
-      const prog = tracker.getProgress(recipeId);
-      const target = prog.remaining * outputQty;
-      return { recipeId, quantity: target, outputQty };
-   }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
+      if (!recipeId) return null;
+      const outputQty = outputQtyOf(recipeId);
+       const pendingRuns = liveFinalPending.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
+       const target = pendingRuns * outputQty;
+       return { recipeId, quantity: target, outputQty };
+    }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
 
     const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
    crafted.push(...completed);
@@ -1918,6 +2006,12 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("craft", "Processing crafting goals...");
     const goalItems: Array<{ itemId: string; quantity: number; limit: number; recipe?: Recipe }> = [];
 
+    // Authoritative in-flight pending, read straight from the live `craft`
+    // queue. The in-memory tracker can momentarily lose jobs (an incomplete
+    // fetch), which would make `tracker.getProgress()` report 0 pending and lead
+    // to re-queueing past the limit — so always size deficits against this.
+    const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
+
     for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
       if (bot.state !== "running") break;
 
@@ -1956,8 +2050,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       const limiter = lowestOutputItem(recipe);
       const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
       const currentStock = countItem(limiter.item_id);
-      const progress = tracker.getProgress(recipe.recipe_id);
-      const pendingRuns = progress.remaining;
+      // Prefer the authoritative live pending; fall back to the in-memory tracker
+      // only if the live read somehow lacks this recipe.
+      const pendingRuns = livePendingRuns.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
       const pendingItems = pendingRuns * (limiter.quantity || 1);
       const stockIncludingQueue = currentStock + pendingItems;
       const needed = limitRuns * (limiter.quantity || 1) - stockIncludingQueue;

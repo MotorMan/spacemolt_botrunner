@@ -531,6 +531,16 @@
         </div>
 
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+          <label style="color:var(--text-bright);font-weight:600">Faction Station Access</label>
+        </div>
+
+        <div class="cmd-group">
+          <label>Ban Player (All Bots)</label>
+          <input type="text" id="ca-ban-player" placeholder="player id or username" style="min-width:160px;font-size:12px;padding:4px 8px">
+          <button class="danger sm" onclick="caExec('facility',{action:'ban',player:val('ca-ban-player')})">Ban</button>
+        </div>
+
+        <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Status Commands</label>
         </div>
 

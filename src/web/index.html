@@ -35785,13 +35785,17 @@ ignoreBlacklist: document.getElementById(
               isShipAtStation &&
               tierOk;
 
-            const botOptions = bots
+            // Include local bots plus any remote bots reported by client-sync
+            // (Connect Clients), so shipping a ship to a bot on another client
+            // is just a dropdown pick like the profile Gifting section does.
+            const localOtherBotOpts = bots
               .filter((b) => b.username !== username)
               .map(
                 (b) =>
                   `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
               )
               .join("");
+            const botOptions = localOtherBotOpts + getRemoteBotOptions(username);
             const giftDropdown =
               !isActive && !isBuilding && !isLoadedOnCarrier
                 ? `

@@ -30309,7 +30309,6 @@ async function fetchPersonalFacilityTypes(username) {
         const repairThreshold = sv.repairThreshold ?? 40;
         const currentSystem = sv.system || "";
         const homeSystem = sv.homeSystem || "";
-        const salvageYardSystem = sv.salvageYardSystem || "";
         const salvageYardStation = sv.salvageYardStation || "";
         const enableFullSalvage = sv.enableFullSalvage !== false;
         const enableTowing = sv.enableTowing ?? false;
@@ -30324,38 +30323,44 @@ async function fetchPersonalFacilityTypes(username) {
         const ignoreBlacklist = sv.ignoreBlacklist ?? false;
         const minimumFuelCells = sv.minimumFuelCells ?? 20;
 
-        // Salvage yard stations list - mobile_capital is dynamic
-        const mcLocation = mobileCapitol
-          ? mobileCapitol.systemName || mobileCapitol.systemId
-          : "unknown (not discovered)";
-        const salvageYardStations = [
-          {
-            id: "alpha_centauri_colonial_station",
-            name: "Alpha Centauri Colonial Station",
-            system: "alpha_centauri",
-          },
-          {
-            id: "node_alpha_processing_station",
-            name: "Node Alpha Processing Station",
-            system: "node_alpha",
-          },
-          {
-            id: "the_anvil_arsenal",
-            name: "The Anvil Arsenal",
-            system: "the_anvil",
-          },
-          { id: "mobile_capital", name: "Mobile Capital", system: mcLocation },
-          {
-            id: "cargo_lanes_freight_depot",
-            name: "Cargo Lanes Freight Depot",
-            system: "cargo_lanes",
-          },
-          {
-            id: "starfall_salvage_station",
-            name: "Starfall Salvage Station",
-            system: "starfall",
-          },
-        ];
+        // Build a list of ALL known stations. Any station can now process salvaged
+        // wrecks (faction stations included), so the user may pick any of them.
+        // The system is derived automatically from the chosen station — no
+        // separate salvage yard system setting is needed.
+        const stationIsStation = (p) =>
+          p.has_base || p.base_id || (p.type || "").toLowerCase() === "station";
+        const allStations = [];
+        for (const [sysId, sysData] of Object.entries(mapData || {})) {
+          const systemLabel = (sysData && (sysData.name || sysData.id)) || sysId;
+          for (const p of (sysData && sysData.pois) || []) {
+            if (stationIsStation(p)) {
+              allStations.push({
+                id: p.id,
+                name: p.name || p.id,
+                system: systemLabel,
+              });
+            }
+          }
+        }
+        // Include the mobile capital as a dynamic option if known
+        if (mobileCapitol) {
+          allStations.push({
+            id: "mobile_capital",
+            name: "Mobile Capital",
+            system: mobileCapitol.systemName || mobileCapitol.systemId || "unknown",
+          });
+        }
+        // Ensure the currently configured station is present even if not yet discovered
+        if (
+          salvageYardStation &&
+          !allStations.find((s) => s.id === salvageYardStation)
+        ) {
+          allStations.push({
+            id: salvageYardStation,
+            name: salvageYardStation,
+            system: "(unknown)",
+          });
+        }
 
         const systemOpts = ['<option value="">(current system)</option>'];
         for (const sys of [...knownSystems].sort((a, b) =>
@@ -30392,29 +30397,14 @@ async function fetchPersonalFacilityTypes(username) {
           );
         }
 
-        const salvageYardOpts = [
-          '<option value="">(auto - any salvage yard)</option>',
-        ];
-        for (const station of [...salvageYardStations].sort((a, b) =>
+        const salvageYardOpts = ['<option value="">(auto - any station)</option>'];
+        for (const station of [...allStations].sort((a, b) =>
           (a.name || "").localeCompare(b.name || ""),
         )) {
           const sel = station.id === salvageYardStation ? " selected" : "";
           const label = `${station.name} (${station.system})`;
           salvageYardOpts.push(
             `<option value="${esc(station.id)}"${sel}>${esc(label)}</option>`,
-          );
-        }
-
-        const salvageYardSystemOpts = [
-          '<option value="">(auto - based on station)</option>',
-        ];
-        for (const sys of [...knownSystems].sort((a, b) =>
-          (a.name || a.id || "").localeCompare(b.name || b.id || ""),
-        )) {
-          const sel = sys.id === salvageYardSystem ? " selected" : "";
-          const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
-          salvageYardSystemOpts.push(
-            `<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`,
           );
         }
 
@@ -30479,17 +30469,9 @@ async function fetchPersonalFacilityTypes(username) {
     <div class="setting-row">
       <div>
         <div class="setting-label">Salvage Yard Station</div>
-        <div class="setting-hint">Station to process towed wrecks. Leave empty to use any salvage yard.</div>
+        <div class="setting-hint">Station to process towed wrecks. Any station may be used (faction stations included). The system is detected automatically from the station. Leave empty to use any available station.</div>
       </div>
       <select id="set-salvager-salvageYardStation">${salvageYardOpts.join("")}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Salvage Yard System</div>
-        <div class="setting-hint">Override system for salvage yard. Usually auto-detected from station.</div>
-      </div>
-      <select id="set-salvager-salvageYardSystem">${salvageYardSystemOpts.join("")}</select>
     </div>
 
     <div class="setting-row">
@@ -30644,9 +30626,6 @@ async function fetchPersonalFacilityTypes(username) {
           autoCloak: document.getElementById("set-salvager-autoCloak").checked,
           salvageYardStation: document.getElementById(
             "set-salvager-salvageYardStation",
-          ).value,
-          salvageYardSystem: document.getElementById(
-            "set-salvager-salvageYardSystem",
           ).value,
           maxRoamJumps:
             parseInt(

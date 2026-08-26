@@ -213,10 +213,9 @@ async function getSalvagerSettings(username?: string): Promise<{
    cargoThreshold: number;
    refuelThreshold: number;
    repairThreshold: number;
-   system: string;
-   homeSystem: string;
-   salvageYardSystem: string;
-   salvageYardStation: string;
+    system: string;
+    homeSystem: string;
+    salvageYardStation: string;
    autoCloak: boolean;
    enableCloak: boolean;
    enableFullSalvage: boolean;
@@ -340,8 +339,7 @@ minimumFuelCells: number;
     repairThreshold: (m.repairThreshold as number) || 40,
     system: (botOverrides.system as string) || (m.system as string) || "",
     homeSystem: (botOverrides.homeSystem as string) || (m.homeSystem as string) || "",
-salvageYardSystem: (botOverrides.salvageYardSystem as string) || (m.salvageYardSystem as string) || "",
-     salvageYardStation: (botOverrides.salvageYardStation as string) || (m.salvageYardStation as string) || "",
+    salvageYardStation: (botOverrides.salvageYardStation as string) || (m.salvageYardStation as string) || "",
      autoCloak: (m.autoCloak as boolean) ?? false,
      enableCloak: (m.enableCloak as boolean) ?? false,
      enableFullSalvage: (m.enableFullSalvage as boolean) !== false,
@@ -1696,14 +1694,13 @@ for (const poi of roamVisit) {
 
       // Determine salvage yard destination
       const configuredStation = settings.salvageYardStation || "";
-      const configuredSystem = settings.salvageYardSystem || "";
-      let targetSystem = configuredSystem;
+      let targetSystem = "";
       let targetStationId: string | null = null;
 
       if (configuredStation) {
-        // User specified a specific salvage yard station
+        // User specified a specific salvage yard station; derive its system from
+        // the selected station (no separate system setting required anymore).
         targetStationId = configuredStation;
-        // Try to find the system for this station
         const sysForStation = getSystemForSalvageYard(configuredStation);
         if (sysForStation) {
           targetSystem = sysForStation;

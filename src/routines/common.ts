@@ -376,14 +376,26 @@ export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
   return pois.find(p => isStationPoi(p)) || null;
 }
 
-/** Get the system ID for a known salvage yard station. */
+/**
+ * Get the system ID for a salvage yard station.
+ * Works for ANY station (not just the legacy hard-coded salvage yards) by
+ * resolving it through the map store, so the system no longer needs to be
+ * configured separately — it is derived from the selected station.
+ */
 export function getSystemForSalvageYard(stationId: string): string | null {
   // Mobile capitol is dynamic - use the tracked location
   if (stationId === "mobile_capital") {
     return getMobileCapitolSystem();
   }
-  
-  // Map other salvage yard stations to their systems
+
+  // Resolve any station through the map store (covers every discovered station,
+  // including faction stations that can now process salvaged wrecks).
+  const resolved = mapStore.resolveStationIdentity(stationId);
+  if (resolved.matched && resolved.systemId) {
+    return resolved.systemId;
+  }
+
+  // Fallback to the legacy hard-coded mapping for any station not yet in the map.
   const stationToSystem: Record<string, string> = {
     "alpha_centauri_colonial_station": "alpha_centauri",  // Alpha Centauri empire
     "node_alpha_processing_station": "node_alpha",        // Node empire

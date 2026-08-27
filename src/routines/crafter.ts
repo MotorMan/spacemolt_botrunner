@@ -93,9 +93,23 @@ interface CraftLimit {
   limit: number;
 }
 
+// A single material threshold that arms a recipe's auto-craft "trigger" mode.
+// When the live count of `item` rises ABOVE `triggerAt`, the recipe is eligible
+// to start; once started it queues enough runs to bring `item` back DOWN to
+// `stopAt`. Multiple entries (one per required component) are ANDed: every
+// material must be above its own trigger before the recipe fires, and the run
+// count is sized so the *limiting* material lands exactly on its stop point.
+export interface MaterialTrigger {
+  item: string;
+  triggerAt: number;
+  stopAt: number;
+}
+
 interface CrafterProfile {
   name: string;
   craftLimits: CraftLimit[];
+  // Per-recipe material triggers (see MaterialTrigger). Keyed by recipe id.
+  recipeTriggers?: Record<string, MaterialTrigger[]>;
 }
 
 async function getCrafterSettings(): Promise<{
@@ -165,7 +179,7 @@ async function getCrafterSettings(): Promise<{
 
   let crafters: CrafterProfile[] = [];
   if (Array.isArray(c.crafters)) {
-    crafters = (c.crafters as Array<{name: string, craftLimits: any}>).map(profile => {
+    crafters = (c.crafters as Array<{name: string, craftLimits: any, recipeTriggers?: any}>).map(profile => {
       const rawLimits = profile.craftLimits || [];
       const craftLimits: CraftLimit[] = [];
       if (Array.isArray(rawLimits)) {
@@ -181,7 +195,24 @@ async function getCrafterSettings(): Promise<{
           }
         }
       }
-      return { name: profile.name || 'Unnamed Crafter', craftLimits };
+      // Material triggers: { [recipeId]: [{ item, triggerAt, stopAt }, ...] }.
+      const recipeTriggers: Record<string, MaterialTrigger[]> = {};
+      const rawTriggers = (profile.recipeTriggers || {}) as Record<string, unknown>;
+      for (const [recipeId, trigs] of Object.entries(rawTriggers)) {
+        if (!recipeId || !Array.isArray(trigs)) continue;
+        const list = (trigs as unknown[])
+          .filter((t): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
+            !!t && typeof (t as any).item === "string" && (t as any).item &&
+            typeof (t as any).triggerAt === "number" && typeof (t as any).stopAt === "number" &&
+            (t as any).triggerAt >= (t as any).stopAt)
+          .map(t => ({
+            item: (t.item as string).toLowerCase(),
+            triggerAt: t.triggerAt as number,
+            stopAt: t.stopAt as number,
+          }));
+        if (list.length > 0) recipeTriggers[recipeId] = list;
+      }
+      return { name: profile.name || 'Unnamed Crafter', craftLimits, recipeTriggers };
     });
   } else if (c.craftLimits) {
     const rawLimits = c.craftLimits;
@@ -200,7 +231,26 @@ async function getCrafterSettings(): Promise<{
       }
     }
     if (craftLimits.length > 0) {
-      crafters.push({ name: "Default Crafter", craftLimits });
+      // Legacy global recipeTriggers key (flat object), for configs that still
+      // use the old flat craftLimits format. New configs nest it under each
+      // crafter profile instead.
+      const recipeTriggers: Record<string, MaterialTrigger[]> = {};
+      const rawTriggers = (c.recipeTriggers as Record<string, unknown>) || {};
+      for (const [recipeId, trigs] of Object.entries(rawTriggers)) {
+        if (!recipeId || !Array.isArray(trigs)) continue;
+        const list = (trigs as unknown[])
+          .filter((t): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
+            !!t && typeof (t as any).item === "string" && (t as any).item &&
+            typeof (t as any).triggerAt === "number" && typeof (t as any).stopAt === "number" &&
+            (t as any).triggerAt >= (t as any).stopAt)
+          .map(t => ({
+            item: (t.item as string).toLowerCase(),
+            triggerAt: t.triggerAt as number,
+            stopAt: t.stopAt as number,
+          }));
+        if (list.length > 0) recipeTriggers[recipeId] = list;
+      }
+      crafters.push({ name: "Default Crafter", craftLimits, recipeTriggers });
     }
   }
 
@@ -902,6 +952,143 @@ function calculateMaxCraftable(
 
   if (maxRuns === Infinity) return 0;
   return maxRuns;
+}
+
+// ── Material-triggered crafting ───────────────────────────────
+//
+// A material trigger lets a recipe auto-fire when its INPUT materials pile up
+// past a "trigger" threshold and craft back down to a "stop" threshold. This is
+// the inverse of the normal craftLimit (which maintains a stock of OUTPUT): it
+// is for "I keep mining iron_ore and want to convert the surplus into steel,
+// but stop before I run the stock dry — e.g. wait until iron_ore > 490k, then
+// refine until iron_ore drops to 200k."
+//
+// `evaluateRecipeTrigger` is pure (no I/O) so it can be unit-tested directly.
+
+export function evaluateRecipeTrigger(
+  recipe: Recipe,
+  triggers: MaterialTrigger[] | undefined,
+  countItemFn: (itemId: string) => number,
+): number | null {
+  if (!triggers || triggers.length === 0) return null;
+  let runs = Infinity;
+  let matchedAnyComponent = false;
+  for (const t of triggers) {
+    const current = countItemFn(t.item.toLowerCase());
+    // Every material must be ABOVE its trigger point before we start, so the
+    // surplus actually exists. If any is still below, the recipe stays armed but
+    // quiet (mining will get us there).
+    if (!(current > t.triggerAt)) return null;
+    // The trigger item must actually be a component of this recipe, otherwise we
+    // have no way to convert it. Skip (don't count) entries that don't match.
+    const comp = recipe.components.find(
+      c => c.item_id.toLowerCase() === t.item.toLowerCase(),
+    );
+    if (!comp) continue;
+    matchedAnyComponent = true;
+    const perRun = comp.quantity || 1;
+    // How many runs would bring this material from `current` down to `stopAt`.
+    const toCraft = Math.floor((current - t.stopAt) / perRun);
+    if (toCraft <= 0) return null; // already at/below the stop point
+    runs = Math.min(runs, toCraft);
+  }
+  if (!matchedAnyComponent) return null;
+  return runs === Infinity ? null : runs;
+}
+
+/**
+ * Evaluate and queue every material-triggered recipe for the active crafter
+ * profile. Returns how many recipes fired and how many successfully queued.
+ *
+ * A recipe fires only when all of its material triggers are above their
+ * `triggerAt` (so the surplus exists) and no job for it is already in flight
+ * (we don't stack trigger batches on top of pending work). When it fires we
+ * size the run count to bring the LIMITING material down to its `stopAt`, then
+ * queue the whole thing in one shot (exactly like the user's "just put that
+ * all in one queue" expectation).
+ */
+export async function processRecipeTriggers(
+  ctx: RoutineContext,
+  bot: any,
+  recipes: Recipe[],
+  recipeTriggers: Record<string, MaterialTrigger[]> | undefined,
+  ownFacilityMap: OwnFacilityMap,
+  settings: CrafterSettings,
+  countItemFn: (itemId: string) => number,
+  tracker: CraftQueueTracker,
+  livePendingRuns?: Map<string, number>,
+): Promise<{ fired: number; queued: number }> {
+  const { log } = ctx;
+  const result = { fired: 0, queued: 0 };
+  if (!recipeTriggers || Object.keys(recipeTriggers).length === 0) return result;
+
+  const recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+  const allowedFacilityRecipeIds = new Set(
+    Object.keys(settings.recipeFacilityLinks || {}),
+  );
+  const livePending =
+    livePendingRuns ?? (await computeLivePendingRuns(bot, recipes, false));
+
+  for (const [recipeId, triggers] of Object.entries(recipeTriggers)) {
+    if (bot.state !== "running") break;
+    if (!triggers || triggers.length === 0) continue;
+
+    const recipe =
+      recipeIndex.get(recipeId) ||
+      recipes.find(r =>
+        r.recipe_id === recipeId ||
+        r.name.toLowerCase() === recipeId.toLowerCase() ||
+        r.output_item_id.toLowerCase() === recipeId.toLowerCase(),
+      );
+    if (!recipe) {
+      log("warn", `Material trigger: recipe "${recipeId}" not found - skipping`);
+      continue;
+    }
+
+    const craftableCheck = isRecipeCraftableNew(recipe, allowedFacilityRecipeIds);
+    if (!craftableCheck.ok) {
+      log("warn", `Material trigger: recipe "${recipeId}" (${recipe.name}) not craftable: ${craftableCheck.reason}`);
+      continue;
+    }
+
+    // Don't stack another trigger batch on top of work already in flight for
+    // this recipe (whether from a trigger, a goal, or category crafting).
+    const pending = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
+    if (pending > 0) continue;
+
+    const runs = evaluateRecipeTrigger(recipe, triggers, countItemFn);
+    if (runs === null) continue;
+
+    result.fired++;
+    const limiter = lowestOutputItem(recipe);
+    const outputPerRun = limiter.quantity || 1;
+    const venue = resolveVenueForRecipe(recipe.recipe_id, recipe.name, ownFacilityMap, settings, bot);
+    const summary = triggers.map(t => `${t.item}>${t.triggerAt}→stop ${t.stopAt}`).join(", ");
+    log("craft", `⚡ Material trigger FIRED for ${recipe.name}: ${summary} -> queueing ${runs} run(s) (limiting output ${outputPerRun}x ${limiter.name})`);
+
+    const queueResult = await queueCraftJob(
+      ctx,
+      recipe.recipe_id,
+      runs * outputPerRun,
+      bot,
+      tracker,
+      countItemFn,
+      recipes,
+      venue,
+      settings,
+      ownFacilityMap,
+      outputPerRun,
+      countItemFn,
+    );
+    if (queueResult.success) {
+      result.queued++;
+      log("craft", `✓ Queued ${queueResult.queuedRuns} run(s) of ${recipe.name} via material trigger`);
+    } else if (queueResult.error && queueResult.error !== "Job already queued") {
+      log("error", `Failed to queue material-trigger run for ${recipe.name}: ${queueResult.error}`);
+    }
+  }
+
+  return result;
 }
 
 // ── External facility guard (dry-run cost check) ──────────────
@@ -2227,6 +2414,32 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Track the goal by the limiting output item so every produced item
       // (including the secondary ones) is actually requested and counted.
       goalItems.push({ itemId: limiter.item_id, quantity: needed, limit, recipe: isItemGoal ? undefined : recipe });
+    }
+
+    // ── Material-triggered crafting ──
+    // Auto-craft recipes whose INPUT materials have piled up past their trigger
+    // threshold, draining them back down to the stop threshold. This runs every
+    // cycle regardless of the goal/limit configuration (and independently of it):
+    // triggers are about converting a raw-material surplus, goals are about
+    // maintaining a finished-goods stock. Both can coexist.
+    const recipeTriggers = (assignedCrafter.recipeTriggers as
+      | Record<string, MaterialTrigger[]>
+      | undefined) || {};
+    if (Object.keys(recipeTriggers).length > 0) {
+      const trigResult = await processRecipeTriggers(
+        ctx,
+        bot,
+        recipes,
+        recipeTriggers,
+        ownFacilityMap,
+        settings,
+        countItem,
+        tracker!,
+        livePendingRuns,
+      );
+      if (trigResult.fired > 0) {
+        ctx.log("craft", `Material triggers fired: ${trigResult.fired} recipe(s), ${trigResult.queued} queued this cycle`);
+      }
     }
 
     if (goalItems.length === 0 && !isSpecializedBot) {

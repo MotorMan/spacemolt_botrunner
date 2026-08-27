@@ -14987,6 +14987,19 @@
       </div>
     </div>
 
+    <!-- Material Triggers Section -->
+    <div style="margin-top:12px;padding:10px;border:1px solid #b8860b;border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:700;margin-bottom:4px;color:var(--text-bright)">⚡ Material Triggers (auto-refine when raw materials pile up)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        Enable a recipe to auto-craft when its INPUT materials rise above a <b>trigger</b> level, draining them back down to a <b>stop</b> level. Example: <code>refine_steel</code> with iron_ore trigger 490000 / stop 200000 waits until you have &gt;490k iron_ore, then refines in one batch until only 200k remains. Add one entry per required material (all must be above their trigger before it fires).
+      </div>
+      <div id="recipeTriggersList"></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <select id="trigger-recipe-select" style="flex:1;min-width:0"></select>
+        <button class="primary sm" onclick="addTriggerRecipe()">+ Add Trigger</button>
+      </div>
+    </div>
+
     <!-- Ship Loadout Management Section -->
     <div style="margin-top:16px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚀 Ship Commission Loadouts</div>
@@ -15230,6 +15243,9 @@
         // Populate item dropdown for initially selected category
         updateCraftItemSelect();
 
+        // Render per-profile material triggers
+        renderRecipeTriggers();
+
         // Populate ship dropdown and load ship loadouts
         populateShipDropdown();
         populateMultiShipDropdown();
@@ -15420,6 +15436,159 @@
 
         delete currentProfile.craftLimits[id];
         rerenderCurrentSettings();
+      }
+
+      // ── Material Triggers UI ──────────────────────────────────
+      // Manages currentProfile.recipeTriggers: { [recipeId]: [{item, triggerAt, stopAt}] }.
+      // Persisted automatically because it lives on the crafter profile object that
+      // saveCrafterSettings() sends back to the server.
+
+      function getTriggerProfile() {
+        const currentCrafterName = window._currentCrafterProfile;
+        if (!settings.crafter) settings.crafter = {};
+        if (!settings.crafter.crafters) settings.crafter.crafters = [];
+        let crafters = settings.crafter.crafters;
+        if (crafters.length === 0) {
+          crafters = [{ name: "Default Crafter", craftLimits: {}, recipeTriggers: {} }];
+          settings.crafter.crafters = crafters;
+        }
+        const p = crafters.find((c) => c.name === currentCrafterName) || crafters[0];
+        if (!p.recipeTriggers) p.recipeTriggers = {};
+        return p;
+      }
+
+      function populateTriggerRecipeSelect() {
+        const sel = document.getElementById("trigger-recipe-select");
+        if (!sel) return;
+        const p = getTriggerProfile();
+        const used = new Set(Object.keys(p.recipeTriggers || {}));
+        const recipes = cachedSettingsRecipes || [];
+        const opts = recipes
+          .filter((r) => {
+            const id = r.recipe_id || r.id || r.name || "";
+            return id && !used.has(id);
+          })
+          .map((r) => {
+            const id = r.recipe_id || r.id || r.name || "";
+            const name = r.name || id;
+            return `<option value="${esc(id)}">${esc(name)}</option>`;
+          })
+          .join("");
+        sel.innerHTML =
+          opts || '<option value="">All recipes have triggers</option>';
+      }
+
+      function renderRecipeTriggers() {
+        const list = document.getElementById("recipeTriggersList");
+        if (!list) return;
+        const p = getTriggerProfile();
+        const trigs = p.recipeTriggers || {};
+        const recipes = cachedSettingsRecipes || [];
+        const ids = Object.keys(trigs);
+        if (ids.length === 0) {
+          list.innerHTML =
+            '<div style="color:var(--dim);padding:4px">No material triggers configured.</div>';
+          populateTriggerRecipeSelect();
+          return;
+        }
+        list.innerHTML = ids
+          .map((id) => {
+            const r = recipes.find(
+              (x) => (x.recipe_id || x.id || x.name) === id,
+            );
+            const name = r ? r.name || id : id;
+            const comps = r
+              ? r.components || r.ingredients || r.inputs || r.materials || []
+              : [];
+            const compStr = comps
+              .map(
+                (c) =>
+                  `${c.quantity || c.amount || 1}x ${c.name || c.item_name || c.item_id || c.id}`,
+              )
+              .join(", ");
+            const triggerRows = (trigs[id] || [])
+              .map((t, i) => {
+                return `
+        <div style="display:flex;gap:6px;align-items:center;margin:4px 0 4px 16px;flex-wrap:wrap">
+          <input type="text" value="${esc(t.item || "")}" data-recipe="${esc(id)}" data-idx="${i}" data-field="item" onchange="updateTriggerField(this)" style="width:170px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px" placeholder="material item id">
+          <span style="font-size:11px;color:var(--dim)">trigger &gt;</span>
+          <input type="number" min="0" value="${t.triggerAt || 0}" data-recipe="${esc(id)}" data-idx="${i}" data-field="triggerAt" onchange="updateTriggerField(this)" style="width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px">
+          <span style="font-size:11px;color:var(--dim)">stop at</span>
+          <input type="number" min="0" value="${t.stopAt || 0}" data-recipe="${esc(id)}" data-idx="${i}" data-field="stopAt" onchange="updateTriggerField(this)" style="width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px">
+          <button class="sm" style="border:none;color:#fff;background:#d32f2f;padding:2px 6px;cursor:pointer;border-radius:4px" onclick="removeTriggerMaterial('${esc(id)}', ${i})">✕</button>
+        </div>`;
+              })
+              .join("");
+            return `
+      <div class="trigger-recipe-block" style="border:1px solid var(--border);border-radius:6px;padding:6px 8px;margin-bottom:8px">
+        <div style="display:flex;gap:8px;align-items:center">
+          <div style="font-weight:600;color:var(--text-bright)">${esc(name)}</div>
+          ${compStr ? `<span style="font-size:11px;color:var(--dim)">(${esc(compStr)})</span>` : ""}
+          <button class="sm" style="margin-left:auto;border:none;color:#fff;background:#d32f2f;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeTriggerRecipe('${esc(id)}')">Remove Recipe</button>
+        </div>
+        ${triggerRows || '<div style="font-size:11px;color:var(--dim);margin-left:16px">No materials yet.</div>'}
+        <button class="sm" style="margin:4px 0 0 16px" onclick="addTriggerMaterial('${esc(id)}')">+ Add Material</button>
+      </div>`;
+          })
+          .join("");
+        populateTriggerRecipeSelect();
+      }
+
+      function addTriggerRecipe() {
+        const sel = document.getElementById("trigger-recipe-select");
+        const id = sel?.value;
+        if (!id) return;
+        const p = getTriggerProfile();
+        if (!p.recipeTriggers) p.recipeTriggers = {};
+        if (!p.recipeTriggers[id]) p.recipeTriggers[id] = [];
+        renderRecipeTriggers();
+      }
+
+      function removeTriggerRecipe(id) {
+        const p = getTriggerProfile();
+        if (p.recipeTriggers) delete p.recipeTriggers[id];
+        renderRecipeTriggers();
+      }
+
+      function addTriggerMaterial(id) {
+        const p = getTriggerProfile();
+        if (!p.recipeTriggers) p.recipeTriggers = {};
+        if (!p.recipeTriggers[id]) p.recipeTriggers[id] = [];
+        const r = (cachedSettingsRecipes || []).find(
+          (x) => (x.recipe_id || x.id || x.name) === id,
+        );
+        const comps = r
+          ? r.components || r.ingredients || r.inputs || r.materials || []
+          : [];
+        const firstComp = comps[0];
+        const item = firstComp
+          ? firstComp.item_id || firstComp.id || firstComp.item || ""
+          : "";
+        p.recipeTriggers[id].push({ item, triggerAt: 0, stopAt: 0 });
+        renderRecipeTriggers();
+      }
+
+      function removeTriggerMaterial(id, idx) {
+        const p = getTriggerProfile();
+        if (p.recipeTriggers && p.recipeTriggers[id]) {
+          p.recipeTriggers[id].splice(idx, 1);
+          if (p.recipeTriggers[id].length === 0) delete p.recipeTriggers[id];
+        }
+        renderRecipeTriggers();
+      }
+
+      function updateTriggerField(el) {
+        const id = el.getAttribute("data-recipe");
+        const idx = parseInt(el.getAttribute("data-idx"), 10);
+        const field = el.getAttribute("data-field");
+        const p = getTriggerProfile();
+        const arr = p.recipeTriggers && p.recipeTriggers[id];
+        if (!arr || !arr[idx]) return;
+        if (field === "item") {
+          arr[idx].item = (el.value || "").trim().toLowerCase();
+        } else {
+          arr[idx][field] = parseInt(el.value, 10) || 0;
+        }
       }
 
       function toggleAllCategories(checkbox) {
@@ -17067,6 +17236,7 @@
         if (!currentProfile) return;
 
         currentProfile.craftLimits = {};
+        if (currentProfile.recipeTriggers) currentProfile.recipeTriggers = {};
         rerenderCurrentSettings();
       }
 

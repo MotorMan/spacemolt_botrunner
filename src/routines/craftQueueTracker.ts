@@ -40,6 +40,9 @@ export interface ServerJobInfo {
 export class CraftQueueTracker {
   private jobs: Map<string, QueuedJob> = new Map();
   private recipeIndex: Map<string, string[]> = new Map();
+  // Job ids we have already warned about for being stalled, so the warning is
+  // logged once per job instead of on every pass.
+  private stallWarned: Set<string> = new Set();
   private bot: Bot;
 
   private static CRAFTING_STATE_FILE = "crafting-state.json";
@@ -93,6 +96,17 @@ export class CraftQueueTracker {
     job.lastUpdate = Date.now();
     this.bot.clearCraftingJobByRecipe(job.recipeId);
     this.jobs.delete(jobId);
+    this.stallWarned.delete(jobId);
+  }
+
+  // Drop a job we deliberately cancelled on the server (e.g. an undrainable fuel
+  // job whose tank is full) so it stops counting as in-flight pending.
+  forgetJob(jobId: string): void {
+    if (!this.jobs.has(jobId)) return;
+    const job = this.jobs.get(jobId)!;
+    this.bot.clearCraftingJobByRecipe(job.recipeId);
+    this.jobs.delete(jobId);
+    this.stallWarned.delete(jobId);
   }
 
   getActiveJobs(): QueuedJob[] {
@@ -122,24 +136,45 @@ export class CraftQueueTracker {
     return { queued, completed, remaining: Math.min(queued - completed, remainingCap) };
   }
 
-  // Clean up any job the server still lists that has made NO progress for longer
-  // than `maxInactiveMs` (e.g. a fuel job the station drone never actually
-  // fulfills). This keeps "pending" honest so a genuinely stuck job can't sit
-  // forever and block a fresh top-up.
-  pruneStaleInactiveJobs(maxInactiveMs: number): string[] {
+  // Report any job the server still lists that has made NO progress for longer
+  // than `maxInactiveMs` (e.g. a fuel job whose station tank is full, so its last
+  // runs can never deposit). Callers use this purely to tell the operator; the
+  // job keeps counting as in-flight.
+  //
+  // NON-DESTRUCTIVE ON PURPOSE. The previous version deleted the job, which
+  // never worked: the next syncWithServer re-added it straight from the live
+  // `craft` queue (with a fresh lastProgressAt), so the same job was "dropped"
+  // every 30 minutes forever while the underlying stall was untouched. Worse,
+  // deleting it made the job stop counting as in-flight, so the planner could
+  // stack duplicate work on top of it. A job the server still lists is real:
+  // report it and let the operator decide.
+  findStalledJobs(maxInactiveMs: number): QueuedJob[] {
     const now = Date.now();
-    const toRemove: string[] = [];
-    for (const [jobId, job] of Array.from(this.jobs.entries())) {
+    const stalled: QueuedJob[] = [];
+    for (const job of Array.from(this.jobs.values())) {
       if (job.completed >= job.quantity) continue;
-      if (now - job.lastProgressAt > maxInactiveMs) {
-        toRemove.push(jobId);
-      }
+      if (now - job.lastProgressAt > maxInactiveMs) stalled.push(job);
     }
-    for (const jobId of toRemove) {
-      this.jobs.delete(jobId);
-      this.cleanupIndex(jobId);
-    }
-    return toRemove;
+    return stalled;
+  }
+
+  // One-shot dedupe for the "job has stalled" warning so a long-lived stall does
+  // not spam the log every pass. Returns true the first time a job is reported.
+  markStallWarned(jobId: string): boolean {
+    if (this.stallWarned.has(jobId)) return false;
+    this.stallWarned.add(jobId);
+    return true;
+  }
+
+  // Keep a stalled job's stall timestamp frozen across repeated live syncs.
+  // syncWithServer() bumps lastProgressAt on every read even when the job has not
+  // actually advanced, which would make a full-tank fuel job look perpetually
+  // "fresh" and never qualify for auto-cancellation. A stalled job that is still
+  // reported with runs remaining simply stays wedged at its original timestamp.
+  pinStallSince(jobId: string, sinceMs: number): void {
+    const job = this.jobs.get(jobId);
+    if (!job) return;
+    if (sinceMs < job.lastProgressAt) job.lastProgressAt = sinceMs;
   }
 
   getJob(jobId: string): QueuedJob | undefined {
@@ -259,6 +294,9 @@ export class CraftQueueTracker {
   }
 
   private cleanupIndex(jobId: string): void {
+    // A job that is gone can never stall again, so forget its warning state too
+    // (this also keeps the set from growing for the life of the process).
+    this.stallWarned.delete(jobId);
     for (const [recipeId, ids] of Array.from(this.recipeIndex.entries())) {
       const filtered = ids.filter(id => id !== jobId);
       if (filtered.length === 0) {

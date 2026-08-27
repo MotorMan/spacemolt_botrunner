@@ -659,16 +659,30 @@ export function resolveVenueForRecipe(
 
 // ── Queue-focused crafting logic ──────────────────────────────
 
-async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<ServerJobInfo[]> {
+interface CraftQueueRead {
+  // False when the `craft queue` read itself failed (transport error / server
+  // error). Callers must NOT treat that as "the queue is empty": doing so made
+  // the tracker count missing syncs against real in-flight jobs and eventually
+  // forget them, after which the planner re-queued work that was already running.
+  ok: boolean;
+  jobs: ServerJobInfo[];
+}
+
+async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = false): Promise<CraftQueueRead> {
   const now = Date.now();
   const cache = bot.craftQueueCache;
   if (!forceRefresh && now - cache.lastQueueCheck < QUEUE_REFRESH_COOLDOWN) {
-    return cache.jobs;
+    return { ok: cache.lastQueueCheck > 0, jobs: cache.jobs };
   }
-  
-  const resp = await bot.exec("craft", { action: "queue" });
+
+  const resp = await bot.exec("craft", { action: "queue" }).catch((e: any) => ({
+    error: { message: (e as Error)?.message || String(e) },
+    result: undefined,
+  }));
   if (resp.error) {
-    return [];
+    // Hand back the last known jobs but flag the read as failed so nobody
+    // mistakes a failed fetch for an empty queue.
+    return { ok: false, jobs: cache.jobs };
   }
   cache.lastQueueCheck = now;
   
@@ -714,8 +728,8 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[], forceRefresh = fa
       runsDone: (job.runs_done as number) || 0,
       runsRemaining: (job.runs_remaining as number) || 0,
     };
-  }).filter(j => j.jobId && j.recipeId);
-  return cache.jobs;
+  }).filter((j: ServerJobInfo) => j.jobId && j.recipeId);
+  return { ok: true, jobs: cache.jobs };
 }
 
 // Aggregate, per recipe_id, how many RUNS are still pending in the live `craft`
@@ -730,8 +744,12 @@ async function computeLivePendingRuns(
   recipes: Recipe[],
   forceRefresh = true,
 ): Promise<Map<string, number>> {
-  const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
+  const { ok, jobs: serverJobs } = await checkCraftingQueue(bot, recipes, forceRefresh);
   const pending = new Map<string, number>();
+  // A failed read means "unknown", not "nothing pending". Returning an empty map
+  // makes every call site fall back to the in-memory tracker (`?? tracker...`),
+  // which is the closest thing we have to the truth until the next good read.
+  if (!ok) return pending;
   for (const j of serverJobs) {
     if (!j.recipeId) continue;
     const remain = Math.max(0, Math.min(j.quantity - j.runsDone, j.runsRemaining));
@@ -772,22 +790,99 @@ function reportQueueStatus(ctx: RoutineContext, tracker: CraftQueueTracker, reci
 
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[], forceRefresh = false): Promise<void> {
   const { bot } = ctx;
-  const serverJobs = await checkCraftingQueue(bot, recipes, forceRefresh);
+  const { ok, jobs: serverJobs } = await checkCraftingQueue(bot, recipes, forceRefresh);
+  if (!ok) {
+    // Do NOT reconcile against a failed read: syncWithServer would count this as
+    // a "missing sync" for every live job and eventually forget them.
+    ctx.log("warn", "craft queue read failed - keeping previously tracked jobs (not treating the queue as empty)");
+    return;
+  }
   tracker.syncWithServer(serverJobs);
   // Drop any job we track locally whose recipe no longer resolves to a known
   // catalog recipe — these are phantom jobs (stale session state, or jobs the
   // queue poller couldn't match) that would otherwise inflate "pending" output.
   tracker.prunePhantomJobs(new Set(recipes.map(r => r.recipe_id)));
-  // Drop jobs the server still lists but that have made NO progress for a long
-  // time (e.g. a fuel job the station drone never actually crafts). Left alone
-  // these sit as phantom "pending" until a process restart. 30 min with no
-  // deposit/run-complete is far longer than any single legitimate craft run.
-  const STUCK_JOB_MAX_MS = 30 * 60 * 1000;
-  const dropped = tracker.pruneStaleInactiveJobs(STUCK_JOB_MAX_MS);
-  if (dropped.length > 0) {
-    ctx.log("warn", `Dropped ${dropped.length} stuck crafting job(s) with no progress (likely phantom pending): ${dropped.join(", ")}`);
+
+  // PRESERVE the stall timestamp for fuel jobs that are undrainable (tank full).
+  // syncWithServer() above "refreshes" lastProgressAt every read even when a job
+  // hasn't actually advanced; a full-tank fuel job would otherwise never look
+  // stalled and we'd never cancel it. If the tank is full and the job still has
+  // runs left, keep counting the stall from when it first got wedged.
+  const maxFuel = bot.homeBaseMaxFuel || 0;
+  const fuel = bot.homeBaseFuel || 0;
+  const tankFull = maxFuel > 0 && fuel >= maxFuel * 0.98;
+  if (tankFull) {
+    const recipeById = new Map(recipes.map(r => [r.recipe_id, r]));
+    for (const job of tracker.getActiveJobs()) {
+      if (job.completed >= job.quantity) continue;
+      const recipe = recipeById.get(job.recipeId);
+      if (recipe && outputsFuelReserve(recipe)) {
+        tracker.pinStallSince(job.jobId, job.lastProgressAt);
+      }
+    }
   }
-  tracker.save();
+
+  // Auto-cancel jobs the server keeps listing but that have made NO progress for
+  // a long time AND are genuinely blocked from completing (their output has
+  // nowhere to go). A fuel_reserve job whose station tank is already full is the
+  // classic case: the remaining runs can never deposit, so the server holds them
+  // "queued" forever. That both blocks fresh top-up work and pollutes the
+  // "pending" count — which is exactly what wedged this crafter for hours.
+  //
+  // We only cancel when ALL of: the job lists runs left, it has been stalled well
+  // past any legitimate craft time, and it is for a fuel_reserve recipe whose
+  // station tank is essentially full. We deliberately do NOT cancel every long-
+  // stalled job: many recipes simply sit waiting for an input and are fine to
+  // leave queued, and cancelling would waste whatever was reserved for them.
+  await autoCancelUndrainableJobs(ctx, tracker, recipes, bot);
+}
+
+// Cancel fuel_reserve jobs whose output literally cannot be deposited: when the
+// station's fuel tank is essentially full the server parks those remaining runs
+// "queued" forever. Left alone that job (a) blocks the crafter from queueing the
+// next top-up (the deficit logic treats it as in-flight forever) and (b) keeps a
+// fake "pending" count alive — which is precisely why the crafter could sit for
+// hours never issuing a new fuel run even though the tank wasn't being topped
+// up. We only cancel after a long stall so a run that is merely being produced
+// quickly, or waiting on an input, is never disturbed.
+async function autoCancelUndrainableJobs(
+  ctx: RoutineContext,
+  tracker: CraftQueueTracker,
+  recipes: Recipe[],
+  bot: any,
+): Promise<void> {
+  const { log } = ctx;
+  const maxFuel = bot.homeBaseMaxFuel || 0;
+  const fuel = bot.homeBaseFuel || 0;
+  // Tank must be essentially full or this run is not undrainable — leave it.
+  if (maxFuel <= 0 || fuel < maxFuel * 0.98) return;
+
+  const recipeById = new Map(recipes.map(r => [r.recipe_id, r]));
+  const STALL_CANCEL_MS = 30 * 60 * 1000;
+  for (const job of tracker.findStalledJobs(STALL_CANCEL_MS)) {
+    if (job.completed >= job.quantity) continue;
+    const recipe = recipeById.get(job.recipeId);
+    if (!recipe || !outputsFuelReserve(recipe)) continue;
+    // One warning per job before we act, so it isn't a silent cancellation.
+    const firstSeen = tracker.markStallWarned(job.jobId);
+    if (firstSeen) {
+      const mins = Math.round((Date.now() - job.lastProgressAt) / 60000);
+      log(
+        "warn",
+        `Crafting job ${job.jobId} (${recipe.name}) has not advanced in ${mins}m and the fuel tank is full ` +
+        `(${fuel}/${maxFuel}) - its remaining ${job.runsRemaining} run(s) cannot deposit, so it will be cancelled in a moment ` +
+        `to let the crafter top up again.`,
+      );
+    }
+    // Give the operator one sync cycle to notice, then cancel.
+    const resp = await bot.exec("craft", { job_id: job.jobId }).catch(() => ({ error: { message: "cancel failed" } }));
+    if (resp.error) {
+      log("warn", `Failed to cancel undrainable job ${job.jobId}: ${resp.error.message}`);
+      continue;
+    }
+    tracker.forgetJob(job.jobId);
+    log("craft", `Cancelled undrainable fuel job ${job.jobId} (${job.runsRemaining} run(s) could not deposit into a full tank)`);
+  }
 }
 
 function calculateMaxCraftable(
@@ -1069,8 +1164,8 @@ export async function queueCraftJob(
      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
    }
 
-   const serverJobs = await checkCraftingQueue(bot, recipes || [], true);
-   tracker.syncWithServer(serverJobs);
+   const { ok: queueOk, jobs: serverJobs } = await checkCraftingQueue(bot, recipes || [], true);
+   if (queueOk) tracker.syncWithServer(serverJobs);
    if (tracker.hasPendingJob(recipeId, originalRuns)) {
      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
    }
@@ -1208,28 +1303,26 @@ async function waitForCompletion(
   const startTime = Date.now();
   let lastStatusReport = Date.now();
 
-  const serverJobIds = await checkCraftingQueue(bot, recipes);
-  tracker.syncWithServer(serverJobIds);
-  tracker.save();
+  const { ok: firstReadOk, jobs: serverJobIds } = await checkCraftingQueue(bot, recipes);
+  if (firstReadOk) tracker.syncWithServer(serverJobIds);
 
-  const progress = tracker.getProgress(recipeId);
-  const completedItems = progress.completed * outputQty;
-  if (completedItems >= quantityItems) {
-    return true;
-  }
+  // Measure completion RELATIVE to where the job started. `progress.completed`
+  // is cumulative for the life of the tracked job, so comparing it directly
+  // against the freshly-requested quantity reported "done" the instant an older
+  // job for the same recipe had already produced that much.
+  const baselineRuns = tracker.getProgress(recipeId).completed;
 
   while (bot.state === "running") {
     await ctx.sleep(5000);
 
     const now = Date.now();
     if (now - bot.craftQueueCache.lastQueueCheck >= QUEUE_REFRESH_COOLDOWN) {
-      const currentJobIds = await checkCraftingQueue(bot, recipes);
-      tracker.syncWithServer(currentJobIds);
-      tracker.save();
+      const { ok, jobs: currentJobIds } = await checkCraftingQueue(bot, recipes);
+      if (ok) tracker.syncWithServer(currentJobIds);
     }
 
     const progress = tracker.getProgress(recipeId);
-    const currentCompletedItems = progress.completed * outputQty;
+    const currentCompletedItems = Math.max(0, progress.completed - baselineRuns) * outputQty;
     if (currentCompletedItems >= quantityItems) {
       log("craft", `Crafting complete for ${recipeId}`);
       return true;
@@ -1271,14 +1364,33 @@ async function waitForAllCompletions(
      const BASE_CHECK_COOLDOWN = 60000;
      let remainingItems = [...initialQueuedItems];
 
+     // Completion must be measured RELATIVE to the runs already done when we
+     // started waiting. `getProgress().completed` is cumulative for the life of a
+     // tracked job, so comparing it against `item.quantity` (which is sized from
+     // the runs still PENDING) declared success immediately for any job that had
+     // already produced that much — that's why a wedged queue kept logging
+     // "Crafted 200x ..." every cycle without crafting anything.
+     const baselineRuns = new Map<string, number>();
+     for (const item of remainingItems) {
+       if (!baselineRuns.has(item.recipeId)) {
+         baselineRuns.set(item.recipeId, tracker.getProgress(item.recipeId).completed);
+       }
+     }
+     // Give up waiting when nothing at all advances for this long. Without it a
+     // job the server keeps listing but never advances (e.g. output storage full)
+     // would hold the routine here forever.
+     const NO_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
+     let lastProgressSeen = Date.now();
+     let lastProgressTotal = 0;
+
      while (bot.state === "running" && remainingItems.length > 0) {
        await ctx.sleep(5000);
 
        const now = Date.now();
        if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-         const serverJobs = await checkCraftingQueue(bot, recipes);
-         tracker.syncWithServer(serverJobs);
-         tracker.save();
+         // Use the full sync path so phantom/stalled jobs get reconciled and
+         // reported while we wait, instead of only raw syncWithServer.
+         await syncCraftingQueue(ctx, tracker, recipes, true);
          lastSync = now;
        }
 
@@ -1290,17 +1402,41 @@ async function waitForAllCompletions(
 
 
       const stillQueued: typeof remainingItems = [];
+      let producedTotal = 0;
+      let sawProgress = false;
       for (const item of remainingItems) {
         const progress = tracker.getProgress(item.recipeId);
-        const completedItems = progress.completed * item.outputQty;
+        const baseline = baselineRuns.get(item.recipeId) || 0;
+        const completedItems = Math.max(0, progress.completed - baseline) * item.outputQty;
+        producedTotal += completedItems;
         if (completedItems >= item.quantity) {
           crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
           bot.stats.totalCrafted += item.quantity;
+          sawProgress = true;
+        } else if (progress.remaining <= 0) {
+          // The live queue no longer lists pending runs for this recipe: the job
+          // finished (the crafting_update handler retires completed jobs), was
+          // cancelled, or vanished. Stop waiting instead of spinning forever, and
+          // only credit what we actually observed.
+          if (completedItems > 0) {
+            crafted.push(`${completedItems}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
+            bot.stats.totalCrafted += completedItems;
+          }
+          log("craft", `${recipeNames.get(item.recipeId) || item.recipeId}: job no longer in the live queue (completed or cancelled) - stopping wait (${completedItems}/${item.quantity} items observed)`);
+          sawProgress = true;
         } else {
           stillQueued.push(item);
         }
       }
       remainingItems = stillQueued;
+
+      if (sawProgress || producedTotal > lastProgressTotal) {
+        lastProgressTotal = Math.max(lastProgressTotal, producedTotal);
+        lastProgressSeen = Date.now();
+      } else if (remainingItems.length > 0 && Date.now() - lastProgressSeen > NO_PROGRESS_TIMEOUT_MS) {
+        log("warn", `No crafting progress for ${Math.round(NO_PROGRESS_TIMEOUT_MS / 60000)}m while waiting on ${remainingItems.length} job(s) - continuing to the next cycle (jobs stay queued on the server)`);
+        break;
+      }
 
       if (remainingItems.length > 0 && Date.now() - lastStatusReport >= 60000) {
         reportQueueStatus(ctx, tracker, recipes);
@@ -1339,6 +1475,11 @@ async function queueAllRecipesOnce(
     // transiently-incomplete fetch, which is what let the crafter stack 28M fuel
     // against a 275k limit).
     const livePending = livePendingRuns ?? await computeLivePendingRuns(bot, recipes, true);
+    // Runs we queue during THIS pass, per recipe. `livePending` is read once at
+    // the top of the pass, so without this a recipe that appears twice in the
+    // plan (two goals sharing a sub-material) would be sized against pre-queue
+    // pending and could be queued twice.
+    const queuedRunsThisPass = new Map<string, number>();
 
     for (const item of allPlanItems) {
       if (bot.state !== "running") break;
@@ -1351,34 +1492,55 @@ async function queueAllRecipesOnce(
       // Prefer the authoritative live pending; only fall back to the in-memory
       // tracker if the live read lacks this recipe.
       const pendingRuns = livePending.get(item.recipe.recipe_id) ?? tracker.getProgress(item.recipe.recipe_id).remaining;
-      const completedRuns = tracker.getProgress(item.recipe.recipe_id).completed;
+      const alreadyQueuedThisPass = queuedRunsThisPass.get(item.recipe.recipe_id) || 0;
 
-      // item.quantityToCraft is expressed in the recipe's first-output items;
-      // convert to the limiting-output frame so the run count is correct.
-      const targetLimiterItems = item.quantityToCraft * ((item.recipe.output_quantity || 1) / outputPerRun);
-      let runsToQueue = Math.max(0, Math.ceil((targetLimiterItems - completedRuns * outputPerRun - pendingRuns * outputPerRun) / outputPerRun));
+      // item.quantityToCraft is expressed in LIMITING-output items: the goal loop
+      // sizes deficits against lowestOutputItem(), and buildCraftingTree converts
+      // it to runs with `ceil(items / limiterQty)`. It must therefore NOT be
+      // rescaled by (output_quantity / outputPerRun) — for a multi-output recipe
+      // (e.g. 4x hydrogen + 2x oxygen) that inflated the request by the ratio
+      // between the outputs and queued twice the runs actually needed.
+      const targetLimiterItems = item.quantityToCraft;
+      // `quantityToCraft` is ALREADY a net deficit: the planner sized it as
+      // limit - (live stock + in-flight output) for goals, and as
+      // needed - available (which also credits in-flight output) for
+      // sub-materials. Subtracting the tracker's `completed`/`pending` AGAIN here
+      // double-counted work that is already reflected in the deficit and is what
+      // wedged the crafter: a job that had finished 100 of 101 runs made
+      // `completed * outputPerRun` (20 000 items) larger than any remaining
+      // deficit, so `runsToQueue` was 0 on EVERY pass and nothing was ever
+      // queued again until the process was restarted (which reset the tracker).
+      let runsToQueue = Math.max(0, Math.ceil(targetLimiterItems / outputPerRun) - alreadyQueuedThisPass);
 
-      // HARD LIMIT CLAMP: never queue so much that completed + pending + queued
+      // HARD LIMIT CLAMP: never queue so much that stock + pending + queued
       // exceeds the configured craftLimit (in limiting-output items). This is the
-      // guaranteed safety net — even if pending is somehow miscounted, a recipe
-      // can never blow past its cap (e.g. 275k fuel_reserve).
+      // guaranteed safety net — even if the deficit is somehow miscounted, a
+      // recipe can never blow past its cap (e.g. 275k fuel_reserve). It is sized
+      // against LIVE STOCK (not the tracker's cumulative `completed`, which
+      // keeps counting output that is already sitting in storage and therefore
+      // clamped the crafter to zero forever).
       const limitItems = limitByRecipe?.get(item.recipe.recipe_id);
       if (limitItems !== undefined) {
         const limitRuns = Math.ceil(limitItems / outputPerRun);
-        const maxQueueable = Math.max(0, limitRuns - completedRuns - pendingRuns);
+        const stockRuns = Math.floor(Math.max(0, rawCountItemFn(limiter.item_id.toLowerCase())) / outputPerRun);
+        const maxQueueable = Math.max(0, limitRuns - stockRuns - pendingRuns - alreadyQueuedThisPass);
         if (runsToQueue > maxQueueable) {
           if (maxQueueable <= 0) {
-            ctx.log("craft", `✓ ${item.recipe.name}: at/over limit (completed ${completedRuns} + pending ${pendingRuns} runs >= ${limitRuns} run limit) - not queueing more`);
+            ctx.log("craft", `✓ ${item.recipe.name}: at/over limit (stock ${stockRuns} + pending ${pendingRuns} runs >= ${limitRuns} run limit) - not queueing more`);
             // nothing to do; record what's already in flight so waiters still see it
             const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
             queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
             continue;
           }
-          ctx.log("craft", `Capping ${item.recipe.name}: ${runsToQueue} runs requested but only ${maxQueueable} fit under the ${limitItems}-item limit (completed ${completedRuns} + pending ${pendingRuns} runs, limit ${limitRuns} runs)`);
+          ctx.log("craft", `Capping ${item.recipe.name}: ${runsToQueue} runs requested but only ${maxQueueable} fit under the ${limitItems}-item limit (stock ${stockRuns} + pending ${pendingRuns} runs, limit ${limitRuns} runs)`);
           runsToQueue = maxQueueable;
         }
       }
       if (runsToQueue <= 0) {
+        // Log it: this used to be a silent `continue`, which is exactly why the
+        // wedged crafter looked like it was "planning" every pass while never
+        // queueing a single run.
+        ctx.log("craft", `${item.recipe.name}: nothing to queue this pass (deficit ${Math.ceil(targetLimiterItems)} items, ${pendingRuns} runs already in flight)`);
         const actualQueued = tracker.getProgress(item.recipe.recipe_id).queued;
         queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
         continue;
@@ -1399,6 +1561,7 @@ async function queueAllRecipesOnce(
        }
 
       const actualQueued = queueResult.queuedRuns || 0;
+      queuedRunsThisPass.set(item.recipe.recipe_id, alreadyQueuedThisPass + actualQueued);
       queued.push({ recipeId: item.recipe.recipe_id, quantity: actualQueued * outputPerRun, outputQty: outputPerRun });
       queuedItemsTotal += actualQueued * outputPerRun;
       if (actualQueued * outputPerRun < runsToQueue * outputPerRun) {
@@ -1728,9 +1891,8 @@ async function craftFromCategories(
   let lastStatusReport = Date.now();
 
   while (totalCrafted < MAX_CRAFTS && bot.state === "running") {
-    const serverJobIds = await checkCraftingQueue(bot, recipes);
-    tracker.syncWithServer(serverJobIds);
-    tracker.save();
+    const { ok: queueOk, jobs: serverJobIds } = await checkCraftingQueue(bot, recipes);
+    if (queueOk) tracker.syncWithServer(serverJobIds);
 
     if (Date.now() - lastStatusReport >= 60000) {
       reportQueueStatus(ctx, tracker, recipes);
@@ -2051,7 +2213,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       const limitRuns = Math.ceil(limit / (limiter.quantity || 1));
       const currentStock = countItem(limiter.item_id);
       // Prefer the authoritative live pending; fall back to the in-memory tracker
-      // only if the live read somehow lacks this recipe.
+      // only if the live read lacks this recipe.
       const pendingRuns = livePendingRuns.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
       const pendingItems = pendingRuns * (limiter.quantity || 1);
       const stockIncludingQueue = currentStock + pendingItems;

@@ -7117,6 +7117,12 @@
     </div>
 
     <div class="cmd-group">
+      <label>Attack Name</label>
+      <input type="text" id="mc-attack-name" placeholder="pirate/player/creature name" style="min-width:200px">
+      <button class="danger sm" onclick="mcAttack()" style="color: var(--red)" title="attack &quot;name&quot;">Attack</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Custom</label>
       <input type="text" id="mc-custom-cmd" placeholder="command" style="min-width:100px">
       <input type="text" id="mc-custom-params" placeholder='{"key":"val"}' style="min-width:160px">
@@ -10947,6 +10953,17 @@
           }
         }
         mcExec(cmd, params);
+      }
+
+      function mcAttack() {
+        const name = (val("mc-attack-name") || "").trim();
+        if (!name) {
+          logResponse(
+            '<span class="resp-err">Enter a target name to attack</span>',
+          );
+          return;
+        }
+        mcExec("attack", { id: name });
       }
 
       function mcFleetBoard() {

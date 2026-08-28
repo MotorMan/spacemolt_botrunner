@@ -568,6 +568,12 @@
           <button class="sm" onclick="caExec('battle',{action:'target',target_id:val('ca-battle-target-id')})" style="color: var(--red)">Target</button>
         </div>
 
+        <div class="cmd-group">
+          <label>Attack All</label>
+          <input type="text" id="ca-attack-name" placeholder="pirate/player/creature name" style="min-width:200px">
+          <button class="danger sm" onclick="caExec('attack',{id:val('ca-attack-name')})" style="color: var(--red)" title='attack "name"'>Attack</button>
+        </div>
+
         <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
           <label style="color:var(--text-bright);font-weight:600">Mass Weapon Reload</label>
         </div>

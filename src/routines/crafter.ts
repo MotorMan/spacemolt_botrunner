@@ -105,11 +105,71 @@ export interface MaterialTrigger {
   stopAt: number;
 }
 
+// Per-recipe material-trigger configuration.
+export interface RecipeTriggerConfig {
+  // One entry per required INPUT material. The recipe fires only when ALL are
+  // above their `triggerAt`, and queues enough runs to bring each down to its
+  // `stopAt` (the limiting material wins).
+  materials: MaterialTrigger[];
+  // Optional cap on the recipe's OUTPUT item. When the output stock is at or
+  // above this, the trigger will NOT fire — hysteresis so we stop producing once
+  // we already have enough of the result (e.g. hold at 20k of a grown good and
+  // only re-trigger once stock drops back below that).
+  maxOutput?: number;
+  // Optional firing priority within a cycle. Lower number fires first. Used to
+  // arbitrate when several recipes share the same INPUT materials: the
+  // highest-priority one consumes the surplus first, and lower-priority ones see
+  // the reduced stock (via the in-cycle budget) and hold off when there isn't
+  // enough left to reach their own stop point.
+  priority?: number;
+}
+
 interface CrafterProfile {
   name: string;
   craftLimits: CraftLimit[];
-  // Per-recipe material triggers (see MaterialTrigger). Keyed by recipe id.
-  recipeTriggers?: Record<string, MaterialTrigger[]>;
+  // Per-recipe material triggers (see RecipeTriggerConfig). Keyed by recipe id.
+  recipeTriggers?: Record<string, RecipeTriggerConfig>;
+}
+
+// Normalize the (possibly legacy / loosely-shaped) recipeTriggers map into the
+// typed RecipeTriggerConfig form. Accepts either the new object form
+// { materials: [...], maxOutput, priority } or the legacy bare-array form
+// ([{ item, triggerAt, stopAt }]).
+function normalizeRecipeTriggers(
+  raw: Record<string, unknown> | undefined,
+): Record<string, RecipeTriggerConfig> {
+  const out: Record<string, RecipeTriggerConfig> = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [recipeId, val] of Object.entries(raw)) {
+    if (!recipeId || !val) continue;
+    const validMaterial = (t: any): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
+      !!t && typeof t.item === "string" && t.item &&
+      typeof t.triggerAt === "number" && typeof t.stopAt === "number" &&
+      t.triggerAt >= t.stopAt;
+    let materials: MaterialTrigger[] = [];
+    let maxOutput: number | undefined;
+    let priority: number | undefined;
+    if (Array.isArray(val)) {
+      materials = (val as unknown[])
+        .filter(validMaterial)
+        .map(t => ({ item: (t.item as string).toLowerCase(), triggerAt: t.triggerAt as number, stopAt: t.stopAt as number }));
+    } else if (typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      const rawMats = (obj.materials as unknown[]) || [];
+      materials = (Array.isArray(rawMats) ? rawMats : [])
+        .filter(validMaterial)
+        .map(t => ({ item: (t.item as string).toLowerCase(), triggerAt: t.triggerAt as number, stopAt: t.stopAt as number }));
+      if (typeof obj.maxOutput === "number" && obj.maxOutput >= 0) maxOutput = obj.maxOutput;
+      if (typeof obj.priority === "number") priority = obj.priority;
+    }
+    if (materials.length > 0) {
+      const cfg: RecipeTriggerConfig = { materials };
+      if (maxOutput !== undefined) cfg.maxOutput = maxOutput;
+      if (priority !== undefined) cfg.priority = priority;
+      out[recipeId] = cfg;
+    }
+  }
+  return out;
 }
 
 async function getCrafterSettings(): Promise<{
@@ -195,23 +255,8 @@ async function getCrafterSettings(): Promise<{
           }
         }
       }
-      // Material triggers: { [recipeId]: [{ item, triggerAt, stopAt }, ...] }.
-      const recipeTriggers: Record<string, MaterialTrigger[]> = {};
-      const rawTriggers = (profile.recipeTriggers || {}) as Record<string, unknown>;
-      for (const [recipeId, trigs] of Object.entries(rawTriggers)) {
-        if (!recipeId || !Array.isArray(trigs)) continue;
-        const list = (trigs as unknown[])
-          .filter((t): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
-            !!t && typeof (t as any).item === "string" && (t as any).item &&
-            typeof (t as any).triggerAt === "number" && typeof (t as any).stopAt === "number" &&
-            (t as any).triggerAt >= (t as any).stopAt)
-          .map(t => ({
-            item: (t.item as string).toLowerCase(),
-            triggerAt: t.triggerAt as number,
-            stopAt: t.stopAt as number,
-          }));
-        if (list.length > 0) recipeTriggers[recipeId] = list;
-      }
+      // Material triggers: { [recipeId]: { materials, maxOutput, priority } }.
+      const recipeTriggers = normalizeRecipeTriggers(profile.recipeTriggers as any);
       return { name: profile.name || 'Unnamed Crafter', craftLimits, recipeTriggers };
     });
   } else if (c.craftLimits) {
@@ -234,22 +279,7 @@ async function getCrafterSettings(): Promise<{
       // Legacy global recipeTriggers key (flat object), for configs that still
       // use the old flat craftLimits format. New configs nest it under each
       // crafter profile instead.
-      const recipeTriggers: Record<string, MaterialTrigger[]> = {};
-      const rawTriggers = (c.recipeTriggers as Record<string, unknown>) || {};
-      for (const [recipeId, trigs] of Object.entries(rawTriggers)) {
-        if (!recipeId || !Array.isArray(trigs)) continue;
-        const list = (trigs as unknown[])
-          .filter((t): t is { item: unknown; triggerAt: unknown; stopAt: unknown } =>
-            !!t && typeof (t as any).item === "string" && (t as any).item &&
-            typeof (t as any).triggerAt === "number" && typeof (t as any).stopAt === "number" &&
-            (t as any).triggerAt >= (t as any).stopAt)
-          .map(t => ({
-            item: (t.item as string).toLowerCase(),
-            triggerAt: t.triggerAt as number,
-            stopAt: t.stopAt as number,
-          }));
-        if (list.length > 0) recipeTriggers[recipeId] = list;
-      }
+      const recipeTriggers = normalizeRecipeTriggers(c.recipeTriggers as any);
       crafters.push({ name: "Default Crafter", craftLimits, recipeTriggers });
     }
   }
@@ -1011,7 +1041,7 @@ export async function processRecipeTriggers(
   ctx: RoutineContext,
   bot: any,
   recipes: Recipe[],
-  recipeTriggers: Record<string, MaterialTrigger[]> | undefined,
+  recipeTriggers: Record<string, RecipeTriggerConfig> | undefined,
   ownFacilityMap: OwnFacilityMap,
   settings: CrafterSettings,
   countItemFn: (itemId: string) => number,
@@ -1029,10 +1059,17 @@ export async function processRecipeTriggers(
   const livePending =
     livePendingRuns ?? (await computeLivePendingRuns(bot, recipes, false));
 
-  for (const [recipeId, triggers] of Object.entries(recipeTriggers)) {
-    if (bot.state !== "running") break;
-    if (!triggers || triggers.length === 0) continue;
-
+  // Resolve every configured trigger to its recipe up front, dropping anything
+  // unresolvable or not craftable. Keep the priority so we can order them.
+  interface TriggerEntry {
+    recipeId: string;
+    recipe: Recipe;
+    config: RecipeTriggerConfig;
+    priority: number;
+  }
+  const entries: TriggerEntry[] = [];
+  for (const [recipeId, config] of Object.entries(recipeTriggers)) {
+    if (!config || !config.materials || config.materials.length === 0) continue;
     const recipe =
       recipeIndex.get(recipeId) ||
       recipes.find(r =>
@@ -1044,11 +1081,49 @@ export async function processRecipeTriggers(
       log("warn", `Material trigger: recipe "${recipeId}" not found - skipping`);
       continue;
     }
-
     const craftableCheck = isRecipeCraftableNew(recipe, allowedFacilityRecipeIds);
     if (!craftableCheck.ok) {
       log("warn", `Material trigger: recipe "${recipeId}" (${recipe.name}) not craftable: ${craftableCheck.reason}`);
       continue;
+    }
+    entries.push({ recipeId, recipe, config, priority: config.priority ?? 100 });
+  }
+
+  if (entries.length === 0) return result;
+
+  // In-cycle material budget: a working copy of every involved INPUT's stock so
+  // that when several recipes share a material, the higher-priority recipe
+  // consumes the surplus first and lower-priority ones see the reduced stock
+  // (and hold off if there isn't enough left to reach their own stop point).
+  // Without this, two recipes both armed on the same ore would each size a full
+  // drain in the same cycle and over-commit the shared stock.
+  const budget = new Map<string, number>();
+  for (const e of entries) {
+    for (const c of e.recipe.components) {
+      const key = c.item_id.toLowerCase();
+      if (!budget.has(key)) budget.set(key, countItemFn(key));
+    }
+  }
+  const budgetCount = (item: string) => budget.get(item.toLowerCase()) ?? 0;
+
+  // Process highest-priority first (lower number = earlier).
+  entries.sort((a, b) => a.priority - b.priority);
+
+  for (const e of entries) {
+    if (bot.state !== "running") break;
+    const { recipe, config } = e;
+
+    // Output cap: don't (re)start if we already have enough of the result. This
+    // is the hysteresis the user asked for — hold at e.g. 20k of a grown good and
+    // only re-trigger once stock drops back below it. Checked against the LIVE
+    // stock (output isn't consumed by crafting, so the budget doesn't track it).
+    if (config.maxOutput !== undefined && config.maxOutput > 0) {
+      const outItem = (recipe.output_item_id || "").toLowerCase();
+      const haveOutput = outItem ? countItemFn(outItem) : 0;
+      if (haveOutput >= config.maxOutput) {
+        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOutput} >= cap ${config.maxOutput}`);
+        continue;
+      }
     }
 
     // Don't stack another trigger batch on top of work already in flight for
@@ -1056,15 +1131,15 @@ export async function processRecipeTriggers(
     const pending = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
     if (pending > 0) continue;
 
-    const runs = evaluateRecipeTrigger(recipe, triggers, countItemFn);
+    const runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
     if (runs === null) continue;
 
     result.fired++;
     const limiter = lowestOutputItem(recipe);
     const outputPerRun = limiter.quantity || 1;
     const venue = resolveVenueForRecipe(recipe.recipe_id, recipe.name, ownFacilityMap, settings, bot);
-    const summary = triggers.map(t => `${t.item}>${t.triggerAt}→stop ${t.stopAt}`).join(", ");
-    log("craft", `⚡ Material trigger FIRED for ${recipe.name}: ${summary} -> queueing ${runs} run(s) (limiting output ${outputPerRun}x ${limiter.name})`);
+    const summary = config.materials.map(t => `${t.item}>${t.triggerAt}→stop ${t.stopAt}`).join(", ");
+    log("craft", `⚡ Material trigger FIRED (pri ${e.priority}) for ${recipe.name}: ${summary} -> queueing ${runs} run(s) (limiting output ${outputPerRun}x ${limiter.name})`);
 
     const queueResult = await queueCraftJob(
       ctx,
@@ -1083,6 +1158,12 @@ export async function processRecipeTriggers(
     if (queueResult.success) {
       result.queued++;
       log("craft", `✓ Queued ${queueResult.queuedRuns} run(s) of ${recipe.name} via material trigger`);
+      // Debit the budget for every component this batch will consume, so later
+      // (lower-priority) triggers sharing any input see the reduced availability.
+      for (const c of recipe.components) {
+        const key = c.item_id.toLowerCase();
+        budget.set(key, Math.max(0, (budget.get(key) ?? 0) - runs * (c.quantity || 1)));
+      }
     } else if (queueResult.error && queueResult.error !== "Job already queued") {
       log("error", `Failed to queue material-trigger run for ${recipe.name}: ${queueResult.error}`);
     }
@@ -2423,7 +2504,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // triggers are about converting a raw-material surplus, goals are about
     // maintaining a finished-goods stock. Both can coexist.
     const recipeTriggers = (assignedCrafter.recipeTriggers as
-      | Record<string, MaterialTrigger[]>
+      | Record<string, RecipeTriggerConfig>
       | undefined) || {};
     if (Object.keys(recipeTriggers).length > 0) {
       const trigResult = await processRecipeTriggers(

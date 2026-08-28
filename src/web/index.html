@@ -15579,17 +15579,30 @@
         const p = getTriggerProfile();
         if (!p.recipeTriggers) p.recipeTriggers = {};
         if (!p.recipeTriggers[id]) p.recipeTriggers[id] = { materials: [], maxOutput: 0, priority: 100 };
+        const cfg = p.recipeTriggers[id];
         const r = (cachedSettingsRecipes || []).find(
           (x) => (x.recipe_id || x.id || x.name) === id,
         );
         const comps = r
           ? r.components || r.ingredients || r.inputs || r.materials || []
           : [];
-        const firstComp = comps[0];
-        const item = firstComp
-          ? firstComp.item_id || firstComp.id || firstComp.item || ""
-          : "";
-        p.recipeTriggers[id].materials.push({ item, triggerAt: 0, stopAt: 0 });
+        // Component item ids in recipe order, de-duplicated, lowercased.
+        const compItems = comps
+          .map((c) => (c.item_id || c.id || c.item || "").toLowerCase())
+          .filter(Boolean);
+        const addedItems = (cfg.materials || [])
+          .map((m) => (m.item || "").toLowerCase())
+          .filter(Boolean);
+        // Populate with the next component not yet in the list; once every
+        // component is placed, repeat the last component for extra slots.
+        let nextItem = "";
+        if (compItems.length > 0) {
+          const next = compItems.find((ci) => !addedItems.includes(ci));
+          nextItem = next || compItems[compItems.length - 1];
+        } else if (addedItems.length > 0) {
+          nextItem = addedItems[addedItems.length - 1];
+        }
+        cfg.materials.push({ item: nextItem, triggerAt: 0, stopAt: 0 });
         renderRecipeTriggers();
       }
 

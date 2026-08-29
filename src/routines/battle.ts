@@ -1458,22 +1458,36 @@ export async function fightJoinedBattle(
     currentTarget = nearbyEnemy;
   }
 
+  // How we "engage" depends on whether we're already a battle participant:
+  //  - If we are NOT yet a participant (freshly pulled in), we must `attack` to register.
+  //  - If we ARE already a participant (e.g. a battle that survived a client restart),
+  //    `attack` HANGS for ~180s and the server still rejects `advance`, so we must NOT
+  //    attack. Instead we (re)target the enemy and set fire stance; the server auto-fires
+  //    at our targeted enemy and we advance. A hunter NEVER flees a one-shot creature it
+  //    can crush — it fights it.
+  let alreadyEngaged = !!status?.is_participant;
+  const doEngage = async (t: NearbyEntity): Promise<boolean> => {
+    if (alreadyEngaged) {
+      await bot.exec("battle", { action: "target", target_id: t.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      return true;
+    }
+    const ok = await attackTarget(ctx, t);
+    if (ok) {
+      alreadyEngaged = true;
+    } else {
+      // Attack rejected (e.g. "already in a battle") — we're engaged, just retarget.
+      await bot.exec("battle", { action: "target", target_id: t.id });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      alreadyEngaged = true;
+    }
+    return ok;
+  };
+
   ctx.log("combat", `🎯 Fighting in joined battle${currentTarget ? ` — targeting ${currentTarget.name}` : ''}`);
 
-  // Actually engage the enemy with the attack command. The server requires an active
-  // attack to register us as "in" the battle for `battle` advance/stance commands —
-  // otherwise advance fails with "You are not in a battle. Use attack to engage...".
-  // IMPORTANT: if we are ALREADY a battle participant (e.g. a stale battle rejoined
-  // after a restart), the `attack` command HANGS for ~180s and then the server still
-  // rejects `advance`. In that case we must only (re)target and let the caller have
-  // already fled+re-engaged. So never issue `attack` when already a participant.
   if (currentTarget) {
-    if (status?.is_participant) {
-      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
-    } else {
-      await attackTarget(ctx, currentTarget);
-      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
-    }
+    await doEngage(currentTarget);
   }
   await ctx.sleep(10000);
 
@@ -1583,7 +1597,7 @@ export async function fightJoinedBattle(
         if (nearbyEnemy) {
           ctx.log("combat", `🎯 Re-acquired live enemy ${nearbyEnemy.name} from nearby scan — engaging`);
           currentTarget = nearbyEnemy;
-          const attackOk = await attackTarget(ctx, currentTarget);
+          const attackOk = await doEngage(currentTarget);
           if (!attackOk) {
             const afterAttack = await getBattleStatus(ctx);
             if (!afterAttack) {
@@ -1620,7 +1634,7 @@ export async function fightJoinedBattle(
         if (nearbyEnemy) {
           ctx.log("combat", `🎯 Re-acquired ${nearbyEnemy.name} from nearby scan after target destroyed`);
           currentTarget = nearbyEnemy;
-          const attackOk = await attackTarget(ctx, currentTarget);
+          const attackOk = await doEngage(currentTarget);
           if (!attackOk) {
             const afterAttack = await getBattleStatus(ctx);
             if (!afterAttack) {
@@ -1692,7 +1706,7 @@ export async function fightJoinedBattle(
     // "advance to close the distance" directive wants.
     if (!targetParticipant && currentTarget) {
       ctx.log("combat", `Tick ${tickCount}: Enemy not in roster — keeping ${currentTarget.name} targeted/engaged | Hull=${hullPct}% | Shields=${shieldPct}%`);
-      const attackOk = await attackTarget(ctx, currentTarget);
+      const attackOk = await doEngage(currentTarget);
       if (!attackOk) {
         const afterAttack = await getBattleStatus(ctx);
         if (!afterAttack) {
@@ -1785,7 +1799,7 @@ export async function fightJoinedBattle(
       // trying to attack instead of silently sitting in the outer ring and dying.
       // Re-attacking an already-engaged target just returns "already in a battle",
       // which attackTarget treats as success, so this is harmless when fine.
-      if (currentTarget) await attackTarget(ctx, currentTarget);
+      if (currentTarget) await doEngage(currentTarget);
       await ctx.sleep(10000);
     }
   }

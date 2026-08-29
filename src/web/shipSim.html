@@ -190,10 +190,13 @@ function selectShip() {
       const basePowerUsed = currentLoadout.weapons.concat(currentLoadout.defense, currentLoadout.utility)
         .reduce((sum, mod) => sum + (mod.power_usage || mod.power_cost || mod.power || 0), 0);
 
-      // Apply engineering skill efficiency bonus (1% reduction per level)
+      // Apply engineering skill efficiency bonus (1% reduction per level).
+      // The server reduces the summed module total then floors it (it does NOT
+      // ceil, and does NOT reduce per-module first — verified against a live
+      // 12/12 Shard build: 5+4+2+2=13 base, ENG 7 -> floor(13*0.93)=12).
       const efficiencyBonus = engineeringSkillLevel * 0.01; // Convert to decimal
-      const cpuUsed = Math.ceil(baseCpuUsed * (1 - efficiencyBonus));
-      const powerUsed = Math.ceil(basePowerUsed * (1 - efficiencyBonus));
+      const cpuUsed = Math.floor(baseCpuUsed * (1 - efficiencyBonus));
+      const powerUsed = Math.floor(basePowerUsed * (1 - efficiencyBonus));
 
       const baseMaxCpu = selectedShip.cpu_capacity || selectedShip.max_cpu || 80;
       const baseMaxPower = selectedShip.power_capacity || selectedShip.max_power || 100;

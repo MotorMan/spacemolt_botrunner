@@ -6464,6 +6464,12 @@
           "quantity",
         );
 
+        // Refresh cargo-gated item action buttons (appear/disappear/qty change)
+        const itemActionsEl = document.getElementById("mc-item-actions");
+        if (itemActionsEl) {
+          itemActionsEl.innerHTML = mcBuildItemActionsHTML(cargoItems);
+        }
+
         // Update storage dropdowns (withdraw, faction deposit)
         updateSelect("mc-wit-item", storageItems, "itemId", "name", "quantity");
         updateSelect(
@@ -6570,6 +6576,91 @@
       function toggleManualSection(section) {
         manualCollapseState[section] = !manualCollapseState[section];
         renderManualControls();
+      }
+
+      // ── Cargo-conditional item action buttons ─────────────────────────
+      // Each entry renders a one-click button in the Manual Control panel
+      // ONLY while that exact item is sitting in the bot's cargo hold.
+      // Everything routes through the `use_item` command
+      // (POST /api/v2/spacemolt/use_item, operationId spacemolt_use_item),
+      // whose body is { id: <item_id>, quantity?: <int, default 1> }.
+      // To expose another consumable, just add an entry here — no other
+      // code changes needed.
+      //   itemId   : cargo item_id that gates the button
+      //   label    : button text (quantity in cargo is appended)
+      //   icon     : optional emoji prefix
+      //   btnClass : button CSS class ("sm", "primary sm", "danger sm")
+      //   quantity : how many to consume per click (default 1)
+      //   title    : hover tooltip
+      const MC_ITEM_ACTIONS = [
+        {
+          itemId: "emergency_warp_device",
+          label: "Emergency Warp",
+          icon: "🌀",
+          btnClass: "danger sm",
+          quantity: 1,
+          title:
+            "Use Emergency Warp Device — warps you to a random nearby system (usable in battle)",
+        },
+      ];
+
+      /** Find a cargo entry for an item ID, tolerating both key styles. */
+      function mcFindCargoItem(cargoItems, itemId) {
+        return (cargoItems || []).find(
+          (i) => (i.itemId || i.item_id) === itemId,
+        );
+      }
+
+      /**
+       * Build the "Item Actions" cmd-group for every MC_ITEM_ACTIONS entry
+       * whose item is currently in cargo. Returns "" when none match, so the
+       * whole row disappears rather than showing an empty box.
+       */
+      function mcBuildItemActionsHTML(cargoItems) {
+        const buttons = [];
+        for (const action of MC_ITEM_ACTIONS) {
+          const owned = mcFindCargoItem(cargoItems, action.itemId);
+          const qty = Number(owned && owned.quantity) || 0;
+          if (qty <= 0) continue;
+          const name =
+            action.label || (owned && owned.name) || catalogName(action.itemId);
+          const text = `${action.icon ? action.icon + " " : ""}${name} (${qty})`;
+          const useQty = Math.max(1, Number(action.quantity) || 1);
+          const tip =
+            action.title ||
+            catalog.items?.[action.itemId]?.description ||
+            `Use ${name}`;
+          buttons.push(
+            `<button class="${esc(action.btnClass || "sm")}" title="${esc(tip)}" onclick="mcUseItem('${escJs(action.itemId)}',${useQty})">${esc(text)}</button>`,
+          );
+        }
+        if (buttons.length === 0) return "";
+        return `<div class="cmd-group">
+      <label>Item Actions</label>
+      ${buttons.join("\n      ")}
+    </div>`;
+      }
+
+      /** Consume a cargo item via the `use_item` command. */
+      function mcUseItem(itemId, quantity) {
+        if (!itemId) {
+          logResponse('<span class="resp-err">No item specified</span>');
+          return;
+        }
+        const bot = getProfileBot();
+        const cargoItems = _pendingFreshCargo || (bot && bot.inventory) || [];
+        const owned = mcFindCargoItem(cargoItems, itemId);
+        if (!owned || (Number(owned.quantity) || 0) <= 0) {
+          logResponse(
+            `<span class="resp-err">${esc(catalogName(itemId) || itemId)} is not in cargo</span>`,
+          );
+          return;
+        }
+        const qty = Math.min(
+          Math.max(1, Number(quantity) || 1),
+          Number(owned.quantity) || 1,
+        );
+        mcExec("use_item", { id: itemId, quantity: qty });
       }
 
       async function renderManualControls(isFreshRender) {
@@ -6813,6 +6904,10 @@
     </div>`;
         }
 
+        // Build context-sensitive item action buttons (only for items
+        // currently in cargo — see MC_ITEM_ACTIONS registry above)
+        const itemActionsSection = mcBuildItemActionsHTML(freshCargo);
+
         // Build wreck salvage section
         const wreckSection = `
     <div class="cmd-group">
@@ -6884,6 +6979,8 @@
       <button class="sm" onclick="mcExec('cloak', { enable: 'true' })">Cloak</button>
       <button class="sm" onclick="mcExec('cloak')">Decloak</button>
     </div>
+
+    <div id="mc-item-actions" style="display:contents">${itemActionsSection}</div>
 
     <div class="cmd-group">
       <label>Refuel Player</label>
@@ -10158,6 +10255,43 @@
           return s;
         },
 
+        use_item(d) {
+          const det = (d && d.details) || d || {};
+          const name =
+            det.item_name ||
+            catalogName(det.item_id) ||
+            det.item_id ||
+            "item";
+          const bits = [
+            `Used ${esc(String(det.quantity_used || 1))}x ${esc(String(name))}`,
+          ];
+          if (det.hull_restored)
+            bits.push(`+${esc(String(det.hull_restored))} hull`);
+          if (det.shield_restored)
+            bits.push(`+${esc(String(det.shield_restored))} shield`);
+          if (det.fuel_added)
+            bits.push(`+${esc(String(det.fuel_added))} fuel`);
+          if (det.stat) {
+            bits.push(
+              `${esc(String(det.stat))}${det.amount ? " +" + esc(String(det.amount)) : ""}${det.duration ? " for " + esc(String(det.duration)) + " ticks" : ""}`,
+            );
+          }
+          // Emergency warp device (and anything else that relocates the ship)
+          const dest =
+            det.destination_system ||
+            (d.location && (d.location.system_name || d.location.system_id));
+          if (dest)
+            bits.push(
+              `→ ${esc(resolveLocation(String(dest)) || String(dest))}`,
+            );
+          if (det.quantity_remaining != null)
+            bits.push(`${esc(String(det.quantity_remaining))} left`);
+          let s = bits.join(" | ");
+          const msg = det.message || d.message;
+          if (msg) s += `\n  ${esc(String(msg))}`;
+          return s;
+        },
+
         send_gift(d) {
           const lines = [];
 
@@ -10453,6 +10587,9 @@
             "buy",
             "jettison",
             "craft",
+            // use_item consumes cargo, so it needs the same post-command
+            // cargo/storage refresh (keeps item action buttons accurate)
+            "use_item",
           ].includes(command) ||
           (command === "view_storage" && params && params.target === "faction");
         if (isStorageCommand) {
@@ -10561,6 +10698,22 @@
               }
               renderProfileSidebar();
               renderManualControls(true);
+            } else if (command === "use_item") {
+              // Some consumables relocate the ship (the emergency warp device
+              // drops you in a random nearby system), so resync location and
+              // pull fresh system data for the Travel/Jump dropdowns + map.
+              const loc = result.data.location || {};
+              const newSystem = loc.system_id || "";
+              if (newSystem && newSystem !== bot.system) {
+                bot.system = newSystem;
+                bot.poi = loc.poi_id || bot.poi;
+                bot.docked = !!loc.docked_at;
+                const who = profileBot;
+                setTimeout(() => {
+                  if (who && who === profileBot) fetchSystemData(who);
+                }, 100);
+              }
+              renderProfileSidebar();
             }
           }
 

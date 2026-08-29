@@ -2461,6 +2461,9 @@ const skillsObj: Record<string, unknown> | null =
     "accept_mission", "complete_mission", "abandon_mission",
     "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
     "set_home_base",
+    // use_item consumes cargo and can also move the ship (emergency warp
+    // device) or change hull/shield/buffs, so cached state must be resynced.
+    "use_item",
   ]);
   const stateRefreshCommands = new Set(["get_cargo", "get_ship", "get_location", "view_storage", "view_faction_storage"]);
   

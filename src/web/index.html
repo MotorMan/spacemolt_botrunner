@@ -2611,9 +2611,11 @@
                 );
                 if (activeTab) {
                   const tabId = activeTab.id?.replace("tab-", "");
-                  if (tabId === "cargo_mover") {
-                    rerenderCurrentSettings();
-                  }
+                if (tabId === "cargo_mover") {
+                  // Guard against clobbering unsaved edits: only refresh when
+                  // the panel isn't dirty / actively focused.
+                  scheduleSettingsPanelRefresh();
+                }
                 }
               }
               break;
@@ -14739,7 +14741,9 @@
             } else {
               cachedSettingsRecipes = cachedSettingsRecipes || [];
             }
-            if (activeSettingsTab === "crafter") renderSettingsPanel();
+            // Use the guarded refresh so in-progress edits aren't clobbered
+            // when the (slow, paginated) recipe fetch finally completes.
+            if (activeSettingsTab === "crafter") scheduleSettingsPanelRefresh();
           },
         );
       }

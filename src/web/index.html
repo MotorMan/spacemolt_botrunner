@@ -15460,6 +15460,23 @@
       // Persisted automatically because it lives on the crafter profile object that
       // saveCrafterSettings() sends back to the server.
 
+      // Resolve the recipe's PRIMARY output item id the same way the backend
+      // does (catalog recipes may store it as output_item_id, an outputs[] array,
+      // or an output/result/produces object). Used for the "= <output>" label and
+      // the output cap, which both key off the primary output.
+      function recipeOutputItem(r) {
+        if (!r) return "";
+        if (r.output_item_id) return r.output_item_id;
+        const outs = r.outputs || r.output || r.result || r.produces;
+        if (Array.isArray(outs) && outs.length) {
+          return outs[0].item_id || outs[0].id || outs[0].item || "";
+        }
+        if (outs && typeof outs === "object") {
+          return outs.item_id || outs.id || outs.item || "";
+        }
+        return r.output_name || r.name || r.id || "";
+      }
+
       function getTriggerProfile() {
         const currentCrafterName = window._currentCrafterProfile;
         if (!settings.crafter) settings.crafter = {};
@@ -15515,9 +15532,7 @@
               (x) => (x.recipe_id || x.id || x.name) === id,
             );
             const name = r ? r.name || id : id;
-            const outName = r
-              ? (r.output_name || r.output_item_id || r.name || id)
-              : id;
+            const outName = recipeOutputItem(r) || id;
             const comps = r
               ? r.components || r.ingredients || r.inputs || r.materials || []
               : [];

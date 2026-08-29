@@ -15515,16 +15515,20 @@
               (x) => (x.recipe_id || x.id || x.name) === id,
             );
             const name = r ? r.name || id : id;
-            const outItem = r ? (r.output_item_id || r.name || id) : id;
+            const outName = r
+              ? (r.output_name || r.output_item_id || r.name || id)
+              : id;
             const comps = r
               ? r.components || r.ingredients || r.inputs || r.materials || []
               : [];
-            const compStr = comps
-              .map(
-                (c) =>
-                  `${c.quantity || c.amount || 1}x ${c.name || c.item_name || c.item_id || c.id}`,
-              )
-              .join(", ");
+            const compStr = comps.length > 0
+              ? comps
+                  .map(
+                    (c) =>
+                      `${c.quantity || c.amount || 1}x ${c.name || c.item_name || c.item_id || c.id}`,
+                  )
+                  .join(", ") + ` = ${outName}`
+              : "";
             const triggerRows = (cfg.materials || [])
               .map((t, i) => {
                 return `
@@ -15546,7 +15550,7 @@
           <button class="sm" style="margin-left:auto;border:none;color:#fff;background:#d32f2f;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeTriggerRecipe('${esc(id)}')">Remove Recipe</button>
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin:6px 0 0 16px;flex-wrap:wrap">
-          <span style="font-size:11px;color:var(--dim)">Don't run when ${esc(outItem)} &ge;</span>
+          <span style="font-size:11px;color:var(--dim)">Don't run when ${esc(outName)} &ge;</span>
           <input type="number" min="0" value="${cfg.maxOutput || 0}" data-recipe="${esc(id)}" data-field="maxOutput" onchange="updateTriggerField(this)" style="width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px" title="Output cap: trigger won't fire while the output stock is at/above this">
           <span style="font-size:11px;color:var(--dim)">Priority</span>
           <input type="number" min="0" value="${cfg.priority != null ? cfg.priority : 100}" data-recipe="${esc(id)}" data-field="priority" onchange="updateTriggerField(this)" style="width:80px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px" title="Lower number fires first when recipes share the same input material">

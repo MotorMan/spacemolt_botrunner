@@ -1005,9 +1005,10 @@ export function evaluateRecipeTrigger(
   let matchedAnyComponent = false;
   for (const t of triggers) {
     const current = countItemFn(t.item.toLowerCase());
-    // Every material must be ABOVE its trigger point before we start, so the
-    // surplus actually exists. If any is still below, the recipe stays armed but
-    // quiet (mining will get us there).
+    // Every material must be ABOVE its trigger point before we start. Because
+    // queued jobs immediately remove their materials from storage, `countItemFn`
+    // already reflects only the FREE stock — so re-firing while a previous batch
+    // is in flight is safe: we simply size from whatever is still free.
     if (!(current > t.triggerAt)) return null;
     // The trigger item must actually be a component of this recipe, otherwise we
     // have no way to convert it. Skip (don't count) entries that don't match.
@@ -1030,12 +1031,15 @@ export function evaluateRecipeTrigger(
  * Evaluate and queue every material-triggered recipe for the active crafter
  * profile. Returns how many recipes fired and how many successfully queued.
  *
- * A recipe fires only when all of its material triggers are above their
- * `triggerAt` (so the surplus exists) and no job for it is already in flight
- * (we don't stack trigger batches on top of pending work). When it fires we
- * size the run count to bring the LIMITING material down to its `stopAt`, then
- * queue the whole thing in one shot (exactly like the user's "just put that
- * all in one queue" expectation).
+ * A recipe fires when all of its material triggers are above their `triggerAt`
+ * on the RAW live stock, and we size the run count from the AVAILABLE material
+ * (raw stock minus what is already committed by in-flight and same-cycle jobs)
+ * so it brings the LIMITING material down to its `stopAt` without ever draining
+ * below it. Because sizing is based on uncommitted material, a recipe can
+ * re-fire while a previous batch is still in flight — it simply won't queue more
+ * than the surplus that hasn't already been claimed. The whole batch is queued
+ * in one shot (exactly like the user's "just put that all in one queue"
+ * expectation).
  */
 export async function processRecipeTriggers(
   ctx: RoutineContext,
@@ -1047,6 +1051,7 @@ export async function processRecipeTriggers(
   countItemFn: (itemId: string) => number,
   tracker: CraftQueueTracker,
   livePendingRuns?: Map<string, number>,
+  outputLimits?: Map<string, number>,
 ): Promise<{ fired: number; queued: number }> {
   const { log } = ctx;
   const result = { fired: 0, queued: 0 };
@@ -1097,6 +1102,13 @@ export async function processRecipeTriggers(
   // (and hold off if there isn't enough left to reach their own stop point).
   // Without this, two recipes both armed on the same ore would each size a full
   // drain in the same cycle and over-commit the shared stock.
+  //
+  // Key insight (per the crafting-queue model): once a recipe is queued, its
+  // materials are IMMEDIATELY removed from faction storage and locked to that
+  // job. So `countItem()` already reports only the FREE stock — in-flight jobs
+  // do NOT hold materials in storage. We therefore seed the budget straight from
+  // `countItem()` and only debit runs queued *this cycle*; we must NOT also
+  // subtract in-flight runs, or we'd double-count and under-queue.
   const budget = new Map<string, number>();
   for (const e of entries) {
     for (const c of e.recipe.components) {
@@ -1126,13 +1138,38 @@ export async function processRecipeTriggers(
       }
     }
 
-    // Don't stack another trigger batch on top of work already in flight for
-    // this recipe (whether from a trigger, a goal, or category crafting).
-    const pending = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
-    if (pending > 0) continue;
+    // No "pending > 0" guard: a recipe may re-fire while a previous batch is
+    // still in flight. Run sizing is based on uncommitted material (see the
+    // budget above), so this can never drain below the stop point — it just
+    // won't queue more than the surplus that hasn't already been claimed.
 
-    const runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
+    let runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
     if (runs === null) continue;
+
+    // Respect the recipe's output cap (the craftLimit / "make N outputs" target):
+    // a material trigger should fill the surplus but never produce past the
+    // user's stated maximum. If the cap is already met (or will be by in-flight
+    // work), hold off instead of over-producing.
+    if (outputLimits && outputLimits.has(e.recipeId)) {
+      const limit = outputLimits.get(e.recipeId) as number;
+      const limiter = lowestOutputItem(recipe);
+      const outPerRun = limiter.quantity || 1;
+      const outItem = limiter.item_id.toLowerCase();
+      const haveOut = countItemFn(outItem);
+      const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
+      const pendingOut = pendingRuns * outPerRun;
+      const room = limit - (haveOut + pendingOut);
+      if (room <= 0) {
+        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${limit}`);
+        continue;
+      }
+      const maxRuns = Math.floor(room / outPerRun);
+      if (maxRuns <= 0) continue;
+      if (runs > maxRuns) {
+        log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (output cap ${limit})`);
+        runs = maxRuns;
+      }
+    }
 
     result.fired++;
     const limiter = lowestOutputItem(recipe);
@@ -2517,6 +2554,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         countItem,
         tracker!,
         livePendingRuns,
+        effectiveQuotas,
       );
       if (trigResult.fired > 0) {
         ctx.log("craft", `Material triggers fired: ${trigResult.fired} recipe(s), ${trigResult.queued} queued this cycle`);

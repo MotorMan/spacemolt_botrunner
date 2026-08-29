@@ -6586,12 +6586,14 @@
       // whose body is { id: <item_id>, quantity?: <int, default 1> }.
       // To expose another consumable, just add an entry here — no other
       // code changes needed.
-      //   itemId   : cargo item_id that gates the button
-      //   label    : button text (quantity in cargo is appended)
-      //   icon     : optional emoji prefix
-      //   btnClass : button CSS class ("sm", "primary sm", "danger sm")
-      //   quantity : how many to consume per click (default 1)
-      //   title    : hover tooltip
+      //   itemId    : cargo item_id that gates the button
+      //   label     : human-readable button label
+      //   icon      : optional emoji prefix
+      //   btnClass  : button CSS class ("sm", "primary sm", "danger sm")
+      //   quantity  : default/forced quantity to consume per click.
+      //               Set `askQty: true` to instead render a number input
+      //               (clamped to how many are in cargo). Both gate on cargo.
+      //   title     : hover tooltip
       const MC_ITEM_ACTIONS = [
         {
           itemId: "emergency_warp_device",
@@ -6601,6 +6603,39 @@
           quantity: 1,
           title:
             "Use Emergency Warp Device — warps you to a random nearby system (usable in battle)",
+        },
+        {
+          itemId: "adrenaline_surge",
+          label: "Adrenaline Surge",
+          icon: "⚡",
+          btnClass: "sm",
+          quantity: 1,
+          title:
+            "+15% to all combat stats for 5 ticks. Powerful but brief.",
+        },
+        {
+          itemId: "shield_charge",
+          label: "Use Shield Charge",
+          icon: "🛡️",
+          btnClass: "primary sm",
+          askQty: true,
+          title: "Instant shield restoration, restores 100 shields each",
+        },
+        {
+          itemId: "advanced_repair_kit",
+          label: "Use Advanced Repair Kit",
+          icon: "🔧",
+          btnClass: "primary sm",
+          askQty: true,
+          title: "Professional repair kit, restores 150 hull each",
+        },
+        {
+          itemId: "repair_kit",
+          label: "Use Repair Kit",
+          icon: "🔧",
+          btnClass: "primary sm",
+          askQty: true,
+          title: "Emergency repair kit. Restores 50 hull each",
         },
       ];
 
@@ -6617,32 +6652,36 @@
        * whole row disappears rather than showing an empty box.
        */
       function mcBuildItemActionsHTML(cargoItems) {
-        const buttons = [];
+        const groups = [];
         for (const action of MC_ITEM_ACTIONS) {
           const owned = mcFindCargoItem(cargoItems, action.itemId);
           const qty = Number(owned && owned.quantity) || 0;
           if (qty <= 0) continue;
           const name =
             action.label || (owned && owned.name) || catalogName(action.itemId);
-          const text = `${action.icon ? action.icon + " " : ""}${name} (${qty})`;
-          const useQty = Math.max(1, Number(action.quantity) || 1);
           const tip =
             action.title ||
             catalog.items?.[action.itemId]?.description ||
             `Use ${name}`;
-          buttons.push(
-            `<button class="${esc(action.btnClass || "sm")}" title="${esc(tip)}" onclick="mcUseItem('${escJs(action.itemId)}',${useQty})">${esc(text)}</button>`,
-          );
+          const btnId = `mc-use-${action.itemId}`;
+          let qtyInput = "";
+          if (action.askQty) {
+            const def = Math.max(1, Number(action.quantity) || 1);
+            qtyInput = `<input type="number" id="${esc(btnId)}-qty" min="1" max="${qty}" value="${def}" style="width:64px" title="How many to use">`;
+          }
+          const group = `<div class="cmd-group">
+        <label>${esc(name)} (${qty})</label>
+        ${qtyInput}
+        <button class="${esc(action.btnClass || "sm")}" id="${esc(btnId)}" title="${esc(tip)}" onclick="mcUseItem('${escJs(action.itemId)}')">${action.icon ? esc(action.icon) + " " : ""}Use</button>
+      </div>`;
+          groups.push(group);
         }
-        if (buttons.length === 0) return "";
-        return `<div class="cmd-group">
-      <label>Item Actions</label>
-      ${buttons.join("\n      ")}
-    </div>`;
+        if (groups.length === 0) return "";
+        return groups.join("\n");
       }
 
       /** Consume a cargo item via the `use_item` command. */
-      function mcUseItem(itemId, quantity) {
+      function mcUseItem(itemId) {
         if (!itemId) {
           logResponse('<span class="resp-err">No item specified</span>');
           return;
@@ -6656,10 +6695,12 @@
           );
           return;
         }
-        const qty = Math.min(
-          Math.max(1, Number(quantity) || 1),
-          Number(owned.quantity) || 1,
-        );
+        // If a quantity input is present, prefer its value; otherwise fall
+        // back to the registry default. Clamp to how many are actually held.
+        const qtyInput = document.getElementById(`mc-use-${itemId}-qty`);
+        let qty = qtyInput ? Number(qtyInput.value) : Number(owned.quantity) || 1;
+        if (!Number.isFinite(qty) || qty < 1) qty = 1;
+        qty = Math.min(qty, Number(owned.quantity) || 1);
         mcExec("use_item", { id: itemId, quantity: qty });
       }
 

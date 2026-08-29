@@ -1443,15 +1443,19 @@ export async function fightJoinedBattle(
     }
   }
 
-  // The newer server combat code OMITS the enemy from participants, so
-  // pickRealBattleTarget is usually null. Re-acquire the real attacker from the
-  // nearby scan (which still lists pirates) so we have someone to actually fight.
-  if (!currentTarget || (status && !status.participants.some(p => p.player_id === currentTarget!.id || p.username === currentTarget!.name))) {
-    const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
-    if (nearbyEnemy) {
-      ctx.log("combat", `Re-acquired enemy from nearby scan: ${nearbyEnemy.name}`);
-      currentTarget = nearbyEnemy;
-    }
+  // When joining an EXISTING battle (the only path into fightJoinedBattle — fresh
+  // battles go through fightFreshBattle), the caller's target is often a synthetic
+  // `fakeTarget` built from the battle roster. For creatures the roster's id is NOT
+  // the id the `attack` command accepts (only get_nearby's `creature_id` is), so
+  // attacking with it silently fails: the bot ends up "in" the battle but never
+  // registered as engaged, the server never auto-fires, and the hunter just sits in
+  // the outer ring and dies (most visible after a client restart mid-battle).
+  // Always re-acquire the real enemy from get_nearby — preferName keeps the correct
+  // target, and we only switch when a matching live entity is actually visible.
+  const nearbyEnemy = await acquireEnemyFromNearby(ctx, currentTarget?.name, maxAttackTier, onlyNPCs);
+  if (nearbyEnemy) {
+    ctx.log("combat", `Re-acquired enemy from nearby scan: ${nearbyEnemy.name} (id ${nearbyEnemy.id})`);
+    currentTarget = nearbyEnemy;
   }
 
   ctx.log("combat", `🎯 Fighting in joined battle${currentTarget ? ` — targeting ${currentTarget.name}` : ''}`);
@@ -1762,7 +1766,13 @@ export async function fightJoinedBattle(
       }
       await ctx.sleep(10000);
     } else {
-      // Already in range and fire stance (default) — server auto-fires each tick
+      // Already in range and fire stance (default) — server auto-fires each tick.
+      // Re-issue the attack defensively: if the initial engage somehow didn't register
+      // us as engaged (e.g. restarted mid-battle with a stale target id), this keeps
+      // trying to attack instead of silently sitting in the outer ring and dying.
+      // Re-attacking an already-engaged target just returns "already in a battle",
+      // which attackTarget treats as success, so this is harmless when fine.
+      if (currentTarget) await attackTarget(ctx, currentTarget);
       await ctx.sleep(10000);
     }
   }

@@ -15012,6 +15012,10 @@
       </div>
       <div id="recipeTriggersList"></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <input type="text" id="trigger-search" placeholder="Search recipes or output item..." oninput="populateTriggerRecipeSelect()" style="flex:1;min-width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <select id="trigger-add-cat" onchange="populateTriggerRecipeSelect()" style="min-width:100px">${catOpts}</select>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
         <select id="trigger-recipe-select" style="flex:1;min-width:0"></select>
         <button class="primary sm" onclick="addTriggerRecipe()">+ Add Trigger</button>
       </div>
@@ -15497,19 +15501,54 @@
         const p = getTriggerProfile();
         const used = new Set(Object.keys(p.recipeTriggers || {}));
         const recipes = cachedSettingsRecipes || [];
+        const searchEl = document.getElementById("trigger-search");
+        const catEl = document.getElementById("trigger-add-cat");
+        const searchText = ((searchEl && searchEl.value) || "").trim().toLowerCase();
+        const cat = (catEl && catEl.value) || "__all__";
+
+        const matches = (r) => {
+          const id = r.recipe_id || r.id || r.name || "";
+          if (!id || used.has(id)) return false;
+          if (cat !== "__all__" && (r.category || "Other") !== cat) return false;
+          if (!searchText) return true;
+          // Match against recipe name/id, description, category, AND the output
+          // item(s) so the user can search by what the recipe makes, not just its
+          // name.
+          const outs = r.outputs || r.output || r.result || r.produces;
+          let outStr = "";
+          if (Array.isArray(outs)) {
+            outStr = outs
+              .map((o) => `${o.item_id || o.id || o.item || ""} ${o.name || o.item_name || ""}`)
+              .join(" ");
+          } else if (outs && typeof outs === "object") {
+            outStr = `${outs.item_id || outs.id || outs.item || ""} ${outs.name || outs.item_name || ""}`;
+          }
+          const hay = [
+            r.name,
+            r.recipe_id,
+            r.id,
+            r.description,
+            r.category,
+            outStr,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+          return hay.includes(searchText);
+        };
+
         const opts = recipes
-          .filter((r) => {
-            const id = r.recipe_id || r.id || r.name || "";
-            return id && !used.has(id);
-          })
+          .filter(matches)
           .map((r) => {
             const id = r.recipe_id || r.id || r.name || "";
             const name = r.name || id;
-            return `<option value="${esc(id)}">${esc(name)}</option>`;
+            const outName = recipeOutputItem(r);
+            const outHint = outName && outName !== id ? ` → ${outName}` : "";
+            return `<option value="${esc(id)}">${esc(name)}${esc(outHint)}</option>`;
           })
           .join("");
         sel.innerHTML =
-          opts || '<option value="">All recipes have triggers</option>';
+          opts || '<option value="">No recipes match</option>';
       }
 
       function renderRecipeTriggers() {

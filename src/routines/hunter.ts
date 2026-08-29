@@ -143,6 +143,19 @@ function prioritizeRainbowLeviathan(creatures: NearbyEntity[]): NearbyEntity[] {
   return [...prioritized, ...rest];
 }
 
+/**
+ * Returns true if a creature is a leviathan (worth a coordinated multi-hunter
+ * assist). Everything else dies to a single hunter shot, so pulling in extra
+ * hunters just splits the loot at the choke-point bottlenecks.
+ *
+ * Currently only Rainbow Leviathan spawns, but the match is generic so any
+ * future leviathan variant is still coordinated.
+ */
+function isLeviathanCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  return name.toLowerCase().includes("leviathan");
+}
+
 async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
@@ -926,6 +939,10 @@ function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: 
   if (!bot.system || !bot.poi) return;
   const settings = getHunterSettings(bot.username);
   if (!settings.coordinateHunts) return;
+  // Only coordinate assists for leviathan creatures. Every other creature drops to
+  // a single hunter shot, so pulling in multiple hunters just splits the loot at the
+  // crowded choke-point POIs where all the bots converge.
+  if (creature && !isLeviathanCreature(target.name)) return;
   botChatChannel.send({
     sender: bot.username,
     recipients: [],
@@ -977,6 +994,14 @@ async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnTyp
     if (bot.state !== "running") break;
     const key = `${req.targetId}|${req.sender}`;
     if (req.sender === bot.username || handled.has(key)) continue;
+
+    // Only coordinate-assist creatures that are leviathans. Every other creature
+    // dies to a single hunter shot, so joining those would just split loot at the
+    // crowded choke-point POIs where all the tour bots converge.
+    if (req.creature && !isLeviathanCreature(req.targetName)) {
+      handled.add(key);
+      continue;
+    }
 
     // Only respond to requests from our exact POI.
     if (req.system !== bot.system || req.poi !== bot.poi) {

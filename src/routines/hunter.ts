@@ -880,6 +880,81 @@ const coordListeners = new Set<string>();
  *  our own broadcast so responders don't echo the assist request back. */
 let coordResponding = false;
 
+// ── Creature "claim" lock (non-API bot chat channel) ──────────
+//
+// Because we no longer want multiple hunters piling onto a weak one-shot creature
+// (it only splits loot at the crowded choke-point POIs all the tour bots share),
+// the first hunter to start attacking a non-leviathan creature "claims" it over the
+// in-memory bot chat channel. Other hunters in the same process honour the claim and
+// skip that creatureId so they pick a different target instead.
+//
+// Leviathans are explicitly NOT claimed — they still get the full assist broadcast
+// (see isLeviathanCreature / broadcastHunterAssist) so the whole wing lands on them.
+
+/** How long a claim stays valid before it is treated as stale (ms). Covers the case
+ *  where the claiming bot dies mid-fight and never releases the lock. */
+const CREATURE_CLAIM_TTL_MS = 90 * 1000;
+/** Map<creatureId, { claimer, expires }> — shared across all bots in this process. */
+const creatureClaims = new Map<string, { claimer: string; expires: number }>();
+
+function releaseExpiredCreatureClaims(): void {
+  const now = Date.now();
+  for (const [id, claim] of creatureClaims) {
+    if (claim.expires <= now) creatureClaims.delete(id);
+  }
+}
+
+/** Broadcast a claim lock for a non-leviathan creature we're about to engage. */
+function claimCreature(ctx: RoutineContext, target: { id: string; name: string }): void {
+  const { bot } = ctx;
+  if (!bot.system || !bot.poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (!settings.coordinateHunts) return;
+  // Only non-leviathan creatures are claimed — leviathans keep the assist broadcast.
+  const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
+  if (!isCreature || isLeviathanCreature(target.name)) return;
+  creatureClaims.set(target.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[CREATURE CLAIM] ${bot.username} claiming ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`,
+    metadata: {
+      type: "creature_claim",
+      system: bot.system,
+      poi: bot.poi,
+      targetName: target.name,
+      targetId: target.id,
+    },
+  });
+}
+
+/** True if a different hunter has an active claim on this creatureId. */
+function isCreatureClaimedByOther(creatureId: string, username: string): boolean {
+  const claim = creatureClaims.get(creatureId);
+  if (!claim) return false;
+  if (claim.expires <= Date.now()) {
+    creatureClaims.delete(creatureId);
+    return false;
+  }
+  return claim.claimer !== username;
+}
+
+/**
+ * Pick the creatures a hunter should engage, honouring other hunters' claim locks.
+ * Leviathans are never filtered (they want the group assist) and are prioritised
+ * first. Non-leviathan creatures already claimed by another bot are dropped so the
+ * hunter picks a different, unclaimed target instead.
+ */
+function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCreatures: boolean, max: number): NearbyEntity[] {
+  releaseExpiredCreatureClaims();
+  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e));
+  const unclaimed = creatures.filter(e =>
+    isLeviathanCreature(e.name) || !isCreatureClaimedByOther(e.id, username),
+  );
+  return prioritizeRainbowLeviathan(unclaimed).slice(0, Math.max(0, max));
+}
+
 /**
  * Wrapper around engageTarget that broadcasts a hunter-assist request (so same-POI
  * allies can join) before fighting. Skips the broadcast when we are ourselves
@@ -900,6 +975,9 @@ async function hunterEngage(
 ): Promise<boolean> {
   if (!coordResponding) {
     broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+    // Lock one-shot creatures so other hunters don't also start attacking the same
+    // target (leviathans are intentionally skipped — they keep the assist broadcast).
+    claimCreature(ctx, target);
   }
   const hsettings = getHunterSettings(ctx.bot.username);
   return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80);
@@ -916,20 +994,27 @@ function ensureHunterCoordListener(username: string): void {
     if (msg.channel !== "coordination") return;
     if (msg.sender === username) return;
     const meta = (msg.metadata || {}) as Record<string, unknown>;
-    if (meta.type !== "hunter_assist") return;
-    const system = (meta.system as string) || "";
-    const poi = (meta.poi as string) || "";
-    if (!system || !poi) return;
-    const req: HunterCoordRequest = {
-      sender: msg.sender,
-      system,
-      poi,
-      targetName: (meta.targetName as string) || "",
-      targetId: (meta.targetId as string) || "",
-      creature: !!(meta.creature),
-      timestamp: msg.timestamp,
-    };
-    coordRequests.get(username)!.push(req);
+    if (meta.type === "hunter_assist") {
+      const system = (meta.system as string) || "";
+      const poi = (meta.poi as string) || "";
+      if (!system || !poi) return;
+      const req: HunterCoordRequest = {
+        sender: msg.sender,
+        system,
+        poi,
+        targetName: (meta.targetName as string) || "",
+        targetId: (meta.targetId as string) || "",
+        creature: !!(meta.creature),
+        timestamp: msg.timestamp,
+      };
+      coordRequests.get(username)!.push(req);
+    } else if (meta.type === "creature_claim") {
+      // Another hunter claimed a one-shot creature — lock it so we don't also attack it.
+      const targetId = (meta.targetId as string) || "";
+      if (targetId) {
+        creatureClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+      }
+    }
   });
 }
 
@@ -1632,9 +1717,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
           const entities = parseNearby(nearbyData);
-          const creatures = prioritizeRainbowLeviathan(
-            entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e)),
-          );
+          const creatures = pickCreatureTargets(entities, bot.username, true, settings.maxCreaturesPerScan);
 
           if (creatures.length === 0) {
             // POI currently clear — stop re-scanning this POI for now
@@ -2045,7 +2128,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
@@ -2062,7 +2145,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+      const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
 
       if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2541,7 +2624,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures))];
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
@@ -2558,7 +2641,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const entities = parseNearby(nearbyData);
       ctx.log("info", `entities: ${entities}`);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+      const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
 
       if (pirate_targets.length === 0 && creature_targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2966,7 +3049,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...scanEntities.filter(e => isCreatureTarget(e, settings.huntCreatures) && !isStationEntity(e))];
+              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
               }
@@ -2982,7 +3065,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       const entities = parseNearby(nearbyData);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-      const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+      const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
       const targets = [...pirate_targets, ...creature_targets];
 
       if (targets.length === 0) {
@@ -3847,7 +3930,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+        const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -4290,7 +4373,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, settings.huntCreatures)).slice(0, settings.maxCreaturesPerScan));
+        const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
@@ -4448,7 +4531,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         bot.trackNearbyPlayers(nearbyData);
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
-        const creature_targets = prioritizeRainbowLeviathan(entities.filter(e => isCreatureTarget(e, currentSettings.huntCreatures)).slice(0, currentSettings.maxCreaturesPerScan));
+        const creature_targets = pickCreatureTargets(entities, bot.username, currentSettings.huntCreatures, currentSettings.maxCreaturesPerScan);
         const targets = [...pirate_targets, ...creature_targets];
         for (const target of targets) {
           await useRepairKits(ctx);

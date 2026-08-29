@@ -204,20 +204,46 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   const hsettings = getHunterSettings(ctx.bot.username);
   const shieldRechargePct = (hsettings.shieldRechargePct ?? 80) / 100;
 
-  if (analysis.reason.includes("Already in battle")) {
-    ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
-  } else {
-    ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
-    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
-    if (engageResp.error) {
-      const errMsg = engageResp.error.message.toLowerCase();
-      if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
-        ctx.log("combat", `Already in battle — proceeding to fight`);
-      } else {
-        ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
-        return;
-      }
+  // If we're ALREADY a participant of this battle (the common case after the client
+  // is restarted mid-fight — the server still has us in the battle), we must NOT try
+  // to `attack`/`engage` it again: the server hangs the `attack` command for ~180s and
+  // then rejects `advance` with "not in battle, use attack to engage", leaving the
+  // hunter frozen in the outer ring. Instead, cleanly leave the stale battle and let
+  // the routine loop re-acquire the (still-present) target and start a FRESH battle,
+  // which is the path that works.
+  const alreadyInBattle =
+    analysis.reason.includes("Already in battle") ||
+    (battleStatus.is_participant === true);
+
+  if (alreadyInBattle) {
+    ctx.log("combat", `Already a participant of battle ${battleStatus.battle_id} (likely a stale battle from a restart) — fleeing to re-engage cleanly`);
+    const fleeResp = await ctx.bot.exec("battle", { action: "flee" });
+    if (fleeResp.error) {
+      const m = (fleeResp.error.message || "").toLowerCase();
+      if (!m.includes("already")) ctx.log("warn", `Flee from stale battle failed: ${fleeResp.error.message}`);
     }
+    // Clear local battle state so the next loop iteration treats us as fresh.
+    ctx.bot.currentBattle.inBattle = false;
+    ctx.bot.currentBattle.battleId = null;
+    await ctx.sleep(2000);
+    return;
+  }
+
+  ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
+  const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
+  if (engageResp.error) {
+    const errMsg = engageResp.error.message.toLowerCase();
+    if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
+      // Race: we actually were already in it. Leave and re-engage fresh.
+      ctx.log("combat", `Already in battle (engage race) — fleeing to re-engage cleanly`);
+      await ctx.bot.exec("battle", { action: "flee" });
+      ctx.bot.currentBattle.inBattle = false;
+      ctx.bot.currentBattle.battleId = null;
+      await ctx.sleep(2000);
+      return;
+    }
+    ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+    return;
   }
 
   // Pick a real target from battle participants so we get the full combat loop

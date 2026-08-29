@@ -1463,9 +1463,17 @@ export async function fightJoinedBattle(
   // Actually engage the enemy with the attack command. The server requires an active
   // attack to register us as "in" the battle for `battle` advance/stance commands —
   // otherwise advance fails with "You are not in a battle. Use attack to engage...".
+  // IMPORTANT: if we are ALREADY a battle participant (e.g. a stale battle rejoined
+  // after a restart), the `attack` command HANGS for ~180s and then the server still
+  // rejects `advance`. In that case we must only (re)target and let the caller have
+  // already fled+re-engaged. So never issue `attack` when already a participant.
   if (currentTarget) {
-    await attackTarget(ctx, currentTarget);
-    await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+    if (status?.is_participant) {
+      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+    } else {
+      await attackTarget(ctx, currentTarget);
+      await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+    }
   }
   await ctx.sleep(10000);
 
@@ -1487,8 +1495,13 @@ export async function fightJoinedBattle(
           // Bot not registered as engaged - need to ensure we're attacking the target
           if (currentTarget) {
             ctx.log("combat", `⚠️ Advance failed - not registered as engaged, ensuring attack on ${currentTarget.name}...`);
-            await attackTarget(ctx, currentTarget);
-            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            // Never re-issue `attack` if we're already a participant — it hangs.
+            if (status?.is_participant) {
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            } else {
+              await attackTarget(ctx, currentTarget);
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            }
             await ctx.sleep(5000);
             // Check if battle is still active
             const afterAttackStatus = await getBattleStatus(ctx);

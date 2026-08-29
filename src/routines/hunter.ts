@@ -156,9 +156,41 @@ function isLeviathanCreature(name: string | undefined): boolean {
   return name.toLowerCase().includes("leviathan");
 }
 
+/**
+ * Used by the reactive battle-join paths (API battle detection while scanning /
+ * navigating). If a battle we are NOT already part of contains a NON-leviathan
+ * creature that another hunter is already fighting, we skip it — that creature is
+ * already being solo'd (and likely claimed), so piling in just splits loot at the
+ * shared choke-point POIs. Leviathan battles still pass through so the wing can
+ * assist as intended.
+ */
+function isWeakCreatureBattleAlreadyHandled(ctx: RoutineContext, battleStatus: { is_participant?: boolean; participants?: Array<{ username?: string }> }): boolean {
+  if (battleStatus.is_participant) return false; // we're already in it — fight
+  const participants = battleStatus.participants || [];
+  const creatures = participants.filter(p => isCreatureName(p.username));
+  if (creatures.length === 0) return false;
+  if (creatures.some(p => isLeviathanCreature(p.username))) return false; // leviathans: group assist
+  const allies = participants.filter(p => {
+    const u = p.username || "";
+    if (isCreatureName(u)) return false;
+    if (u === ctx.bot.username) return false;
+    if (u.startsWith("[POLICE]")) return false;
+    if (u.toLowerCase().includes("pirate") || u.toLowerCase().includes("drifter")) return false;
+    return true;
+  });
+  return allies.length > 0;
+}
+
 async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
+
+  // Don't get pulled into a one-shot creature battle another hunter is already solo'ing
+  // (and likely claimed). Leviathans still pass through for the group assist.
+  if (isWeakCreatureBattleAlreadyHandled(ctx, battleStatus)) {
+    ctx.log("combat", `⏭️ Skipping battle (ID: ${battleStatus.battle_id}) — non-leviathan creature already handled by an ally`);
+    return;
+  }
 
   ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id}) during scanning`);
 
@@ -534,6 +566,13 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
   }
   
   if (!battleStatus) return;
+
+  // Don't get pulled into a one-shot creature battle another hunter is already solo'ing
+  // (and likely claimed). Leviathans still pass through for the group assist.
+  if (isWeakCreatureBattleAlreadyHandled(ctx, battleStatus)) {
+    ctx.log("combat", `⏭️ Navigation battle (ID: ${battleStatus.battle_id}) skipped — non-leviathan creature already handled by an ally`);
+    return;
+  }
 
   ctx.log("combat", `⚠️ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
 
@@ -952,7 +991,16 @@ function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCre
   const unclaimed = creatures.filter(e =>
     isLeviathanCreature(e.name) || !isCreatureClaimedByOther(e.id, username),
   );
-  return prioritizeRainbowLeviathan(unclaimed).slice(0, Math.max(0, max));
+  const result = prioritizeRainbowLeviathan(unclaimed).slice(0, Math.max(0, max));
+  // Claim the creatures we're handing back so a bot scanning on the same tick skips
+  // them (selection is the sync point — the process-shared map prevents two hunters
+  // from both picking the same one-shot creature). Leviathans are never claimed.
+  for (const c of result) {
+    if (!isLeviathanCreature(c.name) && !creatureClaims.has(c.id)) {
+      creatureClaims.set(c.id, { claimer: username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+    }
+  }
+  return result;
 }
 
 /**

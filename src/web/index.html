@@ -35733,6 +35733,7 @@ ignoreBlacklist: document.getElementById(
           return '<div class="faction-no-data">No ship data available</div>';
 
         const ship = extractShip(data);
+        const pers = ship.personnel || {};
         const rawShipName = ship.name || ship.ship_name || "";
         const cls = ship.class || ship.ship_class || ship.class_name || "";
         const customName = ship.custom_name || ship.customName || "";
@@ -35860,6 +35861,21 @@ ignoreBlacklist: document.getElementById(
       <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>
     </div>
     <div class="faction-section"><div class="faction-section-title">Modules</div>${slotsHtml}</div>
+    <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Crew & Personnel</div>
+      <div class="shipyard-stat-grid">
+        <span class="ssl">Crew Efficiency</span><span class="ssv">${typeof ship.crew_efficiency === "number" ? ship.crew_efficiency.toFixed(2) : "?"}</span>
+        <span class="ssl">Minimum Crew</span><span class="ssv">${ship.minimum_crew ?? "?"}</span>
+        <span class="ssl">Effective Crew Cap</span><span class="ssv">${ship.effective_crew_capacity ?? "?"}</span>
+        <span class="ssl">Effective Marine Cap</span><span class="ssv">${ship.effective_marine_capacity ?? "?"}</span>
+        <span class="ssl">Incapacitated</span><span class="ssv" style="${ship.incapacitated ? "color:var(--red)" : ""}">${ship.incapacitated ? "Yes" : "No"}</span>
+      </div>
+      <div class="faction-stat-grid" style="grid-template-columns: 1.4fr 1fr 1fr; margin-top:12px">
+        <span class="fsl">Category</span><span class="fsv">Crew</span><span class="fsv">Marines</span>
+        <span class="fsl">Fit</span><span class="fsv">${num(pers.fit_crew)}</span><span class="fsv">${num(pers.fit_marines)}</span>
+        <span class="fsl">Injured</span><span class="fsv" style="color:var(--orange)">${num(pers.injured_crew)}</span><span class="fsv" style="color:var(--orange)">${num(pers.injured_marines)}</span>
+      </div>
+    </div>
     <details style="margin-top:12px">
       <summary style="cursor:pointer;font-size:11px;color:var(--text-dim)">Raw Ship Data</summary>
       <pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;margin-top:6px;max-height:300px;overflow-y:auto;background:var(--bg);border:1px solid #21262d;border-radius:4px;padding:8px">${esc(rawJson)}</pre>

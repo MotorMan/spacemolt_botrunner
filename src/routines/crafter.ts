@@ -1171,6 +1171,32 @@ export async function processRecipeTriggers(
       }
     }
 
+    // maxOutput cap configured on the trigger itself: a fired trigger must never
+    // produce more than this many of the output item. The hold gate above only
+    // skips firing when LIVE stock already exceeds the cap, but it does NOT clamp
+    // the run count — so a recipe with a large input surplus would fire and blow
+    // well past the user's stated maximum (e.g. queue 3784 runs with maxOutput
+    // 1000). Cap the run count here too, accounting for in-flight work.
+    if (config.maxOutput !== undefined && config.maxOutput > 0) {
+      const limiter = lowestOutputItem(recipe);
+      const outPerRun = limiter.quantity || 1;
+      const outItem = limiter.item_id.toLowerCase();
+      const haveOut = countItemFn(outItem);
+      const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
+      const pendingOut = pendingRuns * outPerRun;
+      const room = config.maxOutput - (haveOut + pendingOut);
+      if (room <= 0) {
+        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}`);
+        continue;
+      }
+      const maxRuns = Math.floor(room / outPerRun);
+      if (maxRuns <= 0) continue;
+      if (runs > maxRuns) {
+        log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (maxOutput ${config.maxOutput})`);
+        runs = maxRuns;
+      }
+    }
+
     result.fired++;
     const limiter = lowestOutputItem(recipe);
     const outputPerRun = limiter.quantity || 1;

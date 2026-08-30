@@ -31,6 +31,8 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   getSystemInfo,
+  getFuelCellFuelValue,
+  isFuelCellItem,
 } from "./common.js";
 import {
   getRadioactiveCapability,
@@ -2251,10 +2253,13 @@ async function ensureFuelCellsStocked(ctx: RoutineContext): Promise<void> {
   if (!minFuel || minFuel <= 0) return;
 
   await bot.refreshCargo();
+  // Count only REAL fuel cells. Do NOT sniff with itemId.includes("fuel") —
+  // that also matches fusion_fuel_rod / reactor_fuel_assembly / fuel_tank etc.,
+  // which inflates the reserve count and makes the bot skip topping up even
+  // though it is carrying zero actual fuel cells (then it runs out mid-route).
   let fuelInCargo = 0;
   for (const item of bot.inventory) {
-    const lower = item.itemId.toLowerCase();
-    if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+    if (isFuelCellItem(item.itemId) && item.quantity > 0) fuelInCargo += item.quantity;
   }
   if (fuelInCargo >= minFuel) return;
 
@@ -2262,7 +2267,8 @@ async function ensureFuelCellsStocked(ctx: RoutineContext): Promise<void> {
   const cargoMax = bot.cargoMax || 850;
   const cargoUsed = bot.cargo || 0;
 
-  const tryWithdraw = async (itemId: string, spacePer: number, mult: number): Promise<boolean> => {
+  const tryWithdraw = async (itemId: string, mult: number): Promise<boolean> => {
+    const spacePer = getItemSize(itemId);
     const qty = Math.min(cellsNeeded * mult, Math.floor((cargoMax - cargoUsed) / spacePer));
     if (qty <= 0) return false;
     try {
@@ -2274,9 +2280,9 @@ async function ensureFuelCellsStocked(ctx: RoutineContext): Promise<void> {
     }
   };
 
-  if (await tryWithdraw("military_fuel_cell", 3, 1)) return;
-  if (await tryWithdraw("premium_fuel_cell", 2, 1)) return;
-  if (await tryWithdraw("fuel_cell", 1, 2)) return;
+  if (await tryWithdraw("military_fuel_cell", 1)) return;
+  if (await tryWithdraw("premium_fuel_cell", 1)) return;
+  if (await tryWithdraw("fuel_cell", 2)) return;
   ctx.log("warn", `Could not withdraw any fuel cells from faction storage (need ${cellsNeeded} more to reach ${minFuel})`);
 }
 

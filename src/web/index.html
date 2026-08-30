@@ -22277,6 +22277,10 @@ When responding:
       </div>
     </div>
     <div class="faction-section" style="margin-top:16px">
+      <div class="faction-section-title">Crew & Personnel</div>
+      ${renderFactionPersonnel(f)}
+    </div>
+    <div class="faction-section" style="margin-top:16px">
       <div class="faction-section-title">Edit Faction</div>
       <div style="display:flex;flex-direction:column;gap:8px">
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -22304,11 +22308,43 @@ When responding:
           <span>Intel Opt-Out — don't share your intel with allies</span>
         </label>
       </div>
-    </div>
-  `;
-      }
+      </div>
+   `;
+       }
 
-      function renderFactionMembers(f, username) {
+       function renderFactionPersonnel(f) {
+         const p = f.personnel;
+         if (!p) {
+           return '<div class="faction-no-data">No crew/personnel data available</div>';
+         }
+         const fmt = (v) =>
+           typeof v === "number" ? v.toLocaleString() : "0";
+         const row = (label, crew, marines) =>
+           `<span class="fsl">${label}</span>` +
+           `<span class="fsv">${fmt(crew)} <span style="color:var(--text-dim);font-size:11px">crew</span></span>` +
+           `<span class="fsv">${fmt(marines)} <span style="color:var(--text-dim);font-size:11px">marines</span></span>`;
+          return `
+    <div class="faction-stat-grid" style="grid-template-columns: 1.4fr 1fr 1fr">
+      <span class="fsl">Category</span><span class="fsv">Crew</span><span class="fsv">Marines</span>
+      ${row("Total", p.total_crew, p.total_marines)}
+      ${row("Fit", p.fit_crew, p.fit_marines)}
+      ${row("Injured", p.injured_crew, p.injured_marines)}
+      ${row("Owned Ship", p.owned_ship_crew, p.owned_ship_marines)}
+      ${row("Assigned Prize", p.assigned_prize_crew, p.assigned_prize_marines)}
+      ${row("Reserve", p.reserve_crew, p.reserve_marines)}
+      ${row("Inbound", p.inbound_crew, p.inbound_marines ?? 0)}
+    </div>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:11px;color:var(--text-dim)">
+      <span>Total Crew+Marines: <b style="color:var(--text-bright)">${fmt((p.total_crew || 0) + (p.total_marines || 0))}</b></span>
+      <span>Fit: <b style="color:var(--text-bright)">${fmt((p.fit_crew || 0) + (p.fit_marines || 0))}</b></span>
+      <span>Injured: <b style="color:var(--orange)">${fmt((p.injured_crew || 0) + (p.injured_marines || 0))}</b></span>
+      <span>Owned Bases: <b style="color:var(--text-bright)">${fmt(f.owned_bases)}</b></span>
+      <span>Member Limit: <b style="color:var(--text-bright)">${fmt(f.members_limit)}</b>${f.members_truncated ? ' <span style="color:var(--orange)">(truncated)</span>' : ""}</span>
+    </div>
+   `;
+       }
+
+       function renderFactionMembers(f, username) {
         const members = Array.isArray(f.members) ? f.members : [];
         if (members.length === 0)
           return '<div class="faction-no-data">No member data available</div>';

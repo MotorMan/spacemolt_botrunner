@@ -2374,6 +2374,10 @@
           connDot.classList.remove("connected");
           connText.textContent = "Disconnected";
           ws = null;
+          // Stop any running Mine Forever loop so it doesn't fire against a
+          // dead connection (it will auto-restart when the operator re-enables
+          // it after reconnect).
+          if (typeof mcStopMineForever === "function") mcStopMineForever();
           if (wsManualClose) return;
           // Retry on a short fixed cadence — forever. No exponential backoff
           // that can strand a client whose first attempt landed during startup.
@@ -6706,6 +6710,80 @@
         mcExec("use_item", { id: itemId, quantity: qty });
       }
 
+      // ── Mine Forever toggle ────────────────────────────────────────
+      // Clicking "Mine Forever" lets the selected bot mine on every game tick
+      // until toggled off again (or the bot/profile changes). A single `mine`
+      // command is one tick of mining, so we re-issue it on an interval that
+      // respects the 10s mutation tick — slightly longer to stay safely under
+      // the server rate limit. We use sendExec directly (bypassing mcExec's
+      // cooldown guard) because the interval itself enforces the cadence.
+      let mineForeverActive = false;
+      let mineForeverBot = null;
+      let mineForeverTimer = null;
+      const MINE_FOREVER_INTERVAL_MS = 11000; // > one mutation tick
+
+      function mcMineForeverTick() {
+        if (!mineForeverActive || !mineForeverBot) return;
+        // Stop silently if the operator switched bots/profiles.
+        if (mineForeverBot !== profileBot) {
+          mcStopMineForever();
+          return;
+        }
+        sendExec(mineForeverBot, "mine", {}, (res) => {
+          if (!res.ok) {
+            logResponse(
+              `<span class="resp-err">Mine Forever stopped: ${esc(res.error || "command failed")}</span>`,
+            );
+            mcStopMineForever();
+          }
+        });
+      }
+
+      function mcStartMineForever() {
+        if (!profileBot) return;
+        if (mineForeverActive && mineForeverBot === profileBot) return;
+        mineForeverActive = true;
+        mineForeverBot = profileBot;
+        if (mineForeverTimer) clearInterval(mineForeverTimer);
+        mcMineForeverTick(); // fire immediately, then keep ticking
+        mineForeverTimer = setInterval(mcMineForeverTick, MINE_FOREVER_INTERVAL_MS);
+        logResponse(
+          `<span class="resp-cmd">▶ Mine Forever started for ${esc(profileBot)} (every ~11s)</span>`,
+        );
+      }
+
+      function mcStopMineForever() {
+        if (mineForeverTimer) {
+          clearInterval(mineForeverTimer);
+          mineForeverTimer = null;
+        }
+        if (mineForeverActive) {
+          mineForeverActive = false;
+          logResponse(
+            `<span class="resp-ok">■ Mine Forever stopped${mineForeverBot ? " for " + esc(mineForeverBot) : ""}</span>`,
+          );
+        }
+        mineForeverActive = false;
+        mineForeverBot = null;
+        // Restore the button label/state if it's currently on screen.
+        const btn = document.getElementById("mc-mine-forever-btn");
+        if (btn) {
+          btn.classList.remove("active");
+          btn.textContent = "Mine Forever";
+        }
+      }
+
+      function mcToggleMineForever() {
+        if (!profileBot) return;
+        // Switching bots while running: stop the old loop entirely.
+        if (mineForeverActive && mineForeverBot !== profileBot) {
+          mcStopMineForever();
+        }
+        if (mineForeverActive) mcStopMineForever();
+        else mcStartMineForever();
+        renderManualControls(true);
+      }
+
       async function renderManualControls(isFreshRender) {
         // Block re-render if we just rendered with fresh data from storage refresh
         if (
@@ -7005,6 +7083,7 @@
 
     <div class="cmd-group">
       <button class="primary sm" onclick="mcExec('mine')">Mine</button>
+      <button class="sm${mineForeverActive && mineForeverBot === profileBot ? ' active' : ''}" id="mc-mine-forever-btn" onclick="mcToggleMineForever()">${mineForeverActive && mineForeverBot === profileBot ? '■ Stop Mining' : 'Mine Forever'}</button>
       <button class="sm" onclick="mcExec('scan')">Scan</button>
     </div>
 

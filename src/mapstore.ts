@@ -2225,6 +2225,33 @@ const locations = this.findOreLocations(oreId, blacklist);
     return null;
   }
 
+  /**
+   * Item IDs that look like mineable ores but are NOT — they are crafting recipe
+   * results, refined goods, or other non-extractable items that the live client
+   * sometimes leaks into POI ore lists. These must never be offered as mineable
+   * targets or shown on the map.
+   */
+  static readonly NON_MINABLE_RESOURCE_IDS = new Set([
+    "compressed_hydrogen", // crafting recipe result, not a raw resource
+    "purified_water", // refined good, not a raw resource
+  ]);
+
+  /**
+   * Whether a resource ID refers to an actual extractable mining resource.
+   * Bare category words ("gas", "ore", "ice", "radioactive") are not real items,
+   * and known crafting/refined results are excluded.
+   */
+  static isMineableResourceId(itemId: string | undefined | null): boolean {
+    if (!itemId) return false;
+    const lc = itemId.toLowerCase();
+    // Bare category words are leaked by the client but are not real items.
+    if (["gas", "ore", "ice", "radioactive", "mineral", "metal"].includes(lc)) {
+      return false;
+    }
+    if (MapStore.NON_MINABLE_RESOURCE_IDS.has(lc)) return false;
+    return true;
+  }
+
   /** Get all unique ores found across all systems. Returns [{item_id, name}]. */
   getAllKnownOres(): Array<{ item_id: string; name: string }> {
     const ores = new Map<string, string>();
@@ -2232,13 +2259,13 @@ const locations = this.findOreLocations(oreId, blacklist);
       for (const poi of sys.pois) {
         // From mining results (ores_found)
         for (const ore of poi.ores_found) {
-          if (ore.item_id && !ores.has(ore.item_id)) {
+          if (ore.item_id && MapStore.isMineableResourceId(ore.item_id) && !ores.has(ore.item_id)) {
             ores.set(ore.item_id, ore.name || ore.item_id);
           }
         }
         // From POI scans (resources)
         for (const res of poi.resources || []) {
-          if (res.resource_id && !ores.has(res.resource_id)) {
+          if (res.resource_id && MapStore.isMineableResourceId(res.resource_id) && !ores.has(res.resource_id)) {
             ores.set(res.resource_id, res.name || res.resource_id);
           }
         }

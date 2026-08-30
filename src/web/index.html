@@ -4949,6 +4949,7 @@
             return (
               !n.includes("gas") &&
               !n.includes("nebula") &&
+              !n.includes("nebulium") &&
               !n.includes("hydrogen") &&
               !n.includes("helium") &&
               !n.includes("ice") &&
@@ -5020,6 +5021,7 @@
             { item_id: "exotic_matter", name: "Exotic Matter" },
             { item_id: "dark_matter_residue", name: "Dark Matter Residue" },
             { item_id: "adamantite_ore", name: "Adamantite Ore" },
+            { item_id: "nebulium", name: "Nebulium" },
           ];
           const sortedDc = [...deepCoreOres].sort((a, b) =>
             (a.name || "").localeCompare(b.name || ""),
@@ -12483,19 +12485,45 @@
         if (overlay) overlay.style.display = "none";
       }
 
+      // Item IDs that look like mineable ores but are NOT — crafting recipe
+      // results, refined goods, or other non-extractable items the live client
+      // leaks into POI ore lists. Mirrors MapStore.NON_MINABLE_RESOURCE_IDS.
+      const NON_MINABLE_RESOURCE_IDS = new Set([
+        "compressed_hydrogen",
+        "purified_water",
+      ]);
+
+      /** Whether a resource ID is an actual extractable mining resource. */
+      function isMineableResource(itemId) {
+        if (!itemId) return false;
+        const lc = String(itemId).toLowerCase();
+        // Bare category words are leaked by the client but are not real items.
+        if (["gas", "ore", "ice", "radioactive", "mineral", "metal"].includes(lc)) {
+          return false;
+        }
+        if (NON_MINABLE_RESOURCE_IDS.has(lc)) return false;
+        // If the catalogue knows this item, only raw extractable resources are mineable.
+        const c = (typeof catalog !== "undefined" && catalog && catalog.items)
+          ? catalog.items[itemId]
+          : null;
+        if (c) return !!c.extracted_by;
+        // Not in catalogue (e.g. a brand-new ore) — don't hide it.
+        return true;
+      }
+
       function buildOreFilters() {
         const ores = new Map();
         for (const sys of Object.values(mapData)) {
           for (const poi of sys.pois || []) {
             // Old-style mining data
             for (const ore of poi.ores_found || []) {
-              if (ore.item_id && !ores.has(ore.item_id)) {
+              if (ore.item_id && isMineableResource(ore.item_id) && !ores.has(ore.item_id)) {
                 ores.set(ore.item_id, ore.name || ore.item_id);
               }
             }
             // New-style resource scan data
             for (const res of poi.resources || []) {
-              if (res.resource_id && !ores.has(res.resource_id)) {
+              if (res.resource_id && isMineableResource(res.resource_id) && !ores.has(res.resource_id)) {
                 ores.set(res.resource_id, res.name || res.resource_id);
               }
             }
@@ -12765,10 +12793,10 @@
             const hasOre = (sys.pois || []).some(
               (poi) =>
                 (poi.ores_found || []).some((o) =>
-                  activeOreFilters.has(o.item_id),
+                  isMineableResource(o.item_id) && activeOreFilters.has(o.item_id),
                 ) ||
                 (poi.resources || []).some((r) =>
-                  activeOreFilters.has(r.resource_id),
+                  isMineableResource(r.resource_id) && activeOreFilters.has(r.resource_id),
                 ),
             );
             if (!hasOre) return false;
@@ -12984,8 +13012,12 @@
             <div class="sys-pois">
               ${pois
                 .map((poi) => {
-                  const resources = (poi.resources || []).slice(0, 6);
-                  const ores = poi.ores_found || [];
+                  const resources = (poi.resources || [])
+                    .filter((r) => isMineableResource(r.resource_id))
+                    .slice(0, 6);
+                  const ores = (poi.ores_found || []).filter((o) =>
+                    isMineableResource(o.item_id),
+                  );
                   return `
                   <div class="poi-card">
                     <div class="poi-head">
@@ -29237,7 +29269,7 @@ async function fetchPersonalFacilityTypes(username) {
         // ores discovered from map scans. knownOres is only populated once POIs
         // have been scanned, so the ore/gas/ice pickers would otherwise be empty.
         const catalogMiningOres = Object.values(catalog.items || {})
-          .filter((it) => it.category === "ore")
+          .filter((it) => it.category === "ore" && isMineableResource(it.id || it.item_id))
           .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
         allMiningOres = catalogMiningOres.slice();
         for (const o of knownOres) {
@@ -29388,6 +29420,7 @@ async function fetchPersonalFacilityTypes(username) {
           "exotic_matter",
           "dark_matter_residue",
           "adamantite_ore",
+          "nebulium",
         ]);
         const oreOres = allMiningOres.filter((o) => {
           const n = o.name.toLowerCase();
@@ -29438,6 +29471,7 @@ async function fetchPersonalFacilityTypes(username) {
           { item_id: "exotic_matter", name: "Exotic Matter" },
           { item_id: "dark_matter_residue", name: "Dark Matter Residue" },
           { item_id: "adamantite_ore", name: "Adamantite Ore" },
+          { item_id: "nebulium", name: "Nebulium" },
         ];
 
         const oreOpts = [
@@ -30059,6 +30093,7 @@ async function fetchPersonalFacilityTypes(username) {
           { item_id: "prismatic_nebulite", name: "Prismatic Nebulite" },
           { item_id: "exotic_matter", name: "Exotic Matter" },
           { item_id: "dark_matter_residue", name: "Dark Matter Residue" },
+          { item_id: "nebulium", name: "Nebulium" },
         ];
         const radioactiveOresList = [
           { item_id: "polonium_ore", name: "Polonium Ore" },
@@ -30516,7 +30551,7 @@ async function fetchPersonalFacilityTypes(username) {
         // it alone leaves the ore/gas/ice pickers empty for users who haven't
         // explored yet (deep core + radioactive already use fixed lists below).
         const catalogMiningOres = Object.values(catalog.items || {})
-          .filter((it) => it.category === "ore")
+          .filter((it) => it.category === "ore" && isMineableResource(it.id || it.item_id))
           .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
         allMiningOres = catalogMiningOres.slice();
         for (const o of knownOres) {
@@ -30535,6 +30570,7 @@ async function fetchPersonalFacilityTypes(username) {
           "exotic_matter",
           "dark_matter_residue",
           "adamantite_ore",
+          "nebulium",
         ]);
 
         // Build ore filter lists
@@ -30582,6 +30618,7 @@ async function fetchPersonalFacilityTypes(username) {
           { item_id: "exotic_matter", name: "Exotic Matter" },
           { item_id: "dark_matter_residue", name: "Dark Matter Residue" },
           { item_id: "adamantite_ore", name: "Adamantite Ore" },
+          { item_id: "nebulium", name: "Nebulium" },
         ];
         // Radioactive ores
         const radioactiveOresList = [

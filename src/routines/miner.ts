@@ -170,6 +170,7 @@ const DEEP_CORE_ORES = new Set([
   "exotic_matter",
   "dark_matter_residue",
   "adamantite_ore",
+  "nebulium",
 ]);
 
 /**
@@ -3367,7 +3368,7 @@ if (shouldAbandon) {
               } else {
                 // No quotas at all - wait
                 ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
-                ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore)");
+                ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore, nebulium)");
                 await ctx.sleep(60000);
                 continue;
               }
@@ -3961,7 +3962,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           // Loop through ALL quota ores to find one with locations within range
           // This ensures we try every available ore before giving up
           let foundAlternative = false;
-          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0);
+          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore));
           
           for (const oreId of allQuotaOres) {
             if (oreId === effectiveTarget) continue;

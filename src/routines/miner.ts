@@ -33,6 +33,7 @@ import {
   getSystemInfo,
   getFuelCellFuelValue,
   isFuelCellItem,
+  getCargoFuelCells,
 } from "./common.js";
 import {
   getRadioactiveCapability,
@@ -2528,6 +2529,32 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       await failMiningSession(bot.username, "No target resource");
     }
 }
+
+    // ── Startup: if we spawned in the field with no fuel cells, go home first ──
+    // It's far better to spend the fuel to return home and restock than to strand
+    // ourselves and wait for a rescue bot that would only send us home anyway.
+    if (!bot.docked) {
+      await bot.refreshCargo();
+      const startupFuelCells = getCargoFuelCells(bot);
+      if (startupFuelCells.cells <= 0) {
+        ctx.log("mining", `Started in the field with NO fuel cells (${startupFuelCells.summary}) — returning to home system ${homeSystem} to stock up before mining`);
+        try {
+          const wentHome = await navigateToSystem(ctx, homeSystem, {
+            fuelThresholdPct: settings0.refuelThreshold,
+            hullThresholdPct: settings0.repairThreshold,
+          });
+          if (wentHome) {
+            await ensureDocked(ctx);
+            ctx.log("mining", "Returned home and docked — running normal home-station startup routine");
+            await ensureFuelCellsStocked(ctx);
+          } else {
+            ctx.log("error", `Failed to navigate home for fuel cells — will continue and hope a rescue reaches us`);
+          }
+        } catch (e) {
+          ctx.log("error", `Error returning home for fuel cells: ${e} — continuing`);
+        }
+      }
+    }
 
     // ── Startup: accept missions ──
     if (settings0.enableMissions) {

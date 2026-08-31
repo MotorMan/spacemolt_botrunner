@@ -946,6 +946,7 @@ async function bulkStationToFaction(
   });
   if (candidates.length === 0) return 0;
 
+  const before = new Map(bot.storage.map((i) => [i.itemId, i.quantity]));
   const chunks = chunkBulkItems(candidates.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
   let movedTypes = 0;
   for (const chunk of chunks) {
@@ -961,6 +962,25 @@ async function bulkStationToFaction(
   await sleep(BULK_SETTLE_MS);
   await bot.refreshFactionStorage(false, undefined, true);
   await bot.refreshStorage();
+
+  // VERIFY: a chunk can report success while the server silently caps/rejects
+  // an over-limit item, leaving it stranded in station storage. Re-read station
+  // storage and only count items whose quantity actually dropped to 0 as moved;
+  // anything still present could not be returned to faction (per-item cap) — call
+  // that out loudly instead of pretending the recovery succeeded.
+  let stranded = 0;
+  for (const [itemId, qtyBefore] of before) {
+    const qtyAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+    if (qtyAfter > 0) {
+      const returned = qtyBefore - qtyAfter;
+      stranded++;
+      ctx.log("error", `⚠️ Could NOT return ${qtyAfter}x ${itemId} to faction storage (returned ${returned}/${qtyBefore} — likely exceeds faction per-item cap). Item is stranded in station storage.`);
+    }
+  }
+  if (stranded > 0) {
+    ctx.log("error", `⚠️ ${stranded} item type(s) stranded in station storage and could not be returned to faction — manual deposit via the game UI (or a smaller batch) is required.`);
+  }
+  movedTypes = before.size - stranded;
   return movedTypes;
 }
 
@@ -3017,6 +3037,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         loadedThisIteration = true;
       } else {
         const batch: Array<{ itemId: string; quantity: number; storageType: 'faction' | 'personal' }> = [];
+        // Track cumulative cargo usage AS we build the batch so we never request
+        // more than the hold can hold. Previously each item was sized against the
+        // full free space independently, so a batch could ask for ~14 full holds
+        // at once — that pulled the ENTIRE remaining target of every item out of
+        // faction storage into station (personal) storage, and anything that
+        // didn't fit (or exceeded the per-item cap) got stranded there and could
+        // not be returned to faction. Capping the batch to one trip's worth keeps
+        // every item in faction storage until it is actually pulled for this trip.
+        let usedInBatch = 0;
         for (const job of jobs) {
           const remaining = jobRemaining.get(job.itemId) || 0;
           if (remaining <= 0) continue;
@@ -3029,15 +3058,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
 
-          const maxFitInCargo = Math.floor(liveFreeNow / Math.max(1, itemSize));
+          const freeForBatch = liveFreeNow - usedInBatch;
+          if (freeForBatch <= 0) break;
+          const maxFitInCargo = Math.floor(freeForBatch / Math.max(1, itemSize));
           const loadQty = Math.min(remaining, maxFitInCargo);
           if (loadQty <= 0) {
             ctx.log("cargo", `Skipping ${job.itemName}: cannot fit any units (size=${itemSize}, freeSpace=${liveFreeNow})`);
             continue;
           }
 
-          ctx.log("cargo", `🔄 Batch loading: ${job.itemName} remaining=${remaining}, will load up to ${loadQty} (size ${itemSize}, free ${liveFreeNow})`);
+          ctx.log("cargo", `🔄 Batch loading: ${job.itemName} remaining=${remaining}, will load up to ${loadQty} (size ${itemSize}, free ${liveFreeNow}, batch used ${usedInBatch})`);
           batch.push({ itemId: job.itemId, quantity: loadQty, storageType: job.storageType });
+          usedInBatch += loadQty * itemSize;
         }
 
           if (batch.length > 0) {

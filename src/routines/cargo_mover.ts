@@ -50,6 +50,7 @@ import {
   getItemProgress,
   loadCargoMoverActivity,
   saveCargoMoverActivity,
+  resetCargoMoverDeliveryProgress,
   createMovement,
   updateMovement,
   completeMovement,
@@ -67,6 +68,7 @@ import {
   getBotClaimedQuantity,
   canClaimItemQuantity,
   cleanupStaleLocks,
+  resetCoordinationTracking,
 } from "./cargoMoverCoordination.js";
 import {
   addInTransitItems,
@@ -74,6 +76,7 @@ import {
   getInTransitQuantity,
   getInTransitSummary,
   cleanupStaleInTransit,
+  resetInTransitData,
 } from "./cargoMoverInTransit.js";
 
 /** Simple dock function that does NOT call collectFromStorage. */
@@ -1400,6 +1403,48 @@ function updateDeliveryTracking(
   if (updated) {
     writeSettings({ cargo_mover: { items } });
   }
+}
+
+/**
+ * FULL reset of all cargo-mover delivered + transit state. Clears every
+ * persistent store the routine consults so the next cycle recomputes everything
+ * from live storage:
+ *   1. `settings.cargo_mover.items[].totalDelivered`  (the UI / settings mirror)
+ *   2. `cargoMoverActivity.itemProgress[*].totalDelivered` (the activity store
+ *      that `findMoveJobs` actually reads via `getItemProgress` — this was the
+ *      store a settings-only reset NEVER cleared, which left the bot believing
+ *      it had already delivered everything)
+ *   3. coordination quantity locks (`deliveredQuantity`)
+ *   4. in-transit tracking
+ *
+ * This is the only reset that makes the bot forget a stale "already delivered"
+ * total. The separate "Reset In-Transit Tracking" button deliberately leaves
+ * delivered counts alone (see its label); use this instead to re-run a move from
+ * scratch. Does NOT delete any items from storage — it only clears bookkeeping.
+ */
+export function resetCargoMoverAllTracking(botUsername?: string): {
+  settingsCleared: number;
+  activityCleared: number;
+  coordination: ReturnType<typeof resetCoordinationTracking>;
+  inTransit: ReturnType<typeof resetInTransitData>;
+} {
+  const all = readSettings();
+  const cargoMover = all.cargo_mover || {};
+  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
+  let settingsCleared = 0;
+  for (const item of items) {
+    if ((item.totalDelivered as number) !== 0) {
+      item.totalDelivered = 0;
+      settingsCleared++;
+    }
+  }
+  if (settingsCleared > 0) writeSettings({ cargo_mover: { items } });
+
+  const activityCleared = resetCargoMoverDeliveryProgress(botUsername).cleared;
+  const coordination = resetCoordinationTracking(true);
+  const inTransit = resetInTransitData();
+
+  return { settingsCleared, activityCleared, coordination, inTransit };
 }
 
 /**

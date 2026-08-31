@@ -18,7 +18,7 @@ import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTran
 import { queryLocalMarket, getLocalMarketStatus } from "../market_local_source.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
-import { reconcileDeliveredWithDestination, getCargoMoverSettings } from "../routines/cargo_mover.js";
+import { reconcileDeliveredWithDestination, getCargoMoverSettings, resetCargoMoverAllTracking } from "../routines/cargo_mover.js";
 import { resetInTransitData } from "../routines/cargoMoverInTransit.js";
 import { resetCoordinationTracking } from "../routines/cargoMoverCoordination.js";
 import {
@@ -973,6 +973,18 @@ if (!this.settings.fuel_service) {
             const inTransit = resetInTransitData();
             const coord = resetCoordinationTracking(true);
             return Response.json({ ok: true, inTransit, coordination: coord });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500 },
+            );
+          }
+        }
+        if (url.pathname === "/api/cargo_mover/reset" && req.method === "POST") {
+          try {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string };
+            const result = resetCargoMoverAllTracking(body.bot);
+            return Response.json({ ok: true, ...result });
           } catch (err) {
             return Response.json(
               { error: err instanceof Error ? err.message : String(err) },

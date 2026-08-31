@@ -33272,6 +33272,7 @@ ignoreBlacklist: document.getElementById(
     <div style="display:flex;gap:8px;margin:8px 0 4px;flex-wrap:wrap">
       <button class="sm" style="background:#2e7d32;border:none;color:#fff;cursor:pointer;border-radius:4px" onclick="reconcileCargoMoverDelivered()" title="Read destination faction storage and set delivered counts to the actual amounts held there">⟳ Reconcile Delivered from Destination</button>
       <button class="sm" style="background:#d32f2f;border:none;color:#fff;cursor:pointer;border-radius:4px" onclick="resetCargoMoverInTransit()" title="Clear inflated in-transit + coordination tracking so bots recompute from live storage">🧹 Reset In-Transit Tracking</button>
+      <button class="sm" style="background:#ff6f00;border:none;color:#fff;cursor:pointer;border-radius:4px" onclick="resetCargoMoverFull()" title="Clear delivered counts (settings mirror + activity store), coordination locks, and in-transit tracking so the bot re-moves everything from live storage">🗑 Full Reset (Delivered + Transit)</button>
       <span id="cm-admin-status" style="font-size:11px;color:var(--text-dim);align-self:center"></span>
     </div>
 
@@ -33797,6 +33798,34 @@ ignoreBlacklist: document.getElementById(
         } catch (e) {
           if (statusEl) statusEl.textContent = `Error: ${e.message}`;
           alert("Reset failed: " + e.message);
+        }
+      }
+
+      async function resetCargoMoverFull() {
+        if (!confirm("FULL RESET: clear delivered counts (settings mirror + activity store), coordination locks, and in-transit tracking? The bot will re-move everything from live storage. This does NOT delete items from storage.")) return;
+        const statusEl = document.getElementById("cm-admin-status");
+        if (statusEl) statusEl.textContent = "Full resetting…";
+        try {
+          const bot = getProfileBot() || bots.find((b) => b.state === "running") || bots[0];
+          const resp = await fetch("/api/cargo_mover/reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bot: bot ? bot.username : undefined }),
+          });
+          const data = await resp.json();
+          if (!resp.ok) throw new Error(data.error || "reset failed");
+          // Zero the in-memory mirror so the UI reflects the reset immediately
+          // (the endpoint already wrote the cleared values to disk).
+          if (settings.cargo_mover && Array.isArray(settings.cargo_mover.items)) {
+            settings.cargo_mover.items.forEach((it) => { it.totalDelivered = 0; });
+          }
+          rerenderCurrentSettings();
+          refreshCargoMoverLiveStatuses();
+          if (statusEl) statusEl.textContent =
+            `Full reset: ${data.settingsCleared} settings, ${data.activityCleared} activity entries cleared; ${data.inTransit.clearedEntries} in-transit, ${data.coordination.clearedLocks} locks.`;
+        } catch (e) {
+          if (statusEl) statusEl.textContent = `Error: ${e.message}`;
+          alert("Full reset failed: " + e.message);
         }
       }
 

@@ -523,6 +523,31 @@ export function clearLastSession(botUsername: string): void {
   }
 }
 
+/**
+ * Zero the delivered counters in the activity-progress store. This is the store
+ * `findMoveJobs` reads via `getItemProgress(...).totalDelivered` — it is a
+ * fleet-wide cumulative that, unlike `settings.cargo_mover.items[].totalDelivered`,
+ * was NEVER cleared by any reset (only the settings mirror was). A stale value
+ * here makes the bot believe everything is already delivered and skip every item
+ * even after the user "resets" the settings. This is the missing half of a real
+ * full reset. Scoped to a single bot when `botUsername` is given, else all bots.
+ */
+export function resetCargoMoverDeliveryProgress(botUsername?: string): { cleared: number } {
+  const activity = loadCargoMoverActivity();
+  let cleared = 0;
+  for (const key of Object.keys(activity.itemProgress)) {
+    if (botUsername && !key.startsWith(`${botUsername}:`)) continue;
+    const p = activity.itemProgress[key];
+    if (p.totalDelivered !== 0 || p.isComplete) {
+      p.totalDelivered = 0;
+      p.isComplete = false;
+      cleared++;
+    }
+  }
+  if (cleared > 0) saveCargoMoverActivity(activity);
+  return { cleared };
+}
+
 /** Get a summary of cargo mover activity. */
 export function getCargoMoverSummary(botUsername?: string): {
   totalMovements: number;

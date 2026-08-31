@@ -339,6 +339,50 @@ export function getItemProgress(
   return activity.itemProgress[key];
 }
 
+/**
+ * SET (not add to) the delivered counter for a bot/item progress entry. Used by
+ * delivery tracking and reconciliation so the activity-store `totalDelivered`
+ * stays in lock-step with the authoritative settings mirror. Unlike
+ * `updateItemProgress({ delivered })`, which increments, this overwrites — that
+ * prevents the activity store from drifting ahead of reality when deposits are
+ * verified/re-counted, which was the root cause of the bot believing far more
+ * had been delivered than actually arrived at the destination.
+ */
+export function setItemProgressDelivered(
+  botUsername: string,
+  itemId: string,
+  value: number,
+  opts?: { itemName?: string; targetQuantity?: number; storageType?: "faction" | "personal" }
+): void {
+  const activity = loadCargoMoverActivity();
+  const key = progressKey(botUsername, itemId);
+  let p = activity.itemProgress[key];
+  if (!p) {
+    const now = new Date().toISOString();
+    p = {
+      itemId,
+      itemName: opts?.itemName || itemId,
+      botUsername,
+      targetQuantity: opts?.targetQuantity || 0,
+      totalWithdrawn: 0,
+      totalDelivered: 0,
+      totalLost: 0,
+      totalTrips: 0,
+      startedAt: now,
+      lastUpdatedAt: now,
+      isComplete: false,
+      storageType: opts?.storageType || "faction",
+    };
+    activity.itemProgress[key] = p;
+  }
+  p.totalDelivered = value;
+  p.lastUpdatedAt = new Date().toISOString();
+  if (p.targetQuantity > 0 && p.totalDelivered >= p.targetQuantity) {
+    p.isComplete = true;
+  }
+  saveCargoMoverActivity(activity);
+}
+
 /** Get all item progress for a bot. */
 export function getBotItemProgress(botUsername: string): ItemDeliveryProgress[] {
   const activity = loadCargoMoverActivity();

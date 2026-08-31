@@ -51,6 +51,7 @@ import {
   loadCargoMoverActivity,
   saveCargoMoverActivity,
   resetCargoMoverDeliveryProgress,
+  setItemProgressDelivered,
   createMovement,
   updateMovement,
   completeMovement,
@@ -1253,12 +1254,18 @@ function findMoveJobs(
       continue;
     }
 
-    // Delivered progress = max of persisted settings count and activity-log
-    // progress (robust across restarts / manual edits).
-    const delivered = Math.max(
-      configItem.totalDelivered || 0,
-      getItemProgress(bot.username, configItem.itemId)?.totalDelivered || 0,
-    );
+    // Delivered progress. The settings mirror (`configItem.totalDelivered`) is
+    // the AUTHORITATIVE, reconcilable count (it is what the "Reconcile" button
+    // writes and what the dashboard shows). The activity-log progress is a
+    // fleet-wide cumulative that was previously NEVER cleared by a reset, so
+    // using Math.max() here let a stale activity-store value override a reset
+    // settings mirror and make the bot believe everything was already delivered
+    // (skipping every item). Prefer the settings mirror; only fall back to the
+    // activity store when the settings entry has no value at all. Both are kept
+    // in sync by updateDeliveryTracking during normal delivery.
+    const delivered = configItem.totalDelivered !== undefined
+      ? (configItem.totalDelivered || 0)
+      : (getItemProgress(bot.username, configItem.itemId)?.totalDelivered || 0);
 
     // Skip if this item's delivery target (if configured) is already met.
     if (configItem.totalToDeliver !== undefined && configItem.totalToDeliver > 0) {
@@ -1386,10 +1393,18 @@ function updateDeliveryTracking(
     // Update coordination locks
     updateDeliveredQuantity(bot.username, itemId, qty);
 
-    // Update activity tracking
-    const progress = updateItemProgress(bot.username, itemId, { delivered: qty });
-    if (progress) {
-      ctx.log("cargo", `  Progress for ${itemId}: ${progress.totalDelivered}/${progress.targetQuantity} delivered (${progress.isComplete ? 'COMPLETE' : 'in progress'})`);
+    // Update activity tracking. SET the activity-store delivered count to the
+    // authoritative cumulative settings value (not add to it) so the activity
+    // store can never drift ahead of what actually arrived — that divergence
+    // was the root cause of the bot believing far more had been delivered than
+    // the destination really held.
+    setItemProgressDelivered(bot.username, itemId, item ? (item.totalDelivered as number) : qty, {
+      itemName: item?.itemName as string | undefined,
+      targetQuantity: item?.totalToDeliver as number | undefined,
+      storageType: (item?.storageType as "faction" | "personal") || "faction",
+    });
+    if (item) {
+      ctx.log("cargo", `  Progress for ${itemId}: ${item.totalDelivered}/${(item.totalToDeliver as number) || "?"} delivered (settings-authoritative)`);
     }
 
     // Log the delivery
@@ -1557,17 +1572,15 @@ export async function reconcileDeliveredWithDestination(
     const item = items.find((it) => it.itemId === configItem.itemId);
     if (item) item.totalDelivered = newDelivered;
 
-    // Overwrite the activity-progress record so the dashboard + findMoveJobs agree.
-    const activity = loadCargoMoverActivity();
-    const progress = activity.itemProgress[`${bot.username}:${configItem.itemId}`];
-    if (progress) {
-      progress.totalDelivered = newDelivered;
-      progress.lastUpdatedAt = new Date().toISOString();
-      if (progress.targetQuantity > 0 && newDelivered >= progress.targetQuantity) {
-        progress.isComplete = true;
-      }
-      saveCargoMoverActivity(activity);
-    }
+    // Overwrite the activity-progress record so the dashboard + findMoveJobs
+    // agree. Always set it (creating the entry if missing) — relying on the
+    // entry already existing was why an inflated activity-store count survived a
+    // reconcile and kept the bot believing everything was delivered.
+    setItemProgressDelivered(bot.username, configItem.itemId, newDelivered, {
+      itemName: configItem.itemName,
+      targetQuantity: configItem.totalToDeliver,
+      storageType: configItem.storageType || "faction",
+    });
 
     if (newDelivered !== oldDelivered) {
       changed.push({

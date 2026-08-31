@@ -1660,10 +1660,12 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     // ── Field consumables ──
     // Gated by !justResupplied so a home base that can't fully restock (e.g. no
     // shield charges in faction storage) doesn't trap us in a return-home loop.
-    // Only bail to resupply when we are COMPLETELY out of one type (0 repair kits
-    // OR 0 shield charges) — a low but non-zero stash is fine for creature farming
-    // where cargo space is reserved for loot. Using min=1 makes `< min` mean `=== 0`.
-    if (isLowOnFieldConsumables(bot.inventory, 1, 1) && !justResupplied) {
+    // Only bail to resupply when we are COMPLETELY out of REPAIR KITS (0) — a
+    // missing shield charge is a luxury we can farm without, and repair kits are
+    // the real life-savers (and almost never used by a healthy routine). Using
+    // minRepairKits=1 means `< 1` == `=== 0`; minShieldCharges=0 disables the
+    // shield check entirely.
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
       ctx.log("combat", "Low on repair kits / shield charges — returning home to resupply");
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
       justResupplied = true;
@@ -1687,10 +1689,18 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       await resubscribeObservationAfterMove(bot);
     }
 
-    // We've left home and are committed to farming — clear the resupply guard so
-    // a genuinely depleted consumable stash will trigger a real resupply trip
-    // after this farm session rather than being suppressed forever.
-    justResupplied = false;
+    // We've left home and are committed to farming. Normally we clear the
+    // resupply guard so a genuinely depleted stash triggers a real resupply trip
+    // later. BUT if the home base could NOT actually restock us (e.g. no repair
+    // kits in faction storage) we are STILL completely out — bailing back would
+    // accomplish nothing and just loop forever. In that case keep the guard set
+    // so we stay out and farm with what we have. Shield charges are intentionally
+    // ignored here (luxury, not a life-saver).
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      justResupplied = true;
+    } else {
+      justResupplied = false;
+    }
 
     // ── Farm: sweep the system `loopCap` times (creatureFarmLoopsPerSystem),
     //    re-scanning each POI to catch respawns, then advance to the next
@@ -1800,7 +1810,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
               await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
-              if (isLowOnFieldConsumables(bot.inventory, 1, 1)) {
+              if (isLowOnFieldConsumables(bot.inventory, 1, 0) && !justResupplied) {
                 ctx.log("combat", "Low on consumables — ending sweep to resupply");
                 break;
               }
@@ -4438,6 +4448,11 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   } else {
     ctx.log("trade", "Skipping fuel cells (disableResupply enabled)");
   }
+
+  // Refresh the in-memory inventory so the freshly withdrawn repair kits /
+  // shield charges / fuel cells are reflected. Without this, isLowOnFieldConsumables
+  // keeps reading the pre-resupply (often 0) counts and re-triggers a return-home.
+  await bot.refreshCargo();
 }
 
 // ── Cycle Patrols Routine (cycle through all patrol profiles) ─────

@@ -1705,9 +1705,17 @@ async function runBulkMovePhase(
 
   // ── Navigate to source & dock ──────────────────────────────
   if (bot.system !== sourceSystem) {
+    // Pre-departure safety: if docked, top off fuel and load military fuel cells
+    // BEFORE undocking so the bot doesn't sail off on a long journey under-fueled
+    // and without in-transit refueling reserves.
+    if (bot.docked) {
+      await tryRefuel(ctx);
+      await bot.refreshFactionStorage(false, undefined, true);
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+    }
+    if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
     await undockForTravel(ctx, warnedNoCloak);
     if (bot.state !== "running") return;
-    if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
     if (!await navigateToSystem(ctx, sourceSystem, safetyOpts)) { await ctx.sleep(30000); return; }
   }
   if (!bot.docked || !botIsAtStation(bot, settings.sourceStation)) {
@@ -2733,14 +2741,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       saveLastSession(bot.username, settings.sourceStation, settings.destinationStation,
         settings.items.map(i => ({ itemId: i.itemId, itemName: i.itemName, quantity: i.quantity, storageType: i.storageType || 'faction' })),
         0, "navigating_to_source", bot.system, bot.poi || "", bot.docked);
-      
-      await undockForTravel(ctx, warnedNoCloak);
-      if (bot.state !== "running") {
-        ctx.log("system", "⛔ Stopping — emergency detected");
-        logCargoActivity(bot.username, "interruption", "Emergency detected during navigation to source", {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        return;
+
+      // Pre-departure safety: if docked, top off fuel and load military fuel cells
+      // BEFORE undocking. Without this the bot would undock first, then call
+      // ensureFueled while already in space (where station refuel is unavailable),
+      // and never load the military fuel cells needed for in-transit refueling —
+      // so it would sail off on a long journey with a low tank and empty reserves.
+      if (bot.docked) {
+        await tryRefuel(ctx);
+        await bot.refreshFactionStorage(false, undefined, true);
+        await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
       }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
@@ -2750,6 +2760,14 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         await ctx.sleep(30000);
         continue;
+      }
+      await undockForTravel(ctx, warnedNoCloak);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        logCargoActivity(bot.username, "interruption", "Emergency detected during navigation to source", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return;
       }
       ctx.log("travel", `Heading to source system ${sourceSystem}...`);
       const arrived = await navigateToSystem(ctx, sourceSystem, safetyOpts);
@@ -3635,9 +3653,13 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
     }
 
-    // Refuel at destination to prevent getting stuck on return journey
+    // Refuel at destination to prevent getting stuck on return journey.
+    // Also load military fuel cells here so the return trip (and the next
+    // outbound cycle) has in-transit refueling reserves — without this the bot
+    // returns home with an empty cargo hold but no military fuel cells aboard.
     await tryRefuel(ctx);
-
+    await bot.refreshFactionStorage(false, undefined, true);
+    await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
     await bot.refreshCargo();
 
     // Check if all jobs are complete (no remaining items for any job)
@@ -3682,14 +3704,6 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel back to source system if needed
     if (bot.system !== sourceSystem) {
-      await undockForTravel(ctx, warnedNoCloak);
-      if (bot.state !== "running") {
-        ctx.log("system", "⛔ Stopping — emergency detected");
-        logCargoActivity(bot.username, "interruption", "Emergency detected during return to source", {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        return;
-      }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel to return to source");
@@ -3698,6 +3712,14 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         await ctx.sleep(30000);
         continue;
+      }
+      await undockForTravel(ctx, warnedNoCloak);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        logCargoActivity(bot.username, "interruption", "Emergency detected during return to source", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return;
       }
       ctx.log("travel", `Heading back to ${sourceSystem}...`);
       logCargoActivity(bot.username, "navigation", `Returning to source system ${sourceSystem}`, {

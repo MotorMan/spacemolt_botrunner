@@ -5261,7 +5261,16 @@
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
         <option value="fleet"${hunterMode === "fleet" ? " selected" : ""}>Fleet Mode (idle until battle)</option>
-      </select>`;
+        <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
+          </select>`;
+
+          // Per-bot PVP target player override (only shown in pvp mode).
+          if (hunterMode === "pvp") {
+            const pvpTargetPlayer = botSettings.targetPlayer || "";
+            actions += `
+      <span class="profile-ore-label" style="margin-left:8px" title="Player to attack every tick. The bot camps its current POI and never moves. Overrides the global Hunter PVP Target Player setting.">PVP Target:</span>
+      <input type="text" id="profile-pvpTargetPlayer" value="${esc(pvpTargetPlayer)}" placeholder="player_name" style="width:140px;padding:2px 6px;font-size:11px" onchange="saveProfileHunterTargetPlayer()">`;
+          }
 
           const patrolCycleMode = botSettings.patrolCycleMode || "random";
           if (hunterMode === "cycle_patrols") {
@@ -5694,6 +5703,22 @@
         const hunterMode = sel.value;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { hunterMode });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileHunterTargetPlayer() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const inp = document.getElementById("profile-pvpTargetPlayer");
+        if (!inp) return;
+        const targetPlayer = inp.value.trim();
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { targetPlayer });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -31389,9 +31414,18 @@ ignoreBlacklist: document.getElementById(
           <option value="station_protection">Station Protection</option>
           <option value="creature_farm">Creature Farm</option>
           <option value="fleet">Fleet Mode (idle until battle)</option>
+          <option value="pvp">PVP (camp POI, attack player)</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">PVP Target Player</div>
+        <div class="setting-hint">Player name to attack when the hunter is in PVP mode. The bot camps its current POI and sends an attack command every tick (no movement). Override per-bot from the bot's manual control panel. Leave empty to disable PVP attacks.</div>
+      </div>
+      <input type="text" id="set-hunter-targetPlayer" placeholder="player_name" value="${esc(h.targetPlayer || "")}" style="width:220px">
     </div>
 
     <div class="setting-row">
@@ -31874,6 +31908,7 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-stopOnDeath").value === "true",
           combatDebug:
             document.getElementById("set-hunter-combatDebug").value === "true",
+          targetPlayer: (document.getElementById("set-hunter-targetPlayer")?.value || "").trim(),
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols
             : [],

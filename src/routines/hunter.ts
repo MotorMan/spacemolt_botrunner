@@ -10,6 +10,8 @@
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
  *   - creature_farm: Farm creatures across a Hunter Patrol Profile's systems
  *   - fleet: Do nothing until pulled into a battle (fleet wingman), fight, then stand down
+ *   - pvp: Camp a single system POI (never move) and send an attack command every
+ *          tick at a configured target player (hunter.targetPlayer / per-bot override)
  *
  * Loop:
  *   1. Navigate to configured patrol system
@@ -305,7 +307,7 @@ async function handleFuelCheckFailure(
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet" | "pvp";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -377,6 +379,7 @@ function getHunterSettings(username?: string): {
   stopOnDeath: boolean;
   targetRandomly: boolean;
   combatDebug: boolean;
+  targetPlayer: string;
   maxCreaturesPerScan: number;
   creatureFarmLoopsPerSystem: number;
   creatureFarmCargoFullPct: number;
@@ -445,6 +448,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   stopOnDeath: (h.stopOnDeath as boolean) ?? false,
   targetRandomly: (h.targetRandomly as boolean) ?? false,
   combatDebug: (h.combatDebug as boolean) ?? false,
+  targetPlayer: (botOverrides.targetPlayer as string) || (h.targetPlayer as string) || "",
   maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
   creatureFarmLoopsPerSystem: ((botOverrides.creatureFarmLoopsPerSystem as number) || (h.creatureFarmLoopsPerSystem as number) || 3),
   creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
@@ -1458,6 +1462,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (initialSettings.mode === "fleet") {
       yield* fleetModeRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "pvp") {
+      yield* pvpRoutine(ctx);
       return;
     }
 
@@ -3203,6 +3212,129 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // After fighting, wait a bit before next scan
     await ctx.sleep(5000);
+  }
+}
+
+// ── PVP Routine ─────────────────────────────────────────────
+//
+// Player-vs-Player hunter. It does NOT patrol or roam: it camps a single system
+// POI and never moves (no navigation, no travel, no flee). Every tick it sends an
+// `attack` command at a configured target player name (global under
+// hunter.targetPlayer, overridable per-bot via <bot>.targetPlayer). If a battle is
+// live it keeps fire stance + re-targets the player each tick. Ammo is reloaded and
+// field repair kits are used in place, but the ship never leaves its POI.
+//
+// The target player must be physically present at the same POI for the attack to
+// land; if they are not, the attack just fails and is re-issued next tick (this is
+// the intended "always attacking" behaviour).
+
+async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+
+  // Camp wherever we already are. We must be at a POI (not docked, in open space)
+  // for the attack command to reach a nearby player.
+  const originalSystem = bot.system;
+  const originalPoi = bot.poi;
+
+  if (bot.docked) {
+    ctx.log("error", "PVP mode cannot camp while docked — undock first (start the routine undocked at the target POI).");
+    return;
+  }
+  if (!originalPoi) {
+    ctx.log("error", "PVP mode requires a current POI (be in a system POI, not a station). Cannot start.");
+    return;
+  }
+
+  ctx.log("info", `PVP mode: camping ${originalPoi} (${originalSystem}) — will attack the configured target player every tick (no movement).`);
+
+  // Tick cadence for re-issuing the attack command.
+  const TICK_MS = 3000;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const targetPlayer = (settings.targetPlayer || "").trim();
+
+    if (!targetPlayer) {
+      ctx.log("error", "PVP mode has no target player set (Settings ▸ Hunter ▸ PVP Target Player). Standing by...");
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    // ── Death recovery ──
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // ── Status ──
+    yield "get_status";
+    await bot.refreshLocation();
+    await bot.refreshShip();
+    logStatus(ctx);
+
+    // ── Ammo reload (in place, no travel) ──
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+    // ── Find the target player in our POI ──
+    yield "scan_for_targets";
+    let targetEntity: NearbyEntity | null = null;
+    const nearbyResp = await bot.exec("get_nearby");
+    if (!nearbyResp.error && nearbyResp.result) {
+      bot.trackNearbyPlayers(nearbyResp.result);
+      const entities = parseNearby(nearbyResp.result);
+      const needle = targetPlayer.toLowerCase();
+      targetEntity = entities.find(
+        e =>
+          e.name.toLowerCase() === needle ||
+          e.id.toLowerCase() === needle,
+      ) || null;
+    }
+
+    // ── Send an attack command every tick ──
+    const targetId = targetEntity ? targetEntity.id : targetPlayer;
+    const atk = await bot.exec("attack", { target_id: targetId });
+    if (atk.error) {
+      const msg = atk.error.message.toLowerCase();
+      if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in") || msg.includes("no target")) {
+        // Fall back to the player name, then just report (we re-issue next tick).
+        const atk2 = await bot.exec("attack", { target_id: targetPlayer });
+        if (atk2.error) {
+          ctx.log("combat", `⚔️ ${targetPlayer} not attackable at ${originalPoi} (${atk2.error.message}) — re-issuing next tick`);
+        } else {
+          ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer} (name fallback)`);
+        }
+      } else {
+        ctx.log("combat", `⚔️ Attack on ${targetPlayer}: ${atk.error.message}`);
+      }
+    } else {
+      ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer}${targetEntity ? "" : " (not in range — re-issued next tick)"}`);
+    }
+
+    // ── If a battle is live, hold fire stance and keep targeting the player ──
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus) {
+      const targetId2 = targetEntity ? targetEntity.id : targetPlayer;
+      const tResp = await bot.exec("battle", { action: "target", target_id: targetId2 });
+      if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+        await bot.exec("battle", { action: "target", target_id: targetPlayer });
+      }
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+    }
+
+    // ── Field repair (in place) ──
+    await useRepairKits(ctx);
+
+    // ── Stay put: re-assert our camp position if we somehow drifted POIs ──
+    if (bot.poi && bot.poi !== originalPoi) {
+      ctx.log("travel", `PVP: re-asserting camp POI ${originalPoi} (no movement otherwise)`);
+      const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+      if (!travelResp.error || (travelResp.error.message || "").toLowerCase().includes("already")) {
+        bot.poi = originalPoi;
+      }
+    }
+
+    await ctx.sleep(TICK_MS);
   }
 }
 

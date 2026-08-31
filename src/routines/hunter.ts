@@ -1660,7 +1660,10 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     // ── Field consumables ──
     // Gated by !justResupplied so a home base that can't fully restock (e.g. no
     // shield charges in faction storage) doesn't trap us in a return-home loop.
-    if (isLowOnFieldConsumables(bot.inventory) && !justResupplied) {
+    // Only bail to resupply when we are COMPLETELY out of one type (0 repair kits
+    // OR 0 shield charges) — a low but non-zero stash is fine for creature farming
+    // where cargo space is reserved for loot. Using min=1 makes `< min` mean `=== 0`.
+    if (isLowOnFieldConsumables(bot.inventory, 1, 1) && !justResupplied) {
       ctx.log("combat", "Low on repair kits / shield charges — returning home to resupply");
       await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
       justResupplied = true;
@@ -1797,7 +1800,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
               await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
-              if (isLowOnFieldConsumables(bot.inventory)) {
+              if (isLowOnFieldConsumables(bot.inventory, 1, 1)) {
                 ctx.log("combat", "Low on consumables — ending sweep to resupply");
                 break;
               }

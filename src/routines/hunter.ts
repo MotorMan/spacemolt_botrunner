@@ -1837,15 +1837,17 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
           const entities = parseNearby(nearbyData);
           const creatures = pickCreatureTargets(entities, bot.username, true, settings.maxCreaturesPerScan);
+          const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+          const targets = [...creatures, ...pirates];
 
-          if (creatures.length === 0) {
+          if (targets.length === 0) {
             // POI currently clear — stop re-scanning this POI for now
             break;
           }
 
-          ctx.log("combat", `Found ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
 
-          for (const target of creatures) {
+          for (const target of targets) {
             if (bot.state !== "running") break;
 
             await bot.refreshShip();

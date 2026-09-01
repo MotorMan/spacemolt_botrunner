@@ -140,8 +140,15 @@ function calculateArmorReduction(armorTotal, damageType) {
   return armorTotal * 0.75;
 }
 
+function stageFloor(v) {
+  const f = Math.floor(v);
+  return { floor: f, spill: (v - f) >= 0.5 ? 1 : 0 };
+}
+
 function resolveVolley(attacker, defender, stanceInMult, rng) {
   let raw = 0;
+  const dmgType = attacker.weapons[0]?.type || 'kinetic';
+
   for (const w of attacker.weapons) {
     const isCrit = rng.nextBool(attacker.critPct / 100);
     const dmg = isCrit ? Math.floor(w.damage * 1.5) : w.damage;
@@ -153,29 +160,35 @@ function resolveVolley(attacker, defender, stanceInMult, rng) {
 
   if (!rng.nextBool(HIT_CHANCE)) return { hullDmg: 0, shieldDrain: 0, breakthrough: false };
 
-  if (defender.shield > 0) {
-    let x1 = Math.floor(pre * (1 - defender.stats.shieldsSkill / 100));
-    const eff = SHIELD_EFF[attacker.weapons[0]?.type || 'kinetic'] || 1.0;
-    let drain = Math.floor(Math.floor(x1 * eff) * (1 - defender.stats.flatPct / 100));
+  const eff = SHIELD_EFF[dmgType] || 1.0;
+
+  if (defender.shield > 0 && eff > 0) {
+    const s1 = stageFloor(pre * (1 - defender.stats.shieldsSkill / 100));
+    const x1 = s1.floor;
+    const s2 = stageFloor(x1 * eff);
+    const d2 = s2.floor;
+    const s3 = stageFloor(d2 * (1 - defender.stats.flatPct / 100));
+    const drain = s3.floor;
+    const spills = s1.spill + s2.spill + s3.spill;
 
     if (defender.shield >= drain) {
       defender.shield -= drain;
-      const spillFrac = (drain - defender.shield) / drain;
-      if (spillFrac >= 0.5) {
-        const hullDmg = Math.max(1, Math.floor(1 * (1 - defender.stats.flatPct / 100)));
-        return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: drain, breakthrough: false };
+      let hullDmg = 0;
+      if (spills > 0) {
+        hullDmg = Math.floor(spills * (1 - defender.stats.flatPct / 100));
       }
-      return { hullDmg: 0, shieldDrain: drain, breakthrough: false };
+      hullDmg = Math.max(hullDmg, 1);
+      return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: drain, breakthrough: false };
     } else {
-      const preShield = defender.shield;
-      const hullIn = pre - Math.floor(preShield / eff);
+      const consumed = Math.floor(defender.shield / eff);
+      const hullIn = pre - consumed;
       defender.shield = 0;
-      const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
+      const f = calculateArmorReduction(defender.stats.armorTotal, dmgType);
       const hullDmg = Math.max(1, Math.floor(hullIn * (1 - f)));
-      return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: preShield, breakthrough: true };
+      return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: consumed, breakthrough: true };
     }
   } else {
-    const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
+    const f = calculateArmorReduction(defender.stats.armorTotal, dmgType);
     const hullDmg = Math.max(1, Math.floor(pre * (1 - f)));
     return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: 0, breakthrough: true };
   }

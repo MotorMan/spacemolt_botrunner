@@ -158,6 +158,18 @@ function isLeviathanCreature(name: string | undefined): boolean {
 }
 
 /**
+ * Returns true if a creature has been branded by another faction/ranch.
+ * Branded creatures must NEVER be attacked — the branding marker lives in the
+ * creature's display name (not the hex id), so we check the name before picking
+ * the id to attack. Future game updates may impose penalties for killing branded
+ * livestock, so we skip them everywhere today.
+ */
+function isBrandedCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  return name.toLowerCase().includes("branded");
+}
+
+/**
  * Used by the reactive battle-join paths (API battle detection while scanning /
  * navigating). If a battle we are NOT already part of contains a NON-leviathan
  * creature that another hunter is already fighting, we skip it — that creature is
@@ -211,8 +223,9 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   // (re-target + fire stance, since `attack` hangs when already engaged).
   ctx.log("combat", `✅ Engaging unexpected battle on side ${analysis.sideId}: ${analysis.reason} — holding and fighting`);
 
-  // Pick a real target from battle participants so we get the full combat loop
-  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+  // Pick a real target from battle participants so we get the full combat loop.
+  // Branded creatures are skipped — we never attack them.
+  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
   if (fakeTarget) {
     broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
@@ -588,7 +601,7 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
       }
     }
 
-const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
+const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
     await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
   }
@@ -943,8 +956,9 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
   const settings = getHunterSettings(bot.username);
   if (!settings.coordinateHunts) return;
   // Only non-leviathan creatures are claimed — leviathans keep the assist broadcast.
+  // Branded creatures are never claimed — they belong to another faction.
   const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
-  if (!isCreature || isLeviathanCreature(target.name)) return;
+  if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name)) return;
   creatureClaims.set(target.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
   botChatChannel.send({
     sender: bot.username,
@@ -980,7 +994,7 @@ function isCreatureClaimedByOther(creatureId: string, username: string): boolean
  */
 function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCreatures: boolean, max: number): NearbyEntity[] {
   releaseExpiredCreatureClaims();
-  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e));
+  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name));
   const unclaimed = creatures.filter(e =>
     isLeviathanCreature(e.name) || !isCreatureClaimedByOther(e.id, username),
   );
@@ -1068,7 +1082,8 @@ function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: 
   // Only coordinate assists for leviathan creatures. Every other creature drops to
   // a single hunter shot, so pulling in multiple hunters just splits the loot at the
   // crowded choke-point POIs where all the bots converge.
-  if (creature && !isLeviathanCreature(target.name)) return;
+  // Branded creatures are NEVER broadcast — they belong to another faction.
+  if (creature && (!isLeviathanCreature(target.name) || isBrandedCreature(target.name))) return;
   botChatChannel.send({
     sender: bot.username,
     recipients: [],
@@ -1124,7 +1139,8 @@ async function checkHunterCoordRequests(ctx: RoutineContext, settings: ReturnTyp
     // Only coordinate-assist creatures that are leviathans. Every other creature
     // dies to a single hunter shot, so joining those would just split loot at the
     // crowded choke-point POIs where all the tour bots converge.
-    if (req.creature && !isLeviathanCreature(req.targetName)) {
+    // Branded creatures are NEVER assisted either — they belong to another faction.
+    if (req.creature && (!isLeviathanCreature(req.targetName) || isBrandedCreature(req.targetName))) {
       handled.add(key);
       continue;
     }
@@ -1175,7 +1191,7 @@ continue;
     }
 
     const valid = req.creature
-      ? isCreatureTarget(match, true)
+      ? isCreatureTarget(match, true) && !isBrandedCreature(match.name)
       : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
     if (!valid) {
       handled.add(key);
@@ -3430,7 +3446,7 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
     }
   }
 
-  const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
   if (fakeTarget) {
     broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));

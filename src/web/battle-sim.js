@@ -167,11 +167,12 @@ function resolveVolley(attacker, defender, stanceInMult, rng) {
       }
       return { hullDmg: 0, shieldDrain: drain, breakthrough: false };
     } else {
-      const hullIn = pre - Math.floor(defender.shield / eff);
+      const preShield = defender.shield;
+      const hullIn = pre - Math.floor(preShield / eff);
       defender.shield = 0;
       const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
       const hullDmg = Math.max(1, Math.floor(hullIn * (1 - f)));
-      return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: defender.shield + drain, breakthrough: true };
+      return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: preShield, breakthrough: true };
     }
   } else {
     const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
@@ -190,7 +191,8 @@ function runBattle(statA, statB, stanceA, stanceB, seed) {
     cooldown: statA.weapons.map(() => 0),
     stance: stanceA,
     fled: false,
-    stats: statA
+    stats: statA,
+    totalDmg: 0
   };
 
   const stateB = {
@@ -200,7 +202,8 @@ function runBattle(statA, statB, stanceA, stanceB, seed) {
     cooldown: statB.weapons.map(() => 0),
     stance: stanceB,
     fled: false,
-    stats: statB
+    stats: statB,
+    totalDmg: 0
   };
 
   const stanceInMultA = STANCE_IN_MULT[stanceA] || 1.0;
@@ -236,12 +239,11 @@ function runBattle(statA, statB, stanceA, stanceB, seed) {
         }
       }
     }
-
     stateA.hull -= volleyB.hullDmg;
     stateB.hull -= volleyA.hullDmg;
 
-    if (volleyA.shieldDrain > 0) stateB.shield = Math.max(0, stateB.shield - volleyA.shieldDrain);
-    if (volleyB.shieldDrain > 0) stateA.shield = Math.max(0, stateA.shield - volleyB.shieldDrain);
+    stateA.totalDmg += volleyB.hullDmg + volleyB.shieldDrain;
+    stateB.totalDmg += volleyA.hullDmg + volleyA.shieldDrain;
 
     const aHit = volleyB.hullDmg > 0 || volleyB.shieldDrain > 0;
     const bHit = volleyA.hullDmg > 0 || volleyA.shieldDrain > 0;
@@ -268,12 +270,12 @@ function runBattle(statA, statB, stanceA, stanceB, seed) {
       }
     }
 
-    if (stateA.hull <= 0 && stateB.hull <= 0) return { winner: 'draw', reason: 'mutual destruction', ticks: tick + 1 };
+    if (stateA.hull <= 0 && stateB.hull <= 0) return { winner: stateA.totalDmg >= stateB.totalDmg ? 'A' : 'B', reason: 'mutual destruction', ticks: tick + 1 };
     if (stateA.hull <= 0) return { winner: 'B', reason: 'hull', ticks: tick + 1 };
     if (stateB.hull <= 0) return { winner: 'A', reason: 'hull', ticks: tick + 1 };
   }
 
-  return { winner: 'stalemate', reason: 'max ticks', ticks: MAX_TICKS };
+  return { winner: stateA.totalDmg >= stateB.totalDmg ? 'A' : 'B', reason: 'stalemate', ticks: MAX_TICKS };
 }
 
 async function runMonteCarlo(statA, statB, stanceA, stanceB, runs, baseSeed) {

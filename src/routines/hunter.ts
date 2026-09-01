@@ -343,6 +343,13 @@ export interface HunterPatrolProfile {
    *  patrolled (matched by POI id or name). Used by the creature_farm sub-routine
    *  to restrict a profile to specific creature spawns. */
   targetPois?: string[];
+  /** Optional creature farm radius mode: when set, the profile generates its
+   *  patrol system list dynamically from `creatureFarmCenterSystem` rather than
+   *  using the static `patrolSystems` array. The center system is resolved by ID
+   *  or name, and all systems within `creatureFarmPatrolRadius` jumps are
+   *  collected, shuffled, and farmed in random order. */
+  creatureFarmCenterSystem?: string;
+  creatureFarmPatrolRadius?: number;
 }
 
 function seededRandom(seed: number): () => number {
@@ -884,6 +891,22 @@ function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string
   }
   
   return result;
+}
+
+/**
+ * Resolve a system reference (ID or name) to a canonical system ID from the
+ * map store. Returns null if the system cannot be found.
+ */
+function resolveSystemId(ref: string): string | null {
+  const normalized = ref.toLowerCase().replace(/_/g, ' ');
+  if (mapStore.getSystem(ref)) return ref;
+  for (const sysId of mapStore.getAllSystemIds()) {
+    const sys = mapStore.getSystem(sysId);
+    if (!sys) continue;
+    const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+    if (sysName === normalized) return sysId;
+  }
+  return null;
 }
 
 // ── Ammo management ──────────────────────────────────────────
@@ -1600,12 +1623,33 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       await ctx.sleep(60000);
       continue;
     }
+
+    let effectiveSystems = profile.patrolSystems;
+    if (profile.creatureFarmCenterSystem && profile.creatureFarmPatrolRadius) {
+      const centerId = resolveSystemId(profile.creatureFarmCenterSystem);
+      if (centerId) {
+        const radiusSystems = findSystemsWithinRadius(centerId, profile.creatureFarmPatrolRadius);
+        if (radiusSystems.length > 0) {
+          for (let i = radiusSystems.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [radiusSystems[i], radiusSystems[j]] = [radiusSystems[j], radiusSystems[i]];
+          }
+          effectiveSystems = radiusSystems;
+          ctx.log("info", `Creature farm radius mode: ${effectiveSystems.length} systems within ${profile.creatureFarmPatrolRadius} jumps of ${centerId}`);
+        } else {
+          ctx.log("warn", `No systems found within ${profile.creatureFarmPatrolRadius} jumps of ${centerId} — falling back to profile patrolSystems`);
+        }
+      } else {
+        ctx.log("warn", `Could not resolve creature farm center system ${profile.creatureFarmCenterSystem} — falling back to profile patrolSystems`);
+      }
+    }
+
     // Re-clamp the index if the assigned profile changed underneath us.
-    if (sysIndex >= profile.patrolSystems.length) sysIndex = 0;
+    if (sysIndex >= effectiveSystems.length) sysIndex = 0;
 
     const homeSystem = settings.homeSystem || "";
     const homeStation = settings.homeStation || "";
-    const targetSystem = profile.patrolSystems[sysIndex];
+    const targetSystem = effectiveSystems[sysIndex];
     const targetPois = profile.targetPois || [];
     // `loopsPerSystem` is the number of full POI sweeps to perform in this system
     // before advancing to the next profile system. This is the "loops" setting
@@ -1866,11 +1910,11 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     // additionally return home to restock after finishing a full profile cycle
     // (mirrors the patrol_systems Single Loop Mode behaviour).
     const prevSystem = targetSystem;
-    const wasLastSystem = (sysIndex + 1) >= profile.patrolSystems.length;
-    sysIndex = (sysIndex + 1) % profile.patrolSystems.length;
-    const nextSystem = profile.patrolSystems[sysIndex];
+    const wasLastSystem = (sysIndex + 1) >= effectiveSystems.length;
+    sysIndex = (sysIndex + 1) % effectiveSystems.length;
+    const nextSystem = effectiveSystems[sysIndex];
     if (nextSystem !== prevSystem) {
-      ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${profile.patrolSystems.length})`);
+      ctx.log("info", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} — routing to ${nextSystem} (${sysIndex + 1}/${effectiveSystems.length})`);
     } else {
       ctx.log("debug", `Creature farm: completed ${loopsPerSystem} loop(s) in ${prevSystem} (only system in profile)`);
     }

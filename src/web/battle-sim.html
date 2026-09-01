@@ -153,11 +153,12 @@
       }
     }
 
-    function populateHullSelects() {
+     function populateHullSelects() {
       const selectA = document.getElementById('hullA');
       const selectB = document.getElementById('hullB');
-      
+       
       for (const ship of catalogShips) {
+        if ((ship.tier || 0) >= 5) continue;
         const optA = document.createElement('option');
         optA.value = ship.id;
         optA.textContent = `${ship.name} (T${ship.tier} ${ship.class})`;
@@ -248,26 +249,26 @@
     }
 
     async function runSimulation() {
-      const fitA = getFit('A');
-      const fitB = getFit('B');
-      
-      if (!fitA || !fitB) {
-        alert('Please select hulls for both ships');
-        return;
-      }
-      
-      if (fitA.weapons.length === 0 && fitB.weapons.length === 0) {
-        alert('At least one ship needs weapons');
-        return;
-      }
-      
-      const runs = parseInt(document.getElementById('runsInput').value) || 10000;
-      const seed = parseInt(document.getElementById('seedInput').value) || 12345;
-      
       const content = document.getElementById('resultsContent');
       content.innerHTML = '<div class="empty-state">Running simulation...</div>';
       
       try {
+        const fitA = getFit('A');
+        const fitB = getFit('B');
+        
+        if (!fitA || !fitB) {
+          alert('Please select hulls for both ships');
+          return;
+        }
+        
+        if (fitA.weapons.length === 0 && fitB.weapons.length === 0) {
+          alert('At least one ship needs weapons');
+          return;
+        }
+        
+        const runs = parseInt(document.getElementById('runsInput').value) || 10000;
+        const seed = parseInt(document.getElementById('seedInput').value) || 12345;
+        
         const table = await BattleSim.runTable(fitA, fitB, runs, seed);
         const html = BattleSim.formatTableHTML(table);
         content.innerHTML = html;

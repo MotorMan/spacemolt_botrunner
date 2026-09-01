@@ -186,8 +186,8 @@ function resolveVolley(attacker, defender, stanceInMult, rng) {
       let hullDmg = 0;
       if (spills > 0) {
         hullDmg = Math.floor(spills * (1 - defender.stats.flatPct / 100));
+        hullDmg = Math.max(1, hullDmg);
       }
-      hullDmg = Math.max(hullDmg, 1);
       return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: drain, breakthrough: false };
     } else {
       const consumed = Math.floor(defender.shield / eff);

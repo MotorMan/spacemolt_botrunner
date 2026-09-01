@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeFile } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeFile, statSync } from "fs";
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
@@ -444,6 +444,61 @@ function loadFlockSettings(): FlockSettingsData {
 function saveFlockSettings(data: FlockSettingsData): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(FLOCK_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+// ── Static file serving ──────────────────────────────────────
+
+const MIME_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".svg": "image/svg+xml",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".eot": "application/vnd.ms-fontobject",
+  ".map": "application/json",
+};
+
+function getMimeType(pathname: string): string {
+  const ext = pathname.substring(pathname.lastIndexOf(".")).toLowerCase();
+  return MIME_TYPES[ext] || "application/octet-stream";
+}
+
+async function serveStaticFile(pathname: string, webDir: string): Promise<Response | null> {
+  // Security: prevent directory traversal
+  const normalized = pathname.replace(/[?#].*$/, ""); // strip query/hash
+  if (normalized.includes("..") || normalized.includes("//")) return null;
+
+  const filePath = join(webDir, normalized);
+  
+  // Ensure the resolved path is within webDir
+  const resolvedFilePath = filePath.replace(/\\/g, "/");
+  const resolvedWebDir = webDir.replace(/\\/g, "/");
+  if (!resolvedFilePath.startsWith(resolvedWebDir)) return null;
+
+  if (!existsSync(filePath)) return null;
+
+  try {
+    const stats = statSync(filePath);
+    if (!stats.isFile()) return null;
+
+    const content = readFileSync(filePath);
+    return new Response(content, {
+      headers: {
+        "Content-Type": getMimeType(filePath),
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ── Stats persistence ─────────────────────────────────────
@@ -2800,6 +2855,138 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/shipComparison.html") {
           const shipComparisonPath = join(import.meta.dir, "shipComparison.html");
           return new Response(readFileSync(shipComparisonPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve battle-sim.html for battle simulator
+        if (url.pathname === "/battle-sim.html") {
+          const battleSimPath = join(import.meta.dir, "battle-sim.html");
+          return new Response(readFileSync(battleSimPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve battle-sim.js
+        if (url.pathname === "/battle-sim.js") {
+          const battleSimJsPath = join(import.meta.dir, "battle-sim.js");
+          return new Response(readFileSync(battleSimJsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "application/javascript; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve battle-sim.css
+        if (url.pathname === "/battle-sim.css") {
+          const battleSimCssPath = join(import.meta.dir, "battle-sim.css");
+          return new Response(readFileSync(battleSimCssPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/css; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipsforsale.html for shipyard iframe
+        if (url.pathname === "/shipsforsale.html") {
+          const shipsForSalePath = join(import.meta.dir, "shipsforsale.html");
+          return new Response(readFileSync(shipsForSalePath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve market.html for market iframe
+        if (url.pathname === "/market.html") {
+          const marketPath = join(import.meta.dir, "market.html");
+          return new Response(readFileSync(marketPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve station.html for station iframe
+        if (url.pathname === "/station.html") {
+          const stationPath = join(import.meta.dir, "station.html");
+          return new Response(readFileSync(stationPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve creatures.html for creatures iframe
+        if (url.pathname === "/creatures.html") {
+          const creaturesPath = join(import.meta.dir, "creatures.html");
+          return new Response(readFileSync(creaturesPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.html for chat iframe
+        if (url.pathname === "/chat.html") {
+          const chatPath = join(import.meta.dir, "chat.html");
+          return new Response(readFileSync(chatPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve fa.html for fa iframe
+        if (url.pathname === "/fa.html") {
+          const faPath = join(import.meta.dir, "fa.html");
+          return new Response(readFileSync(faPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve commandall.html for commandall iframe
+        if (url.pathname === "/commandall.html") {
+          const commandallPath = join(import.meta.dir, "commandall.html");
+          return new Response(readFileSync(commandallPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve players.html for players iframe
+        if (url.pathname === "/players.html") {
+          const playersPath = join(import.meta.dir, "players.html");
+          return new Response(readFileSync(playersPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve engineeringCalc.html for engineering calc iframe
+        if (url.pathname === "/engineeringCalc.html") {
+          const engineeringCalcPath = join(import.meta.dir, "engineeringCalc.html");
+          return new Response(readFileSync(engineeringCalcPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

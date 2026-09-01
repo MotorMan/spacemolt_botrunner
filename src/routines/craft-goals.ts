@@ -10,6 +10,49 @@
 
 import { readSettings } from "./common.js";
 
+// Minimal structural type for settings signature computation.
+// CrafterSettings (from crafter.ts) is structurally compatible with this,
+// but we define it here so this pure-logic module has no runtime dependency
+// on the heavy bot runtime pulled in by crafter.ts.
+interface SettingsForSignature {
+  crafters: Array<{ name: string; craftLimits: unknown; recipeTriggers?: unknown }>;
+  botQuotaOverrides: Record<string, Record<string, number>>;
+  categoryAssignments: Record<string, string[]>;
+  enabledCategories: string[];
+  craftingHomeBase: string;
+  recipeFacilityLinks: Record<string, string[]>;
+  forceOwnFacility: boolean;
+}
+
+/**
+ * Compact signature of the settings fields that determine crafting goals
+ * (quotas, limits, facility links, triggers, home base, etc.). Used to detect
+ * when the operator changes the loadout mid-run. When the inner plan loop in
+ * executeCraftingPlan sees a change it breaks so the outer routine re-derives
+ * goals from scratch — a "fresh start" per cycle — rather than planning
+ * against a stale snapshot for hours.
+ *
+ * Non-goal fields (preset, cycle time) are deliberately excluded because they
+ * are already picked up by the in-place `settings` refresh and do not
+ * invalidate the current goal set.
+ */
+export function settingsGoalSignature(settings: SettingsForSignature | null): string {
+  if (!settings) return "null";
+  return JSON.stringify({
+    crafters: settings.crafters.map(c => ({
+      name: c.name,
+      craftLimits: c.craftLimits,
+      recipeTriggers: c.recipeTriggers,
+    })),
+    botQuotaOverrides: settings.botQuotaOverrides,
+    categoryAssignments: settings.categoryAssignments,
+    enabledCategories: settings.enabledCategories,
+    craftingHomeBase: settings.craftingHomeBase,
+    recipeFacilityLinks: settings.recipeFacilityLinks,
+    forceOwnFacility: settings.forceOwnFacility,
+  });
+}
+
 interface Recipe {
   recipe_id: string;
   name: string;

@@ -12,6 +12,7 @@ import {
   isRecipeCraftable as isRecipeCraftableNew,
   findRecipeForItem,
   hasRecipeMaterials,
+  settingsGoalSignature,
 } from "./craft-goals.js";
 import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 import { catalogStore } from "../catalogstore.js";
@@ -1991,27 +1992,45 @@ async function executeCraftingPlan(
     // pass below — only recipes/settings were being held stale.)
     let lastRevalidate = Date.now();
     const REVALIDATE_COOLDOWN_MS = 60000;
-    const revalidateInputs = async () => {
+
+    // Returns true when goal-affecting settings or the recipe catalog changed
+    // since the last sync, so the caller can break the active-plan loop and let
+    // the outer routine re-derive goals from scratch. This is what makes each
+    // outer cycle a true "fresh start" — without it the inner loop holds stale
+    // quotas/limits/triggers for its entire multi-pass lifetime (up to 600 passes
+    // × 300s sleeps = hours) and silently ignores operator edits to the loadout.
+    const revalidateInputs = async (): Promise<boolean> => {
       const now = Date.now();
-      if (now - lastRevalidate < REVALIDATE_COOLDOWN_MS) return;
+      if (now - lastRevalidate < REVALIDATE_COOLDOWN_MS) return false;
       lastRevalidate = now;
+      let settingsChanged = false;
+      let recipesChanged = false;
       try {
         const freshRecipes = await fetchAllRecipes(ctx);
         if (freshRecipes.length > 0) {
           recipes = freshRecipes;
           recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
+          recipesChanged = true;
         }
       } catch (e) {
         log("warn", `Recipe revalidation failed, keeping previous recipe list: ${(e as Error)?.message || e}`);
       }
       try {
         const freshSettings = await getCrafterSettings();
+        if (settingsGoalSignature(freshSettings) !== settingsGoalSignature(settings)) {
+          settingsChanged = true;
+          log("craft", `Goal-affecting settings changed during active plan (quotas/limits/facilities/triggers/home base) - breaking to re-derive goals from scratch on next outer cycle`);
+        }
         settings = freshSettings;
         allowedFacilityRecipeIds = new Set(Object.keys(freshSettings.recipeFacilityLinks || {}));
         cycleWaitMs = (freshSettings.cycleTimeSec || 30) * 1000;
       } catch (e) {
         log("warn", `Settings revalidation failed, keeping previous settings: ${(e as Error)?.message || e}`);
       }
+      if (recipesChanged && !settingsChanged) {
+        log("craft", `Recipe catalog changed during active plan - breaking to re-evaluate on next outer cycle`);
+      }
+      return settingsChanged || recipesChanged;
     };
 
     // Per-recipe hard ceiling (in limiting-output ITEMS) taken from the
@@ -2031,7 +2050,7 @@ async function executeCraftingPlan(
     // Active loop: keep re-planning and queueing as sub-materials become available.
     while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
       loopCount++;
-      await revalidateInputs();
+      if (await revalidateInputs()) break;
       await syncCraftingQueue(ctx, tracker, recipes, true);
       // Re-resolve the facility list each pass. A facility can be upgraded
       // (level/type change) while the crafter is mid-plan, and routing must

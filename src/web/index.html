@@ -926,6 +926,7 @@
         <div class="shipyard-subtabs" style="display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px;">
           <button class="active" onclick="switchShipyardView('manage')" id="shipyardViewManage">Manage Ships</button>
           <button onclick="switchShipyardView('forsale')" id="shipyardViewForsale">Ships For Sale</button>
+          <button onclick="switchShipyardView('battle')" id="shipyardViewBattle">Battle Sim</button>
         </div>
         <div id="shipyardManageView">
           <div class="faction-layout">
@@ -942,6 +943,9 @@
         </div>
         <div id="shipyardForsaleView" style="display: none; height: 100%; min-height: 0">
           <iframe id="shipsforsaleFrame" src="/shipsforsale.html" style="width: 100%; height: calc(100% - 50px); border: none;"></iframe>
+        </div>
+        <div id="shipyardBattleView" style="display: none; height: 100%; min-height: 0">
+          <iframe id="battleSimFrame" src="/battle-sim.html" style="width: 100%; height: calc(100% - 50px); border: none;"></iframe>
         </div>
       </div>
 
@@ -1674,10 +1678,16 @@
       function switchShipyardView(view) {
         document.getElementById("shipyardViewManage").classList.toggle("active", view === "manage");
         document.getElementById("shipyardViewForsale").classList.toggle("active", view === "forsale");
+        document.getElementById("shipyardViewBattle").classList.toggle("active", view === "battle");
         document.getElementById("shipyardManageView").style.display = view === "manage" ? "" : "none";
         document.getElementById("shipyardForsaleView").style.display = view === "forsale" ? "" : "none";
+        document.getElementById("shipyardBattleView").style.display = view === "battle" ? "" : "none";
         if (view === "forsale") {
           const frame = document.getElementById("shipsforsaleFrame");
+          if (frame) frame.src = frame.src;
+        }
+        if (view === "battle") {
+          const frame = document.getElementById("battleSimFrame");
           if (frame) frame.src = frame.src;
         }
       }

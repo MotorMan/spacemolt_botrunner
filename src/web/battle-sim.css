@@ -1,0 +1,267 @@
+.battle-sim-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 16px;
+  gap: 12px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.battle-sim-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-card);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.battle-sim-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.battle-sim-stats {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.battle-sim-filters {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.filter-group label {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.filter-group input {
+  width: 80px;
+  padding: 4px 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.battle-sim-fitters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.fitter-column {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.fitter-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  flex-shrink: 0;
+}
+
+.fitter-header h4 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.fitter-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.field select {
+  padding: 6px 10px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.slot-container {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.slot-container select {
+  padding: 4px 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.skills-section {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.skills-section h5 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.skill-inputs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.skill-input {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.skill-input label {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.skill-input input {
+  padding: 4px 8px;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  width: 60px;
+}
+
+.battle-sim-results {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  flex-shrink: 0;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.battle-sim-results h4 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+}
+
+.battle-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.battle-table th {
+  text-align: left;
+  padding: 6px 10px;
+  background: var(--bg-row-hover);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-bright);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.battle-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #21262d;
+  white-space: nowrap;
+}
+
+.battle-table tr:hover td {
+  background: var(--bg-row-hover);
+}
+
+.battle-table tbody th {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.win-a { color: var(--green); font-weight: 600; }
+.win-b { color: var(--red); font-weight: 600; }
+.draw { color: var(--yellow); font-weight: 600; }
+.fled { color: var(--cyan); font-weight: 600; }
+.stalemate { color: var(--text-dim); }
+
+.legend {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.empty-state {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-dim);
+  font-style: italic;
+}
+
+@media (max-width: 1024px) {
+  .battle-sim-fitters {
+    grid-template-columns: 1fr;
+  }
+}

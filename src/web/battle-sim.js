@@ -55,6 +55,10 @@ async function loadCatalog() {
   }
 }
 
+function getShips() {
+  return ships;
+}
+
 function getShip(id) {
   return ships.find(s => s.id === id);
 }
@@ -366,10 +370,11 @@ async function loadPresetFit(name) {
 }
 
 window.BattleSim = {
-  loadCatalog,
-  getShip,
-  getModule,
-  getModulesBySlot,
+   loadCatalog,
+   getShips,
+   getShip,
+   getModule,
+   getModulesBySlot,
   resolveFit,
   runBattle,
   runMonteCarlo,

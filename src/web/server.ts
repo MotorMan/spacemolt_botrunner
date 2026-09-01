@@ -1380,6 +1380,21 @@ if (!this.settings.fuel_service) {
             return Response.json({ error: "rawMissions.json not found" }, { status: 404 });
           }
         }
+        if (url.pathname.startsWith("/data/combat-sim/fits/")) {
+          const match = url.pathname.match(/^\/data\/combat-sim\/fits\/([^/]+)\.json$/);
+          if (match) {
+            const fitPath = join(DATA_DIR, "combat-sim", "fits", `${match[1]}.json`);
+            if (existsSync(fitPath)) {
+              return new Response(readFileSync(fitPath, "utf-8"), {
+                headers: {
+                  "Content-Type": "application/json",
+                  "Cache-Control": "no-store",
+                },
+              });
+            }
+          }
+          return Response.json({ error: "Fit not found" }, { status: 404 });
+        }
         if (url.pathname === "/api/wildlife") {
           return new Response(this.getWildlifeJson(), {
             headers: { "Content-Type": "application/json" },

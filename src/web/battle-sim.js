@@ -137,7 +137,17 @@ function calculateArmorReduction(armorTotal, damageType) {
   if (counted >= ARMOR_LAW_CROSSOVER) {
     return counted / (counted + ARMOR_K);
   }
-  return armorTotal * 0.75;
+  return Math.floor(armorTotal * 0.75);
+}
+
+function applyArmorReduction(hullIn, armorTotal, damageType) {
+  if (hullIn <= 0) return 0;
+  const f = calculateArmorReduction(armorTotal, damageType);
+  const counted = armorTotal * (ARMOR_MULT[damageType] || 1.0);
+  if (counted >= ARMOR_LAW_CROSSOVER) {
+    return Math.max(1, Math.floor(hullIn * (1 - f)));
+  }
+  return Math.max(1, hullIn - f);
 }
 
 function stageFloor(v) {
@@ -183,13 +193,11 @@ function resolveVolley(attacker, defender, stanceInMult, rng) {
       const consumed = Math.floor(defender.shield / eff);
       const hullIn = pre - consumed;
       defender.shield = 0;
-      const f = calculateArmorReduction(defender.stats.armorTotal, dmgType);
-      const hullDmg = Math.max(1, Math.floor(hullIn * (1 - f)));
+      const hullDmg = applyArmorReduction(hullIn, defender.stats.armorTotal, dmgType);
       return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: consumed, breakthrough: true };
     }
   } else {
-    const f = calculateArmorReduction(defender.stats.armorTotal, dmgType);
-    const hullDmg = Math.max(1, Math.floor(pre * (1 - f)));
+    const hullDmg = applyArmorReduction(pre, defender.stats.armorTotal, dmgType);
     return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: 0, breakthrough: true };
   }
 }

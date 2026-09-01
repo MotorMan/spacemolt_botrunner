@@ -154,27 +154,27 @@ function resolveVolley(attacker, defender, stanceInMult, rng) {
   if (!rng.nextBool(HIT_CHANCE)) return { hullDmg: 0, shieldDrain: 0, breakthrough: false };
 
   if (defender.shield > 0) {
-    let x1 = Math.floor(pre * (1 - defender.shieldsSkill / 100));
+    let x1 = Math.floor(pre * (1 - defender.stats.shieldsSkill / 100));
     const eff = SHIELD_EFF[attacker.weapons[0]?.type || 'kinetic'] || 1.0;
-    let drain = Math.floor(Math.floor(x1 * eff) * (1 - defender.flatPct / 100));
+    let drain = Math.floor(Math.floor(x1 * eff) * (1 - defender.stats.flatPct / 100));
 
     if (defender.shield >= drain) {
       defender.shield -= drain;
       const spillFrac = (drain - defender.shield) / drain;
       if (spillFrac >= 0.5) {
-        const hullDmg = Math.max(1, Math.floor(1 * (1 - defender.flatPct / 100)));
+        const hullDmg = Math.max(1, Math.floor(1 * (1 - defender.stats.flatPct / 100)));
         return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: drain, breakthrough: false };
       }
       return { hullDmg: 0, shieldDrain: drain, breakthrough: false };
     } else {
       const hullIn = pre - Math.floor(defender.shield / eff);
       defender.shield = 0;
-      const f = calculateArmorReduction(defender.armorTotal, attacker.weapons[0]?.type || 'kinetic');
+      const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
       const hullDmg = Math.max(1, Math.floor(hullIn * (1 - f)));
       return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: defender.shield + drain, breakthrough: true };
     }
   } else {
-    const f = calculateArmorReduction(defender.armorTotal, attacker.weapons[0]?.type || 'kinetic');
+    const f = calculateArmorReduction(defender.stats.armorTotal, attacker.weapons[0]?.type || 'kinetic');
     const hullDmg = Math.max(1, Math.floor(pre * (1 - f)));
     return { hullDmg: Math.min(hullDmg, defender.hull), shieldDrain: 0, breakthrough: true };
   }
@@ -276,7 +276,7 @@ function runBattle(statA, statB, stanceA, stanceB, seed) {
   return { winner: 'stalemate', reason: 'max ticks', ticks: MAX_TICKS };
 }
 
-function runMonteCarlo(statA, statB, stanceA, stanceB, runs, baseSeed) {
+async function runMonteCarlo(statA, statB, stanceA, stanceB, runs, baseSeed) {
   const results = { A: 0, B: 0, draw: 0, stalemate: 0, fled: 0 };
   const assumed = stanceA === 'evade' || stanceA === 'flee' || stanceB === 'evade' || stanceB === 'flee';
 
@@ -292,6 +292,7 @@ function runMonteCarlo(statA, statB, stanceA, stanceB, runs, baseSeed) {
     } else {
       results.stalemate++;
     }
+    if (i > 0 && i % 1000 === 0) await new Promise(r => setTimeout(r, 0));
   }
 
   const total = runs;
@@ -309,12 +310,12 @@ function runMonteCarlo(statA, statB, stanceA, stanceB, runs, baseSeed) {
   return { dominant, pct: Math.round(maxPct), assumed, details: results };
 }
 
-function runTable(statA, statB, runs = DEFAULT_RUNS, seed = 12345) {
+async function runTable(statA, statB, runs = DEFAULT_RUNS, seed = 12345) {
   const table = [];
   for (const sa of STANCES) {
     const row = [];
     for (const sb of STANCES) {
-      const res = runMonteCarlo(statA, statB, sa, sb, runs, seed);
+      const res = await runMonteCarlo(statA, statB, sa, sb, runs, seed);
       row.push(res);
     }
     table.push(row);

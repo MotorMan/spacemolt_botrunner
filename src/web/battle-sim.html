@@ -268,7 +268,7 @@
       content.innerHTML = '<div class="empty-state">Running simulation...</div>';
       
       try {
-        const table = BattleSim.runTable(fitA, fitB, runs, seed);
+        const table = await BattleSim.runTable(fitA, fitB, runs, seed);
         const html = BattleSim.formatTableHTML(table);
         content.innerHTML = html;
       } catch (e) {
@@ -308,7 +308,7 @@
       }
     }
 
-    function downloadJSON() {
+    async function downloadJSON() {
       const fitA = getFit('A');
       const fitB = getFit('B');
       const runs = parseInt(document.getElementById('runsInput').value) || 10000;
@@ -316,7 +316,7 @@
       
       if (!fitA || !fitB) return;
       
-      const table = BattleSim.runTable(fitA, fitB, runs, seed);
+      const table = await BattleSim.runTable(fitA, fitB, runs, seed);
       
       const output = {
         shipA: { name: fitA.name, ...fitA },

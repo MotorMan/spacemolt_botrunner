@@ -3386,7 +3386,7 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
       ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer}${targetEntity ? "" : " (not in range — re-issued next tick)"}`);
     }
 
-    // ── If a battle is live, hold fire stance and keep targeting the player ──
+    // ── If a battle is live, keep targeting the player ──
     const battleStatus = await getBattleStatus(ctx);
     if (battleStatus) {
       const targetId2 = targetEntity ? targetEntity.id : targetPlayer;
@@ -3394,7 +3394,6 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
       if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
         await bot.exec("battle", { action: "target", target_id: targetPlayer });
       }
-      await bot.exec("battle", { action: "stance", stance: "fire" });
     }
 
     // ── Field repair (in place) ──

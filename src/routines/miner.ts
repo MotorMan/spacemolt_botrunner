@@ -1,4 +1,4 @@
-import type { Routine, RoutineContext } from "../bot.js";
+import type { Routine, RoutineContext, Bot } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
 import { extractLibResult } from "../commandBridge.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
@@ -34,6 +34,7 @@ import {
   getFuelCellFuelValue,
   isFuelCellItem,
   getCargoFuelCells,
+  estimateRouteFuel,
 } from "./common.js";
 import {
   getRadioactiveCapability,
@@ -159,6 +160,52 @@ function getMiningBlacklist(settings: Awaited<ReturnType<typeof getMinerSettings
     return [];
   }
   return baseBlacklist;
+}
+
+/**
+ * Estimate whether the cargo fuel-cell reserve is adequate for a round trip
+ * to `targetSystemId` and back home. Returns a human-readable reason.
+ */
+async function checkFuelCellAdequacy(
+  ctx: RoutineContext,
+  targetSystemId: string,
+  homeSystem: string,
+  bot: Bot,
+): Promise<{ adequate: boolean; reason: string }> {
+  const { fuel: currentFuel, cells, summary } = getCargoFuelCells(bot);
+  const settings = await getMinerSettings(bot.username);
+  const minCells = settings.minimumFuelCells || 20;
+
+  if (cells <= 0) {
+    return { adequate: false, reason: `no fuel cells in cargo (${summary})` };
+  }
+
+  // Quick gate: if below the configured minimum, treat as inadequate.
+  if (cells < minCells) {
+    return { adequate: false, reason: `only ${cells} fuel cell(s) in cargo (minimum: ${minCells})` };
+  }
+
+  // Try to get route fuel estimates for both legs.
+  let estimatedTripFuel = 0;
+  const toTarget = await estimateRouteFuel(ctx, targetSystemId);
+  const toHome = await estimateRouteFuel(ctx, homeSystem);
+  if (toTarget) estimatedTripFuel += toTarget.estimatedFuel;
+  if (toHome) estimatedTripFuel += toHome.estimatedFuel;
+
+  if (estimatedTripFuel <= 0) {
+    // Can't estimate — rely on the minimum-cell count gate above.
+    return { adequate: true, reason: `cannot estimate route fuel, but ${cells} cells meets minimum` };
+  }
+
+  const bufferedNeed = estimatedTripFuel * 1.2;
+  if (currentFuel < bufferedNeed) {
+    return {
+      adequate: false,
+      reason: `round-trip fuel estimate ~${Math.round(bufferedNeed)}, cargo cells provide ${currentFuel} fuel`,
+    };
+  }
+
+  return { adequate: true, reason: `${currentFuel} fuel in ${cells} cells covers ~${Math.round(bufferedNeed)} needed` };
 }
 
 /**
@@ -2530,14 +2577,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 }
 
-    // ── Startup: if we spawned in the field with no fuel cells, go home first ──
+    // ── Startup: if we spawned in the field with inadequate fuel cells, go home first ──
     // It's far better to spend the fuel to return home and restock than to strand
     // ourselves and wait for a rescue bot that would only send us home anyway.
     if (!bot.docked) {
       await bot.refreshCargo();
       const startupFuelCells = getCargoFuelCells(bot);
-      if (startupFuelCells.cells <= 0) {
-        ctx.log("mining", `Started in the field with NO fuel cells (${startupFuelCells.summary}) — returning to home system ${homeSystem} to stock up before mining`);
+      const minCells = settings0.minimumFuelCells || 20;
+      const needsRestock = startupFuelCells.cells < minCells;
+      if (needsRestock) {
+        const adequacy = await checkFuelCellAdequacy(ctx, homeSystem, homeSystem, bot);
+        ctx.log("mining", `Started in the field with low fuel cells (${startupFuelCells.summary}) — ${adequacy.reason} — returning to home system ${homeSystem} to stock up before mining`);
         try {
           const wentHome = await navigateToSystem(ctx, homeSystem, {
             fuelThresholdPct: settings0.refuelThreshold,
@@ -4374,6 +4424,37 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           ctx.log("escort", `Sent jumping to ${nextSystem}`);
         }
       };
+
+      const preNavFuelCells = getCargoFuelCells(bot);
+      const fuelAdequacy = await checkFuelCellAdequacy(ctx, targetSystemId, homeSystem, bot);
+      if (!fuelAdequacy.adequate) {
+        ctx.log("mining", `Inadequate fuel cells before navigating to ${targetSystemId}: ${fuelAdequacy.reason} — returning home to restock first`);
+        yield "return_home";
+        yield "pre_return_fuel";
+        if (recoveredSession) {
+          await updateMiningSession(bot.username, { state: "returning_home" });
+        }
+        const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!returnFueled) {
+          const { pois: currentPois } = await getSystemInfo(ctx);
+          const currentStation = findStation(currentPois);
+          if (currentStation) {
+            await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
+          }
+        }
+        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (!homeArrived) {
+          ctx.log("error", "Failed to return home for fuel cells — will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+        await ensureDocked(ctx);
+        await ensureFuelCellsStocked(ctx);
+        ctx.log("mining", "Restocked fuel cells at home — restarting mining cycle");
+        continue;
+      }
+
+      ctx.log("mining", `Navigating to ${targetSystemId} for ${effectiveTarget || resourceLabel || miningType} mining (fuel cells: ${preNavFuelCells.cells}, ${preNavFuelCells.fuel} fuel — ${fuelAdequacy.reason})`);
 
       const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
       if (!arrived) {
@@ -7753,7 +7834,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     // - Refuel and continue mining instead of returning home
     // This prevents depositing at random stations during refuel detours
     const isCargoFull = fillRatio >= cargoThresholdRatio;
-    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull;
+    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull && settings.stayOutUntilFull;
 
     const shouldReturnHome = settings.noMidMiningRetarget
       ? (bot.system !== homeSystem && homeSystem)

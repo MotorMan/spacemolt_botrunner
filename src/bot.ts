@@ -340,10 +340,13 @@ docked = false;
   towingWreckId: string | null = null;
 
 shipSpeed = 1;
-   hasPathfinderDrive = false;
-   hasEmergencyWarpStabilizer: boolean | null = null;
-   installedMods: string[] = [];
-   hasLeadLinedCargoHold: boolean | null = null;
+    hasPathfinderDrive = false;
+    hasEmergencyWarpStabilizer: boolean | null = null;
+    installedMods: string[] = [];
+    hasLeadLinedCargoHold: boolean | null = null;
+  private _prevHullPct: number = 100;
+  private _prevHasEws: boolean | null = null;
+  private _ewsFallbackTriggered = false;
   /** Outstanding bounties (credits) keyed by faction. Parsed in applyStatusResult. */
   bounties: Record<string, number> = {};
   lastKnownTick?: number;
@@ -1906,6 +1909,8 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     const ship = r.ship as Record<string, unknown> | undefined;
     debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
     if (ship) {
+      const prevHullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+      const prevHasEws = this.hasEmergencyWarpStabilizer;
       const rawName = (ship.name as string) || "";
       const shipType = (ship.ship_type as string) || (ship.type as string) || "";
       this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
@@ -1915,7 +1920,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
       this.cargo = (ship.cargo_used as number) ?? this.cargo;
       this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+      this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
       this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
       this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
@@ -1938,6 +1943,37 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         this.ammo = ship.ammo as number;
       }
       this.applyModuleFlags(modulesArray, modulesResolved);
+
+      if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
+        const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+        if (prevHullPct > 20 && hullPct <= 20) {
+          const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+          const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+
+          if (ewsGone || positionChanged) {
+            this._ewsFallbackTriggered = true;
+            this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+            saveStoppedState(this.username, "emergency");
+            saveLastUsedRoutine(this.username, "return_home");
+
+            if (this._state === "running") {
+              this._state = "stopping";
+              this._abortController?.abort();
+            }
+
+            const botName = this.username;
+            setTimeout(() => {
+              void (async () => {
+                const { handleStart, getBot } = await import("./botmanager.js");
+                const bot = getBot(botName);
+                if (!bot) return;
+                if (bot.state === "running") return;
+                await handleStart({ type: "start", bot: botName, routine: "return_home" });
+              })().catch(() => {});
+            }, 4000);
+          }
+        }
+      }
      }
 
     // Towing state handling - moved outside ship block since it's on player/location
@@ -2041,6 +2077,8 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
       const ship = (r.ship as Record<string, unknown>) || r;
       const player = r.player as Record<string, unknown> | undefined;
       if (ship) {
+        const prevHullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+        const prevHasEws = this.hasEmergencyWarpStabilizer;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
@@ -2059,6 +2097,38 @@ this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
         if (totalAmmo > 0) this.ammo = totalAmmo;
         else if (ship.ammo != null) this.ammo = ship.ammo as number;
         this.applyModuleFlags(modulesArray, modulesResolved);
+
+        if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
+          const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
+          if (prevHullPct > 20 && hullPct <= 20) {
+            const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+            const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+
+            if (ewsGone || positionChanged) {
+              this._ewsFallbackTriggered = true;
+              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+              saveStoppedState(this.username, "emergency");
+              saveLastUsedRoutine(this.username, "return_home");
+
+              if (this._state === "running") {
+                this._state = "stopping";
+                this._abortController?.abort();
+              }
+
+              const botName = this.username;
+              setTimeout(() => {
+                void (async () => {
+                  const { handleStart, getBot } = await import("./botmanager.js");
+                  const bot = getBot(botName);
+                  if (!bot) return;
+                  if (bot.state === "running") return;
+                  await handleStart({ type: "start", bot: botName, routine: "return_home" });
+                })().catch(() => {});
+              }, 4000);
+            }
+          }
+        }
+
         if (modulesArray.length > 0 || modulesResolved) {
           this.installedMods = modulesArray
             .map(m => moduleTypeId(m) || (m.name as string) || "")

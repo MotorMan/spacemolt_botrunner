@@ -5038,48 +5038,50 @@ export async function boardingSubroutine(
     }
   }
 
-  // ── Phase 2: Advance to engaged zone ──
-  const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-  ctx.log("combat", `⚔️ Boarding: closing distance to engaged with ${target.name}`);
-  await ctx.sleep(10000);
+   // ── Phase 2: Advance to engaged zone ──
+   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+   ctx.log("combat", `⚔️ Boarding: closing distance to engaged with ${target.name}`);
+   await ctx.sleep(10000);
 
-  let ourZone = "outer";
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const initStatus = await getBattleStatus(ctx);
-    if (!initStatus) {
-      ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
-      return "target_eliminated";
-    }
-    ourZone = initStatus.your_zone || "outer";
-    if (ourZone === "engaged") {
-      ctx.log("combat", "✅ Boarding: already at engaged zone");
-      break;
-    }
-    const ourZoneNum = zoneDirMap[ourZone] ?? 0;
-    if (ourZoneNum < 3) {
-      ctx.log("combat", `↩️ Boarding: advancing from ${ourZone}...`);
-      const advResp = await bot.exec("battle", { action: "advance" });
-      if (advResp.error) {
-        const msg = advResp.error.message.toLowerCase();
-        if (msg.includes("not in battle") || msg.includes("no active battle")) {
-          // Not registered as engaged — re-attack target
-          ctx.log("combat", `⚠️ Advance failed — re-attacking ${target.name}...`);
-          await bot.exec("attack", { target_id: target.id });
-          await ctx.sleep(2000);
-          const postAttackStatus = await getBattleStatus(ctx);
-          if (!postAttackStatus) {
-            ctx.log("combat", `✅ Boarding: battle ended after re-engage — ${target.name} eliminated!`);
-            return "target_eliminated";
-          }
-          continue;
-        }
-        ctx.log("combat", `⚠️ Advance note: ${advResp.error.message}`);
-      }
-      await ctx.sleep(5000);
-    } else {
-      break;
-    }
-  }
+   let ourZone = "outer";
+   for (let attempt = 0; attempt < 6; attempt++) {
+     const initStatus = await getBattleStatus(ctx);
+     if (!initStatus) {
+       ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
+       return "target_eliminated";
+     }
+     ourZone = initStatus.your_zone || "outer";
+     if (ourZone === "engaged") {
+       ctx.log("combat", "✅ Boarding: already at engaged zone");
+       break;
+     }
+     const ourZoneNum = zoneDirMap[ourZone] ?? 0;
+     if (ourZoneNum < 3) {
+       // Ensure fire stance is active — the game requires dealing damage to advance zones
+       await bot.exec("battle", { action: "stance", stance: "fire" });
+       ctx.log("combat", `↩️ Boarding: advancing from ${ourZone}...`);
+       const advResp = await bot.exec("battle", { action: "advance" });
+       if (advResp.error) {
+         const msg = advResp.error.message.toLowerCase();
+         if (msg.includes("not in battle") || msg.includes("no active battle")) {
+           // Not registered as engaged — re-attack target
+           ctx.log("combat", `⚠️ Advance failed — re-attacking ${target.name}...`);
+           await bot.exec("attack", { target_id: target.id });
+           await ctx.sleep(2000);
+           const postAttackStatus = await getBattleStatus(ctx);
+           if (!postAttackStatus) {
+             ctx.log("combat", `✅ Boarding: battle ended after re-engage — ${target.name} eliminated!`);
+             return "target_eliminated";
+           }
+           continue;
+         }
+         ctx.log("combat", `⚠️ Advance note: ${advResp.error.message}`);
+       }
+       await ctx.sleep(10000);
+     } else {
+       break;
+     }
+   }
 
   // ── Phase 3: Shield suppression + boarding ──
   let tickCount = 0;
@@ -5128,12 +5130,10 @@ export async function boardingSubroutine(
        if (ourZone !== "engaged") {
          const ourZoneNum = zoneDirMap[ourZone] ?? 0;
          if (ourZoneNum < 3) {
-           // Check if target shields are already low — if so, use brace to avoid killing before we can board
-           const shieldCheck = getTargetShieldPct(status, target.id, target.name);
-           if (shieldCheck !== null && shieldCheck <= shieldThreshold) {
-             ctx.log("combat", `🛡️ Boarding: target shields already at ${shieldCheck}% (≤ ${shieldThreshold}%) — holding brace stance while closing to engaged`);
-             await bot.exec("battle", { action: "stance", stance: "brace" });
-           }
+           // Use fire stance while advancing — the game requires dealing damage to advance zones.
+           // We only hold brace once at engaged with low shields, to avoid killing the target
+           // before we can issue board stance.
+           await bot.exec("battle", { action: "stance", stance: "fire" });
            ctx.log("combat", `↩️ Boarding: advancing from ${ourZone} to engaged (required for boarding)...`);
            const adv = await bot.exec("battle", { action: "advance" });
            if (adv.error) {
@@ -5158,29 +5158,48 @@ export async function boardingSubroutine(
          }
        }
 
-       // Check shield percentage
-       const shieldPct = getTargetShieldPct(status, target.id, target.name);
-       if (shieldPct !== null && shieldPct <= shieldThreshold) {
-         // Shields are low enough — switch to boarding stance
-         ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${shieldThreshold}%) — initiating board stance with ${marines} marines!`);
-         const boardResp = await bot.exec("battle", {
-           action: "stance",
-           stance: "board",
-           target_id: target.id,
-           marines: marines,
-         });
-         if (boardResp.error) {
-           const msg = boardResp.error.message.toLowerCase();
-           if (msg.includes("not in battle") || msg.includes("no active battle")) {
-             ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
-             return "target_eliminated";
-           }
-           ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardResp.error.message} — switching to fire to finish`);
-           await bot.exec("battle", { action: "stance", stance: "fire" });
-         } else {
-           ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
-           boardingActive = true;
-         }
+        // Check shield percentage
+        const shieldPct = getTargetShieldPct(status, target.id, target.name);
+        if (shieldPct !== null && shieldPct <= shieldThreshold) {
+          // Shields are low enough — first brace to stop damaging, then issue boarding stance
+          // Brace prevents accidental kills while we transition to board stance
+          await bot.exec("battle", { action: "stance", stance: "brace" });
+          ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${shieldThreshold}%) — initiating board stance with ${marines} marines!`);
+          const boardResp = await bot.exec("battle", {
+            action: "stance",
+            stance: "board",
+            target_id: target.id,
+            marines: marines,
+          });
+          if (boardResp.error) {
+            const msg = boardResp.error.message.toLowerCase();
+            if (msg.includes("not in battle") || msg.includes("no active battle")) {
+              ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
+              return "target_eliminated";
+            }
+            // Try with target name instead of id (some servers require name)
+            const boardRespName = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.name,
+              marines: marines,
+            });
+            if (boardRespName.error) {
+              const msg2 = boardRespName.error.message.toLowerCase();
+              if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
+                ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
+                return "target_eliminated";
+              }
+              ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
+              await bot.exec("battle", { action: "stance", stance: "fire" });
+            } else {
+              ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
+              boardingActive = true;
+            }
+          } else {
+            ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
+            boardingActive = true;
+          }
        } else {
          // Shields still high — suppress with fire stance at engaged zone
          const enemyStance = targetParticipant?.stance || "unknown";
@@ -5298,12 +5317,7 @@ async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<t
     // System info may fail if we're at a station — continue to fallback
   }
 
-  // Fall back to home station's base_id if set at top level
-  const homeSystem = settings.homeSystem || "";
-  if (homeSystem) {
-    return homeSystem;
-  }
-
+  // No suitable destination found
   return null;
 }
 
@@ -5351,13 +5365,20 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
     return false;
   }
 
-  ctx.log("combat", `🛸 Claiming prize ${availablePrize.ship_name || availablePrize.prize_id} → destination: ${destBaseId}`);
+   ctx.log("combat", `🛸 Claiming prize ${availablePrize.ship_name || availablePrize.prize_id} → destination: ${destBaseId}`);
 
-  const claimResp = await bot.exec("claim_prize", {
-    id: availablePrize.prize_id,
-    target: destBaseId,
-    crew_disposition: "aboard",
-  });
+   // Refuel the prize ship before sending it off — a prize with insufficient fuel may fail to arrive
+   await bot.exec("service_prize", {
+     id: availablePrize.prize_id,
+     service_action: "refuel",
+     quantity: 100,
+   });
+
+   const claimResp = await bot.exec("claim_prize", {
+     id: availablePrize.prize_id,
+     target: destBaseId,
+     crew_disposition: "aboard",
+   });
 
   if (claimResp.error) {
     const msg = claimResp.error.message.toLowerCase();

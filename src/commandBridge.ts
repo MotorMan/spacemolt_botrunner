@@ -223,6 +223,7 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'view_insurance': 'spacemolt_salvage',
    'set_home_base': 'spacemolt_salvage',
    'claim_prize': 'spacemolt_salvage',
+   'service_prize': 'spacemolt_salvage',
 
   // Fleet
   'fleet': 'spacemolt_fleet',

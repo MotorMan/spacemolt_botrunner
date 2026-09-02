@@ -5272,6 +5272,7 @@
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
         <option value="fleet"${hunterMode === "fleet" ? " selected" : ""}>Fleet Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
+        <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
           </select>`;
 
           // Per-bot PVP target player override (only shown in pvp mode).
@@ -31342,6 +31343,9 @@ ignoreBlacklist: document.getElementById(
         const meatShield = h.meatShield ?? false;
         const stopOnDeath = h.stopOnDeath ?? false;
         const combatDebug = h.combatDebug ?? false;
+        const boardingEnabled = h.boardingEnabled ?? false;
+        const boardingShieldThreshold = h.boardingShieldThreshold ?? 5;
+        const boardingMarines = h.boardingMarines ?? 0;
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
         const tierOpts = tierOptions
@@ -31425,6 +31429,7 @@ ignoreBlacklist: document.getElementById(
           <option value="creature_farm">Creature Farm</option>
           <option value="fleet">Fleet Mode (idle until battle)</option>
           <option value="pvp">PVP (camp POI, attack player)</option>
+          <option value="boarding">Boarding (patrol + board eligible targets)</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>
@@ -31827,7 +31832,34 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-hunter-creatureFarmLoopsPerSystem" min="1" max="100" value="${h.creatureFarmLoopsPerSystem ?? 3}">
     </div>
 
-    <div class="settings-save-bar">
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Boarding Mode</div>
+         <div class="setting-hint">When enabled (and ship has boarding capability + fit marines), the hunter switches to board stance on eligible targets with shields at or below the threshold instead of destroying them. Requires the "boarding" mode to be selected.</div>
+       </div>
+       <select id="set-hunter-boardingEnabled">
+         <option value="false"${!boardingEnabled ? " selected" : ""}>Disabled</option>
+         <option value="true"${boardingEnabled ? " selected" : ""}>Enabled</option>
+       </select>
+     </div>
+
+     <div class="setting-row" id="set-hunter-boardingShieldThreshold-row">
+       <div>
+         <div class="setting-label">Boarding Shield Threshold (%)</div>
+         <div class="setting-hint">Shield percentage at or below which to attempt boarding. 0 = always try to board (no shield suppression needed). Default: 5.</div>
+       </div>
+       <input type="number" id="set-hunter-boardingShieldThreshold" min="0" max="100" value="${boardingShieldThreshold}">
+     </div>
+
+     <div class="setting-row" id="set-hunter-boardingMarines-row">
+       <div>
+         <div class="setting-label">Boarding Marines Committed</div>
+         <div class="setting-hint">Number of marines to commit to the board stance. 0 = commit all fit marines aboard.</div>
+       </div>
+       <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
+     </div>
+
+     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
   `;
@@ -31935,6 +31967,16 @@ ignoreBlacklist: document.getElementById(
               document.getElementById("set-hunter-creatureFarmLoopsPerSystem")
                 .value,
             ) || 3,
+          boardingEnabled:
+            document.getElementById("set-hunter-boardingEnabled")?.value === "true",
+          boardingShieldThreshold:
+            parseInt(
+              document.getElementById("set-hunter-boardingShieldThreshold")?.value,
+            ) || 5,
+          boardingMarines:
+            parseInt(
+              document.getElementById("set-hunter-boardingMarines")?.value,
+            ) || 0,
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;

@@ -27,7 +27,8 @@ import { isConnectionError } from "./connection.js";
 /** A login() promise older than this (ms) is treated as wedged and reset, so a
  *  dead socket can never permanently park the routine on an unresolved promise. */
 const LOGIN_WEDGE_TIMEOUT_MS = 60_000;
-import { catalogStore } from "./catalogstore.js";
+   import { catalogStore } from "./catalogstore.js";
+import type { PrizeRecoveryInfo, CrewDisposition, PrizeWaitReason, PrizeTransitKind } from "./types/game.js";
 import { extractShipModules, moduleTypeId } from "./shipmodules.js";
 import { isPirateTarget, isCreatureTarget, isCreatureName } from "./routines/battle.js";
 
@@ -97,8 +98,9 @@ export interface BotStatus {
    * dashboard with a jail-bars indicator next to the bot name when non-empty.
    * Empty object = no bounties / unknown.
    */
-  bounties: Record<string, number>;
-  inBattle?: boolean;
+     bounties: Record<string, number>;
+     prizeRecoveries: PrizeRecoveryInfo[];
+   inBattle?: boolean;
   battleId?: string | null;
   /**
    * Transient flag set only for bot cards that have been rehydrated from the
@@ -355,6 +357,8 @@ docked = false;
   private _ewsFallbackTriggered = false;
   /** Outstanding bounties (credits) keyed by faction. Parsed in applyStatusResult. */
   bounties: Record<string, number> = {};
+  /** Prize recovery records. Parsed from get_status prize_recoveries. */
+  prizeRecoveries: PrizeRecoveryInfo[] = [];
   lastKnownTick?: number;
 
   /** Accumulated stats for this bot. */
@@ -1589,7 +1593,37 @@ if (command === "get_status") {
       }
       this.bounties = parsed;
     }
-             if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
+    // Parse prize_recoveries from get_status (claimant-private capture state)
+    const prizeRecoveriesRaw = (r.prize_recoveries as Array<Record<string, unknown>> | undefined);
+    if (prizeRecoveriesRaw && Array.isArray(prizeRecoveriesRaw)) {
+      this.prizeRecoveries = prizeRecoveriesRaw.map(pr => ({
+        prize_id: pr.prize_id as string,
+        actor_id: pr.actor_id as string,
+        ship_id: pr.ship_id as string,
+        ship_class: pr.ship_class as string,
+        ship_name: pr.ship_name as string | undefined,
+        status: pr.status as PrizeRecoveryInfo["status"],
+        destination_base_id: pr.destination_base_id as string,
+        prize_crew_fit: pr.prize_crew_fit as number,
+        crew_disposition: pr.crew_disposition as CrewDisposition,
+        hull: pr.hull as number,
+        max_hull: pr.max_hull as number,
+        fuel: pr.fuel as number,
+        max_fuel: pr.max_fuel as number,
+        system_id: pr.system_id as string | undefined,
+        poi_id: pr.poi_id as string | undefined,
+        wait_reason: pr.wait_reason as PrizeWaitReason | undefined,
+        transit_kind: pr.transit_kind as PrizeTransitKind | undefined,
+        transit_from_system_id: pr.transit_from_system_id as string | undefined,
+        transit_from_poi_id: pr.transit_from_poi_id as string | undefined,
+        transit_to_system_id: pr.transit_to_system_id as string | undefined,
+        transit_to_poi_id: pr.transit_to_poi_id as string | undefined,
+        transit_arrival_tick: pr.transit_arrival_tick as number | undefined,
+      }));
+    } else {
+      this.prizeRecoveries = [];
+    }
+            if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
                this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
              }
 
@@ -4938,6 +4972,7 @@ if (this.craftQueueTracker && jobId && recipeId) {
       isCloaked: this.isCloaked,
       hasEmergencyWarpStabilizer: this.hasEmergencyWarpStabilizer,
       bounties: this.bounties,
+      prizeRecoveries: this.prizeRecoveries,
       inBattle: this.currentBattle.inBattle,
       battleId: this.currentBattle.battleId,
     };

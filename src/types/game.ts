@@ -414,6 +414,68 @@ export interface Drone {
   bandwidth: number;
 }
 
+// ── Prizes ───────────────────────────────────────────────────
+
+export type PrizeStatus =
+  | "available"
+  | "claimed"
+  | "in_transit"
+  | "delivered"
+  | "destroyed"
+  | "expired"
+  | "recaptured";
+
+export type CrewDisposition = "aboard" | "faction_reserve";
+
+export type PrizeTransitKind = "jump" | "travel";
+
+export type PrizeWaitReason =
+  | "no_route"
+  | "no_fuel"
+  | "destination_missing"
+  | "incapacitated"
+  | "manual_stop";
+
+export interface PrizeInfo {
+  prize_id: string;
+  actor_id: string;
+  ship_id: string;
+  ship_class: string;
+  ship_name?: string;
+  status: PrizeStatus;
+  hull: number;
+  max_hull: number;
+  shield: number;
+  max_shield: number;
+  in_combat: boolean;
+  wait_reason?: PrizeWaitReason;
+}
+
+export interface PrizeRecoveryInfo {
+  prize_id: string;
+  actor_id: string;
+  ship_id: string;
+  ship_class: string;
+  ship_name?: string;
+  status: PrizeStatus;
+  destination_base_id: string;
+  prize_crew_fit: number;
+  crew_disposition: CrewDisposition;
+  hull: number;
+  max_hull: number;
+  fuel: number;
+  max_fuel: number;
+  system_id?: string;
+  poi_id?: string;
+  wait_reason?: PrizeWaitReason;
+  transit_kind?: PrizeTransitKind;
+  transit_from_system_id?: string;
+  transit_from_poi_id?: string;
+  transit_to_system_id?: string;
+  transit_to_poi_id?: string;
+  transit_arrival_tick?: number;
+}
+
 // ── Battle ───────────────────────────────────────────────────
 
 export interface BattleParticipant {

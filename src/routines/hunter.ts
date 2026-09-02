@@ -108,6 +108,7 @@ import {
 import type { Bot } from "../bot.js";
 import { fleetStatus } from "./fleet.js";
 import type { PirateTier, NearbyEntity } from "./battle.js";
+import type { PrizeInfo } from "../types/game.js";
 import {
   parseNearby,
   isPirateTarget,
@@ -4881,9 +4882,13 @@ function resolveMarineCommitment(fitMarines: number, configured: number): number
 /**
  * Find the target participant in the battle and return its shield percentage.
  */
-function getTargetShieldPct(status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>, targetId: string): number | null {
+function getTargetShieldPct(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  targetId: string,
+  targetName?: string,
+): number | null {
   const participant = status.participants.find(
-    p => p.player_id === targetId || p.username === targetId,
+    p => p.player_id === targetId || p.username === targetId || (targetName ? p.username === targetName : false),
   );
   if (!participant) return null;
   const pct = participant.shield_pct ?? participant.shield_percent;
@@ -5128,8 +5133,8 @@ export async function boardingSubroutine(
       }
 
       // Check shield percentage
-      const shieldPct = getTargetShieldPct(status, target.id);
-      if (shieldPct !== null && shieldPct > 0 && shieldPct <= shieldThreshold) {
+      const shieldPct = getTargetShieldPct(status, target.id, target.name);
+      if (shieldPct !== null && shieldPct <= shieldThreshold) {
         // Shields are low enough — switch to boarding stance
         ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${shieldThreshold}%) — initiating board stance with ${marines} marines!`);
         const boardResp = await bot.exec("battle", {
@@ -5219,6 +5224,204 @@ export async function boardingSubroutine(
   }
 
   return "failed";
+}
+
+// ── Prize Recovery ──────────────────────────────────────────────
+//
+// After a successful boarding capture, the prize ship remains at the current
+// POI until claimed. The bot must be at the same POI (out of combat), then
+// issue spacemolt_salvage(claim_prize, ...) with a destination station base ID.
+// The prize then autonomously travels to the destination and appears in
+// get_status().prize_recoveries with status "in_transit".
+
+/**
+ * Extract intact prize ships from a get_nearby / observation result.
+ * Prizes appear in the `nearby_prizes` array of the get_nearby response.
+ */
+function getNearbyPrizes(result: unknown): PrizeInfo[] {
+  if (!result || typeof result !== "object") return [];
+  const r = result as Record<string, unknown>;
+  const prizesRaw = r.nearby_prizes as Array<Record<string, unknown>> | undefined;
+  if (!prizesRaw || !Array.isArray(prizesRaw)) return [];
+
+  return prizesRaw.map(p => ({
+    prize_id: p.prize_id as string,
+    actor_id: p.actor_id as string,
+    ship_id: p.ship_id as string,
+    ship_class: p.ship_class as string,
+    ship_name: p.ship_name as string | undefined,
+    status: (p.status as PrizeInfo["status"]) || "available",
+    hull: p.hull as number,
+    max_hull: p.max_hull as number,
+    shield: p.shield as number,
+    max_shield: p.max_shield as number,
+    in_combat: p.in_combat as boolean,
+    wait_reason: p.wait_reason as PrizeInfo["wait_reason"] | undefined,
+  }));
+}
+
+/**
+ * Find a station base ID to use as the prize recovery destination.
+ * Prefers the bot's configured home station; falls back to the system's
+ * first non-pirate station; falls back to any station in the current system.
+ */
+async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<string | null> {
+  const hs = settings.homeStation || "";
+  if (hs && hs.includes("|")) {
+    const parts = hs.split("|");
+    const baseId = parts[1];
+    if (baseId) return baseId;
+  } else if (hs) {
+    return hs;
+  }
+
+  // Try the current system's stations
+  try {
+    const { pois } = await getSystemInfo(ctx);
+    if (pois && pois.length > 0) {
+      const station = findStation(pois, undefined, true);
+      if (station?.base_id) return station.base_id;
+    }
+  } catch {
+    // System info may fail if we're at a station — continue to fallback
+  }
+
+  // Fall back to home station's base_id if set at top level
+  const homeSystem = settings.homeSystem || "";
+  if (homeSystem) {
+    return homeSystem;
+  }
+
+  return null;
+}
+
+/**
+ * Attempt to claim a prize at the current POI.
+ *
+ * After a successful boarding, the prize ship should be at the same POI,
+ * out of combat. This function finds the prize in nearby_prizes, determines
+ * a destination station, and calls claim_prize to send the prize recovering
+ * to that station.
+ *
+ * Returns true if the prize was claimed, false otherwise.
+ */
+async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Need to be out of combat to claim a prize
+  const battle = await getBattleStatus(ctx);
+  if (battle) {
+    ctx.log("combat", "ClaimPrize: still in battle — cannot claim prize yet");
+    return false;
+  }
+
+  // Scan nearby for prizes
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) {
+    ctx.log("combat", "ClaimPrize: no nearby data — cannot check for prizes");
+    return false;
+  }
+
+  const prizes = getNearbyPrizes(nearbyData);
+  const availablePrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+  if (!availablePrize) {
+    if (prizes.length > 0) {
+      ctx.log("combat", `ClaimPrize: found ${prizes.length} prize(s) but none claimable (status: ${prizes.map(p => p.status).join(", ")})`);
+    }
+    return false;
+  }
+
+  // Find a destination station
+  const destBaseId = findDestinationBaseId(ctx, settings);
+  if (!destBaseId) {
+    ctx.log("combat", "ClaimPrize: no destination station found to send prize to");
+    return false;
+  }
+
+  ctx.log("combat", `🛸 Claiming prize ${availablePrize.ship_name || availablePrize.prize_id} → destination: ${destBaseId}`);
+
+  const claimResp = await bot.exec("claim_prize", {
+    id: availablePrize.prize_id,
+    target: destBaseId,
+    crew_disposition: "aboard",
+  });
+
+  if (claimResp.error) {
+    const msg = claimResp.error.message.toLowerCase();
+    if (msg.includes("no prize") || msg.includes("not found") || msg.includes("invalid")) {
+      ctx.log("combat", `ClaimPrize: prize not claimable (${claimResp.error.message}) — may already be claimed by another pilot`);
+      return false;
+    }
+    if (msg.includes("rate limit") || msg.includes("retry")) {
+      ctx.log("combat", `ClaimPrize: rate limited — will retry next tick`);
+      return false;
+    }
+    ctx.log("error", `ClaimPrize failed: ${claimResp.error.message}`);
+    return false;
+  }
+
+  ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
+  return true;
+}
+
+/**
+ * After a boarding capture, attempt to claim the prize and monitor its
+ * recovery state until it reaches a terminal state.
+ *
+ * Terminal states: delivered, destroyed, expired, recaptured.
+ * Non-terminal states: available, claimed, in_transit.
+ *
+ * Returns true if the prize was successfully delivered, false otherwise.
+ */
+async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+  const { bot } = ctx;
+  const maxWaitTicks = 30; // ~300 seconds max wait for recovery
+  let waitTick = 0;
+
+  while (waitTick < maxWaitTicks) {
+    waitTick++;
+
+    // Check if we have an active prize recovery
+    await bot.refreshStatus();
+    const recoveries = bot.prizeRecoveries;
+
+    if (recoveries.length === 0) {
+      // No recovery record yet — try to claim at current POI
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+      if (!claimed) {
+        // Not at the prize POI, or another pilot already claimed it
+        ctx.log("combat", "RecoverPrize: could not claim prize — may need to be at the right POI");
+        return false;
+      }
+    } else {
+      // Check recovery status
+      const recovery = recoveries[0];
+      if (recovery) {
+        ctx.log("combat", `RecoverPrize: status=${recovery.status} fuel=${recovery.fuel}/${recovery.max_fuel} hull=${recovery.hull}/${recovery.max_hull}`);
+
+        if (recovery.status === "delivered") {
+          ctx.log("combat", `✅ Prize ${recovery.ship_name || recovery.prize_id} delivered to ${recovery.destination_base_id}!`);
+          return true;
+        }
+        if (recovery.status === "destroyed" || recovery.status === "expired" || recovery.status === "recaptured") {
+          ctx.log("combat", `RecoverPrize: prize ${recovery.status} — aborting recovery`);
+          return false;
+        }
+        // Still in_transit or claimed — wait for it to deliver
+        if (recovery.status === "in_transit") {
+          if (recovery.wait_reason) {
+            ctx.log("combat", `RecoverPrize: prize stalled (${recovery.wait_reason}) — will retry`);
+          }
+        }
+      }
+    }
+
+    await ctx.sleep(10000);
+  }
+
+  ctx.log("combat", "RecoverPrize: timed out waiting for prize delivery");
+  return false;
 }
 
 // ── Boarding Routine (patrol mode with boarding) ──────────────────
@@ -5431,6 +5634,13 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
+              // Attempt prize recovery — the captured ship is now a prize at this POI
+              const recovered = await recoverPrize(ctx, settings);
+              if (recovered) {
+                ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+              } else {
+                ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it`);
+              }
               continue;
             } else if (result === "target_eliminated") {
               totalKills++;

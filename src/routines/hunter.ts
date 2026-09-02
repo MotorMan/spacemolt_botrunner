@@ -3394,7 +3394,7 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
       if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
         await bot.exec("battle", { action: "target", target_id: targetPlayer });
       }
-      await bot.exec("battle", { action: "advance" });
+      await bot.exec("battle", { action: "stance", stance: "fire" });
     }
 
     // ── Field repair (in place) ──

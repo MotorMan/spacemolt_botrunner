@@ -524,11 +524,11 @@
                   <button
                     class="battle-stance-btn"
                     id="stanceBoardBtn"
-                    onclick="battleStance('board')"
+                    onclick="logFleetCombat('Use Stance Board from the Command All page — boarding requires target_id + marines', 'warn')"
                   >
                     <span>🚢</span>
                     <span class="battle-stance-label">Board</span>
-                    <span class="battle-stance-desc">Boarding assault</span>
+                    <span class="battle-stance-desc">Use Command All</span>
                   </button>
                 </div>
               </div>
@@ -7373,7 +7373,8 @@
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'flee'})" style="color: var(--red)">Stance Flee</button>
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'brace'})" style="color: var(--red)">Stance Brace</button>
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
-      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'board'})" style="color: var(--green)">Stance Board</button>
+      <button class="sm" onclick="mcStanceBoard()" style="color: var(--green)">Stance Board</button>
+      <input type="number" id="mcBoardMarines" min="0" placeholder="marines" style="width:60px;font-size:11px;padding:2px;" title="0 = all fit marines">
     </div>
 
     <div class="cmd-group">
@@ -11375,6 +11376,27 @@
         const targetName = select.options[select.selectedIndex]?.text || targetId;
         logResponse(`<span class="resp-cmd">Targeting ${esc(targetName)}</span>`);
         mcExec("battle", { action: "target", target_id: targetId });
+      }
+
+      function mcStanceBoard() {
+        if (!profileBot) return;
+        const select = document.getElementById("mc-battle-target");
+        if (!select) {
+          logResponse('<span class="resp-err">Target select not found</span>');
+          return;
+        }
+        const targetId = select.value;
+        if (!targetId) {
+          logResponse('<span class="resp-err">Select a target first</span>');
+          return;
+        }
+
+        const marinesInput = document.getElementById("mcBoardMarines");
+        const marines = marinesInput ? parseInt(marinesInput.value, 10) : 0;
+
+        const targetName = select.options[select.selectedIndex]?.text || targetId;
+        logResponse(`<span class="resp-cmd">Boarding ${esc(targetName)}${marines ? ` (${marines} marines)` : ""}</span>`);
+        mcExec("battle", { action: "stance", id: "board", target_id: targetId, marines: isNaN(marines) ? 0 : marines });
       }
 
       // Send exec command and invoke callback with result

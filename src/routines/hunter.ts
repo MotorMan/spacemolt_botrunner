@@ -5043,15 +5043,23 @@ export async function boardingSubroutine(
    ctx.log("combat", `⚔️ Boarding: closing distance to engaged with ${target.name}`);
    await ctx.sleep(10000);
 
-   let ourZone = "outer";
-   for (let attempt = 0; attempt < 6; attempt++) {
-     const initStatus = await getBattleStatus(ctx);
-     if (!initStatus) {
-       ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
-       return "target_eliminated";
-     }
-     ourZone = initStatus.your_zone || "outer";
-     if (ourZone === "engaged") {
+    let ourZone = "outer";
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const initStatus = await getBattleStatus(ctx);
+      if (!initStatus) {
+        ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
+        return "target_eliminated";
+      }
+      ourZone = initStatus.your_zone || "outer";
+      // Check if our target was killed (e.g. by an assist hunter) during advance
+      const targetParticipant = initStatus.participants.find(
+        p => p.player_id === target.id || p.username === target.name,
+      );
+      if (targetParticipant && targetParticipant.is_destroyed) {
+        ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed during advance — abandoning boarding`);
+        return "target_eliminated";
+      }
+      if (ourZone === "engaged") {
        ctx.log("combat", "✅ Boarding: already at engaged zone");
        break;
      }
@@ -5696,9 +5704,19 @@ async function* boardingSystemPass(
       continue;
     }
 
-    ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${poi.name}`);
+    // Sort by hull descending — board the largest (most valuable) ships first.
+    // Lower-hull pirates can't threaten our shields, while high-hull pirates
+    // are worth more and are the priority boarding targets.
+    pirate_targets.sort((a, b) => {
+      const ah = a.maxHull || a.hull || 0;
+      const bh = b.maxHull || b.hull || 0;
+      return bh - ah;
+    });
 
-    for (const target of pirate_targets) {
+    ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${poi.name} (sorted by hull: ${pirate_targets.map(p => `${p.name}(${p.maxHull || p.hull || 0})`).join(", ")})`);
+
+    for (let targetIdx = 0; targetIdx < pirate_targets.length; targetIdx++) {
+      const target = pirate_targets[targetIdx];
       if (bot.state !== "running") break;
 
       await bot.refreshShip();
@@ -5716,6 +5734,13 @@ async function* boardingSystemPass(
       }
 
       yield "engage";
+
+      // Re-verify target is still present (an assist hunter may have killed it)
+      const stillPresent = entities.find(e => e.id === target.id || e.name === target.name);
+      if (!stillPresent) {
+        ctx.log("combat", `⚠️ ${target.name} is no longer at this POI (likely claimed by another hunter) — skipping to next target`);
+        continue;
+      }
 
       // Determine if we should attempt boarding this target
       const canBoard = settings.boardingEnabled
@@ -5751,14 +5776,14 @@ async function* boardingSystemPass(
               ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it`);
             }
             continue;
-          } else if (result === "target_eliminated") {
-            totalKills++;
-            ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
-            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-            await useRepairKits(ctx);
-            await bot.refreshCargo();
-            continue;
+           } else if (result === "target_eliminated") {
+             totalKills++;
+             ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
+             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+             await useRepairKits(ctx);
+             await bot.refreshCargo();
+             continue;
           } else if (result === "retreat") {
             break;
           }

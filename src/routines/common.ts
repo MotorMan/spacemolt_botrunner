@@ -8,7 +8,7 @@ import { combatDebugLog, combatDebugLogLine } from "../debug.js";
 import type { Bot, RoutineContext } from "../bot.js";
 import { isConnectionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
-import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
+import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance, BattleCombatState, BoardingPublicStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist, getStationBlacklist, isCustomsDisabled } from "../web/server.js";
@@ -5327,6 +5327,8 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     your_target_id: (result.your_target_id as string) || undefined,
     auto_pilot: (result.auto_pilot as boolean) || undefined,
     is_participant: (result.is_participant as boolean) || false,
+    boarding: (result.boarding as BoardingPublicStatus[]) || undefined,
+    combat_state: (result.combat_state as BattleCombatState) || undefined,
   };
 
   return status;

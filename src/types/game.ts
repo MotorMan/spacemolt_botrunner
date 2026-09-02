@@ -15,7 +15,7 @@ export type ChatChannel = "global" | "faction" | "local" | "system" | "private";
 export type MissionStatus = "available" | "active" | "complete" | "failed";
 export type OrderType = "buy" | "sell";
 export type BattleZone = "outer" | "mid" | "inner" | "engaged";
-export type BattleStance = "fire" | "evade" | "brace" | "flee";
+export type BattleStance = "fire" | "evade" | "brace" | "flee" | "board";
 export type BattleActionType = "advance" | "retreat" | "stance" | "target" | "engage";
 export type CommissionStatus = "pending" | "building" | "ready" | "cancelled";
 
@@ -442,6 +442,30 @@ export interface BattleSide {
   members?: string[];
 }
 
+export interface BattleCombatState {
+  can_escape?: boolean;
+  em_disrupted?: boolean;
+  effective_speed?: number;
+  flee_counter?: number;
+  flee_required?: number;
+  incapacitated?: boolean;
+  max_weapon_reach?: number;
+  speed_penalty_pct?: number;
+  warp_disrupted?: boolean;
+  webbed?: boolean;
+  web_strength_pct?: number;
+  disruption_ticks?: number;
+}
+
+export interface BoardingPublicStatus {
+  operation_id: string;
+  phase: string;
+  progress?: string;
+  target_id?: string;
+  attacker_id?: string;
+  self_destruct_countdown?: number;
+}
+
 export interface BattleStatus {
   battle_id: string;
   tick?: number;
@@ -454,6 +478,8 @@ export interface BattleStatus {
   your_target_id?: string;
   auto_pilot?: boolean;
   is_participant?: boolean;
+  boarding?: BoardingPublicStatus[];
+  combat_state?: BattleCombatState;
 }
 
 // ── Faction ──────────────────────────────────────────────────

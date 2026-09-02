@@ -13,6 +13,12 @@
  *   - pvp: Camp a single system POI (never move) and send an attack command every
  *          tick at a configured target player (hunter.targetPlayer / per-bot override)
  *
+ * Modes:
+ *   - boarding: Hunt pirates as usual, but when a target's shields drop below
+ *          boardingShieldThreshold and the ship has boarding capability + marines,
+ *          enter the board stance (committing boardingMarines) instead of firing
+ *          to destruction. Monitors the boarding operation to completion.
+ *
  * Loop:
  *   1. Navigate to configured patrol system
  *   2. Visit each non-station POI looking for pirate targets
@@ -55,6 +61,9 @@
  *   fleetFightPlayers         — fight players too, since the fleet leader picked the
  *                               target (default: true; false = honour onlyNPCs and flee players)
  *   fleetUndockToFight        — undock when a battle starts while docked (default: true)
+ *   boardingEnabled          — when true, the hunter switches to boarding stance on eligible targets with low shields instead of killing them (default: false)
+ *   boardingShieldThreshold   — shield % at or below which to attempt boarding (default: 5)
+ *   boardingMarines           — marines to commit to the board stance (0 = all fit marines on board; default: 0)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -110,6 +119,7 @@ import {
   fightFreshBattle,
   fightJoinedBattle,
   getWeaponModules,
+  emergencyFleeSpam,
 } from "./battle.js";
 
 
@@ -320,7 +330,7 @@ async function handleFuelCheckFailure(
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet" | "pvp";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet" | "pvp" | "boarding";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -405,10 +415,13 @@ function getHunterSettings(username?: string): {
   creatureFarmCargoFullPct: number;
   creatureFarmMaxPassesPerPoi: number;
   creatureFarmMaxSystemSweeps: number;
-  fleetIdlePollSeconds: number;
+   fleetIdlePollSeconds: number;
   fleetBattleConfirmSeconds: number;
   fleetFightPlayers: boolean;
   fleetUndockToFight: boolean;
+  boardingEnabled: boolean;
+  boardingShieldThreshold: number;
+  boardingMarines: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -474,11 +487,14 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
   creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
   creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
   creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
-  fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
-  fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
-  fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
-  fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
-};
+   fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
+   fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
+   fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
+   fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
+   boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? false,
+   boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
+   boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
+ };
 }
 
 /** Persist hunter mode setting for a specific bot. */
@@ -750,7 +766,6 @@ async function checkAndAcceptMissions(ctx: RoutineContext): Promise<void> {
     }
   }
 }
-
 async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
@@ -777,7 +792,6 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     }
   }
 }
-
 // ── Safe-system docking ───────────────────────────────────────
 
 async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number }): Promise<boolean> {
@@ -1231,7 +1245,6 @@ continue;
     }
   }
 }
-
 /** Extract the system ID from a [COMBAT WARNING] or [HULL DAMAGE] faction message. */
 function extractAlertSystem(content: string): string | null {
   // Both alert types end with:  ...| sys_xxxx/poi_yyyy
@@ -1506,6 +1519,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (initialSettings.mode === "pvp") {
       yield* pvpRoutine(ctx);
+      return;
+    }
+
+    if (initialSettings.mode === "boarding") {
+      yield* boardingRoutine(ctx);
       return;
     }
 
@@ -1927,7 +1945,6 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 }
-
 // ── Roam Systems Routine (original behavior) ────────────────────
 
 async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -2023,10 +2040,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
            ctx.log("combat", `Battle detected after navigation attempt - hunter fights, not flees!`);
            await handleNavigationBattleInterrupt(ctx, settings);
          } else {
-           ctx.log("error", `Could not reach ${alertTarget} — resuming normal patrol`);
-         }
-       }
-    }
+            ctx.log("error", `Could not reach ${alertTarget} — resuming normal patrol`);
+          }
+        }
+      }
 
     // ── Navigate to a huntable (low/unregulated) system ──
     yield "find_patrol_system";
@@ -2561,7 +2578,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     }
   }
 }
-
 // ── Roam System Routine (stay in current system) ────────────────
 
 async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -3010,7 +3026,6 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
   }
 }
-
 // ── Stationary Routine (stay in one POI) ────────────────────────
 
 async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -4215,7 +4230,6 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     }
   }
 }
-
 /** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
 export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
@@ -4661,7 +4675,6 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 }
-
 async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
@@ -4813,14 +4826,719 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
       } else {
         await navigateToSafeStation(ctx, currentSafetyOpts);
       }
-      await ensureHunterResupply(ctx);
-      systemIndex = 0;
     }
   }
 }
+// ── Boarding Subroutine ──────────────────────────────────────────
+//
+// Called from a hunter combat flow when boarding is enabled and the target's
+// shields have dropped below boardingShieldThreshold. The subroutine:
+//   1. Suppresses shields with fire stance until below threshold.
+//   2. Issues `battle target` + `battle stance board` (V1: stance="board",
+//      target_id, marines) to initiate the boarding operation.
+//   3. Monitors the `boarding` array in get_battle_status until the operation
+//      completes (phase = "victory" or "defeat" or "withdrawn") or the battle
+//      ends.
+//   4. Returns true if the boarding was successful, false otherwise.
+//
+// The boarding stance is persistent: once issued it stays active for multiple
+// ticks (auto-closes to point-blank range). The bot does not fire normal weapons
+// while boarding. Friendly fire can still destroy the target and kill the
+// marines, so the subroutine keeps an eye on hull and bails to fire/brace if
+// things go badly.
 
+const BOARD_MAX_TICKS = 90;
+const BOARD_TICK_MS = 10000;
 
+/**
+ * Get the number of fit marines aboard the bot's ship.
+ * Calls get_ship to refresh personnel data.
+ */
+async function getFitMarineCount(ctx: RoutineContext): Promise<number> {
+  await ctx.bot.refreshShip();
+  return ctx.bot.fitMarines;
+}
 
+/**
+ * Check if the bot's ship has boarding capability.
+ */
+async function checkBoardingCapability(ctx: RoutineContext): Promise<boolean> {
+  await ctx.bot.refreshShip();
+  return ctx.bot.hasBoardingCapability;
+}
 
+/**
+ * Resolve how many marines to commit to the boarding stance.
+ * boardingMarines=0 means "all fit marines on board".
+ */
+function resolveMarineCommitment(fitMarines: number, configured: number): number {
+  if (configured > 0) {
+    return Math.min(configured, fitMarines);
+  }
+  return fitMarines;
+}
 
+/**
+ * Find the target participant in the battle and return its shield percentage.
+ */
+function getTargetShieldPct(status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>, targetId: string): number | null {
+  const participant = status.participants.find(
+    p => p.player_id === targetId || p.username === targetId,
+  );
+  if (!participant) return null;
+  const pct = participant.shield_pct ?? participant.shield_percent;
+  return pct != null ? pct : null;
+}
+
+/**
+ * Check if any boarding operation in the battle status is for our target.
+ */
+function findBoardingOperation(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  targetId: string,
+): { operation_id: string; phase: string; progress?: string } | null {
+  if (!status.boarding || status.boarding.length === 0) return null;
+  const op = status.boarding.find(
+    b => b.target_id === targetId || b.attacker_id === status.your_target_id,
+  );
+  if (!op) {
+    // If we can't match by target, but there's a boarding operation where attacker matches our ship
+    const ourOp = status.boarding[0];
+    return {
+      operation_id: ourOp.operation_id,
+      phase: ourOp.phase,
+      progress: ourOp.progress,
+    };
+  }
+  return {
+    operation_id: op.operation_id,
+    phase: op.phase,
+    progress: op.progress,
+  };
+}
+
+/**
+ * The boarding subroutine: open the battle directly (scan + attack + advance to
+ * engaged), suppress shields with fire stance until below threshold, then issue
+ * the board stance and monitor the boarding operation to completion.
+ *
+ * This does NOT call engageTarget — that function runs fightFreshBattle to total
+ * destruction, which would prevent boarding. Instead we replicate the battle-opening
+ * and zone-closing logic inline, then interpose the boarding stance when shields are
+ * low enough.
+ *
+ * Returns:
+ *   "captured" — boarding operation succeeded (target captured)
+ *   "target_eliminated" — target was destroyed (before, during, or after boarding)
+ *   "failed" — boarding failed, aborted, or timed out; the caller may re-engage normally
+ *   "retreat" — hull critical, must flee
+ */
+export async function boardingSubroutine(
+  ctx: RoutineContext,
+  target: NearbyEntity,
+  shieldThreshold: number,
+  marinesConfigured: number,
+  fleeThreshold: number,
+  shieldRechargePct: number,
+): Promise<"captured" | "target_eliminated" | "failed" | "retreat"> {
+  const { bot } = ctx;
+  if (!target.id) {
+    ctx.log("combat", "Boarding: no target ID — aborting");
+    return "failed";
+  }
+
+  // Check boarding capability
+  const canBoard = await checkBoardingCapability(ctx);
+  if (!canBoard) {
+    ctx.log("combat", "Boarding: ship lacks boarding capability — falling back to fire stance");
+    return "failed";
+  }
+
+  // Resolve marine commitment
+  const fitMarines = await getFitMarineCount(ctx);
+  if (fitMarines < 1) {
+    ctx.log("combat", "Boarding: no fit marines aboard — cannot board");
+    return "failed";
+  }
+  const marines = resolveMarineCommitment(fitMarines, marinesConfigured);
+  ctx.log("combat", `Boarding: ${fitMarines} fit marines aboard, committing ${marines} to board stance (threshold: ${shieldThreshold}%)`);
+
+  // ── Phase 1: Open the battle directly (scan + attack) ──
+  ctx.log("combat", `⚔️ Boarding: engaging ${target.name}...`);
+
+  // If already in a battle, skip scan/attack and go straight to advance.
+  let battleActive = false;
+  const preAttackStatus = await getBattleStatus(ctx);
+  if (preAttackStatus) {
+    battleActive = true;
+    ctx.log("combat", `⚔️ Boarding: already in battle with ${target.name} — closing to engaged`);
+  }
+
+  if (!battleActive) {
+    // Scan the target to get ship info (non-fatal if it fails)
+    let scanResp = await bot.exec("scan", { target_id: target.id });
+    if (scanResp.error) {
+      const errMsg = scanResp.error.message.toLowerCase();
+      if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
+        ctx.log("combat", `⚔️ Scan revealed battle already active with ${target.name} — entering combat directly`);
+        battleActive = true;
+      } else if (errMsg.includes("invalid_target")) {
+        scanResp = await bot.exec("scan", { target_id: target.name });
+      }
+    }
+    if (!scanResp.error && scanResp.result) {
+      const s = scanResp.result as Record<string, unknown>;
+      const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
+      const faction = (s.faction as string) || target.faction || "unknown";
+      ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
+    }
+
+    if (!battleActive) {
+      let attackResp = await bot.exec("attack", { target_id: target.id });
+      if (attackResp.error) {
+        const msg = attackResp.error.message.toLowerCase();
+        if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+          ctx.log("combat", `Attack with id failed — trying name "${target.name}"...`);
+          attackResp = await bot.exec("attack", { target_id: target.name });
+        }
+      }
+      if (attackResp.error) {
+        const msg = attackResp.error.message.toLowerCase();
+        if (msg.includes("not found") || msg.includes("invalid") ||
+            msg.includes("no target") || msg.includes("already") || msg.includes("not in")) {
+          return "failed";
+        }
+        // Attack error but maybe a battle was started anyway — check
+        const postStatus = await getBattleStatus(ctx);
+        if (postStatus) {
+          battleActive = true;
+          ctx.log("combat", `⚔️ Attack errored ("${attackResp.error.message}") but battle is active — entering combat`);
+        } else {
+          ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+          return "failed";
+        }
+      } else {
+        battleActive = true;
+      }
+    }
+  }
+
+  if (!battleActive) {
+    // Verify battle is live
+    const checkStatus = await getBattleStatus(ctx);
+    if (!checkStatus) {
+      ctx.log("combat", "Boarding: no active battle after attack — target may have been eliminated");
+      return "target_eliminated";
+    }
+  }
+
+  // ── Phase 2: Advance to engaged zone ──
+  const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+  ctx.log("combat", `⚔️ Boarding: closing distance to engaged with ${target.name}`);
+  await ctx.sleep(10000);
+
+  let ourZone = "outer";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const initStatus = await getBattleStatus(ctx);
+    if (!initStatus) {
+      ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
+      return "target_eliminated";
+    }
+    ourZone = initStatus.your_zone || "outer";
+    if (ourZone === "engaged") {
+      ctx.log("combat", "✅ Boarding: already at engaged zone");
+      break;
+    }
+    const ourZoneNum = zoneDirMap[ourZone] ?? 0;
+    if (ourZoneNum < 3) {
+      ctx.log("combat", `↩️ Boarding: advancing from ${ourZone}...`);
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        const msg = advResp.error.message.toLowerCase();
+        if (msg.includes("not in battle") || msg.includes("no active battle")) {
+          // Not registered as engaged — re-attack target
+          ctx.log("combat", `⚠️ Advance failed — re-attacking ${target.name}...`);
+          await bot.exec("attack", { target_id: target.id });
+          await ctx.sleep(2000);
+          const postAttackStatus = await getBattleStatus(ctx);
+          if (!postAttackStatus) {
+            ctx.log("combat", `✅ Boarding: battle ended after re-engage — ${target.name} eliminated!`);
+            return "target_eliminated";
+          }
+          continue;
+        }
+        ctx.log("combat", `⚠️ Advance note: ${advResp.error.message}`);
+      }
+      await ctx.sleep(5000);
+    } else {
+      break;
+    }
+  }
+
+  // ── Phase 3: Shield suppression + boarding ──
+  let tickCount = 0;
+  let boardingActive = false;
+  let lastHull = bot.hull;
+
+  while (bot.state === "running") {
+    tickCount++;
+    if (tickCount > BOARD_MAX_TICKS) {
+      ctx.log("combat", "Boarding: timeout reached — switching to fire stance to finish");
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      return "failed";
+    }
+
+    const status = await getBattleStatus(ctx);
+    if (!status) {
+      ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+      return "target_eliminated";
+    }
+
+    // Check hull
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    const damageThisTick = Math.max(0, lastHull - bot.hull);
+    lastHull = bot.hull;
+
+    if (hullPct <= fleeThreshold) {
+      ctx.log("combat", `💀 Boarding: hull critical (${hullPct}%) — FLEEING!`);
+      await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
+      return "retreat";
+    }
+
+    // Check if our target is destroyed
+    const targetParticipant = status.participants.find(
+      p => p.player_id === target.id || p.username === target.name,
+    );
+    if (targetParticipant && targetParticipant.is_destroyed) {
+      ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
+      return "target_eliminated";
+    }
+
+    // If not yet boarding, check shield threshold and suppress
+    if (!boardingActive) {
+      // Target the enemy
+      const tgtResp = await bot.exec("battle", { action: "target", target_id: target.id });
+      if (tgtResp.error) {
+        const msg = tgtResp.error.message.toLowerCase();
+        if (msg.includes("not in battle") || msg.includes("no active battle")) {
+          ctx.log("combat", "✅ Boarding: battle ended during targeting");
+          return "target_eliminated";
+        }
+      }
+
+      // Check shield percentage
+      const shieldPct = getTargetShieldPct(status, target.id);
+      if (shieldPct !== null && shieldPct > 0 && shieldPct <= shieldThreshold) {
+        // Shields are low enough — switch to boarding stance
+        ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${shieldThreshold}%) — initiating board stance with ${marines} marines!`);
+        const boardResp = await bot.exec("battle", {
+          action: "stance",
+          stance: "board",
+          target_id: target.id,
+          marines: marines,
+        });
+        if (boardResp.error) {
+          const msg = boardResp.error.message.toLowerCase();
+          if (msg.includes("not in battle") || msg.includes("no active battle")) {
+            ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
+            return "target_eliminated";
+          }
+          ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardResp.error.message} — continuing fire`);
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+        } else {
+          ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
+          boardingActive = true;
+        }
+      } else {
+        // Shields still high — keep firing, use fire stance
+        const enemyStance = targetParticipant?.stance || "unknown";
+        const enemyZone = targetParticipant?.zone || "unknown";
+        ctx.log("combat", `Boarding tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Target shields=${shieldPct ?? "unknown"}% (need ≤${shieldThreshold}%) | Dmg=${damageThisTick}`);
+
+        // Advance to engaged if not already there
+        const ourZoneNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
+        if (ourZoneNum < 3) {
+          ctx.log("combat", `↩️ Boarding: advancing from ${status.your_zone || "outer"} to engaged to maintain firing range...`);
+          const adv = await bot.exec("battle", { action: "advance" });
+          if (adv.error) {
+            const msg = adv.error.message.toLowerCase();
+            if (msg.includes("not in battle") || msg.includes("no active battle")) {
+              ctx.log("combat", "✅ Boarding: battle ended during advance");
+              return "target_eliminated";
+            }
+          }
+        }
+
+        await bot.exec("battle", { action: "stance", stance: "fire" });
+        await ctx.sleep(BOARD_TICK_MS);
+      }
+    } else {
+      // Boarding is active — monitor the operation
+      const boardingOp = findBoardingOperation(status, target.id);
+      if (boardingOp) {
+        ctx.log("combat", `🛸 Boarding: operation ${boardingOp.operation_id} — phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);
+        if (boardingOp.phase === "victory") {
+          ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}!`);
+          return "captured";
+        }
+        if (boardingOp.phase === "defeat" || boardingOp.phase === "withdrawn") {
+          ctx.log("combat", `Boarding: operation ${boardingOp.phase} — target ${boardingOp.phase === "defeat" ? "resisted" : "withdrawn"}`);
+          // If defeated, target may still be alive — try to finish with fire
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          boardingActive = false;
+        }
+      } else {
+        // Boarding operation no longer in status — it ended
+        const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
+        if (!targetStillAlive) {
+          ctx.log("combat", `✅ Boarding: ${target.name} eliminated during operation`);
+          return "target_eliminated";
+        }
+        // Boarding ended but target alive — try to finish with fire
+        ctx.log("combat", `Boarding: operation ended (no boarding entry in status) — finishing with fire stance`);
+        await bot.exec("battle", { action: "stance", stance: "fire" });
+        boardingActive = false;
+      }
+
+      // In-combat repair / shield top-up if needed
+      const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+      if (hullPct <= fleeThreshold) {
+        ctx.log("combat", `💀 Boarding: hull critical (${hullPct}%) — FLEEING!`);
+        await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
+        return "retreat";
+      }
+      const shieldTopUpPct = shieldRechargePct / 100;
+      if (shieldPct < shieldTopUpPct * 100) {
+        await topUpShields(ctx, shieldTopUpPct);
+        await useRepairKits(ctx);
+      }
+
+      await ctx.sleep(BOARD_TICK_MS);
+    }
+  }
+
+  return "failed";
+}
+
+// ── Boarding Routine (patrol mode with boarding) ──────────────────
+//
+// Identical patrol flow to roam_systems, but when boarding is enabled and a
+// target's shields drop below the configured threshold, the hunter initiates
+// a boarding operation instead of destroying the target.
+
+async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+  let totalBoardings = 0;
+
+  await ensureObservationSubscribed();
+  await ensureHunterCoordListener(bot.username);
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+
+    // ── Death recovery ──
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+      joinBattles: true,
+    };
+
+    // ── Status ──
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    // ── Fuel ──
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    // ── Hull ──
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
+      yield "emergency_repair";
+      const docked = await navigateToSafeStation(ctx, safetyOpts);
+      if (docked) {
+        await completeActiveMissions(ctx);
+        await repairShip(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await checkAndAcceptMissions(ctx);
+        await ensureInsured(ctx);
+        await bot.checkSkills();
+        await ensureUndocked(ctx);
+        await resubscribeObservationAfterMove(bot);
+      }
+      continue;
+    }
+
+    // ── Navigate to patrol system ──
+    const patrolSystem = settings.system || "";
+    if (patrolSystem && bot.system !== patrolSystem) {
+      ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
+      const arrived = await navigateToSystem(ctx, patrolSystem, safetyOpts);
+      if (arrived) {
+        await resubscribeObservationAfterMove(bot);
+      }
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${patrolSystem} — patrolling ${bot.system} instead`);
+        }
+      }
+    }
+
+    if (bot.state !== "running") break;
+
+    // ── Confirm we're in a huntable system ──
+    await fetchSecurityLevel(ctx, bot.system);
+    const currentSec = mapStore.getSystem(bot.system)?.security_level;
+    if (!isHuntableSystem(currentSec)) {
+      ctx.log("info", `${bot.system} is ${currentSec || "unknown"} security — searching for a huntable system...`);
+      const huntTarget = findNearestHuntableSystem(bot.system);
+      if (huntTarget) {
+        const sys = mapStore.getSystem(huntTarget);
+        ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) — navigating...`);
+        const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
+        if (!huntArrived) {
+          const battleAfterNav = await getBattleStatus(ctx);
+          if (battleAfterNav) {
+            await handleNavigationBattleInterrupt(ctx, settings);
+          }
+        }
+        await resubscribeObservationAfterMove(bot);
+      }
+    }
+
+    // ── Get system layout ──
+    yield "scan_system";
+    await fetchSecurityLevel(ctx, bot.system);
+    const { pois } = await getSystemInfo(ctx);
+    const patrolPois = pois.filter(p => !isStationPoi(p));
+
+    if (patrolPois.length === 0) {
+      ctx.log("info", "No non-station POIs to patrol — waiting 30s");
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    ctx.log("info", `Boarding mode: patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
+
+    for (const poi of patrolPois) {
+      if (bot.state !== "running") break;
+
+      await bot.refreshShip();
+      const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (midHull <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${midHull}% — aborting patrol`);
+        break;
+      }
+
+      if (await checkAndHandleExistingBattle(ctx, settings)) continue;
+
+      yield "travel_to_poi";
+      ctx.log("travel", `Boarding patrol: ${poi.name}...`);
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+        continue;
+      }
+      bot.poi = poi.id;
+      bot.clearObservationState();
+      await ctx.sleep(1000);
+
+      yield "scan_for_targets";
+      const nearbyResult = await getObservationOrNearby(bot);
+      const nearbyData = nearbyResult.result;
+      if (!nearbyData) {
+        ctx.log("error", `No nearby data at ${poi.name}`);
+        continue;
+      }
+      bot.trackNearbyPlayers(nearbyData);
+      bot.trackWildlife(nearbyData);
+
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+
+      const entities = parseNearby(nearbyData);
+      const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e));
+
+      if (pirate_targets.length === 0) {
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        continue;
+      }
+
+      ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${poi.name}`);
+
+      for (const target of pirate_targets) {
+        if (bot.state !== "running") break;
+
+        await bot.refreshShip();
+        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (preHull <= settings.repairThreshold) {
+          ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
+          break;
+        }
+
+        await useRepairKits(ctx);
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!hasAmmo && !settings.meatShield) {
+          ctx.log("combat", "Out of ammo — aborting patrol to resupply");
+          break;
+        }
+
+        yield "engage";
+
+        // Determine if we should attempt boarding this target
+        const canBoard = settings.boardingEnabled
+          && settings.boardingShieldThreshold > 0
+          && await checkBoardingCapability(ctx);
+
+        if (canBoard) {
+          const fitMarines = await getFitMarineCount(ctx);
+          if (fitMarines >= 1) {
+            ctx.log("combat", `⚔️ Boarding engagement: ${target.name} (shields ≤ ${settings.boardingShieldThreshold}% → board)`);
+            const result = await boardingSubroutine(
+              ctx,
+              target,
+              settings.boardingShieldThreshold,
+              settings.boardingMarines,
+              settings.fleeThreshold,
+              settings.shieldRechargePct,
+            );
+
+            if (result === "captured") {
+              totalKills++;
+              totalBoardings++;
+              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding!`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              continue;
+            } else if (result === "target_eliminated") {
+              totalKills++;
+              ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              continue;
+            } else if (result === "retreat") {
+              break;
+            }
+            // "failed" — fall through to normal fire engagement
+            ctx.log("combat", `Boarding failed for ${target.name} — engaging normally`);
+          }
+        }
+
+        // Normal fire engagement (fallback or boarding disabled)
+        if (!coordResponding) {
+          broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+          claimCreature(ctx, target);
+        }
+        const hsettings = getHunterSettings(ctx.bot.username);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80);
+
+        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
+        if (won) {
+          totalKills++;
+          ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting...`);
+          yield "loot";
+          if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          if (isLowOnFieldConsumables(bot.inventory)) {
+            ctx.log("combat", "Low on repair kits or shield charges — ending sweep to resupply");
+            break;
+          }
+        }
+      }
+    }
+
+    // ── Post-patrol decision ──
+    yield "post_patrol";
+    await bot.refreshCargo();
+    await bot.refreshShip();
+    const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    const needsRepair = postHull <= settings.repairThreshold;
+    const hasFuelCells = bot.inventory?.some(i =>
+      i.itemId === 'fuel_cell' ||
+      i.itemId === 'premium_fuel_cell' ||
+      i.itemId === 'military_fuel_cell'
+    );
+    const needsFuel = !hasFuelCells;
+
+    if (needsRepair || needsFuel) {
+      ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — returning to safe system...`);
+      yield "dock";
+      const docked = await navigateToSafeStation(ctx, safetyOpts);
+      if (!docked) {
+        ctx.log("error", "Could not dock anywhere — retrying next cycle");
+        continue;
+      }
+      await collectFromStorage(ctx);
+      yield "complete_missions";
+      await completeActiveMissions(ctx);
+      await bot.refreshLocation();
+      yield "check_missions";
+      await checkAndAcceptMissions(ctx);
+      yield "ensure_insured";
+      await ensureInsured(ctx);
+      yield "refuel";
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      yield "repair";
+      await repairShip(ctx);
+      yield "reload";
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      yield "fit_mods";
+      const modProfile = getModProfile("hunter");
+      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+      yield "check_skills";
+      await bot.checkSkills();
+
+      if (settings.singleLoop) {
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await navigateToSystem(ctx, hsys, safetyOpts);
+          const t = await bot.exec("travel", { target_poi: hpoi });
+          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+        } else {
+          await navigateToSafeStation(ctx, safetyOpts);
+        }
+        await ensureHunterResupply(ctx);
+      }
+    } else {
+      ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);
+      if (!patrolSystem) {
+        const nextSystem = findNextHuntSystem(bot.system);
+        if (nextSystem) {
+          const sys = mapStore.getSystem(nextSystem);
+          ctx.log("travel", `Moving to ${sys?.name || nextSystem} (${sys?.security_level || "unknown"}) to continue hunt...`);
+          await navigateToSystem(ctx, nextSystem, safetyOpts);
+          await resubscribeObservationAfterMove(bot);
+        }
+      }
+    }
+  }
+}
 

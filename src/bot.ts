@@ -339,11 +339,17 @@ docked = false;
   /** The ID of the wreck being towed (if any). */
   towingWreckId: string | null = null;
 
-shipSpeed = 1;
+  shipSpeed = 1;
     hasPathfinderDrive = false;
     hasEmergencyWarpStabilizer: boolean | null = null;
     installedMods: string[] = [];
     hasLeadLinedCargoHold: boolean | null = null;
+    /** Fit marines aboard the ship (from get_ship personnel). */
+    fitMarines = 0;
+    /** Effective marine capacity after hull/module effects (from get_ship). */
+    effectiveMarineCapacity = 0;
+    /** Whether this ship has boarding capability (from get_ship ship class data). */
+    hasBoardingCapability = false;
   private _prevHullPct: number = 100;
   private _prevHasEws: boolean | null = null;
   private _ewsFallbackTriggered = false;
@@ -2129,11 +2135,21 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           }
         }
 
-        if (modulesArray.length > 0 || modulesResolved) {
-          this.installedMods = modulesArray
-            .map(m => moduleTypeId(m) || (m.name as string) || "")
-            .filter(Boolean);
-        }
+         if (modulesArray.length > 0 || modulesResolved) {
+           this.installedMods = modulesArray
+             .map(m => moduleTypeId(m) || (m.name as string) || "")
+             .filter(Boolean);
+         }
+
+         // Parse personnel data
+         const personnel = (ship.personnel as Record<string, unknown> | undefined) || {};
+         this.fitMarines = (personnel.fit_marines as number) ?? 0;
+
+         // Parse boarding capability and effective marine capacity
+         this.effectiveMarineCapacity = (ship.effective_marine_capacity as number) ?? this.effectiveMarineCapacity;
+         // boarding_capability is in the hull/class data block
+         const hullData = (ship.hull_class as Record<string, unknown> | undefined) || {};
+         this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
       }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;

@@ -521,6 +521,15 @@
                     <span class="battle-stance-label">Flee</span>
                     <span class="battle-stance-desc">Auto-retreat</span>
                   </button>
+                  <button
+                    class="battle-stance-btn"
+                    id="stanceBoardBtn"
+                    onclick="battleStance('board')"
+                  >
+                    <span>🚢</span>
+                    <span class="battle-stance-label">Board</span>
+                    <span class="battle-stance-desc">Boarding assault</span>
+                  </button>
                 </div>
               </div>
             </div>
@@ -7364,6 +7373,7 @@
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'flee'})" style="color: var(--red)">Stance Flee</button>
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'brace'})" style="color: var(--red)">Stance Brace</button>
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
+      <button class="sm" onclick="mcExec('battle',{action:'stance',id:'board'})" style="color: var(--green)">Stance Board</button>
     </div>
 
     <div class="cmd-group">
@@ -40586,6 +40596,12 @@ function saveFuelServiceSettings() {
           desc: "Auto-retreat",
           color: "#9e9e9e",
         },
+        board: {
+          label: "Board",
+          icon: "🚢",
+          desc: "Boarding assault",
+          color: "#4caf50",
+        },
       };
 
       /** Check if we're in battle and update UI */
@@ -40906,7 +40922,7 @@ function saveFuelServiceSettings() {
         }
 
         // Stance buttons
-        ["fire", "evade", "brace", "flee"].forEach((stance) => {
+        ["fire", "evade", "brace", "flee", "board"].forEach((stance) => {
           const btn = document.getElementById(
             `stance${stance.charAt(0).toUpperCase() + stance.slice(1)}Btn`,
           );

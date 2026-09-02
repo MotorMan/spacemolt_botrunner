@@ -5668,7 +5668,7 @@ async function* boardingSystemPass(
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
     const entities = parseNearby(nearbyData);
-    const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e));
+    const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
 
     if (pirate_targets.length === 0) {
       if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);

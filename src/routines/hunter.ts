@@ -4891,8 +4891,9 @@ function getTargetShieldPct(
     p => p.player_id === targetId || p.username === targetId || (targetName ? p.username === targetName : false),
   );
   if (!participant) return null;
-  const pct = participant.shield_pct ?? participant.shield_percent;
-  return pct != null ? pct : null;
+  // shield_pct is optional in the API — when omitted, treat as 0 (shields depleted)
+  const pct = participant.shield_pct ?? participant.shield_percent ?? 0;
+  return pct;
 }
 
 /**

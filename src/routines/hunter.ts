@@ -5121,13 +5121,19 @@ export async function boardingSubroutine(
       return "target_eliminated";
     }
 
-     // If not yet boarding, check shield threshold and suppress
+      // If not yet boarding, check shield threshold and suppress
      if (!boardingActive) {
        // Check if we're at the engaged zone — boarding can only start there
        const ourZone = status.your_zone || "outer";
        if (ourZone !== "engaged") {
          const ourZoneNum = zoneDirMap[ourZone] ?? 0;
          if (ourZoneNum < 3) {
+           // Check if target shields are already low — if so, use brace to avoid killing before we can board
+           const shieldCheck = getTargetShieldPct(status, target.id, target.name);
+           if (shieldCheck !== null && shieldCheck <= shieldThreshold) {
+             ctx.log("combat", `🛡️ Boarding: target shields already at ${shieldCheck}% (≤ ${shieldThreshold}%) — holding brace stance while closing to engaged`);
+             await bot.exec("battle", { action: "stance", stance: "brace" });
+           }
            ctx.log("combat", `↩️ Boarding: advancing from ${ourZone} to engaged (required for boarding)...`);
            const adv = await bot.exec("battle", { action: "advance" });
            if (adv.error) {

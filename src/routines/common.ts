@@ -5368,6 +5368,7 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     },
     ctx.bot.system,
     ctx.bot.poi,
+    ctx.bot.username,
   ));
 
   return status;
@@ -5528,7 +5529,7 @@ export async function handleBattleNotifications(
       case "battle_tick":
         // Debug: log full battle update state for every tick
         {
-          const debugLines = formatBattleUpdateDebug(battleNotif, ctx.bot.system, ctx.bot.poi);
+          const debugLines = formatBattleUpdateDebug(battleNotif, ctx.bot.system, ctx.bot.poi, ctx.bot.username);
           ctx.log("combat", debugLines);
         }
 
@@ -6023,16 +6024,30 @@ export function formatBattleUpdateDebug(
   data: BattleDebugData,
   botSystem: string | undefined,
   botPoi: string | undefined,
+  botUsername?: string,
 ): string {
   const lines: string[] = [];
 
   const stance = data.your_stance || "unknown";
   const zone = data.your_zone || "unknown";
-  const ourSide = data.your_side_id;
+  let ourSide = data.your_side_id;
+
+  // Fallback: if your_side_id isn't available (e.g. first get_battle_status poll
+  // before the WebSocket battle_update has arrived), try to find our own participant
+  // in the participants array by matching username. This lets us correctly classify
+  // enemies vs friendlies even without the push-notification side_id.
+  if (ourSide === undefined && botUsername && data.participants && data.participants.length > 0) {
+    const ourParticipant = data.participants.find(
+      p => typeof p === "object" && (p as Record<string, unknown>).username === botUsername,
+    );
+    if (ourParticipant) {
+      ourSide = (ourParticipant as Record<string, unknown>).side_id as number | undefined;
+    }
+  }
 
   const loc = botSystem || "?";
   const poi = botPoi ? `/${botPoi}` : "";
-  lines.push(`\x1b[96m⚔ [BattleUpdate tick:${data.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}\x1b[0m`);
+  lines.push(`⚔ [BattleUpdate tick:${data.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}`);
 
   const participants = data.participants;
   if (!participants || participants.length === 0) {
@@ -6053,11 +6068,7 @@ export function formatBattleUpdateDebug(
     }
   }
 
-  const hpColor = (pct: number): string =>
-    pct < 30 ? "\x1b[91m" : pct < 70 ? "\x1b[93m" : "\x1b[92m";
-  const RESET = "\x1b[0m";
-
-  const fmt = (p: Record<string, unknown>, color: string) => {
+  const fmt = (p: Record<string, unknown>, label: string) => {
     const username = (p.username as string) || (p.ship_name as string) || "???";
     const kind = (p.kind as string) || "";
     const shipClass = (p.ship_class as string) || "";
@@ -6071,22 +6082,20 @@ export function formatBattleUpdateDebug(
     const isNpc = (p.is_npc as boolean);
     const shipInfo = [shipClass, kind].filter(Boolean).join("/");
     const tag = isNpc ? "[NPC]" : "[P]";
-    const label = shipInfo ? `${shipInfo} ` : "";
-    const hc = hpColor(hull);
-    const sc = hpColor(shields);
-    return `    - ${color}${username}${RESET} ${tag}${label} [zone:${pzone} dist:${dist}] hull:${hc}${hull}%${RESET} shields:${sc}${shields}%${RESET} stance:${stanceP} target:${targetDisplay}`;
+    const label2 = shipInfo ? `${shipInfo} ` : "";
+    return `    - ${username} ${label}${tag}${label2} [zone:${pzone} dist:${dist}] hull:${hull}% shields:${shields}% stance:${stanceP} target:${targetDisplay}`;
   };
 
   if (enemies.length > 0) {
-    lines.push(`\x1b[91m  enemies(${enemies.length}):${RESET}`);
-    for (const e of enemies) lines.push(fmt(e as Record<string, unknown>, "\x1b[91m"));
+    lines.push(`  enemies(${enemies.length}):`);
+    for (const e of enemies) lines.push(fmt(e as Record<string, unknown>, "E "));
   } else {
     lines.push("  enemies(0): none");
   }
 
   if (friendlies.length > 0) {
-    lines.push(`\x1b[92m  friendlies(${friendlies.length}):${RESET}`);
-    for (const f of friendlies) lines.push(fmt(f as Record<string, unknown>, "\x1b[92m"));
+    lines.push(`  friendlies(${friendlies.length}):`);
+    for (const f of friendlies) lines.push(fmt(f as Record<string, unknown>, "F "));
   } else {
     lines.push("  friendlies(0): none");
   }

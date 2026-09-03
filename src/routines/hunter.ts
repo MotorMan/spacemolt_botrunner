@@ -5087,191 +5087,193 @@ export async function boardingSubroutine(
     }
   }
 
-   // ── Phase 2: Advance to engaged zone ──
+   // ── Phase 2+3: Suppress shields → close distance → board → monitor ──
+   //
+   // User's directive: "as soon as the target is ready to board, we just engage
+   // boarding stance. it will get us closer and do things for us."
+   //
+   // So instead of a rigid advance-to-engaged phase followed by a separate
+   // shield-check, we run a single unified loop that:
+   //   1. Checks if battle/target ended / hull is critical
+   //   2. Checks target shield % — if ≤ threshold, brace + board IMMEDIATELY
+   //      (the board stance itself closes distance, so zone doesn't matter)
+   //   3. If shields still high, use fire to suppress + advance to close range
+   //   4. Once boarding starts, monitor the operation to completion
    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-   ctx.log("combat", `⚔️ Boarding: closing distance to engaged with ${target.name}`);
-   await ctx.sleep(10000);
 
-    let ourZone = "outer";
-    for (let attempt = 0; attempt < 6; attempt++) {
-      const initStatus = await getBattleStatus(ctx);
-      if (!initStatus) {
-        ctx.log("combat", `✅ Boarding: battle ended during advance — ${target.name} eliminated!`);
-        return "target_eliminated";
-      }
-      ourZone = initStatus.your_zone || "outer";
-      // Check if our target was killed (e.g. by an assist hunter) during advance
-      const targetParticipant = initStatus.participants.find(
-        p => p.player_id === target.id || p.username === target.name,
-      );
-      if (targetParticipant && targetParticipant.is_destroyed) {
-        ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed during advance — abandoning boarding`);
-        return "target_eliminated";
-      }
-      if (ourZone === "engaged") {
-       ctx.log("combat", "✅ Boarding: already at engaged zone");
-       break;
-     }
-     const ourZoneNum = zoneDirMap[ourZone] ?? 0;
-     if (ourZoneNum < 3) {
-       // Ensure fire stance is active — the game requires dealing damage to advance zones
+   let tickCount = 0;
+   let boardingActive = false;
+   let lastHull = bot.hull;
+
+   while (bot.state === "running") {
+     tickCount++;
+     if (tickCount > BOARD_MAX_TICKS) {
+       ctx.log("combat", "Boarding: timeout reached — switching to fire stance to finish");
        await bot.exec("battle", { action: "stance", stance: "fire" });
-       ctx.log("combat", `↩️ Boarding: advancing from ${ourZone}...`);
-       const advResp = await bot.exec("battle", { action: "advance" });
-       if (advResp.error) {
-         const msg = advResp.error.message.toLowerCase();
-         if (msg.includes("not in battle") || msg.includes("no active battle")) {
-           // Not registered as engaged — re-attack target
-           ctx.log("combat", `⚠️ Advance failed — re-attacking ${target.name}...`);
-           await bot.exec("attack", { target_id: target.id });
-           await ctx.sleep(2000);
-           const postAttackStatus = await getBattleStatus(ctx);
-           if (!postAttackStatus) {
-             ctx.log("combat", `✅ Boarding: battle ended after re-engage — ${target.name} eliminated!`);
-             return "target_eliminated";
-           }
-           continue;
-         }
-         ctx.log("combat", `⚠️ Advance note: ${advResp.error.message}`);
-       }
-       await ctx.sleep(10000);
-     } else {
-       break;
+       return "failed";
      }
-   }
 
-  // ── Phase 3: Shield suppression + boarding ──
-  let tickCount = 0;
-  let boardingActive = false;
-  let lastHull = bot.hull;
+     const status = await getBattleStatus(ctx);
+     if (!status) {
+       ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+       return "target_eliminated";
+     }
 
-  while (bot.state === "running") {
-    tickCount++;
-    if (tickCount > BOARD_MAX_TICKS) {
-      ctx.log("combat", "Boarding: timeout reached — switching to fire stance to finish");
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      return "failed";
-    }
+     // Check hull
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     const damageThisTick = Math.max(0, lastHull - bot.hull);
+     lastHull = bot.hull;
 
-    const status = await getBattleStatus(ctx);
-    if (!status) {
-      ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-      return "target_eliminated";
-    }
+     if (hullPct <= fleeThreshold) {
+       ctx.log("combat", `💀 Boarding: hull critical (${hullPct}%) — FLEEING!`);
+       await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
+       return "retreat";
+     }
 
-    // Check hull
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    const damageThisTick = Math.max(0, lastHull - bot.hull);
-    lastHull = bot.hull;
+     // Check if our target is destroyed
+     const targetParticipant = status.participants.find(
+       p => p.player_id === target.id || p.username === target.name,
+     );
+     if (targetParticipant && targetParticipant.is_destroyed) {
+       ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
+       return "target_eliminated";
+     }
 
-    if (hullPct <= fleeThreshold) {
-      ctx.log("combat", `💀 Boarding: hull critical (${hullPct}%) — FLEEING!`);
-      await emergencyFleeSpam(ctx, `hull at ${hullPct}% during boarding`);
-      return "retreat";
-    }
+       // ── Phase 3: Shield suppression + boarding ──
+       if (!boardingActive) {
+         // Check shield percentage — BEFORE zone check.
+         // If shields are already at/below threshold, brace + board immediately
+         // regardless of our zone. The boarding stance auto-closes distance.
+         const shieldPct = getTargetShieldPct(status, target.id, target.name);
+         // When no boarding clamp is installed, we must wait until shields are completely
+         // depleted (0%) before boarding — otherwise boarding will fail / not be available.
+         // With a boarding clamp, the configured shieldThreshold applies normally.
+         const effectiveShieldThreshold = clampInfo.hasClamp ? shieldThreshold : 0;
 
-    // Check if our target is destroyed
-    const targetParticipant = status.participants.find(
-      p => p.player_id === target.id || p.username === target.name,
-    );
-    if (targetParticipant && targetParticipant.is_destroyed) {
-      ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
-      return "target_eliminated";
-    }
+         if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
+           // Shields are low enough — brace to stop all damage, then issue boarding stance.
+           // Brace prevents accidental kills while we transition to board stance.
+           await bot.exec("battle", { action: "stance", stance: "brace" });
 
-      // If not yet boarding, check shield threshold and suppress
-     if (!boardingActive) {
-       // Check if we're at the engaged zone — boarding can only start there
-       const ourZone = status.your_zone || "outer";
-       if (ourZone !== "engaged") {
-         const ourZoneNum = zoneDirMap[ourZone] ?? 0;
-         if (ourZoneNum < 3) {
-           // Use fire stance while advancing — the game requires dealing damage to advance zones.
-           // We only hold brace once at engaged with low shields, to avoid killing the target
-           // before we can issue board stance.
-           await bot.exec("battle", { action: "stance", stance: "fire" });
-           ctx.log("combat", `↩️ Boarding: advancing from ${ourZone} to engaged (required for boarding)...`);
-           const adv = await bot.exec("battle", { action: "advance" });
-           if (adv.error) {
-             const msg = adv.error.message.toLowerCase();
+           // Target the enemy first (some servers require a target before board stance)
+           const tgtResp = await bot.exec("battle", { action: "target", target_id: target.id });
+           if (tgtResp.error) {
+             const msg = tgtResp.error.message.toLowerCase();
              if (msg.includes("not in battle") || msg.includes("no active battle")) {
-               ctx.log("combat", "✅ Boarding: battle ended during advance");
+               ctx.log("combat", "✅ Boarding: battle ended during targeting");
                return "target_eliminated";
              }
            }
-         }
-         await ctx.sleep(BOARD_TICK_MS);
-         continue;
-       }
 
-       // We're at engaged zone — target the enemy
-       const tgtResp = await bot.exec("battle", { action: "target", target_id: target.id });
-       if (tgtResp.error) {
-         const msg = tgtResp.error.message.toLowerCase();
-         if (msg.includes("not in battle") || msg.includes("no active battle")) {
-           ctx.log("combat", "✅ Boarding: battle ended during targeting");
-           return "target_eliminated";
-         }
-       }
+           ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);
+           const boardResp = await bot.exec("battle", {
+             action: "stance",
+             stance: "board",
+             target_id: target.id,
+             marines: marines,
+           });
+           if (boardResp.error) {
+             const msg = boardResp.error.message.toLowerCase();
+             if (msg.includes("not in battle") || msg.includes("no active battle")) {
+               ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
+               return "target_eliminated";
+             }
+             // Try with target name instead of id (some servers require name)
+             const boardRespName = await bot.exec("battle", {
+               action: "stance",
+               stance: "board",
+               target_id: target.name,
+               marines: marines,
+             });
+             if (boardRespName.error) {
+               const msg2 = boardRespName.error.message.toLowerCase();
+               if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
+                 ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
+                 return "target_eliminated";
+               }
+               // Board stance failed — probably not at engaged range yet.
+               // Try one advance with fire (brief damage burst), then brace + retry board.
+               const ourZone = status.your_zone || "outer";
+               if (ourZone !== "engaged" && zoneDirMap[ourZone] !== undefined && zoneDirMap[ourZone] < 3) {
+                 ctx.log("combat", `↩️ Boarding: not at engaged (${ourZone}) — advancing then retrying board stance`);
+                 await bot.exec("battle", { action: "stance", stance: "fire" });
+                 const adv = await bot.exec("battle", { action: "advance" });
+                 if (adv.error) {
+                   const amsg = adv.error.message.toLowerCase();
+                   if (amsg.includes("not in battle") || amsg.includes("no active battle")) {
+                     ctx.log("combat", "✅ Boarding: battle ended during advance");
+                     return "target_eliminated";
+                   }
+                 }
+                 await ctx.sleep(BOARD_TICK_MS);
+                 // Re-retrieve status, check target not destroyed, then brace + retry board
+                 const retryStatus = await getBattleStatus(ctx);
+                 if (!retryStatus) {
+                   ctx.log("combat", "✅ Boarding: battle ended during advance retry");
+                   return "target_eliminated";
+                 }
+                 const retryTarget = retryStatus.participants.find(
+                   p => p.player_id === target.id || p.username === target.name,
+                 );
+                 if (retryTarget && retryTarget.is_destroyed) {
+                   ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed during advance retry — abandoning boarding`);
+                   return "target_eliminated";
+                 }
+                 await bot.exec("battle", { action: "stance", stance: "brace" });
+                 const retryBoard = await bot.exec("battle", {
+                   action: "stance",
+                   stance: "board",
+                   target_id: target.id,
+                   marines: marines,
+                 });
+                 if (retryBoard.error) {
+                   ctx.log("combat", `⚠️ Boarding: retry board stance failed — ${retryBoard.error.message} — switching to fire to finish`);
+                   await bot.exec("battle", { action: "stance", stance: "fire" });
+                   boardingActive = false;
+                 } else {
+                   ctx.log("combat", `🛸 Boarding: board stance issued (retry)! Operation beginning.`);
+                   boardingActive = true;
+                 }
+               } else {
+                 ctx.log("combat", `⚠️ Boarding: failed to issue board stance at engaged — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
+                 await bot.exec("battle", { action: "stance", stance: "fire" });
+                 boardingActive = false;
+               }
+             } else {
+               ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
+               boardingActive = true;
+             }
+           } else {
+             ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
+             boardingActive = true;
+           }
+         } else {
+          // Shields still high — suppress with fire stance.
+          // Use fire + advance to close distance and reduce shields.
+          // The key: we keep firing ONLY while shields are above threshold.
+          // As soon as they drop, the next loop iteration will brace + board.
+          const enemyStance = targetParticipant?.stance || "unknown";
+          const enemyZone = targetParticipant?.zone || "unknown";
+          const ourZone = status.your_zone || "outer";
+          ctx.log("combat", `Boarding tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Target shields=${shieldPct ?? "unknown"}% (need ≤${effectiveShieldThreshold}%) | Dmg=${damageThisTick}`);
 
-        // Check shield percentage
-        const shieldPct = getTargetShieldPct(status, target.id, target.name);
-        // When no boarding clamp is installed, we must wait until shields are completely
-        // depleted (0%) before boarding — otherwise boarding will fail / not be available.
-        // With a boarding clamp, the configured shieldThreshold applies normally.
-        const effectiveShieldThreshold = clampInfo.hasClamp ? shieldThreshold : 0;
-        if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
-          // Shields are low enough — first brace to stop damaging, then issue boarding stance
-          // Brace prevents accidental kills while we transition to board stance
-          await bot.exec("battle", { action: "stance", stance: "brace" });
-          ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);
-          const boardResp = await bot.exec("battle", {
-            action: "stance",
-            stance: "board",
-            target_id: target.id,
-            marines: marines,
-          });
-          if (boardResp.error) {
-            const msg = boardResp.error.message.toLowerCase();
-            if (msg.includes("not in battle") || msg.includes("no active battle")) {
-              ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
-              return "target_eliminated";
-            }
-            // Try with target name instead of id (some servers require name)
-            const boardRespName = await bot.exec("battle", {
-              action: "stance",
-              stance: "board",
-              target_id: target.name,
-              marines: marines,
-            });
-            if (boardRespName.error) {
-              const msg2 = boardRespName.error.message.toLowerCase();
-              if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
-                ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          if (ourZone !== "engaged" && zoneDirMap[ourZone] !== undefined && zoneDirMap[ourZone] < 3) {
+            const adv = await bot.exec("battle", { action: "advance" });
+            if (adv.error) {
+              const amsg = adv.error.message.toLowerCase();
+              if (amsg.includes("not in battle") || amsg.includes("no active battle")) {
+                ctx.log("combat", "✅ Boarding: battle ended during advance — target eliminated!");
                 return "target_eliminated";
               }
-              ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
-              await bot.exec("battle", { action: "stance", stance: "fire" });
-            } else {
-              ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
-              boardingActive = true;
+              ctx.log("combat", `⚠️ Advance note: ${adv.error.message}`);
             }
-          } else {
-            ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
-            boardingActive = true;
           }
-       } else {
-         // Shields still high — suppress with fire stance at engaged zone
-         const enemyStance = targetParticipant?.stance || "unknown";
-         const enemyZone = targetParticipant?.zone || "unknown";
-         ctx.log("combat", `Boarding tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Target shields=${shieldPct ?? "unknown"}% (need ≤${shieldThreshold}%) | Dmg=${damageThisTick}`);
-
-         await bot.exec("battle", { action: "stance", stance: "fire" });
-         await ctx.sleep(BOARD_TICK_MS);
-       }
-    } else {
-      // Boarding is active — monitor the operation
+          await ctx.sleep(BOARD_TICK_MS);
+        }
+      } else {
+        // Boarding is active — monitor the operation
       const boardingOp = findBoardingOperation(status, target.id);
       if (boardingOp) {
         ctx.log("combat", `🛸 Boarding: operation ${boardingOp.operation_id} — phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);

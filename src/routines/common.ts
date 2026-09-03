@@ -5324,7 +5324,7 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     return null;
   }
 
-  combatDebugLog(bot.username, "battle:get_status", result);
+   combatDebugLog(bot.username, "battle:get_status", result);
 
   // Parse battle status
   const status: BattleStatus = {
@@ -5342,6 +5342,19 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     boarding: (result.boarding as BoardingPublicStatus[]) || undefined,
     combat_state: (result.combat_state as BattleCombatState) || undefined,
   };
+
+  ctx.log("combat", formatBattleUpdateDebug(
+    {
+      your_stance: result.your_stance as string | undefined,
+      your_zone: result.your_zone as string | undefined,
+      your_side_id: result.your_side_id as number | undefined,
+      participants: result.participants as Array<Record<string, unknown>> | undefined,
+      sides: result.sides as Array<Record<string, unknown>> | undefined,
+      tick: result.tick as number | undefined,
+    },
+    ctx.bot.system,
+    ctx.bot.poi,
+  ));
 
   return status;
 }
@@ -5963,6 +5976,21 @@ export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]
 }
 
 /**
+ * Minimal shape that both BattleNotification (from notification parsing) and
+ * BattleStatus (from get_battle_status API polling) satisfy. Used by
+ * formatBattleUpdateDebug so either code path can produce consistent debug
+ * output.
+ */
+interface BattleDebugData {
+  your_stance?: string;
+  your_zone?: string;
+  your_side_id?: number;
+  participants?: Array<Record<string, unknown>>;
+  sides?: Array<Record<string, unknown>>;
+  tick?: number;
+}
+
+/**
  * Format a one-line debug summary of every participant in a battle_update,
  * partitioning them into enemies vs friendlies relative to our own side.
  *
@@ -5973,26 +6001,26 @@ export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]
  *   friendlies(1):
  *     - MyBot (player) [zone:engaged dist:0] hull:80% shields:60% stance:fire target:Raider
  *
- * @param notif  Parsed BattleNotification (type "battle_tick") with participants
+ * @param data  Battle notification or status with stance/zone/participants
  * @param botSystem  Current system ID of the bot
  * @param botPoi  Current POI ID of the bot
  */
 export function formatBattleUpdateDebug(
-  notif: BattleNotification,
+  data: BattleDebugData,
   botSystem: string | undefined,
   botPoi: string | undefined,
 ): string {
   const lines: string[] = [];
 
-  const stance = notif.your_stance || "unknown";
-  const zone = notif.your_zone || "unknown";
-  const ourSide = notif.your_side_id;
+  const stance = data.your_stance || "unknown";
+  const zone = data.your_zone || "unknown";
+  const ourSide = data.your_side_id;
 
   const loc = botSystem || "?";
   const poi = botPoi ? `/${botPoi}` : "";
-  lines.push(`⚔ [BattleUpdate tick:${notif.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}`);
+  lines.push(`⚔ [BattleUpdate tick:${data.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}`);
 
-  const participants = notif.participants;
+  const participants = data.participants;
   if (!participants || participants.length === 0) {
     lines.push("  (no participant data — server returned empty participant list)");
     return lines.join("\n");

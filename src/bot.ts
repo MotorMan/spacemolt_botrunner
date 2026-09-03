@@ -392,6 +392,11 @@ docked = false;
     battleId: string | null;
     lastUpdate: number; // Timestamp of last battle update
     participants: Array<Record<string, unknown>>;
+    /** From battle_update WebSocket notifications — not always present in get_battle_status API response */
+    yourStance?: string;
+    yourZone?: string;
+    yourSideId?: number;
+    lastTick?: number;
   } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
 
   /** Track the last known observation subscription ID and its cached presence data.
@@ -3489,6 +3494,10 @@ getSkillLevel(skillId: string): number {
     this.currentBattle.battleId = null;
     this.currentBattle.participants = [];
     this.currentBattle.lastUpdate = Date.now();
+    this.currentBattle.yourStance = undefined;
+    this.currentBattle.yourZone = undefined;
+    this.currentBattle.yourSideId = undefined;
+    this.currentBattle.lastTick = undefined;
   }
 
   /**
@@ -4076,20 +4085,26 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
             : this.currentBattle.participants;
           debugLogForBot(this.username, "bot:battle", `${this.username} battle_started: ${battleId}`);
         }
-       } else if (msgType === "battle_update" && data && typeof data === "object") {
-        const battleId = (data.battle_id as string) || "";
-        const tick = (data.tick as number) || 0;
-        const participants = Array.isArray(data.participants) ? data.participants : [];
-        
-        if (battleId) {
-          // We're in battle - update global state
-          this.currentBattle.inBattle = true;
-          this.currentBattle.battleId = battleId;
-          this.currentBattle.lastUpdate = Date.now();
-          this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+        } else if (msgType === "battle_update" && data && typeof data === "object") {
+         const battleId = (data.battle_id as string) || "";
+         const tick = (data.tick as number) || 0;
+         const participants = Array.isArray(data.participants) ? data.participants : [];
+         
+         if (battleId) {
+           // We're in battle - update global state
+           this.currentBattle.inBattle = true;
+           this.currentBattle.battleId = battleId;
+           this.currentBattle.lastUpdate = Date.now();
+           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+           // Stash our own stance/zone/side_id/tick from the push notification —
+           // the get_battle_status API response doesn't include these fields.
+           this.currentBattle.yourStance = (data.your_stance as string) || undefined;
+           this.currentBattle.yourZone = (data.your_zone as string) || undefined;
+           this.currentBattle.yourSideId = (data.your_side_id as number) || undefined;
+           this.currentBattle.lastTick = tick > 0 ? tick : undefined;
 
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
-        }
+           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length} stance:${this.currentBattle.yourStance} zone:${this.currentBattle.yourZone} side:${this.currentBattle.yourSideId}`);
+         }
        } else if (msgType === "battle_ended" && data && typeof data === "object") {
         // Authoritative lib signal: the battle is over for everyone. Clear our
         // battle flag immediately so isInBattle() stops reporting a stale

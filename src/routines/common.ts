@@ -5326,31 +5326,45 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
 
    combatDebugLog(bot.username, "battle:get_status", result);
 
+  // Merge WebSocket-pushed battle_update fields with the fresh API response.
+  // The get_battle_status API response does NOT include your_stance / your_zone
+  // / your_side_id / tick — those only arrive via the battle_update WebSocket
+  // push notification. Fall back to the WebSocket-stored values when the API
+  // response doesn't include them.
+  const ws = bot.currentBattle;
+  const resultWithWs: Record<string, unknown> = {
+    ...result,
+    your_stance: result.your_stance ?? ws.yourStance,
+    your_zone: result.your_zone ?? ws.yourZone,
+    your_side_id: result.your_side_id ?? ws.yourSideId,
+    tick: result.tick ?? ws.lastTick,
+  };
+
   // Parse battle status
   const status: BattleStatus = {
-    battle_id: (result.battle_id as string) || "",
-    tick: (result.tick as number) || undefined,
-    system_id: (result.system_id as string) || undefined,
-    sides: (result.sides as BattleSide[]) || [],
-    participants: (result.participants as BattleParticipant[]) || [],
-    your_side_id: (result.your_side_id as number) || undefined,
-    your_zone: (result.your_zone as BattleZone) || undefined,
-    your_stance: (result.your_stance as BattleStance) || undefined,
-    your_target_id: (result.your_target_id as string) || undefined,
-    auto_pilot: (result.auto_pilot as boolean) || undefined,
-    is_participant: (result.is_participant as boolean) || false,
-    boarding: (result.boarding as BoardingPublicStatus[]) || undefined,
-    combat_state: (result.combat_state as BattleCombatState) || undefined,
+    battle_id: (resultWithWs.battle_id as string) || "",
+    tick: (resultWithWs.tick as number) || undefined,
+    system_id: (resultWithWs.system_id as string) || undefined,
+    sides: (resultWithWs.sides as BattleSide[]) || [],
+    participants: (resultWithWs.participants as BattleParticipant[]) || [],
+    your_side_id: (resultWithWs.your_side_id as number) || undefined,
+    your_zone: (resultWithWs.your_zone as BattleZone) || undefined,
+    your_stance: (resultWithWs.your_stance as BattleStance) || undefined,
+    your_target_id: (resultWithWs.your_target_id as string) || undefined,
+    auto_pilot: (resultWithWs.auto_pilot as boolean) || undefined,
+    is_participant: (resultWithWs.is_participant as boolean) || false,
+    boarding: (resultWithWs.boarding as BoardingPublicStatus[]) || undefined,
+    combat_state: (resultWithWs.combat_state as BattleCombatState) || undefined,
   };
 
   ctx.log("combat", formatBattleUpdateDebug(
     {
-      your_stance: result.your_stance as string | undefined,
-      your_zone: result.your_zone as string | undefined,
-      your_side_id: result.your_side_id as number | undefined,
-      participants: result.participants as Array<Record<string, unknown>> | undefined,
-      sides: result.sides as Array<Record<string, unknown>> | undefined,
-      tick: result.tick as number | undefined,
+      your_stance: resultWithWs.your_stance as string | undefined,
+      your_zone: resultWithWs.your_zone as string | undefined,
+      your_side_id: resultWithWs.your_side_id as number | undefined,
+      participants: resultWithWs.participants as Array<Record<string, unknown>> | undefined,
+      sides: resultWithWs.sides as Array<Record<string, unknown>> | undefined,
+      tick: resultWithWs.tick as number | undefined,
     },
     ctx.bot.system,
     ctx.bot.poi,
@@ -6018,7 +6032,7 @@ export function formatBattleUpdateDebug(
 
   const loc = botSystem || "?";
   const poi = botPoi ? `/${botPoi}` : "";
-  lines.push(`⚔ [BattleUpdate tick:${data.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}`);
+  lines.push(`\x1b[96m⚔ [BattleUpdate tick:${data.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}\x1b[0m`);
 
   const participants = data.participants;
   if (!participants || participants.length === 0) {
@@ -6039,34 +6053,40 @@ export function formatBattleUpdateDebug(
     }
   }
 
-  const fmt = (p: Record<string, unknown>) => {
+  const hpColor = (pct: number): string =>
+    pct < 30 ? "\x1b[91m" : pct < 70 ? "\x1b[93m" : "\x1b[92m";
+  const RESET = "\x1b[0m";
+
+  const fmt = (p: Record<string, unknown>, color: string) => {
     const username = (p.username as string) || (p.ship_name as string) || "???";
     const kind = (p.kind as string) || "";
     const shipClass = (p.ship_class as string) || "";
-    const hull = (p.hull_pct as number) ?? (p.hull_percent as number) ?? "?";
-    const shields = (p.shield_pct as number) ?? (p.shield_percent as number) ?? "?";
+    const hull = (p.hull_pct as number) ?? (p.hull_percent as number) ?? 0;
+    const shields = (p.shield_pct as number) ?? (p.shield_percent as number) ?? 0;
     const pzone = (p.zone as string) || "?";
     const dist = (p.zone_distance as number) ?? "?";
-    const stanceP = (p.stance as string) || "?";
+    const stanceP = (p.stance as string) || "-";
     const target = (p.target_id as string) || "";
     const targetDisplay = target || "None";
     const isNpc = (p.is_npc as boolean);
     const shipInfo = [shipClass, kind].filter(Boolean).join("/");
     const tag = isNpc ? "[NPC]" : "[P]";
     const label = shipInfo ? `${shipInfo} ` : "";
-    return `    - ${username} ${tag}${label} [zone:${pzone} dist:${dist}] hull:${hull}% shields:${shields}% stance:${stanceP} target:${targetDisplay}`;
+    const hc = hpColor(hull);
+    const sc = hpColor(shields);
+    return `    - ${color}${username}${RESET} ${tag}${label} [zone:${pzone} dist:${dist}] hull:${hc}${hull}%${RESET} shields:${sc}${shields}%${RESET} stance:${stanceP} target:${targetDisplay}`;
   };
 
   if (enemies.length > 0) {
-    lines.push(`  enemies(${enemies.length}):`);
-    for (const e of enemies) lines.push(fmt(e as Record<string, unknown>));
+    lines.push(`\x1b[91m  enemies(${enemies.length}):${RESET}`);
+    for (const e of enemies) lines.push(fmt(e as Record<string, unknown>, "\x1b[91m"));
   } else {
     lines.push("  enemies(0): none");
   }
 
   if (friendlies.length > 0) {
-    lines.push(`  friendlies(${friendlies.length}):`);
-    for (const f of friendlies) lines.push(fmt(f as Record<string, unknown>));
+    lines.push(`\x1b[92m  friendlies(${friendlies.length}):${RESET}`);
+    for (const f of friendlies) lines.push(fmt(f as Record<string, unknown>, "\x1b[92m"));
   } else {
     lines.push("  friendlies(0): none");
   }

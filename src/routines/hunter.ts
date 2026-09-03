@@ -5114,56 +5114,66 @@ export async function boardingSubroutine(
        return "failed";
      }
 
-       const status = await getBattleStatus(ctx);
-       if (!status) {
-         if (boardingActive) {
-           ctx.log("combat", `✅ Boarding: battle ended during active boarding — polling for captured prize (up to 3 checks)`);
-           let foundPrize = false;
-           for (let prizeTick = 0; prizeTick < 3; prizeTick++) {
-             await ctx.sleep(2000);
-             const nearbyResult = await getObservationOrNearby(bot);
-             const nearbyData = nearbyResult.result;
-             const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
-             const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
-             if (capturedPrize) {
-               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found on poll ${prizeTick + 1}: ${capturedPrize.ship_name || capturedPrize.prize_id})`);
-               foundPrize = true;
-               break;
-             }
-             ctx.log("combat", `🛸 Prize poll ${prizeTick + 1}/3 — no prize yet, waiting...`);
-             
-             // Also check prizeRecoveries in case it appeared there first
-             await bot.refreshStatus();
-             const recoveries = bot.prizeRecoveries;
-             const activeRecovery = recoveries.find(r => r.status === "in_transit" || r.status === "claimed");
-             if (activeRecovery) {
-               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (active prize recovery found: ${activeRecovery.ship_name || activeRecovery.prize_id})`);
-               foundPrize = true;
-               break;
-             }
-           }
-           
-           if (!foundPrize) {
-             ctx.log("combat", `⚠️ Boarding: battle ended — no prize found after 3 polls, checking if target was eliminated instead`);
-             const nearbyResult = await getObservationOrNearby(bot);
-             const nearbyData = nearbyResult.result;
-             const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
-             const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
-             if (capturedPrize) {
-               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found in final check)`);
-               return "captured";
-             }
-             ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-           }
-           
-           if (foundPrize) {
-             return "captured";
-           }
-         } else {
-           ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-         }
-         return "target_eliminated";
-       }
+        const status = await getBattleStatus(ctx);
+        if (!status) {
+          if (boardingActive) {
+            ctx.log("combat", `✅ Boarding: battle ended during active boarding — polling for captured prize (up to 8 checks, 3s apart)`);
+            let foundPrize = false;
+            for (let prizeTick = 0; prizeTick < 8; prizeTick++) {
+              await ctx.sleep(3000);
+              const nearbyResult = await getObservationOrNearby(bot);
+              const nearbyData = nearbyResult.result;
+              const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+              const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+              if (capturedPrize) {
+                ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found on poll ${prizeTick + 1}: ${capturedPrize.ship_name || capturedPrize.prize_id})`);
+                foundPrize = true;
+                break;
+              }
+              ctx.log("combat", `🛸 Prize poll ${prizeTick + 1}/8 — no prize yet, waiting...`);
+              
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              const activeRecovery = recoveries.find(r => r.status === "in_transit" || r.status === "claimed");
+              if (activeRecovery) {
+                ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (active prize recovery: ${activeRecovery.ship_name || activeRecovery.prize_id})`);
+                foundPrize = true;
+                break;
+              }
+            }
+            
+            if (!foundPrize) {
+              ctx.log("combat", `⚠️ Boarding: prize not visible after 8 polls — checking target status`);
+              const nearbyResult = await getObservationOrNearby(bot);
+              const nearbyData = nearbyResult.result;
+              const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+              const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+              if (capturedPrize) {
+                ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found in final check)`);
+                return "captured";
+              }
+              
+              const finalStatus = await getBattleStatus(ctx);
+              if (finalStatus) {
+                const tp = finalStatus.participants.find(p => p.player_id === target.id || p.username === target.name);
+                if (tp && tp.is_destroyed) {
+                  ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+                  return "target_eliminated";
+                }
+              }
+              
+              ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (boarding was active, assuming capture — prize may still be spawning)`);
+              return "captured";
+            }
+            
+            if (foundPrize) {
+              return "captured";
+            }
+          } else {
+            ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+          }
+          return "target_eliminated";
+        }
 
      // Check hull
      await bot.refreshShip();
@@ -5617,20 +5627,11 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     const recoveries = bot.prizeRecoveries;
 
     if (recoveries.length === 0) {
-      // No recovery record yet — try to claim at current POI
       const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
       if (!claimed) {
-        // Prize might be at a different POI in this system (battles are system-wide).
-        // Search all system POIs for the prize ship.
         const found = await findAndClaimPrizeAcrossSystem(ctx, settings, knownShipId);
         if (!found) {
-          // Could not find or claim the prize
-          if (knownShipId) {
-            ctx.log("combat", `🔍 RecoverPrize: could not find prize (ship_id: ${knownShipId}) at any POI in ${bot.system} — may have been claimed by another pilot or expired`);
-          } else {
-            ctx.log("combat", `RecoverPrize: could not claim prize — may need to be at the right POI or another pilot may have already claimed it`);
-          }
-          return false;
+          ctx.log("combat", `RecoverPrize: prize not visible yet — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
         }
       }
     } else {

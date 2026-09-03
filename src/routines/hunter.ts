@@ -5104,6 +5104,7 @@ export async function boardingSubroutine(
    let tickCount = 0;
    let boardingActive = false;
    let lastHull = bot.hull;
+   let lastBoardRetryTick = 0;
 
    while (bot.state === "running") {
      tickCount++;
@@ -5113,24 +5114,56 @@ export async function boardingSubroutine(
        return "failed";
      }
 
-      const status = await getBattleStatus(ctx);
-      if (!status) {
-        if (boardingActive) {
-          ctx.log("combat", `✅ Boarding: battle ended during active boarding — checking for captured prize`);
-          const nearbyResult = await getObservationOrNearby(bot);
-          const nearbyData = nearbyResult.result;
-          const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
-          const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
-          if (capturedPrize) {
-            ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize detected after battle end)`);
-            return "captured";
-          }
-          ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-        } else {
-          ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-        }
-        return "target_eliminated";
-      }
+       const status = await getBattleStatus(ctx);
+       if (!status) {
+         if (boardingActive) {
+           ctx.log("combat", `✅ Boarding: battle ended during active boarding — polling for captured prize (up to 3 checks)`);
+           let foundPrize = false;
+           for (let prizeTick = 0; prizeTick < 3; prizeTick++) {
+             await ctx.sleep(2000);
+             const nearbyResult = await getObservationOrNearby(bot);
+             const nearbyData = nearbyResult.result;
+             const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+             const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+             if (capturedPrize) {
+               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found on poll ${prizeTick + 1}: ${capturedPrize.ship_name || capturedPrize.prize_id})`);
+               foundPrize = true;
+               break;
+             }
+             ctx.log("combat", `🛸 Prize poll ${prizeTick + 1}/3 — no prize yet, waiting...`);
+             
+             // Also check prizeRecoveries in case it appeared there first
+             await bot.refreshStatus();
+             const recoveries = bot.prizeRecoveries;
+             const activeRecovery = recoveries.find(r => r.status === "in_transit" || r.status === "claimed");
+             if (activeRecovery) {
+               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (active prize recovery found: ${activeRecovery.ship_name || activeRecovery.prize_id})`);
+               foundPrize = true;
+               break;
+             }
+           }
+           
+           if (!foundPrize) {
+             ctx.log("combat", `⚠️ Boarding: battle ended — no prize found after 3 polls, checking if target was eliminated instead`);
+             const nearbyResult = await getObservationOrNearby(bot);
+             const nearbyData = nearbyResult.result;
+             const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+             const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+             if (capturedPrize) {
+               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found in final check)`);
+               return "captured";
+             }
+             ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+           }
+           
+           if (foundPrize) {
+             return "captured";
+           }
+         } else {
+           ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+         }
+         return "target_eliminated";
+       }
 
      // Check hull
      await bot.refreshShip();
@@ -5280,33 +5313,40 @@ export async function boardingSubroutine(
           // Check if shields went above threshold — only then switch to fire.
           // If shields are still ≤ threshold, re-try board stance instead of
           // switching to fire and wasting time suppressing shields again.
-          const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
-          const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
-          if (shieldPctNow !== null && shieldPctNow <= effectiveShieldThresholdNow) {
-            ctx.log("combat", `↩️ Boarding: operation dropped but shields still low (${shieldPctNow}% ≤ ${effectiveShieldThresholdNow}%) — re-issuing board stance`);
-            await bot.exec("battle", { action: "stance", stance: "brace" });
-            const retryBoard = await bot.exec("battle", {
-              action: "stance",
-              stance: "board",
-              target_id: target.id,
-              marines: marines,
-            });
-            if (retryBoard.error) {
-              const msg = retryBoard.error.message.toLowerCase();
-              if (msg.includes("not in battle") || msg.includes("no active battle")) {
-                ctx.log("combat", "✅ Boarding: battle ended during board retry");
-                return "target_eliminated";
-              }
-              if (msg.includes("already") || msg.includes("queued")) {
-                ctx.log("combat", `🛸 Boarding: board stance already queued — continuing to monitor`);
-              } else {
-                ctx.log("combat", `⚠️ Boarding: re-issue board failed — ${retryBoard.error.message}`);
-              }
-            } else {
-              ctx.log("combat", `🛸 Boarding: board stance re-issued! Continuing operation.`);
-            }
-            // Keep boardingActive true — we re-issued board stance
-          } else {
+           const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
+           const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
+           if (shieldPctNow !== null && shieldPctNow <= effectiveShieldThresholdNow) {
+             const ticksSinceRetry = tickCount - lastBoardRetryTick;
+             if (ticksSinceRetry < 3) {
+               ctx.log("combat", `🛸 Boarding: waiting before retry (${ticksSinceRetry}/3 ticks since last retry)`);
+             } else {
+               ctx.log("combat", `↩️ Boarding: operation dropped but shields still low (${shieldPctNow}% ≤ ${effectiveShieldThresholdNow}%) — re-issuing board stance`);
+               await bot.exec("battle", { action: "stance", stance: "brace" });
+               const retryBoard = await bot.exec("battle", {
+                 action: "stance",
+                 stance: "board",
+                 target_id: target.id,
+                 marines: marines,
+               });
+               if (retryBoard.error) {
+                 const msg = retryBoard.error.message.toLowerCase();
+                 if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                   ctx.log("combat", "✅ Boarding: battle ended during board retry");
+                   return "target_eliminated";
+                 }
+                 if (msg.includes("already") || msg.includes("queued")) {
+                   ctx.log("combat", `🛸 Boarding: board stance already queued — backing off, will not retry for 3 ticks`);
+                   lastBoardRetryTick = tickCount;
+                 } else {
+                   ctx.log("combat", `⚠️ Boarding: re-issue board failed — ${retryBoard.error.message}`);
+                   lastBoardRetryTick = tickCount;
+                 }
+               } else {
+                 ctx.log("combat", `🛸 Boarding: board stance re-issued! Continuing operation.`);
+                 lastBoardRetryTick = tickCount;
+               }
+             }
+           } else {
             // Shields above threshold — boarding attempt failed, legitimately switch to fire
             ctx.log("combat", `Boarding: operation ended, shields at ${shieldPctNow ?? "unknown"}% — finishing with fire stance`);
             await bot.exec("battle", { action: "stance", stance: "fire" });
@@ -5920,6 +5960,17 @@ async function* boardingSystemPass(
         continue;
       }
 
+      // Check for any available prizes at this POI before engaging
+      const preBattlePrizes = getNearbyPrizes(freshScanResp.result);
+      const preBattlePrize = preBattlePrizes.find(p => p.status === "available" || p.status === "claimed");
+      if (preBattlePrize) {
+        ctx.log("combat", `🛸 Found unclaimed prize ${preBattlePrize.ship_name || preBattlePrize.prize_id} at ${poi.name} before engaging ${target.name}`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        if (claimed) {
+          ctx.log("combat", `🏆 Prize claimed before engaging ${target.name}`);
+        }
+      }
+
       // Determine if we should attempt boarding this target
       const canBoard = settings.boardingEnabled
         && settings.boardingShieldThreshold > 0
@@ -6053,11 +6104,27 @@ async function* boardingSystemPass(
            ctx.log("combat", "Low on repair kits or shield charges — ending sweep to resupply");
            break;
          }
-       }
-     }
-   }
+        }
+      }
+    }
 
-  // ── Post-patrol decision ──
+    // After processing all targets at this POI, check for any prizes left behind
+    // (from battles that happened before we arrived, or from captures we missed)
+    yield "check_prizes";
+    const prizeCheckResp = await bot.exec("get_nearby");
+    if (!prizeCheckResp.error && prizeCheckResp.result) {
+      const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
+      const missedPrize = prizesAtPoi.find(p => p.status === "available" || p.status === "claimed");
+      if (missedPrize) {
+        ctx.log("combat", `🛸 Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat — claiming now`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        if (claimed) {
+          ctx.log("combat", `🏆 Missed prize from ${bot.poi} successfully claimed!`);
+        }
+      }
+    }
+
+   // ── Post-patrol decision ──
   yield "post_patrol";
   await bot.refreshCargo();
   await bot.refreshShip();

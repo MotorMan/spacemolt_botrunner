@@ -12,7 +12,6 @@ import {
   isRecipeCraftable as isRecipeCraftableNew,
   findRecipeForItem,
   hasRecipeMaterials,
-  settingsGoalSignature,
 } from "./craft-goals.js";
 import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 import { catalogStore } from "../catalogstore.js";
@@ -1698,111 +1697,6 @@ async function waitForCompletion(
   return false;
 }
 
-async function waitForAllCompletions(
-   ctx: RoutineContext,
-   initialQueuedItems: Array<{ recipeId: string; quantity: number; outputQty: number }>,
-   tracker: CraftQueueTracker,
-   bot: any,
-   recipes: Recipe[],
-   settings?: CrafterSettings | null,
-): Promise<string[]> {
-   const { log } = ctx;
-   const crafted: string[] = [];
-
-   const recipeNames = new Map<string, string>();
-   for (const r of recipes) {
-     recipeNames.set(r.recipe_id, r.name);
-   }
-
-     let lastSync = 0;
-     let lastStatusReport = Date.now();
-     let lastBaseCheck = 0;
-     const BASE_CHECK_COOLDOWN = 60000;
-     let remainingItems = [...initialQueuedItems];
-
-     // Completion must be measured RELATIVE to the runs already done when we
-     // started waiting. `getProgress().completed` is cumulative for the life of a
-     // tracked job, so comparing it against `item.quantity` (which is sized from
-     // the runs still PENDING) declared success immediately for any job that had
-     // already produced that much — that's why a wedged queue kept logging
-     // "Crafted 200x ..." every cycle without crafting anything.
-     const baselineRuns = new Map<string, number>();
-     for (const item of remainingItems) {
-       if (!baselineRuns.has(item.recipeId)) {
-         baselineRuns.set(item.recipeId, tracker.getProgress(item.recipeId).completed);
-       }
-     }
-     // Give up waiting when nothing at all advances for this long. Without it a
-     // job the server keeps listing but never advances (e.g. output storage full)
-     // would hold the routine here forever.
-     const NO_PROGRESS_TIMEOUT_MS = 10 * 60 * 1000;
-     let lastProgressSeen = Date.now();
-     let lastProgressTotal = 0;
-
-     while (bot.state === "running" && remainingItems.length > 0) {
-       await ctx.sleep(5000);
-
-       const now = Date.now();
-       if (now - lastSync >= QUEUE_REFRESH_COOLDOWN) {
-         // Use the full sync path so phantom/stalled jobs get reconciled and
-         // reported while we wait, instead of only raw syncWithServer.
-         await syncCraftingQueue(ctx, tracker, recipes, true);
-         lastSync = now;
-       }
-
-      if (settings?.craftingHomeBase && now - lastBaseCheck >= BASE_CHECK_COOLDOWN) {
-        await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, log);
-        lastBaseCheck = now;
-      }
-
-
-
-      const stillQueued: typeof remainingItems = [];
-      let producedTotal = 0;
-      let sawProgress = false;
-      for (const item of remainingItems) {
-        const progress = tracker.getProgress(item.recipeId);
-        const baseline = baselineRuns.get(item.recipeId) || 0;
-        const completedItems = Math.max(0, progress.completed - baseline) * item.outputQty;
-        producedTotal += completedItems;
-        if (completedItems >= item.quantity) {
-          crafted.push(`${item.quantity}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
-          bot.stats.totalCrafted += item.quantity;
-          sawProgress = true;
-        } else if (progress.remaining <= 0) {
-          // The live queue no longer lists pending runs for this recipe: the job
-          // finished (the crafting_update handler retires completed jobs), was
-          // cancelled, or vanished. Stop waiting instead of spinning forever, and
-          // only credit what we actually observed.
-          if (completedItems > 0) {
-            crafted.push(`${completedItems}x ${recipeNames.get(item.recipeId) || item.recipeId}`);
-            bot.stats.totalCrafted += completedItems;
-          }
-          log("craft", `${recipeNames.get(item.recipeId) || item.recipeId}: job no longer in the live queue (completed or cancelled) - stopping wait (${completedItems}/${item.quantity} items observed)`);
-          sawProgress = true;
-        } else {
-          stillQueued.push(item);
-        }
-      }
-      remainingItems = stillQueued;
-
-      if (sawProgress || producedTotal > lastProgressTotal) {
-        lastProgressTotal = Math.max(lastProgressTotal, producedTotal);
-        lastProgressSeen = Date.now();
-      } else if (remainingItems.length > 0 && Date.now() - lastProgressSeen > NO_PROGRESS_TIMEOUT_MS) {
-        log("warn", `No crafting progress for ${Math.round(NO_PROGRESS_TIMEOUT_MS / 60000)}m while waiting on ${remainingItems.length} job(s) - continuing to the next cycle (jobs stay queued on the server)`);
-        break;
-      }
-
-      if (remainingItems.length > 0 && Date.now() - lastStatusReport >= 60000) {
-        reportQueueStatus(ctx, tracker, recipes);
-        lastStatusReport = Date.now();
-      }
-    }
-
-   return crafted;
- }
-
 async function queueAllRecipesOnce(
     ctx: RoutineContext,
     allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }>,
@@ -1939,7 +1833,7 @@ async function executeCraftingPlan(
     facilityAvailableRecipes?: Set<string>,
     ownFacilityMap: OwnFacilityMap = new Map(),
     settings: CrafterSettings | null = null,
-): Promise<{ crafted: string[]; prereqs: string[]; deadlineHit: boolean }> {
+): Promise<{ crafted: string[]; prereqs: string[] }> {
    const { log, bot } = ctx;
    const crafted: string[] = [];
    const prereqs: string[] = [];
@@ -1997,96 +1891,6 @@ async function executeCraftingPlan(
       return { hasPending, produced };
     };
 
-    let lastStatusReport = Date.now();
-    let stagnationIterations = 0;
-    let stagnationMs = 0;
-    const STAGNATION_BUDGET_MS = 60000;
-    const ACTIVE_LOOP_CAP = 600;
-    let loopCount = 0;
-    let cycleWaitMs = ((settings && settings.cycleTimeSec) || 30) * 1000;
-    // Inner loop uses a short, fixed sleep for responsive dependency resolution.
-    // It must NOT use cycleTimeSec (which can be 300s) — that makes the inner
-    // loop spin at glacial speed, leaving sub-material chains unresolved for
-    // minutes. The outer loop enforces the full cycleTimeSec cadence.
-    const INNER_LOOP_SLEEP_MS = 5000;
-    // Long-running active loops (e.g. 5-minute cycle configs) can run for many
-    // passes during which the operator may ADD/EDIT recipes, adjust the loadout
-    // (craftLimits / recipeFacilityLinks), or otherwise change the world. The
-    // plan below must not keep operating on a snapshot taken at the start of the
-    // run, so we periodically re-read recipes + settings and rebuild the derived
-    // indexes. Without this the crafter plans against an "ancient" recipe/loadout
-    // list and never picks up new storage targets until a full process restart.
-    // (Faction storage, facilities, queue and base-fuel are already re-read every
-    // pass below — only recipes/settings were being held stale.)
-    let lastRevalidate = Date.now();
-    const REVALIDATE_COOLDOWN_MS = 60000;
-
-    // Returns true when goal-affecting settings or the recipe catalog changed
-    // since the last sync, so the caller can break the active-plan loop and let
-    // the outer routine re-derive goals from scratch. This is what makes each
-    // outer cycle a true "fresh start" — without it the inner loop holds stale
-    // quotas/limits/triggers for its entire multi-pass lifetime and silently
-    // ignores operator edits to the loadout.
-    const revalidateInputs = async (): Promise<boolean> => {
-      const now = Date.now();
-      if (now - lastRevalidate < REVALIDATE_COOLDOWN_MS) return false;
-      lastRevalidate = now;
-      let settingsChanged = false;
-      let recipesChanged = false;
-      try {
-        const freshRecipes = await fetchAllRecipes(ctx);
-        if (freshRecipes.length > 0) {
-          // Only flag recipesChanged when the recipe SET actually changed —
-          // NOT every fetch. Previously this was set true unconditionally on
-          // every revalidation pass, which broke the inner loop after a single
-          // iteration (the 300s inner sleep always exceeded the 60s
-          // REVALIDATE_COOLDOWN, so revalidation always "succeeded" and the
-          // loop bailed before resolving dependency chains). Comparing recipe
-          // IDs is sufficient: a recipe's per-run quantity or time does not
-          // alter which goals are derivable, only which recipes exist.
-          const oldIds = new Set(recipes.map(r => r.recipe_id));
-          let changed = freshRecipes.length !== recipes.length;
-          if (!changed) {
-            for (const r of freshRecipes) {
-              if (!oldIds.has(r.recipe_id)) { changed = true; break; }
-            }
-          }
-          if (changed) {
-            recipes = freshRecipes;
-            recipeIndex = new Map(recipes.map(r => [r.recipe_id, r]));
-            recipesChanged = true;
-          }
-        }
-      } catch (e) {
-        log("warn", `Recipe revalidation failed, keeping previous recipe list: ${(e as Error)?.message || e}`);
-      }
-      try {
-        const freshSettings = await getCrafterSettings();
-        if (settingsGoalSignature(freshSettings) !== settingsGoalSignature(settings)) {
-          settingsChanged = true;
-          log("craft", `Goal-affecting settings changed during active plan (quotas/limits/facilities/triggers/home base) - breaking to re-derive goals from scratch on next outer cycle`);
-        }
-        settings = freshSettings;
-        allowedFacilityRecipeIds = new Set(Object.keys(freshSettings.recipeFacilityLinks || {}));
-        cycleWaitMs = (freshSettings.cycleTimeSec || 30) * 1000;
-      } catch (e) {
-        log("warn", `Settings revalidation failed, keeping previous settings: ${(e as Error)?.message || e}`);
-      }
-      if (recipesChanged && !settingsChanged) {
-        log("craft", `Recipe catalog changed during active plan - breaking to re-evaluate on next outer cycle`);
-      }
-      return settingsChanged || recipesChanged;
-    };
-
-    // Wall-clock deadline: the inner plan loop must yield back to the outer loop
-    // within cycleTimeSec seconds so the crafter does a true "soft restart"
-    // (re-read settings, re-derive goals). Without this, with cycleTimeSec=300
-    // the inner loop sleeps 300s per pass and can run for hours (600 passes ×
-    // 300s = 50h), making settings changes invisible for a very long time.
-    let planStartTime = Date.now();
-    const planDeadlineMs = cycleWaitMs;
-    let deadlineHit = false;
-
     // Per-recipe hard ceiling (in limiting-output ITEMS) taken from the
     // configured craftLimit. Used by queueAllRecipesOnce to clamp how much we
     // ever queue, so a recipe can NEVER exceed its limit even if pending tracking
@@ -2101,160 +1905,78 @@ async function executeCraftingPlan(
       }
     }
 
-    // Active loop: keep re-planning and queueing as sub-materials become available.
-    while (bot.state === "running" && loopCount < ACTIVE_LOOP_CAP) {
-      loopCount++;
-      if (await revalidateInputs()) break;
-      await syncCraftingQueue(ctx, tracker, recipes, true);
-      // Re-resolve the facility list each pass. A facility can be upgraded
-      // (level/type change) while the crafter is mid-plan, and routing must
-      // target the current facility rather than the snapshot taken at round
-      // start — otherwise it keeps using the old-level facility.
-      if (settings) {
-        const refreshed = await refreshFacilityMaps(bot, settings);
-        facilityAvailableRecipes = refreshed.facilityAvailableRecipes;
-        ownFacilityMap = refreshed.ownFacilityMap;
+    // Single-pass plan: sync the server queue, compute remaining goal deficits,
+    // build the full multi-goal crafting tree, and queue every recipe in one
+    // shot. Sub-materials that can't be queued yet (their inputs haven't been
+    // produced) are skipped — the next outer cycle (after cycleTimeSec seconds)
+    // re-reads fresh stock/storage and queues them then. This keeps the crafter
+    // simple and predictable: queue once, wait cycleTimeSec, full restart.
+    await syncCraftingQueue(ctx, tracker, recipes, true);
+
+    // Recompute which goals still need production using live stock + in-flight
+    // output. Read pending straight from the authoritative `craft` queue so a
+    // transiently-stale tracker (which would report 0 pending) can never make
+    // us think we're short and re-queue past the limit.
+    const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
+    const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (!recipeId) continue;
+      const liveStock = countItemFn!(g.itemId.toLowerCase());
+      const pendingRuns = livePendingRuns.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
+      const queuedOutput = pendingRuns * outputQtyOf(recipeId);
+      if (liveStock + queuedOutput < g.limit) {
+        remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
       }
-      // Re-read faction storage LIVE each pass. As queued jobs consume/produce
-      // materials on the server, the holdings change continuously; a stale count
-      // here is what makes the planner think it needs to re-refine materials it
-      // already has enough of (e.g. steel_plate). Target the crafting home base
-      // station so a roaming crafter reads the right storage.
-        // Re-read faction storage LIVE each pass. As queued jobs consume/produce
-        // materials on the server, the holdings change continuously; a stale count
-        // here is what makes the planner think it needs to re-refine materials it
-        // already has enough of (e.g. steel_plate). Target the crafting home base
-        // station so a roaming crafter reads the right storage — or, when the home
-        // base is set to "@current", the station the crafter is docked at.
-        const fsArgs = factionStorageRefreshArgs(settings?.craftingHomeBase || "");
-        await bot.refreshFactionStorage(true, fsArgs.stationId, fsArgs.readCurrentStation);
+    }
 
-        // Refresh home station fuel via get_base every pass so fuel_reserve
-        // goals always see the actual station fuel level after jobs complete
-        // between loop iterations. Do this unconditionally when a home base is
-        // configured — it is the only source of truth for base.fuel and the
-        // crafter cannot recover from a stale value. A "@current" home base reads
-        // the docked station instead of a fixed global station.
-        if (settings?.craftingHomeBase) {
-          await refreshCrafterBaseFuel(bot, settings.craftingHomeBase, ctx.log);
-        }
-
-
-      // Recompute which goals still need production using live stock + in-flight
-      // output. Read pending straight from the authoritative `craft` queue so a
-      // transiently-stale tracker (which would report 0 pending) can never make
-      // us think we're short and re-queue past the limit.
-      const livePendingRuns = await computeLivePendingRuns(bot, recipes, true);
-      const remainingGoals: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
-      for (const g of goalsToAchieve) {
-        const recipeId = recipeIdForGoal(g);
-        if (!recipeId) continue;
-        const liveStock = countItemFn!(g.itemId.toLowerCase());
-        const pendingRuns = livePendingRuns.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
-        const queuedOutput = pendingRuns * outputQtyOf(recipeId);
-        if (liveStock + queuedOutput < g.limit) {
-          remainingGoals.push({ itemId: g.itemId, quantity: g.limit - (liveStock + queuedOutput), recipe: g.recipe });
-        }
-      }
-
-     if (remainingGoals.length === 0) {
-       log("craft", "All goals covered by stock + in-flight queue - waiting for production to finish");
-       break;
-     }
-
-      // Whether anything is still in production (including sub-materials we're waiting on).
+    if (remainingGoals.length > 0) {
+      // Credit outputs that in-flight jobs will produce so we can keep building
+      // higher-tier items as soon as their sub-materials appear. We must NOT also
+      // subtract the materials those jobs consume: the server deducts a job's
+      // inputs up-front when it is queued, so the live faction-storage count we
+      // read each pass ALREADY excludes them. Subtracting them again here would
+      // double-count and could zero out a material we genuinely have.
       const { hasPending, produced } = accountPending();
-      const anyPending = hasPending;
       const availableFn = (itemId: string): number => {
         const id = itemId.toLowerCase();
         return Math.max(0, countItemFn!(id) + (produced.get(id) || 0));
       };
 
       const plans = calculateMultiGoalPlan(remainingGoals, recipes, availableFn, facilityAvailableRecipes, countItemFn!, allowedFacilityRecipeIds);
-     const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
-     for (const plan of plans) {
-       log("craft", formatCraftingPlan(plan));
-       for (const item of plan.flatOrder) {
-         allPlanItems.push({
-           recipe: item.recipe,
-           quantityToCraft: Math.max(1, Math.floor(item.quantityToCraft)),
-           reason: item.reason,
-           depth: item.depth,
-         });
-       }
-     }
+      const allPlanItems: Array<{ recipe: Recipe; quantityToCraft: number; reason: string; depth: number }> = [];
+      for (const plan of plans) {
+        log("craft", formatCraftingPlan(plan));
+        for (const item of plan.flatOrder) {
+          allPlanItems.push({
+            recipe: item.recipe,
+            quantityToCraft: Math.max(1, Math.floor(item.quantityToCraft)),
+            reason: item.reason,
+            depth: item.depth,
+          });
+        }
+      }
 
       const effectiveSettings = settings || await getCrafterSettings();
       const { queuedItems } = await queueAllRecipesOnce(ctx, allPlanItems, tracker, recipes, availableFn, ownFacilityMap, effectiveSettings, countItemFn!, livePendingRuns, limitByRecipe);
 
-      // Progress is being made if we queued something this pass, or if the queue
-      // still has jobs producing sub-materials we're waiting on.
-      if (queuedItems > 0 || anyPending) {
-        stagnationIterations = 0;
-        stagnationMs = 0;
-      } else {
-        stagnationIterations++;
-        stagnationMs += INNER_LOOP_SLEEP_MS;
+      if (queuedItems > 0) {
+        log("craft", `Queued ${queuedItems} item(s) this pass - waiting ${settings?.cycleTimeSec || 30}s for the next cycle to re-evaluate`);
       }
-
-      if (Date.now() - lastStatusReport >= 60000) {
-        reportQueueStatus(ctx, tracker, recipes);
-        lastStatusReport = Date.now();
+      if (hasPending && queuedItems === 0) {
+        log("craft", "Sub-materials in production - will be ready next cycle");
       }
-
-      if (stagnationIterations >= ACTIVE_LOOP_CAP || stagnationMs >= STAGNATION_BUDGET_MS) {
-        log("craft", "No new materials to progress crafting - pausing active crafting until next cycle");
-        break;
-      }
-
-      // Wall-clock deadline: the inner plan loop must not run longer than
-      // cycleTimeSec seconds, otherwise the outer loop never gets to re-read
-      // settings / re-derive goals, and the crafter behaves like it "started
-      // once and never restarted". Break here so executeCraftingPlan returns
-      // and the outer cycle begins a fresh pass.
-      if (Date.now() - planStartTime >= planDeadlineMs) {
-        log("craft", `Plan deadline (${planDeadlineMs / 1000}s) reached - soft-restarting outer cycle`);
-        deadlineHit = true;
-        break;
-      }
-
-      log("craft", `Active plan pass ${loopCount} done - waiting ${INNER_LOOP_SLEEP_MS / 1000}s before next pass`);
-      await ctx.sleep(INNER_LOOP_SLEEP_MS);
-    }
-
-    // Wait for the final goal items to actually be produced before returning.
-    // Read the authoritative live pending once up front (a `.map` callback isn't
-    // async, so we can't `await` inside it) so we correctly wait for genuinely
-    // in-flight jobs even if the in-memory tracker briefly lost them.
-    // Skip this wait when the cycle-time deadline was hit: the inner plan loop
-    // already consumed cycleTimeSec seconds, and waitForAllCompletions can block
-    // for 10+ minutes on long-running jobs (e.g. fuel_reserve). Returning
-    // promptly lets the outer loop soft-restart and pick up any settings
-    // changes. In-flight jobs remain on the server queue and are picked up next cycle.
-    if (!deadlineHit) {
-      const liveFinalPending = await computeLivePendingRuns(bot, recipes, true);
-      const finalItems = goalsToAchieve.map(g => {
-        const recipeId = recipeIdForGoal(g);
-        if (!recipeId) return null;
-        const outputQty = outputQtyOf(recipeId);
-        const pendingRuns = liveFinalPending.get(recipeId) ?? tracker.getProgress(recipeId).remaining;
-        const target = pendingRuns * outputQty;
-        return { recipeId, quantity: target, outputQty };
-      }).filter((x): x is { recipeId: string; quantity: number; outputQty: number } => !!x && x.quantity > 0);
-
-      const completed = await waitForAllCompletions(ctx, finalItems, tracker, bot, recipes, settings);
-      crafted.push(...completed);
     } else {
-      ctx.log("info", "Skipping completion wait — cycle deadline reached, jobs remain queued on server");
+      log("craft", "All goals covered by stock + in-flight queue - nothing to queue this cycle");
     }
 
-   for (const g of goalsToAchieve) {
-     const recipeId = recipeIdForGoal(g);
-     if (recipeId) prereqs.push(`${g.limit}x ${recipeIndex.get(recipeId)?.name || recipeId}`);
-   }
+    for (const g of goalsToAchieve) {
+      const recipeId = recipeIdForGoal(g);
+      if (recipeId) prereqs.push(`${g.limit}x ${recipeIndex.get(recipeId)?.name || recipeId}`);
+    }
 
-    return { crafted, prereqs, deadlineHit };
-}
+    return { crafted, prereqs };
+  }
 
 // ── Craft from enabled categories ─────────────────────────────
 
@@ -2717,7 +2439,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("craft", `Executing active queue-based plan (${settings.goalProcessingMode} mode)`);
     const result = await executeCraftingPlan(ctx, goalItems, tracker!, recipes, settings.craftingPreset, settings.finalItemThreshold, countItem, facilityAvailableRecipes, ownFacilityMap, settings);
-    const { crafted: craftedSummary, deadlineHit } = result;
+    const { crafted: craftedSummary } = result;
 
     const parts: string[] = [];
     if (craftedSummary.length > 0) parts.push(`Crafted ${craftedSummary.join(", ")}`);
@@ -2753,11 +2475,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "repair";
     await repairShip(ctx);
 
-    if (deadlineHit) {
-      ctx.log("info", `Cycle deadline reached — restarting immediately (settings changes will be picked up next cycle)`);
-    } else {
-      ctx.log("info", `Waiting ${settings.cycleTimeSec}s before next crafting cycle...`);
-      await ctx.sleep(cycleWaitMs);
-    }
+    ctx.log("info", `Waiting ${settings.cycleTimeSec}s before next crafting cycle...`);
+    await ctx.sleep(cycleWaitMs);
   }
 };

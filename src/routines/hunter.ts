@@ -5101,10 +5101,10 @@ export async function boardingSubroutine(
    //   4. Once boarding starts, monitor the operation to completion
    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
 
-   let tickCount = 0;
-   let boardingActive = false;
-   let lastHull = bot.hull;
-   let lastBoardRetryTick = 0;
+    let tickCount = 0;
+    let boardingActive = false;
+    let lastHull = bot.hull;
+    let boardStanceIssued = false;
 
    while (bot.state === "running") {
      tickCount++;
@@ -5197,63 +5197,54 @@ export async function boardingSubroutine(
          // With a boarding clamp, the configured shieldThreshold applies normally.
          const effectiveShieldThreshold = clampInfo.hasClamp ? shieldThreshold : 0;
 
-         if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
-           // Shields are low enough — brace to stop all damage, then issue boarding stance.
-           // Brace prevents accidental kills while we transition to board stance.
-           await bot.exec("battle", { action: "stance", stance: "brace" });
-
-           // Target the enemy first (some servers require a target before board stance)
-           const tgtResp = await bot.exec("battle", { action: "target", target_id: target.id });
-           if (tgtResp.error) {
-             const msg = tgtResp.error.message.toLowerCase();
-             if (msg.includes("not in battle") || msg.includes("no active battle")) {
-               ctx.log("combat", "✅ Boarding: battle ended during targeting");
-               return "target_eliminated";
+          if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
+            ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);
+            
+            const boardResp = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.id,
+              marines: marines,
+            });
+             if (boardResp.error) {
+               const msg = boardResp.error.message.toLowerCase();
+               if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                 ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
+                 return "target_eliminated";
+               }
+               const boardRespName = await bot.exec("battle", {
+                 action: "stance",
+                 stance: "board",
+                 target_id: target.name,
+                 marines: marines,
+               });
+               if (boardRespName.error) {
+                 const msg2 = boardRespName.error.message.toLowerCase();
+                 if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
+                   ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
+                   return "target_eliminated";
+                 }
+                 if (msg2.includes("already has a boarding stance transition queued this tick") ||
+                     msg2.includes("boarding stance transition queued") ||
+                     msg2.includes("already")) {
+                   ctx.log("combat", "🛸 Boarding: transition already queued — switching to passive monitoring");
+                   boardingActive = true;
+                   boardStanceIssued = true;
+                 } else {
+                   ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
+                   await bot.exec("battle", { action: "stance", stance: "fire" });
+                   boardingActive = false;
+                 }
+               } else {
+                 ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
+                 boardingActive = true;
+                 boardStanceIssued = true;
+               }
+             } else {
+               ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
+               boardingActive = true;
+               boardStanceIssued = true;
              }
-           }
-
-           ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);
-           const boardResp = await bot.exec("battle", {
-             action: "stance",
-             stance: "board",
-             target_id: target.id,
-             marines: marines,
-           });
-            if (boardResp.error) {
-              const msg = boardResp.error.message.toLowerCase();
-              if (msg.includes("not in battle") || msg.includes("no active battle")) {
-                ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
-                return "target_eliminated";
-              }
-              const boardRespName = await bot.exec("battle", {
-                action: "stance",
-                stance: "board",
-                target_id: target.name,
-                marines: marines,
-              });
-              if (boardRespName.error) {
-                const msg2 = boardRespName.error.message.toLowerCase();
-                if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
-                  ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
-                  return "target_eliminated";
-                }
-                if (msg2.includes("already has a boarding stance transition queued this tick") ||
-                    msg2.includes("boarding stance transition queued")) {
-                  ctx.log("combat", "🛸 Boarding: transition already queued — continuing to monitor without retry");
-                  boardingActive = true;
-                } else {
-                  ctx.log("combat", `⚠️ Boarding: failed to issue board stance at engaged — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
-                  await bot.exec("battle", { action: "stance", stance: "fire" });
-                  boardingActive = false;
-                }
-              } else {
-                ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
-                boardingActive = true;
-              }
-            } else {
-              ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
-              boardingActive = true;
-            }
          } else {
           // Shields still high — suppress with fire stance.
           // Use fire + advance to close distance and reduce shields.
@@ -5280,6 +5271,12 @@ export async function boardingSubroutine(
         }
       } else {
         // Boarding is active — monitor the operation
+        if (!boardStanceIssued) {
+          ctx.log("combat", `🛸 Boarding: waiting for board stance to activate...`);
+          await ctx.sleep(BOARD_TICK_MS);
+          continue;
+        }
+        
       const boardingOp = findBoardingOperation(status, target.id);
       if (boardingOp) {
         ctx.log("combat", `🛸 Boarding: operation ${boardingOp.operation_id} — phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);
@@ -5289,68 +5286,57 @@ export async function boardingSubroutine(
         }
         if (boardingOp.phase === "defeat" || boardingOp.phase === "withdrawn") {
           ctx.log("combat", `Boarding: operation ${boardingOp.phase} — target ${boardingOp.phase === "defeat" ? "resisted" : "withdrawn"}`);
-          // If defeated, target may still be alive — try to finish with fire
-          await bot.exec("battle", { action: "stance", stance: "fire" });
           boardingActive = false;
+          boardStanceIssued = false;
         }
       } else {
         // Boarding operation not found in get_battle_status response.
-        // This can happen because the API lags behind the WebSocket push state.
-        // DON'T immediately switch to fire — check if our stance is still "board".
         const ourStanceNow = status.your_stance || "";
         if (ourStanceNow === "board") {
-          // Boarding stance is still active — the get_battle_status response
-          // just doesn't include operation data yet. Keep monitoring, DON'T
-          // switch to fire (that would kill the boarding attempt).
           ctx.log("combat", `🛸 Boarding: operation data not in status yet (stance=board) — continuing to monitor`);
+        } else if (boardStanceIssued) {
+          ctx.log("combat", `🛸 Boarding: board stance no longer active — waiting to see if operation completed`);
+          boardStanceIssued = false;
+          boardingActive = false;
         } else {
-          // Boarding truly ended — check target and shields
           const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
           if (!targetStillAlive) {
             ctx.log("combat", `✅ Boarding: ${target.name} eliminated during operation`);
             return "target_eliminated";
           }
-          // Check if shields went above threshold — only then switch to fire.
-          // If shields are still ≤ threshold, re-try board stance instead of
-          // switching to fire and wasting time suppressing shields again.
-           const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
-           const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
-           if (shieldPctNow !== null && shieldPctNow <= effectiveShieldThresholdNow) {
-             const ticksSinceRetry = tickCount - lastBoardRetryTick;
-             if (ticksSinceRetry < 3) {
-               ctx.log("combat", `🛸 Boarding: waiting before retry (${ticksSinceRetry}/3 ticks since last retry)`);
-             } else {
-               ctx.log("combat", `↩️ Boarding: operation dropped but shields still low (${shieldPctNow}% ≤ ${effectiveShieldThresholdNow}%) — re-issuing board stance`);
-               await bot.exec("battle", { action: "stance", stance: "brace" });
-               const retryBoard = await bot.exec("battle", {
-                 action: "stance",
-                 stance: "board",
-                 target_id: target.id,
-                 marines: marines,
-               });
-               if (retryBoard.error) {
-                 const msg = retryBoard.error.message.toLowerCase();
-                 if (msg.includes("not in battle") || msg.includes("no active battle")) {
-                   ctx.log("combat", "✅ Boarding: battle ended during board retry");
-                   return "target_eliminated";
-                 }
-                 if (msg.includes("already") || msg.includes("queued")) {
-                   ctx.log("combat", `🛸 Boarding: board stance already queued — backing off, will not retry for 3 ticks`);
-                   lastBoardRetryTick = tickCount;
-                 } else {
-                   ctx.log("combat", `⚠️ Boarding: re-issue board failed — ${retryBoard.error.message}`);
-                   lastBoardRetryTick = tickCount;
-                 }
-               } else {
-                 ctx.log("combat", `🛸 Boarding: board stance re-issued! Continuing operation.`);
-                 lastBoardRetryTick = tickCount;
-               }
-             }
-           } else {
-            // Shields above threshold — boarding attempt failed, legitimately switch to fire
+          const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
+          const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
+          if (shieldPctNow !== null && shieldPctNow <= effectiveShieldThresholdNow) {
+            ctx.log("combat", `↩️ Boarding: shields still low (${shieldPctNow}% ≤ ${effectiveShieldThresholdNow}%) — re-issuing board stance`);
+            const retryBoard = await bot.exec("battle", {
+              action: "stance",
+              stance: "board",
+              target_id: target.id,
+              marines: marines,
+            });
+            if (retryBoard.error) {
+              const msg = retryBoard.error.message.toLowerCase();
+              if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                ctx.log("combat", "✅ Boarding: battle ended during board retry");
+                return "target_eliminated";
+              }
+              if (msg.includes("already") || msg.includes("queued")) {
+                ctx.log("combat", `🛸 Boarding: board stance already queued — monitoring without further retries`);
+                boardingActive = true;
+                boardStanceIssued = true;
+              } else {
+                ctx.log("combat", `⚠️ Boarding: re-issue board failed — ${retryBoard.error.message}`);
+              }
+            } else {
+              ctx.log("combat", `🛸 Boarding: board stance re-issued! Continuing operation.`);
+              boardingActive = true;
+              boardStanceIssued = true;
+            }
+          } else {
             ctx.log("combat", `Boarding: operation ended, shields at ${shieldPctNow ?? "unknown"}% — finishing with fire stance`);
             await bot.exec("battle", { action: "stance", stance: "fire" });
             boardingActive = false;
+            boardStanceIssued = false;
           }
         }
       }

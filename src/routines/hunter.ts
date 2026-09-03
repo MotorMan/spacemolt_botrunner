@@ -5113,11 +5113,24 @@ export async function boardingSubroutine(
        return "failed";
      }
 
-     const status = await getBattleStatus(ctx);
-     if (!status) {
-       ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
-       return "target_eliminated";
-     }
+      const status = await getBattleStatus(ctx);
+      if (!status) {
+        if (boardingActive) {
+          ctx.log("combat", `✅ Boarding: battle ended during active boarding — checking for captured prize`);
+          const nearbyResult = await getObservationOrNearby(bot);
+          const nearbyData = nearbyResult.result;
+          const prizes = nearbyData ? getNearbyPrizes(nearbyData) : [];
+          const capturedPrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+          if (capturedPrize) {
+            ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize detected after battle end)`);
+            return "captured";
+          }
+          ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+        } else {
+          ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+        }
+        return "target_eliminated";
+      }
 
      // Check hull
      await bot.refreshShip();
@@ -5173,81 +5186,41 @@ export async function boardingSubroutine(
              target_id: target.id,
              marines: marines,
            });
-           if (boardResp.error) {
-             const msg = boardResp.error.message.toLowerCase();
-             if (msg.includes("not in battle") || msg.includes("no active battle")) {
-               ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
-               return "target_eliminated";
-             }
-             // Try with target name instead of id (some servers require name)
-             const boardRespName = await bot.exec("battle", {
-               action: "stance",
-               stance: "board",
-               target_id: target.name,
-               marines: marines,
-             });
-             if (boardRespName.error) {
-               const msg2 = boardRespName.error.message.toLowerCase();
-               if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
-                 ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
-                 return "target_eliminated";
-               }
-               // Board stance failed — probably not at engaged range yet.
-               // Try one advance with fire (brief damage burst), then brace + retry board.
-               const ourZone = status.your_zone || "outer";
-               if (ourZone !== "engaged" && zoneDirMap[ourZone] !== undefined && zoneDirMap[ourZone] < 3) {
-                 ctx.log("combat", `↩️ Boarding: not at engaged (${ourZone}) — advancing then retrying board stance`);
-                 await bot.exec("battle", { action: "stance", stance: "fire" });
-                 const adv = await bot.exec("battle", { action: "advance" });
-                 if (adv.error) {
-                   const amsg = adv.error.message.toLowerCase();
-                   if (amsg.includes("not in battle") || amsg.includes("no active battle")) {
-                     ctx.log("combat", "✅ Boarding: battle ended during advance");
-                     return "target_eliminated";
-                   }
-                 }
-                 await ctx.sleep(BOARD_TICK_MS);
-                 // Re-retrieve status, check target not destroyed, then brace + retry board
-                 const retryStatus = await getBattleStatus(ctx);
-                 if (!retryStatus) {
-                   ctx.log("combat", "✅ Boarding: battle ended during advance retry");
-                   return "target_eliminated";
-                 }
-                 const retryTarget = retryStatus.participants.find(
-                   p => p.player_id === target.id || p.username === target.name,
-                 );
-                 if (retryTarget && retryTarget.is_destroyed) {
-                   ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed during advance retry — abandoning boarding`);
-                   return "target_eliminated";
-                 }
-                 await bot.exec("battle", { action: "stance", stance: "brace" });
-                 const retryBoard = await bot.exec("battle", {
-                   action: "stance",
-                   stance: "board",
-                   target_id: target.id,
-                   marines: marines,
-                 });
-                 if (retryBoard.error) {
-                   ctx.log("combat", `⚠️ Boarding: retry board stance failed — ${retryBoard.error.message} — switching to fire to finish`);
-                   await bot.exec("battle", { action: "stance", stance: "fire" });
-                   boardingActive = false;
-                 } else {
-                   ctx.log("combat", `🛸 Boarding: board stance issued (retry)! Operation beginning.`);
-                   boardingActive = true;
-                 }
-               } else {
-                 ctx.log("combat", `⚠️ Boarding: failed to issue board stance at engaged — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
-                 await bot.exec("battle", { action: "stance", stance: "fire" });
-                 boardingActive = false;
-               }
-             } else {
-               ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
-               boardingActive = true;
-             }
-           } else {
-             ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
-             boardingActive = true;
-           }
+            if (boardResp.error) {
+              const msg = boardResp.error.message.toLowerCase();
+              if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued");
+                return "target_eliminated";
+              }
+              const boardRespName = await bot.exec("battle", {
+                action: "stance",
+                stance: "board",
+                target_id: target.name,
+                marines: marines,
+              });
+              if (boardRespName.error) {
+                const msg2 = boardRespName.error.message.toLowerCase();
+                if (msg2.includes("not in battle") || msg2.includes("no active battle")) {
+                  ctx.log("combat", "✅ Boarding: battle ended before board stance could be issued (name)");
+                  return "target_eliminated";
+                }
+                if (msg2.includes("already has a boarding stance transition queued this tick") ||
+                    msg2.includes("boarding stance transition queued")) {
+                  ctx.log("combat", "🛸 Boarding: transition already queued — continuing to monitor without retry");
+                  boardingActive = true;
+                } else {
+                  ctx.log("combat", `⚠️ Boarding: failed to issue board stance at engaged — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
+                  await bot.exec("battle", { action: "stance", stance: "fire" });
+                  boardingActive = false;
+                }
+              } else {
+                ctx.log("combat", `🛸 Boarding: board stance issued (via name)! Operation beginning.`);
+                boardingActive = true;
+              }
+            } else {
+              ctx.log("combat", `🛸 Boarding: board stance issued! Operation beginning.`);
+              boardingActive = true;
+            }
          } else {
           // Shields still high — suppress with fire stance.
           // Use fire + advance to close distance and reduce shields.
@@ -5934,10 +5907,16 @@ async function* boardingSystemPass(
 
       yield "engage";
 
-      // Re-verify target is still present (an assist hunter may have killed it)
-      const stillPresent = entities.find(e => e.id === target.id || e.name === target.name);
+      const freshScanResp = await bot.exec("get_nearby");
+      let freshEntities: NearbyEntity[] = [];
+      if (!freshScanResp.error && freshScanResp.result) {
+        bot.trackNearbyPlayers(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result);
+        freshEntities = parseNearby(freshScanResp.result);
+      }
+      const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
       if (!stillPresent) {
-        ctx.log("combat", `⚠️ ${target.name} is no longer at this POI (likely claimed by another hunter) — skipping to next target`);
+        ctx.log("combat", `⚠️ ${target.name} is no longer at this POI (likely claimed or left) — skipping to next target`);
         continue;
       }
 
@@ -5959,70 +5938,124 @@ async function* boardingSystemPass(
             settings.shieldRechargePct,
           );
 
-           if (result === "captured") {
-             totalKills++;
-             totalBoardings++;
-              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-             await useRepairKits(ctx);
-             await bot.refreshCargo();
-             // Check prize_recoveries for the captured ship
-             await bot.refreshStatus();
-             const recoveries = bot.prizeRecoveries;
-             if (recoveries.length > 0) {
-               const cap = recoveries[0];
-               ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
-             }
-             // Attempt prize recovery — the captured ship is now a prize that may be
-             // at the current POI or at the POI where the battle started (battles are system-wide)
-             const recovered = await recoverPrize(ctx, settings);
-             if (recovered) {
-               ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
-             } else {
-               ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
-             }
-            continue;
-           } else if (result === "target_eliminated") {
-             totalKills++;
-             ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
-             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-             await useRepairKits(ctx);
-             await bot.refreshCargo();
+            if (result === "captured") {
+              totalKills++;
+              totalBoardings++;
+               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              if (recoveries.length > 0) {
+                const cap = recoveries[0];
+                ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+              }
+              const recovered = await recoverPrize(ctx, settings);
+              if (recovered) {
+                ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+              } else {
+                ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
+              }
+
+              yield "safety_check";
+              const postCaptureResp = await bot.exec("get_nearby");
+              if (!postCaptureResp.error) {
+                bot.trackNearbyPlayers(postCaptureResp.result);
+                bot.trackWildlife(postCaptureResp.result);
+              }
              continue;
-          } else if (result === "retreat") {
-            break;
-          }
-          // "failed" — fall through to normal fire engagement
-          ctx.log("combat", `Boarding failed for ${target.name} — engaging normally`);
-        }
-      }
+            } else if (result === "target_eliminated") {
+              totalKills++;
+              ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
+              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
 
-      // Normal fire engagement (fallback or boarding disabled)
-      if (!coordResponding) {
-        broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
-        claimCreature(ctx, target);
-      }
-      const hsettings = getHunterSettings(ctx.bot.username);
-      const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80);
+              yield "safety_check";
+              const postKillResp = await bot.exec("get_nearby");
+              if (!postKillResp.error) {
+                bot.trackNearbyPlayers(postKillResp.result);
+                bot.trackWildlife(postKillResp.result);
+                const nearbyEntities = parseNearby(postKillResp.result);
+                const newThreats = nearbyEntities.filter(e =>
+                  isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+                  !isStationEntity(e) &&
+                  e.id !== target.id &&
+                  e.name !== target.name
+                );
+                if (newThreats.length > 0) {
+                  ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} — engaging!`);
+                  for (const newThreat of newThreats) {
+                    if (bot.state !== "running") break;
+                    const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                    if (newWon) {
+                      totalKills++;
+                      ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) — additional threat eliminated`);
+                    }
+                  }
+                }
+              }
+              continue;
+           } else if (result === "retreat") {
+             break;
+           }
+           // "failed" — fall through to normal fire engagement
+           ctx.log("combat", `Boarding failed for ${target.name} — engaging normally`);
+         }
+       }
 
-      if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
-      if (won) {
-        totalKills++;
-        ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting...`);
-        yield "loot";
-        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-        await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-        await useRepairKits(ctx);
-        await bot.refreshCargo();
-        if (isLowOnFieldConsumables(bot.inventory)) {
-          ctx.log("combat", "Low on repair kits or shield charges — ending sweep to resupply");
-          break;
-        }
-      }
-    }
-  }
+       // Normal fire engagement (fallback or boarding disabled)
+       if (!coordResponding) {
+         broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+         claimCreature(ctx, target);
+       }
+       const hsettings = getHunterSettings(ctx.bot.username);
+       const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80);
+
+       if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
+       if (won) {
+         totalKills++;
+         ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting...`);
+         yield "loot";
+         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+         await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+         await useRepairKits(ctx);
+         await bot.refreshCargo();
+
+         yield "safety_check";
+         const postKillResp2 = await bot.exec("get_nearby");
+         if (!postKillResp2.error) {
+           bot.trackNearbyPlayers(postKillResp2.result);
+           bot.trackWildlife(postKillResp2.result);
+           const nearbyEntities2 = parseNearby(postKillResp2.result);
+           const newThreats2 = nearbyEntities2.filter(e =>
+             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+             !isStationEntity(e) &&
+             e.id !== target.id &&
+             e.name !== target.name
+           );
+           if (newThreats2.length > 0) {
+             ctx.log("combat", `🚨 ${newThreats2.length} new pirate(s) detected after kill: ${newThreats2.map(t => t.name).join(", ")} — engaging!`);
+             for (const newThreat of newThreats2) {
+               if (bot.state !== "running") break;
+               const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+               if (newWon) {
+                 totalKills++;
+                 ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) — additional threat eliminated`);
+               }
+             }
+           }
+         }
+         if (isLowOnFieldConsumables(bot.inventory)) {
+           ctx.log("combat", "Low on repair kits or shield charges — ending sweep to resupply");
+           break;
+         }
+       }
+     }
+   }
 
   // ── Post-patrol decision ──
   yield "post_patrol";

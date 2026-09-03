@@ -447,6 +447,7 @@ export async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
   const { bot } = ctx;
   const all: Recipe[] = [];
   let page = 1;
+  let totalPages = 1;
   while (true) {
     const resp = await bot.exec("catalog", { type: "recipes", page, page_size: 50 });
     if (resp.error) {
@@ -456,9 +457,15 @@ export async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
     const parsed = parseRecipes(resp.result);
     all.push(...parsed);
     const r = resp.result as Record<string, unknown> | undefined;
-    const totalPages = (r?.total_pages as number) || 1;
+    totalPages = (r?.total_pages as number) || 1;
+    if (page === 1 && totalPages === 1 && all.length < 50) {
+      ctx.log("warn", `Catalog API returned only ${all.length} recipes on page 1 with total_pages=1 — pagination may be broken (expected ${r?.total || "?"} total)`);
+    }
     if (page >= totalPages || parsed.length === 0) break;
     page++;
+  }
+  if (all.length > 0) {
+    ctx.log("debug", `fetchAllRecipes: ${all.length} total across ${page} page(s), total_pages=${totalPages}`);
   }
   return all;
 }
@@ -1006,18 +1013,21 @@ export function evaluateRecipeTrigger(
   let matchedAnyComponent = false;
   for (const t of triggers) {
     const current = countItemFn(t.item.toLowerCase());
-    // Every material must be ABOVE its trigger point before we start. Because
-    // queued jobs immediately remove their materials from storage, `countItemFn`
-    // already reflects only the FREE stock — so re-firing while a previous batch
-    // is in flight is safe: we simply size from whatever is still free.
-    if (!(current > t.triggerAt)) return null;
     // The trigger item must actually be a component of this recipe, otherwise we
-    // have no way to convert it. Skip (don't count) entries that don't match.
+    // have no way to convert it. Skip (don't count) entries that don't match
+    // BEFORE checking the threshold: a non-component material in the trigger
+    // config (e.g. a stale or typo'd entry) must NOT cause the whole recipe to
+    // fail to fire when the real components are above their triggers.
     const comp = recipe.components.find(
       c => c.item_id.toLowerCase() === t.item.toLowerCase(),
     );
     if (!comp) continue;
     matchedAnyComponent = true;
+    // Every material must be ABOVE its trigger point before we start. Because
+    // queued jobs immediately remove their materials from storage, `countItemFn`
+    // already reflects only the FREE stock — so re-firing while a previous batch
+    // is in flight is safe: we simply size from whatever is still free.
+    if (!(current > t.triggerAt)) return null;
     const perRun = comp.quantity || 1;
     // How many runs would bring this material from `current` down to `stopAt`.
     const toCraft = Math.floor((current - t.stopAt) / perRun);
@@ -1145,7 +1155,21 @@ export async function processRecipeTriggers(
     // won't queue more than the surplus that hasn't already been claimed.
 
     let runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
-    if (runs === null) continue;
+    if (runs === null) {
+      // Debug: show each trigger material's count vs threshold so it's clear why
+      // the trigger didn't fire (which material is below `triggerAt`, or which
+      // component doesn't exist on the recipe, or which is already at/below stop).
+      const detail = config.materials.map(t => {
+        const liveCount = countItemFn(t.item.toLowerCase());
+        const budgetCount_ = budgetCount(t.item.toLowerCase());
+        const isComponent = !!recipe.components.find(
+          c => c.item_id.toLowerCase() === t.item.toLowerCase(),
+        );
+        return `${t.item}: live=${liveCount} budget=${budgetCount_} triggerAt=${t.triggerAt} stopAt=${t.stopAt} isComponent=${isComponent}`;
+      }).join("; ");
+      log("craft", `Material trigger NOT fired for ${recipe.name} (${recipe.recipe_id}): ${detail}`);
+      continue;
+    }
 
     // Respect the recipe's output cap (the craftLimit / "make N outputs" target):
     // a material trigger should fill the surplus but never produce past the
@@ -2429,6 +2453,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     yield "fetch_recipes";
     const recipes = await fetchAllRecipes(ctx);
+    ctx.log("craft", `Fetched ${recipes.length} recipes from catalog API`);
     if (recipes.length === 0) {
       ctx.log("error", "No recipes available - waiting 60s");
       await ctx.sleep(60000);

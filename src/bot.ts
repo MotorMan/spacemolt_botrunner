@@ -352,6 +352,8 @@ docked = false;
     effectiveMarineCapacity = 0;
     /** Whether this ship has boarding capability (from get_ship ship class data). */
     hasBoardingCapability = false;
+    /** Latch strength of the installed boarding clamp module (0 if not installed). */
+    boardingClampLatchStrength = 0;
   private _prevHullPct: number = 100;
   private _prevHasEws: boolean | null = null;
   private _ewsFallbackTriggered = false;
@@ -2181,10 +2183,27 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
          // Parse boarding capability and effective marine capacity
          this.effectiveMarineCapacity = (ship.effective_marine_capacity as number) ?? this.effectiveMarineCapacity;
-         // boarding_capability is in the hull/class data block
-         const hullData = (ship.hull_class as Record<string, unknown> | undefined) || {};
-         this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
-      }
+          // boarding_capability is in the hull/class data block
+          const hullData = (ship.hull_class as Record<string, unknown> | undefined) || {};
+          this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
+          // Parse boarding clamp latch strength from installed modules
+          let maxLatchStrength = 0;
+          for (const mod of modulesArray) {
+            if (mod && typeof mod === "object") {
+              const modTypeId = moduleTypeId(mod);
+              if (modTypeId && modTypeId.includes("boarding")) {
+                const ls = mod.latch_strength as number | undefined;
+                if (ls && ls > maxLatchStrength) maxLatchStrength = ls;
+              }
+            }
+          }
+          // Fallback: check by known module type ids if module details weren't resolved
+          if (maxLatchStrength === 0) {
+            if (this.installedMods.includes("assault_boarding_lock")) maxLatchStrength = 18;
+            else if (this.installedMods.includes("boarding_clamp")) maxLatchStrength = 8;
+          }
+          this.boardingClampLatchStrength = maxLatchStrength;
+       }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
@@ -2857,6 +2876,22 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           .filter(Boolean);
       }
       this.applyModuleFlags(modules, resolved);
+      // Refresh boarding clamp latch strength from resolved modules
+      let maxLatchStrength = 0;
+      for (const mod of modules) {
+        if (mod && typeof mod === "object") {
+          const modTypeId = moduleTypeId(mod);
+          if (modTypeId && modTypeId.includes("boarding")) {
+            const ls = mod.latch_strength as number | undefined;
+            if (ls && ls > maxLatchStrength) maxLatchStrength = ls;
+          }
+        }
+      }
+      if (maxLatchStrength === 0) {
+        if (this.installedMods.includes("assault_boarding_lock")) maxLatchStrength = 18;
+        else if (this.installedMods.includes("boarding_clamp")) maxLatchStrength = 8;
+      }
+      this.boardingClampLatchStrength = maxLatchStrength;
     }
     return this.installedMods;
   }

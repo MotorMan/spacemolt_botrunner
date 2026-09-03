@@ -11392,11 +11392,34 @@
         }
 
         const marinesInput = document.getElementById("mcBoardMarines");
-        const marines = marinesInput ? parseInt(marinesInput.value, 10) : 0;
-
+        const requested = marinesInput ? parseInt(marinesInput.value, 10) : NaN;
         const targetName = select.options[select.selectedIndex]?.text || targetId;
-        logResponse(`<span class="resp-cmd">Boarding ${esc(targetName)}${marines ? ` (${marines} marines)` : ""}</span>`);
-        mcExec("battle", { action: "stance", id: "board", target_id: targetId, marines: isNaN(marines) ? 0 : marines });
+
+        // The server requires a positive marine count — 0 / empty does NOT mean
+        // "all marines". When no count is entered, resolve the bot's fit marine
+        // count from get_ship so an empty field commits everything aboard.
+        if (!requested || isNaN(requested) || requested <= 0) {
+          logResponse(`<span class="resp-cmd">Resolving fit marines for boarding ${esc(targetName)}…</span>`);
+          sendExec(profileBot, "get_ship", {}, (result) => {
+            if (!result.ok || !result.data) {
+              logResponse('<span class="resp-err">Could not resolve fit marines (get_ship failed)</span>');
+              return;
+            }
+            const ship = (result.data && result.data.ship) || result.data;
+            const pers = (ship && ship.personnel) || {};
+            const fitMarines = Number(pers.fit_marines ?? 0);
+            if (!fitMarines || fitMarines <= 0) {
+              logResponse('<span class="resp-err">No fit marines aboard — cannot board</span>');
+              return;
+            }
+            logResponse(`<span class="resp-cmd">Boarding ${esc(targetName)} (${fitMarines} marines)</span>`);
+            mcExec("battle", { action: "stance", id: "board", target_id: targetId, marines: fitMarines });
+          });
+          return;
+        }
+
+        logResponse(`<span class="resp-cmd">Boarding ${esc(targetName)} (${requested} marines)</span>`);
+        mcExec("battle", { action: "stance", id: "board", target_id: targetId, marines: requested });
       }
 
       // Send exec command and invoke callback with result

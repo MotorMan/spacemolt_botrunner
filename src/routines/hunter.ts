@@ -4869,6 +4869,44 @@ async function checkBoardingCapability(ctx: RoutineContext): Promise<boolean> {
 }
 
 /**
+ * Returns info about the bot's installed boarding clamp module.
+ * Detects "boarding_clamp" (latch strength 8) and "assault_boarding_lock"
+ * (latch strength 18). When latch strength > 0, the bot can attempt
+ * boarding; higher latch strength enables more aggressive damage
+ * before the target becomes unsalvageable.
+ */
+interface BoardingClampInfo {
+  /** True if any boarding clamp module is installed. */
+  hasClamp: boolean;
+  /** Latch strength of the installed module (8 for Boarding Clamp, 18 for Assault Boarding Lock). 0 if none. */
+  latchStrength: number;
+  /** Human-readable module name. */
+  moduleName: string | null;
+  /** Whether the assault (advanced) version is installed. */
+  isAssaultLock: boolean;
+}
+
+function getBoardingClampInfo(bot: Bot): BoardingClampInfo {
+  const mods = bot.installedMods;
+  const latchStrength = bot.boardingClampLatchStrength;
+  if (latchStrength > 0) {
+    const isAssault = latchStrength >= 15;
+    return {
+      hasClamp: true,
+      latchStrength,
+      moduleName: isAssault ? "Assault Boarding Lock" : "Boarding Clamp",
+      isAssaultLock: isAssault,
+    };
+  }
+  return {
+    hasClamp: false,
+    latchStrength: 0,
+    moduleName: null,
+    isAssaultLock: false,
+  };
+}
+
+/**
  * Resolve how many marines to commit to the boarding stance.
  * boardingMarines=0 means "all fit marines on board".
  */
@@ -4961,6 +4999,14 @@ export async function boardingSubroutine(
   if (!canBoard) {
     ctx.log("combat", "Boarding: ship lacks boarding capability — falling back to fire stance");
     return "failed";
+  }
+
+  // Detect boarding clamp module for latch strength info
+  const clampInfo = getBoardingClampInfo(bot);
+  if (clampInfo.hasClamp) {
+    ctx.log("combat", `🛸 Boarding: ${clampInfo.moduleName} installed (latch strength: ${clampInfo.latchStrength})`);
+  } else {
+    ctx.log("combat", "⚠️ Boarding: no boarding clamp module detected — boarding will require extreme precision (shields must be near 0)");
   }
 
   // Resolve marine commitment
@@ -5171,11 +5217,15 @@ export async function boardingSubroutine(
 
         // Check shield percentage
         const shieldPct = getTargetShieldPct(status, target.id, target.name);
-        if (shieldPct !== null && shieldPct <= shieldThreshold) {
+        // When no boarding clamp is installed, we must wait until shields are completely
+        // depleted (0%) before boarding — otherwise boarding will fail / not be available.
+        // With a boarding clamp, the configured shieldThreshold applies normally.
+        const effectiveShieldThreshold = clampInfo.hasClamp ? shieldThreshold : 0;
+        if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
           // Shields are low enough — first brace to stop damaging, then issue boarding stance
           // Brace prevents accidental kills while we transition to board stance
           await bot.exec("battle", { action: "stance", stance: "brace" });
-          ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${shieldThreshold}%) — initiating board stance with ${marines} marines!`);
+          ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);
           const boardResp = await bot.exec("battle", {
             action: "stance",
             stance: "board",

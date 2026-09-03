@@ -4784,6 +4784,12 @@ export interface BattleNotification {
   /** Battle participants data - used for pirate detection */
   participants?: Array<Record<string, unknown>>;
   sides?: Array<Record<string, unknown>>;
+  /** From battle_update: our own stance this tick */
+  your_stance?: string;
+  /** From battle_update: our own distance ring */
+  your_zone?: string;
+  /** From battle_update: our own side id */
+  your_side_id?: number;
 }
 
 /**
@@ -4866,6 +4872,9 @@ export function parseBattleNotification(notification: unknown): BattleNotificati
     const tick = (updateData.tick as number) || 0;
     const participants = Array.isArray(updateData.participants) ? updateData.participants as Array<Record<string, unknown>> : undefined;
     const sides = Array.isArray(updateData.sides) ? updateData.sides as Array<Record<string, unknown>> : undefined;
+    const yourStance = (updateData.your_stance as string) || undefined;
+    const yourZone = (updateData.your_zone as string) || undefined;
+    const yourSideId = (updateData.your_side_id as number) || undefined;
     
     // If we have a battle_id, this means we're still in battle
     if (battleId) {
@@ -4875,6 +4884,9 @@ export function parseBattleNotification(notification: unknown): BattleNotificati
         tick,
         participants,
         sides,
+        your_stance: yourStance,
+        your_zone: yourZone,
+        your_side_id: yourSideId,
         message: `Battle update - tick: ${tick}`,
       };
     }
@@ -5487,6 +5499,12 @@ export async function handleBattleNotifications(
         return true;
 
       case "battle_tick":
+        // Debug: log full battle update state for every tick
+        {
+          const debugLines = formatBattleUpdateDebug(battleNotif, ctx.bot.system, ctx.bot.poi);
+          ctx.log("combat", debugLines);
+        }
+
         // Check for pirates in battle participants (from battle_update)
         if (battleNotif.participants) {
           const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
@@ -5942,6 +5960,90 @@ export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]
     highestTier,
     pirates,
   };
+}
+
+/**
+ * Format a one-line debug summary of every participant in a battle_update,
+ * partitioning them into enemies vs friendlies relative to our own side.
+ *
+ * Produces output like:
+ *   ⚔ [BattleUpdate tick:42] self[stance:fire zone:outer] @ SYYS-123/Poi-45 | enemies(2):
+ *     - Raider (pirate) [zone:outer dist:3] hull:45% shields:90% stance:fire target:None
+ *     - Breacher (pirate) [zone:mid dist:1] hull:100% shields:100% stance:fire target:None
+ *   friendlies(1):
+ *     - MyBot (player) [zone:engaged dist:0] hull:80% shields:60% stance:fire target:Raider
+ *
+ * @param notif  Parsed BattleNotification (type "battle_tick") with participants
+ * @param botSystem  Current system ID of the bot
+ * @param botPoi  Current POI ID of the bot
+ */
+export function formatBattleUpdateDebug(
+  notif: BattleNotification,
+  botSystem: string | undefined,
+  botPoi: string | undefined,
+): string {
+  const lines: string[] = [];
+
+  const stance = notif.your_stance || "unknown";
+  const zone = notif.your_zone || "unknown";
+  const ourSide = notif.your_side_id;
+
+  const loc = botSystem || "?";
+  const poi = botPoi ? `/${botPoi}` : "";
+  lines.push(`⚔ [BattleUpdate tick:${notif.tick ?? "?"}] self[stance:${stance} zone:${zone}] @ ${loc}${poi}`);
+
+  const participants = notif.participants;
+  if (!participants || participants.length === 0) {
+    lines.push("  (no participant data — server returned empty participant list)");
+    return lines.join("\n");
+  }
+
+  const enemies: Record<string, unknown>[] = [];
+  const friendlies: Record<string, unknown>[] = [];
+
+  for (const p of participants) {
+    if (!p || typeof p !== "object") continue;
+    const sideId = (p.side_id as number | undefined);
+    if (ourSide !== undefined && sideId !== undefined && sideId !== ourSide) {
+      enemies.push(p);
+    } else {
+      friendlies.push(p);
+    }
+  }
+
+  const fmt = (p: Record<string, unknown>) => {
+    const username = (p.username as string) || (p.ship_name as string) || "???";
+    const kind = (p.kind as string) || "";
+    const shipClass = (p.ship_class as string) || "";
+    const hull = (p.hull_pct as number) ?? (p.hull_percent as number) ?? "?";
+    const shields = (p.shield_pct as number) ?? (p.shield_percent as number) ?? "?";
+    const pzone = (p.zone as string) || "?";
+    const dist = (p.zone_distance as number) ?? "?";
+    const stanceP = (p.stance as string) || "?";
+    const target = (p.target_id as string) || "";
+    const targetDisplay = target || "None";
+    const isNpc = (p.is_npc as boolean);
+    const shipInfo = [shipClass, kind].filter(Boolean).join("/");
+    const tag = isNpc ? "[NPC]" : "[P]";
+    const label = shipInfo ? `${shipInfo} ` : "";
+    return `    - ${username} ${tag}${label} [zone:${pzone} dist:${dist}] hull:${hull}% shields:${shields}% stance:${stanceP} target:${targetDisplay}`;
+  };
+
+  if (enemies.length > 0) {
+    lines.push(`  enemies(${enemies.length}):`);
+    for (const e of enemies) lines.push(fmt(e as Record<string, unknown>));
+  } else {
+    lines.push("  enemies(0): none");
+  }
+
+  if (friendlies.length > 0) {
+    lines.push(`  friendlies(${friendlies.length}):`);
+    for (const f of friendlies) lines.push(fmt(f as Record<string, unknown>));
+  } else {
+    lines.push("  friendlies(0): none");
+  }
+
+  return lines.join("\n");
 }
 
 // ── Customs Inspection ───────────────────────────────────────────

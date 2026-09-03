@@ -4933,11 +4933,14 @@ function findBoardingOperation(
  * and zone-closing logic inline, then interpose the boarding stance when shields are
  * low enough.
  *
- * Returns:
- *   "captured" — boarding operation succeeded (target captured)
- *   "target_eliminated" — target was destroyed (before, during, or after boarding)
- *   "failed" — boarding failed, aborted, or timed out; the caller may re-engage normally
- *   "retreat" — hull critical, must flee
+  * Returns:
+  *   "captured" — boarding operation succeeded (target captured)
+  *   "target_eliminated" — target was destroyed (before, during, or after boarding)
+  *   "failed" — boarding failed, aborted, or timed out; the caller may re-engage normally
+  *   "retreat" — hull critical, must flee
+  *
+  * On "captured", the prize ship may be at the current POI or at the POI where
+  * the battle started (battles are system-wide). The caller handles prize recovery.
  */
 export async function boardingSubroutine(
   ctx: RoutineContext,
@@ -5330,6 +5333,95 @@ async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<t
 }
 
 /**
+ * Search all POIs in the current system for a prize matching the given ship_id
+ * (if provided), or any available prize. When found, claim it with a destination
+ * station.
+ *
+ * Battles are system-wide, so a captured prize may appear at a different POI
+ * than where the bot is currently located.
+ */
+async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, knownShipId?: string): Promise<boolean> {
+  const { bot } = ctx;
+  const destBaseId = await findDestinationBaseId(ctx, settings);
+  if (!destBaseId) {
+    ctx.log("combat", "FindPrize: no destination station found — cannot claim prize");
+    return false;
+  }
+
+  const { pois } = await getSystemInfo(ctx);
+  if (!pois || pois.length === 0) {
+    ctx.log("combat", "FindPrize: no POIs found in current system");
+    return false;
+  }
+
+  // Exclude stations from the POI search
+  const searchPois = pois.filter(p => !isStationPoi(p));
+  if (searchPois.length === 0) return false;
+
+  // If we're already at a POI, check it first before traveling
+  const currentPoiMatch = searchPois.find(p => p.id === bot.poi || p.name === bot.poi);
+  const orderedPois = currentPoiMatch ? [currentPoiMatch, ...searchPois.filter(p => p !== currentPoiMatch)] : searchPois;
+
+  for (const poi of orderedPois) {
+    if (bot.state !== "running") return false;
+
+    // Travel to this POI if not already there
+    if (bot.poi !== poi.id) {
+      ctx.log("travel", `🔍 FindPrize: searching for prize at ${poi.name}...`);
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("combat", `FindPrize: could not travel to ${poi.name}: ${travelResp.error.message}`);
+        continue;
+      }
+      await ctx.sleep(2000);
+    }
+
+    // Check for prizes at this POI
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (!nearbyData) continue;
+
+    const prizes = getNearbyPrizes(nearbyData);
+    const availablePrize = prizes.find(p =>
+      (p.status === "available" || p.status === "claimed") &&
+      (!knownShipId || p.ship_id === knownShipId),
+    );
+
+    if (availablePrize) {
+      ctx.log("combat", `🛸 FindPrize: found prize ${availablePrize.ship_name || availablePrize.prize_id} at ${poi.name}!`);
+
+      // Refuel the prize ship before sending it off
+      await bot.exec("service_prize", {
+        id: availablePrize.prize_id,
+        service_action: "refuel",
+        quantity: 100,
+      });
+
+      const claimResp = await bot.exec("claim_prize", {
+        id: availablePrize.prize_id,
+        target: destBaseId,
+        crew_disposition: "aboard",
+      });
+
+      if (claimResp.error) {
+        const msg = claimResp.error.message.toLowerCase();
+        if (msg.includes("no prize") || msg.includes("not found") || msg.includes("invalid")) {
+          ctx.log("combat", `FindPrize: prize not claimable (${claimResp.error.message}) — may already be claimed`);
+          continue;
+        }
+        ctx.log("error", `FindPrize: claim failed: ${claimResp.error.message}`);
+        continue;
+      }
+
+      ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
  * Attempt to claim a prize at the current POI.
  *
  * After a successful boarding, the prize ship should be at the same POI,
@@ -5410,12 +5502,16 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
  * After a boarding capture, attempt to claim the prize and monitor its
  * recovery state until it reaches a terminal state.
  *
+ * Battles are system-wide, so the prize ship may be at a different POI than
+ * where the bot is currently located. This function searches all system POIs
+ * for the prize if it's not at the current POI.
+ *
  * Terminal states: delivered, destroyed, expired, recaptured.
  * Non-terminal states: available, claimed, in_transit.
  *
  * Returns true if the prize was successfully delivered, false otherwise.
  */
-async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, knownShipId?: string): Promise<boolean> {
   const { bot } = ctx;
   const maxWaitTicks = 30; // ~300 seconds max wait for recovery
   let waitTick = 0;
@@ -5431,9 +5527,18 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
       // No recovery record yet — try to claim at current POI
       const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
       if (!claimed) {
-        // Not at the prize POI, or another pilot already claimed it
-        ctx.log("combat", "RecoverPrize: could not claim prize — may need to be at the right POI");
-        return false;
+        // Prize might be at a different POI in this system (battles are system-wide).
+        // Search all system POIs for the prize ship.
+        const found = await findAndClaimPrizeAcrossSystem(ctx, settings, knownShipId);
+        if (!found) {
+          // Could not find or claim the prize
+          if (knownShipId) {
+            ctx.log("combat", `🔍 RecoverPrize: could not find prize (ship_id: ${knownShipId}) at any POI in ${bot.system} — may have been claimed by another pilot or expired`);
+          } else {
+            ctx.log("combat", `RecoverPrize: could not claim prize — may need to be at the right POI or another pilot may have already claimed it`);
+          }
+          return false;
+        }
       }
     } else {
       // Check recovery status
@@ -5760,21 +5865,29 @@ async function* boardingSystemPass(
             settings.shieldRechargePct,
           );
 
-          if (result === "captured") {
-            totalKills++;
-            totalBoardings++;
-            ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding!`);
-            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-            await useRepairKits(ctx);
-            await bot.refreshCargo();
-            // Attempt prize recovery — the captured ship is now a prize at this POI
-            const recovered = await recoverPrize(ctx, settings);
-            if (recovered) {
-              ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
-            } else {
-              ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it`);
-            }
+           if (result === "captured") {
+             totalKills++;
+             totalBoardings++;
+              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+             await useRepairKits(ctx);
+             await bot.refreshCargo();
+             // Check prize_recoveries for the captured ship
+             await bot.refreshStatus();
+             const recoveries = bot.prizeRecoveries;
+             if (recoveries.length > 0) {
+               const cap = recoveries[0];
+               ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+             }
+             // Attempt prize recovery — the captured ship is now a prize that may be
+             // at the current POI or at the POI where the battle started (battles are system-wide)
+             const recovered = await recoverPrize(ctx, settings);
+             if (recovered) {
+               ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+             } else {
+               ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
+             }
             continue;
            } else if (result === "target_eliminated") {
              totalKills++;

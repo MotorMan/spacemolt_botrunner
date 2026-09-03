@@ -7375,6 +7375,7 @@
       <button class="sm" onclick="mcExec('battle',{action:'stance',id:'evade'})" style="color: var(--red)">Stance Evade</button>
       <button class="sm" onclick="mcStanceBoard()" style="color: var(--green)">Stance Board</button>
       <input type="number" id="mcBoardMarines" min="0" placeholder="marines" style="width:60px;font-size:11px;padding:2px;" title="0 = all fit marines">
+      <button class="sm" onclick="mcExec('treat_personnel')" style="color: var(--cyan)" title="Heal injured crew and marines at a station with medical facilities">🩹 Treat Personnel</button>
     </div>
 
     <div class="cmd-group">
@@ -10527,6 +10528,26 @@
           let s = "Repaired";
           if (hull) s += ` +${hull} hull`;
           if (cost) s += ` (${Number(cost).toLocaleString()}cr)`;
+          return s;
+        },
+
+        treat_personnel(d) {
+          if (!d) return "";
+          if (typeof d === "string") return esc(d);
+          const details = d.details || d;
+          const msg = details.message || d.message;
+          if (msg) return esc(msg);
+          const crew = details.crew_treated || details.crew || 0;
+          const marines = details.marines_treated || details.marines || 0;
+          const cost = details.cost || details.credits_spent;
+          const pool = details.medical_pool_remaining;
+          const ship = details.ship_name || details.target;
+          let s = `Treated ${crew} crew`;
+          if (marines) s += ` and ${marines} marines`;
+          if (ship && ship !== "self") s += ` aboard ${esc(ship)}`;
+          if (cost) s += ` for ${Number(cost).toLocaleString()}cr`;
+          s += ".";
+          if (pool != null) s += ` Medical pool remaining: ${pool}`;
           return s;
         },
 

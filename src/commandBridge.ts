@@ -96,9 +96,10 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   'list_ship_for_sale': 'spacemolt_ship',
   'cancel_ship_listing': 'spacemolt_ship',
   'commission_quote': 'spacemolt_ship',
-  'refit_ship': 'spacemolt_ship',
-  'rename_ship': 'spacemolt_ship',
-  'supply_commission': 'spacemolt_ship',
+   'refit_ship': 'spacemolt_ship',
+   'rename_ship': 'spacemolt_ship',
+   'supply_commission': 'spacemolt_ship',
+   'treat_personnel': 'spacemolt_ship',
 
   // Storage commands (actions differ from command names)
    'deposit_items': 'spacemolt_storage',

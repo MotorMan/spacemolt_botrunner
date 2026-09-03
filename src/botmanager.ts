@@ -2459,8 +2459,9 @@ const skillsObj: Record<string, unknown> | null =
     "refuel", "repair", "deposit_items", "withdraw_items", "faction_deposit_items", "faction_withdraw_items", "jettison",
     "attack", "loot_wreck", "salvage_wreck", "send_gift", "craft",
     "accept_mission", "complete_mission", "abandon_mission",
-    "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
+    "buy_ship", "sell_ship", "switch_ship",     "install_mod", "uninstall_mod", "set_colors",
     "set_home_base",
+    "treat_personnel",
     // use_item consumes cargo and can also move the ship (emergency warp
     // device) or change hull/shield/buffs, so cached state must be resynced.
     "use_item",

@@ -1144,6 +1144,31 @@ export async function fightFreshBattle(
       }
     }
 
+    // Range-based target switching: if current target is fleeing (out of range)
+    // and there's a closer hostile in the battle, switch to it instead of
+    // endlessly chasing while other enemies pound on us.
+    if (targetParticipant && target && status) {
+      const liveStatus = status;
+      const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+      const ourZoneNum = zoneDirMap[ourCurrentZone] ?? 0;
+      if (targetZoneNum <= ourZoneNum - 2 && ourCurrentZone !== "engaged") {
+        const closerEnemy = liveStatus.participants.find(p => {
+          if (p.side_id === liveStatus.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === target.id || p.username === target.name) return false;
+          const pZone = p.zone || "outer";
+          const pZoneNum = zoneDirMap[pZone] ?? 0;
+          return pZoneNum > targetZoneNum;
+        });
+        if (closerEnemy) {
+          ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (closer than fleeing ${target.name})`);
+          target = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          targetParticipant = closerEnemy;
+          await ctx.sleep(300);
+        }
+      }
+    }
+
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
       await emergencyFleeSpam(ctx, "hull critical during combat");
@@ -1747,6 +1772,31 @@ export async function fightJoinedBattle(
           if (currentTarget) ctx.log("combat", `${currentTarget.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
         }
         lastKnownEnemyZone = targetParticipant.zone;
+      }
+    }
+
+    // Range-based target switching: if current target is fleeing (out of range)
+    // and there's a closer hostile in the battle, switch to it instead of
+    // endlessly chasing while other enemies pound on us.
+    if (targetParticipant && currentTarget && status) {
+      const liveStatus = status;
+      const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+      const ourZoneNum = zoneDirMap[ourZone] ?? 0;
+      if (targetZoneNum <= ourZoneNum - 2 && ourZone !== "engaged") {
+        const closerEnemy = liveStatus.participants.find(p => {
+          if (p.side_id === liveStatus.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === currentTarget!.id || p.username === currentTarget!.name) return false;
+          const pZone = p.zone || "outer";
+          const pZoneNum = zoneDirMap[pZone] ?? 0;
+          return pZoneNum > targetZoneNum;
+        });
+        if (closerEnemy) {
+          ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (closer than fleeing ${currentTarget.name})`);
+          currentTarget = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          targetParticipant = closerEnemy;
+          await ctx.sleep(300);
+        }
       }
     }
 

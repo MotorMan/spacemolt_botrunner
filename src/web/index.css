@@ -729,6 +729,16 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .log-line.cat-broadcast { color: var(--orange); }
 .log-line.cat-chat { color: var(--magenta); }
 
+/* Inline ANSI colors for mid-line highlighting */
+.ansi-red { color: #ff6b6b; }
+.ansi-green { color: #3fb950; }
+.ansi-yellow { color: #d29922; }
+.ansi-cyan { color: #22b8cf; }
+.ansi-white { color: #f0f6fc; }
+.ansi-bright { font-weight: 600; }
+.ansi-bright-red { color: #ff8787; font-weight: 600; }
+.ansi-bright-green { color: #56d364; font-weight: 600; }
+
 /* ── Chat input ─────────────────────────────────── */
 .chat-bar {
   display: flex;

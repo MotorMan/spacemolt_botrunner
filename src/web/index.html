@@ -20919,13 +20919,55 @@ When responding:
         if (autoScroll[panel]) el.scrollTop = 0;
       }
 
+      function ansiToHtml(text) {
+        const classes = {
+          1: "ansi-bright",
+          31: "ansi-red",
+          32: "ansi-green",
+          33: "ansi-yellow",
+          34: "ansi-cyan",
+          35: "ansi-white",
+          36: "ansi-cyan",
+          37: "ansi-white",
+        };
+        const stack = [];
+        let html = "";
+        let last = 0;
+        const re = /\x1b\[([0-9;]*)m/g;
+        let match = null;
+        while ((match = re.exec(text)) !== null) {
+          html += escHtml(text.slice(last, match.index));
+          last = match.index + match[0].length;
+          if (match[1] === "0") {
+            while (stack.length) html += "</span>";
+            stack.length = 0;
+          } else {
+            const codes = match[1].split(";").map(Number).filter(n => n > 0);
+            const cls = codes.map(c => classes[c]).filter(Boolean).join(" ");
+            if (cls) {
+              html += `<span class="${cls}">`;
+              stack.push(cls);
+            }
+          }
+        }
+        html += escHtml(text.slice(last));
+        while (stack.length) html += "</span>";
+        return html;
+      }
+
+      function escHtml(s) {
+        return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] || c));
+      }
+
       function makeLogLine(text) {
         const div = document.createElement("div");
         div.className = "log-line";
+        // Strip ANSI codes for category detection
+        const raw = text.replace(/\x1b\[[0-9;]*m/g, "");
         // Format: "HH:MM:SS [username] [category] msg" — capture the second bracket (category)
-        const m = text.match(/\[[^\]]+\]\s*\[([^\]]+)\]/);
+        const m = raw.match(/\[[^\]]+\]\s*\[([^\]]+)\]/);
         if (m) div.classList.add(`cat-${m[1].toLowerCase().trim()}`);
-        div.textContent = text;
+        div.innerHTML = ansiToHtml(text);
         return div;
       }
 

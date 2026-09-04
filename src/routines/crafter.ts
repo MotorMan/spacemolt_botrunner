@@ -26,6 +26,15 @@ const QUEUE_REFRESH_COOLDOWN = 60000;
 // "148k phantom fuel pending" bug). The cache now lives PER-BOT on
 // `bot.craftQueueCache` — see checkCraftingQueue().
 
+// ANSI color codes for mid-line log highlighting (rendered by the web UI).
+const ANSI_RESET = "\x1b[0m";
+const ANSI_BOLD = "\x1b[1m";
+const ANSI_RED = "\x1b[31m";
+const ANSI_GREEN = "\x1b[32m";
+const ANSI_YELLOW = "\x1b[33m";
+const ANSI_CYAN = "\x1b[36m";
+const ANSI_WHITE = "\x1b[37m";
+
 // Sentinel for the "crafting home base storage" setting. When a crafter's
 // craftingHomeBase equals this, it reads the faction storage of the station it
 // is CURRENTLY docked at instead of a fixed global station. This lets multiple
@@ -1181,7 +1190,7 @@ export async function processRecipeTriggers(
       const outItem = (recipe.output_item_id || "").toLowerCase();
       const haveOutput = outItem ? countItemFn(outItem) : 0;
       if (haveOutput >= config.maxOutput) {
-        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOutput} >= cap ${config.maxOutput}`);
+        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOutput} >= cap ${config.maxOutput}${ANSI_RESET}`);
         continue;
       }
     }
@@ -1203,9 +1212,14 @@ export async function processRecipeTriggers(
            return `${t.item}: LOW:${current} of ${t.triggerAt}`;
          })
          .filter((s): s is string => s !== null);
-       if (lowMaterials.length > 0) {
-         log("craft", `NOT Crafting: ${recipe.name} (${recipe.recipe_id}): ${lowMaterials.join(", ")}`);
-       }
+        if (lowMaterials.length > 0) {
+          const colored = lowMaterials.map(s => {
+            const [mat, rest] = s.split(": ");
+            const [lowPart, numStr, ofPart, triggerStr] = rest.split(" ");
+            return `${mat}: ${ANSI_RED}${ANSI_BOLD}${lowPart}${ANSI_RESET}${ANSI_RED}:${numStr}${ANSI_RESET} ${ofPart} ${ANSI_GREEN}${triggerStr}${ANSI_RESET}`;
+          }).join(", ");
+          log("craft", `${ANSI_YELLOW}NOT Crafting:${ANSI_RESET} ${recipe.name} (${recipe.recipe_id}): ${colored}`);
+        }
        continue;
      }
 
@@ -1223,37 +1237,37 @@ export async function processRecipeTriggers(
          const haveOut = countItemFn(outItem);
          const pendingOut = pendingOutputByItem.get(outItem) || 0;
          const room = itemLimit - (haveOut + pendingOut);
-         if (room <= 0) {
-           log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${itemLimit}`);
-           continue;
-         }
-         const maxRuns = Math.floor(room / outPerRun);
-         if (maxRuns <= 0) continue;
-         if (runs > maxRuns) {
-           log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (output cap ${itemLimit})`);
-           runs = maxRuns;
-         }
-       }
-     }
-
-    // maxOutput cap configured on the trigger itself: a fired trigger must never
-    // produce more than this many of the output item. The hold gate above only
-    // skips firing when LIVE stock already exceeds the cap, but it does NOT clamp
-    // the run count — so a recipe with a large input surplus would fire and blow
-    // well past the user's stated maximum (e.g. queue 3784 runs with maxOutput
-    // 1000). Cap the run count here too, accounting for in-flight work.
-    if (config.maxOutput !== undefined && config.maxOutput > 0) {
-      const limiter = lowestOutputItem(recipe);
-      const outPerRun = limiter.quantity || 1;
-      const outItem = limiter.item_id.toLowerCase();
-      const haveOut = countItemFn(outItem);
-      const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
-      const pendingOut = pendingRuns * outPerRun;
-      const room = config.maxOutput - (haveOut + pendingOut);
-      if (room <= 0) {
-        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}`);
-        continue;
+          if (room <= 0) {
+            log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOut}+${pendingOut} pending >= cap ${itemLimit}${ANSI_RESET}`);
+            continue;
+          }
+          const maxRuns = Math.floor(room / outPerRun);
+          if (maxRuns <= 0) continue;
+          if (runs > maxRuns) {
+            log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${ANSI_CYAN}${maxRuns}${ANSI_RESET} (output cap ${ANSI_GREEN}${itemLimit}${ANSI_RESET})`);
+            runs = maxRuns;
+          }
+        }
       }
+
+     // maxOutput cap configured on the trigger itself: a fired trigger must never
+     // produce more than this many of the output item. The hold gate above only
+     // skips firing when LIVE stock already exceeds the cap, but it does NOT clamp
+     // the run count — so a recipe with a large input surplus would fire and blow
+     // well past the user's stated maximum (e.g. queue 3784 runs with maxOutput
+     // 1000). Cap the run count here too, accounting for in-flight work.
+     if (config.maxOutput !== undefined && config.maxOutput > 0) {
+       const limiter = lowestOutputItem(recipe);
+       const outPerRun = limiter.quantity || 1;
+       const outItem = limiter.item_id.toLowerCase();
+       const haveOut = countItemFn(outItem);
+       const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
+       const pendingOut = pendingRuns * outPerRun;
+       const room = config.maxOutput - (haveOut + pendingOut);
+       if (room <= 0) {
+         log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}${ANSI_RESET}`);
+         continue;
+       }
       const maxRuns = Math.floor(room / outPerRun);
       if (maxRuns <= 0) continue;
       if (runs > maxRuns) {
@@ -1266,8 +1280,8 @@ export async function processRecipeTriggers(
     const limiter = lowestOutputItem(recipe);
     const outputPerRun = limiter.quantity || 1;
     const venue = resolveVenueForRecipe(recipe.recipe_id, recipe.name, ownFacilityMap, settings, bot);
-    const summary = config.materials.map(t => `${t.item}>${t.triggerAt}→stop ${t.stopAt}`).join(", ");
-    log("craft", `⚡ Material trigger FIRED (pri ${e.priority}) for ${recipe.name}: ${summary} -> queueing ${runs} run(s) (limiting output ${outputPerRun}x ${limiter.name})`);
+    const summary = config.materials.map(t => `${t.item}>${ANSI_CYAN}${t.triggerAt}${ANSI_RESET}→stop ${ANSI_GREEN}${t.stopAt}${ANSI_RESET}`).join(", ");
+    log("craft", `${ANSI_YELLOW}⚡${ANSI_RESET} Material trigger ${ANSI_GREEN}FIRED${ANSI_RESET} (pri ${ANSI_CYAN}${e.priority}${ANSI_RESET}) for ${recipe.name}: ${summary} -> queueing ${ANSI_CYAN}${runs}${ANSI_RESET} run(s) (limiting output ${ANSI_CYAN}${outputPerRun}x ${limiter.name}${ANSI_RESET})`);
 
     const queueResult = await queueCraftJob(
       ctx,
@@ -1285,7 +1299,7 @@ export async function processRecipeTriggers(
     );
     if (queueResult.success) {
       result.queued++;
-      log("craft", `✓ Queued ${queueResult.queuedRuns} run(s) of ${recipe.name} via material trigger`);
+      log("craft", `${ANSI_GREEN}✓${ANSI_RESET} Queued ${ANSI_CYAN}${queueResult.queuedRuns}${ANSI_RESET} run(s) of ${recipe.name} via material trigger`);
       // Debit the budget for every component this batch will consume, so later
       // (lower-priority) triggers sharing any input see the reduced availability.
       for (const c of recipe.components) {

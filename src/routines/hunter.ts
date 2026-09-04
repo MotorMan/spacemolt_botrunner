@@ -5292,7 +5292,33 @@ export async function boardingSubroutine(
         ctx.log("combat", `🛸 Boarding: operation ${boardingOp.operation_id} — phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);
         if (boardingOp.phase === "victory") {
           ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}!`);
-          return "captured";
+          
+          // Register the captured prize in the tracker for later recovery
+          bot.registerCapturedPrize(target.id, target.name, status.battle_id || "");
+          
+          // Switch to the next closest enemy instead of staying locked on the captured ship
+          const closerEnemy = status.participants.find(p => {
+            if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+            if (p.player_id === target.id || p.username === target.name) return false;
+            return true;
+          });
+          
+          if (closerEnemy) {
+            const newTargetName = closerEnemy.username || closerEnemy.player_id || "unknown";
+            ctx.log("combat", `🎯 Switching to ${newTargetName} after capturing ${target.name}`);
+            target = { id: closerEnemy.player_id || closerEnemy.username, name: newTargetName } as any;
+            await bot.exec("battle", { action: "target", target_id: target.id });
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            boardingActive = false;
+            boardStanceIssued = false;
+          } else {
+            // No more enemies — battle should end soon
+            ctx.log("combat", `✅ No more enemies after capturing ${target.name} — awaiting battle end`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            boardingActive = false;
+            boardStanceIssued = false;
+            return "captured";
+          }
         }
         if (boardingOp.phase === "defeat" || boardingOp.phase === "withdrawn") {
           ctx.log("combat", `Boarding: operation ${boardingOp.phase} — target ${boardingOp.phase === "defeat" ? "resisted" : "withdrawn"}`);
@@ -5484,14 +5510,34 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
     const nearbyData = nearbyResult.result;
     if (!nearbyData) continue;
 
-    const prizes = getNearbyPrizes(nearbyData);
-    const availablePrize = prizes.find(p =>
-      (p.status === "available" || p.status === "claimed") &&
-      (!knownShipId || p.ship_id === knownShipId),
-    );
+     const prizes = getNearbyPrizes(nearbyData);
+     
+     // First check for prizes matching our captured prize tracker
+     let availablePrize = prizes.find(p => {
+       const match = bot.findCapturedPrizeMatch(p);
+       return match && (p.status === "available" || p.status === "claimed");
+     });
+     
+     // Fall back to knownShipId match or any available prize
+     if (!availablePrize) {
+       availablePrize = prizes.find(p =>
+         (p.status === "available" || p.status === "claimed") &&
+         (!knownShipId || p.ship_id === knownShipId),
+       );
+     }
+     
+     // Final fallback: any available prize
+     if (!availablePrize) {
+       availablePrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+     }
 
-    if (availablePrize) {
-      ctx.log("combat", `🛸 FindPrize: found prize ${availablePrize.ship_name || availablePrize.prize_id} at ${poi.name}!`);
+     if (availablePrize) {
+       ctx.log("combat", `🛸 FindPrize: found prize ${availablePrize.ship_name || availablePrize.prize_id} at ${poi.name}!`);
+       
+       const trackedMatch = bot.findCapturedPrizeMatch(availablePrize);
+       if (trackedMatch) {
+         ctx.log("combat", `🛸 FindPrize: matched tracked capture ship_id=${trackedMatch.ship_id}`);
+       }
 
       // Refuel the prize ship before sending it off
       await bot.exec("service_prize", {
@@ -5516,8 +5562,17 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
         continue;
       }
 
-      ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
-      return true;
+   ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
+   
+   // Update the tracker with the confirmed prize_id
+   if (availablePrize.ship_id && availablePrize.prize_id) {
+     const existing = bot.getCapturedPrizeByShipId(availablePrize.ship_id);
+     if (existing) {
+       bot.registerCapturedPrize(availablePrize.ship_id, availablePrize.ship_class || existing.ship_class, existing.battle_id, availablePrize.prize_id);
+     }
+   }
+   
+   return true;
     }
   }
 
@@ -5553,12 +5608,29 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
   }
 
   const prizes = getNearbyPrizes(nearbyData);
-  const availablePrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+  
+  // First, check if any prize matches our captured prize tracker (by ship_id)
+  let availablePrize = prizes.find(p => {
+    const match = bot.findCapturedPrizeMatch(p);
+    return match && (p.status === "available" || p.status === "claimed");
+  });
+  
+  // If no tracked match, fall back to any available prize
+  if (!availablePrize) {
+    availablePrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+  }
+  
   if (!availablePrize) {
     if (prizes.length > 0) {
       ctx.log("combat", `ClaimPrize: found ${prizes.length} prize(s) but none claimable (status: ${prizes.map(p => p.status).join(", ")})`);
     }
     return false;
+  }
+  
+  // Log if this prize matches a tracked capture
+  const trackedMatch = bot.findCapturedPrizeMatch(availablePrize);
+  if (trackedMatch) {
+    ctx.log("combat", `🛸 ClaimPrize: matched tracked capture ship_id=${trackedMatch.ship_id} prize_id=${availablePrize.prize_id}`);
   }
 
   // Find a destination station
@@ -5597,8 +5669,17 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
     return false;
   }
 
-  ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
-  return true;
+    ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} claimed! Recovery initiated to ${destBaseId}.`);
+    
+    // Update the tracker with the confirmed prize_id
+    if (availablePrize.ship_id && availablePrize.prize_id) {
+      const existing = bot.getCapturedPrizeByShipId(availablePrize.ship_id);
+      if (existing) {
+        bot.registerCapturedPrize(availablePrize.ship_id, availablePrize.ship_class || existing.ship_class, existing.battle_id, availablePrize.prize_id);
+      }
+    }
+    
+    return true;
 }
 
 /**

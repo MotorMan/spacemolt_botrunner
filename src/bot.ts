@@ -408,6 +408,11 @@ docked = false;
   observationActiveScan = false;
   observationTick = 0;
 
+  /** Track captured prize ships by ship_id → prize_id mapping.
+   *  Populated by ship_captured WebSocket notifications so we can find
+   *  the correct prize_id in get_nearby even if we didn't see it immediately. */
+  capturedPrizeTracker: Map<string, { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number }> = new Map();
+
   /** Set of queued crafting job IDs to prevent duplicate submissions. */
   private queuedCraftingJobs: Set<string> = new Set();
 
@@ -4124,19 +4129,19 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
         if (isUs) {
           this.clearBattleState(`battle_left (${leftName || leftId || "us"})`);
         }
-       } else if (msgType === "battle_damage" && data && typeof data === "object") {
-         // Battle damage also indicates we're in battle
-         const attackerName = (data.attacker_name as string) || "";
-         const targetName = (data.target_name as string) || "";
-         const totalDamage = (data.total_damage as number) || 0;
+        } else if (msgType === "battle_damage" && data && typeof data === "object") {
+          // Battle damage also indicates we're in battle
+          const attackerName = (data.attacker_name as string) || "";
+          const targetName = (data.target_name as string) || "";
+          const totalDamage = (data.total_damage as number) || 0;
 
-         // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
-         const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
-         if (battleId || attackerName) {
-           this.currentBattle.inBattle = true;
-           if (battleId) {
-             this.currentBattle.battleId = battleId;
-           }
+          // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+          const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+          if (battleId || attackerName) {
+            this.currentBattle.inBattle = true;
+            if (battleId) {
+              this.currentBattle.battleId = battleId;
+            }
 this.currentBattle.lastUpdate = Date.now();
           }
 
@@ -4150,6 +4155,19 @@ this.currentBattle.lastUpdate = Date.now();
               this.lastBattleResponseMs = now;
               await this.sendBattleResponseToAI(attackerName, totalDamage);
 }
+          }
+        } else if (msgType === "ship_captured" && data && typeof data === "object") {
+          const captureData = data as Record<string, unknown>;
+          const capturedShipId = (captureData.ship_id as string) || "";
+          const capturedShipClass = (captureData.ship_class as string) || "";
+          const battleId = (captureData.battle_id as string) || this.currentBattle.battleId || "";
+          const captorId = (captureData.captor_id as string) || "";
+          const captorName = (captureData.captor_username as string) || "";
+          const formerOwnerName = (captureData.former_owner_username as string) || "";
+
+          if (capturedShipId && captorName === this.username) {
+            this.log("combat", `🎉 SHIP_CAPTURED: ${formerOwnerName || capturedShipClass} (ship_id=${capturedShipId}) — prize_id pending from get_nearby`);
+            this.registerCapturedPrize(capturedShipId, capturedShipClass, battleId);
           }
         } else if (msgType === "battle_alert" && data && typeof data === "object") {
          const alertData = data as Record<string, unknown>;
@@ -4683,39 +4701,83 @@ if (this.craftQueueTracker && jobId && recipeId) {
    * the creatureIds we no longer see (killed / despawned), which is what keeps
    * data/creatures from growing forever.
    */
-  trackWildlife(nearbyResult: unknown): void {
-    if (!nearbyResult || typeof nearbyResult !== "object") {
-      return;
+   trackWildlife(nearbyResult: unknown): void {
+     if (!nearbyResult || typeof nearbyResult !== "object") {
+       return;
+     }
+
+     const data = nearbyResult as Record<string, unknown>;
+     // Only a response that actually carries a creature list may reconcile —
+     // a partial/unrelated payload must never be read as "no creatures here".
+     if (!Array.isArray(data.creatures)) return;
+     const creaturesArray = data.creatures as Array<Record<string, unknown>>;
+
+     const observed: ObservedCreature[] = [];
+     for (const entity of creaturesArray) {
+       const name = (entity.name as string) || "";
+       if (!name || !name.trim()) continue;
+       const hull = (entity.hull as number) || 0;
+       observed.push({
+         name: name.trim(),
+         creatureId: (entity.creature_id as string) || "",
+         species: (entity.species as string) || "",
+         role: (entity.role as string) || "",
+         maxHull: (entity.max_hull as number) || hull,
+       });
+     }
+
+     const result = wildlifeStore.reconcile(this.system, this.poi, observed);
+
+     if (result.newTypes > 0) {
+       this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
+     }
+     if (result.prunedIds > 0 || result.prunedTypes > 0) {
+       debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
+         `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${this.poi}`);
+     }
+   }
+
+  /** Register a captured prize ship from a ship_captured WebSocket notification.
+   *  Stores the mapping so we can find the prize_id in get_nearby by matching ship_id.
+   */
+  registerCapturedPrize(shipId: string, shipClass: string, battleId: string, prizeId?: string): void {
+    if (!shipId) return;
+    this.capturedPrizeTracker.set(shipId, {
+      prize_id: prizeId || "",
+      ship_id: shipId,
+      ship_class: shipClass,
+      battle_id: battleId,
+      timestamp: Date.now(),
+    });
+    this.log("combat", `📦 Registered captured prize: ship_id=${shipId} class=${shipClass} battle=${battleId}${prizeId ? ` prize_id=${prizeId}` : " (prize_id pending)"}`);
+  }
+
+  /** Look up a captured prize by ship_id. Returns the tracker entry or undefined. */
+  getCapturedPrizeByShipId(shipId: string): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number } | undefined {
+    return this.capturedPrizeTracker.get(shipId);
+  }
+
+  /** Find a captured prize entry matching a nearby prize by ship_id. */
+  findCapturedPrizeMatch(prize: { ship_id?: string; prize_id?: string; status?: string }): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number } | undefined {
+    if (!prize.ship_id) return undefined;
+    const entry = this.capturedPrizeTracker.get(prize.ship_id);
+    if (entry) return entry;
+    // Also try matching by prize_id if we already know it
+    if (prize.prize_id) {
+      for (const val of this.capturedPrizeTracker.values()) {
+        if (val.prize_id === prize.prize_id) return val;
+      }
     }
+    return undefined;
+  }
 
-    const data = nearbyResult as Record<string, unknown>;
-    // Only a response that actually carries a creature list may reconcile —
-    // a partial/unrelated payload must never be read as "no creatures here".
-    if (!Array.isArray(data.creatures)) return;
-    const creaturesArray = data.creatures as Array<Record<string, unknown>>;
-
-    const observed: ObservedCreature[] = [];
-    for (const entity of creaturesArray) {
-      const name = (entity.name as string) || "";
-      if (!name || !name.trim()) continue;
-      const hull = (entity.hull as number) || 0;
-      observed.push({
-        name: name.trim(),
-        creatureId: (entity.creature_id as string) || "",
-        species: (entity.species as string) || "",
-        role: (entity.role as string) || "",
-        maxHull: (entity.max_hull as number) || hull,
-      });
-    }
-
-    const result = wildlifeStore.reconcile(this.system, this.poi, observed);
-
-    if (result.newTypes > 0) {
-      this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
-    }
-    if (result.prunedIds > 0 || result.prunedTypes > 0) {
-      debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
-        `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${this.poi}`);
+  /** Clear old captured prize entries (older than 5 minutes) to prevent memory bloat. */
+  pruneStaleCapturedPrizes(): void {
+    const cutoff = Date.now() - 5 * 60_000;
+    for (const [shipId, entry] of this.capturedPrizeTracker) {
+      if (entry.timestamp < cutoff) {
+        this.capturedPrizeTracker.delete(shipId);
+      }
     }
   }
 

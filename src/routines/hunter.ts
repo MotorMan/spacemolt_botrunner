@@ -3390,35 +3390,48 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
       ) || null;
     }
 
-    // ── Send an attack command every tick ──
+    // ── Send an attack command every tick, or enter combat loop if already fighting ──
     const targetId = targetEntity ? targetEntity.id : targetPlayer;
+    const fakeTarget = targetEntity ? targetEntity : { id: targetPlayer, name: targetPlayer } as NearbyEntity;
+
+    const existingBattle = await getBattleStatus(ctx);
+    if (existingBattle) {
+      ctx.log("combat", `⚔️ Already in battle — engaging ${targetPlayer}`);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart);
+      continue;
+    }
+
     const atk = await bot.exec("attack", { target_id: targetId });
     if (atk.error) {
       const msg = atk.error.message.toLowerCase();
       if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in") || msg.includes("no target")) {
-        // Fall back to the player name, then just report (we re-issue next tick).
         const atk2 = await bot.exec("attack", { target_id: targetPlayer });
         if (atk2.error) {
           ctx.log("combat", `⚔️ ${targetPlayer} not attackable at ${originalPoi} (${atk2.error.message}) — re-issuing next tick`);
         } else {
           ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer} (name fallback)`);
         }
+      } else if (msg.includes("interrupted by combat") || msg.includes("interrupted by battle")) {
+        ctx.log("combat", `⚔️ Attack interrupted by combat — entering battle immediately`);
+        const battleStatus = await getBattleStatus(ctx);
+        if (battleStatus) {
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart);
+        }
+      } else if (msg.includes("action is already pending") || msg.includes("already pending") || msg.includes("already in progress")) {
+        const battleStatus = await getBattleStatus(ctx);
+        if (battleStatus) {
+          ctx.log("combat", `⚔️ Attack blocked by pending action — battle is live, entering combat loop`);
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart);
+        } else {
+          ctx.log("combat", `⚔️ Attack on ${targetPlayer}: ${atk.error.message} — re-issuing next tick`);
+        }
       } else {
         ctx.log("combat", `⚔️ Attack on ${targetPlayer}: ${atk.error.message}`);
       }
     } else {
       ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer}${targetEntity ? "" : " (not in range — re-issued next tick)"}`);
-    }
-
-    // ── If a battle is live, hold fire stance and keep targeting the player ──
-    const battleStatus = await getBattleStatus(ctx);
-    if (battleStatus) {
-      const targetId2 = targetEntity ? targetEntity.id : targetPlayer;
-      const tResp = await bot.exec("battle", { action: "target", target_id: targetId2 });
-      if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
-        await bot.exec("battle", { action: "target", target_id: targetPlayer });
-      }
-      await bot.exec("battle", { action: "stance", stance: "fire" });
+      await ctx.sleep(1000);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart);
     }
 
     // ── Field repair (in place) ──

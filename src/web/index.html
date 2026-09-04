@@ -20964,11 +20964,10 @@ When responding:
         const raw = text.replace(/\u001b\[[0-9;]*m/g, "");
         const m = raw.match(/\[[^\]]+\]\s*\[([^\]]+)\]/);
         if (m) div.classList.add(`cat-${m[1].toLowerCase().trim()}`);
-        try {
+        if (text.indexOf("\u001b[") >= 0) {
           div.innerHTML = ansiToHtml(text);
-        } catch (e) {
-          console.error("[makeLogLine] ansiToHtml failed:", e);
-          div.textContent = text;
+        } else {
+          div.innerHTML = text;
         }
         return div;
       }

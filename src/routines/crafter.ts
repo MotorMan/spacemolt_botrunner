@@ -26,14 +26,45 @@ const QUEUE_REFRESH_COOLDOWN = 60000;
 // "148k phantom fuel pending" bug). The cache now lives PER-BOT on
 // `bot.craftQueueCache` — see checkCraftingQueue().
 
-// ANSI color codes for mid-line log highlighting (rendered by the web UI).
-const ANSI_RESET = "\x1b[0m";
-const ANSI_BOLD = "\x1b[1m";
-const ANSI_RED = "\x1b[31m";
-const ANSI_GREEN = "\x1b[32m";
-const ANSI_YELLOW = "\x1b[33m";
-const ANSI_CYAN = "\x1b[36m";
-const ANSI_WHITE = "\x1b[37m";
+// HTML markup for log lines rendered in the web UI.
+// The dashboard's ANSI parser is unreliable for inline spans, so we inject
+// explicit <span class="ansi-..."> tags directly. The CSS classes are defined
+// in index.css.
+const HTML_RESET = '</span>';
+const HTML_BOLD_RED = '<span class="ansi-red ansi-bright">';
+const HTML_RED = '<span class="ansi-red">';
+const HTML_GREEN = '<span class="ansi-green">';
+const HTML_YELLOW = '<span class="ansi-yellow">';
+const HTML_CYAN = '<span class="ansi-cyan">';
+
+/** Wrap `value` in a colored HTML span. */
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
+}
+
+/** Markup for `NOT Crafting: Name (id): item: LOW:N of M` lines. */
+function markupNotCrafting(recipeName: string, recipeId: string, lowMaterials: string[]): string {
+  const colored = lowMaterials
+    .map(s => {
+      const [mat, rest] = s.split(": ");
+      const m = rest.match(/^(LOW:\d+)\s+(of)\s+(\d+)$/);
+      if (!m) return `${mat}: ${span(rest, "ansi-red")}`;
+      const [, lowPart, ofPart, triggerStr] = m;
+      return `${mat}: ${span(lowPart, "ansi-red ansi-bright")} ${ofPart} ${span(triggerStr, "ansi-green")}`;
+    })
+    .join(", ");
+  return `${span("NOT Crafting:", "ansi-yellow")} ${recipeName} (${recipeId}): ${colored}`;
+}
+
+/** Markup for held/cap log lines (`... at N >= cap M`). */
+function markupHeld(prefix: string, outItem: string, have: number, cap: number): string {
+  return `${prefix} output ${outItem} at ${span(`${have} >= cap ${cap}`, "ansi-green")}`;
+}
+
+/** Markup for a fired trigger summary (`item>N->stop M`). */
+function markupSummary(items: { item: string; triggerAt: number; stopAt: number }[]): string {
+  return items.map(t => `${t.item}>${span(String(t.triggerAt), "ansi-cyan")}→stop ${span(String(t.stopAt), "ansi-green")}`).join(", ");
+}
 
 // Sentinel for the "crafting home base storage" setting. When a crafter's
 // craftingHomeBase equals this, it reads the faction storage of the station it
@@ -1190,7 +1221,7 @@ export async function processRecipeTriggers(
       const outItem = (recipe.output_item_id || "").toLowerCase();
       const haveOutput = outItem ? countItemFn(outItem) : 0;
       if (haveOutput >= config.maxOutput) {
-        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOutput} >= cap ${config.maxOutput}${ANSI_RESET}`);
+        log("craft", markupHeld(`Material trigger held for ${recipe.name}:`, outItem, haveOutput, config.maxOutput));
         continue;
       }
     }
@@ -1212,16 +1243,9 @@ export async function processRecipeTriggers(
            return `${t.item}: LOW:${current} of ${t.triggerAt}`;
          })
          .filter((s): s is string => s !== null);
-         if (lowMaterials.length > 0) {
-           const colored = lowMaterials.map(s => {
-             const [mat, rest] = s.split(": ");
-             const m = rest.match(/^(LOW:\d+)\s+(of)\s+(\d+)$/);
-             if (!m) return `${mat}: ${ANSI_RED}${rest}${ANSI_RESET}`;
-             const [, lowPart, ofPart, triggerStr] = m;
-             return `${mat}: ${ANSI_RED}${ANSI_BOLD}${lowPart}${ANSI_RESET} ${ofPart} ${ANSI_GREEN}${triggerStr}${ANSI_RESET}`;
-           }).join(", ");
-           log("craft", `${ANSI_YELLOW}NOT Crafting:${ANSI_RESET} ${recipe.name} (${recipe.recipe_id}): ${colored}`);
-         }
+        if (lowMaterials.length > 0) {
+          log("craft", markupNotCrafting(recipe.name, recipe.recipe_id, lowMaterials));
+        }
        continue;
      }
 
@@ -1239,18 +1263,18 @@ export async function processRecipeTriggers(
          const haveOut = countItemFn(outItem);
          const pendingOut = pendingOutputByItem.get(outItem) || 0;
          const room = itemLimit - (haveOut + pendingOut);
-          if (room <= 0) {
-            log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOut}+${pendingOut} pending >= cap ${itemLimit}${ANSI_RESET}`);
-            continue;
-          }
-          const maxRuns = Math.floor(room / outPerRun);
-          if (maxRuns <= 0) continue;
-          if (runs > maxRuns) {
-            log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${ANSI_CYAN}${maxRuns}${ANSI_RESET} (output cap ${ANSI_GREEN}${itemLimit}${ANSI_RESET})`);
-            runs = maxRuns;
-          }
-        }
-      }
+         if (room <= 0) {
+           log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${HTML_GREEN}${haveOut}+${pendingOut} pending >= cap ${itemLimit}${HTML_RESET}`);
+           continue;
+         }
+         const maxRuns = Math.floor(room / outPerRun);
+         if (maxRuns <= 0) continue;
+         if (runs > maxRuns) {
+           log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${HTML_CYAN}${maxRuns}${HTML_RESET} (output cap ${HTML_GREEN}${itemLimit}${HTML_RESET})`);
+           runs = maxRuns;
+         }
+       }
+     }
 
      // maxOutput cap configured on the trigger itself: a fired trigger must never
      // produce more than this many of the output item. The hold gate above only
@@ -1267,7 +1291,7 @@ export async function processRecipeTriggers(
        const pendingOut = pendingRuns * outPerRun;
        const room = config.maxOutput - (haveOut + pendingOut);
        if (room <= 0) {
-         log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${ANSI_GREEN}${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}${ANSI_RESET}`);
+         log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${HTML_GREEN}${haveOut}+${pendingOut} pending >= cap ${config.maxOutput}${HTML_RESET}`);
          continue;
        }
       const maxRuns = Math.floor(room / outPerRun);
@@ -1282,8 +1306,8 @@ export async function processRecipeTriggers(
     const limiter = lowestOutputItem(recipe);
     const outputPerRun = limiter.quantity || 1;
     const venue = resolveVenueForRecipe(recipe.recipe_id, recipe.name, ownFacilityMap, settings, bot);
-    const summary = config.materials.map(t => `${t.item}>${ANSI_CYAN}${t.triggerAt}${ANSI_RESET}→stop ${ANSI_GREEN}${t.stopAt}${ANSI_RESET}`).join(", ");
-    log("craft", `${ANSI_YELLOW}⚡${ANSI_RESET} Material trigger ${ANSI_GREEN}FIRED${ANSI_RESET} (pri ${ANSI_CYAN}${e.priority}${ANSI_RESET}) for ${recipe.name}: ${summary} -> queueing ${ANSI_CYAN}${runs}${ANSI_RESET} run(s) (limiting output ${ANSI_CYAN}${outputPerRun}x ${limiter.name}${ANSI_RESET})`);
+    const summary = config.materials.map(t => `${t.item}>${span(String(t.triggerAt), "ansi-cyan")}→stop ${span(String(t.stopAt), "ansi-green")}`).join(", ");
+    log("craft", `${span("⚡", "ansi-yellow")} Material trigger ${span("FIRED", "ansi-green")} (pri ${span(String(e.priority), "ansi-cyan")}) for ${recipe.name}: ${summary} -> queueing ${span(String(runs), "ansi-cyan")} run(s) (limiting output ${span(`${outputPerRun}x ${limiter.name}`, "ansi-cyan")})`);
 
     const queueResult = await queueCraftJob(
       ctx,
@@ -1301,7 +1325,7 @@ export async function processRecipeTriggers(
     );
     if (queueResult.success) {
       result.queued++;
-      log("craft", `${ANSI_GREEN}✓${ANSI_RESET} Queued ${ANSI_CYAN}${queueResult.queuedRuns}${ANSI_RESET} run(s) of ${recipe.name} via material trigger`);
+      log("craft", `${span("✓", "ansi-green")} Queued ${span(String(queueResult.queuedRuns), "ansi-cyan")} run(s) of ${recipe.name} via material trigger`);
       // Debit the budget for every component this batch will consume, so later
       // (lower-priority) triggers sharing any input see the reduced availability.
       for (const c of recipe.components) {

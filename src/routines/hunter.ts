@@ -143,7 +143,7 @@ async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isOb
         const r = resp.result as Record<string, unknown>;
         const prizes = (r.prizes || r.nearby_prizes || []) as Array<Record<string, unknown>>;
         const prizeSummary = prizes.map(p => `prize_id=${p.prize_id} ship_id=${p.ship_id} status=${p.status} ship=${p.ship_name || p.ship_class}`).join(" | ") || "no prizes";
-        console.log(`[DEBUG][get_nearby] poi=${r.poi_id || bot.poi} prizes=${prizes.length}: ${prizeSummary}`);
+        bot.log("debug", `[get_nearby] poi=${r.poi_id || bot.poi} prizes=${prizes.length}: ${prizeSummary}`);
       }
       return { result: resp.result, isObservation: false };
     }
@@ -5458,6 +5458,38 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
   return true;
 }
 
+/**
+ * Service any stalled prizes at the current POI.
+ * Checks get_nearby for prizes with wait_reason set and attempts to fix them.
+ * The game enforces ownership — service_prize will fail if the prize isn't ours.
+ */
+async function serviceAnyStalledPrizes(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) return;
+
+  const prizes = getNearbyPrizes(nearbyData);
+  for (const prize of prizes) {
+    if (!prize.wait_reason) continue;
+    if (bot.state !== "running") break;
+
+    ctx.log("combat", `🛸 Prize ${prize.ship_name || prize.prize_id} stalled at ${bot.poi} (${prize.wait_reason}) — attempting service`);
+
+    if (prize.wait_reason === "no_fuel") {
+      await servicePrize(ctx, prize, "refuel");
+    } else if (prize.wait_reason === "incapacitated") {
+      ctx.log("combat", `Prize incapacitated — cannot auto-fix`);
+    } else if (prize.wait_reason === "destination_missing") {
+      ctx.log("combat", `Prize destination missing — cannot auto-fix`);
+    } else if (prize.wait_reason === "no_route") {
+      ctx.log("combat", `Prize has no route — cannot auto-fix`);
+    } else if (prize.wait_reason === "manual_stop") {
+      await servicePrize(ctx, prize, "resume");
+    }
+  }
+}
+
 // ── Prize Recovery ──────────────────────────────────────────────
 //
 // After a successful boarding capture, the prize ship remains at the current
@@ -5673,9 +5705,12 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
  * a destination station, and calls claim_prize to send the prize recovering
  * to that station.
  *
+ * When requireTrackerMatch is false (default true), any available/claimed
+ * prize at the current POI will be claimed. The game enforces ownership.
+ *
  * Returns true if the prize was claimed, false otherwise.
  */
-async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, requireTrackerMatch: boolean = true): Promise<boolean> {
   const { bot } = ctx;
 
   // Need to be out of combat to claim a prize
@@ -5695,18 +5730,27 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
 
   const prizes = getNearbyPrizes(nearbyData);
   
-  // First, check if any prize matches our captured prize tracker (by ship_id)
-  let availablePrize = prizes.find(p => {
-    const match = bot.findCapturedPrizeMatch(p);
-    return match && (p.status === "available" || p.status === "claimed");
-  });
-
-  // If no tracked match, do NOT claim random prizes
-  if (!availablePrize) {
-    if (prizes.length > 0) {
-      ctx.log("combat", `ClaimPrize: found ${prizes.length} prize(s) but none match captured ship tracker`);
+  let availablePrize: PrizeInfo | undefined;
+  
+  if (requireTrackerMatch) {
+    // Only claim prizes matching our captured ship tracker
+    availablePrize = prizes.find(p => {
+      const match = bot.findCapturedPrizeMatch(p);
+      return match && (p.status === "available" || p.status === "claimed");
+    });
+    
+    if (!availablePrize) {
+      if (prizes.length > 0) {
+        ctx.log("combat", `ClaimPrize: found ${prizes.length} prize(s) but none match captured ship tracker`);
+      }
+      return false;
     }
-    return false;
+  } else {
+    // Claim any available or claimed prize at current POI
+    availablePrize = prizes.find(p => p.status === "available" || p.status === "claimed");
+    if (!availablePrize) {
+      return false;
+    }
   }
   
   // Log if this prize matches a tracked capture
@@ -6114,6 +6158,9 @@ async function* boardingSystemPass(
     bot.trackNearbyPlayers(nearbyData);
     bot.trackWildlife(nearbyData);
 
+    // Service any stalled prizes at this POI (refuel, resume, etc.)
+    await serviceAnyStalledPrizes(ctx);
+
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
     const entities = parseNearby(nearbyData);
@@ -6325,11 +6372,14 @@ async function* boardingSystemPass(
       const missedPrize = prizesAtPoi.find(p => p.status === "available" || p.status === "claimed");
       if (missedPrize) {
         ctx.log("combat", `🛸 Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat — claiming now`);
-        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false);
         if (claimed) {
           ctx.log("combat", `🏆 Missed prize from ${bot.poi} successfully claimed!`);
         }
       }
+      
+      // Service any stalled prizes (no fuel, etc.) regardless of tracker
+      await serviceAnyStalledPrizes(ctx);
     }
 
    // ── Post-patrol decision ──

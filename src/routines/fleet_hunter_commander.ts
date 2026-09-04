@@ -635,7 +635,7 @@ async function engageTargetFleet(
     await ctx.sleep(1000);
 
     // Use engageTarget from battle.ts with sideId for commander
-    return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", sideId, false, 0, false, cloakOnStart);
+    return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", sideId, false, 0, false, cloakOnStart, 5, 3, 1, 25);
   }
 
   // No existing battle — start fresh fight
@@ -661,7 +661,7 @@ async function engageTargetFleet(
   ctx.log("combat", `⚔️ Fleet battle started with ${target.name} — advancing`);
 
   // Use engageTarget from battle.ts (no sideId since it's a fresh battle)
-  return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", undefined, false, 0, false, cloakOnStart);
+  return await engageTarget(ctx, target, fleeThreshold, fleeFromTier, minPiratesToFlee, "large", undefined, false, 0, false, cloakOnStart, 5, 3, 1, 25);
 }
 
 // ── Fleet Hunter Commander Routine ───────────────────────

@@ -80,6 +80,8 @@ interface FleetHunterSettings {
   cloakOnStart: boolean;
   ammoThreshold: number;
   maxReloadAttempts: number;
+  ammoReloadAbsoluteThreshold: number;
+  ammoReloadPercentThreshold: number;
   huntingEnabled: boolean;
   manualMode: boolean;
 }
@@ -102,6 +104,8 @@ function getFleetHunterSettings(): FleetHunterSettings {
     cloakOnStart: (h.cloakOnStart as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     huntingEnabled: (h.huntingEnabled as boolean) ?? true,
     manualMode: (h.manualMode as boolean) ?? false,
   };
@@ -279,6 +283,11 @@ async function executeAttackCommand(ctx: RoutineContext, params: string): Promis
     0, // repairThreshold
     false, // onlyNPCs
     settings.cloakOnStart, // cloakOnStart
+    80, // shieldRechargePct
+    settings.ammoThreshold,
+    settings.maxReloadAttempts,
+    settings.ammoReloadAbsoluteThreshold,
+    settings.ammoReloadPercentThreshold,
   );
 
   if (!won) {

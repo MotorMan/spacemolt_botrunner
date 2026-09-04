@@ -1080,8 +1080,8 @@ async function hunterEngage(
     // target (leviathans are intentionally skipped — they keep the assist broadcast).
     claimCreature(ctx, target);
   }
-  const hsettings = getHunterSettings(ctx.bot.username);
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80);
+   const hsettings = getHunterSettings(ctx.bot.username);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
 }
 
 /** Register the bot's coordination listener once. */
@@ -6357,7 +6357,7 @@ async function* boardingSystemPass(
          claimCreature(ctx, target);
        }
        const hsettings = getHunterSettings(ctx.bot.username);
-       const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
 
        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
        if (won) {

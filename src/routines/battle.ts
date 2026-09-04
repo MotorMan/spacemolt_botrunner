@@ -661,6 +661,10 @@ export async function engageTarget(
   onlyNPCs: boolean = false,     // if true, flee when encountering players
   cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
   shieldRechargePct: number = 80, // shield % to top up to in combat (e.g. 80 for 80%)
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -673,7 +677,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -697,7 +701,7 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
@@ -758,14 +762,14 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart);
+        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
       }
     }
     return false;
   }
 
-  ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct);
+   ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
@@ -796,6 +800,10 @@ export async function fightFreshBattle(
   repairThreshold: number = 0,
   cloakOnStart: boolean = false,
   shieldRechargePct: number = 80,
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -1045,6 +1053,11 @@ export async function fightFreshBattle(
         await ctx.sleep(10000);
         continue;
       }
+    }
+
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
     }
 
     const enemyStance = targetParticipant?.stance || "unknown";
@@ -1446,6 +1459,10 @@ export async function fightJoinedBattle(
   shieldRechargePct: number = 80,
   onlyNPCs: boolean = false,
   cloakOnStart: boolean = false,
+  ammoThreshold: number = 5,
+  maxReloadAttempts: number = 3,
+  ammoReloadAbsoluteThreshold: number = 1,
+  ammoReloadPercentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -1720,6 +1737,11 @@ export async function fightJoinedBattle(
         await ctx.sleep(10000);
         continue;
       }
+    }
+
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };

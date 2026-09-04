@@ -20930,25 +20930,24 @@ When responding:
           36: "ansi-cyan",
           37: "ansi-white",
         };
+        const ESC = String.fromCharCode(27);
+        if (text.indexOf(ESC) < 0) return escHtml(text);
         const stack = [];
         let html = "";
         let last = 0;
-        const re = /\x1b\[([0-9;]*)m/g;
-        let match = null;
-        while ((match = re.exec(text)) !== null) {
-          html += escHtml(text.slice(last, match.index));
-          last = match.index + match[0].length;
-          if (match[1] === "0") {
-            while (stack.length) html += "</span>";
-            stack.length = 0;
-          } else {
-            const codes = match[1].split(";").map(Number).filter(n => n > 0);
-            const cls = codes.map(c => classes[c]).filter(Boolean).join(" ");
-            if (cls) {
-              html += `<span class="${cls}">`;
-              stack.push(cls);
-            }
+        let idx = text.indexOf(ESC);
+        while (idx >= 0) {
+          html += escHtml(text.slice(last, idx));
+          const end = text.indexOf("m", idx);
+          if (end < 0) break;
+          const codes = text.slice(idx + 1, end).split(";").map(Number).filter(n => n > 0);
+          const cls = codes.map(c => classes[c]).filter(Boolean).join(" ");
+          if (cls) {
+            html += '<span class="' + cls + '">';
+            stack.push(cls);
           }
+          last = end + 1;
+          idx = text.indexOf(ESC, last);
         }
         html += escHtml(text.slice(last));
         while (stack.length) html += "</span>";
@@ -20962,12 +20961,15 @@ When responding:
       function makeLogLine(text) {
         const div = document.createElement("div");
         div.className = "log-line";
-        // Strip ANSI codes for category detection
-        const raw = text.replace(/\x1b\[[0-9;]*m/g, "");
-        // Format: "HH:MM:SS [username] [category] msg" — capture the second bracket (category)
+        const raw = text.replace(/\u001b\[[0-9;]*m/g, "");
         const m = raw.match(/\[[^\]]+\]\s*\[([^\]]+)\]/);
         if (m) div.classList.add(`cat-${m[1].toLowerCase().trim()}`);
-        div.innerHTML = ansiToHtml(text);
+        try {
+          div.innerHTML = ansiToHtml(text);
+        } catch (e) {
+          console.error("[makeLogLine] ansiToHtml failed:", e);
+          div.textContent = text;
+        }
         return div;
       }
 

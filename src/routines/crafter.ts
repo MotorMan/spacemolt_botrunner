@@ -1212,14 +1212,16 @@ export async function processRecipeTriggers(
            return `${t.item}: LOW:${current} of ${t.triggerAt}`;
          })
          .filter((s): s is string => s !== null);
-        if (lowMaterials.length > 0) {
-          const colored = lowMaterials.map(s => {
-            const [mat, rest] = s.split(": ");
-            const [lowPart, numStr, ofPart, triggerStr] = rest.split(" ");
-            return `${mat}: ${ANSI_RED}${ANSI_BOLD}${lowPart}${ANSI_RESET}${ANSI_RED}:${numStr}${ANSI_RESET} ${ofPart} ${ANSI_GREEN}${triggerStr}${ANSI_RESET}`;
-          }).join(", ");
-          log("craft", `${ANSI_YELLOW}NOT Crafting:${ANSI_RESET} ${recipe.name} (${recipe.recipe_id}): ${colored}`);
-        }
+         if (lowMaterials.length > 0) {
+           const colored = lowMaterials.map(s => {
+             const [mat, rest] = s.split(": ");
+             const m = rest.match(/^(LOW:\d+)\s+(of)\s+(\d+)$/);
+             if (!m) return `${mat}: ${ANSI_RED}${rest}${ANSI_RESET}`;
+             const [, lowPart, ofPart, triggerStr] = m;
+             return `${mat}: ${ANSI_RED}${ANSI_BOLD}${lowPart}${ANSI_RESET} ${ofPart} ${ANSI_GREEN}${triggerStr}${ANSI_RESET}`;
+           }).join(", ");
+           log("craft", `${ANSI_YELLOW}NOT Crafting:${ANSI_RESET} ${recipe.name} (${recipe.recipe_id}): ${colored}`);
+         }
        continue;
      }
 

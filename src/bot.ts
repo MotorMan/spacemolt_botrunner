@@ -4742,6 +4742,10 @@ if (this.craftQueueTracker && jobId && recipeId) {
    */
   registerCapturedPrize(shipId: string, shipClass: string, battleId: string, prizeId?: string): void {
     if (!shipId) return;
+    const existing = this.capturedPrizeTracker.get(shipId);
+    if (existing && existing.prize_id) {
+      return;
+    }
     this.capturedPrizeTracker.set(shipId, {
       prize_id: prizeId || "",
       ship_id: shipId,

@@ -1131,6 +1131,44 @@ export async function processRecipeTriggers(
   // Process highest-priority first (lower number = earlier).
   entries.sort((a, b) => a.priority - b.priority);
 
+  // Aggregate output limits by item so recipes that share the same output
+  // collectively respect the limit (e.g. multiple superconductor recipes).
+  const itemLimits = new Map<string, number>();
+  if (outputLimits && outputLimits.size > 0) {
+    for (const e of entries) {
+      const limiter = lowestOutputItem(e.recipe);
+      const outItem = limiter.item_id.toLowerCase();
+      const recipeLimit = outputLimits.get(e.recipeId);
+      if (recipeLimit === undefined) continue;
+      const prev = itemLimits.get(outItem);
+      if (prev === undefined || recipeLimit < prev) {
+        itemLimits.set(outItem, recipeLimit);
+      }
+    }
+  }
+
+  // Build a combined pending map (server + tracker) keyed by recipeId, then
+  // aggregate by output item so limit checks see total committed output.
+  const combinedPendingByRecipe = new Map<string, number>();
+  for (const [recipeId, runs] of livePending.entries()) {
+    combinedPendingByRecipe.set(recipeId, (combinedPendingByRecipe.get(recipeId) || 0) + runs);
+  }
+  for (const job of tracker.getActiveJobs()) {
+    const pending = Math.max(0, Math.min(job.quantity - job.completed, job.runsRemaining));
+    combinedPendingByRecipe.set(job.recipeId, (combinedPendingByRecipe.get(job.recipeId) || 0) + pending);
+  }
+
+  const pendingOutputByItem = new Map<string, number>();
+  for (const [recipeId, pendingRuns] of combinedPendingByRecipe.entries()) {
+    const r = recipeIndex.get(recipeId);
+    if (!r) continue;
+    const outs = (r.outputs && r.outputs.length > 0) ? r.outputs : [{ item_id: r.output_item_id, quantity: r.output_quantity || 1 }];
+    for (const o of outs) {
+      const outId = o.item_id.toLowerCase();
+      pendingOutputByItem.set(outId, (pendingOutputByItem.get(outId) || 0) + (o.quantity || 1) * pendingRuns);
+    }
+  }
+
   for (const e of entries) {
     if (bot.state !== "running") break;
     const { recipe, config } = e;
@@ -1154,46 +1192,49 @@ export async function processRecipeTriggers(
     // won't queue more than the surplus that hasn't already been claimed.
 
     let runs = evaluateRecipeTrigger(recipe, config.materials, budgetCount);
-    if (runs === null) {
-      // Debug: show each trigger material's count vs threshold so it's clear why
-      // the trigger didn't fire (which material is below `triggerAt`, or which
-      // component doesn't exist on the recipe, or which is already at/below stop).
-      const detail = config.materials.map(t => {
-        const liveCount = countItemFn(t.item.toLowerCase());
-        const budgetCount_ = budgetCount(t.item.toLowerCase());
-        const isComponent = !!recipe.components.find(
-          c => c.item_id.toLowerCase() === t.item.toLowerCase(),
-        );
-        return `${t.item}: live=${liveCount} budget=${budgetCount_} triggerAt=${t.triggerAt} stopAt=${t.stopAt} isComponent=${isComponent}`;
-      }).join("; ");
-      log("craft", `Material trigger NOT fired for ${recipe.name} (${recipe.recipe_id}): ${detail}`);
-      continue;
-    }
+     if (runs === null) {
+       const lowMaterials = config.materials
+         .map(t => {
+           const current = countItemFn(t.item.toLowerCase());
+           const comp = recipe.components.find(
+             c => c.item_id.toLowerCase() === t.item.toLowerCase(),
+           );
+           if (!comp || current > t.triggerAt) return null;
+           return `${t.item}: LOW:${current} of ${t.triggerAt}`;
+         })
+         .filter((s): s is string => s !== null);
+       if (lowMaterials.length > 0) {
+         log("craft", `NOT Crafting: ${recipe.name} (${recipe.recipe_id}): ${lowMaterials.join(", ")}`);
+       }
+       continue;
+     }
 
-    // Respect the recipe's output cap (the craftLimit / "make N outputs" target):
-    // a material trigger should fill the surplus but never produce past the
-    // user's stated maximum. If the cap is already met (or will be by in-flight
-    // work), hold off instead of over-producing.
-    if (outputLimits && outputLimits.has(e.recipeId)) {
-      const limit = outputLimits.get(e.recipeId) as number;
-      const limiter = lowestOutputItem(recipe);
-      const outPerRun = limiter.quantity || 1;
-      const outItem = limiter.item_id.toLowerCase();
-      const haveOut = countItemFn(outItem);
-      const pendingRuns = livePending.get(recipe.recipe_id) ?? tracker.getProgress(recipe.recipe_id).remaining;
-      const pendingOut = pendingRuns * outPerRun;
-      const room = limit - (haveOut + pendingOut);
-      if (room <= 0) {
-        log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${limit}`);
-        continue;
-      }
-      const maxRuns = Math.floor(room / outPerRun);
-      if (maxRuns <= 0) continue;
-      if (runs > maxRuns) {
-        log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (output cap ${limit})`);
-        runs = maxRuns;
-      }
-    }
+     // Respect the recipe's output cap (the craftLimit / "make N outputs" target):
+     // a material trigger should fill the surplus but never produce past the
+     // user's stated maximum. If the cap is already met (or will be by in-flight
+     // work), hold off instead of over-producing. Limits are aggregated by output
+     // item so multiple recipes producing the same item share the cap.
+     if (itemLimits.size > 0) {
+       const limiter = lowestOutputItem(recipe);
+       const outPerRun = limiter.quantity || 1;
+       const outItem = limiter.item_id.toLowerCase();
+       const itemLimit = itemLimits.get(outItem);
+       if (itemLimit !== undefined) {
+         const haveOut = countItemFn(outItem);
+         const pendingOut = pendingOutputByItem.get(outItem) || 0;
+         const room = itemLimit - (haveOut + pendingOut);
+         if (room <= 0) {
+           log("craft", `Material trigger held for ${recipe.name}: output ${outItem} at ${haveOut}+${pendingOut} pending >= cap ${itemLimit}`);
+           continue;
+         }
+         const maxRuns = Math.floor(room / outPerRun);
+         if (maxRuns <= 0) continue;
+         if (runs > maxRuns) {
+           log("craft", `Material trigger for ${recipe.name}: capping ${runs} runs to ${maxRuns} (output cap ${itemLimit})`);
+           runs = maxRuns;
+         }
+       }
+     }
 
     // maxOutput cap configured on the trigger itself: a fired trigger must never
     // produce more than this many of the output item. The hold gate above only

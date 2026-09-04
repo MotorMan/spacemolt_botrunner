@@ -141,9 +141,11 @@ async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isOb
       const resp = await bot.exec("get_nearby");
       if (resp.result) {
         const r = resp.result as Record<string, unknown>;
-        const prizes = (r.prizes || r.nearby_prizes || []) as Array<Record<string, unknown>>;
-        const prizeSummary = prizes.map(p => `prize_id=${p.prize_id} ship_id=${p.ship_id} status=${p.status} ship=${p.ship_name || p.ship_class}`).join(" | ") || "no prizes";
-        bot.log("debug", `[get_nearby] poi=${r.poi_id || bot.poi} prizes=${prizes.length}: ${prizeSummary}`);
+        const prizesFromPrizes = Array.isArray(r.prizes) ? r.prizes : [];
+        const prizesFromNearby = Array.isArray(r.nearby_prizes) ? r.nearby_prizes : [];
+        const allPrizes = prizesFromPrizes.length > 0 ? prizesFromPrizes : prizesFromNearby;
+        const prizeSummary = allPrizes.map(p => `prize_id=${p.prize_id} ship_id=${p.ship_id} status=${p.status} ship=${p.ship_name || p.ship_class}`).join(" | ") || "no prizes";
+        bot.log("debug", `[get_nearby] poi=${r.poi_id || bot.poi} prizes=${allPrizes.length}: ${prizeSummary}`);
       }
       return { result: resp.result, isObservation: false };
     }
@@ -5505,7 +5507,9 @@ async function serviceAnyStalledPrizes(ctx: RoutineContext): Promise<void> {
 function getNearbyPrizes(result: unknown): PrizeInfo[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
-  const prizesRaw = (r.prizes || r.nearby_prizes) as Array<Record<string, unknown>> | undefined;
+  const prizesFromPrizes = Array.isArray(r.prizes) ? r.prizes : [];
+  const prizesFromNearby = Array.isArray(r.nearby_prizes) ? r.nearby_prizes : [];
+  const prizesRaw = prizesFromPrizes.length > 0 ? prizesFromPrizes : prizesFromNearby;
   if (!prizesRaw || !Array.isArray(prizesRaw)) return [];
 
   return prizesRaw.map(p => ({
@@ -5820,6 +5824,27 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
   }
 
   ctx.log("combat", `⚠️ ClaimPrize: prize not visible after claim — cannot verify`);
+
+  // FALLBACK: Check get_status prize_recoveries to confirm the claim worked
+  const statusResp = await bot.exec("get_status");
+  if (!statusResp.error && statusResp.result && typeof statusResp.result === "object") {
+    const statusRecoveries = (statusResp.result as Record<string, unknown>)?.prize_recoveries as Array<Record<string, unknown>> | undefined;
+    const statusRecovery = statusRecoveries?.find((pr: Record<string, unknown>) => (pr.prize_id as string) === availablePrize.prize_id || (pr.ship_id as string) === availablePrize.ship_id);
+    if (statusRecovery && (statusRecovery.status === "claimed" || statusRecovery.status === "in_transit")) {
+      ctx.log("combat", `✅ Prize ${availablePrize.ship_name || availablePrize.prize_id} verified as ${statusRecovery.status} via get_status!`);
+      const recoveryShipId = statusRecovery.ship_id as string | undefined;
+      const recoveryPrizeId = statusRecovery.prize_id as string | undefined;
+      const recoveryShipClass = statusRecovery.ship_class as string | undefined;
+      if (recoveryShipId && recoveryPrizeId) {
+        const existing = bot.getCapturedPrizeByShipId(recoveryShipId);
+        if (existing) {
+          bot.registerCapturedPrize(recoveryShipId, recoveryShipClass || existing.ship_class, existing.battle_id, recoveryPrizeId);
+        }
+      }
+      return true;
+    }
+  }
+
   return false;
 }
 

@@ -5539,56 +5539,14 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
           ctx.log("combat", `🛸 FindPrize: matched tracked capture ship_id=${trackedMatch.ship_id}`);
         }
 
-        // Refuel the prize ship before sending it off.
-        // Fuel data comes from get_status prize_recoveries, NOT get_nearby.
-        const recovery2 = bot.prizeRecoveries.find(r => r.prize_id === availablePrize.prize_id || r.ship_id === availablePrize.ship_id);
-        let refuelQty2 = 100;
-        let skippedRefuel2 = false;
-        
-        if (recovery2) {
-          const recFuel = recovery2.fuel ?? 0;
-          const recMaxFuel = recovery2.max_fuel ?? 0;
-          if (recMaxFuel > 0 && recFuel >= recMaxFuel) {
-            ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} already fully fueled (${recFuel}/${recMaxFuel}) — skipping refuel`);
-            skippedRefuel2 = true;
-          } else if (recMaxFuel > 0) {
-            refuelQty2 = Math.min(recMaxFuel - recFuel, 100);
-            ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} fuel=${recFuel}/${recMaxFuel} — refueling ${refuelQty2}`);
-          } else {
-            ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} fuel=${recFuel} (max unknown) — refueling ${refuelQty2}`);
-          }
-        } else {
-          ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} — no recovery data yet, refueling ${refuelQty2}`);
-        }
-        
-        if (!skippedRefuel2) {
-          const refuelResp = await bot.exec("service_prize", {
-            id: availablePrize.prize_id,
-            service_action: "refuel",
-            quantity: refuelQty2,
-          });
-          
-          if (refuelResp.error) {
-            const refuelMsg = refuelResp.error.message.toLowerCase();
-            if (refuelMsg.includes("not found") || refuelMsg.includes("invalid")) {
-              ctx.log("combat", `FindPrize: refuel failed — prize not found (${refuelResp.error.message})`);
-              continue;
-            }
-            if (refuelMsg.includes("rate limit") || refuelMsg.includes("retry")) {
-              ctx.log("combat", `FindPrize: refuel rate limited — will retry next tick`);
-              continue;
-            }
-            ctx.log("combat", `⚠️ FindPrize: refuel note: ${refuelResp.error.message} — continuing to claim`);
-          } else {
-            ctx.log("combat", `🛸 Refueled prize ${availablePrize.ship_name || availablePrize.prize_id} (+${refuelQty2} fuel)`);
-          }
-        }
+        // NOTE: Cannot refuel before claiming — only the claimant can service a prize,
+        // and claiming sends it off immediately. We verify post-claim via get_nearby.
 
-       const claimResp = await bot.exec("claim_prize", {
-         id: availablePrize.prize_id,
-         target: destBaseId,
-         crew_disposition: "aboard",
-       });
+        const claimResp = await bot.exec("claim_prize", {
+          id: availablePrize.prize_id,
+          target: destBaseId,
+          crew_disposition: "aboard",
+        });
 
        if (claimResp.error) {
          const msg = claimResp.error.message.toLowerCase();
@@ -5708,50 +5666,8 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
 
   ctx.log("combat", `🛸 Claiming prize ${availablePrize.ship_name || availablePrize.prize_id} → destination: ${destBaseId}`);
 
-  // Refuel the prize ship before sending it off.
-  // Fuel data comes from get_status prize_recoveries, NOT get_nearby.
-  const recovery = bot.prizeRecoveries.find(r => r.prize_id === availablePrize.prize_id || r.ship_id === availablePrize.ship_id);
-  let refuelQty = 100;
-  let skippedRefuel = false;
-  
-  if (recovery) {
-    const recFuel = recovery.fuel ?? 0;
-    const recMaxFuel = recovery.max_fuel ?? 0;
-    if (recMaxFuel > 0 && recFuel >= recMaxFuel) {
-      ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} already fully fueled (${recFuel}/${recMaxFuel}) — skipping refuel`);
-      skippedRefuel = true;
-    } else if (recMaxFuel > 0) {
-      refuelQty = Math.min(recMaxFuel - recFuel, 100);
-      ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} fuel=${recFuel}/${recMaxFuel} — refueling ${refuelQty}`);
-    } else {
-      ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} fuel=${recFuel} (max unknown) — refueling ${refuelQty}`);
-    }
-  } else {
-    ctx.log("combat", `🛸 Prize ${availablePrize.ship_name || availablePrize.prize_id} — no recovery data yet, refueling ${refuelQty}`);
-  }
-  
-  if (!skippedRefuel) {
-    const refuelResp = await bot.exec("service_prize", {
-      id: availablePrize.prize_id,
-      service_action: "refuel",
-      quantity: refuelQty,
-    });
-    
-    if (refuelResp.error) {
-      const refuelMsg = refuelResp.error.message.toLowerCase();
-      if (refuelMsg.includes("not found") || refuelMsg.includes("invalid")) {
-        ctx.log("combat", `ClaimPrize: refuel failed — prize not found (${refuelResp.error.message})`);
-        return false;
-      }
-      if (refuelMsg.includes("rate limit") || refuelMsg.includes("retry")) {
-        ctx.log("combat", `ClaimPrize: refuel rate limited — will retry next tick`);
-        return false;
-      }
-      ctx.log("combat", `⚠️ ClaimPrize: refuel note: ${refuelResp.error.message} — continuing to claim`);
-    } else {
-      ctx.log("combat", `🛸 Refueled prize ${availablePrize.ship_name || availablePrize.prize_id} (+${refuelQty} fuel)`);
-    }
-  }
+  // NOTE: Cannot refuel before claiming — only the claimant can service a prize,
+  // and claiming sends it off immediately. We verify post-claim via get_nearby.
 
   const claimResp = await bot.exec("claim_prize", {
     id: availablePrize.prize_id,

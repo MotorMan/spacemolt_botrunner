@@ -554,10 +554,10 @@ export function getHunterPatrolProfile(username: string): HunterPatrolProfile | 
 /** Returns true if the bot is low on field repair consumables and should return to resupply. */
 function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5, minShieldCharges = 5): boolean {
   const repair = (inventory || [])
-    .filter(i => (i.itemId || "").toLowerCase().includes("repair_kit"))
+    .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   const shields = (inventory || [])
-    .filter(i => (i.itemId || "").toLowerCase().includes("shield_charge"))
+    .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   return repair < minRepairKits || shields < minShieldCharges;
 }
@@ -2453,13 +2453,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const needsRepair = postHull <= settings.repairThreshold;
 
     // Only return home for fuel when we have ZERO fuel cells of any type in cargo
-    const hasFuelCells = bot.inventory?.some(i =>
-      i.itemId === 'fuel_cell' ||
-      i.itemId === 'premium_fuel_cell' ||
-      i.itemId === 'military_fuel_cell'
-    );
-    const needsFuel = !hasFuelCells;
-
+     // Only return home for fuel when fuel is actually low AND we have no fuel cells
+     const hasFuelCells = bot.inventory?.some(i =>
+       i.itemId.toLowerCase() === 'fuel_cell' ||
+       i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+       i.itemId.toLowerCase() === 'military_fuel_cell'
+     );
+     const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
@@ -2927,13 +2927,13 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     const needsRepair = postHull <= settings.repairThreshold;
 
     // Only return home for fuel when we have ZERO fuel cells of any type in cargo
-    const hasFuelCells = bot.inventory?.some(i =>
-      i.itemId === 'fuel_cell' ||
-      i.itemId === 'premium_fuel_cell' ||
-      i.itemId === 'military_fuel_cell'
-    );
-    const needsFuel = !hasFuelCells;
-
+     // Only return home for fuel when fuel is actually low AND we have no fuel cells
+     const hasFuelCells = bot.inventory?.some(i =>
+       i.itemId.toLowerCase() === 'fuel_cell' ||
+       i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+       i.itemId.toLowerCase() === 'military_fuel_cell'
+     );
+     const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
@@ -6255,15 +6255,15 @@ async function* boardingSystemPass(
   await bot.refreshShip();
   const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
   const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  const needsRepair = postHull <= settings.repairThreshold;
-  const hasFuelCells = bot.inventory?.some(i =>
-    i.itemId === 'fuel_cell' ||
-    i.itemId === 'premium_fuel_cell' ||
-    i.itemId === 'military_fuel_cell'
-  );
-  const needsFuel = !hasFuelCells;
+   const needsRepair = postHull <= settings.repairThreshold;
+   const hasFuelCells = bot.inventory?.some(i =>
+     i.itemId.toLowerCase() === 'fuel_cell' ||
+     i.itemId.toLowerCase() === 'premium_fuel_cell' ||
+     i.itemId.toLowerCase() === 'military_fuel_cell'
+   );
+   const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
 
-  if (needsRepair || needsFuel) {
+   if (needsRepair || needsFuel) {
     ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — returning to safe system...`);
     yield "dock";
     const docked = await navigateToSafeStation(ctx, safetyOpts);
@@ -6308,4 +6308,8 @@ async function* boardingSystemPass(
 
   return [totalKills, totalBoardings];
 }
+
+
+
+
 

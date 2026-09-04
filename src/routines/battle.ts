@@ -1038,6 +1038,11 @@ export async function fightFreshBattle(
     const damageThisTick = Math.max(0, lastHull - bot.hull);
     lastHull = bot.hull;
 
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
+    }
+
     // In-combat emergency field repair / shield top-up (hunter style)
     if (repairThreshold > 0) {
       let didAction = false;
@@ -1053,11 +1058,6 @@ export async function fightFreshBattle(
         await ctx.sleep(10000);
         continue;
       }
-    }
-
-    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
-    if (!hasAmmo) {
-      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
     }
 
     const enemyStance = targetParticipant?.stance || "unknown";
@@ -1728,6 +1728,11 @@ export async function fightJoinedBattle(
       }
     }
 
+    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    if (!hasAmmo) {
+      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
+    }
+
     // Shield recharge for escorts (even when repairThreshold is 0)
     // shieldRechargePct is passed as percentage (e.g., 80 for 80%), convert to decimal for topUpShields
     const shieldTargetPct = shieldRechargePct / 100;
@@ -1737,11 +1742,6 @@ export async function fightJoinedBattle(
         await ctx.sleep(10000);
         continue;
       }
-    }
-
-    const hasAmmo = await ensureAmmoLoaded(ctx, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
-    if (!hasAmmo) {
-      ctx.log("combat", `⚠️ No ammo reloaded — continuing fight (meat-shield if cargo empty)`);
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };

@@ -5488,32 +5488,40 @@ function getNearbyPrizes(result: unknown): PrizeInfo[] {
 
 /**
  * Find a station base ID to use as the prize recovery destination.
- * Prefers the bot's configured home station; falls back to the system's
- * first non-pirate station; falls back to any station in the current system.
+ *
+ * The home station is almost never in the current system, so we resolve it
+ * from the global mapStore to get its `base_id`. claim_prize requires the
+ * `base_id`, not the POI `id`.
  */
 async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<string | null> {
-  const hs = settings.homeStation || "";
-  if (hs && hs.includes("|")) {
-    const parts = hs.split("|");
-    const baseId = parts[1];
-    if (baseId) return baseId;
-  } else if (hs) {
-    return hs;
-  }
+  const homeStation = settings.homeStation || "";
+  if (!homeStation) return null;
 
-  // Try the current system's stations
-  try {
-    const { pois } = await getSystemInfo(ctx);
-    if (pois && pois.length > 0) {
-      const station = findStation(pois, undefined, true);
-      if (station?.base_id) return station.base_id;
+  const lowerHome = homeStation.toLowerCase();
+
+  // Handle "system|poi" format — extract the poi part for lookup
+  const homePoi = homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+
+  // Resolve from mapStore (home station is global, not local)
+  const allSystems = mapStore.getAllSystems();
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    for (const poi of sys.pois) {
+      const travelId = poi.base_id || poi.id;
+      if (
+        travelId.toLowerCase() === lowerHome ||
+        poi.id.toLowerCase() === lowerHome ||
+        poi.base_id?.toLowerCase() === lowerHome ||
+        (poi.base_name && poi.base_name.toLowerCase().includes(lowerHome.replace(/_/g, " "))) ||
+        (poi.name && poi.name.toLowerCase().includes(lowerHome.replace(/_/g, " ")))
+      ) {
+        return poi.base_id || poi.id;
+      }
     }
-  } catch {
-    // System info may fail if we're at a station — continue to fallback
   }
 
-  // No suitable destination found
-  return null;
+  // If we couldn't resolve it, return the raw setting as a last resort
+  // (it might already be a base_id)
+  return homeStation;
 }
 
 /**

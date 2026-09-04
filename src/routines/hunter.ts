@@ -5787,15 +5787,22 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
   const { bot } = ctx;
   const maxWaitTicks = 30; // ~300 seconds max wait for recovery
   let waitTick = 0;
-  let lastStatus = "";
 
-  while (waitTick < maxWaitTicks) {
+  while (bot.state === "running" && waitTick < maxWaitTicks) {
     waitTick++;
 
     await bot.refreshStatus();
     const recoveries = bot.prizeRecoveries;
 
-    if (recoveries.length === 0) {
+    // Find the tracked captured prize entry for THIS capture
+    const trackedEntries = Array.from(bot.capturedPrizeTracker.values());
+    const targetEntry = trackedEntries.find(e => {
+      if (knownShipId && e.ship_id === knownShipId) return true;
+      return e.ship_id && recoveries.some(r => r.ship_id === e.ship_id || r.prize_id === e.prize_id);
+    });
+
+    if (!targetEntry) {
+      ctx.log("combat", `RecoverPrize: no tracked captured prize yet — attempting to claim`);
       const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
       if (!claimed) {
         const found = await findAndClaimPrizeAcrossSystem(ctx, settings, knownShipId);
@@ -5803,41 +5810,57 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
           ctx.log("combat", `RecoverPrize: prize not visible yet — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
         }
       }
-    } else {
-      const recovery = recoveries[0];
-      if (recovery) {
-        const statusChanged = recovery.status !== lastStatus;
-        lastStatus = recovery.status;
+      await ctx.sleep(10000);
+      continue;
+    }
 
-        if (statusChanged) {
-          ctx.log("combat", `RecoverPrize: status=${recovery.status} fuel=${recovery.fuel}/${recovery.max_fuel} hull=${recovery.hull}/${recovery.max_hull}`);
+    // Find the recovery entry that matches our tracked prize
+    const recovery = recoveries.find(r => r.ship_id === targetEntry.ship_id || r.prize_id === targetEntry.prize_id);
+
+    if (!recovery) {
+      ctx.log("combat", `RecoverPrize: tracked prize (ship=${targetEntry.ship_id}) not yet in prize_recoveries — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    ctx.log("combat", `RecoverPrize[t=${targetEntry.ship_id.slice(0,8)}]: status=${recovery.status} fuel=${recovery.fuel}/${recovery.max_fuel} hull=${recovery.hull}/${recovery.max_hull} wait=${recovery.wait_reason || "none"}`);
+
+    if (recovery.status === "delivered") {
+      ctx.log("combat", `✅ Prize ${recovery.ship_name || recovery.prize_id} delivered to ${recovery.destination_base_id}!`);
+      bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+      return true;
+    }
+    if (recovery.status === "destroyed" || recovery.status === "expired" || recovery.status === "recaptured") {
+      ctx.log("combat", `RecoverPrize: prize ${recovery.status} — aborting recovery`);
+      bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+      return false;
+    }
+
+    if (recovery.status === "claimed" || recovery.status === "in_transit") {
+      const stillThere = await isPrizeStillAtPoi(ctx, recovery);
+      if (!stillThere) {
+        ctx.log("combat", `✅ Prize ${recovery.ship_name || recovery.prize_id} left the POI — recovery complete`);
+        bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+        return true;
+      }
+
+      if (recovery.wait_reason === "no_fuel") {
+        ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) — attempting refuel`);
+        const refueled = await servicePrize(ctx, recovery, "refuel");
+        if (!refueled) {
+          ctx.log("combat", `RecoverPrize: refuel failed — will retry next tick`);
         }
-
-        if (recovery.status === "delivered") {
-          ctx.log("combat", `✅ Prize ${recovery.ship_name || recovery.prize_id} delivered to ${recovery.destination_base_id}!`);
-          return true;
-        }
-        if (recovery.status === "destroyed" || recovery.status === "expired" || recovery.status === "recaptured") {
-          ctx.log("combat", `RecoverPrize: prize ${recovery.status} — aborting recovery`);
-          return false;
-        }
-
-        if (recovery.status === "claimed" || recovery.status === "in_transit") {
-          const stillThere = await isPrizeStillAtPoi(ctx, recovery);
-          if (!stillThere) {
-            ctx.log("combat", `✅ Prize ${recovery.ship_name || recovery.prize_id} left the POI — recovery complete`);
-            return true;
-          }
-
-          if (recovery.wait_reason === "no_fuel") {
-            ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) — attempting refuel`);
-            const refueled = await servicePrize(ctx, recovery, "refuel");
-            if (!refueled) {
-              ctx.log("combat", `RecoverPrize: refuel failed — will retry next tick`);
-            }
-          } else if (recovery.wait_reason === "incapacitated" || recovery.wait_reason === "destination_missing") {
-            ctx.log("combat", `RecoverPrize: prize stalled (${recovery.wait_reason}) — cannot auto-fix, waiting`);
-          }
+      } else if (recovery.wait_reason === "incapacitated") {
+        ctx.log("combat", `RecoverPrize: prize stalled (incapacitated) — cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "destination_missing") {
+        ctx.log("combat", `RecoverPrize: prize stalled (destination_missing) — cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "no_route") {
+        ctx.log("combat", `RecoverPrize: prize stalled (no_route) — cannot auto-fix, waiting`);
+      } else if (recovery.wait_reason === "manual_stop") {
+        ctx.log("combat", `RecoverPrize: prize manually stopped — attempting resume`);
+        const resumed = await servicePrize(ctx, recovery, "resume");
+        if (!resumed) {
+          ctx.log("combat", `RecoverPrize: resume failed — will retry next tick`);
         }
       }
     }
@@ -5845,7 +5868,9 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     await ctx.sleep(10000);
   }
 
-  ctx.log("combat", "RecoverPrize: timed out waiting for prize to leave POI");
+  if (waitTick >= maxWaitTicks) {
+    ctx.log("combat", "RecoverPrize: timed out waiting for prize to leave POI");
+  }
   return false;
 }
 

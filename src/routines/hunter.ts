@@ -138,9 +138,15 @@ function isStationEntity(e: NearbyEntity): boolean {
 }
 
 async function getObservationOrNearby(bot: Bot): Promise<{ result: unknown; isObservation: boolean }> {
-     const resp = await bot.exec("get_nearby");
-     return { result: resp.result, isObservation: false };
-   }
+      const resp = await bot.exec("get_nearby");
+      if (resp.result) {
+        const r = resp.result as Record<string, unknown>;
+        const prizes = (r.prizes || r.nearby_prizes || []) as Array<Record<string, unknown>>;
+        const prizeSummary = prizes.map(p => `prize_id=${p.prize_id} ship_id=${p.ship_id} status=${p.status} ship=${p.ship_name || p.ship_class}`).join(" | ") || "no prizes";
+        console.log(`[DEBUG][get_nearby] poi=${r.poi_id || bot.poi} prizes=${prizes.length}: ${prizeSummary}`);
+      }
+      return { result: resp.result, isObservation: false };
+    }
 
 function getObservationDebugLine(bot: Bot): string {
      return "observation: disabled (using polling)";
@@ -5492,15 +5498,18 @@ function getNearbyPrizes(result: unknown): PrizeInfo[] {
  * The home station is almost never in the current system, so we resolve it
  * from the global mapStore to get its `base_id`. claim_prize requires the
  * `base_id`, not the POI `id`.
+ *
+ * IMPORTANT: homeStation may be stored as "system|poi" (e.g. "arneb|a356fc2c...").
+ * We must extract the poi part BEFORE matching, otherwise the `|` breaks the lookup
+ * and we return the raw string which claim_prize rejects.
  */
 async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<string | null> {
   const homeStation = settings.homeStation || "";
   if (!homeStation) return null;
 
-  const lowerHome = homeStation.toLowerCase();
-
   // Handle "system|poi" format — extract the poi part for lookup
   const homePoi = homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+  const lowerHomePoi = homePoi.toLowerCase();
 
   // Resolve from mapStore (home station is global, not local)
   const allSystems = mapStore.getAllSystems();
@@ -5508,11 +5517,11 @@ async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<t
     for (const poi of sys.pois) {
       const travelId = poi.base_id || poi.id;
       if (
-        travelId.toLowerCase() === lowerHome ||
-        poi.id.toLowerCase() === lowerHome ||
-        poi.base_id?.toLowerCase() === lowerHome ||
-        (poi.base_name && poi.base_name.toLowerCase().includes(lowerHome.replace(/_/g, " "))) ||
-        (poi.name && poi.name.toLowerCase().includes(lowerHome.replace(/_/g, " ")))
+        travelId.toLowerCase() === lowerHomePoi ||
+        poi.id.toLowerCase() === lowerHomePoi ||
+        poi.base_id?.toLowerCase() === lowerHomePoi ||
+        (poi.base_name && poi.base_name.toLowerCase().includes(lowerHomePoi.replace(/_/g, " "))) ||
+        (poi.name && poi.name.toLowerCase().includes(lowerHomePoi.replace(/_/g, " ")))
       ) {
         return poi.base_id || poi.id;
       }
@@ -5802,14 +5811,7 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     });
 
     if (!targetEntry) {
-      ctx.log("combat", `RecoverPrize: no tracked captured prize yet — attempting to claim`);
-      const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
-      if (!claimed) {
-        const found = await findAndClaimPrizeAcrossSystem(ctx, settings, knownShipId);
-        if (!found) {
-          ctx.log("combat", `RecoverPrize: prize not visible yet — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
-        }
-      }
+      ctx.log("combat", `RecoverPrize: no tracked captured prize yet — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
       await ctx.sleep(10000);
       continue;
     }
@@ -5818,7 +5820,11 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     const recovery = recoveries.find(r => r.ship_id === targetEntry.ship_id || r.prize_id === targetEntry.prize_id);
 
     if (!recovery) {
-      ctx.log("combat", `RecoverPrize: tracked prize (ship=${targetEntry.ship_id}) not yet in prize_recoveries — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
+      ctx.log("combat", `RecoverPrize: tracked prize (ship=${targetEntry.ship_id}) not yet in prize_recoveries — attempting claim`);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+      if (!claimed) {
+        ctx.log("combat", `RecoverPrize: claim at current POI failed — will retry next tick (tick ${waitTick}/${maxWaitTicks})`);
+      }
       await ctx.sleep(10000);
       continue;
     }

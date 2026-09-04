@@ -5658,7 +5658,7 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
   }
 
   // Find a destination station
-  const destBaseId = findDestinationBaseId(ctx, settings);
+  const destBaseId = await findDestinationBaseId(ctx, settings);
   if (!destBaseId) {
     ctx.log("combat", "ClaimPrize: no destination station found to send prize to");
     return false;

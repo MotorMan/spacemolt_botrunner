@@ -5803,24 +5803,29 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     await bot.refreshStatus();
     const recoveries = bot.prizeRecoveries;
 
-    // Find the tracked captured prize entry for THIS capture
+    // Find the tracked captured prize entry for THIS capture.
+    // If no tracked entry matches an existing recovery, fall back to the first
+    // tracked entry (new capture that hasn't been claimed yet).
     const trackedEntries = Array.from(bot.capturedPrizeTracker.values());
-    const targetEntry = trackedEntries.find(e => {
+    let targetEntry = trackedEntries.find((e: { ship_id?: string; prize_id?: string }) => {
       if (knownShipId && e.ship_id === knownShipId) return true;
       return e.ship_id && recoveries.some(r => r.ship_id === e.ship_id || r.prize_id === e.prize_id);
     });
+    if (!targetEntry && trackedEntries.length > 0) {
+      targetEntry = trackedEntries[0];
+    }
 
     if (!targetEntry) {
-      ctx.log("combat", `RecoverPrize: no tracked captured prize yet — will keep polling (tick ${waitTick}/${maxWaitTicks})`);
-      await ctx.sleep(10000);
-      continue;
+      ctx.log("combat", `RecoverPrize: no tracked captured prize — aborting`);
+      return false;
     }
 
     // Find the recovery entry that matches our tracked prize
     const recovery = recoveries.find(r => r.ship_id === targetEntry.ship_id || r.prize_id === targetEntry.prize_id);
 
     if (!recovery) {
-      ctx.log("combat", `RecoverPrize: tracked prize (ship=${targetEntry.ship_id}) not yet in prize_recoveries — attempting claim`);
+      // No recovery yet for this tracked prize — try to claim it at current POI
+      ctx.log("combat", `RecoverPrize: tracked prize ship=${targetEntry.ship_id} prize=${targetEntry.prize_id || "?"} — attempting claim`);
       const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
       if (!claimed) {
         ctx.log("combat", `RecoverPrize: claim at current POI failed — will retry next tick (tick ${waitTick}/${maxWaitTicks})`);

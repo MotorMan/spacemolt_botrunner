@@ -5412,7 +5412,7 @@ export async function boardingSubroutine(
 function getNearbyPrizes(result: unknown): PrizeInfo[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
-  const prizesRaw = r.nearby_prizes as Array<Record<string, unknown>> | undefined;
+  const prizesRaw = (r.prizes || r.nearby_prizes) as Array<Record<string, unknown>> | undefined;
   if (!prizesRaw || !Array.isArray(prizesRaw)) return [];
 
   return prizesRaw.map(p => ({

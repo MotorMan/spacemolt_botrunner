@@ -8,6 +8,7 @@ import {
   noteLocalMarketObservation,
 } from "../market_local_source.js";
 import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
+import { updateShipListings } from "../shipsforsale.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
@@ -63,6 +64,8 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let lastBaseId: string | null = null;
   let currentBaseId: string | null = null;
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
+  let lastShipBrowseAt = 0;
+  const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
 
   // Observation subscription: collect the player/pirate/empire-NPC data this bot
   // sees at every station (same intent as the get_nearby feed, but via the live
@@ -236,6 +239,33 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       lastBaseId = nextBaseId;
+    }
+
+    if (Date.now() - lastShipBrowseAt >= SHIP_BROWSE_INTERVAL_MS) {
+      try {
+        yield `browse_ships_${bot.poi}`;
+        const browseResp = await bot.exec("browse_ships");
+        if (browseResp.error) {
+          ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
+        } else if (browseResp.result && typeof browseResp.result === "object") {
+          const result = browseResp.result as Record<string, unknown>;
+          const listings = (
+            Array.isArray(result.listings) ? result.listings : []
+          ) as Array<Record<string, unknown>>;
+
+          if (listings.length > 0) {
+            const mappedPoi = mapStore.getSystem(bot.system)?.pois.find((p) => p.id === bot.poi);
+            const stationName = mappedPoi?.name
+              || (result.base_name as string)
+              || (result.station_name as string)
+              || bot.poi;
+            updateShipListings(bot.system, bot.poi, stationName, listings, ctx.log);
+          }
+        }
+      } catch (err) {
+        ctx.log("error", `browse_ships error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      lastShipBrowseAt = Date.now();
     }
 
     await ctx.sleep(30000);

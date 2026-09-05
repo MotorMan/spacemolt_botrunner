@@ -3397,7 +3397,7 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
     const existingBattle = await getBattleStatus(ctx);
     if (existingBattle) {
       ctx.log("combat", `⚔️ Already in battle — engaging ${targetPlayer}`);
-      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
       continue;
     }
 
@@ -3415,13 +3415,13 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
         ctx.log("combat", `⚔️ Attack interrupted by combat — entering battle immediately`);
         const battleStatus = await getBattleStatus(ctx);
         if (battleStatus) {
-          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         }
       } else if (msg.includes("action is already pending") || msg.includes("already pending") || msg.includes("already in progress")) {
         const battleStatus = await getBattleStatus(ctx);
         if (battleStatus) {
           ctx.log("combat", `⚔️ Attack blocked by pending action — battle is live, entering combat loop`);
-          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
+          await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         } else {
           ctx.log("combat", `⚔️ Attack on ${targetPlayer}: ${atk.error.message} — re-issuing next tick`);
         }
@@ -3431,7 +3431,7 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
     } else {
       ctx.log("combat", `⚔️ Attack command sent to ${targetPlayer}${targetEntity ? "" : " (not in range — re-issued next tick)"}`);
       await ctx.sleep(1000);
-      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
+      await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
     }
 
     // ── Field repair (in place) ──

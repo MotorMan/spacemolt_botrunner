@@ -522,8 +522,12 @@ async function flockSalvageWrecks(
             return { itemsLooted: totalLooted, isTowing: true };
           } else {
             ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) but value ${salvageValue}cr below threshold ${minTowValue}cr - releasing`);
-            // Release the tow since it's not valuable enough
-            await bot.exec("release_tow");
+            const releaseResp = await bot.exec("release_tow");
+            if (releaseResp.error) {
+              ctx.log("warn", `Failed to release low-value tow: ${releaseResp.error.message}`);
+              bot.towingWreck = false;
+              bot.towingWreckId = null;
+            }
           }
         }
       }

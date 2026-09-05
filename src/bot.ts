@@ -2033,18 +2033,14 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
     }
 
-    const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-    // Only update towing state if the field is present in the response
-    if (towingWreckId !== undefined && towingWreckId !== null) {
-      if (towingWreckId !== "") {
-        this.towingWreck = true;
-        this.towingWreckId = towingWreckId;
-      } else {
-        this.towingWreck = false;
-        this.towingWreckId = null;
-      }
-    }
-    // If field is not present, preserve existing towing state
+     const towingWreckId = (p.towing_wreck_id as string) ?? (ship?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
+     if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
+       this.towingWreck = true;
+       this.towingWreckId = towingWreckId;
+     } else {
+       this.towingWreck = false;
+       this.towingWreckId = null;
+     }
 
     playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
@@ -2102,17 +2098,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
       const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-      // Only update towing state if the field is present in the response (get_location may not include it)
-      if (towingWreckId !== undefined && towingWreckId !== null) {
-        if (towingWreckId !== "") {
-          this.towingWreck = true;
-          this.towingWreckId = towingWreckId;
-        } else {
-          this.towingWreck = false;
-          this.towingWreckId = null;
-        }
+      if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
+        this.towingWreck = true;
+        this.towingWreckId = towingWreckId;
+      } else {
+        this.towingWreck = false;
+        this.towingWreckId = null;
       }
-      // If field is not present, preserve existing towing state
       const creditsValue = r.credits ?? player?.credits;
       if (!this.account && typeof creditsValue === "number") this.credits = creditsValue;
     }

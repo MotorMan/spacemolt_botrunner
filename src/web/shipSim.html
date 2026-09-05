@@ -370,6 +370,8 @@ function selectShip() {
         if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
         if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
         if (module.damage) details.push(`Dmg: ${module.damage}`);
+        if (module.reach) details.push(`Reach: ${module.reach}`);
+        if (module.cooldown) details.push(`Cooldown: ${module.cooldown}`);
         if (module.mining_power) details.push(`Mining: ${module.mining_power}`);
         if (module.shield_bonus) details.push(`Shield: +${module.shield_bonus}`);
         if (module.armor_bonus) details.push(`Armor: +${module.armor_bonus}`);
@@ -518,8 +520,17 @@ function selectShip() {
         if (currentLoadout[category].length > 0) {
           html += `<div class="shipsim-loadout-title">${category.charAt(0).toUpperCase() + category.slice(1)}</div>`;
           currentLoadout[category].forEach((module, index) => {
+            const details = [];
+            if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
+            if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
+            if (module.damage) details.push(`Dmg: ${module.damage}`);
+            if (module.reach) details.push(`Reach: ${module.reach}`);
+            if (module.cooldown) details.push(`Cooldown: ${module.cooldown}`);
             html += `<div class="shipsim-loadout-item">
-              <span>${module.name || module.item_name || module.id}</span>
+              <div>
+                <span>${module.name || module.item_name || module.id}</span>
+                ${details.length > 0 ? `<span style="font-size:11px;color:var(--text-dim);margin-left:6px;">(${details.join(', ')})</span>` : ''}
+              </div>
               <span class="shipsim-loadout-remove" onclick="removeModuleFromLoadout('${category}', ${index})">✕</span>
             </div>`;
           });

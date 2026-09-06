@@ -66,6 +66,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
   let lastShipBrowseAt = 0;
   const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
+  let wasConnected = bot.isConnected();
 
   // Observation subscription: collect the player/pirate/empire-NPC data this bot
   // sees at every station (same intent as the get_nearby feed, but via the live
@@ -173,6 +174,14 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("warn", "Market routine requires being docked — waiting...");
       await ctx.sleep(5000);
       continue;
+    }
+
+    const isConnected = bot.isConnected();
+    if (!isConnected) {
+      wasConnected = false;
+    } else if (!wasConnected) {
+      wasConnected = true;
+      lastBaseId = null;
     }
 
       const nextBaseId = bot.poi;

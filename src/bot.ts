@@ -2098,12 +2098,17 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
         this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
       }
       const towingWreckId = (p.towing_wreck_id as string) ?? (player?.towing_wreck_id as string) ?? (r.towing_wreck_id as string);
-      if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
-        this.towingWreck = true;
-        this.towingWreckId = towingWreckId;
-      } else {
-        this.towingWreck = false;
-        this.towingWreckId = null;
+      // Towing state is owned by refreshStatus() (a real get_status). For
+      // library-backed bots refreshLocation() only sees stale account.state,
+      // so skip towing updates here to avoid resurrecting phantom tows.
+      if (!this.account) {
+        if (towingWreckId !== undefined && towingWreckId !== null && towingWreckId !== "") {
+          this.towingWreck = true;
+          this.towingWreckId = towingWreckId;
+        } else {
+          this.towingWreck = false;
+          this.towingWreckId = null;
+        }
       }
       const creditsValue = r.credits ?? player?.credits;
       if (!this.account && typeof creditsValue === "number") this.credits = creditsValue;

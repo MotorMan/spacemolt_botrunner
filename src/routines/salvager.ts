@@ -657,8 +657,19 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
    let escortReportedFuelPct: number | null = null;
    let escortFuelQuerySent: number = 0; // timestamp of last fuel query to avoid spamming
 
-await bot.refreshLocation();
-   const startSystem = bot.system;
+ await bot.refreshLocation();
+    if (bot.towingWreck) {
+      const wrecksResp = await bot.exec("get_wrecks");
+      const wrecks = parseWrecks(wrecksResp.result);
+      const towedWreck = bot.towingWreckId ? wrecks.find(w => w.wreck_id === bot.towingWreckId) : wrecks[0];
+      if (!towedWreck) {
+        ctx.log("warn", `Routine startup: thought we were towing ${bot.towingWreckId} but wreck not in get_wrecks — clearing`);
+        bot.towingWreck = false;
+        bot.towingWreckId = null;
+        await bot.exec("release_tow").catch(() => {});
+      }
+    }
+    const startSystem = bot.system;
    const settings0 = await getSalvagerSettings(bot.username);
    const homeSystem0 = settings0.homeSystem || startSystem;
 

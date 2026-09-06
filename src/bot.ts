@@ -713,6 +713,8 @@ docked = false;
     this._state = "idle";
     this._routine = null;
     this._error = null;
+    // Reset the abort controller so ad-hoc commands work after an error/stopping.
+    this._abortController = null;
   }
 
   /** Get the bot's empire affiliation from the library account state. */
@@ -1011,7 +1013,7 @@ docked = false;
       return { error: { code: "no_account", message: "Library account not connected" }, result: undefined, notifications: [] };
     }
 
-    if (this._abortController?.signal.aborted) {
+    if (this._state === "stopping" && this._abortController?.signal.aborted) {
       const err = new Error("Bot stopped") as Error & { name?: string };
       err.name = "AbortError";
       throw err;
@@ -2865,6 +2867,10 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
     this._state = "idle";
     this._routine = null;
+    // Routine ended — the abort controller was for this routine's lifetime only.
+    // Clear it so ad-hoc commands (get_status, get_nearby, etc.) issued while the
+    // bot is idle don't trip the "Bot stopped" guard in libExec().
+    this._abortController = null;
     // Routine ended — drop the market push stream (it was only for trade
     // routines) so an idle bot generates no market bandwidth.
     this.syncMarketSubscription();

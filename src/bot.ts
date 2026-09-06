@@ -1011,6 +1011,12 @@ docked = false;
       return { error: { code: "no_account", message: "Library account not connected" }, result: undefined, notifications: [] };
     }
 
+    if (this._abortController?.signal.aborted) {
+      const err = new Error("Bot stopped") as Error & { name?: string };
+      err.name = "AbortError";
+      throw err;
+    }
+
     // Transport-level auth is already handled by connectOwned(); treat it as a no-op.
     if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
       return { result: { ok: true }, error: undefined, notifications: [] };
@@ -2002,28 +2008,25 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
           const ewsGone = this.hasEmergencyWarpStabilizer !== true;
 
-          if (ewsGone || positionChanged) {
-            this._ewsFallbackTriggered = true;
-            this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
-            saveStoppedState(this.username, "emergency");
-            saveLastUsedRoutine(this.username, "return_home");
+           if (ewsGone || positionChanged) {
+             this._ewsFallbackTriggered = true;
+             this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+             saveStoppedState(this.username, "emergency");
+             saveLastUsedRoutine(this.username, "return_home");
 
-            if (this._state === "running") {
-              this._state = "stopping";
-              this._abortController?.abort();
-            }
+             this.stop();
 
-            const botName = this.username;
-            setTimeout(() => {
-              void (async () => {
-                const { handleStart, getBot } = await import("./botmanager.js");
-                const bot = getBot(botName);
-                if (!bot) return;
-                if (bot.state === "running") return;
-                await handleStart({ type: "start", bot: botName, routine: "return_home" });
-              })().catch(() => {});
-            }, 4000);
-          }
+             const botName = this.username;
+             setTimeout(() => {
+               void (async () => {
+                 const { handleStart, getBot } = await import("./botmanager.js");
+                 const bot = getBot(botName);
+                 if (!bot) return;
+                 if (bot.state === "running") return;
+                 await handleStart({ type: "start", bot: botName, routine: "return_home" });
+               })().catch(() => {});
+             }, 4000);
+           }
         }
       }
      }
@@ -2153,28 +2156,25 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
             const ewsGone = this.hasEmergencyWarpStabilizer !== true;
 
-            if (ewsGone || positionChanged) {
-              this._ewsFallbackTriggered = true;
-              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
-              saveStoppedState(this.username, "emergency");
-              saveLastUsedRoutine(this.username, "return_home");
+             if (ewsGone || positionChanged) {
+               this._ewsFallbackTriggered = true;
+               this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+               saveStoppedState(this.username, "emergency");
+               saveLastUsedRoutine(this.username, "return_home");
 
-              if (this._state === "running") {
-                this._state = "stopping";
-                this._abortController?.abort();
-              }
+               this.stop();
 
-              const botName = this.username;
-              setTimeout(() => {
-                void (async () => {
-                  const { handleStart, getBot } = await import("./botmanager.js");
-                  const bot = getBot(botName);
-                  if (!bot) return;
-                  if (bot.state === "running") return;
-                  await handleStart({ type: "start", bot: botName, routine: "return_home" });
-                })().catch(() => {});
-              }, 4000);
-            }
+               const botName = this.username;
+               setTimeout(() => {
+                 void (async () => {
+                   const { handleStart, getBot } = await import("./botmanager.js");
+                   const bot = getBot(botName);
+                   if (!bot) return;
+                   if (bot.state === "running") return;
+                   await handleStart({ type: "start", bot: botName, routine: "return_home" });
+                 })().catch(() => {});
+               }, 4000);
+             }
           }
         }
 
@@ -2850,13 +2850,15 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
         await ctx.sleep(2000);
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this._error = msg;
-      this.log("error", `Routine error: ${msg}`);
-      this._state = "error";
-      // Re-throw so the caller's .catch() handler fires, ensuring the bot
-      // assignment is cleared and "crashed" is logged rather than "finished".
-      throw err;
+      if (err instanceof Error && err.name === "AbortError") {
+        this.log("system", "Routine stopped by abort signal");
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        this._error = msg;
+        this.log("error", `Routine error: ${msg}`);
+        this._state = "error";
+        throw err;
+      }
     } finally {
       await generator.return(undefined);
     }

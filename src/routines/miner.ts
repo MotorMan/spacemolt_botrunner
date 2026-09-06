@@ -290,7 +290,7 @@ export async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean
         checkStr.includes("deep_core_extractor_ii") ||
         checkStr.includes("deep_core_extractor") ||
         checkStr.includes("deep core extractor") ||
-        modSpecial.includes("rare_ore_access")) {
+        modSpecial.includes("rare_ore_access") || modSpecial.includes("deep_core_access")) {
       return true;
     }
   }
@@ -918,7 +918,7 @@ export async function hasEquipmentForMiningType(ctx: RoutineContext, miningType:
             checkStr.includes("deep_core_extractor_ii") ||
             checkStr.includes("deep_core_extractor") ||
             checkStr.includes("deep core extractor") ||
-            modSpecial.includes("rare_ore_access")) {
+            modSpecial.includes("rare_ore_access") || modSpecial.includes("deep_core_access")) {
           return true;
         }
         break;

@@ -115,7 +115,7 @@ export async function getRadioactiveCapability(ctx: RoutineContext): Promise<{
           checkStr.includes("deep_core_extractor_ii") ||
           checkStr.includes("deep_core_extractor") ||
           checkStr.includes("deep core extractor") ||
-          modSpecial.includes("rare_ore_access")) {
+          modSpecial.includes("rare_ore_access") || modSpecial.includes("deep_core_access")) {
         hasDeepCoreExtractor = true;
       }
 

@@ -203,12 +203,15 @@ export const COMMAND_TOOL_MAP: Record<string, string> = {
   // Facility (special: uses /tool/{action} pattern)
   'facility': 'spacemolt_facility',
 
-   // Battle
+  // Battle
    'battle': 'spacemolt_battle',
    'get_battle_status': 'spacemolt_battle',
    'reload': 'spacemolt_battle',
 
-   // Observation
+   // Arena
+   'arena': 'spacemolt_arena',
+
+    // Observation
    'subscribe_observation': 'spacemolt',
 
   // Salvage
@@ -312,7 +315,7 @@ export const COMMAND_ACTION_MAP: Record<string, string> = {
  };
 
 // Commands that use payload.action for the action (like facility and battle)
-export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
+export const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet', 'arena']);
 
 /**
  * Normalize a library command result into the bare `{ result }` envelope the

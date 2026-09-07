@@ -3333,9 +3333,12 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const stats = mapStore.getVisitStats();
       if (stats.unvisited === 0 || connections.length === 0) {
         ctx.log("warn", `At pirate system ${bot.system} with no viable route - returning home`);
-        const homeArrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+        const home = getGlobalHomeBase();
+        const homeSystem = home.system || "sol";
+        const homeName = home.name || "home base";
+        const homeArrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
         if (homeArrived) {
-          ctx.log("system", "Returned to Sol from pirate system - continuing achievement mode");
+          ctx.log("system", `Returned to ${homeName} from pirate system - continuing achievement mode`);
           await ctx.sleep(5000);
         }
         continue;
@@ -3354,8 +3357,11 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (stats.unvisited === 0) {
       ctx.log("info", "All systems visited! Returning home and auto-disabling achievement mode.");
       // Return home first
-      const homeSystem = "sol";
+      const home = getGlobalHomeBase();
+      const homeSystem = home.system || "sol";
+      const homeName = home.name || "home base";
       if (bot.system.toLowerCase() !== homeSystem) {
+        ctx.log("system", `Returning to ${homeName} to complete achievement mode`);
         await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
       }
       setExplorerMode(bot.username, "explore");
@@ -3402,7 +3408,10 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check if we're in a pirate system and need to return
         if (isPirateSystem(bot.system)) {
           ctx.log("warn", "In pirate system with no route to unvisited - returning home");
-          await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+          const home = getGlobalHomeBase();
+          const homeSystem = home.system || "sol";
+          const homeName = home.name || "home base";
+          await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
           await ctx.sleep(5000);
         } else {
           await ctx.sleep(30000);

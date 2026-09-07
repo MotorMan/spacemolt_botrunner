@@ -404,6 +404,7 @@ function getHunterSettings(username?: string): {
   disableWreckSalvaging: boolean;
   patrolSystems: string[];
   singleLoop: boolean;
+  stayInPoi: boolean;
   homeSystem: string;
   homeStation: string;
   desiredShieldCharges: number;
@@ -476,6 +477,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
+    stayInPoi: (botOverrides.stayInPoi as boolean) ?? (h.stayInPoi as boolean) ?? false,
     homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || "",
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
@@ -6138,6 +6140,7 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
   const all = readSettings();
   const h = (all.hunter || {}) as any;
   const hunterPatrols: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  let stayPoiAnchor: { system: string; poi: string } | null = null;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -6185,6 +6188,36 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
         await ensureUndocked(ctx);
         await resubscribeObservationAfterMove(bot);
       }
+      continue;
+    }
+
+    // ── Stay-in-POI mode: anchor at one POI and re-scan each cycle ──
+    if (settings.stayInPoi) {
+      if (!stayPoiAnchor) {
+        stayPoiAnchor = { system: bot.system, poi: bot.poi };
+        ctx.log("info", `Boarding stay-in-POI mode: anchored at POI ${bot.poi} in ${bot.system} — re-scanning each cycle`);
+      }
+      if (bot.system !== stayPoiAnchor.system) {
+        ctx.log("travel", `Returning to anchor system ${stayPoiAnchor.system}...`);
+        const arrived = await navigateToSystem(ctx, stayPoiAnchor.system, safetyOpts);
+        if (arrived) {
+          await resubscribeObservationAfterMove(bot);
+          if (stayPoiAnchor.poi && bot.poi !== stayPoiAnchor.poi) {
+            const t = await bot.exec("travel", { target_poi: stayPoiAnchor.poi });
+            if (!t.error) {
+              bot.poi = stayPoiAnchor.poi;
+              bot.clearObservationState();
+              await ctx.sleep(1000);
+            }
+          }
+        } else {
+          ctx.log("error", `Could not return to anchor system ${stayPoiAnchor.system} — continuing at current location`);
+          stayPoiAnchor = null;
+        }
+      }
+      const result = yield* engageBoardingTargetsAtCurrentPoi(ctx, settings, totalKills, totalBoardings);
+      totalKills = result[0];
+      totalBoardings = result[1];
       continue;
     }
 
@@ -6259,6 +6292,250 @@ function resolveBoardingPatrolSystems(
 
   // No profile or system found — return empty (caller will use findNearestHuntableSystem fallback)
   return [];
+}
+
+/**
+ * Engage any pirate targets present at the bot's current POI.
+ *
+ * This is the shared engagement sweep used by the stay-in-POI boarding
+ * branch. It scans nearby entities, filters for valid boarding/fire
+ * targets, engages them (boarding when enabled + shields are low enough,
+ * otherwise normal fire), claims prizes, and scavenges wrecks.
+ *
+ * Unlike boardingSystemPass this does NOT travel between POIs or run the
+ * post-sweep dock/resupply sequence — the caller (boardingRoutine's
+ * main loop) handles hull/fuel checks and re-navigation on the next
+ * cycle.
+ *
+ * Returns [totalKills, totalBoardings].
+ */
+async function* engageBoardingTargetsAtCurrentPoi(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  startKills: number,
+  startBoardings: number,
+): AsyncGenerator<string, [number, number], void> {
+  const { bot } = ctx;
+  let totalKills = startKills;
+  let totalBoardings = startBoardings;
+
+  if (await checkAndHandleExistingBattle(ctx, settings)) return [totalKills, totalBoardings];
+  await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+
+  yield "scan_for_targets";
+  const nearbyResult = await getObservationOrNearby(bot);
+  const nearbyData = nearbyResult.result;
+  if (!nearbyData) {
+    ctx.log("error", `No nearby data at ${bot.poi}`);
+    return [totalKills, totalBoardings];
+  }
+  bot.trackNearbyPlayers(nearbyData);
+  bot.trackWildlife(nearbyData);
+  await serviceAnyStalledPrizes(ctx);
+
+  const entities = parseNearby(nearbyData);
+  const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+
+  if (pirate_targets.length > 0) {
+    pirate_targets.sort((a, b) => {
+      const ah = a.maxHull || a.hull || 0;
+      const bh = b.maxHull || b.hull || 0;
+      return bh - ah;
+    });
+
+    ctx.log("combat", `Found ${pirate_targets.length} boarding candidate(s) at ${bot.poi} (sorted by hull: ${pirate_targets.map(p => `${p.name}(${p.maxHull || p.hull || 0})`).join(", ")})`);
+
+    for (let targetIdx = 0; targetIdx < pirate_targets.length; targetIdx++) {
+      const target = pirate_targets[targetIdx];
+      if (bot.state !== "running") break;
+
+      await bot.refreshShip();
+      const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (preHull <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
+        break;
+      }
+
+      await useRepairKits(ctx);
+      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      if (!hasAmmo && !settings.meatShield) {
+        ctx.log("combat", "Out of ammo — aborting sweep");
+        break;
+      }
+
+      yield "engage";
+
+      const freshScanResp = await bot.exec("get_nearby");
+      let freshEntities: NearbyEntity[] = [];
+      if (!freshScanResp.error && freshScanResp.result) {
+        bot.trackNearbyPlayers(freshScanResp.result);
+        bot.trackWildlife(freshScanResp.result);
+        freshEntities = parseNearby(freshScanResp.result);
+      }
+      const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+      if (!stillPresent) {
+        ctx.log("combat", `⚠️ ${target.name} is no longer at this POI (likely claimed or left) — skipping to next target`);
+        continue;
+      }
+
+      const preBattlePrizes = getNearbyPrizes(freshScanResp.result);
+      const preBattlePrize = preBattlePrizes.find(p => p.status === "available" || p.status === "claimed");
+      if (preBattlePrize) {
+        ctx.log("combat", `🛸 Found unclaimed prize ${preBattlePrize.ship_name || preBattlePrize.prize_id} at ${bot.poi} before engaging ${target.name}`);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        if (claimed) ctx.log("combat", `🏆 Prize claimed before engaging ${target.name}`);
+      }
+
+      const canBoard = settings.boardingEnabled
+        && settings.boardingShieldThreshold > 0
+        && await checkBoardingCapability(ctx);
+
+      if (canBoard) {
+        const fitMarines = await getFitMarineCount(ctx);
+        if (fitMarines >= 1) {
+          ctx.log("combat", `⚔️ Boarding engagement: ${target.name} (shields ≤ ${settings.boardingShieldThreshold}% → board)`);
+          const result = await boardingSubroutine(
+            ctx,
+            target,
+            settings.boardingShieldThreshold,
+            settings.boardingMarines,
+            settings.fleeThreshold,
+            settings.shieldRechargePct,
+          );
+
+          if (result === "captured") {
+            totalKills++;
+            totalBoardings++;
+            ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            await bot.refreshStatus();
+            const recoveries = bot.prizeRecoveries;
+            if (recoveries.length > 0) {
+              const cap = recoveries[0];
+              ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+            }
+            const recovered = await recoverPrize(ctx, settings, target.id);
+            if (recovered) {
+              ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+            } else {
+              ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
+            }
+
+            yield "safety_check";
+            const postCaptureResp = await bot.exec("get_nearby");
+            if (!postCaptureResp.error) {
+              bot.trackNearbyPlayers(postCaptureResp.result);
+              bot.trackWildlife(postCaptureResp.result);
+            }
+            continue;
+          } else if (result === "target_eliminated") {
+            totalKills++;
+            ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+
+            yield "safety_check";
+            const postKillResp = await bot.exec("get_nearby");
+            if (!postKillResp.error) {
+              bot.trackNearbyPlayers(postKillResp.result);
+              bot.trackWildlife(postKillResp.result);
+              const nearbyEntities = parseNearby(postKillResp.result);
+              const newThreats = nearbyEntities.filter(e =>
+                isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+                !isStationEntity(e) &&
+                e.id !== target.id &&
+                e.name !== target.name
+              );
+              if (newThreats.length > 0) {
+                ctx.log("combat", `🚨 ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} — engaging!`);
+                for (const newThreat of newThreats) {
+                  if (bot.state !== "running") break;
+                  const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+                  if (newWon) {
+                    totalKills++;
+                    ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) — additional threat eliminated`);
+                  }
+                }
+              }
+            }
+            continue;
+          } else if (result === "retreat") {
+            break;
+          }
+          ctx.log("combat", `Boarding failed for ${target.name} — engaging normally`);
+        }
+      }
+
+      if (!coordResponding) {
+        broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
+        claimCreature(ctx, target);
+      }
+      const hsettings = getHunterSettings(ctx.bot.username);
+      const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
+
+      if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
+      if (won) {
+        totalKills++;
+        ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting...`);
+        yield "loot";
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+        await useRepairKits(ctx);
+        await bot.refreshCargo();
+
+        yield "safety_check";
+        const postKillResp2 = await bot.exec("get_nearby");
+        if (!postKillResp2.error) {
+          bot.trackNearbyPlayers(postKillResp2.result);
+          bot.trackWildlife(postKillResp2.result);
+          const nearbyEntities2 = parseNearby(postKillResp2.result);
+          const newThreats2 = nearbyEntities2.filter(e =>
+            isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+            !isStationEntity(e) &&
+            e.id !== target.id &&
+            e.name !== target.name
+          );
+          if (newThreats2.length > 0) {
+            ctx.log("combat", `🚨 ${newThreats2.length} new pirate(s) detected after kill: ${newThreats2.map(t => t.name).join(", ")} — engaging!`);
+            for (const newThreat of newThreats2) {
+              if (bot.state !== "running") break;
+              const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.cloakOnStart);
+              if (newWon) {
+                totalKills++;
+                ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) — additional threat eliminated`);
+              }
+            }
+          }
+        }
+        if (isLowOnFieldConsumables(bot.inventory)) {
+          ctx.log("combat", "Low on repair kits or shield charges — ending sweep");
+          break;
+        }
+      }
+    }
+  } else {
+    if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+  }
+
+  yield "check_prizes";
+  const prizeCheckResp = await bot.exec("get_nearby");
+  if (!prizeCheckResp.error && prizeCheckResp.result) {
+    const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
+    const missedPrize = prizesAtPoi.find(p => p.status === "available" || p.status === "claimed");
+    if (missedPrize) {
+      ctx.log("combat", `🛸 Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat — claiming now`);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false);
+      if (claimed) ctx.log("combat", `🏆 Missed prize from ${bot.poi} successfully claimed!`);
+    }
+    await serviceAnyStalledPrizes(ctx);
+  }
+
+  return [totalKills, totalBoardings];
 }
 
 /**

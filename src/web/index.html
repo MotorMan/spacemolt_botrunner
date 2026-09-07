@@ -5345,6 +5345,15 @@
         Single Loop
       </label>`;
 
+          if (hunterMode === "boarding") {
+            const stayInPoi = botSettings.stayInPoi ?? false;
+            actions += `
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px" title="Stay at the current POI and re-scan every cycle instead of navigating between POIs/systems">
+        <input type="checkbox" id="profile-hunter-stayInPoi" onchange="saveProfileHunterStayInPoi()"${stayInPoi ? " checked" : ""}>
+        Stay in this POI
+      </label>`;
+          }
+
           // patrol_radius specific settings
           if (hunterMode === "patrol_radius") {
             const pirateBaseSystem = botSettings.pirateBaseSystem || "";
@@ -5777,6 +5786,23 @@
 
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { singleLoop });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileHunterStayInPoi() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const checkbox = document.getElementById("profile-hunter-stayInPoi");
+        if (!checkbox) return;
+        const stayInPoi = checkbox.checked;
+
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { stayInPoi });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -31465,6 +31491,7 @@ ignoreBlacklist: document.getElementById(
         const boardingEnabled = h.boardingEnabled ?? false;
         const boardingShieldThreshold = h.boardingShieldThreshold ?? 5;
         const boardingMarines = h.boardingMarines ?? 0;
+        const stayInPoi = h.stayInPoi ?? false;
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
         const tierOpts = tierOptions
@@ -31975,10 +32002,21 @@ ignoreBlacklist: document.getElementById(
          <div class="setting-label">Boarding Marines Committed</div>
          <div class="setting-hint">Number of marines to commit to the board stance. 0 = commit all fit marines aboard.</div>
        </div>
-       <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
-     </div>
+        <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
+      </div>
 
-     <div class="settings-save-bar">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Stay in POI (boarding mode)</div>
+          <div class="setting-hint">When enabled in boarding mode, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs and systems. Recommended with a fixed patrol profile or single system.</div>
+        </div>
+        <select id="set-hunter-stayInPoi">
+          <option value="false"${!stayInPoi ? " selected" : ""}>Disabled (patrol between POIs)</option>
+          <option value="true"${stayInPoi ? " selected" : ""}>Enabled (stay at current POI)</option>
+        </select>
+      </div>
+
+      <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
   `;
@@ -32096,6 +32134,8 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-hunter-boardingMarines")?.value,
             ) || 0,
+          stayInPoi:
+            document.getElementById("set-hunter-stayInPoi")?.value === "true",
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;

@@ -2220,7 +2220,7 @@ export type FuelCheckOutcome = "fueled" | "in_battle" | "failed";
 export async function ensureFueledEx(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean },
 ): Promise<FuelCheckOutcome> {
   const { bot } = ctx;
 
@@ -2266,7 +2266,7 @@ export async function ensureFueledEx(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
   return (await ensureFueledEx(ctx, thresholdPct, opts)) === "fueled";
 }
@@ -2278,7 +2278,7 @@ export async function ensureFueled(
 async function ensureFueledCore(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -2428,14 +2428,31 @@ async function ensureFueledCore(
   // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
   if (opts?.skipBlacklist && opts?.homeSystem) {
     const homeSystem = opts.homeSystem;
+    const globalHome = getGlobalHomeBase();
+    // Resolve the home station POI id: prefer the explicitly passed one, fall back
+    // to the global home base. Strip any "system|poi" prefix so we only get the POI id.
+    let homeStationPoi = opts.homeStation || globalHome.station || "";
+    if (homeStationPoi.includes("|")) {
+      homeStationPoi = homeStationPoi.split("|")[1] || "";
+    }
     ctx.log("system", `Hunter mode: navigating to home system ${homeSystem} for refueling...`);
     const navResult = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
     if (navResult) {
       await bot.refreshLocation();
-      await getSystemInfo(ctx);
-      const homeStation = findStation(pois);
+      const { pois: homePois } = await getSystemInfo(ctx);
+      // Try to dock at the specific configured home station first (bypassing the
+      // station blacklist via targetStationId). Fall back to any station only if
+      // the configured station isn't found in the system.
+      let homeStation = homeStationPoi ? homePois.find(p => p.id === homeStationPoi && isStationPoi(p)) : null;
+      if (!homeStation) {
+        homeStation = findStation(homePois, "repair") || findStation(homePois);
+      }
       if (homeStation) {
-        await ensureDocked(ctx);
+        if (homeStationPoi && homeStation.id === homeStationPoi) {
+          await ensureDocked(ctx, true, 0, { targetStationId: homeStationPoi });
+        } else {
+          await ensureDocked(ctx);
+        }
         await tryRefuel(ctx, { skipApprovedCheck: true });
         await bot.refreshShip();
         const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
@@ -3120,7 +3137,8 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-      const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+    const navHome = opts.skipBlacklist ? getGlobalHomeBase() : { system: "", station: "" };
+    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot, homeSystem: navHome.system, homeStation: navHome.station });
       if (fueled === "in_battle") {
         // Not a fuel problem — we're in a fight, and jumps are rejected while in
         // battle anyway. Abort navigation so the caller resolves combat first

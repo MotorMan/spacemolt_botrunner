@@ -71,7 +71,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import { getSystemBlacklist } from "../web/server.js";
-import { writeSettings, isCombatDebugEnabled } from "./common.js";
+import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common.js";
 import { combatDebugLog } from "../debug.js";
 import {
   findStation,
@@ -478,8 +478,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
     stayInPoi: (botOverrides.stayInPoi as boolean) ?? (h.stayInPoi as boolean) ?? false,
-    homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || "",
-    homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
+  homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || (getGlobalHomeBase().system as string) || "",
+  homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || (getGlobalHomeBase().station as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
     desiredFuelCells: (h.desiredFuelCells as number) ?? -1,
@@ -1711,7 +1711,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     logStatus(ctx);
 
     // ── Fuel ──
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
@@ -1994,7 +1994,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
@@ -2625,7 +2625,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
@@ -3110,7 +3110,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
@@ -6165,7 +6165,7 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     logStatus(ctx);
 
     // ── Fuel ──
-    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true, skipFleeCheck: true });
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
@@ -6861,22 +6861,64 @@ async function* boardingSystemPass(
    );
    const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
 
-   if (needsRepair || needsFuel) {
-    ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — returning to safe system...`);
-    yield "dock";
-    const docked = await navigateToSafeStation(ctx, safetyOpts);
-    if (!docked) {
-      ctx.log("error", "Could not dock anywhere — retrying next cycle");
-    }
-    await collectFromStorage(ctx);
-    yield "complete_missions";
-    await completeActiveMissions(ctx);
-    await bot.refreshLocation();
-    yield "check_missions";
-    await checkAndAcceptMissions(ctx);
-    yield "ensure_insured";
-    await ensureInsured(ctx);
-    yield "refuel";
+    if (needsRepair || needsFuel) {
+      // When fuel is low and a home base is configured, go directly home so the
+      // hunter returns to the correct faction storage / station instead of a
+      // random bypass station.
+      if (needsFuel && settings.homeSystem) {
+        ctx.log("system", `Low fuel (${postFuel}%) — returning to home base (${settings.homeSystem})...`);
+        yield "dock";
+        const homeOk = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
+        if (!homeOk) {
+          ctx.log("system", "Could not reach home base — falling back to nearest safe station");
+          yield "dock";
+          const docked = await navigateToSafeStation(ctx, safetyOpts);
+          if (!docked) ctx.log("error", "Could not dock anywhere — retrying next cycle");
+        } else {
+          await bot.refreshLocation();
+          const { pois: homePois } = await getSystemInfo(ctx);
+          let homeStationPoi = settings.homeStation || "";
+          if (homeStationPoi.includes("|")) {
+            homeStationPoi = homeStationPoi.split("|")[1] || "";
+          }
+          let homeStation = homeStationPoi ? homePois.find(p => p.id === homeStationPoi && isStationPoi(p)) : null;
+          if (!homeStation) {
+            homeStation = findStation(homePois, "repair") || findStation(homePois);
+          }
+          if (homeStation) {
+            if (homeStationPoi && homeStation.id === homeStationPoi) {
+              await ensureDocked(ctx, true, 0, { targetStationId: homeStationPoi });
+            } else {
+              await ensureDocked(ctx);
+            }
+            await tryRefuel(ctx, { skipApprovedCheck: true });
+          }
+          await bot.refreshShip();
+          const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (newFuel < (settings.refuelThreshold ?? 20)) {
+            ctx.log("system", `Still short on fuel (${newFuel}%) at home — falling back to nearest safe station`);
+            yield "dock";
+            const docked = await navigateToSafeStation(ctx, safetyOpts);
+            if (!docked) ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          }
+        }
+      } else {
+        ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — returning to safe system...`);
+        yield "dock";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+        }
+      }
+      await collectFromStorage(ctx);
+      yield "complete_missions";
+      await completeActiveMissions(ctx);
+      await bot.refreshLocation();
+      yield "check_missions";
+      await checkAndAcceptMissions(ctx);
+      yield "ensure_insured";
+      await ensureInsured(ctx);
+      yield "refuel";
     await tryRefuel(ctx, { skipApprovedCheck: true });
     yield "repair";
     await repairShip(ctx);

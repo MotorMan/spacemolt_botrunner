@@ -2006,11 +2006,12 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
       if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
         const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
-        if (prevHullPct > 20 && hullPct <= 20) {
-          const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
-          const ewsGone = this.hasEmergencyWarpStabilizer !== true;
-
-           if (ewsGone || positionChanged) {
+        const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+        const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+        // EWS is a one-shot module fired at critical hull; detect by module
+        // disappearance (ewsGone) OR unexpected position change at low hull.
+        // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
+         if (ewsGone || (positionChanged && hullPct <= 20)) {
              this._ewsFallbackTriggered = true;
              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
              saveStoppedState(this.username, "emergency");
@@ -2026,12 +2027,11 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
                  if (!bot) return;
                  if (bot.state === "running") return;
                  await handleStart({ type: "start", bot: botName, routine: "return_home" });
-               })().catch(() => {});
-             }, 4000);
-           }
+                })().catch(() => {});
+              }, 4000);
+            }
+          }
         }
-      }
-     }
 
     // Towing state handling - moved outside ship block since it's on player/location
     if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
@@ -2130,6 +2130,12 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       const r = resp.result as Record<string, unknown>;
       const ship = (r.ship as Record<string, unknown>) || r;
       const player = r.player as Record<string, unknown> | undefined;
+      // Refresh live position from the get_ship response so EWS position-change
+      // detection works even when refreshStatus (get_status) hasn't run recently.
+      const loc = r.location as Record<string, unknown> | undefined;
+      const pos = loc || player || r;
+      this.system = (loc?.system_id as string) || (pos.current_system as string) || this.system;
+      this.poi = (loc?.poi_id as string) || (pos.current_poi as string) || (pos.poi_id as string) || this.poi;
       if (ship) {
         const prevHullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
         const prevHasEws = this.hasEmergencyWarpStabilizer;
@@ -2154,31 +2160,31 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
 
         if (!this._ewsFallbackTriggered && this._state === "running" && prevHasEws === true) {
           const hullPct = this.maxHull > 0 ? (this.hull / this.maxHull) * 100 : 100;
-          if (prevHullPct > 20 && hullPct <= 20) {
-            const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
-            const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+          const positionChanged = this.system !== this.lastSystem || this.poi !== this.lastPoi;
+          const ewsGone = this.hasEmergencyWarpStabilizer !== true;
+          // EWS is a one-shot module fired at critical hull; detect by module
+          // disappearance (ewsGone) OR unexpected position change at low hull.
+          // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
+           if (ewsGone || (positionChanged && hullPct <= 20)) {
+             this._ewsFallbackTriggered = true;
+             this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+             saveStoppedState(this.username, "emergency");
+             saveLastUsedRoutine(this.username, "return_home");
 
-             if (ewsGone || positionChanged) {
-               this._ewsFallbackTriggered = true;
-               this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
-               saveStoppedState(this.username, "emergency");
-               saveLastUsedRoutine(this.username, "return_home");
+             this.stop();
 
-               this.stop();
-
-               const botName = this.username;
-               setTimeout(() => {
-                 void (async () => {
-                   const { handleStart, getBot } = await import("./botmanager.js");
-                   const bot = getBot(botName);
-                   if (!bot) return;
-                   if (bot.state === "running") return;
-                   await handleStart({ type: "start", bot: botName, routine: "return_home" });
-                 })().catch(() => {});
-               }, 4000);
-             }
-          }
-        }
+             const botName = this.username;
+             setTimeout(() => {
+               void (async () => {
+                 const { handleStart, getBot } = await import("./botmanager.js");
+                 const bot = getBot(botName);
+                 if (!bot) return;
+                 if (bot.state === "running") return;
+                 await handleStart({ type: "start", bot: botName, routine: "return_home" });
+               })().catch(() => {});
+             }, 4000);
+           }
+         }
 
          if (modulesArray.length > 0 || modulesResolved) {
            this.installedMods = modulesArray
@@ -2215,6 +2221,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
        }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
+      // Track position changes so EWS detection in refreshShip works across calls.
+      if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+        this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+        this.logPosition();
+        this.lastSystem = this.system;
+        this.lastPoi = this.poi;
+      }
     }
     return resp;
   }

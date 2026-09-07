@@ -11622,7 +11622,7 @@
           };
         const [, time, cat, msg] = m;
         const catClass = LOG_CAT_CLASSES[cat] || "";
-        const html = `<span class="log-time">${esc(time)}</span> <span class="log-cat ${catClass}">[${esc(cat)}]</span> <span class="log-msg">${esc(msg)}</span>`;
+        const html = `<span class="log-time">${esc(time)}</span> <span class="log-cat ${catClass}">[${esc(cat)}]</span> <span class="log-msg">${msg}</span>`;
         return { html, catClass };
       }
 

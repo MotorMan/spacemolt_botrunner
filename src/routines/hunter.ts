@@ -5210,14 +5210,34 @@ export async function boardingSubroutine(
        return "retreat";
      }
 
-     // Check if our target is destroyed
-     const targetParticipant = status.participants.find(
-       p => p.player_id === target.id || p.username === target.name,
-     );
-     if (targetParticipant && targetParticipant.is_destroyed) {
-       ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
-       return "target_eliminated";
-     }
+      // Check if our target is destroyed or no longer in the battle
+      const targetParticipant = status.participants.find(
+        p => p.player_id === target.id || p.username === target.name,
+      );
+      if (!targetParticipant) {
+        // Target is no longer in the battle — it was captured or eliminated
+        // by someone else. Switch to the next eligible enemy so we can
+        // continue boarding instead of firing at nothing.
+        const nextEnemy = status.participants.find(p => {
+          if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+          if (p.player_id === target.id || p.username === target.name) return false;
+          return true;
+        });
+        if (nextEnemy) {
+          const newTargetName = nextEnemy.username || nextEnemy.player_id || "unknown";
+          ctx.log("combat", `🎯 Target ${target.name} no longer in battle — switching to ${newTargetName} for boarding`);
+          target = { id: nextEnemy.player_id || nextEnemy.username, name: newTargetName } as any;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          continue;
+        }
+        ctx.log("combat", `✅ No more enemies — boarding subroutine complete`);
+        await bot.exec("battle", { action: "stance", stance: "fire" });
+        return boardStanceIssued ? "captured" : "target_eliminated";
+      }
+      if (targetParticipant.is_destroyed) {
+        ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
+        return "target_eliminated";
+      }
 
        // ── Phase 3: Shield suppression + boarding ──
        if (!boardingActive) {
@@ -5351,9 +5371,32 @@ export async function boardingSubroutine(
         if (ourStanceNow === "board") {
           ctx.log("combat", `🛸 Boarding: operation data not in status yet (stance=board) — continuing to monitor`);
         } else if (boardStanceIssued) {
-          ctx.log("combat", `🛸 Boarding: board stance no longer active — waiting to see if operation completed`);
+          ctx.log("combat", `🛸 Boarding: board stance no longer active — checking if operation completed`);
           boardStanceIssued = false;
           boardingActive = false;
+
+          // The boarding operation vanished from the status — the target was
+          // most likely captured (victory) or eliminated. Check if the target
+          // participant is gone from the battle and, if so, switch to the next
+          // eligible enemy so we can continue boarding in the next iteration.
+          const targetGone = !targetParticipant || targetParticipant.is_destroyed;
+          if (targetGone) {
+            const nextEnemy = status.participants.find(p => {
+              if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+              if (p.player_id === target.id || p.username === target.name) return false;
+              return true;
+            });
+            if (nextEnemy) {
+              const newTargetName = nextEnemy.username || nextEnemy.player_id || "unknown";
+              ctx.log("combat", `🎯 Target ${target.name} captured/eliminated — switching to ${newTargetName}`);
+              target = { id: nextEnemy.player_id || nextEnemy.username, name: newTargetName } as any;
+              await bot.exec("battle", { action: "target", target_id: target.id });
+            } else {
+              ctx.log("combat", `✅ No more enemies after ${target.name} — boarding subroutine complete`);
+              await bot.exec("battle", { action: "stance", stance: "fire" });
+              return "captured";
+            }
+          }
         } else {
           const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
           if (!targetStillAlive) {

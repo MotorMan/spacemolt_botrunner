@@ -475,10 +475,11 @@ function getHunterSettings(username?: string): {
   const botHunterPatrolAssignments: Record<string, string> = (h.botHunterPatrolAssignments as Record<string, string>) || {};
 
   let resolvedPatrolSystems: string[] = [];
+  let assignedProfile: HunterPatrolProfile | undefined;
 
   if (hunterPatrols.length > 0 && username) {
     const assignedProfileName = botHunterPatrolAssignments[username] || hunterPatrols[0]?.name || "Default Patrol";
-    const assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
+    assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
     resolvedPatrolSystems = assignedProfile?.patrolSystems || [];
   } else if (Array.isArray(h.patrolSystems)) {
     // Legacy single list
@@ -538,7 +539,11 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? false,
     boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
     boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
-    boardingPrizeDestination: (botOverrides.boardingPrizeDestination as string) || (h.boardingPrizeDestination as string) || "",
+    boardingPrizeDestination:
+      (assignedProfile?.boardingPrizeDestination as string) ||
+      (botOverrides.boardingPrizeDestination as string) ||
+      (h.boardingPrizeDestination as string) ||
+      "",
   };
 }
 

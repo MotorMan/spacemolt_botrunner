@@ -31749,13 +31749,21 @@ ignoreBlacklist: document.getElementById(
                      <input type="text" id="hunter-patrol-targetpois-entry" value="${esc((p.targetPois || []).join(', '))}" placeholder="poi_id or POI name, comma separated" style="flex:1">
                      <button onclick="saveCurrentHunterProfileTargetPois()">Save POIs</button>
                    </div>
-                   <div class="blacklist-divider">creature farm radius mode (optional — overrides static systems)</div>
-                   <div class="blacklist-add-row">
-                     <input type="text" id="hunter-patrol-center-system" value="${esc(p.creatureFarmCenterSystem || '')}" placeholder="Center system ID or name" style="flex:1">
-                     <input type="number" id="hunter-patrol-radius" value="${p.creatureFarmPatrolRadius || ''}" placeholder="Radius (jumps)" min="1" max="20" style="width:100px">
-                     <button onclick="saveCurrentHunterProfileRadius()">Save Radius</button>
-                   </div>
-                 </div>
+                    <div class="blacklist-divider">creature farm radius mode (optional — overrides static systems)</div>
+                    <div class="blacklist-add-row">
+                      <input type="text" id="hunter-patrol-center-system" value="${esc(p.creatureFarmCenterSystem || '')}" placeholder="Center system ID or name" style="flex:1">
+                      <input type="number" id="hunter-patrol-radius" value="${p.creatureFarmPatrolRadius || ''}" placeholder="Radius (jumps)" min="1" max="20" style="width:100px">
+                      <button onclick="saveCurrentHunterProfileRadius()">Save Radius</button>
+                    </div>
+                    <div class="blacklist-divider">boarding prize destination (optional — overrides global home station)</div>
+                    <div class="blacklist-add-row">
+                      <select id="hunter-patrol-boarding-prize-destination" style="flex:1">
+                        <option value="">(use global Home Station)</option>
+                        ${stationList.map(({ val, label, sysName }) => `<option value="${val}"${val === p.boardingPrizeDestination ? " selected" : ""}>${label} (${sysName})</option>`).join("")}
+                      </select>
+                      <button onclick="saveCurrentHunterProfileBoardingPrizeDestination()">Save Destination</button>
+                    </div>
+                  </div>
               </div>`;
               })()
             : ""
@@ -32410,25 +32418,41 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
-      function saveCurrentHunterProfileRadius() {
-        const idx = window._currentHunterPatrolIndex;
-        if (idx === undefined) return;
-        const centerInput = document.getElementById("hunter-patrol-center-system");
-        const radiusInput = document.getElementById("hunter-patrol-radius");
-        if (!centerInput || !radiusInput) return;
-        const profile = settings.hunter.hunterPatrols[idx];
-        if (!profile) return;
-        const center = centerInput.value.trim();
-        const radius = parseInt(radiusInput.value, 10);
-        profile.creatureFarmCenterSystem = center || undefined;
-        profile.creatureFarmPatrolRadius = Number.isFinite(radius) && radius > 0 ? radius : undefined;
-        rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
-      }
+       function saveCurrentHunterProfileRadius() {
+         const idx = window._currentHunterPatrolIndex;
+         if (idx === undefined) return;
+         const centerInput = document.getElementById("hunter-patrol-center-system");
+         const radiusInput = document.getElementById("hunter-patrol-radius");
+         if (!centerInput || !radiusInput) return;
+         const profile = settings.hunter.hunterPatrols[idx];
+         if (!profile) return;
+         const center = centerInput.value.trim();
+         const radius = parseInt(radiusInput.value, 10);
+         profile.creatureFarmCenterSystem = center || undefined;
+         profile.creatureFarmPatrolRadius = Number.isFinite(radius) && radius > 0 ? radius : undefined;
+         rerenderCurrentSettings();
+         send({
+           type: "saveSettings",
+           routine: "hunter",
+           settings: settings.hunter,
+         });
+       }
+
+       function saveCurrentHunterProfileBoardingPrizeDestination() {
+         const idx = window._currentHunterPatrolIndex;
+         if (idx === undefined) return;
+         const select = document.getElementById("hunter-patrol-boarding-prize-destination");
+         if (!select) return;
+         const profile = settings.hunter.hunterPatrols[idx];
+         if (!profile) return;
+         profile.boardingPrizeDestination = select.value.trim() || undefined;
+         rerenderCurrentSettings();
+         send({
+           type: "saveSettings",
+           routine: "hunter",
+           settings: settings.hunter,
+         });
+       }
 
       function removeSystemFromCurrentHunterProfile(systemId) {
         const idx = window._currentHunterPatrolIndex;

@@ -5397,7 +5397,22 @@ export async function boardingSubroutine(
           await ctx.sleep(BOARD_TICK_MS);
           continue;
         }
-        
+
+        const shieldPctNow = getTargetShieldPct(status, target.id, target.name);
+        const effectiveShieldThresholdNow = clampInfo.hasClamp ? shieldThreshold : 0;
+        if (
+          shieldPctNow !== null &&
+          effectiveShieldThresholdNow > 0 &&
+          shieldPctNow > effectiveShieldThresholdNow &&
+          shieldPctNow > 10
+        ) {
+          ctx.log("combat", `⚠️ Boarding: ${target.name} shields regenerated to ${shieldPctNow}% (above ${effectiveShieldThresholdNow}% threshold) — resetting boarding attempt, switching to fire`);
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          boardingActive = false;
+          boardStanceIssued = false;
+          continue;
+        }
+
       const boardingOp = findBoardingOperation(status, target.id);
       if (boardingOp) {
         ctx.log("combat", `🛸 Boarding: operation ${boardingOp.operation_id} — phase=${boardingOp.phase} progress=${boardingOp.progress ?? "n/a"}`);

@@ -104,6 +104,7 @@ import {
   getItemSize,
   topUpShields,
   useRepairKits,
+  acquireFuelCellsAndRefuel,
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
@@ -5642,11 +5643,20 @@ async function isPrizeStillAtPoi(ctx: RoutineContext, recovery: { prize_id: stri
   return !!match;
 }
 
+const SERVICED_PRIZE_CACHE_TTL_MS = 60 * 1000;
+const servicedPrizeCache = new Map<string, number>();
+
 /**
  * Service a prize (refuel/repair) via spacemolt_salvage service_prize.
  */
 async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; ship_id?: string; ship_class?: string }, action: "refuel" | "repair" | "stop" | "resume" | "redirect", target?: string, quantity?: number): Promise<boolean> {
   const { bot } = ctx;
+  const cacheKey = `${recovery.prize_id}|${action}`;
+  const cached = servicedPrizeCache.get(cacheKey);
+  if (cached && Date.now() - cached < SERVICED_PRIZE_CACHE_TTL_MS) {
+    return true;
+  }
+
   const payload: Record<string, unknown> = {
     id: recovery.prize_id,
     service_action: action,
@@ -5661,10 +5671,34 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
       ctx.log("combat", `ServicePrize: prize not found (${recovery.prize_id}) — may have left`);
       return false;
     }
+    if (msg.includes("fuel_full")) {
+      ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} already fully fueled`);
+      servicedPrizeCache.set(cacheKey, Date.now());
+      return true;
+    }
+    if (msg.includes("insufficient_resources") && action === "refuel") {
+      ctx.log("combat", `ServicePrize: insufficient resources to refuel prize — topping up ship fuel first`);
+      await acquireFuelCellsAndRefuel(ctx);
+      const retry = await bot.exec("service_prize", payload);
+      if (!retry.error) {
+        servicedPrizeCache.set(cacheKey, Date.now());
+        ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+        return true;
+      }
+      const retryMsg = retry.error.message.toLowerCase();
+      if (retryMsg.includes("fuel_full")) {
+        ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} already fully fueled (retry)`);
+        servicedPrizeCache.set(cacheKey, Date.now());
+        return true;
+      }
+      ctx.log("error", `ServicePrize retry failed (${action}): ${retry.error.message}`);
+      return false;
+    }
     ctx.log("error", `ServicePrize failed (${action}): ${resp.error.message}`);
     return false;
   }
 
+  servicedPrizeCache.set(cacheKey, Date.now());
   ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action})`);
   return true;
 }

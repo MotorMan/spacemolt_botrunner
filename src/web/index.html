@@ -2619,7 +2619,17 @@
               break;
             case "settings_updated":
               // Settings were updated on disk by a bot routine (e.g., cargo mover delivery tracking)
+              const prevSystemBlacklist = settings.system_blacklist;
+              const prevStationBlacklist = settings.station_blacklist;
               settings = msg.settings;
+              if (settingsPanelDirty()) {
+                if (activeSettingsTab === "system_blacklist") {
+                  settings.system_blacklist = prevSystemBlacklist;
+                }
+                if (activeSettingsTab === "station_blacklist") {
+                  settings.station_blacklist = prevStationBlacklist;
+                }
+              }
               applyWindowTitle();
               window.currentSettings = settings;
               // Only re-render if settings tab is active (user is watching)
@@ -13437,6 +13447,46 @@
         return false;
       }
 
+      function systemBlacklistTabDirty() {
+        if (activeSettingsTab !== "system_blacklist") return false;
+        const panel = document.getElementById("settingsContent");
+        if (!panel) return false;
+        const items = panel.querySelectorAll(".blacklist-item");
+        const currentList = Array.isArray(settings.system_blacklist)
+          ? settings.system_blacklist
+          : [];
+        if (items.length !== currentList.length) return true;
+        const currentSet = new Set(currentList.map((s) => s.toLowerCase()));
+        for (const item of items) {
+          const nameEl = item.querySelector(".blacklist-name");
+          if (!nameEl) continue;
+          const match = nameEl.textContent.match(/\(([^)]+)\)/);
+          if (!match) continue;
+          if (!currentSet.has(match[1].toLowerCase())) return true;
+        }
+        return false;
+      }
+
+      function stationBlacklistTabDirty() {
+        if (activeSettingsTab !== "station_blacklist") return false;
+        const panel = document.getElementById("settingsContent");
+        if (!panel) return false;
+        const items = panel.querySelectorAll(".blacklist-item");
+        const currentList = Array.isArray(settings.station_blacklist)
+          ? settings.station_blacklist
+          : [];
+        if (items.length !== currentList.length) return true;
+        const currentSet = new Set(currentList.map((s) => s.toLowerCase()));
+        for (const item of items) {
+          const nameEl = item.querySelector(".blacklist-name");
+          if (!nameEl) continue;
+          const match = nameEl.textContent.match(/\(([^)]+)\)/);
+          if (!match) continue;
+          if (!currentSet.has(match[1].toLowerCase())) return true;
+        }
+        return false;
+      }
+
       // Generic guard: true when the open settings tab has unsaved edits in the
       // DOM. This generalizes the miner-quotas-specific minerQuotaTabDirty()
       // guard so every settings page is protected against background refreshes
@@ -13465,7 +13515,11 @@
       function settingsPanelDirty() {
         const panel = document.getElementById("settingsContent");
         if (!panel || _settingsPanelSnapshot === null) return false;
-        return serializeSettingsPanel(panel) !== _settingsPanelSnapshot;
+        if (serializeSettingsPanel(panel) !== _settingsPanelSnapshot) return true;
+        if (minerQuotaTabDirty()) return true;
+        if (systemBlacklistTabDirty()) return true;
+        if (stationBlacklistTabDirty()) return true;
+        return false;
       }
 
       function scheduleSettingsPanelRefresh() {

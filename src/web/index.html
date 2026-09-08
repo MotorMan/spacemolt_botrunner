@@ -31545,6 +31545,7 @@ ignoreBlacklist: document.getElementById(
         const boardingEnabled = h.boardingEnabled ?? false;
         const boardingShieldThreshold = h.boardingShieldThreshold ?? 5;
         const boardingMarines = h.boardingMarines ?? 0;
+        const boardingPrizeDestination = h.boardingPrizeDestination || "";
         const stayInPoi = h.stayInPoi ?? false;
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
@@ -32051,15 +32052,26 @@ ignoreBlacklist: document.getElementById(
        <input type="number" id="set-hunter-boardingShieldThreshold" min="0" max="100" value="${boardingShieldThreshold}">
      </div>
 
-     <div class="setting-row" id="set-hunter-boardingMarines-row">
-       <div>
-         <div class="setting-label">Boarding Marines Committed</div>
-         <div class="setting-hint">Number of marines to commit to the board stance. 0 = commit all fit marines aboard.</div>
+      <div class="setting-row" id="set-hunter-boardingMarines-row">
+        <div>
+          <div class="setting-label">Boarding Marines Committed</div>
+          <div class="setting-hint">Number of marines to commit to the board stance. 0 = commit all fit marines aboard.</div>
+        </div>
+         <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
        </div>
-        <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
+
+      <div class="setting-row" id="set-hunter-boardingPrizeDestination-row">
+        <div>
+          <div class="setting-label">Boarding Prize Destination</div>
+          <div class="setting-hint">Station to send captured prize ships to. Uses the same format as Home Station below (select from list or enter a station ID / base ID / base name). Leave empty to use the global Home Station.</div>
+        </div>
+        <select id="set-hunter-boardingPrizeDestination">
+          <option value="">(use global Home Station)</option>
+          ${stationList.map(({ val, label, sysName }) => `<option value="${val}"${val === boardingPrizeDestination ? " selected" : ""}>${label} (${sysName})</option>`).join("")}
+        </select>
       </div>
 
-      <div class="setting-row">
+       <div class="setting-row">
         <div>
           <div class="setting-label">Stay in POI (boarding mode)</div>
           <div class="setting-hint">When enabled in boarding mode, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs and systems. Recommended with a fixed patrol profile or single system.</div>
@@ -32188,6 +32200,8 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-hunter-boardingMarines")?.value,
             ) || 0,
+          boardingPrizeDestination:
+            document.getElementById("set-hunter-boardingPrizeDestination")?.value.trim() || "",
           stayInPoi:
             document.getElementById("set-hunter-stayInPoi")?.value === "true",
         };

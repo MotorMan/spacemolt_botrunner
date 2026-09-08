@@ -251,6 +251,7 @@ async function handleUnexpectedBattle(
 
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
 
   if (boardingEnabled && fakeTarget) {
     const canBoard = await checkBoardingCapability(ctx);
@@ -263,7 +264,7 @@ async function handleUnexpectedBattle(
         const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
         if (result === "failed") {
           ctx.log("combat", `Boarding failed for ${boardingTarget.name} — switching to fire stance to finish`);
-          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs);
+          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, false, isCreatureName(boardingTarget.name));
         }
         return;
       }
@@ -271,9 +272,9 @@ async function handleUnexpectedBattle(
   }
 
   if (fakeTarget) {
-    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+    broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, false, fakeTargetIsCreature);
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
@@ -661,7 +662,8 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
 
 const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
+    const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, false, fakeTargetIsCreature);
   }
 }
 
@@ -1100,14 +1102,13 @@ async function hunterEngage(
   onlyNPCs: boolean = false,
   cloakOnStart: boolean = false,
 ): Promise<boolean> {
+  const isCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
   if (!coordResponding) {
-    broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
-    // Lock one-shot creatures so other hunters don't also start attacking the same
-    // target (leviathans are intentionally skipped — they keep the assist broadcast).
+    broadcastHunterAssist(ctx, target, isCreature);
     claimCreature(ctx, target);
   }
    const hsettings = getHunterSettings(ctx.bot.username);
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, isCreature);
 }
 
 /** Register the bot's coordination listener once. */
@@ -3557,10 +3558,11 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
 
   const enemy = (bot.currentBattle.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
   if (fakeTarget) {
-    broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
+    broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
+  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, false, fakeTargetIsCreature);
 }
 
 async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -6563,7 +6565,8 @@ async function* engageBoardingTargetsAtCurrentPoi(
         claimCreature(ctx, target);
       }
       const hsettings = getHunterSettings(ctx.bot.username);
-      const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
+      const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
+       const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
 
       if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
       if (won) {

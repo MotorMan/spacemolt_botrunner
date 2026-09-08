@@ -655,16 +655,17 @@ export async function engageTarget(
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
   maxAttackTier: PirateTier,
-  sideId?: number, // Optional: if provided, skip analysis and directly join this side
+  sideId?: number,
   skipScan: boolean = false,
-  repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
-  onlyNPCs: boolean = false,     // if true, flee when encountering players
-  cloakOnStart: boolean = false, // if true, disable cloak before attack and re-cloak after battle
-  shieldRechargePct: number = 80, // shield % to top up to in combat (e.g. 80 for 80%)
+  repairThreshold: number = 0,
+  onlyNPCs: boolean = false,
+  cloakOnStart: boolean = false,
+  shieldRechargePct: number = 80,
   ammoThreshold: number = 5,
   maxReloadAttempts: number = 3,
   ammoReloadAbsoluteThreshold: number = 1,
   ammoReloadPercentThreshold: number = 25,
+  stayAtEngaged: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -677,7 +678,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, false, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -701,7 +702,7 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, false, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
@@ -762,14 +763,14 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, false, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs, cloakOnStart, stayAtEngaged, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
       }
     }
     return false;
   }
 
-   ctx.log("combat", `⚔️ Battle started with ${target.name} — advancing to engage`);
-  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold);
+   ctx.log("combat", `🎯 Battle started with ${target.name} — advancing to engage`);
+  return await fightFreshBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, cloakOnStart, shieldRechargePct, ammoThreshold, maxReloadAttempts, ammoReloadAbsoluteThreshold, ammoReloadPercentThreshold, stayAtEngaged);
 }
 
 // ── Combat Loops ──────────────────────────────────────────────
@@ -804,6 +805,7 @@ export async function fightFreshBattle(
   maxReloadAttempts: number = 3,
   ammoReloadAbsoluteThreshold: number = 1,
   ammoReloadPercentThreshold: number = 25,
+  stayAtEngaged: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -1190,7 +1192,29 @@ export async function fightFreshBattle(
 
     // Stay within 1 zone of enemy to maintain firing range
     const zoneDiff = ourZoneNum - enemyZoneNum;
-    
+
+    if (stayAtEngaged) {
+      const ourZoneNow = status.your_zone || "outer";
+      if (ourZoneNow !== "engaged") {
+        ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        const adv = await bot.exec("battle", { action: "advance" });
+        if (adv.error) {
+          const errMsg = adv.error.message.toLowerCase();
+          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+            ctx.log("combat", "✅ Battle ended (advance failed: not in battle) - victory!");
+            await checkAndPraiseMorgThar(ctx, true);
+            await recloakAfterBattle(ctx, cloakOnStart);
+            return true;
+          }
+          ctx.log("error", "Advance to engaged failed: " + adv.error.message);
+        }
+      }
+      await attackTarget(ctx, target);
+      await bot.exec("battle", { action: "target", target_id: target.id });
+      await ctx.sleep(10000);
+      continue;
+    }
+
     // Always advance if we're not at engaged zone (especially when enemy zone is unknown/outer)
     if (ourCurrentZone !== "engaged") {
       if (zoneDiff > 1) {

@@ -121,6 +121,7 @@ import {
   fightJoinedBattle,
   getWeaponModules,
   emergencyFleeSpam,
+  recloakAfterBattle,
 } from "./battle.js";
 
 
@@ -225,6 +226,7 @@ async function handleUnexpectedBattle(
   boardingShieldThreshold: number = 5,
   boardingMarines: number = 0,
   shieldRechargePct: number = 80,
+  cloakOnStart: boolean = false,
 ): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
@@ -258,7 +260,7 @@ async function handleUnexpectedBattle(
         const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
         ctx.log("combat", `🛸 Boarding: engaging unexpected battle with ${boardingTarget.name} (shields ≤ ${boardingShieldThreshold}% → board)`);
         broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
-        const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct);
+        const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
         if (result === "failed") {
           ctx.log("combat", `Boarding failed for ${boardingTarget.name} — switching to fire stance to finish`);
           await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs);
@@ -286,7 +288,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
     apiChecked = true;
     if (battleStatus) {
       ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
       return true;
     }
     // API returned no battle - clear stale WebSocket state if present
@@ -307,7 +309,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
   // API failed, check WebSocket state as fallback
   if (ctx.bot.isInBattle()) {
     ctx.log("combat", `⚠️ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
     return true;
   }
   
@@ -1884,7 +1886,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           bot.trackNearbyPlayers(nearbyData);
           bot.trackWildlife(nearbyData);
 
-          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
           const entities = parseNearby(nearbyData);
           const creatures = pickCreatureTargets(entities, bot.username, true, settings.maxCreaturesPerScan);
@@ -2285,7 +2287,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -2780,7 +2782,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       bot.trackWildlife(nearbyData);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -3204,7 +3206,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     bot.trackWildlife(nearbyData);
 
     // Check if we got pulled into battle during scanning
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if ((nearbyData as any).notifications) {
@@ -3283,7 +3285,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           const safetyCheckResp = await bot.exec("get_nearby");
           if (!safetyCheckResp.error) {
             bot.trackNearbyPlayers(safetyCheckResp.result);
-            await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+            await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
             const nearbyEntities = parseNearby(safetyCheckResp.result);
             const newThreats = nearbyEntities.filter(e =>
               isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -5059,6 +5061,7 @@ export async function boardingSubroutine(
   marinesConfigured: number,
   fleeThreshold: number,
   shieldRechargePct: number,
+  cloakOnStart: boolean = false,
 ): Promise<"captured" | "target_eliminated" | "failed" | "retreat"> {
   const { bot } = ctx;
   if (!target.id) {
@@ -5187,10 +5190,11 @@ export async function boardingSubroutine(
      }
 
          const status = await getBattleStatus(ctx);
-         if (!status) {
-           if (boardingActive) {
-             ctx.log("combat", `✅ Boarding: battle ended during active boarding — polling for captured prize (up to 8 checks, 3s apart)`);
-             let foundPrize = false;
+          if (!status) {
+            if (boardingActive) {
+              ctx.log("combat", `✅ Boarding: battle ended during active boarding — polling for captured prize (up to 8 checks, 3s apart)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              let foundPrize = false;
              for (let prizeTick = 0; prizeTick < 8; prizeTick++) {
                await ctx.sleep(3000);
                const nearbyResult = await getObservationOrNearby(bot);
@@ -5228,6 +5232,7 @@ export async function boardingSubroutine(
               if (capturedPrize) {
                 ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (prize found in final check)`);
                 bot.registerCapturedPrize(capturedPrize.ship_id, capturedPrize.ship_class || target.name, "", capturedPrize.prize_id);
+                await recloakAfterBattle(ctx, cloakOnStart);
                 return "captured";
               }
               
@@ -5236,19 +5241,23 @@ export async function boardingSubroutine(
                 const tp = finalStatus.participants.find(p => p.player_id === target.id || p.username === target.name);
                 if (tp && tp.is_destroyed) {
                   ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+                  await recloakAfterBattle(ctx, cloakOnStart);
                   return "target_eliminated";
                 }
               }
               
               ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}! (boarding was active, assuming capture — prize may still be spawning)`);
+              await recloakAfterBattle(ctx, cloakOnStart);
               return "captured";
             }
             
             if (foundPrize) {
+              await recloakAfterBattle(ctx, cloakOnStart);
               return "captured";
             }
           } else {
             ctx.log("combat", `✅ Boarding: battle ended — ${target.name} eliminated!`);
+            await recloakAfterBattle(ctx, cloakOnStart);
           }
           return "target_eliminated";
         }
@@ -6397,7 +6406,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
   let totalBoardings = startBoardings;
 
   if (await checkAndHandleExistingBattle(ctx, settings)) return [totalKills, totalBoardings];
-  await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+  await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
   yield "scan_for_targets";
   const nearbyResult = await getObservationOrNearby(bot);
@@ -6478,13 +6487,14 @@ async function* engageBoardingTargetsAtCurrentPoi(
             settings.boardingMarines,
             settings.fleeThreshold,
             settings.shieldRechargePct,
+            settings.cloakOnStart,
           );
 
           if (result === "captured") {
             totalKills++;
             totalBoardings++;
             ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            await recloakAfterBattle(ctx, settings.cloakOnStart);
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
@@ -6703,7 +6713,7 @@ async function* boardingSystemPass(
     // Service any stalled prizes at this POI (refuel, resume, etc.)
     await serviceAnyStalledPrizes(ctx);
 
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
     const entities = parseNearby(nearbyData);
     const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
@@ -6784,13 +6794,14 @@ async function* boardingSystemPass(
             settings.boardingMarines,
             settings.fleeThreshold,
             settings.shieldRechargePct,
+            settings.cloakOnStart,
           );
 
             if (result === "captured") {
               totalKills++;
               totalBoardings++;
                ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-              if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+              await recloakAfterBattle(ctx, settings.cloakOnStart);
               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();

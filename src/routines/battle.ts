@@ -1310,7 +1310,12 @@ function pickRealBattleTarget(
     const name = (p.username || p.player_id || "").toLowerCase();
     return /overlord|grand marshal|warlord|admiral|nyx|korr|boss|alpha|omega|prime|executioner|sentinel|apex|razor|striker/.test(name);
   });
-  const chosen = bossish || enemies[0];
+  const sortedByShields = enemies.sort(
+    (a, b) =>
+      (a.shield_pct ?? a.shield_percent ?? 100) -
+      (b.shield_pct ?? b.shield_percent ?? 100),
+  );
+  const chosen = bossish || sortedByShields[0];
 
   return {
     id: chosen.player_id || chosen.username || "",

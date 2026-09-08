@@ -255,12 +255,13 @@ async function handleUnexpectedBattle(
     if (canBoard) {
       const fitMarines = await getFitMarineCount(ctx);
       if (fitMarines >= 1) {
-        ctx.log("combat", `🛸 Boarding: engaging unexpected battle with ${fakeTarget.name} (shields ≤ ${boardingShieldThreshold}% → board)`);
-        broadcastHunterAssist(ctx, fakeTarget, isCreatureName(fakeTarget.name));
-        const result = await boardingSubroutine(ctx, fakeTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct);
+        const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
+        ctx.log("combat", `🛸 Boarding: engaging unexpected battle with ${boardingTarget.name} (shields ≤ ${boardingShieldThreshold}% → board)`);
+        broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
+        const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct);
         if (result === "failed") {
-          ctx.log("combat", `Boarding failed for ${fakeTarget.name} — switching to fire stance to finish`);
-          await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs);
+          ctx.log("combat", `Boarding failed for ${boardingTarget.name} — switching to fire stance to finish`);
+          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs);
         }
         return;
       }
@@ -4962,6 +4963,33 @@ function resolveMarineCommitment(fitMarines: number, configured: number): number
 }
 
 /**
+ * Pick the enemy with the lowest shields from a battle status.
+ * Used by boarding to ensure we engage the most vulnerable target.
+ */
+function pickLowestShieldsEnemy(
+  status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
+  ourSideId: number | undefined,
+): { id: string; name: string } | null {
+  if (!status.participants || status.participants.length === 0) return null;
+  const side = ourSideId ?? status.your_side_id;
+  const enemies = status.participants.filter(
+    p => side === undefined || p.side_id !== side,
+  );
+  const alive = enemies.filter(p => !p.is_destroyed && (p.player_id || p.username));
+  if (alive.length === 0) return null;
+  const sorted = alive.sort(
+    (a, b) =>
+      (a.shield_pct ?? a.shield_percent ?? 100) -
+      (b.shield_pct ?? b.shield_percent ?? 100),
+  );
+  const chosen = sorted[0];
+  return {
+    id: chosen.player_id || chosen.username || "",
+    name: chosen.username || chosen.player_id || "enemy",
+  };
+}
+
+/**
  * Find the target participant in the battle and return its shield percentage.
  */
 function getTargetShieldPct(
@@ -5261,12 +5289,25 @@ export async function boardingSubroutine(
         await bot.exec("battle", { action: "stance", stance: "fire" });
         return boardStanceIssued ? "captured" : "target_eliminated";
       }
-      if (targetParticipant.is_destroyed) {
-        ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
-        return "target_eliminated";
-      }
+       if (targetParticipant.is_destroyed) {
+         ctx.log("combat", `⚠️ Boarding: ${target.name} was destroyed before boarding could complete`);
+         return "target_eliminated";
+       }
 
-       // ── Phase 3: Shield suppression + boarding ──
+       // ── Dynamic re-targeting: always board the weakest enemy ──
+       const lowestShieldsEnemy = pickLowestShieldsEnemy(status, status.your_side_id);
+       if (lowestShieldsEnemy && (lowestShieldsEnemy.id !== target.id && lowestShieldsEnemy.name !== target.name)) {
+         const lowShieldPct = getTargetShieldPct(status, lowestShieldsEnemy.id, lowestShieldsEnemy.name);
+         const currentShieldPct = getTargetShieldPct(status, target.id, target.name);
+         if (lowShieldPct !== null && currentShieldPct !== null && lowShieldPct < currentShieldPct) {
+           const newTargetName = lowestShieldsEnemy.name || "unknown";
+           ctx.log("combat", `🎯 Re-targeting to ${newTargetName} (shields ${lowShieldPct}% < ${currentShieldPct}% on ${target.name})`);
+           target = { id: lowestShieldsEnemy.id, name: newTargetName } as any;
+           await bot.exec("battle", { action: "target", target_id: target.id });
+         }
+       }
+
+        // ── Phase 3: Shield suppression + boarding ──
        if (!boardingActive) {
          // Check shield percentage — BEFORE zone check.
          // If shields are already at/below threshold, brace + board immediately

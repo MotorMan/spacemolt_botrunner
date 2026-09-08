@@ -73,6 +73,7 @@ import { botChatChannel } from "../bot_chat_channel.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common.js";
 import { combatDebugLog } from "../debug.js";
+import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
 import {
   findStation,
   isStationPoi,
@@ -261,6 +262,7 @@ async function handleUnexpectedBattle(
         const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
         ctx.log("combat", `🛸 Boarding: engaging unexpected battle with ${boardingTarget.name} (shields ≤ ${boardingShieldThreshold}% → board)`);
         broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
+        broadcastBoardingClaim(ctx, boardingTarget);
         const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
         if (result === "failed") {
           ctx.log("combat", `Boarding failed for ${boardingTarget.name} — switching to fire stance to finish`);
@@ -387,6 +389,11 @@ export interface HunterPatrolProfile {
    *  patrolled (matched by POI id or name). Used by the creature_farm sub-routine
    *  to restrict a profile to specific creature spawns. */
   targetPois?: string[];
+  /** Optional per-profile prize destination for boarding mode. When set,
+   *  captured prize ships are sent to this station instead of the global
+   *  homeStation. Accepts the same format as homeStation (POI id, base id,
+   *  base name, or "system|poi"). */
+  boardingPrizeDestination?: string;
   /** Optional creature farm radius mode: when set, the profile generates its
    *  patrol system list dynamically from `creatureFarmCenterSystem` rather than
    *  using the static `patrolSystems` array. The center system is resolved by ID
@@ -457,6 +464,7 @@ function getHunterSettings(username?: string): {
   boardingEnabled: boolean;
   boardingShieldThreshold: number;
   boardingMarines: number;
+  boardingPrizeDestination: string;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -527,10 +535,11 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
    fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
    fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
    fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
-   boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? false,
-   boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
-   boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
- };
+    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? false,
+    boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
+    boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
+    boardingPrizeDestination: (botOverrides.boardingPrizeDestination as string) || (h.boardingPrizeDestination as string) || "",
+  };
 }
 
 /** Persist hunter mode setting for a specific bot. */
@@ -1111,6 +1120,34 @@ async function hunterEngage(
   return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, isCreature);
 }
 
+// ── Boarding claim lock (non-API bot chat channel) ────────────
+//
+// When a hunter starts boarding a target it broadcasts a claim on the
+// in-memory bot chat channel. Other hunters in the same POI honour the
+// claim: with multiple targets they pick a different ship, and with only
+// one target they switch to brace stance so they do not damage the prize.
+
+function broadcastBoardingClaim(ctx: RoutineContext, target: { id: string; name: string }): void {
+  const { bot } = ctx;
+  if (!bot.system || !bot.poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (!settings.coordinateHunts) return;
+  boardingClaims.set(target.id, { claimer: bot.username, expires: Date.now() + BOARDING_CLAIM_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[BOARDING CLAIM] ${bot.username} boarding ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`,
+    metadata: {
+      type: "hunter_boarding_claim",
+      system: bot.system,
+      poi: bot.poi,
+      targetName: target.name,
+      targetId: target.id,
+    },
+  });
+}
+
 /** Register the bot's coordination listener once. */
 function ensureHunterCoordListener(username: string): void {
   if (coordListeners.has(username)) return;
@@ -1137,10 +1174,14 @@ function ensureHunterCoordListener(username: string): void {
       };
       coordRequests.get(username)!.push(req);
     } else if (meta.type === "creature_claim") {
-      // Another hunter claimed a one-shot creature — lock it so we don't also attack it.
       const targetId = (meta.targetId as string) || "";
       if (targetId) {
         creatureClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+      }
+    } else if (meta.type === "hunter_boarding_claim") {
+      const targetId = (meta.targetId as string) || "";
+      if (targetId) {
+        boardingClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + BOARDING_CLAIM_TTL_MS });
       }
     }
   });
@@ -1892,7 +1933,8 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           const entities = parseNearby(nearbyData);
           const creatures = pickCreatureTargets(entities, bot.username, true, settings.maxCreaturesPerScan);
           const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
-          const targets = [...creatures, ...pirates];
+          let targets = [...creatures, ...pirates];
+          targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
           if (targets.length === 0) {
             // POI currently clear — stop re-scanning this POI for now
@@ -2321,17 +2363,20 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
 
-      if (pirate_targets.length === 0 && creature_targets.length === 0) {
+      let allTargets = [...pirate_targets, ...creature_targets];
+      allTargets = pickUnclaimedBoardingTarget(allTargets, bot.username);
+
+      if (allTargets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      const allTargets = [...pirate_targets, ...creature_targets];
+      const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets.filter(e => isStationEntity(e));
+      const nonStationTargets = allTargets2.filter(e => !isStationEntity(e));
+      const stationTargets = allTargets2.filter(e => isStationEntity(e));
 
       let targetsToEngage: NearbyEntity[];
       if (settings.targetRandomly) {
@@ -2816,17 +2861,20 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
 
-      if (pirate_targets.length === 0 && creature_targets.length === 0) {
+      let allTargets = [...pirate_targets, ...creature_targets];
+      allTargets = pickUnclaimedBoardingTarget(allTargets, bot.username);
+
+      if (allTargets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
         if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
-      const allTargets = [...pirate_targets, ...creature_targets];
+      const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets.filter(e => isStationEntity(e));
+      const nonStationTargets = allTargets2.filter(e => !isStationEntity(e));
+      const stationTargets = allTargets2.filter(e => isStationEntity(e));
 
       let targetsToEngage: NearbyEntity[];
       if (settings.targetRandomly) {
@@ -3238,7 +3286,8 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const entities = parseNearby(nearbyData);
       const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
-      const targets = [...pirate_targets, ...creature_targets];
+      let targets = [...pirate_targets, ...creature_targets];
+      targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
       if (targets.length === 0) {
         ctx.log("combat", `No targets at ${originalPoi}`);
@@ -4240,7 +4289,8 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
-        const targets = [...pirate_targets, ...creature_targets];
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -4687,7 +4737,8 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         const creature_targets = pickCreatureTargets(entities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan);
-        const targets = [...pirate_targets, ...creature_targets];
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -4844,7 +4895,8 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
         const entities = parseNearby(nearbyData);
         const pirate_targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
         const creature_targets = pickCreatureTargets(entities, bot.username, currentSettings.huntCreatures, currentSettings.maxCreaturesPerScan);
-        const targets = [...pirate_targets, ...creature_targets];
+        let targets = [...pirate_targets, ...creature_targets];
+        targets = pickUnclaimedBoardingTarget(targets, bot.username);
         for (const target of targets) {
           await useRepairKits(ctx);
           await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
@@ -5070,6 +5122,8 @@ export async function boardingSubroutine(
     ctx.log("combat", "Boarding: no target ID — aborting");
     return "failed";
   }
+
+  broadcastBoardingClaim(ctx, target);
 
   // Check boarding capability
   const canBoard = await checkBoardingCapability(ctx);
@@ -5681,20 +5735,27 @@ function getNearbyPrizes(result: unknown): PrizeInfo[] {
 /**
  * Find a station base ID to use as the prize recovery destination.
  *
- * The home station is almost never in the current system, so we resolve it
+ * When boarding mode is enabled and a `boardingPrizeDestination` is set on the
+ * patrol profile, that station is used instead of the global `homeStation`.
+ * This lets the boarding hunter send captured prizes to a nearby station
+ * rather than crossing the galaxy to the home base.
+ *
+ * The destination is almost never in the current system, so we resolve it
  * from the global mapStore to get its `base_id`. claim_prize requires the
  * `base_id`, not the POI `id`.
  *
- * IMPORTANT: homeStation may be stored as "system|poi" (e.g. "arneb|a356fc2c...").
+ * IMPORTANT: The destination may be stored as "system|poi" (e.g. "arneb|a356fc2c...").
  * We must extract the poi part BEFORE matching, otherwise the `|` breaks the lookup
  * and we return the raw string which claim_prize rejects.
  */
 async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<string | null> {
-  const homeStation = settings.homeStation || "";
-  if (!homeStation) return null;
+  const destination = settings.boardingEnabled && settings.boardingPrizeDestination
+    ? settings.boardingPrizeDestination
+    : (settings.homeStation || "");
+  if (!destination) return null;
 
   // Handle "system|poi" format — extract the poi part for lookup
-  const homePoi = homeStation.includes("|") ? homeStation.split("|")[1] : homeStation;
+  const homePoi = destination.includes("|") ? destination.split("|")[1] : destination;
   const lowerHomePoi = homePoi.toLowerCase();
 
   // Resolve from mapStore (home station is global, not local)
@@ -5716,7 +5777,7 @@ async function findDestinationBaseId(ctx: RoutineContext, settings: ReturnType<t
 
   // If we couldn't resolve it, return the raw setting as a last resort
   // (it might already be a base_id)
-  return homeStation;
+  return destination;
 }
 
 /**
@@ -5879,7 +5940,7 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
  *
  * Returns true if the prize was claimed, false otherwise.
  */
-async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, requireTrackerMatch: boolean = true): Promise<boolean> {
+async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, requireTrackerMatch: boolean = true, specificPrize?: PrizeInfo): Promise<boolean> {
   const { bot } = ctx;
 
   // Need to be out of combat to claim a prize
@@ -5900,8 +5961,10 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
   const prizes = getNearbyPrizes(nearbyData);
   
   let availablePrize: PrizeInfo | undefined;
-  
-     if (requireTrackerMatch) {
+
+  if (specificPrize) {
+    availablePrize = specificPrize;
+  } else if (requireTrackerMatch) {
     // Only claim prizes matching our captured ship tracker.
     // A prize with status="claimed" but no wait_reason is freshly claimed and
     // hasn't appeared in get_status prize_recoveries yet — claim it to assign a
@@ -6422,7 +6485,8 @@ async function* engageBoardingTargetsAtCurrentPoi(
   await serviceAnyStalledPrizes(ctx);
 
   const entities = parseNearby(nearbyData);
-  const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+  let pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+  pirate_targets = pickUnclaimedBoardingTarget(pirate_targets, bot.username);
 
   if (pirate_targets.length > 0) {
     pirate_targets.sort((a, b) => {
@@ -6616,11 +6680,12 @@ async function* engageBoardingTargetsAtCurrentPoi(
   const prizeCheckResp = await bot.exec("get_nearby");
   if (!prizeCheckResp.error && prizeCheckResp.result) {
     const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
-    const missedPrize = prizesAtPoi.find(p => p.status === "available" || p.status === "claimed");
-    if (missedPrize) {
+    const missedPrizes = prizesAtPoi.filter(p => p.status === "available" || p.status === "claimed");
+    for (const missedPrize of missedPrizes) {
       ctx.log("combat", `🛸 Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat — claiming now`);
-      const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, missedPrize);
       if (claimed) ctx.log("combat", `🏆 Missed prize from ${bot.poi} successfully claimed!`);
+      await ctx.sleep(1000);
     }
     await serviceAnyStalledPrizes(ctx);
   }
@@ -6719,7 +6784,8 @@ async function* boardingSystemPass(
     await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
     const entities = parseNearby(nearbyData);
-    const pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+    let pirate_targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e) && !e.isCreature && !isCreatureName(e.name));
+    pirate_targets = pickUnclaimedBoardingTarget(pirate_targets, bot.username);
 
     if (pirate_targets.length === 0) {
       if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
@@ -6772,13 +6838,14 @@ async function* boardingSystemPass(
 
       // Check for any available prizes at this POI before engaging
       const preBattlePrizes = getNearbyPrizes(freshScanResp.result);
-      const preBattlePrize = preBattlePrizes.find(p => p.status === "available" || p.status === "claimed");
-      if (preBattlePrize) {
+      const preBattleAvailable = preBattlePrizes.filter(p => p.status === "available" || p.status === "claimed");
+      for (const preBattlePrize of preBattleAvailable) {
         ctx.log("combat", `🛸 Found unclaimed prize ${preBattlePrize.ship_name || preBattlePrize.prize_id} at ${poi.name} before engaging ${target.name}`);
-        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, preBattlePrize);
         if (claimed) {
           ctx.log("combat", `🏆 Prize claimed before engaging ${target.name}`);
         }
+        await ctx.sleep(1000);
       }
 
       // Determine if we should attempt boarding this target
@@ -6925,13 +6992,14 @@ async function* boardingSystemPass(
     const prizeCheckResp = await bot.exec("get_nearby");
     if (!prizeCheckResp.error && prizeCheckResp.result) {
       const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);
-      const missedPrize = prizesAtPoi.find(p => p.status === "available" || p.status === "claimed");
-      if (missedPrize) {
+      const missedPrizes = prizesAtPoi.filter(p => p.status === "available" || p.status === "claimed");
+      for (const missedPrize of missedPrizes) {
         ctx.log("combat", `🛸 Found unclaimed prize ${missedPrize.ship_name || missedPrize.prize_id} at ${bot.poi} after combat — claiming now`);
-        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false);
+        const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, missedPrize);
         if (claimed) {
           ctx.log("combat", `🏆 Missed prize from ${bot.poi} successfully claimed!`);
         }
+        await ctx.sleep(1000);
       }
       
       // Service any stalled prizes (no fuel, etc.) regardless of tracker

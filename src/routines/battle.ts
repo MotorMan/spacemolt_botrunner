@@ -5,6 +5,7 @@ import { mapStore } from "../mapstore.js";
 import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
 import { combatDebugLog } from "../debug.js";
+import { isBoardingClaimedByOther, releaseExpiredBoardingClaims } from "../boardingCooperation.js";
 
 /**
  * Returns true if the given display name belongs to a known creature (wildlife).
@@ -46,6 +47,51 @@ export async function waitForServerTick(
   // Wait for server tick (~10s) as safety net.
   ctx.log("combat", `Waiting for server response (max ${timeoutMs}ms)...`);
   await ctx.sleep(Math.min(timeoutMs, 10000));
+}
+
+/**
+ * Check if our current target is claimed by another hunter for boarding.
+ * If so, and there are other unclaimed enemies, switch to one of them.
+ * If there are no other enemies, switch to brace stance to avoid damaging
+ * the prize.
+ *
+ * Returns the (possibly new) target and whether we should brace.
+ */
+async function cooperateWithBoardingClaim(
+  ctx: RoutineContext,
+  status: BattleStatus,
+  currentTarget: NearbyEntity | null,
+): Promise<{ target: NearbyEntity | null; brace: boolean }> {
+  const { bot } = ctx;
+  releaseExpiredBoardingClaims();
+
+  if (!currentTarget) return { target: null, brace: false };
+
+  if (!isBoardingClaimedByOther(currentTarget.id, bot.username)) {
+    return { target: currentTarget, brace: false };
+  }
+
+  const ourSideId = status.your_side_id;
+  const enemies = status.participants.filter(p => {
+    if (p.side_id === ourSideId || p.is_destroyed) return false;
+    const pid = p.player_id || p.username || "";
+    if (!pid) return false;
+    return !isBoardingClaimedByOther(pid, bot.username);
+  });
+
+  if (enemies.length > 0) {
+    const newTarget = enemies[0];
+    ctx.log("combat", `🤝 Boarding cooperation: ${currentTarget.name} claimed by ally — switching to ${newTarget.username || newTarget.player_id}`);
+    await bot.exec("battle", { action: "target", target_id: newTarget.player_id || newTarget.username });
+    return {
+      target: { id: newTarget.player_id || newTarget.username, name: newTarget.username || newTarget.player_id } as NearbyEntity,
+      brace: false,
+    };
+  }
+
+  ctx.log("combat", `🤝 Boarding cooperation: ${currentTarget.name} claimed by ally — switching to brace stance (no other targets)`);
+  await bot.exec("battle", { action: "stance", stance: "brace" });
+  return { target: currentTarget, brace: true };
 }
 
 export const TIER_ORDER: Record<PirateTier, number> = {
@@ -958,6 +1004,22 @@ export async function fightFreshBattle(
       p => p.player_id === target.id || p.username === target.name
     );
 
+    if (targetParticipant && target && !targetParticipant.is_destroyed) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, target);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
+        target = coop.target;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        targetParticipant = status.participants.find(
+          p => p.player_id === target.id || p.username === target.name
+        );
+        await ctx.sleep(300);
+      }
+    }
+
     if (targetParticipant && targetParticipant.is_destroyed) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — finding new target...`);
       const better = pickRealBattleTarget(status, status.your_side_id);
@@ -996,6 +1058,18 @@ export async function fightFreshBattle(
     }
 
     if (!targetParticipant && target) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, target);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && (coop.target.id !== target.id || coop.target.name !== target.name)) {
+        target = coop.target;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        await ctx.sleep(300);
+        continue;
+      }
+
       const better = pickRealBattleTarget(status, status.your_side_id);
       if (better && better.name !== target.name) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target left the battle)`);
@@ -1644,7 +1718,40 @@ export async function fightJoinedBattle(
       p => currentTarget && (p.player_id === currentTarget.id || p.username === currentTarget.name)
     );
 
+    if (targetParticipant && currentTarget && !targetParticipant.is_destroyed) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
+        const newTarget = coop.target;
+        currentTarget = newTarget;
+        await bot.exec("battle", { action: "target", target_id: newTarget.id });
+        targetParticipant = status.participants.find(
+          p => p.player_id === newTarget.id || p.username === newTarget.name
+        );
+        await ctx.sleep(300);
+      }
+    }
+
     if (!targetParticipant) {
+      const coop = await cooperateWithBoardingClaim(ctx, status, currentTarget);
+      if (coop.brace) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      if (coop.target && currentTarget && (coop.target.id !== currentTarget.id || coop.target.name !== currentTarget.name)) {
+        const newTarget = coop.target;
+        currentTarget = newTarget;
+        await bot.exec("battle", { action: "target", target_id: newTarget.id });
+        await ctx.sleep(300);
+        targetParticipant = status.participants.find(
+          p => p.player_id === newTarget.id || p.username === newTarget.name
+        );
+        continue;
+      }
+
       const better = pickRealBattleTarget(status, status.your_side_id);
       if (better && (!currentTarget || better.id !== currentTarget.id)) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target invalid or left the battle)`);

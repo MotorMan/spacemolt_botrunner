@@ -1946,6 +1946,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
     const marketSource = await resolveMarketSource();
     ctx.log("trade", `[MarketSource] mode=${marketSource.mode} label=${marketSource.label} reason=${marketSource.reason}`);
+    ctx.log("trade", `[MarketQuery] uniqueItems=[${uniqueItems.slice(0,20).join(", ")}]`);
     if (uniqueItems.length > 0 && marketSource.mode === "none") {
       ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
     } else if (uniqueItems.length > 0) {

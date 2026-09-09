@@ -465,6 +465,7 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
 
   const idx = await getIndex();
   const live = overlay.get(itemId);
+  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} idx=${idx ? "yes" : "no"} live=${live ? "yes" : "no"} idxEntries=${idx?.byItem.get(itemId)?.length ?? 0}`);
   if (!idx && (!live || live.size === 0)) {
     const why = lastLoadError
       ? `local market file unreadable: ${lastLoadError}`
@@ -513,10 +514,12 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
   }
 
   results.sort((a, b) => (tradeType === "sell" ? b.price - a.price : a.price - b.price));
-  return {
+  const ret: MarketQueryResult = {
     ok: results.length > 0,
     results: results.slice(0, 10),
     error: results.length === 0 ? "No matching orders found" : undefined,
     source: "local",
   };
+  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} returned=${ret.ok} count=${ret.results.length} first=${ret.results[0] ? `${ret.results[0].stationName}/${ret.results[0].itemName}@${ret.results[0].price}` : "none"}`);
+  return ret;
 }

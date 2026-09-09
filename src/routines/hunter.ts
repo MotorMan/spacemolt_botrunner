@@ -4360,13 +4360,21 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   // Deposit any extra loot so user can see what was brought home.
   // When disableResupply is enabled, deposit EVERYTHING so the bot undocks
   // with an empty cargo hold (suicide / no-return runs).
+  // Build a set of all known ammo item IDs from the catalog so we never
+  // accidentally deposit ammo during the loot-cleanup phase below.
+  const allAmmoIds = new Set<string>();
+  const ammoIndex = catalogStore.getAmmoTypeIndex();
+  for (const ids of Object.values(ammoIndex)) {
+    for (const id of ids) allAmmoIds.add(id.toLowerCase());
+  }
+
   for (const item of [...bot.inventory]) {
     if (item.quantity <= 0) continue;
 
     if (!hs.disableResupply) {
       const id = item.itemId.toLowerCase();
       const isProtected =
-        id.includes("ammo") ||
+        allAmmoIds.has(id) ||
         id.includes("cell_pack") ||
         id.includes("plasma") ||
         id.includes("fuel_cell") ||
@@ -5423,7 +5431,7 @@ export async function boardingSubroutine(
                    ctx.log("combat", "🛸 Boarding: transition already queued — switching to passive monitoring");
                    boardingActive = true;
                    boardStanceIssued = true;
-                 } else {
+    } else {
                    ctx.log("combat", `⚠️ Boarding: failed to issue board stance — ${boardRespName.error.message} (${boardResp.error.message}) — switching to fire to finish`);
                    await bot.exec("battle", { action: "stance", stance: "fire" });
                    boardingActive = false;
@@ -5568,12 +5576,13 @@ export async function boardingSubroutine(
               target_id: target.id,
               marines: marines,
             });
-            if (retryBoard.error) {
-              const msg = retryBoard.error.message.toLowerCase();
-              if (msg.includes("not in battle") || msg.includes("no active battle")) {
-                ctx.log("combat", "✅ Boarding: battle ended during board retry");
-                return "target_eliminated";
-              }
+              if (retryBoard.error) {
+                const msg = retryBoard.error.message.toLowerCase();
+                if (msg.includes("not in battle") || msg.includes("no active battle")) {
+                  ctx.log("combat", "✅ Boarding: battle ended during board retry");
+                  await recloakAfterBattle(ctx, cloakOnStart);
+                  return "target_eliminated";
+                }
               if (msg.includes("already") || msg.includes("queued")) {
                 ctx.log("combat", `🛸 Boarding: board stance already queued — monitoring without further retries`);
                 boardingActive = true;
@@ -5609,11 +5618,12 @@ export async function boardingSubroutine(
       }
 
       await ctx.sleep(BOARD_TICK_MS);
-    }
+   }
   }
 
-  return "failed";
-}
+    await recloakAfterBattle(ctx, cloakOnStart);
+    return "failed";
+  }
 
 /**
  * Update the captured prize tracker with the actual prize data from get_nearby.
@@ -6631,6 +6641,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
+            await recloakAfterBattle(ctx, settings.cloakOnStart);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -6942,6 +6953,7 @@ async function* boardingSystemPass(
               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
+              await recloakAfterBattle(ctx, settings.cloakOnStart);
 
               yield "safety_check";
               const postKillResp = await bot.exec("get_nearby");
@@ -7059,8 +7071,10 @@ async function* boardingSystemPass(
      i.itemId.toLowerCase() === 'military_fuel_cell'
    );
    const needsFuel = postFuel < (settings.refuelThreshold ?? 20) && !hasFuelCells;
+   const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+   const needsAmmo = !hasAmmo && !settings.meatShield;
 
-    if (needsRepair || needsFuel) {
+    if (needsRepair || needsFuel || needsAmmo) {
       // When fuel is low and a home base is configured, go directly home so the
       // hunter returns to the correct faction storage / station instead of a
       // random bypass station.
@@ -7103,7 +7117,8 @@ async function* boardingSystemPass(
           }
         }
       } else {
-        ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — returning to safe system...`);
+        const reason = needsAmmo ? `ammo depleted` : (needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`);
+        ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — ${reason}, returning to safe system...`);
         yield "dock";
         const docked = await navigateToSafeStation(ctx, safetyOpts);
         if (!docked) {
@@ -7119,28 +7134,28 @@ async function* boardingSystemPass(
       yield "ensure_insured";
       await ensureInsured(ctx);
       yield "refuel";
-    await tryRefuel(ctx, { skipApprovedCheck: true });
-    yield "repair";
-    await repairShip(ctx);
-    yield "reload";
-    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-    yield "fit_mods";
-    const modProfile = getModProfile("hunter");
-    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-    yield "check_skills";
-    await bot.checkSkills();
+      await tryRefuel(ctx, { skipApprovedCheck: true });
+      yield "repair";
+      await repairShip(ctx);
+      yield "reload";
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+      yield "fit_mods";
+      const modProfile = getModProfile("hunter");
+      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+      yield "check_skills";
+      await bot.checkSkills();
 
-    if (settings.singleLoop) {
-      const hs = settings.homeStation || "";
-      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
-      if (hsys && hpoi) {
-        await navigateToSystem(ctx, hsys, safetyOpts);
-        const t = await bot.exec("travel", { target_poi: hpoi });
-        if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
-      } else {
-        await navigateToSafeStation(ctx, safetyOpts);
-      }
-      await ensureHunterResupply(ctx);
+      if (settings.singleLoop) {
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await navigateToSystem(ctx, hsys, safetyOpts);
+          const t = await bot.exec("travel", { target_poi: hpoi });
+          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+        } else {
+          await navigateToSafeStation(ctx, safetyOpts);
+        }
+        await ensureHunterResupply(ctx);
     }
   } else {
     ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);

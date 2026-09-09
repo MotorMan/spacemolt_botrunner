@@ -2587,7 +2587,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           }
           if (!errMsg.includes("already")) {
             // Check if it's a mobile station that moved
-            if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+            const isMobileCapitalDest = settings.destinationStation === "mobile_capital" || settings.destinationStation.includes("mobile_capital");
+            if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
               ctx.log("cargo", "Mobile capital not found at expected location during recovery, querying current system...");
               const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
               if (currentSystem) {
@@ -3415,7 +3416,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         }
         if (!errMsg.includes("already")) {
           // Check if mobile capital moved and we got location info
-          if (settings.destinationStation === "mobile_capital" && errMsg.includes("jump to") && errMsg.includes("to find it")) {
+          const isMobileCapitalDest = settings.destinationStation === "mobile_capital" || settings.destinationStation.includes("mobile_capital");
+          if (isMobileCapitalDest && errMsg.includes("jump to") && errMsg.includes("to find it")) {
             // Parse the error message like "Jump to First Step to find it."
             const match = tResp.error.message.match(/jump to (.+?) to find it/i);
             if (match) {
@@ -3485,7 +3487,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             }
           }
           // Check if it's a mobile station that moved (fallback for other cases)
-          else if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+          else if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
             ctx.log("cargo", "Mobile capital not found at expected location, querying current system...");
             const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
             if (currentSystem) {

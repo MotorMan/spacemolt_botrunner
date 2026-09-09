@@ -1937,48 +1937,46 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // (or no remote client is reachable) — straight from the local
     // data/marketDetails.json. Each buy order found becomes an extra buyer.
     let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
-    if (settings.useRemoteMarketQuery !== false) {
-      const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
-      // When recovering a loaded hold the storage list is irrelevant — the
-      // items that need a buyer are the ones already in cargo. map.json can be
-       // minutes behind the real market (and is still syncing right after a
-       // restart), which is exactly how a full hold ends up "no buyers found".
-       const cargoItems = pendingCargoRecovery ? pendingCargo.map(i => i.itemId) : [];
-       const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
-        const marketSource = await resolveMarketSource();
-        ctx.log("trade", `[MarketSource] mode=${marketSource.mode} label=${marketSource.label} reason=${marketSource.reason}`);
-       if (uniqueItems.length > 0 && marketSource.mode === "none") {
-         ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
-       } else if (uniqueItems.length > 0) {
-         const results = await Promise.all(uniqueItems.map(async (itemId) => {
-           try {
-             const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
-             if (!res.ok || res.results.length === 0) return null;
-             return res.results.map(r => ({
-               itemId,
-               itemName: itemId,
-               systemId: r.systemId,
-               poiId: r.stationPoiId,
-               poiName: r.stationName,
-               price: r.price,
-               quantity: r.quantity,
-             }));
-           } catch {
-             return null;
-           }
-         }));
-          remoteBuyDemand = results.filter(Boolean).flat() as typeof remoteBuyDemand;
-          const src = getMarketSourceInfo();
-          const origin = src.mode === "local" ? "local market data" : "connected clients";
-          ctx.log("trade", `[MarketQuery] queried ${uniqueItems.length} items, got ${remoteBuyDemand.length} buyers: ${remoteBuyDemand.slice(0,5).map(r => `${r.itemId}@${r.price}`).join(", ")}`);
-          if (remoteBuyDemand.length > 0) {
-            ctx.log("trade", `[${src.label}] Faction trader: found ${remoteBuyDemand.length} buyer(s) from ${origin}`);
-          } else {
-            ctx.log("trade", `[${src.label}] Faction trader: no buyers in ${origin} for ${uniqueItems.length} item(s)`);
-          }
-           ctx.log("trade", `[Routes] storageItems=${storageItems.length} cargoItems=${cargoItems.length} uniqueItems=${uniqueItems.length} remoteBuyDemand=${remoteBuyDemand.length}`);
+    const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
+    // When recovering a loaded hold the storage list is irrelevant — the
+    // items that need a buyer are the ones already in cargo. map.json can be
+    // minutes behind the real market (and is still syncing right after a
+    // restart), which is exactly how a full hold ends up "no buyers found".
+    const cargoItems = pendingCargoRecovery ? pendingCargo.map(i => i.itemId) : [];
+    const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
+    const marketSource = await resolveMarketSource();
+    ctx.log("trade", `[MarketSource] mode=${marketSource.mode} label=${marketSource.label} reason=${marketSource.reason}`);
+    if (uniqueItems.length > 0 && marketSource.mode === "none") {
+      ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
+    } else if (uniqueItems.length > 0) {
+      const results = await Promise.all(uniqueItems.map(async (itemId) => {
+        try {
+          const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
+          if (!res.ok || res.results.length === 0) return null;
+          return res.results.map(r => ({
+            itemId,
+            itemName: itemId,
+            systemId: r.systemId,
+            poiId: r.stationPoiId,
+            poiName: r.stationName,
+            price: r.price,
+            quantity: r.quantity,
+          }));
+        } catch {
+          return null;
         }
+      }));
+      remoteBuyDemand = results.filter(Boolean).flat() as typeof remoteBuyDemand;
+      const src = getMarketSourceInfo();
+      const origin = src.mode === "local" ? "local market data" : "connected clients";
+      ctx.log("trade", `[MarketQuery] queried ${uniqueItems.length} items, got ${remoteBuyDemand.length} buyers: ${remoteBuyDemand.slice(0,5).map(r => `${r.itemId}@${r.price}`).join(", ")}`);
+      if (remoteBuyDemand.length > 0) {
+        ctx.log("trade", `[${src.label}] Faction trader: found ${remoteBuyDemand.length} buyer(s) from ${origin}`);
+      } else {
+        ctx.log("trade", `[${src.label}] Faction trader: no buyers in ${origin} for ${uniqueItems.length} item(s)`);
+      }
     }
+    ctx.log("trade", `[Routes] storageItems=${storageItems.length} cargoItems=${cargoItems.length} uniqueItems=${uniqueItems.length} remoteBuyDemand=${remoteBuyDemand.length}`);
 
     // A hold that still contains goods always outranks a new trade: withdrawing
     // more items at a station we only stopped at by accident either overfills

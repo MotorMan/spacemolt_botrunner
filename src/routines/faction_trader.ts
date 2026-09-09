@@ -1231,6 +1231,10 @@ async function findFactionSellRoutes(
 
     const buyers = allBuys.filter(b => b.itemId === item.itemId && b.price > 0);
 
+    if (buyers.length === 0 && allBuys.length > 0) {
+      ctx.log("trade", `DEBUG: no buyers match itemId="${item.itemId}" (source=${source}) among ${allBuys.length} candidates: first 5 itemIds=[${allBuys.slice(0,5).map(b=>b.itemId).join(", ")}]`);
+    }
+
     if (buyers.length === 0) {
       ctx.log("trade", `No buyers for ${item.name} - skipping`);
       continue;

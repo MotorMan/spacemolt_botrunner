@@ -1945,7 +1945,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
        // restart), which is exactly how a full hold ends up "no buyers found".
        const cargoItems = pendingCargoRecovery ? pendingCargo.map(i => i.itemId) : [];
        const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
-       const marketSource = await resolveMarketSource();
+        const marketSource = await resolveMarketSource();
+        ctx.log("trade", `[MarketSource] mode=${marketSource.mode} label=${marketSource.label} reason=${marketSource.reason}`);
        if (uniqueItems.length > 0 && marketSource.mode === "none") {
          ctx.log("trade", `[Market] Faction trader: no market data source — ${marketSource.reason}`);
        } else if (uniqueItems.length > 0) {
@@ -1966,15 +1967,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
              return null;
            }
          }));
-         remoteBuyDemand = results.filter(Boolean).flat() as typeof remoteBuyDemand;
-         const src = getMarketSourceInfo();
-         const origin = src.mode === "local" ? "local market data" : "connected clients";
-         if (remoteBuyDemand.length > 0) {
-           ctx.log("trade", `[${src.label}] Faction trader: found ${remoteBuyDemand.length} buyer(s) from ${origin}`);
-         } else {
-           ctx.log("trade", `[${src.label}] Faction trader: no buyers in ${origin} for ${uniqueItems.length} item(s)`);
-         }
-       }
+          remoteBuyDemand = results.filter(Boolean).flat() as typeof remoteBuyDemand;
+          const src = getMarketSourceInfo();
+          const origin = src.mode === "local" ? "local market data" : "connected clients";
+          ctx.log("trade", `[MarketQuery] queried ${uniqueItems.length} items, got ${remoteBuyDemand.length} buyers: ${remoteBuyDemand.slice(0,5).map(r => `${r.itemId}@${r.price}`).join(", ")}`);
+          if (remoteBuyDemand.length > 0) {
+            ctx.log("trade", `[${src.label}] Faction trader: found ${remoteBuyDemand.length} buyer(s) from ${origin}`);
+          } else {
+            ctx.log("trade", `[${src.label}] Faction trader: no buyers in ${origin} for ${uniqueItems.length} item(s)`);
+          }
+           ctx.log("trade", `[Routes] storageItems=${storageItems.length} cargoItems=${cargoItems.length} uniqueItems=${uniqueItems.length} remoteBuyDemand=${remoteBuyDemand.length}`);
+        }
     }
 
     // A hold that still contains goods always outranks a new trade: withdrawing

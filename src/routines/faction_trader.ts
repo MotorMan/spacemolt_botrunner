@@ -3074,9 +3074,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             if (jumpNum % 3 !== 0) return true;
             // When returning cargo to origin there is no buyer to validate —
             // skip the "buyer gone" abort check or it would loop forever.
-            if (route!.returningToSource) return true;
-            const marketResp = await bot.exec("view_market", { item_id: route!.itemId });
-            let destBuyer: { quantity: number; price: number } | undefined;
+             if (route!.returningToSource) return true;
+             const marketResp = await bot.exec("view_market", { item_id: route!.itemId, station_id: route!.destPoi });
+             let destBuyer: { quantity: number; price: number } | undefined;
             if (!marketResp.error && marketResp.result) {
               const marketData = marketResp.result as Record<string, unknown>;
               const items = Array.isArray(marketData) ? marketData : Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items as Array<Record<string, unknown>> : [];

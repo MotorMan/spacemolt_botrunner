@@ -66,6 +66,7 @@ import {
   stockAfterburnerConsumables,
 } from "./afterburner.js";
 import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../client_sync_hooks.js";
+import { queryLocalMarket } from "../market_local_source.js";
 import { readSellOutcome, type SellFill } from "./sellOutcome.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -3075,26 +3076,21 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             // When returning cargo to origin there is no buyer to validate —
             // skip the "buyer gone" abort check or it would loop forever.
              if (route!.returningToSource) return true;
-             const marketResp = await bot.exec("view_market", { item_id: route!.itemId, station_id: route!.destPoi });
+             const marketResp = await queryLocalMarket({
+               itemId: route!.itemId,
+               tradeType: "sell",
+               requesterSystemId: bot.system,
+             });
              let destBuyer: { quantity: number; price: number } | undefined;
-            if (!marketResp.error && marketResp.result) {
-              const marketData = marketResp.result as Record<string, unknown>;
-              const items = Array.isArray(marketData) ? marketData : Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items as Array<Record<string, unknown>> : [];
-              const itemMarket = items.find(i => (i.item_id as string) === route!.itemId);
-              if (itemMarket) {
-                const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
-                const raw = buyOrders.find(o => {
-                  const poiId = (o.poi_id as string) || (o.station_poi_id as string) || "";
-                  return poiId === route!.destPoi && ((o.quantity as number) || (o.remaining as number) || 0) > 0;
-                });
-                if (raw) {
-                  destBuyer = {
-                    quantity: (raw.quantity as number) || (raw.remaining as number) || 0,
-                    price: (raw.price_each as number) || (raw.price as number) || 0,
-                  };
-                }
-              }
-            }
+             if (marketResp.ok && marketResp.results.length > 0) {
+               const destResult = marketResp.results.find(r => r.stationPoiId === route!.destPoi && r.quantity > 0);
+               if (destResult) {
+                 destBuyer = {
+                   quantity: destResult.quantity,
+                   price: destResult.price,
+                 };
+               }
+             }
             if (!destBuyer || destBuyer.quantity <= 0) {
               ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer gone at ${route!.destPoiName} — aborting`);
               // Flip this run to return-to-origin right now so we head home with

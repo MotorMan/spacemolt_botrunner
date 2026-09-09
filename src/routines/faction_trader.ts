@@ -24,6 +24,7 @@ import {
   logFactionActivity,
   detectAndRecoverFromDeath,
   maxItemsForCargo,
+  getItemSize,
   readSettings,
   writeSettings,
   isPirateSystem,
@@ -148,6 +149,8 @@ function getFactionTraderSettings(username?: string): {
   afterburnerMinFuelCells: number;
   afterburnerMinJumps: number;
   afterburnerMinFillRatio: number;
+  carryFuelCells: boolean;
+  carryFuelCellCount: number;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -221,6 +224,8 @@ function getFactionTraderSettings(username?: string): {
       (t.afterburnerMinJumps as number) ?? DEFAULT_AFTERBURNER_MIN_JUMPS,
     afterburnerMinFillRatio:
       (t.afterburnerMinFillRatio as number) ?? DEFAULT_AFTERBURNER_MIN_FILL_RATIO,
+    carryFuelCells: (t.carryFuelCells as boolean) ?? false,
+    carryFuelCellCount: (t.carryFuelCellCount as number) ?? 5,
   };
 }
 
@@ -2911,6 +2916,43 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
           await bot.refreshCargo();
           await bot.refreshStatus();
+        }
+
+        // ── Load additional fuel cells for trip reserve ──
+        // Runs for all trips; afterburner consumables are already stocked above.
+        // Only fills up to carryFuelCellCount, preferring MFC > premium > regular.
+        if (settings.carryFuelCells && settings.carryFuelCellCount > 0) {
+          await bot.refreshCargo();
+          const currentCells = bot.inventory
+            .filter(i => {
+              const lower = i.itemId.toLowerCase();
+              return lower === "military_fuel_cell" || lower === "premium_fuel_cell" || lower === "fuel_cell";
+            })
+            .reduce((sum, i) => sum + i.quantity, 0);
+          if (currentCells < settings.carryFuelCellCount) {
+            let need = settings.carryFuelCellCount - currentCells;
+            const milSize = getItemSize("military_fuel_cell") || 3;
+            const premSize = getItemSize("premium_fuel_cell") || 2;
+            const regSize = getItemSize("fuel_cell") || 1;
+            for (const [itemId, size, label] of [
+              ["military_fuel_cell", milSize, "military_fuel_cell"],
+              ["premium_fuel_cell", premSize, "premium_fuel_cell"],
+              ["fuel_cell", regSize, "fuel_cell"],
+            ] as [string, number, string][]) {
+              if (need <= 0) break;
+              const inStorage = bot.factionStorage.find(i => i.itemId === itemId)?.quantity || 0;
+              if (inStorage <= 0) continue;
+              const freeSpace = getFreeSpace(bot);
+              const canTake = Math.min(need, inStorage, Math.floor(freeSpace / Math.max(1, size)));
+              if (canTake <= 0) continue;
+              const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: itemId, quantity: canTake });
+              if (!wResp.error) {
+                ctx.log("trade", `Withdrew ${canTake}x ${label} for trip fuel reserve`);
+                need -= canTake;
+                await bot.refreshCargo();
+              }
+            }
+          }
         }
 
         const freeSpace = getFreeSpace(bot);

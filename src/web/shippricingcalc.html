@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ship Pricing Calc - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .spc-layout { flex:1; min-height:0; display:flex; flex-direction:column; gap:12px; }
+    .spc-header { display:flex; align-items:center; gap:12px; flex-wrap:wrap; flex-shrink:0; }
+    .spc-header h3 { margin:0; color:var(--text-bright); }
+    .spc-controls { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .spc-controls label { font-size:12px; color:var(--text-dim); }
+    .spc-controls select, .spc-controls input { padding:6px 10px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:12px; }
+    .spc-content { flex:1; min-height:0; overflow:auto; }
+    .spc-ship { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; margin-bottom:8px; overflow:hidden; }
+    .spc-ship-head { padding:10px 12px; cursor:pointer; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .spc-ship-head:hover { background:var(--bg-row-hover); }
+    .spc-ship-name { font-weight:600; color:var(--text-bright); flex:1; min-width:140px; }
+    .spc-ship-class { font-size:11px; color:var(--text-dim); }
+    .spc-ship-total { font-size:14px; font-weight:700; color:var(--green); font-family:monospace; }
+    .spc-ship-body { display:none; padding:0 12px 12px 12px; border-top:1px solid var(--border); }
+    .spc-ship.expanded .spc-ship-body { display:block; }
+    .spc-section { margin-top:10px; }
+    .spc-section-title { font-size:11px; font-weight:600; color:var(--text-dim); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px; }
+    .spc-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .spc-table th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--border); color:var(--text-dim); font-weight:600; }
+    .spc-table td { padding:4px 8px; border-bottom:1px solid #21262d; }
+    .spc-table tr:last-child td { border-bottom:none; }
+    .spc-price { font-family:monospace; text-align:right; }
+    .spc-cost { font-family:monospace; text-align:right; color:var(--yellow); }
+    .spc-total { font-family:monospace; text-align:right; font-weight:700; color:var(--green); }
+    .spc-badge { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:600; }
+    .spc-badge-market { background:#0d2818; color:var(--green); }
+    .spc-badge-base { background:#2d1b00; color:var(--yellow); }
+    .spc-badge-missing { background:#2d0000; color:var(--red); }
+    .spc-empty { text-align:center; padding:40px; color:var(--text-dim); }
+    .spc-bar { display:flex; gap:12px; align-items:center; padding:8px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; flex-shrink:0; flex-wrap:wrap; }
+    .spc-stat { font-size:12px; color:var(--text-dim); }
+    .spc-stat b { color:var(--text-bright); }
+  </style>
+</head>
+<body>
+  <div class="spc-layout">
+    <div class="spc-header">
+      <h3>Ship Pricing Calc</h3>
+      <div class="spc-controls">
+        <label>Bot:</label>
+        <select id="botSelect"><option value="">Select bot...</option></select>
+        <button class="primary" onclick="fetchShips()">Fetch Ships</button>
+      </div>
+    </div>
+    <div class="spc-bar" id="spcBar">
+      <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">2.42</b>x</span>
+      <input type="number" id="multiplier" value="2.42" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('multiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
+      <span class="spc-stat" id="spcStats"></span>
+    </div>
+    <div class="spc-content" id="spcContent">
+      <div class="spc-empty">Select a bot and click Fetch Ships to begin.</div>
+    </div>
+  </div>
+
+  <script>
+    let catalog = { ships: {}, items: {}, recipes: {} };
+    let marketIndex = new Map();
+    let shipPricingData = [];
+    let multiplier = 2.42;
+
+    async function loadCatalog() {
+      try {
+        const res = await fetch('/data/catalog.json');
+        catalog = await res.json();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+      }
+    }
+
+    async function loadMarketData() {
+      try {
+        const res = await fetch('/data/marketDetails.json');
+        const data = await res.json();
+        marketIndex.clear();
+        for (const entry of (data.items || [])) {
+          const key = (entry.itemId || '').toLowerCase();
+          if (!marketIndex.has(key)) marketIndex.set(key, []);
+          marketIndex.get(key).push(entry);
+        }
+      } catch (e) {
+        console.error('Failed to load market data:', e);
+      }
+    }
+
+    async function populateBotSelect() {
+      const sel = document.getElementById('botSelect');
+      try {
+        const res = await fetch('/api/bots');
+        const bots = await res.json();
+        sel.innerHTML = '<option value="">Select bot...</option>' +
+          bots.map(b => `<option value="${b.username}">${b.username}</option>`).join('');
+      } catch (e) {
+        console.error('Failed to load bots:', e);
+      }
+    }
+
+    async function fetchShips() {
+      const bot = document.getElementById('botSelect').value;
+      if (!bot) return alert('Select a bot first');
+      const content = document.getElementById('spcContent');
+      content.innerHTML = '<div class="spc-empty">Fetching ship list...</div>';
+      try {
+        const res = await fetch('/api/ship-pricing/list-ships', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error || 'Failed');
+        const shipsRaw = json.data;
+        let ships = [];
+        if (shipsRaw && Array.isArray(shipsRaw.ships)) ships = shipsRaw.ships;
+        else if (Array.isArray(shipsRaw)) ships = shipsRaw;
+        else if (shipsRaw && typeof shipsRaw === 'object') ships = [shipsRaw];
+        if (ships.length === 0) {
+          content.innerHTML = '<div class="spc-empty">No ships found.</div>';
+          return;
+        }
+        await loadCatalog();
+        await loadMarketData();
+        multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
+        shipPricingData = [];
+        for (const s of ships) {
+          const shipId = s.id || s.ship_id || '';
+          const shipInfo = await fetchShipDetails(bot, shipId);
+          const pricing = computeShipPricing(shipInfo);
+          shipPricingData.push({ ship: s, shipInfo, pricing });
+        }
+        renderPricing();
+        document.getElementById('spcStats').textContent = `${shipPricingData.length} ships priced`;
+      } catch (e) {
+        content.innerHTML = `<div class="spc-empty">Error: ${e.message}</div>`;
+      }
+    }
+
+    async function fetchShipDetails(bot, shipId) {
+      try {
+        const res = await fetch('/api/ship-pricing/get-ship', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot, ship_id: shipId })
+        });
+        const json = await res.json();
+        if (json.ok && json.data) return json.data;
+      } catch (e) {
+        console.error('get_ship failed for', shipId, e);
+      }
+      return null;
+    }
+
+    function getMarketPrice(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const entries = marketIndex.get(key);
+      if (!entries || entries.length === 0) return null;
+      let bestSell = null;
+      let bestBuy = null;
+      for (const entry of entries) {
+        for (const o of (entry.sellOrders || [])) {
+          if (!bestSell || o.price < bestSell.price) bestSell = { price: o.price, qty: o.quantity, station: entry.stationName };
+        }
+        for (const o of (entry.buyOrders || [])) {
+          if (!bestBuy || o.price > bestBuy.price) bestBuy = { price: o.price, qty: o.quantity, station: entry.stationName };
+        }
+      }
+      return { bestSell, bestBuy };
+    }
+
+    function resolveItemPrice(itemId, baseValue) {
+      const mp = getMarketPrice(itemId);
+      if (mp && mp.bestSell) {
+        return { price: mp.bestSell.price, source: 'market', detail: `lowest sell ${mp.bestSell.price.toLocaleString()}cr (${mp.bestSell.qty}x @ ${mp.bestSell.station})` };
+      }
+      if (mp && mp.bestBuy) {
+        return { price: mp.bestBuy.price, source: 'market', detail: `highest buy ${mp.bestBuy.price.toLocaleString()}cr (${mp.bestBuy.qty}x @ ${mp.bestBuy.station})` };
+      }
+      const fallback = Math.floor((baseValue || 0) * multiplier);
+      return { price: fallback, source: 'base', detail: `no market data → base ${baseValue} × ${multiplier}` };
+    }
+
+    function computeRecipeCost(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const recipes = Object.values(catalog.recipes || {});
+      const recipe = recipes.find(r => {
+        const outputs = r.outputs || [];
+        return outputs.some(o => (o.item_id || '').toLowerCase() === key);
+      });
+      if (!recipe) return null;
+      let total = 0;
+      let lines = [];
+      for (const inp of (recipe.inputs || [])) {
+        const itemEntry = catalog.items[inp.item_id] || {};
+        const baseVal = itemEntry.base_value || 0;
+        const rp = resolveItemPrice(inp.item_id, baseVal);
+        const cost = rp.price * (inp.quantity || 1);
+        total += cost;
+        lines.push({ itemId: inp.item_id, qty: inp.quantity || 1, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
+      }
+      return { total, lines, recipeId: recipe.id };
+    }
+
+    function computeShipPricing(shipData) {
+      const result = { hull: { cost: 0, lines: [] }, modules: [], total: 0 };
+      if (!shipData) return result;
+      const ship = (shipData.ship && typeof shipData.ship === 'object') ? shipData.ship : shipData;
+      const shipId = (ship.id || '').toLowerCase();
+      const shipEntry = catalog.ships[shipId] || null;
+      const baseHull = ship.base_hull || ship.max_hull || 0;
+
+      if (shipEntry && Array.isArray(shipEntry.build_materials)) {
+        let hullCost = 0;
+        for (const mat of shipEntry.build_materials) {
+          const itemId = mat.item_id;
+          const qty = mat.quantity || 1;
+          const itemEntry = catalog.items[itemId] || {};
+          const baseVal = itemEntry.base_value || 0;
+          const rp = resolveItemPrice(itemId, baseVal);
+          const cost = rp.price * qty;
+          hullCost += cost;
+          result.hull.lines.push({ itemId, qty, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
+        }
+        result.hull.cost = hullCost;
+      } else {
+        result.hull.cost = 0;
+        result.hull.lines.push({ itemId: 'unknown', qty: 1, unitPrice: 0, cost: 0, source: 'missing', detail: 'no build_materials in catalog' });
+      }
+
+      const modules = [];
+      if (Array.isArray(shipData.modules)) {
+        for (const mod of shipData.modules) {
+          const modTypeId = (mod.type_id || mod.module_id || mod.item_id || mod.id || '').toLowerCase();
+          const modEntry = catalog.items[modTypeId] || {};
+          const modBase = modEntry.base_value || 0;
+          const mp = getMarketPrice(modTypeId);
+          let cost, source, detail;
+          let recipeCost = null;
+          if (mp && mp.bestSell) {
+            cost = mp.bestSell.price;
+            source = 'market';
+            detail = `lowest sell ${mp.bestSell.price.toLocaleString()}cr (${mp.bestSell.qty}x @ ${mp.bestSell.station})`;
+          } else if (mp && mp.bestBuy) {
+            cost = mp.bestBuy.price;
+            source = 'market';
+            detail = `highest buy ${mp.bestBuy.price.toLocaleString()}cr (${mp.bestBuy.qty}x @ ${mp.bestBuy.station})`;
+          } else {
+            recipeCost = computeRecipeCost(modTypeId);
+            if (recipeCost) {
+              cost = recipeCost.total;
+              source = 'recipe';
+              detail = `recipe ${recipeCost.recipeId} materials`;
+            } else {
+              cost = Math.floor(modBase * multiplier);
+              source = 'base';
+              detail = `no market/recipe data → base ${modBase} × ${multiplier}`;
+            }
+          }
+          result.modules.push({ mod, modTypeId, cost, source, detail, recipeLines: recipeCost ? recipeCost.lines : [] });
+          result.total += cost;
+        }
+      }
+      result.total += result.hull.cost;
+      return result;
+    }
+
+    function renderPricing() {
+      const content = document.getElementById('spcContent');
+      if (shipPricingData.length === 0) {
+        content.innerHTML = '<div class="spc-empty">No pricing data.</div>';
+        return;
+      }
+      let html = '';
+      for (const sp of shipPricingData) {
+        const name = sp.ship.name || sp.ship.ship_name || sp.ship.id || 'Unknown';
+        const cls = sp.ship.ship_class || sp.shipInfo?.ship?.ship_class || '';
+        html += `<div class="spc-ship" onclick="this.classList.toggle('expanded')">
+          <div class="spc-ship-head">
+            <span class="spc-ship-name">${esc(name)}</span>
+            <span class="spc-ship-class">${esc(cls)}</span>
+            <span class="spc-ship-total">${sp.pricing.total.toLocaleString()} cr</span>
+          </div>
+          <div class="spc-ship-body">
+            <div class="spc-section">
+              <div class="spc-section-title">Hull Build Materials</div>
+              <table class="spc-table">
+                <thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead>
+                <tbody>
+                  ${sp.pricing.hull.lines.map(l => `<tr>
+                    <td>${esc(l.itemId)}</td>
+                    <td style="text-align:right">${l.qty}</td>
+                    <td class="spc-price">${l.unitPrice.toLocaleString()}</td>
+                    <td class="spc-cost">${l.cost.toLocaleString()}</td>
+                    <td><span class="spc-badge spc-badge-${l.source==='market'?'market':l.source==='base'?'base':'missing'}">${l.source}</span></td>
+                    <td style="font-size:10px;color:var(--text-dim)">${esc(l.detail)}</td>
+                  </tr>`).join('')}
+                </tbody>
+                <tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Hull Total</td><td class="spc-total">${sp.pricing.hull.cost.toLocaleString()}</td><td colspan="2"></td></tr></tfoot>
+              </table>
+            </div>
+            <div class="spc-section">
+              <div class="spc-section-title">Modules</div>
+              ${sp.pricing.modules.length === 0 ? '<div style="color:var(--text-dim);font-size:12px">No modules detected</div>' : `
+              <table class="spc-table">
+                <thead><tr><th>Module</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead>
+                <tbody>
+                  ${sp.pricing.modules.map(m => `<tr>
+                    <td>${esc(m.modTypeId)}</td>
+                    <td class="spc-cost">${m.cost.toLocaleString()}</td>
+                    <td><span class="spc-badge spc-badge-${m.source==='market'?'market':m.source==='recipe'?'base':m.source==='base'?'base':'missing'}">${m.source}</span></td>
+                    <td style="font-size:10px;color:var(--text-dim)">${esc(m.detail)}</td>
+                  </tr>`).join('')}
+                </tbody>
+              </table>
+              ${sp.pricing.modules.filter(m => m.source === 'recipe' && m.recipeLines && m.recipeLines.length > 0).length > 0 ? `
+              <div style="margin-top:8px">
+                <div class="spc-section-title">Module Recipe Materials</div>
+                ${sp.pricing.modules.filter(m => m.source === 'recipe').map(m => `
+                  <table class="spc-table" style="margin-bottom:6px">
+                    <thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th></tr></thead>
+                    <tbody>
+                      ${m.recipeLines.map(l => `<tr>
+                        <td>${esc(l.itemId)}</td>
+                        <td style="text-align:right">${l.qty}</td>
+                        <td class="spc-price">${l.unitPrice.toLocaleString()}</td>
+                        <td class="spc-cost">${l.cost.toLocaleString()}</td>
+                        <td><span class="spc-badge spc-badge-${l.source==='market'?'market':'base'}">${l.source}</span></td>
+                      </tr>`).join('')}
+                    </tbody>
+                    <tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Recipe Total</td><td class="spc-total">${m.cost.toLocaleString()}</td><td></td></tr></tfoot>
+                  </table>
+                `).join('')}
+              </div>` : ''}
+            </div>
+          </div>
+        </div>`;
+      }
+      content.innerHTML = html;
+    }
+
+    function esc(s) {
+      if (s == null) return '';
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    populateBotSelect();
+  </script>
+</body>
+</html>

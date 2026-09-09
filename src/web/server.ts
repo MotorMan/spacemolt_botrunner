@@ -2629,6 +2629,48 @@ if (!this.settings.fuel_service) {
             return Response.json({ ok: true, coordination, inTransit });
           }
 
+          // ── Ship Pricing Calc ──────────────────────────────────
+          if (url.pathname === "/api/ship-pricing/list-ships" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const result = await botInstance.exec("list_ships");
+              if (result.error) {
+                return Response.json({ error: result.error.message || "list_ships failed", data: result.result }, { status: 500 });
+              }
+              return Response.json({ ok: true, data: result.result });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
+          if (url.pathname === "/api/ship-pricing/get-ship" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string; ship_id?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const params: Record<string, unknown> = {};
+              if (body.ship_id) params.ship_id = body.ship_id;
+              const result = await botInstance.exec("get_ship", params);
+              if (result.error) {
+                return Response.json({ error: result.error.message || "get_ship failed", data: result.result }, { status: 500 });
+              }
+              return Response.json({ ok: true, data: result.result });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
+
           // Serve index.css
 
         if (url.pathname === "/index.css") {
@@ -2947,6 +2989,17 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/creatures.html") {
           const creaturesPath = join(import.meta.dir, "creatures.html");
           return new Response(readFileSync(creaturesPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shippricingcalc.html for ship pricing calc iframe
+        if (url.pathname === "/shippricingcalc.html") {
+          const spcPath = join(import.meta.dir, "shippricingcalc.html");
+          return new Response(readFileSync(spcPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

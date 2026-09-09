@@ -821,12 +821,25 @@ export async function engageTarget(
 
 // ── Combat Loops ──────────────────────────────────────────────
 
-/** Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module. */
+/**
+ * Re-cloak after battle if cloakOnStart is enabled and bot has a cloak module.
+ *
+ * ⚠️  CRITICAL FEATURE — DO NOT DISABLE OR MOVE THIS CALL ⚠️
+ *
+ * This function is called immediately after every battle victory/exit path.
+ * Re-cloaking RIGHT AFTER battle is essential for pirate stronghold fights:
+ *   • Keeps the bot hidden from nearby pirates between fights
+ *   • Prevents being targeted while looting/scavenging
+ *   • Required for the cloakOnStart combat protocol
+ *
+ * Any code path that exits a battle MUST call this before doing anything else.
+ * Do not add delays, navigation, or other logic between battle end and re-cloak.
+ */
 export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
   const { bot } = ctx;
   if (!cloakOnStart) return;
   if (bot.isCloaked) return;
-  
+
   const resp = await bot.exec("cloak", { enable: true });
   if (!resp.error) {
     ctx.log("combat", "Re-cloaked after battle victory");

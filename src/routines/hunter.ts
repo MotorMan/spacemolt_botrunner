@@ -267,7 +267,8 @@ async function handleUnexpectedBattle(
         const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
         if (result === "failed") {
           ctx.log("combat", `Boarding failed for ${boardingTarget.name} — switching to fire stance to finish`);
-          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, false, isCreatureName(boardingTarget.name));
+          // ⚠️ CRITICAL: Pass cloakOnStart through — re-cloak must happen immediately after battle
+          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, isCreatureName(boardingTarget.name));
         }
         return;
       }
@@ -277,7 +278,7 @@ async function handleUnexpectedBattle(
   if (fakeTarget) {
     broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, false, fakeTargetIsCreature);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, fakeTargetIsCreature);
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
@@ -678,7 +679,7 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
 const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
     const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, false, fakeTargetIsCreature);
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, fakeTargetIsCreature);
   }
 }
 
@@ -3617,7 +3618,7 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
   if (fakeTarget) {
     broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, false, fakeTargetIsCreature);
+  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, fakeTargetIsCreature);
 }
 
 async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {

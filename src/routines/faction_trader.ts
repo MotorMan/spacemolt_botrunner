@@ -1943,7 +1943,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // minutes behind the real market (and is still syncing right after a
     // restart), which is exactly how a full hold ends up "no buyers found".
     const cargoItems = pendingCargoRecovery ? pendingCargo.map(i => i.itemId) : [];
-    const uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
+    let uniqueItems: string[];
+    if (settings.tradeItems.length > 0) {
+      const tradeItemIds = settings.tradeItems.map(t => t.itemId.toLowerCase());
+      const storageIds = storageItems.map(id => id.toLowerCase());
+      const tradeInStorage = tradeItemIds.filter(id => storageIds.includes(id));
+      const otherItems = storageItems.filter(id => !tradeItemIds.includes(id.toLowerCase()));
+      uniqueItems = Array.from(new Set([...cargoItems, ...tradeInStorage, ...otherItems])).slice(0, 20);
+    } else {
+      uniqueItems = Array.from(new Set([...cargoItems, ...storageItems])).slice(0, 20);
+    }
     const marketSource = await resolveMarketSource();
     ctx.log("trade", `[MarketSource] mode=${marketSource.mode} label=${marketSource.label} reason=${marketSource.reason}`);
     ctx.log("trade", `[MarketQuery] uniqueItems=[${uniqueItems.slice(0,20).join(", ")}]`);

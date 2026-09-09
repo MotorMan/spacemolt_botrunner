@@ -917,6 +917,50 @@ docked = false;
     return roundedTimeout * 1000; // Convert to milliseconds
   }
 
+  triggerEmergencyWarpStabilizer(): void {
+    if (this._ewsFallbackTriggered) return;
+    this._ewsFallbackTriggered = true;
+
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
+    this.actionLog.push(emergencyLine);
+    const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
+    this.actionLog.push(stopLine);
+
+    if (this.onLog) {
+      this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
+      this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
+    } else {
+      console.log(
+        `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+          `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
+      );
+      console.log(
+        `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+          `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
+      );
+    }
+
+    saveStoppedState(this.username, "emergency");
+    saveLastUsedRoutine(this.username, "return_home");
+
+    if (this._state === "running") {
+      this._state = "stopping";
+      this._abortController?.abort();
+    }
+
+    const botName = this.username;
+    setTimeout(() => {
+      void (async () => {
+        const { handleStart, getBot } = await import("./botmanager.js");
+        const bot = getBot(botName);
+        if (!bot) return;
+        if (bot.state === "running") return;
+        await handleStart({ type: "start", bot: botName, routine: "return_home" });
+      })().catch(() => {});
+    }, 4000);
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -926,62 +970,9 @@ docked = false;
     }
 
     // Emergency Warp Stabilizer detection — monitor ALL log lines
-    // Check BEFORE logging to avoid recursion issues
     if (message.includes("Emergency Warp Stabilizer activated")) {
-      // Log the emergency message directly without triggering another detection
-      const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
-      this.actionLog.push(emergencyLine);
-      const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
-      this.actionLog.push(stopLine);
-
-      if (this.onLog) {
-        this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
-        this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
-      } else {
-        console.log(
-          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
-            `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
-        );
-        console.log(
-          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
-            `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
-        );
-      }
-
-      // Mark bot as stopped-by-emergency so it won't auto-restart on mass disconnect
-      saveStoppedState(this.username, "emergency");
-
-      // Reassign the bot's last-used routine to "return_home" so that nothing
-      // can ever automatically re-queue it into the routine it was just pulled
-      // out of (miner/trader/etc.). Emergency-Warp always drops the ship back at
-      // its home base, so return_home will find it already home, confirm dock,
-      // and then idle — keeping it home instead of re-entering the old routine.
-      saveLastUsedRoutine(this.username, "return_home");
-
-      // Stop the routine immediately
-      if (this._state === "running") {
-        this._state = "stopping";
-        this._abortController?.abort();
-      }
-
-      // Once the aborted routine has unwound, explicitly start the return_home
-      // routine so the bot is in a "stay home" state (it is already home). This
-      // runs best-effort: if the bot is already busy with another routine it is
-      // skipped, and the re-assigned last-used routine guarantees that the next
-      // auto-resume / mass-reconnect still lands it on return_home, never the
-      // old routine.
-      const botName = this.username;
-      setTimeout(() => {
-        void (async () => {
-          const { handleStart, getBot } = await import("./botmanager.js");
-          const bot = getBot(botName);
-          if (!bot) return;
-          if (bot.state === "running") return;
-          await handleStart({ type: "start", bot: botName, routine: "return_home" });
-        })().catch(() => {});
-      }, 4000);
-
-      return; // Don't log the original message again, we've already handled it
+      this.triggerEmergencyWarpStabilizer();
+      return;
     }
 
     if (this.onLog) {
@@ -3850,6 +3841,21 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
       const notif = n as Record<string, unknown>;
       const type = notif.type as string | undefined;
       const msgType = notif.msg_type as string | undefined;
+      let data = notif.data as Record<string, unknown> | string | undefined;
+
+      // Emergency Warp Stabilizer detection via server push frames
+      if (type === "ok" && data && typeof data === "object" && (data as Record<string, unknown>).type === "emergency_warp_stabilizer_activated") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
+      if (type === "action_result" && data && typeof data === "object" && (data as Record<string, unknown>).command === "emergency_warp_stabilizer") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
+      if (msgType === "battle_left" && data && typeof data === "object" && (data as Record<string, unknown>).reason === "emergency_warp") {
+        this.triggerEmergencyWarpStabilizer();
+        continue;
+      }
 
       if (isCombatDebugEnabled()) {
         const battleTypes = new Set([
@@ -3864,7 +3870,6 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
 
       // Chat messages - route to AI chat handler and display
       if (msgType === "chat_message") {
-        const data = notif.data as Record<string, unknown> | undefined;
         if (data && typeof data === "object") {
           const channel = (data.channel as string) || "local";
           const sender = (data.sender as string) || "Unknown";
@@ -4088,7 +4093,7 @@ const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
         continue;
       }
 
-      let data = notif.data as Record<string, unknown> | string | undefined;
+      data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {
         try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
       }

@@ -70,6 +70,39 @@ import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../
 import { queryLocalMarket } from "../market_local_source.js";
 import { readSellOutcome, type SellFill } from "./sellOutcome.js";
 
+const MOBILE_STATION_IDS = new Set(["mobile_capitol", "frontier_station"]);
+
+function isMobileStationPoi(poiId: string): boolean {
+  return MOBILE_STATION_IDS.has(poiId.toLowerCase());
+}
+
+async function resolveMobileStation(
+  ctx: RoutineContext,
+  poiId: string,
+  systemId: string,
+  poiName: string,
+): Promise<{ systemId: string; poiId: string; poiName: string } | null> {
+  if (!isMobileStationPoi(poiId)) return { systemId, poiId, poiName };
+
+  ctx.log("trade", `Resolving mobile station ${poiId} via find_route...`);
+  const resp = await ctx.bot.exec("find_route", { target: poiId });
+  if (resp.error || !resp.result) {
+    ctx.log("error", `find_route failed for ${poiId}: ${resp.error?.message || "no result"}`);
+    return null;
+  }
+  const result = resp.result as Record<string, unknown>;
+  const found = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+  if (!found) {
+    ctx.log("error", `find_route: ${poiId} not found`);
+    return null;
+  }
+  const resolvedSystem = (result.target_system as string) || systemId;
+  const resolvedPoi = (result.target_poi as string) || poiId;
+  const resolvedName = (result.target_poi_name as string) || poiName;
+  ctx.log("trade", `Mobile station ${poiId} → ${resolvedSystem}/${resolvedPoi} (${resolvedName})`);
+  return { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName };
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 interface TradeItemConfig {
@@ -1253,16 +1286,19 @@ async function findFactionSellRoutes(
         continue;
       }
 
-      if (!isValidDestination(ctx, buy.systemId, buy.poiId)) {
+      const resolved = await resolveMobileStation(ctx, buy.poiId, buy.systemId, buy.poiName);
+      if (!resolved) continue;
+
+      if (!isValidDestination(ctx, resolved.systemId, resolved.poiId)) {
         continue;
       }
 
-      const reserved = getReservedQuantity(item.itemId, buy.poiId, bot.username);
+      const reserved = getReservedQuantity(item.itemId, resolved.poiId, bot.username);
       const availableDepth = Math.max(0, buy.quantity - reserved);
       if (availableDepth <= 0) continue;
 
-      const toDest = estimateFuelCost(currentSystem, buy.systemId, costPerJump);
-      const returnHome = estimateFuelCost(buy.systemId, homeSystem, costPerJump);
+      const toDest = estimateFuelCost(currentSystem, resolved.systemId, costPerJump);
+      const returnHome = estimateFuelCost(resolved.systemId, homeSystem, costPerJump);
       if (toDest.jumps >= 999) continue;
       const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
       const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
@@ -1280,9 +1316,9 @@ async function findFactionSellRoutes(
         itemId: item.itemId,
         itemName: item.name,
         availableQty: item.quantity,
-        destSystem: buy.systemId,
-        destPoi: buy.poiId,
-        destPoiName: buy.poiName,
+        destSystem: resolved.systemId,
+        destPoi: resolved.poiId,
+        destPoiName: resolved.poiName,
         sellPrice: buy.price,
         sellQty: qty,
         jumps: toDest.jumps,
@@ -1461,6 +1497,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // Recover sessions that are either faction routes OR cargo routes (interrupted trades)
     // Also recover any session that has a valid state (even if flags aren't set correctly)
     if (activeSession) {
+      if (isMobileStationPoi(activeSession.destPoi)) {
+        const resolved = await resolveMobileStation(ctx, activeSession.destPoi, activeSession.destSystem, activeSession.destPoiName);
+        if (resolved) {
+          await updateTradeSession(bot.username, {
+            destSystem: resolved.systemId,
+            destPoi: resolved.poiId,
+            destPoiName: resolved.poiName,
+          });
+          activeSession.destSystem = resolved.systemId;
+          activeSession.destPoi = resolved.poiId;
+          activeSession.destPoiName = resolved.poiName;
+        }
+      }
       const settings = getFactionTraderSettings(bot.username);
       recoveredSession = await recoverFactionTradeSession(ctx, activeSession, settings);
       if (recoveredSession) {
@@ -2062,7 +2111,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // Walk the buyers in price order instead of giving up on the item as
           // soon as the single best buyer turns out to be blacklisted/unknown.
           // Capped so a run of rejects can't spam the log with red errors.
-          const bestBuyer = buyers.slice(0, 10).find(b => isValidDestination(ctx, b.systemId, b.poiId));
+          let bestBuyer: typeof buyers[0] | undefined;
+          for (const b of buyers.slice(0, 10)) {
+            const resolved = await resolveMobileStation(ctx, b.poiId, b.systemId, b.poiName);
+            if (resolved && isValidDestination(ctx, resolved.systemId, resolved.poiId)) {
+              bestBuyer = { ...b, systemId: resolved.systemId, poiId: resolved.poiId, poiName: resolved.poiName };
+              break;
+            }
+          }
           if (!bestBuyer) {
             ctx.log("trade", `No valid destination among the top ${Math.min(buyers.length, 10)} of ${buyers.length} buyer(s) for ${item.quantity}x ${item.name} in cargo`);
             continue;
@@ -3107,6 +3163,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
       // Update session state to in_transit
       await updateTradeSession(bot.username, { state: "in_transit" });
+
+      if (route!.destPoi && isMobileStationPoi(route!.destPoi)) {
+        const resolved = await resolveMobileStation(ctx, route!.destPoi, route!.destSystem, route!.destPoiName);
+        if (resolved) {
+          route!.destSystem = resolved.systemId;
+          route!.destPoi = resolved.poiId;
+          route!.destPoiName = resolved.poiName;
+        }
+      }
 
       if (bot.system !== route!.destSystem) {
         ctx.log("travel", `Heading to ${route!.destPoiName} in ${route!.destSystem}...`);

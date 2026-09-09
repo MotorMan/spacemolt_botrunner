@@ -757,7 +757,9 @@ export async function engageTarget(
   if (cloakOnStart && bot.isCloaked) {
     ctx.log("combat", `Disabling cloak before attacking ${target.name}...`);
     const cloakResp = await bot.exec("cloak", { enable: false });
-    if (cloakResp.error) {
+    if (!cloakResp.error) {
+      bot.isCloaked = false;
+    } else {
       ctx.log("warn", `Failed to disable cloak: ${cloakResp.error.message}`);
     }
   }
@@ -842,10 +844,13 @@ export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: bool
 
   const resp = await bot.exec("cloak", { enable: true });
   if (!resp.error) {
+    bot.isCloaked = true;
     ctx.log("combat", "Re-cloaked after battle victory");
   } else {
     const msg = resp.error.message.toLowerCase();
-    if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+    } else if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
       ctx.log("warn", `Failed to re-cloak after battle: ${resp.error.message}`);
     }
   }

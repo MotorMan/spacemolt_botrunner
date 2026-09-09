@@ -7091,6 +7091,7 @@ async function* boardingSystemPass(
               await ensureDocked(ctx);
             }
             await tryRefuel(ctx, { skipApprovedCheck: true });
+            await ensureHunterResupply(ctx);
           }
           await bot.refreshShip();
           const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;

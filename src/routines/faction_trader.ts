@@ -1586,14 +1586,42 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       clearFactionStorageCache();
       bot.factionStorage = [];
       recoveredSessionHandled = false;
-      // Emptying bot.factionStorage used to be the only thing stopping the
-      // storage planner from starting a brand new trade on top of a full hold.
-      // That "worked" only while the bot was wrongly stuck in personal mode;
-      // with faction mode correctly detected away from home, the planner would
-      // happily pick a route out of the home hub's storage and then fail to
-      // withdraw anything at the station we're actually docked at. Selling what
-      // we're already carrying comes first — always.
       pendingCargoRecovery = true;
+    }
+
+    // ── Empty non-trade cargo if nearly full ──
+    // A bot returning home from an interrupted trade often arrives with a full
+    // hold of fuel cells or other non-trade items. If we leave them there the
+    // planner selects a route and then can only withdraw a handful of items
+    // because the cargo is already full.
+    if (!recoveredSession && pendingCargo.length === 0) {
+      const freeSpace = getFreeSpace(bot);
+      const fillRatio = bot.cargoMax > 0 ? (bot.cargoMax - freeSpace) / bot.cargoMax : 0;
+      if (fillRatio > 0.8) {
+        ctx.log("trade", `Cargo is ${Math.round(fillRatio * 100)}% full — depositing non-trade items to make room`);
+        let depositedAny = false;
+        for (const item of [...bot.inventory]) {
+          if (item.quantity <= 0) continue;
+          const lower = item.itemId.toLowerCase();
+          const isAbFuel = isAfterburnerFuelItem(item.itemId);
+          const isFuel = !isAbFuel && (lower.includes("fuel") || lower.includes("energy_cell"));
+          if (isAbFuel) continue;
+          if (isFuel && fillRatio <= 0.9) continue;
+          const resp = await bot.exec("storage", {
+            action: 'deposit',
+            target: personalMode ? 'storage' : 'faction',
+            item_id: item.itemId,
+            quantity: item.quantity,
+          });
+          if (!resp.error) {
+            depositedAny = true;
+            ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to ${personalMode ? 'personal' : 'faction'} storage`);
+          }
+        }
+        if (depositedAny) {
+          await bot.refreshCargo();
+        }
+      }
     }
 
     // ── Handle recovered session ──
@@ -1985,6 +2013,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
     
     await bot.refreshStatus();
+    const freeSpace = getFreeSpace(bot);
+    const effectiveCapacity = freeSpace > 0 ? freeSpace : 1;
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
 
     // Market query: augment local buy demand with fresh prices from another
@@ -2048,7 +2078,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // the hold or fails outright (faction storage is per-station).
     const foundRoutes = pendingCargoRecovery
       ? []
-      : await findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode, remoteBuyDemand);
+      : await findFactionSellRoutes(ctx, settings, bot.system, effectiveCapacity, personalMode, remoteBuyDemand);
 
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group

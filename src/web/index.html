@@ -31569,6 +31569,7 @@ ignoreBlacklist: document.getElementById(
         const desiredFuelCells = h.desiredFuelCells ?? -1;
         const desiredEmergencyWarpDevices = h.desiredEmergencyWarpDevices ?? 3;
         const desiredAmmoBoxes = h.desiredAmmoBoxes ?? 0;
+        const desiredMedicalSupplies = h.desiredMedicalSupplies ?? 0;
         const disableResupply = h.disableResupply ?? false;
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
@@ -31893,6 +31894,14 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Desired Medical Supplies</div>
+        <div class="setting-hint">Target number of medical_supplies items to keep in cargo for in-flight treatment of injured crew and marines.</div>
+      </div>
+      <input type="number" id="set-hunter-desiredMedicalSupplies" min="0" max="50" value="${desiredMedicalSupplies}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Skip Consumable Resupply</div>
         <div class="setting-hint">Still reloads weapons, but skips withdrawing repair kits, shield charges, and emergency warp devices from storage. Deposits all loot before undocking so you don't lose items on death. Best for suicide runs or creature hunting where you want to keep credits/loot and minimize losses.</div>
       </div>
@@ -32182,6 +32191,10 @@ ignoreBlacklist: document.getElementById(
           desiredAmmoBoxes:
             parseInt(
               document.getElementById("set-hunter-desiredAmmoBoxes").value,
+            ) || 0,
+          desiredMedicalSupplies:
+            parseInt(
+              document.getElementById("set-hunter-desiredMedicalSupplies").value,
             ) || 0,
           disableResupply:
             document.getElementById("set-hunter-disableResupply").value === "true",

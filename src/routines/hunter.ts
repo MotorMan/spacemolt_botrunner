@@ -451,6 +451,7 @@ function getHunterSettings(username?: string): {
   desiredFuelCells: number;
   desiredEmergencyWarpDevices: number;
   desiredAmmoBoxes: number;
+  desiredMedicalSupplies: number;
   disableResupply: boolean;
   pirateBaseSystem: string;
   patrolRadius: number;
@@ -526,6 +527,7 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     desiredFuelCells: (h.desiredFuelCells as number) ?? -1,
     desiredEmergencyWarpDevices: (h.desiredEmergencyWarpDevices as number) ?? 3,
     desiredAmmoBoxes: (h.desiredAmmoBoxes as number) ?? -1,
+    desiredMedicalSupplies: (h.desiredMedicalSupplies as number) ?? 0,
     disableResupply: (h.disableResupply as boolean) ?? false,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
@@ -4397,7 +4399,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
         id.includes("plasma") ||
         id.includes("fuel_cell") ||
         id.includes("repair_kit") ||
-        id.includes("shield_charge");
+        id.includes("shield_charge") ||
+        id.includes("medical_supplies");
       if (isProtected) continue;
     }
 
@@ -4620,6 +4623,26 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       ctx.log("trade", `Withdrew ${warpToGet} emergency_warp_device from faction storage`);
     } else {
       ctx.log("trade", `Emergency warp devices: relying on faction storage (${warpToGet} needed)`);
+    }
+  }
+
+  const desiredMedical = hs.desiredMedicalSupplies ?? 0;
+  const currentMedical = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("medical_supplies"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const medicalToGet = Math.max(0, desiredMedical - currentMedical);
+  if (!hs.disableResupply && medicalToGet > 0 && freeSpace >= getItemSize("medical_supplies")) {
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: "medical_supplies",
+      quantity: medicalToGet
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${medicalToGet} medical_supplies from faction storage`);
+      freeSpace -= medicalToGet * getItemSize("medical_supplies");
+    } else {
+      ctx.log("trade", `Medical supplies: relying on faction storage (${medicalToGet} needed)`);
     }
   }
 

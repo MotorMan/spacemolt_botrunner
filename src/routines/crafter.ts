@@ -1068,8 +1068,9 @@ export function evaluateRecipeTrigger(
     // is in flight is safe: we simply size from whatever is still free.
     if (!(current > t.triggerAt)) return null;
     const perRun = comp.quantity || 1;
-    // How many runs would bring this material from `current` down to `stopAt`.
-    const toCraft = Math.floor((current - t.stopAt) / perRun);
+    const surplus = current - t.stopAt;
+    const batchSize = t.triggerAt - t.stopAt;
+    const toCraft = Math.floor(Math.min(surplus, batchSize) / perRun);
     if (toCraft <= 0) return null; // already at/below the stop point
     runs = Math.min(runs, toCraft);
   }

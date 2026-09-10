@@ -261,20 +261,23 @@ function isThisBotsTransitCargo(
   const lower = itemId.toLowerCase();
   if (isBulkSkipItem(itemId)) return false;
 
-  const effectiveDest = settings.destinationStation;
-  const isConfigured = settings.items.some((ci) => {
-    if (ci.itemId !== itemId) return false;
-    // An item configured with its own per-item destination still counts as
-    // "ours" only when that destination is the one we're currently serving.
-    const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
-    return itemDest === effectiveDest;
-  });
+  // Any item in our configured list is this bot's transit cargo, regardless of
+  // whether it uses the global destination or a per-item shipLoadoutDestination.
+  const isConfigured = settings.items.some((ci) => ci.itemId === itemId);
   if (isConfigured) return true;
 
   // Not in our item list — but maybe we legitimately loaded it and it's still
-  // tracked as in-transit under our name for this destination.
-  const inTransitSelf = getInTransitQuantity(itemId, effectiveDest, botUsername);
-  return inTransitSelf > 0;
+  // tracked as in-transit under our name for one of our configured destinations.
+  const configuredDests = new Set(
+    settings.items
+      .filter((i) => i.itemId === itemId)
+      .map((i) => i.shipLoadoutDestination || settings.destinationStation),
+  );
+  for (const dest of configuredDests) {
+    if (getInTransitQuantity(itemId, dest, botUsername) > 0) return true;
+  }
+
+  return false;
 }
 
 /** Get current system for mobile stations like mobile_capital or frontier_station. */
@@ -1246,8 +1249,17 @@ async function deliverCargoAboard(
     const itemIds = delivered.map((d) => d.itemId);
     const quantities = delivered.map((d) => d.quantity);
     updateDeliveryTracking(ctx, itemIds, quantities, settings);
-    // Remove delivered items from in-transit tracking.
-    removeInTransitItems(bot.username, settings.destinationStation, delivered);
+    // Remove delivered items from in-transit tracking (per-item destination).
+    const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+    for (const deliveredItem of delivered) {
+      const ci = settings.items.find((i) => i.itemId === deliveredItem.itemId);
+      const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+      if (!byDest.has(dest)) byDest.set(dest, []);
+      byDest.get(dest)!.push(deliveredItem);
+    }
+    for (const [dest, items] of byDest) {
+      removeInTransitItems(bot.username, dest, items);
+    }
     ctx.log("cargo", `📦 Removed ${delivered.length} item type(s) from in-transit tracking after graceful delivery`);
   }
 
@@ -1304,6 +1316,18 @@ function findMoveJobs(
     // Also count what's already in cargo hold
     const inCargo = bot.inventory.find(i => i.itemId === configItem.itemId)?.quantity || 0;
 
+    // Only count cargo that is actually destined for this destination
+    // (same shipLoadoutDestination or global destination).
+    const inCargoForDest = bot.inventory
+      .filter((i) => {
+        if (i.itemId !== configItem.itemId) return false;
+        const ci = settings.items.find((item) => item.itemId === i.itemId);
+        if (!ci) return false;
+        const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
+        return itemDest === effectiveDestStation;
+      })
+      .reduce((sum, i) => sum + i.quantity, 0);
+
     // Total available = in storage + already in cargo
     const totalAvailable = inStorage + inCargo;
     
@@ -1325,17 +1349,18 @@ function findMoveJobs(
     const alreadyClaimed = getBotClaimedQuantity(bot.username, configItem.itemId);
 
     // Target = configured quantity (or totalToDeliver if set), minus what's
-    // already delivered and what's already in transit. This way we never assume
-    // every configured item is still at the source — in-transit items are already
-    // loaded (possibly in another mover's hold) and must not be re-moved.
+    // already delivered, what's already in transit, and what is already aboard
+    // and destined for this destination. This way we never reload cargo we are
+    // already carrying, and we never duplicate work that other movers have
+    // in-flight.
     const deliveryTarget =
       (configItem.totalToDeliver && configItem.totalToDeliver > 0)
         ? configItem.totalToDeliver
         : (configItem.quantity > 0 ? configItem.quantity : 0);
     const baseTargetQty = deliveryTarget > 0 ? deliveryTarget : availableQty;
-    const effectiveTargetQty = Math.max(0, baseTargetQty - delivered - inTransitQty);
+    const effectiveTargetQty = Math.max(0, baseTargetQty - delivered - inTransitQty - inCargoForDest);
 
-    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
+    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, inCargoForDest=${inCargoForDest}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, delivered=${delivered}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
 
     if (effectiveTargetQty > 0 && availableQty > 0) {
       const blacklist = (settings.ignoreBlacklistWhenCloaked && ctx.bot.isCloaked) ? [] : getSystemBlacklist();
@@ -2696,6 +2721,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           const itemIds = deliveredItems.map((d) => d.itemId);
           const quantities = deliveredItems.map((d) => d.quantity);
           updateDeliveryTracking(ctx, itemIds, quantities, settings);
+
+          // Remove delivered items from in-transit tracking (per-item destination).
+          const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+          for (const deliveredItem of deliveredItems) {
+            const ci = settings.items.find((i) => i.itemId === deliveredItem.itemId);
+            const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+            if (!byDest.has(dest)) byDest.set(dest, []);
+            byDest.get(dest)!.push(deliveredItem);
+          }
+          for (const [dest, items] of byDest) {
+            removeInTransitItems(bot.username, dest, items);
+          }
         }
       }
 
@@ -3301,9 +3338,18 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     if (loadedItems.length > 0) {
-      addInTransitItems(bot.username, settings.destinationStation, loadedItems);
+      const byDest = new Map<string, Array<{ itemId: string; itemName: string; quantity: number }>>();
+      for (const loaded of loadedItems) {
+        const ci = settings.items.find((i) => i.itemId === loaded.itemId);
+        const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+        if (!byDest.has(dest)) byDest.set(dest, []);
+        byDest.get(dest)!.push(loaded);
+      }
+      for (const [dest, items] of byDest) {
+        addInTransitItems(bot.username, dest, items);
+      }
       const totalInTransit = loadedItems.reduce((sum, i) => sum + i.quantity, 0);
-      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${totalInTransit} total items) → ${settings.destinationStation}`);
+      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${totalInTransit} total items)`);
       // Robust milestone log: cargo has left the source and is now in transit.
       logCargoActivity(bot.username, "in_transit", `Cargo in transit: ${totalInTransit} items heading to ${settings.destinationStation}`, {
         location: `${bot.system}/${bot.poi}`,
@@ -3638,8 +3684,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         const quantities = deliveredItems.map((d) => d.quantity);
         updateDeliveryTracking(ctx, itemIds, quantities, settings);
 
-        // Remove delivered items from in-transit tracking
-        removeInTransitItems(bot.username, settings.destinationStation, deliveredItems);
+        // Remove delivered items from in-transit tracking (per-item destination)
+        const byDest = new Map<string, Array<{ itemId: string; quantity: number }>>();
+        for (const delivered of deliveredItems) {
+          const ci = settings.items.find((i) => i.itemId === delivered.itemId);
+          const dest = ci?.shipLoadoutDestination || settings.destinationStation;
+          if (!byDest.has(dest)) byDest.set(dest, []);
+          byDest.get(dest)!.push(delivered);
+        }
+        for (const [dest, items] of byDest) {
+          removeInTransitItems(bot.username, dest, items);
+        }
         ctx.log("cargo", `📦 Removed ${deliveredItems.length} item types from in-transit tracking (${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} verified deliveries)`);
 
         // Update trip completion tracking

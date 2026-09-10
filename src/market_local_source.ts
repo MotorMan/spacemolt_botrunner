@@ -502,6 +502,7 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
     }
     results.push({
       ok: true,
+      itemId,
       stationName: item.stationName,
       systemId: item.systemId,
       stationPoiId: item.stationPoiId,

@@ -184,6 +184,7 @@ export interface MarketQueryRequest {
 /** A single market deal result returned by the data-holding client. */
 export interface MarketQueryResponse {
   ok: boolean;
+  itemId: string;
   stationName: string;
   systemId: string;
   stationPoiId: string;

@@ -2019,8 +2019,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: bot.system });
           if (!res.ok || res.results.length === 0) return null;
           return res.results.map(r => ({
-            itemId,
-            itemName: itemId,
+            itemId: r.itemId || itemId,
+            itemName: r.itemId || itemId,
             systemId: r.systemId,
             poiId: r.stationPoiId,
             poiName: r.stationName,

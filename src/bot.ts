@@ -1014,12 +1014,6 @@ docked = false;
       return { error: { code: "no_account", message: "Library account not connected" }, result: undefined, notifications: [] };
     }
 
-    if (this._state === "stopping" && this._abortController?.signal.aborted) {
-      const err = new Error("Bot stopped") as Error & { name?: string };
-      err.name = "AbortError";
-      throw err;
-    }
-
     // Transport-level auth is already handled by connectOwned(); treat it as a no-op.
     if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
       return { result: { ok: true }, error: undefined, notifications: [] };

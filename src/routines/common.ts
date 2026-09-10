@@ -1741,6 +1741,67 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   }
 }
 
+export async function treatPersonnel(
+  ctx: RoutineContext,
+  opts?: { crew?: number; marines?: number; provider?: "station" | "field" | "faction"; reserve?: boolean },
+): Promise<{ crewTreated: number; marinesTreated: number } | null> {
+  const { bot } = ctx;
+  await bot.refreshShip();
+  const crew = opts?.crew ?? bot.injuredCrew ?? 0;
+  const marines = opts?.marines ?? bot.injuredMarines ?? 0;
+  if (crew <= 0 && marines <= 0) {
+    return { crewTreated: 0, marinesTreated: 0 };
+  }
+
+  const provider = opts?.provider ?? (bot.docked ? "station" : "field");
+  const payload: Record<string, unknown> = {
+    crew,
+    marines,
+    provider,
+    reserve: opts?.reserve ?? false,
+  };
+  const resp = await bot.exec("treat_personnel", payload);
+  if (resp.error) {
+    ctx.log("system", `Treat personnel failed: ${resp.error.message}`);
+    return null;
+  }
+
+  const details = (resp.result as Record<string, unknown> | undefined)?.details as Record<string, unknown> | undefined;
+  const treatedCrew = (details?.crew_treated as number | undefined) ?? crew;
+  const treatedMarines = (details?.marines_treated as number | undefined) ?? marines;
+  ctx.log("system", `Treated ${treatedCrew} crew and ${treatedMarines} marines (provider=${provider}, reserve=${payload.reserve})`);
+  await bot.refreshShip();
+  return { crewTreated: treatedCrew, marinesTreated: treatedMarines };
+}
+
+export async function recruitPersonnel(
+  ctx: RoutineContext,
+  desiredCrew: number,
+  desiredMarines: number,
+): Promise<{ crewRecruited: number; marinesRecruited: number } | null> {
+  const { bot } = ctx;
+  if (desiredCrew <= 0 && desiredMarines <= 0) {
+    return { crewRecruited: 0, marinesRecruited: 0 };
+  }
+
+  const payload: Record<string, unknown> = {
+    crew: Math.max(0, desiredCrew),
+    marines: Math.max(0, desiredMarines),
+  };
+  const resp = await bot.exec("recruit_personnel", payload);
+  if (resp.error) {
+    ctx.log("system", `Recruit personnel failed: ${resp.error.message}`);
+    return null;
+  }
+
+  const details = (resp.result as Record<string, unknown> | undefined)?.details as Record<string, unknown> | undefined;
+  const recruitedCrew = (details?.crew_recruited as number | undefined) ?? 0;
+  const recruitedMarines = (details?.marines_recruited as number | undefined) ?? 0;
+  ctx.log("system", `Recruited ${recruitedCrew} crew and ${recruitedMarines} marines`);
+  await bot.refreshShip();
+  return { crewRecruited: recruitedCrew, marinesRecruited: recruitedMarines };
+}
+
 export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<boolean> {
   const { bot } = ctx;
   if (!bot.maxShield || bot.maxShield <= 0) {

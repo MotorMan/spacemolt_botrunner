@@ -348,11 +348,21 @@ docked = false;
     hasLeadLinedCargoHold: boolean | null = null;
     /** Fit marines aboard the ship (from get_ship personnel). */
     fitMarines = 0;
+    /** Fit crew aboard the ship (from get_ship personnel). */
+    fitCrew = 0;
+    /** Injured marines aboard the ship (from get_ship personnel). */
+    injuredMarines = 0;
+    /** Injured crew aboard the ship (from get_ship personnel). */
+    injuredCrew = 0;
     /** Effective marine capacity after hull/module effects (from get_ship). */
     effectiveMarineCapacity = 0;
+    /** Maximum crew capacity from ship hull class (from get_ship). */
+    crewCapacity = 0;
+    /** Maximum marine capacity from ship hull class (from get_ship). */
+    marineCapacity = 0;
     /** Whether this ship has boarding capability (from get_ship ship class data). */
     hasBoardingCapability = false;
-    /** Latch strength of the installed boarding clamp module (0 if not installed). */
+    /** Latch strength of the installed boarding clamp module (0 if none installed). */
     boardingClampLatchStrength = 0;
   private _prevHullPct: number = 100;
   private _prevHasEws: boolean | null = null;
@@ -2183,15 +2193,22 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
              .filter(Boolean);
          }
 
-         // Parse personnel data
-         const personnel = (ship.personnel as Record<string, unknown> | undefined) || {};
-         this.fitMarines = (personnel.fit_marines as number) ?? 0;
+          // Parse personnel data
+          const personnel = (ship.personnel as Record<string, unknown> | undefined) || {};
+          this.fitMarines = (personnel.fit_marines as number) ?? 0;
+          this.injuredMarines = (personnel.injured_marines as number) ?? 0;
+          this.injuredCrew = (personnel.injured_crew as number) ?? 0;
+          this.fitCrew = (personnel.fit_crew as number) ?? 0;
 
-         // Parse boarding capability and effective marine capacity
-         this.effectiveMarineCapacity = (ship.effective_marine_capacity as number) ?? this.effectiveMarineCapacity;
-          // boarding_capability is in the hull/class data block
+          // Parse capacity data from hull class
           const hullData = (ship.hull_class as Record<string, unknown> | undefined) || {};
-          this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
+          this.crewCapacity = (hullData.crew_capacity as number) ?? this.crewCapacity;
+          this.marineCapacity = (hullData.marine_capacity as number) ?? this.marineCapacity;
+
+          // Parse boarding capability and effective marine capacity
+          this.effectiveMarineCapacity = (ship.effective_marine_capacity as number) ?? this.effectiveMarineCapacity;
+           // boarding_capability is in the hull/class data block
+           this.hasBoardingCapability = !!(hullData.boarding_capability as boolean | undefined) || this.installedMods.some(m => m.toLowerCase().includes("boarding"));
           // Parse boarding clamp latch strength from installed modules
           let maxLatchStrength = 0;
           for (const mod of modulesArray) {

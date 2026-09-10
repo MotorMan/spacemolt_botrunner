@@ -2615,7 +2615,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             const isMobileCapitalDest = settings.destinationStation === "mobile_capital" || settings.destinationStation.includes("mobile_capital");
             if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
               ctx.log("cargo", "Mobile capital not found at expected location during recovery, querying current system...");
-              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+              const currentSystem = await getMobileStationSystem(ctx, "mobile_capital");
               if (currentSystem) {
                 ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
                 // Navigate to the new system
@@ -3466,63 +3466,57 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           if (isMobileCapitalDest && errMsg.includes("jump to") && errMsg.includes("to find it")) {
             // Parse the error message like "Jump to First Step to find it."
             const match = tResp.error.message.match(/jump to (.+?) to find it/i);
-            if (match) {
-              const newSystemName = match[1];
-              ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
+             if (match) {
+               const newSystemName = match[1];
+               ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
 
-              // Update map store with new location
-              // We need to get the system ID from the name, or use the name directly
-              // For now, we'll query the current location and update the map
-              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
-              if (currentSystem) {
-                // Update the map store
-                mapStore.updateMobileCapitolLocation(currentSystem, newSystemName, "mobile_capital");
-                ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${currentSystem})`);
+               // Resolve the new system name to a system ID from the map store
+               const targetSystem = mapStore.getSystems().find(
+                 (s) => s.name && s.name.toLowerCase() === newSystemName.toLowerCase()
+               );
+               const targetSystemId = targetSystem?.id || newSystemName;
 
-                // Navigate to the new system
-                if (bot.system !== currentSystem) {
-                  ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName} (${currentSystem})...`);
-                  const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
-                  if (!arrived || bot.state !== "running") {
-                    if (bot.state !== "running") {
-                      ctx.log("system", "⛔ Stopping — emergency detected");
-                      return;
-                    }
-                    ctx.log("error", `Failed to reach mobile capital's new system ${currentSystem}`);
-                    logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${currentSystem}`, {
-                      location: `${bot.system}/${bot.poi}`,
-                    });
-                    allJobsCompleted = false;
-                    break;
-                  }
-                  ctx.log("cargo", `✅ Arrived at mobile capital's new system ${currentSystem}`);
-                }
+               // Update the map store with the new mobile capital location
+               mapStore.updateMobileCapitolLocation(targetSystemId, newSystemName, "mobile_capital");
+               ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${targetSystemId})`);
 
-                // Retry travel to the mobile capital
-                const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
-                if (retryResp.error) {
-                  const retryErrMsg = retryResp.error.message.toLowerCase();
-                  if (!retryErrMsg.includes("already")) {
-                    ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
-                    logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
-                      location: `${bot.system}/${bot.poi}`,
-                    });
-                    allJobsCompleted = false;
-                    break;
-                  }
-                } else {
-                  bot.poi = stationTravelTarget(settings.destinationStation);
-                }
-              } else {
-                ctx.log("error", "Could not determine mobile capital's new location from error message");
-                logCargoActivity(bot.username, "error", "Could not parse mobile capital relocation from error message", {
-                  location: `${bot.system}/${bot.poi}`,
-                  error: tResp.error.message,
-                });
-                allJobsCompleted = false;
-                break;
-              }
-            } else {
+               // Navigate to the new system using the system name directly
+               const normalizedBotSystem = bot.system.toLowerCase().replace(/_/g, ' ').trim();
+               const normalizedTarget = newSystemName.toLowerCase().replace(/_/g, ' ').trim();
+               if (normalizedBotSystem !== normalizedTarget) {
+                 ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName}...`);
+                 const arrived = await navigateToSystem(ctx, newSystemName, safetyOpts);
+                 if (!arrived || bot.state !== "running") {
+                   if (bot.state !== "running") {
+                     ctx.log("system", "⛔ Stopping — emergency detected");
+                     return;
+                   }
+                   ctx.log("error", `Failed to reach mobile capital's new system ${newSystemName}`);
+                   logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${newSystemName}`, {
+                     location: `${bot.system}/${bot.poi}`,
+                   });
+                   allJobsCompleted = false;
+                   break;
+                 }
+                 ctx.log("cargo", `✅ Arrived at mobile capital's new system ${newSystemName}`);
+               }
+
+               // Retry travel to the mobile capital
+               const retryResp = await bot.exec("travel", { target_poi: stationTravelTarget(settings.destinationStation) });
+               if (retryResp.error) {
+                 const retryErrMsg = retryResp.error.message.toLowerCase();
+                 if (!retryErrMsg.includes("already")) {
+                   ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
+                   logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
+                     location: `${bot.system}/${bot.poi}`,
+                   });
+                   allJobsCompleted = false;
+                   break;
+                 }
+               } else {
+                 bot.poi = stationTravelTarget(settings.destinationStation);
+               }
+             } else {
               ctx.log("error", "Could not parse new system name from mobile capital relocation error");
               logCargoActivity(bot.username, "error", "Could not parse system name from mobile capital relocation error", {
                 location: `${bot.system}/${bot.poi}`,
@@ -3535,7 +3529,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           // Check if it's a mobile station that moved (fallback for other cases)
           else if (isMobileCapitalDest && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
             ctx.log("cargo", "Mobile capital not found at expected location, querying current system...");
-            const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+            const currentSystem = await getMobileStationSystem(ctx, "mobile_capital");
             if (currentSystem) {
               ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
               // Navigate to the new system

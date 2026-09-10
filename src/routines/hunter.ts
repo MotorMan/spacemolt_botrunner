@@ -6160,11 +6160,9 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
  */
 async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, knownShipId?: string): Promise<boolean> {
   const { bot } = ctx;
-  const maxWaitTicks = 30; // ~300 seconds max wait for recovery
+  const maxWaitTicks = 30;
   let waitTick = 0;
 
-  // Clean up entries older than 5 minutes so stale trackers from previous
-  // battles don't cause RecoverPrize to chase ghost prizes.
   bot.pruneStaleCapturedPrizes();
 
   while (bot.state === "running" && waitTick < maxWaitTicks) {
@@ -6173,9 +6171,102 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     await bot.refreshStatus();
     const recoveries = bot.prizeRecoveries;
 
-    // Find the tracked captured prize entry for THIS capture.
-    // If no tracked entry matches an existing recovery, fall back to the first
-    // tracked entry (new capture that hasn't been claimed yet).
+    // PHASE 1: Claim every available prize at the current POI.
+    // Keep looping until get_nearby reports NO available prizes,
+    // so we never leave a prize behind because a single claim attempt
+    // failed (e.g. "Another action is already pending").
+    const nearbyResult = await getObservationOrNearby(bot);
+    const nearbyData = nearbyResult.result;
+    if (nearbyData) {
+      const nearbyPrizes = getNearbyPrizes(nearbyData);
+      const availablePrizes = nearbyPrizes.filter(
+        p => p.status === "available" || (p.status === "claimed" && !p.wait_reason),
+      );
+
+      if (availablePrizes.length > 0) {
+        for (const prize of availablePrizes) {
+          if (bot.state !== "running") return false;
+
+          const trackedMatch = bot.findCapturedPrizeMatch(prize);
+          if (!trackedMatch && !knownShipId && prize.status === "available") {
+            ctx.log("combat", `🛸 RecoverPrize: found untracked available prize ${prize.ship_name || prize.prize_id} — claiming`);
+            const claimed = await claimPrizeAtCurrentPoi(ctx, settings, false, prize);
+            if (claimed) {
+              ctx.log("combat", `🏆 Untracked prize ${prize.ship_name || prize.prize_id} claimed`);
+              if (prize.ship_id && prize.prize_id) {
+                bot.registerCapturedPrize(prize.ship_id, prize.ship_class || "", "", prize.prize_id);
+              }
+            }
+            await ctx.sleep(2000);
+            continue;
+          }
+
+          if (trackedMatch || knownShipId) {
+            ctx.log("combat", `🛸 RecoverPrize: attempting claim for ${prize.ship_name || prize.prize_id} (status=${prize.status})`);
+            const claimed = await claimPrizeAtCurrentPoi(ctx, settings, true, prize);
+            if (claimed) {
+              ctx.log("combat", `🏆 RecoverPrize: prize ${prize.ship_name || prize.prize_id} claimed successfully`);
+              if (prize.ship_id && prize.prize_id) {
+                const existing = bot.getCapturedPrizeByShipId(prize.ship_id);
+                if (existing) {
+                  bot.registerCapturedPrize(prize.ship_id, prize.ship_class || existing.ship_class, existing.battle_id, prize.prize_id);
+                }
+              }
+            }
+            await ctx.sleep(2000);
+          }
+        }
+
+        await bot.refreshStatus();
+        const updatedRecoveries = bot.prizeRecoveries;
+        const hasActiveRecovery = updatedRecoveries.some(r => {
+          const entry = bot.capturedPrizeTracker.get(r.ship_id) || (r.prize_id ? bot.capturedPrizeTracker.get(r.prize_id) : undefined);
+          return entry && (r.status === "in_transit" || r.status === "claimed");
+        });
+
+        if (hasActiveRecovery) {
+          ctx.log("combat", "RecoverPrize: prize claimed, waiting for it to leave POI...");
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        const postClaimNearby = await getObservationOrNearby(bot);
+        const postClaimData = postClaimNearby.result;
+        if (postClaimData) {
+          const postClaimPrizes = getNearbyPrizes(postClaimData);
+          const stillAvailable = postClaimPrizes.filter(
+            p => p.status === "available" || (p.status === "claimed" && !p.wait_reason),
+          );
+          if (stillAvailable.length > 0) {
+            ctx.log("combat", `RecoverPrize: ${stillAvailable.length} prize(s) still available after claim attempt — retrying next tick`);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
+
+        ctx.log("combat", "RecoverPrize: all available prizes processed — moving on");
+        return false;
+      }
+
+      const stalled = nearbyPrizes.find(p => {
+        const match = bot.findCapturedPrizeMatch(p);
+        return match && p.status === "claimed" && p.wait_reason;
+      });
+      if (stalled) {
+        if (stalled.wait_reason === "no_fuel") {
+          ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) — attempting refuel`);
+          await servicePrize(ctx, stalled, "refuel");
+        } else if (stalled.wait_reason === "manual_stop") {
+          ctx.log("combat", `RecoverPrize: prize manually stopped — attempting resume`);
+          await servicePrize(ctx, stalled, "resume");
+        } else {
+          ctx.log("combat", `RecoverPrize: prize stalled (${stalled.wait_reason}) — cannot auto-fix, waiting`);
+        }
+        await ctx.sleep(5000);
+        continue;
+      }
+    }
+
     const trackedEntries = Array.from(bot.capturedPrizeTracker.values());
     let targetEntry = trackedEntries.find((e: { ship_id?: string; prize_id?: string }) => {
       if (knownShipId && e.ship_id === knownShipId) return true;
@@ -6190,84 +6281,43 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
       return false;
     }
 
-    // Find the recovery entry that matches our tracked prize
     const recovery = recoveries.find(r => r.ship_id === targetEntry.ship_id || r.prize_id === targetEntry.prize_id);
 
-     if (!recovery) {
-        // No recovery yet for this tracked prize — try to claim it at current POI
-        ctx.log("combat", `RecoverPrize: tracked prize ship=${targetEntry.ship_id} prize=${targetEntry.prize_id || "?"} — attempting claim`);
-        const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
-        if (claimed) {
-          // A prize was claimed. claimPrizeAtCurrentPoi matches ANY tracker entry
-          // via findCapturedPrizeMatch, so it may have claimed a different prize
-          // than targetEntry. If the tracked prize isn't at this POI, clean up
-          // the stale entry instead of looping on it.
-          const nearbyResult = await getObservationOrNearby(bot);
-          const nearbyData = nearbyResult.result;
-          if (nearbyData) {
-            const nearbyPrizes = getNearbyPrizes(nearbyData);
-            const targetPrize = nearbyPrizes.find(p =>
-              p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
-            );
-            if (!targetPrize) {
-              ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not at POI (another entry was claimed instead) — removing stale tracker entry`);
-              bot.capturedPrizeTracker.delete(targetEntry.ship_id);
-            }
+    if (!recovery) {
+      ctx.log("combat", `RecoverPrize: no recovery entry for tracked prize ship=${targetEntry.ship_id} prize=${targetEntry.prize_id || "?"}`);
+      const claimed = await claimPrizeAtCurrentPoi(ctx, settings);
+      if (claimed) {
+        ctx.log("combat", `🏆 RecoverPrize: prize claimed, waiting for it to leave POI...`);
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      const nearbyAfterFail = await getObservationOrNearby(bot);
+      const nearbyAfterFailData = nearbyAfterFail.result;
+      if (nearbyAfterFailData) {
+        const nearbyAfterFailPrizes = getNearbyPrizes(nearbyAfterFailData);
+        const targetPrize = nearbyAfterFailPrizes.find(p =>
+          p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
+        );
+        if (!targetPrize) {
+          ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not at POI — removing stale tracker entry`);
+          bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+          if (bot.capturedPrizeTracker.size === 0) {
+            ctx.log("combat", `RecoverPrize: no more tracked captured prizes — aborting`);
+            return false;
           }
           await ctx.sleep(3000);
           continue;
         }
-        // Claim didn't succeed — the prize may already be claimed but stalled at
-        // this POI (e.g. no_fuel). get_status().prize_recoveries omits prizes
-        // parked at the current POI, so we won't find a recovery entry for them.
-        // Check get_nearby directly and service the stalled prize instead of
-        // re-issuing claim_prize in a loop.
-        const nearbyResult = await getObservationOrNearby(bot);
-        const nearbyData = nearbyResult.result;
-        if (nearbyData) {
-          const nearbyPrizes = getNearbyPrizes(nearbyData);
-          const stalled = nearbyPrizes.find(p => {
-            const match = bot.findCapturedPrizeMatch(p);
-            return match && p.status === "claimed" && p.wait_reason;
-          });
-          if (stalled) {
-            if (stalled.wait_reason === "no_fuel") {
-              ctx.log("combat", `RecoverPrize: prize already claimed but stalled (no_fuel) — attempting refuel`);
-              await servicePrize(ctx, stalled, "refuel");
-            } else if (stalled.wait_reason === "manual_stop") {
-              ctx.log("combat", `RecoverPrize: prize already claimed but manually stopped — attempting resume`);
-              await servicePrize(ctx, stalled, "resume");
-            } else {
-              ctx.log("combat", `RecoverPrize: prize already claimed but stalled (${stalled.wait_reason}) — cannot auto-fix, waiting`);
-            }
-          } else {
-            // No stalled prizes and claim failed. Check if the tracked prize is
-            // actually at this POI. If the tracked ship_id/prize_id isn't in
-            // get_nearby, this is a stale tracker entry (prize claimed by
-            // another bot, already delivered, or from a previous battle) —
-            // clean it up instead of looping on a ghost prize for 30 ticks.
-            const targetPrize = nearbyPrizes.find(p =>
-              p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
-            );
-            if (!targetPrize) {
-              ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not found at POI (get_nearby shows ${nearbyPrizes.length} prize(s)) — removing stale tracker entry`);
-              bot.capturedPrizeTracker.delete(targetEntry.ship_id);
-              if (bot.capturedPrizeTracker.size === 0) {
-                ctx.log("combat", `RecoverPrize: no more tracked captured prizes — aborting`);
-                return false;
-              }
-              // Re-select targetEntry on next iteration (will pick a non-stale entry)
-              await ctx.sleep(3000);
-              continue;
-            }
-            ctx.log("combat", `RecoverPrize: claim at current POI failed — will retry next tick (tick ${waitTick}/${maxWaitTicks})`);
-          }
-         } else {
-           ctx.log("combat", `RecoverPrize: claim at current POI failed — will retry next tick (tick ${waitTick}/${maxWaitTicks})`);
-          }
-        await ctx.sleep(10000);
-        continue;
+        if (targetPrize.status === "available" || (targetPrize.status === "claimed" && !targetPrize.wait_reason)) {
+          ctx.log("combat", `RecoverPrize: claim at current POI failed — will retry next tick (tick ${waitTick}/${maxWaitTicks})`);
+          await ctx.sleep(10000);
+          continue;
+        }
       }
+      await ctx.sleep(10000);
+      continue;
+    }
 
     ctx.log("combat", `RecoverPrize[t=${targetEntry.ship_id.slice(0,8)}]: status=${recovery.status} fuel=${recovery.fuel}/${recovery.max_fuel} hull=${recovery.hull}/${recovery.max_hull} wait=${recovery.wait_reason || "none"}`);
 

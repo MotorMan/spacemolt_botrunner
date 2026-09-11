@@ -65,6 +65,7 @@
   <script>
     let catalog = { ships: {}, items: {}, recipes: {} };
     let marketIndex = new Map();
+    let remoteMarketCache = new Map();
     let shipPricingData = [];
     let multiplier = 2.42;
 
@@ -90,6 +91,66 @@
       } catch (e) {
         console.error('Failed to load market data:', e);
       }
+    }
+
+    async function queryRemoteMarket(itemId) {
+      const key = (itemId || '').toLowerCase();
+      if (remoteMarketCache.has(key)) return remoteMarketCache.get(key) || null;
+      try {
+        const [sellRes, buyRes] = await Promise.all([
+          fetch('/api/client-sync/market-query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'buy' })
+          }),
+          fetch('/api/client-sync/market-query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'sell' })
+          })
+        ]);
+        const sellData = await sellRes.json();
+        const buyData = await buyRes.json();
+        const itemEntry = catalog.items[key] || {};
+        const baseValue = itemEntry.base_value || 0;
+        const refined = isRefinedOreProduct(itemId);
+        const module = isShipModule(itemId);
+        let bestSell = null;
+        let bestBuy = null;
+        if (sellData.ok && sellData.results && sellData.results.length > 0) {
+          const filtered = sellData.results.filter(r => {
+            if (refined && r.price < 15) return false;
+            if (module && r.price < 1000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestSell = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+        if (buyData.ok && buyData.results && buyData.results.length > 0) {
+          const filtered = buyData.results.filter(r => {
+            if (refined && r.price < 15) return false;
+            if (module && r.price < 1000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestBuy = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+        if (bestSell || bestBuy) {
+          const result = { bestSell, bestBuy };
+          remoteMarketCache.set(key, result);
+          return result;
+        }
+      } catch (e) {
+        console.error('Remote market query failed for', itemId, e);
+      }
+      remoteMarketCache.set(key, null);
+      return null;
     }
 
     async function populateBotSelect() {
@@ -134,8 +195,13 @@
         for (const s of ships) {
           const shipId = s.id || s.ship_id || '';
           const shipInfo = await fetchShipDetails(bot, shipId);
-          const pricing = computeShipPricing(shipInfo);
-          shipPricingData.push({ ship: s, shipInfo, pricing });
+          const pricing = await computeShipPricing(shipInfo);
+          const name = s.name || s.ship_name || shipInfo?.ship?.name || shipInfo?.ship?.ship_name || shipId || 'Unknown';
+          const cls = s.ship_class || s.shipClass || shipInfo?.ship?.class_name || '';
+          if (!s.name && !s.ship_name) {
+            console.warn('Ship missing name in list_ships:', JSON.stringify(s).slice(0, 200));
+          }
+          shipPricingData.push({ ship: { ...s, _name: name, _cls: cls }, shipInfo, pricing });
         }
         renderPricing();
         document.getElementById('spcStats').textContent = `${shipPricingData.length} ships priced`;
@@ -159,10 +225,26 @@
       return null;
     }
 
+    function isRefinedOreProduct(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /ingot|plate|sheet|rod|powder|alloy/.test(id) && !/ore/.test(id);
+    }
+
+    function isShipModule(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /module|shield|engine|weapon|cloak|cpu|drive|compressor|expander|harvester|stabilizer|projector|hardener|bay|mount/.test(id);
+    }
+
     function getMarketPrice(itemId) {
       const key = (itemId || '').toLowerCase();
       const entries = marketIndex.get(key);
-      if (!entries || entries.length === 0) return null;
+      if (!entries || entries.length === 0) {
+        return null;
+      }
+      const itemEntry = catalog.items[key] || {};
+      const baseValue = itemEntry.base_value || 0;
+      const refined = isRefinedOreProduct(itemId);
+      const module = isShipModule(itemId);
       let bestSell = null;
       let bestBuy = null;
       for (const entry of entries) {
@@ -170,14 +252,26 @@
           if (!bestSell || o.price < bestSell.price) bestSell = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
         for (const o of (entry.buyOrders || [])) {
+          if (refined && o.price < 15) continue;
+          if (module && o.price < 1000) continue;
+          if (baseValue > 0 && o.price < baseValue) continue;
           if (!bestBuy || o.price > bestBuy.price) bestBuy = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
       }
       return { bestSell, bestBuy };
     }
 
-    function resolveItemPrice(itemId, baseValue) {
-      const mp = getMarketPrice(itemId);
+    async function getMarketPriceAsync(itemId) {
+      const key = (itemId || '').toLowerCase();
+      const local = getMarketPrice(itemId);
+      if (local && (local.bestSell || local.bestBuy)) return local;
+      const remote = await queryRemoteMarket(itemId);
+      if (remote && (remote.bestSell || remote.bestBuy)) return remote;
+      return null;
+    }
+
+    async function resolveItemPrice(itemId, baseValue) {
+      const mp = await getMarketPriceAsync(itemId);
       if (mp && mp.bestSell) {
         return { price: mp.bestSell.price, source: 'market', detail: `lowest sell ${mp.bestSell.price.toLocaleString()}cr (${mp.bestSell.qty}x @ ${mp.bestSell.station})` };
       }
@@ -188,7 +282,7 @@
       return { price: fallback, source: 'base', detail: `no market data → base ${baseValue} × ${multiplier}` };
     }
 
-    function computeRecipeCost(itemId) {
+    async function computeRecipeCost(itemId) {
       const key = (itemId || '').toLowerCase();
       const recipes = Object.values(catalog.recipes || {});
       const recipe = recipes.find(r => {
@@ -201,7 +295,7 @@
       for (const inp of (recipe.inputs || [])) {
         const itemEntry = catalog.items[inp.item_id] || {};
         const baseVal = itemEntry.base_value || 0;
-        const rp = resolveItemPrice(inp.item_id, baseVal);
+        const rp = await resolveItemPrice(inp.item_id, baseVal);
         const cost = rp.price * (inp.quantity || 1);
         total += cost;
         lines.push({ itemId: inp.item_id, qty: inp.quantity || 1, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
@@ -209,11 +303,11 @@
       return { total, lines, recipeId: recipe.id };
     }
 
-    function computeShipPricing(shipData) {
+    async function computeShipPricing(shipData) {
       const result = { hull: { cost: 0, lines: [] }, modules: [], total: 0 };
       if (!shipData) return result;
       const ship = (shipData.ship && typeof shipData.ship === 'object') ? shipData.ship : shipData;
-      const shipId = (ship.id || '').toLowerCase();
+      const shipId = (ship.class_id || ship.type || ship.id || '').toLowerCase();
       const shipEntry = catalog.ships[shipId] || null;
       const baseHull = ship.base_hull || ship.max_hull || 0;
 
@@ -224,7 +318,7 @@
           const qty = mat.quantity || 1;
           const itemEntry = catalog.items[itemId] || {};
           const baseVal = itemEntry.base_value || 0;
-          const rp = resolveItemPrice(itemId, baseVal);
+          const rp = await resolveItemPrice(itemId, baseVal);
           const cost = rp.price * qty;
           hullCost += cost;
           result.hull.lines.push({ itemId, qty, unitPrice: rp.price, cost, source: rp.source, detail: rp.detail });
@@ -241,7 +335,7 @@
           const modTypeId = (mod.type_id || mod.module_id || mod.item_id || mod.id || '').toLowerCase();
           const modEntry = catalog.items[modTypeId] || {};
           const modBase = modEntry.base_value || 0;
-          const mp = getMarketPrice(modTypeId);
+          const mp = await getMarketPriceAsync(modTypeId);
           let cost, source, detail;
           let recipeCost = null;
           if (mp && mp.bestSell) {
@@ -253,7 +347,7 @@
             source = 'market';
             detail = `highest buy ${mp.bestBuy.price.toLocaleString()}cr (${mp.bestBuy.qty}x @ ${mp.bestBuy.station})`;
           } else {
-            recipeCost = computeRecipeCost(modTypeId);
+            recipeCost = await computeRecipeCost(modTypeId);
             if (recipeCost) {
               cost = recipeCost.total;
               source = 'recipe';
@@ -280,8 +374,8 @@
       }
       let html = '';
       for (const sp of shipPricingData) {
-        const name = sp.ship.name || sp.ship.ship_name || sp.ship.id || 'Unknown';
-        const cls = sp.ship.ship_class || sp.shipInfo?.ship?.ship_class || '';
+        const name = sp.ship._name || sp.ship.name || sp.ship.ship_name || sp.ship.id || 'Unknown';
+        const cls = sp.ship._cls || sp.ship.ship_class || sp.shipInfo?.ship?.ship_class || '';
         html += `<div class="spc-ship" onclick="this.classList.toggle('expanded')">
           <div class="spc-ship-head">
             <span class="spc-ship-name">${esc(name)}</span>

@@ -125,8 +125,9 @@ interface CargoMoverSettings {
   factionStorageBot?: string;
   refuelThreshold: number;
   repairThreshold: number;
-  militaryFuelCells: number;
-  ignorePiratesWhenCloaked: boolean;
+    militaryFuelCells: number;
+    disableMarketBuy: boolean;
+    ignorePiratesWhenCloaked: boolean;
   ignoreBlacklistWhenCloaked: boolean;
   /** Bulk-move sub-routine: move EVERYTHING from the source faction storage to
    *  the destination instead of the hand-picked `items` list. */
@@ -182,6 +183,7 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     militaryFuelCells: (t.militaryFuelCells as number) || 10,
+    disableMarketBuy: (t.disableMarketBuy as boolean) ?? false,
     // When cloaked a ship cannot be ambushed, so (default ON) it may ignore
     // pirates and blacklisted systems while cloaked.
     ignorePiratesWhenCloaked: (botOverrides.ignorePiratesWhenCloaked as boolean) ?? (t.ignorePiratesWhenCloaked as boolean) ?? true,
@@ -421,12 +423,14 @@ async function undockForTravel(
 }
 
 /** Ensure the bot carries the user-configured number of military fuel cells
- * (default 10). These power in-transit refueling and are NEVER delivered to the
- * destination (fuel cells are excluded from deposits). Loads from faction
- * storage first, then falls back to buying from the market. */
+ *  (default 10). These power in-transit refueling and are NEVER delivered to the
+ *  destination (fuel cells are excluded from deposits). Loads from faction
+ *  storage first, then falls back to buying from the market unless
+ *  `settings.disableMarketBuy` is set. */
 async function ensureMilitaryFuelCells(
   ctx: RoutineContext,
   targetCount: number,
+  settings: CargoMoverSettings,
 ): Promise<number> {
   const { bot } = ctx;
   if (targetCount <= 0) return 0;
@@ -465,9 +469,9 @@ async function ensureMilitaryFuelCells(
     }
   }
 
-  // Fallback: buy from the market.
+  // Fallback: buy from the market (only if not disabled).
   const haveAfterFaction = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
-  if (haveAfterFaction < targetCount) {
+  if (haveAfterFaction < targetCount && !settings.disableMarketBuy) {
     const stillNeed = targetCount - haveAfterFaction;
     const buyResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: stillNeed });
     if (!buyResp.error) {
@@ -475,6 +479,8 @@ async function ensureMilitaryFuelCells(
     } else {
       ctx.log("warn", `Could not buy military_fuel_cell from market: ${buyResp.error.message}`);
     }
+  } else if (haveAfterFaction < targetCount && settings.disableMarketBuy) {
+    ctx.log("cargo", `⛔ Market buying disabled — skipping buy for ${targetCount - haveAfterFaction}x military_fuel_cell (have ${haveAfterFaction}/${targetCount})`);
   }
 
   const finalHave = bot.inventory.find((i) => i.itemId === "military_fuel_cell")?.quantity || 0;
@@ -1736,7 +1742,7 @@ async function runBulkMovePhase(
     if (bot.docked) {
       await tryRefuel(ctx);
       await bot.refreshFactionStorage(false, undefined, true);
-      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
     }
     if (!await ensureFueled(ctx, safetyOpts.fuelThresholdPct)) { await ctx.sleep(30000); return; }
     await undockForTravel(ctx, warnedNoCloak);
@@ -1787,7 +1793,7 @@ async function runBulkMovePhase(
   // which is unrelated to this routine's source and would make us plan against
   // the wrong inventory.
   await bot.refreshFactionStorage(false, settings.sourceStation);
-  await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+  await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
 
   // ── Empty a full hold BEFORE planning/loading ──────────────
   // If the bot starts a bulk-move phase with a (near) full hold — e.g. it was
@@ -2788,7 +2794,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       if (bot.docked) {
         await tryRefuel(ctx);
         await bot.refreshFactionStorage(false, undefined, true);
-        await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+        await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
       }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
@@ -2919,7 +2925,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       // These are never delivered and power in-transit refueling.
       // Read the SOURCE station's faction storage (not general.factionStorageStation).
       await bot.refreshFactionStorage(false, settings.sourceStation);
-      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+      await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
     }
 
     // Clear UNRELATED cargo items to FACTION storage (not personal) so other
@@ -3710,7 +3716,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // returns home with an empty cargo hold but no military fuel cells aboard.
     await tryRefuel(ctx);
     await bot.refreshFactionStorage(false, undefined, true);
-    await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells);
+    await ensureMilitaryFuelCells(ctx, settings.militaryFuelCells, settings);
     await bot.refreshCargo();
 
     // Check if all jobs are complete (no remaining items for any job)

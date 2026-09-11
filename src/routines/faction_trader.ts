@@ -338,11 +338,11 @@ async function recoverFactionTradeSession(
     const cargoItem = bot.inventory.find(i => i.itemId === session.itemId);
     const cargoQty = cargoItem?.quantity ?? 0;
 
-  if (cargoQty <= 0) {
-    ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
-    await failFactionSession(session.botUsername, "Items not in cargo");
-    return null;
-  }
+    if (cargoQty <= 0) {
+      ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
+      await failFactionSession(session.botUsername, "Items not in cargo");
+      return null;
+    }
 
     if (cargoQty < session.quantityBought) {
       ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
@@ -355,86 +355,85 @@ async function recoverFactionTradeSession(
     }
   }
 
-  // Check if we're at the destination
-  if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
-    // Verify the destination buyer still exists and price is still profitable
-    const marketResp = await bot.exec("view_market", { item_id: session.itemId });
-    let destBuyer: { quantity: number; price: number } | undefined;
-    if (!marketResp.error && marketResp.result) {
-      const marketData = marketResp.result as Record<string, unknown>;
-      const items = Array.isArray(marketData) ? marketData : Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items as Array<Record<string, unknown>> : [];
-      const itemMarket = items.find(i => (i.item_id as string) === session.itemId);
-      if (itemMarket) {
-        const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
-        const raw = buyOrders.find(o => {
-          const poiId = (o.poi_id as string) || (o.station_poi_id as string) || "";
-          return poiId === session.destPoi && ((o.quantity as number) || (o.remaining as number) || 0) > 0;
-        });
-        if (raw) {
-          destBuyer = {
-            quantity: (raw.quantity as number) || (raw.remaining as number) || 0,
-            price: (raw.price_each as number) || (raw.price as number) || 0,
-          };
-        }
+  // Verify the destination buyer still exists and price is still profitable.
+  // This applies to every state: even a "buying" session that never left home
+  // should abort instead of sending the bot to a dead or sub-minimum buyer.
+  const marketResp = await bot.exec("view_market", { item_id: session.itemId });
+  let destBuyer: { quantity: number; price: number } | undefined;
+  if (!marketResp.error && marketResp.result) {
+    const marketData = marketResp.result as Record<string, unknown>;
+    const items = Array.isArray(marketData) ? marketData : Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items as Array<Record<string, unknown>> : [];
+    const itemMarket = items.find(i => (i.item_id as string) === session.itemId);
+    if (itemMarket) {
+      const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+      const raw = buyOrders.find(o => {
+        const poiId = (o.poi_id as string) || (o.station_poi_id as string) || "";
+        return poiId === session.destPoi && ((o.quantity as number) || (o.remaining as number) || 0) > 0;
+      });
+      if (raw) {
+        destBuyer = {
+          quantity: (raw.quantity as number) || (raw.remaining as number) || 0,
+          price: (raw.price_each as number) || (raw.price as number) || 0,
+        };
       }
     }
+  }
 
-    if (!destBuyer || destBuyer.quantity <= 0) {
-        // The buyer vanished before we could sell. Do NOT reroute to the
-        // nearest/highest-price station and dump the cargo there — we'd lose
-        // track of a valuable item forever. Put it back where we got it.
-        const originSystem = session.sourceSystem || settings.homeSystem;
-        const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
-        const originName = session.sourcePoiName || originPoi || originSystem;
+  if (!destBuyer || destBuyer.quantity <= 0) {
+    // The buyer vanished before we could sell. Do NOT reroute to the
+    // nearest/highest-price station and dump the cargo there — we'd lose
+    // track of a valuable item forever. Put it back where we got it.
+    const originSystem = session.sourceSystem || settings.homeSystem;
+    const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
+    const originName = session.sourcePoiName || originPoi || originSystem;
 
-        ctx.log("trade", `Destination buyer gone at ${session.destPoiName} — returning cargo to origin (${originName}) instead of dumping it elsewhere`);
+    ctx.log("trade", `Destination buyer gone at ${session.destPoiName} — returning cargo to origin (${originName}) instead of dumping it elsewhere`);
 
-        // Release the stale lock for the original destination BEFORE mutating the
-        // session's destination, or the lock leaks and blocks other bots.
-        releaseBuyOrderLock(
-          bot.username,
-          session.itemId,
-          session.destPoi,
-          "buyer_gone_returning_to_origin",
-        );
+    // Release the stale lock for the original destination BEFORE mutating the
+    // session's destination, or the lock leaks and blocks other bots.
+    releaseBuyOrderLock(
+      bot.username,
+      session.itemId,
+      session.destPoi,
+      "buyer_gone_returning_to_origin",
+    );
 
-        const updated = await updateTradeSession(session.botUsername, {
-          destSystem: originSystem,
-          destPoi: originPoi,
-          destPoiName: originName,
-          returnToSource: true,
-          sellQuantity: session.quantityBought,
-          totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
-          notes: (session.notes || "") + ` | Buyer gone — returning to ${originName}`,
-        });
-        if (updated) session = updated;
-      } else if (destBuyer.price < session.buyPricePerUnit) {
-        // For faction trades, buyPricePerUnit is 0 (no purchase cost), so this
-        // only fires when the price dropped to 0/unprofitable. Return home too.
-        if (destBuyer.price <= 0) {
-          const originSystem = session.sourceSystem || settings.homeSystem;
-          const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
-          const originName = session.sourcePoiName || originPoi || originSystem;
+    const updated = await updateTradeSession(session.botUsername, {
+      destSystem: originSystem,
+      destPoi: originPoi,
+      destPoiName: originName,
+      returnToSource: true,
+      sellQuantity: session.quantityBought,
+      totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+      notes: (session.notes || "") + ` | Buyer gone — returning to ${originName}`,
+    });
+    if (updated) session = updated;
+  } else if (destBuyer.price < session.buyPricePerUnit) {
+    // For faction trades, buyPricePerUnit is 0 (no purchase cost), so this
+    // only fires when the price dropped to 0/unprofitable. Return home too.
+    if (destBuyer.price <= 0) {
+      const originSystem = session.sourceSystem || settings.homeSystem;
+      const originPoi = session.sourcePoi || getHomeStationPoi(settings.homeStation);
+      const originName = session.sourcePoiName || originPoi || originSystem;
 
-          ctx.log("trade", `Price dropped to ${destBuyer.price}cr at ${session.destPoiName} — returning cargo to origin (${originName})`);
-          releaseBuyOrderLock(
-            bot.username,
-            session.itemId,
-            session.destPoi,
-            "price_zero_returning_to_origin",
-          );
-          const updated = await updateTradeSession(session.botUsername, {
-            destSystem: originSystem,
-            destPoi: originPoi,
-            destPoiName: originName,
-            returnToSource: true,
-            sellQuantity: session.quantityBought,
-            totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
-            notes: (session.notes || "") + ` | Price zero — returning to origin`,
-          });
-          if (updated) session = updated;
-        }
-      }
+      ctx.log("trade", `Price dropped to ${destBuyer.price}cr at ${session.destPoiName} — returning cargo to origin (${originName})`);
+      releaseBuyOrderLock(
+        bot.username,
+        session.itemId,
+        session.destPoi,
+        "price_zero_returning_to_origin",
+      );
+      const updated = await updateTradeSession(session.botUsername, {
+        destSystem: originSystem,
+        destPoi: originPoi,
+        destPoiName: originName,
+        returnToSource: true,
+        sellQuantity: session.quantityBought,
+        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, originSystem, settings.fuelCostPerJump).jumps,
+        notes: (session.notes || "") + ` | Price zero — returning to origin`,
+      });
+      if (updated) session = updated;
+    }
   }
 
   ctx.log("trade", `Session recovered: ${session.quantityBought}x ${session.itemName} → ${session.destPoiName}`);

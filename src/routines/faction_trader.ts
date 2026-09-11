@@ -70,7 +70,7 @@ import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../
 import { queryLocalMarket } from "../market_local_source.js";
 import { readSellOutcome, type SellFill } from "./sellOutcome.js";
 
-const MOBILE_STATION_IDS = new Set(["mobile_capitol", "frontier_station"]);
+const MOBILE_STATION_IDS = new Set(["mobile_capitol", "mobile_capital", "frontier_station"]);
 
 function isMobileStationPoi(poiId: string): boolean {
   return MOBILE_STATION_IDS.has(poiId.toLowerCase());
@@ -1238,7 +1238,33 @@ async function findFactionSellRoutes(
     const priceB = bestPriceLookup.get(b.item.itemId) || 0;
     return priceB - priceA;
   });
-  
+
+  const missingItemIds = [...new Set(itemsToProcess.map(({ item }) => item.itemId))]
+    .filter(id => !allBuys.some(b => b.itemId === id));
+
+  if (missingItemIds.length > 0) {
+    const additionalResults = await Promise.all(
+      missingItemIds.map(id =>
+        queryRemoteMarket({ itemId: id, tradeType: "sell", requesterSystemId: currentSystem })
+          .then(res => (res.ok && res.results.length > 0 ? res.results.map(r => ({
+            itemId: r.itemId || id,
+            itemName: r.itemId || id,
+            systemId: r.systemId,
+            poiId: r.stationPoiId,
+            poiName: r.stationName,
+            price: r.price,
+            quantity: r.quantity,
+          })) : []))
+          .catch(() => [])
+      )
+    );
+    const additionalBuyers = additionalResults.flat() as typeof allBuys;
+    allBuys = [...allBuys, ...additionalBuyers];
+    if (additionalBuyers.length > 0) {
+      ctx.log("trade", `On-demand query found ${additionalBuyers.length} buyer(s) for ${missingItemIds.length} missing item(s)`);
+    }
+  }
+
   ctx.log("trade", `Processing ${itemsToProcess.length} items (global min: ${settings.minSellPrice})`);
 
   for (const { item, source, categoryConfig } of itemsToProcess) {

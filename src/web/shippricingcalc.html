@@ -423,13 +423,14 @@
       let html = '';
       for (const s of shipList) {
         const shipId = s.id || s.ship_id || '';
-        const name = s.name || s.ship_name || shipId || 'Unknown';
+        const name = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
+        const displayName = name ? name + ' - ' + shipId : shipId;
         const cls = s.ship_class || s.shipClass || '';
         const state = shipStates.get(shipId) || 'pending';
         const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
-          '    <span class="spc-ship-name">' + esc(name) + '</span>' +
+          '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
           '    <span class="spc-ship-class">' + esc(cls) + '</span>' +
           '    <span class="spc-ship-status" id="ship-status-' + shipId + '">' + statusText + '</span>' +
           '  </div>' +
@@ -492,7 +493,9 @@
       if (!shipInfo) return '<div class="spc-empty">No ship data available</div>';
       const ship = (shipInfo.ship && typeof shipInfo.ship === 'object') ? shipInfo.ship : shipInfo;
       const cls = ship.class_name || ship.ship_class || '';
-      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(ship.name || ship.ship_name || shipId) + '</b> <span style="color:var(--text-dim)">' + esc(cls) + '</span></div>';
+      const shipName = (ship.name || ship.ship_name || '').trim();
+      const displayName = shipName ? shipName + ' - ' + shipId : shipId;
+      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--text-dim)">' + esc(cls) + '</span></div>';
       html += '<div class="spc-section">';
       html += '<div class="spc-section-title">Hull Build Materials</div>';
       html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';

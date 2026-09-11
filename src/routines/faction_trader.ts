@@ -1772,35 +1772,67 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // ── Handle recovered session in "buying" state with cargo already loaded ──
     // This happens when the session was created but the bot was interrupted before traveling
     if (!recoveredSessionHandled && recoveredSession && recoveredSession.state === "buying") {
+      const session = recoveredSession;
+      if (session.returnToSource) {
+        ctx.log("trade", `Recovered session marked returnToSource in "buying" state — depositing cargo back to ${personalMode ? "personal" : "faction"} storage instead of traveling to ${session.destPoiName}`);
+        const docked = await ensureDocked(ctx);
+        if (!docked) {
+          ctx.log("error", `Cannot dock to deposit cargo — will retry next cycle`);
+          await ctx.sleep(30000);
+          continue;
+        }
+
+        await bot.refreshCargo();
+        const inCargo = bot.inventory.find(i => i.itemId === session.itemId);
+        const cargoQty = inCargo?.quantity ?? 0;
+        if (cargoQty > 0) {
+          const dep = await depositCargoItem(ctx, session.itemId, cargoQty, personalMode);
+          if (dep.ok) {
+            ctx.log("trade", `Deposited ${cargoQty}x ${session.itemName} to ${dep.target ?? (personalMode ? "personal" : "faction")} storage (buyer gone)`);
+          } else {
+            ctx.log("error", `Failed to deposit ${cargoQty}x ${session.itemName}: ${dep.error}`);
+          }
+        } else {
+          ctx.log("trade", `No ${session.itemName} in cargo to deposit — nothing to stow`);
+        }
+
+        const retSession = getActiveSession(bot.username);
+        if (retSession) {
+          releaseSessionLock(bot.username, "returned_to_origin_buyer_gone");
+          await abandonTradeSession(bot.username, "Cargo returned to origin (buyer vanished before departure)");
+        }
+        continue;
+      }
+
       // Verify the destination is still valid
-      if (!isValidDestination(ctx, recoveredSession.destSystem, recoveredSession.destPoi)) {
-        ctx.log("error", `Cannot recover session: destination ${recoveredSession.destPoiName} is invalid`);
+      if (!isValidDestination(ctx, session.destSystem, session.destPoi)) {
+        ctx.log("error", `Cannot recover session: destination ${session.destPoiName} is invalid`);
         await failFactionSession(bot.username, "Invalid destination in recovered session");
         recoveredSession = null;
       } else {
         // Check if cargo is already loaded (from previous interrupted attempt)
         await bot.refreshCargo();
-        const cargoItem = bot.inventory.find(i => i.itemId === recoveredSession!.itemId);
+        const cargoItem = bot.inventory.find(i => i.itemId === session.itemId);
         const cargoQty = cargoItem?.quantity ?? 0;
 
           if (cargoQty > 0) {
-            ctx.log("trade", `Recovered session in "buying" state with cargo already loaded: ${cargoQty}x ${recoveredSession!.itemName}`);
+            ctx.log("trade", `Recovered session in "buying" state with cargo already loaded: ${cargoQty}x ${session.itemName}`);
 
             // Set up route from session
             route = {
-              itemId: recoveredSession!.itemId,
-              itemName: recoveredSession!.itemName,
+              itemId: session.itemId,
+              itemName: session.itemName,
               availableQty: cargoQty,
-              destSystem: recoveredSession!.destSystem,
-              destPoi: recoveredSession!.destPoi,
-              destPoiName: recoveredSession!.destPoiName,
-              sellPrice: recoveredSession!.sellPricePerUnit,
-              sellQty: recoveredSession!.sellQuantity,
-            jumps: recoveredSession!.totalJumps,
-            roundTripJumps: recoveredSession!.totalJumps,
-            totalRevenue: recoveredSession!.expectedRevenue,
-            totalProfit: recoveredSession!.expectedProfit,
-            returningToSource: !!recoveredSession!.returnToSource,
+              destSystem: session.destSystem,
+              destPoi: session.destPoi,
+              destPoiName: session.destPoiName,
+              sellPrice: session.sellPricePerUnit,
+              sellQty: session.sellQuantity,
+            jumps: session.totalJumps,
+            roundTripJumps: session.totalJumps,
+            totalRevenue: session.expectedRevenue,
+            totalProfit: session.expectedProfit,
+            returningToSource: !!session.returnToSource,
           };
             withdrawQty = cargoQty;
             recoveredSessionHandled = true;
@@ -1819,8 +1851,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             }
 
             // Jump directly to destination
-            ctx.log("travel", `Resuming route to ${recoveredSession!.destPoiName}...`);
-            const arrived = await navigateToSystem(ctx, recoveredSession!.destSystem, {
+            ctx.log("travel", `Resuming route to ${session.destPoiName}...`);
+            const arrived = await navigateToSystem(ctx, session.destSystem, {
               ...safetyOpts,
               noJettison: true,
               onJump: async (jumpNum) => {
@@ -1841,12 +1873,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
             // Arrived at destination - update session state and continue to sell phase
             await updateTradeSession(bot.username, { state: "at_destination" });
-            bot.system = recoveredSession!.destSystem;
+            bot.system = session.destSystem;
 
             // Travel to destination POI and dock
-            if (bot.poi !== recoveredSession!.destPoi) {
-              ctx.log("travel", `Traveling to ${recoveredSession!.destPoiName}...`);
-              const travelResp = await bot.exec("travel", { target_poi: recoveredSession!.destPoi });
+            if (bot.poi !== session.destPoi) {
+              ctx.log("travel", `Traveling to ${session.destPoiName}...`);
+              const travelResp = await bot.exec("travel", { target_poi: session.destPoi });
 
               // Check for battle after travel
               if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
@@ -1865,7 +1897,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 }
               }
 
-              bot.poi = recoveredSession!.destPoi;
+              bot.poi = session.destPoi;
             }
 
             await ensureDocked(ctx);

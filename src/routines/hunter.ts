@@ -126,6 +126,7 @@ import {
   getWeaponModules,
   emergencyFleeSpam,
   recloakAfterBattle,
+  ensureCloakedIfNeeded,
 } from "./battle.js";
 
 
@@ -6469,6 +6470,7 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
       yield "emergency_repair";
+      await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
       const docked = await navigateToSafeStation(ctx, safetyOpts);
       if (docked) {
         await completeActiveMissions(ctx);
@@ -6491,10 +6493,12 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       }
       if (bot.system !== stayPoiAnchor.system) {
         ctx.log("travel", `Returning to anchor system ${stayPoiAnchor.system}...`);
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const arrived = await navigateToSystem(ctx, stayPoiAnchor.system, safetyOpts);
         if (arrived) {
           await resubscribeObservationAfterMove(bot);
           if (stayPoiAnchor.poi && bot.poi !== stayPoiAnchor.poi) {
+            await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
             const t = await bot.exec("travel", { target_poi: stayPoiAnchor.poi });
             if (!t.error) {
               bot.poi = stayPoiAnchor.poi;
@@ -6528,6 +6532,7 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
 
       if (bot.system !== targetSystem) {
         ctx.log("travel", `Boarding patrol: heading to ${targetSystem}...`);
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
         if (arrived) {
           await resubscribeObservationAfterMove(bot);
@@ -6835,6 +6840,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
     await serviceAnyStalledPrizes(ctx);
   }
 
+  await recloakAfterBattle(ctx, settings.cloakOnStart);
   return [totalKills, totalBoardings];
 }
 
@@ -6904,6 +6910,7 @@ async function* boardingSystemPass(
 
     yield "travel_to_poi";
     ctx.log("travel", `Boarding patrol: ${poi.name}...`);
+    await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
     const travelResp = await bot.exec("travel", { target_poi: poi.id });
     if (travelResp.error && !travelResp.error.message.includes("already")) {
       ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
@@ -7178,6 +7185,7 @@ async function* boardingSystemPass(
       if (needsFuel && settings.homeSystem) {
         ctx.log("system", `Low fuel (${postFuel}%) — returning to home base (${settings.homeSystem})...`);
         yield "dock";
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const homeOk = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
         if (!homeOk) {
           ctx.log("system", "Could not reach home base — falling back to nearest safe station");
@@ -7217,6 +7225,7 @@ async function* boardingSystemPass(
         const reason = needsAmmo ? `ammo depleted` : (needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`);
         ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — ${reason}, returning to safe system...`);
         yield "dock";
+        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const docked = await navigateToSafeStation(ctx, safetyOpts);
         if (!docked) {
           ctx.log("error", "Could not dock anywhere — retrying next cycle");
@@ -7246,10 +7255,12 @@ async function* boardingSystemPass(
         const hs = settings.homeStation || "";
         const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
         if (hsys && hpoi) {
+          await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
           await navigateToSystem(ctx, hsys, safetyOpts);
           const t = await bot.exec("travel", { target_poi: hpoi });
           if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
         } else {
+          await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
           await navigateToSafeStation(ctx, safetyOpts);
         }
         await ensureHunterResupply(ctx);
@@ -7258,6 +7269,7 @@ async function* boardingSystemPass(
     ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);
   }
 
+  await recloakAfterBattle(ctx, settings.cloakOnStart);
   return [totalKills, totalBoardings];
 }
 

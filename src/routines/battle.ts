@@ -856,6 +856,25 @@ export async function recloakAfterBattle(ctx: RoutineContext, cloakOnStart: bool
   }
 }
 
+export async function ensureCloakedIfNeeded(ctx: RoutineContext, cloakOnStart: boolean): Promise<void> {
+  const { bot } = ctx;
+  if (!cloakOnStart) return;
+  if (bot.isCloaked) return;
+
+  const resp = await bot.exec("cloak", { enable: true });
+  if (!resp.error) {
+    bot.isCloaked = true;
+    ctx.log("travel", "Re-cloaked before travel (cloakOnStart backup)");
+  } else {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+      bot.isCloaked = true;
+    } else if (!msg.includes("already cloaked") && !msg.includes("already_cloaked")) {
+      ctx.log("warn", `Failed to re-cloak before travel: ${resp.error.message}`);
+    }
+  }
+}
+
 export async function fightFreshBattle(
   ctx: RoutineContext,
   target: NearbyEntity,

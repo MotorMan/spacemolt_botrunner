@@ -86,13 +86,7 @@
           >
             Creatures
           </div>
-          <div
-            class="top-tab"
-            data-tab="shippricingcalc"
-            onclick="switchTab('shippricingcalc')"
-          >
-            Ship Pricing
-          </div>
+
           </div>
       </div>
       <div class="header-right">
@@ -943,6 +937,7 @@
           <button class="active" onclick="switchShipyardView('manage')" id="shipyardViewManage">Manage Ships</button>
           <button onclick="switchShipyardView('forsale')" id="shipyardViewForsale">Ships For Sale</button>
           <button onclick="switchShipyardView('battle')" id="shipyardViewBattle">Battle Sim</button>
+          <button onclick="switchShipyardView('pricing')" id="shipyardViewPricing">Ship Pricing Calc</button>
         </div>
         <div id="shipyardManageView" style="display: flex; flex: 1; min-height: 0; flex-direction: column; padding: 16px; gap: 16px; overflow: hidden; position: relative;">
           <div class="faction-layout" style="flex: 1; min-height: 0;">
@@ -962,6 +957,9 @@
         </div>
         <div id="shipyardBattleView" style="display: none; flex: 1; min-height: 0; position: relative;">
           <iframe id="battleSimFrame" src="/battle-sim.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+        <div id="shipyardPricingView" style="display: none; flex: 1; min-height: 0; position: relative;">
+          <iframe id="shipPricingFrame" src="/shippricingcalc.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
         </div>
       </div>
 
@@ -1373,10 +1371,7 @@
         <iframe id="creaturesFrame" src="/creatures.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
       </div>
 
-      <!-- ══ Ship Pricing Calc Tab ══ -->
-      <div class="tab-page" id="page-shippricingcalc" style="padding: 0; gap: 0;">
-        <iframe id="shipPricingFrame" src="/shippricingcalc.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
-      </div>
+
     </main>
 
     <!-- Shutdown Confirmation Modal -->
@@ -1700,15 +1695,21 @@
         document.getElementById("shipyardViewManage").classList.toggle("active", view === "manage");
         document.getElementById("shipyardViewForsale").classList.toggle("active", view === "forsale");
         document.getElementById("shipyardViewBattle").classList.toggle("active", view === "battle");
+        document.getElementById("shipyardViewPricing").classList.toggle("active", view === "pricing");
         document.getElementById("shipyardManageView").style.display = view === "manage" ? "" : "none";
         document.getElementById("shipyardForsaleView").style.display = view === "forsale" ? "" : "none";
         document.getElementById("shipyardBattleView").style.display = view === "battle" ? "" : "none";
+        document.getElementById("shipyardPricingView").style.display = view === "pricing" ? "" : "none";
         if (view === "forsale") {
           const frame = document.getElementById("shipsforsaleFrame");
           if (frame) frame.src = frame.src;
         }
         if (view === "battle") {
           const frame = document.getElementById("battleSimFrame");
+          if (frame) frame.src = frame.src;
+        }
+        if (view === "pricing") {
+          const frame = document.getElementById("shipPricingFrame");
           if (frame) frame.src = frame.src;
         }
       }

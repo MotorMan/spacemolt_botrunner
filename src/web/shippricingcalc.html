@@ -95,10 +95,11 @@
     async function populateBotSelect() {
       const sel = document.getElementById('botSelect');
       try {
-        const res = await fetch('/api/bots');
-        const bots = await res.json();
+        const res = await fetch('/api/bots/discovered');
+        const data = await res.json();
+        const names = (data.usernames || []).filter(Boolean);
         sel.innerHTML = '<option value="">Select bot...</option>' +
-          bots.map(b => `<option value="${b.username}">${b.username}</option>`).join('');
+          names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
       } catch (e) {
         console.error('Failed to load bots:', e);
       }
@@ -337,7 +338,7 @@
                     <tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Recipe Total</td><td class="spc-total">${m.cost.toLocaleString()}</td><td></td></tr></tfoot>
                   </table>
                 `).join('')}
-              </div>` : ''}
+              </div>` : ''}`}
             </div>
           </div>
         </div>`;

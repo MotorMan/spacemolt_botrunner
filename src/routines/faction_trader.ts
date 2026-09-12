@@ -76,6 +76,12 @@ function isMobileStationPoi(poiId: string): boolean {
   return MOBILE_STATION_IDS.has(poiId.toLowerCase());
 }
 
+const MOBILE_STATION_BASE_MAP: Record<string, string> = {
+  mobile_capitol: "frontier_station",
+  mobile_capital: "frontier_station",
+  frontier_station: "frontier_station",
+};
+
 const mobileStationCache = new Map<string, { systemId: string; poiId: string; poiName: string; originalPoiId: string; baseId: string }>();
 
 async function resolveMobileStation(
@@ -112,18 +118,7 @@ async function resolveMobileStation(
   const resolvedPoi = (result.target_poi as string) || poiId;
   const resolvedName = (result.target_poi_name as string) || poiName;
 
-  let baseId = poiId;
-  try {
-    const poiResp = await ctx.bot.exec("get_poi", { poi_id: resolvedPoi });
-    if (!poiResp.error && poiResp.result) {
-      const poiData = (poiResp.result as any)?.poi || (poiResp.result as any)?.base || {};
-      const rawBase = poiData.base_id || poiData.id || resolvedPoi;
-      baseId = String(rawBase).trim();
-    }
-  } catch {
-    // best-effort; fall back to poiId
-  }
-
+  const baseId = MOBILE_STATION_BASE_MAP[poiId.toLowerCase()] || poiId;
   const resolved = { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName, originalPoiId: poiId, baseId };
   mobileStationCache.set(cacheKey, resolved);
   ctx.log("trade", `Mobile station ${poiId} → ${resolvedSystem}/${resolvedPoi} (${resolvedName}) base_id=${baseId}`);
@@ -1370,7 +1365,7 @@ async function findFactionSellRoutes(
           itemId: item.itemId,
           tradeType: "sell",
           requesterSystemId: currentSystem,
-          stationPoiId: resolved.poiId,
+          stationPoiId: resolved.baseId,
         });
         if (stationResp.ok && stationResp.results.length > 0) {
           const match = stationResp.results.find(r => r.quantity > 0);
@@ -3393,8 +3388,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 itemId: route!.itemId,
                 tradeType: "sell",
                 requesterSystemId: bot.system,
-                stationPoiId: route!.destPoi || route!.destOriginalPoi,
-                baseStationId: route!.destPoi,
+                stationPoiId: route!.destBaseId || route!.destPoi || route!.destOriginalPoi,
+                baseStationId: route!.destBaseId || route!.destPoi || route!.destOriginalPoi,
               });
               let destBuyer: { quantity: number; price: number } | undefined;
               if (marketResp.ok && marketResp.results.length > 0) {

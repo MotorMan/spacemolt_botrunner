@@ -12,7 +12,7 @@ import { updateShipListings } from "../shipsforsale.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
-  stationPoiId: string,
+  stationKey: string,
   stationName: string,
   items: Array<Record<string, unknown>>,
 ): void {
@@ -46,7 +46,7 @@ function saveItemsToMarketDetails(
     }
 
     if (obs.length) {
-      marketDetailsStore.upsertItems(systemId, stationPoiId, stationName, obs);
+      marketDetailsStore.upsertItems(systemId, stationKey, stationName, obs);
     }
     return obs;
   });
@@ -55,7 +55,7 @@ function saveItemsToMarketDetails(
   // these prices immediately instead of waiting for the (throttled) re-parse
   // of the 10MB marketDetails.json.
   if (observations.length) {
-    noteLocalMarketObservation(systemId, stationPoiId, stationName, observations);
+    noteLocalMarketObservation(systemId, stationKey, stationName, observations);
   }
 }
 
@@ -92,13 +92,9 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
     const cb = (entry: import("../marketstreamstore.js").MarketStreamEntry | null) => {
       if (!entry || !entry.items.length) return;
       try {
-        // Record against the POI we are actually docked at, captured at
-        // subscribe time. Using `baseId` as the station POI id (as this used to)
-        // wrote entries under an id that does not exist in the galaxy map for
-        // every station whose base id differs from its POI id (e.g. Sol Central
-        // / confederacy_central_command), producing market rows no routine
-        // could ever travel to.
-        saveItemsToMarketDetails(systemId, poiId, stationName, entry.items as Array<Record<string, unknown>>);
+        const isMobileCapital = baseId === "frontier_station" || poiId === "frontier_station" || poiId === "mobile_capital" || poiId === "mobile_capitol";
+        const stationKey = isMobileCapital ? "frontier_station" : poiId;
+        saveItemsToMarketDetails(systemId, stationKey, stationName, entry.items as Array<Record<string, unknown>>);
       } catch {
         /* ignore marketDetails errors from push updates */
       }
@@ -227,12 +223,14 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
             || (snapshot.station_name as string)
             || bot.poi;
 
-          try {
-            saveItemsToMarketDetails(bot.system, bot.poi, stationName, items);
-            ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
-          } catch {
-            /* ignore marketDetails errors */
-          }
+           try {
+             const isMobileCapital = baseId === "frontier_station" || bot.poi === "frontier_station" || bot.poi === "mobile_capital" || bot.poi === "mobile_capitol";
+             const stationKey = isMobileCapital ? "frontier_station" : bot.poi;
+             saveItemsToMarketDetails(bot.system, stationKey, stationName, items);
+             ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
+           } catch {
+             /* ignore marketDetails errors */
+           }
 
           subscribeMarketUpdates(baseId, bot.system, bot.poi, stationName);
           currentBaseId = baseId;

@@ -76,13 +76,25 @@ function isMobileStationPoi(poiId: string): boolean {
   return MOBILE_STATION_IDS.has(poiId.toLowerCase());
 }
 
+const mobileStationCache = new Map<string, { systemId: string; poiId: string; poiName: string; originalPoiId: string; baseId: string }>();
+
 async function resolveMobileStation(
   ctx: RoutineContext,
   poiId: string,
   systemId: string,
   poiName: string,
 ): Promise<{ systemId: string; poiId: string; poiName: string; originalPoiId: string; baseId: string } | null> {
-  if (!isMobileStationPoi(poiId)) return { systemId, poiId, poiName, originalPoiId: poiId, baseId: poiId };
+  const cacheKey = poiId.toLowerCase();
+  const cached = mobileStationCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  if (!isMobileStationPoi(poiId)) {
+    const result = { systemId, poiId, poiName, originalPoiId: poiId, baseId: poiId };
+    mobileStationCache.set(cacheKey, result);
+    return result;
+  }
 
   ctx.log("trade", `Resolving mobile station ${poiId} via find_route...`);
   const resp = await ctx.bot.exec("find_route", { target: poiId });
@@ -100,9 +112,6 @@ async function resolveMobileStation(
   const resolvedPoi = (result.target_poi as string) || poiId;
   const resolvedName = (result.target_poi_name as string) || poiName;
 
-  // Stable base id is the market-data key. Mobile stations keep the same
-  // base_id across system jumps, so the market routine always writes under
-  // this id regardless of where the station currently is.
   let baseId = poiId;
   try {
     const poiResp = await ctx.bot.exec("get_poi", { poi_id: resolvedPoi });
@@ -115,8 +124,10 @@ async function resolveMobileStation(
     // best-effort; fall back to poiId
   }
 
+  const resolved = { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName, originalPoiId: poiId, baseId };
+  mobileStationCache.set(cacheKey, resolved);
   ctx.log("trade", `Mobile station ${poiId} → ${resolvedSystem}/${resolvedPoi} (${resolvedName}) base_id=${baseId}`);
-  return { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName, originalPoiId: poiId, baseId };
+  return resolved;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -688,8 +699,8 @@ async function getRemoteBuyOrdersAtStation(
       itemId,
       tradeType: "sell",
       requesterSystemId: systemId,
-      stationPoiId: originalPoiId || poiId,
-      baseStationId: baseStationId || originalPoiId || poiId,
+      stationPoiId: poiId,
+      baseStationId: poiId,
     });
     if (!res.ok || res.results.length === 0) return [];
     return res.results
@@ -1348,6 +1359,30 @@ async function findFactionSellRoutes(
       const availableDepth = Math.max(0, buy.quantity - reserved);
       if (availableDepth <= 0) continue;
 
+      // Re-query the specific resolved station to validate the price and
+      // quantity. The global buyer list can contain stale entries keyed under
+      // an alias (e.g. frontier_station) whose price no longer matches the
+      // live book at the resolved poi_id (mobile_capital).
+      let verifiedPrice = buy.price;
+      let verifiedQty = availableDepth;
+      try {
+        const stationResp = await queryLocalMarket({
+          itemId: item.itemId,
+          tradeType: "sell",
+          requesterSystemId: currentSystem,
+          stationPoiId: resolved.poiId,
+        });
+        if (stationResp.ok && stationResp.results.length > 0) {
+          const match = stationResp.results.find(r => r.quantity > 0);
+          if (match) {
+            verifiedPrice = match.price;
+            verifiedQty = Math.min(availableDepth, match.quantity);
+          }
+        }
+      } catch {
+        // best-effort; fall back to the global price
+      }
+
       const toDest = estimateFuelCost(currentSystem, resolved.systemId, costPerJump);
       const returnHome = estimateFuelCost(resolved.systemId, homeSystem, costPerJump);
       if (toDest.jumps >= 999) continue;
@@ -1355,13 +1390,13 @@ async function findFactionSellRoutes(
       const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
 
       const maxQty = itemMaxSellQty > 0 ? Math.min(remainingSellQty, item.quantity) : item.quantity;
-      const qty = Math.min(maxQty, availableDepth, maxItemsForCargo(cargoCapacity, item.itemId));
+      const qty = Math.min(maxQty, verifiedQty, maxItemsForCargo(cargoCapacity, item.itemId));
       if (qty <= 0) continue;
 
       const costPerUnit = materialCost + (roundTripJumps > 0 ? roundTripFuel / qty : 0);
-      if (materialCost > 0 && buy.price <= costPerUnit) continue;
+      if (materialCost > 0 && verifiedPrice <= costPerUnit) continue;
 
-      const totalProfit = (buy.price - costPerUnit) * qty;
+      const totalProfit = (verifiedPrice - costPerUnit) * qty;
 
       routes.push({
         itemId: item.itemId,
@@ -1372,11 +1407,11 @@ async function findFactionSellRoutes(
         destOriginalPoi: resolved.originalPoiId,
         destBaseId: resolved.baseId,
         destPoiName: resolved.poiName,
-        sellPrice: buy.price,
+        sellPrice: verifiedPrice,
         sellQty: qty,
         jumps: toDest.jumps,
         roundTripJumps,
-        totalRevenue: qty * buy.price,
+        totalRevenue: qty * verifiedPrice,
         totalProfit,
       });
       break; // best buyer for this item
@@ -1450,6 +1485,8 @@ async function detectFactionMode(
 
 export const factionTraderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
+
+  mobileStationCache.clear();
 
   await bot.refreshStatus();
   const startSystem = bot.system;
@@ -3356,8 +3393,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 itemId: route!.itemId,
                 tradeType: "sell",
                 requesterSystemId: bot.system,
-                stationPoiId: route!.destOriginalPoi || route!.destPoi,
-                baseStationId: route!.destBaseId || route!.destOriginalPoi || route!.destPoi,
+                stationPoiId: route!.destPoi || route!.destOriginalPoi,
+                baseStationId: route!.destPoi,
               });
               let destBuyer: { quantity: number; price: number } | undefined;
               if (marketResp.ok && marketResp.results.length > 0) {

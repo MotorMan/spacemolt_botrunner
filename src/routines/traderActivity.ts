@@ -28,6 +28,8 @@ export interface TradeSession {
   totalSpent: number;
   destSystem: string;
   destPoi: string;
+  destOriginalPoi: string;
+  destBaseId: string;
   destPoiName: string;
   sellPricePerUnit: number;
   sellQuantity: number;
@@ -249,7 +251,7 @@ export function getActiveSession(botUsername: string): TradeSession | undefined 
 
 export function createTradeSession(params: {
   botUsername: string;
-  route: { itemId: string; itemName: string; sourceSystem: string; sourcePoi: string; sourcePoiName: string; buyPrice: number; buyQty: number; destSystem: string; destPoi: string; destPoiName: string; sellPrice: number; sellQty: number; jumps: number; profitPerUnit: number; totalProfit: number; };
+  route: { itemId: string; itemName: string; sourceSystem: string; sourcePoi: string; sourcePoiName: string; buyPrice: number; buyQty: number; destSystem: string; destPoi: string; destOriginalPoi?: string; destBaseId?: string; destPoiName: string; sellPrice: number; sellQty: number; jumps: number; profitPerUnit: number; totalProfit: number; };
   isFactionRoute?: boolean;
   isCargoRoute?: boolean;
   investedCredits?: number;
@@ -269,6 +271,8 @@ export function createTradeSession(params: {
     totalSpent: route.buyPrice * route.buyQty,
     destSystem: route.destSystem,
     destPoi: route.destPoi,
+    destOriginalPoi: route.destOriginalPoi || route.destPoi,
+    destBaseId: route.destBaseId || route.destOriginalPoi || route.destPoi,
     destPoiName: route.destPoiName,
     sellPricePerUnit: route.sellPrice,
     sellQuantity: route.sellQty,

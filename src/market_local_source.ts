@@ -458,7 +458,7 @@ async function estimateSystemDistance(fromSystem: string, toSystem: string): Pro
  * `source` marker on the result.
  */
 export async function queryLocalMarket(query: MarketQueryRequest): Promise<MarketQueryResult> {
-  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy" } = query;
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, baseStationId } = query;
   if (!itemId) {
     return { ok: false, results: [], error: "itemId required", source: "local" };
   }
@@ -482,10 +482,48 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
   if (live) {
     for (const [key, item] of live) byStation.set(key, item);
   }
-  if (byStation.size === 0) {
-    return { ok: false, results: [], error: "No matching orders found", source: "local" };
+
+  // Direct path: build results from the merged station map.
+  let filteredResults = await buildMarketResults(byStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId });
+
+  // Cross-system fallback: when the direct path returned nothing and the caller
+  // supplied a stable base id (e.g. a mobile station whose resolved poi_id
+  // differs from the base_id under which the market data is stored), scan every
+  // system for entries whose stationPoiId matches that base id.
+  if (filteredResults.length === 0 && baseStationId) {
+    const baseByStation = new Map<string, LocalMarketItem>();
+    if (idx) {
+      for (const item of idx.byItem.get(itemId) || []) {
+        if (item.stationPoiId === baseStationId) {
+          baseByStation.set(`${item.systemId}/${item.stationPoiId}`, item);
+        }
+      }
+    }
+    if (live) {
+      for (const [key, item] of live) {
+        if (item.stationPoiId === baseStationId) baseByStation.set(key, item);
+      }
+    }
+    if (baseByStation.size > 0) {
+      filteredResults = await buildMarketResults(baseByStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId: baseStationId });
+    }
   }
 
+  const ret: MarketQueryResult = {
+    ok: filteredResults.length > 0,
+    results: filteredResults,
+    error: filteredResults.length === 0 ? "No matching orders found" : undefined,
+    source: "local",
+  };
+  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} returned=${ret.ok} count=${ret.results.length} first=${ret.results[0] ? `${ret.results[0].stationName}/${ret.results[0].itemName}@${ret.results[0].price}` : "none"}`);
+  return ret;
+}
+
+async function buildMarketResults(
+  byStation: Map<string, LocalMarketItem>,
+  opts: { itemId: string; maxPrice?: number; minQuantity?: number; requesterSystemId?: string; tradeType?: "buy" | "sell"; stationPoiId?: string },
+): Promise<MarketQueryResponse[]> {
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId } = opts;
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
   for (const item of byStation.values()) {
@@ -513,14 +551,10 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
       lastUpdated: item.lastUpdated,
     });
   }
-
   results.sort((a, b) => (tradeType === "sell" ? b.price - a.price : a.price - b.price));
-  const ret: MarketQueryResult = {
-    ok: results.length > 0,
-    results: results.slice(0, 10),
-    error: results.length === 0 ? "No matching orders found" : undefined,
-    source: "local",
-  };
-  console.log(`[queryLocalMarket] itemId=${itemId} tradeType=${tradeType} returned=${ret.ok} count=${ret.results.length} first=${ret.results[0] ? `${ret.results[0].stationName}/${ret.results[0].itemName}@${ret.results[0].price}` : "none"}`);
-  return ret;
+  if (stationPoiId) {
+    const stationFiltered = results.filter((r) => r.stationPoiId === stationPoiId);
+    if (stationFiltered.length > 0) return stationFiltered;
+  }
+  return results.slice(0, 10);
 }

@@ -179,6 +179,15 @@ export interface MarketQueryRequest {
   /** Type of trade: "buy" to find cheapest sell orders, "sell" to find
    *  highest buy orders. Defaults to "buy". */
   tradeType?: "buy" | "sell";
+  /** If set, return only results for this exact station POI id (bypasses the
+   *  global top-10 limit so the caller can inspect the full book for one
+   *  station regardless of how it ranks globally). */
+  stationPoiId?: string;
+  /** Stable base id of the station, if known. Used as a cross-system fallback:
+   *  when the direct system+poi query returns nothing (e.g. a mobile station
+   *  that just jumped), the query rescans all systems for entries whose
+   *  stationPoiId matches this base id. */
+  baseStationId?: string;
 }
 
 /** A single market deal result returned by the data-holding client. */

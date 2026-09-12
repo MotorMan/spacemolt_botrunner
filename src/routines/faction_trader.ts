@@ -81,8 +81,8 @@ async function resolveMobileStation(
   poiId: string,
   systemId: string,
   poiName: string,
-): Promise<{ systemId: string; poiId: string; poiName: string } | null> {
-  if (!isMobileStationPoi(poiId)) return { systemId, poiId, poiName };
+): Promise<{ systemId: string; poiId: string; poiName: string; originalPoiId: string; baseId: string } | null> {
+  if (!isMobileStationPoi(poiId)) return { systemId, poiId, poiName, originalPoiId: poiId, baseId: poiId };
 
   ctx.log("trade", `Resolving mobile station ${poiId} via find_route...`);
   const resp = await ctx.bot.exec("find_route", { target: poiId });
@@ -99,8 +99,24 @@ async function resolveMobileStation(
   const resolvedSystem = (result.target_system as string) || systemId;
   const resolvedPoi = (result.target_poi as string) || poiId;
   const resolvedName = (result.target_poi_name as string) || poiName;
-  ctx.log("trade", `Mobile station ${poiId} → ${resolvedSystem}/${resolvedPoi} (${resolvedName})`);
-  return { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName };
+
+  // Stable base id is the market-data key. Mobile stations keep the same
+  // base_id across system jumps, so the market routine always writes under
+  // this id regardless of where the station currently is.
+  let baseId = poiId;
+  try {
+    const poiResp = await ctx.bot.exec("get_poi", { poi_id: resolvedPoi });
+    if (!poiResp.error && poiResp.result) {
+      const poiData = (poiResp.result as any)?.poi || (poiResp.result as any)?.base || {};
+      const rawBase = poiData.base_id || poiData.id || resolvedPoi;
+      baseId = String(rawBase).trim();
+    }
+  } catch {
+    // best-effort; fall back to poiId
+  }
+
+  ctx.log("trade", `Mobile station ${poiId} → ${resolvedSystem}/${resolvedPoi} (${resolvedName}) base_id=${baseId}`);
+  return { systemId: resolvedSystem, poiId: resolvedPoi, poiName: resolvedName, originalPoiId: poiId, baseId };
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -496,6 +512,8 @@ interface FactionSellRoute {
   availableQty: number;
   destSystem: string;
   destPoi: string;
+  destOriginalPoi: string;
+  destBaseId: string;
   destPoiName: string;
   sellPrice: number;
   sellQty: number;
@@ -662,12 +680,20 @@ async function getRemoteBuyOrdersAtStation(
   systemId: string,
   poiId: string,
   minPrice: number,
+  originalPoiId?: string,
+  baseStationId?: string,
 ): Promise<Array<{ priceEach: number; orderQty: number }>> {
   try {
-    const res = await queryRemoteMarket({ itemId, tradeType: "sell", requesterSystemId: systemId });
+    const res = await queryRemoteMarket({
+      itemId,
+      tradeType: "sell",
+      requesterSystemId: systemId,
+      stationPoiId: originalPoiId || poiId,
+      baseStationId: baseStationId || originalPoiId || poiId,
+    });
     if (!res.ok || res.results.length === 0) return [];
     return res.results
-      .filter(r => r.systemId === systemId && r.stationPoiId === poiId && r.price >= minPrice)
+      .filter(r => r.systemId === systemId && (r.stationPoiId === poiId || r.stationPoiId === originalPoiId) && r.price >= minPrice)
       .map(r => ({ priceEach: r.price, orderQty: r.quantity }))
       .sort((a, b) => b.priceEach - a.priceEach);
   } catch {
@@ -1343,6 +1369,8 @@ async function findFactionSellRoutes(
         availableQty: item.quantity,
         destSystem: resolved.systemId,
         destPoi: resolved.poiId,
+        destOriginalPoi: resolved.originalPoiId,
+        destBaseId: resolved.baseId,
         destPoiName: resolved.poiName,
         sellPrice: buy.price,
         sellQty: qty,
@@ -1688,22 +1716,24 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           await tryRefuel(ctx);
         }
 
-        // Set up route for immediate execution
-        route = {
-          itemId: recoveredSession!.itemId,
-          itemName: recoveredSession!.itemName,
-          availableQty: recoveredSession!.quantityBought,
-          destSystem: recoveredSession!.destSystem,
-          destPoi: recoveredSession!.destPoi,
-          destPoiName: recoveredSession!.destPoiName,
-          sellPrice: recoveredSession!.sellPricePerUnit,
-          sellQty: recoveredSession!.sellQuantity,
-          jumps: recoveredSession!.totalJumps - recoveredSession!.jumpsCompleted,
-          roundTripJumps: recoveredSession!.totalJumps,
-          totalRevenue: recoveredSession!.expectedRevenue,
-          totalProfit: recoveredSession!.expectedProfit,
-          returningToSource: !!recoveredSession!.returnToSource,
-        };
+      // Set up route for immediate execution
+      route = {
+        itemId: recoveredSession!.itemId,
+        itemName: recoveredSession!.itemName,
+        availableQty: recoveredSession!.quantityBought,
+        destSystem: recoveredSession!.destSystem,
+        destPoi: recoveredSession!.destPoi,
+        destOriginalPoi: recoveredSession!.destOriginalPoi || recoveredSession!.destPoi,
+        destBaseId: recoveredSession!.destBaseId || recoveredSession!.destOriginalPoi || recoveredSession!.destPoi,
+        destPoiName: recoveredSession!.destPoiName,
+        sellPrice: recoveredSession!.sellPricePerUnit,
+        sellQty: recoveredSession!.sellQuantity,
+        jumps: recoveredSession!.totalJumps - recoveredSession!.jumpsCompleted,
+        roundTripJumps: recoveredSession!.totalJumps,
+        totalRevenue: recoveredSession!.expectedRevenue,
+        totalProfit: recoveredSession!.expectedProfit,
+        returningToSource: !!recoveredSession!.returnToSource,
+      };
       withdrawQty = recoveredSession.quantityBought;
       recoveredSessionHandled = true;
 
@@ -1847,15 +1877,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               availableQty: cargoQty,
               destSystem: session.destSystem,
               destPoi: session.destPoi,
+              destOriginalPoi: session.destOriginalPoi || session.destPoi,
+              destBaseId: session.destBaseId || session.destOriginalPoi || session.destPoi,
               destPoiName: session.destPoiName,
               sellPrice: session.sellPricePerUnit,
               sellQty: session.sellQuantity,
-            jumps: session.totalJumps,
-            roundTripJumps: session.totalJumps,
-            totalRevenue: session.expectedRevenue,
-            totalProfit: session.expectedProfit,
-            returningToSource: !!session.returnToSource,
-          };
+              jumps: session.totalJumps,
+              roundTripJumps: session.totalJumps,
+              totalRevenue: session.expectedRevenue,
+              totalProfit: session.expectedProfit,
+              returningToSource: !!session.returnToSource,
+            };
             withdrawQty = cargoQty;
             recoveredSessionHandled = true;
 
@@ -2101,7 +2133,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // connected client, or — when the market routines run in this same client
     // (or no remote client is reachable) — straight from the local
     // data/marketDetails.json. Each buy order found becomes an extra buyer.
-    let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
+    let remoteBuyDemand: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number; lastUpdated?: string }> = [];
     const storageItems = (personalMode ? bot.storage : bot.factionStorage).map(i => i.itemId);
     // When recovering a loaded hold the storage list is irrelevant — the
     // items that need a buyer are the ones already in cargo. map.json can be
@@ -2136,6 +2168,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             poiName: r.stationName,
             price: r.price,
             quantity: r.quantity,
+            lastUpdated: (r as any).lastUpdated,
           }));
         } catch {
           return null;
@@ -2152,6 +2185,28 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       }
     }
     ctx.log("trade", `[Routes] storageItems=${storageItems.length} cargoItems=${cargoItems.length} uniqueItems=${uniqueItems.length} remoteBuyDemand=${remoteBuyDemand.length}`);
+
+    // Deduplicate buyers: the same physical station can appear under multiple
+    // POI ids (e.g. a mobile station alias like frontier_station and its
+    // resolved canonical id mobile_capital). Keep the freshest observation for
+    // each item+station so a stale high-price entry cannot hijack route planning.
+    if (remoteBuyDemand.length > 0) {
+      const deduped = new Map<string, typeof remoteBuyDemand[0]>();
+      for (const buy of remoteBuyDemand) {
+        const key = `${buy.itemId}|${buy.systemId}|${buy.poiName}`;
+        const existing = deduped.get(key);
+        if (!existing) {
+          deduped.set(key, buy);
+        } else if (buy.lastUpdated && existing.lastUpdated && buy.lastUpdated > existing.lastUpdated) {
+          deduped.set(key, buy);
+        }
+      }
+      const before = remoteBuyDemand.length;
+      remoteBuyDemand = Array.from(deduped.values());
+      if (remoteBuyDemand.length < before) {
+        ctx.log("trade", `[MarketQuery] deduped ${before} -> ${remoteBuyDemand.length} buyers by station freshness`);
+      }
+    }
 
     // A hold that still contains goods always outranks a new trade: withdrawing
     // more items at a station we only stopped at by accident either overfills
@@ -2250,6 +2305,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             availableQty: item.quantity,
             destSystem: bestBuyer.systemId,
             destPoi: bestBuyer.poiId,
+            destOriginalPoi: bestBuyer.poiId,
+            destBaseId: bestBuyer.poiId,
             destPoiName: bestBuyer.poiName,
             sellPrice: bestBuyer.price,
             sellQty: qty,
@@ -2748,7 +2805,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         if (initialMarketCheck.buyOrders.length === 0) {
           // Fallback: view_market can lag or be empty right after a server restart.
           const fallbackOrders = await getRemoteBuyOrdersAtStation(
-            ctx, route!.itemId, bot.system, bot.poi, itemMinSellPrice,
+            ctx, route!.itemId, bot.system, bot.poi, itemMinSellPrice, route!.destOriginalPoi, route!.destBaseId,
           );
           if (fallbackOrders.length > 0) {
             const fallbackQty = Math.min(wQty, fallbackOrders[0].orderQty);
@@ -3192,6 +3249,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           buyQty: qty,
           destSystem: route!.destSystem,
           destPoi: route!.destPoi,
+          destOriginalPoi: route!.destOriginalPoi || route!.destPoi,
+          destBaseId: route!.destBaseId || route!.destOriginalPoi || route!.destPoi,
           destPoiName: route!.destPoiName,
           sellPrice: route!.sellPrice,
           sellQty: route!.sellQty,
@@ -3293,21 +3352,23 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             // When returning cargo to origin there is no buyer to validate —
             // skip the "buyer gone" abort check or it would loop forever.
              if (route!.returningToSource) return true;
-             const marketResp = await queryLocalMarket({
-               itemId: route!.itemId,
-               tradeType: "sell",
-               requesterSystemId: bot.system,
-             });
-             let destBuyer: { quantity: number; price: number } | undefined;
-             if (marketResp.ok && marketResp.results.length > 0) {
-               const destResult = marketResp.results.find(r => r.stationPoiId === route!.destPoi && r.quantity > 0);
-               if (destResult) {
-                 destBuyer = {
-                   quantity: destResult.quantity,
-                   price: destResult.price,
-                 };
-               }
-             }
+              const marketResp = await queryLocalMarket({
+                itemId: route!.itemId,
+                tradeType: "sell",
+                requesterSystemId: bot.system,
+                stationPoiId: route!.destOriginalPoi || route!.destPoi,
+                baseStationId: route!.destBaseId || route!.destOriginalPoi || route!.destPoi,
+              });
+              let destBuyer: { quantity: number; price: number } | undefined;
+              if (marketResp.ok && marketResp.results.length > 0) {
+                const destResult = marketResp.results.find(r => r.quantity > 0);
+                if (destResult) {
+                  destBuyer = {
+                    quantity: destResult.quantity,
+                    price: destResult.price,
+                  };
+                }
+              }
             if (!destBuyer || destBuyer.quantity <= 0) {
               ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer gone at ${route!.destPoiName} — aborting`);
               // Flip this run to return-to-origin right now so we head home with
@@ -3454,7 +3515,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // Fallback: view_market can lag or be empty right after a server restart.
           // Re-query the remote market source for this station before giving up.
           const fallbackOrders = await getRemoteBuyOrdersAtStation(
-            ctx, route!.itemId, route!.destSystem, route!.destPoi, itemMinSellPrice,
+            ctx, route!.itemId, route!.destSystem, route!.destPoi, itemMinSellPrice, route!.destOriginalPoi, route!.destBaseId,
           );
           if (fallbackOrders.length > 0) {
             const fallbackQty = Math.min(inCargo, fallbackOrders[0].orderQty);

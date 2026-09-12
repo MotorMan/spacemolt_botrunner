@@ -2209,7 +2209,9 @@ export async function findReachableFuelStation(
   // Strategy 2: ignore the blacklist (still skips pirate systems inside mapStore)
   const bypass = mapStore.findNearestStationSystem(bot.system, [], approvedSet, deniedSet);
   if (bypass) {
-    ctx.log("system", `Found station ${bypass.poiName} in ${bypass.systemId} by bypassing the blacklist — stranded is worse than an avoided system`);
+    const isApproved = approvedSet.has(bypass.poiId) || approvedSet.has(`${bypass.systemId}|${bypass.poiId}`);
+    const reason = isApproved ? "approved fuel station takes priority over blacklist" : "stranded is worse than an avoided system";
+    ctx.log("system", `Found station ${bypass.poiName} in ${bypass.systemId} by bypassing the blacklist — ${reason}`);
     return { ...bypass, blacklistBypassed: true };
   }
 

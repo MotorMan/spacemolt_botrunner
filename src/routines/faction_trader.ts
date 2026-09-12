@@ -1607,11 +1607,34 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       return i.quantity > 0 && isTradeCargoItem(i.itemId, settings);
     });
     if (pendingCargo.length > 0 && !recoveredSession) {
-      ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo on startup — treating as recovery`);
-      clearFactionStorageCache();
-      bot.factionStorage = [];
-      recoveredSessionHandled = false;
-      pendingCargoRecovery = true;
+      const homeStationRaw = settings.homeStation || "";
+      const homeStationPoi = getHomeStationPoi(homeStationRaw) || null;
+      const homeSystem = settings.homeSystem ||
+        (homeStationRaw.includes("|") ? homeStationRaw.split("|")[0] : startSystem);
+      const atHomeBase = (!homeSystem || bot.system === homeSystem) &&
+        (!homeStationPoi || bot.poi === homeStationPoi);
+
+      if (atHomeBase) {
+        ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo at home — depositing to storage before planning new trades`);
+        const docked = await ensureDocked(ctx);
+        if (docked) {
+          for (const item of pendingCargo) {
+            const dep = await depositCargoItem(ctx, item.itemId, item.quantity, personalMode);
+            if (dep.ok) {
+              ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to ${dep.target ?? (personalMode ? "personal" : "faction")} storage`);
+            }
+          }
+          await bot.refreshCargo();
+          clearFactionStorageCache();
+          bot.factionStorage = [];
+        }
+      } else {
+        ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo on startup — treating as recovery`);
+        clearFactionStorageCache();
+        bot.factionStorage = [];
+        recoveredSessionHandled = false;
+        pendingCargoRecovery = true;
+      }
     }
 
     // ── Empty non-trade cargo if nearly full ──

@@ -223,14 +223,27 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
             || (snapshot.station_name as string)
             || bot.poi;
 
-           try {
-             const isMobileCapital = baseId === "frontier_station" || bot.poi === "frontier_station" || bot.poi === "mobile_capital" || bot.poi === "mobile_capitol";
-             const stationKey = isMobileCapital ? "frontier_station" : bot.poi;
-             saveItemsToMarketDetails(bot.system, stationKey, stationName, items);
-             ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
-           } catch {
-             /* ignore marketDetails errors */
-           }
+          const isMobileCapital =
+            baseId === "frontier_station" ||
+            bot.poi === "frontier_station" ||
+            bot.poi === "mobile_capital" ||
+            bot.poi === "mobile_capitol";
+          const stationKey = isMobileCapital ? "frontier_station" : bot.poi;
+
+          if (isMobileCapital) {
+            marketDetailsStore.clearStation(bot.system, "frontier_station");
+            marketDetailsStore.clearStation(bot.system, "mobile_capital");
+            marketDetailsStore.clearStation(bot.system, "mobile_capitol");
+          } else {
+            marketDetailsStore.clearStation(bot.system, stationKey);
+          }
+
+          try {
+            saveItemsToMarketDetails(bot.system, stationKey, stationName, items);
+            ctx.log("info", `Saved ${items.length} items to marketDetails.json`);
+          } catch {
+            /* ignore marketDetails errors */
+          }
 
           subscribeMarketUpdates(baseId, bot.system, bot.poi, stationName);
           currentBaseId = baseId;

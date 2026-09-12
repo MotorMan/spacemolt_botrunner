@@ -1774,7 +1774,21 @@ async function* scanStation(
 
         // Memory-only upsert; marketDetailsStore persists on its 2-min cadence
         // (and on shutdown) instead of rewriting the whole ~10MB file here.
-        const detailsUpdated = marketDetailsStore.upsertItems(systemId, poi.id, poi.name, observations) > 0;
+        const isMobileCapital =
+          poi.id === "frontier_station" ||
+          poi.id === "mobile_capital" ||
+          poi.id === "mobile_capitol";
+        const stationKey = isMobileCapital ? "frontier_station" : poi.id;
+
+        if (isMobileCapital) {
+          marketDetailsStore.clearStation(systemId, "frontier_station");
+          marketDetailsStore.clearStation(systemId, "mobile_capital");
+          marketDetailsStore.clearStation(systemId, "mobile_capitol");
+        } else {
+          marketDetailsStore.clearStation(systemId, stationKey);
+        }
+
+        const detailsUpdated = marketDetailsStore.upsertItems(systemId, stationKey, poi.name, observations) > 0;
 
         if (detailsUpdated) {
           ctx.log("info", `Recorded detailed market data for ${items.length} items`);
@@ -2758,8 +2772,22 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                 observations.push({ itemId, itemName, buyOrders, sellOrders });
               }
 
+              const isMobileCapital =
+                target.stationPoi === "frontier_station" ||
+                target.stationPoi === "mobile_capital" ||
+                target.stationPoi === "mobile_capitol";
+              const stationKey = isMobileCapital ? "frontier_station" : target.stationPoi;
+
+              if (isMobileCapital) {
+                marketDetailsStore.clearStation(target.systemId, "frontier_station");
+                marketDetailsStore.clearStation(target.systemId, "mobile_capital");
+                marketDetailsStore.clearStation(target.systemId, "mobile_capitol");
+              } else {
+                marketDetailsStore.clearStation(target.systemId, stationKey);
+              }
+
               const detailsUpdated = marketDetailsStore.upsertItems(
-                target.systemId, target.stationPoi, target.stationName, observations,
+                target.systemId, stationKey, target.stationName, observations,
               ) > 0;
 
               if (detailsUpdated) {

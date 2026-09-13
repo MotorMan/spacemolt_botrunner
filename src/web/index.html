@@ -34474,6 +34474,7 @@ ignoreBlacklist: document.getElementById(
       // ── Fuel Transport Settings ──────────────────────────────────
       let ftFactionItems = [];
       let ftLoadouts = {};
+      let ftEditingItemIndex = -1;
 
       async function loadFuelTransferLoadouts() {
         try {
@@ -34615,15 +34616,33 @@ ignoreBlacklist: document.getElementById(
           items.length > 0
             ? items
                 .map(
-                  (item, idx) => `
+                  (item, idx) => {
+                    const isEditing = ftEditingItemIndex === idx;
+                    if (isEditing) {
+                      return `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(item.itemName || item.itemId)}</div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+              <input type="number" id="ft-edit-qty-${idx}" value="${item.targetQuantity}" min="1" style="width:100px">
+            </div>
+          </div>
+          <button class="sm" style="background:#388e3c;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="saveFuelTransportItemEdit(${idx})">Save</button>
+          <button class="sm" style="background:#757575;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="cancelFuelTransportItemEdit()">Cancel</button>
+        </div>
+      `;
+                    }
+                    return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
             <div class="craft-limit-name">${esc(item.itemName || item.itemId)}</div>
             <div class="craft-limit-detail">Target qty at each station: <b>${item.targetQuantity.toLocaleString()}</b></div>
           </div>
+          <button class="sm" style="background:#f9a825;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="editFuelTransportItem(${idx})">✎</button>
           <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeFuelTransportItem(${idx})">✕</button>
         </div>
-      `,
+      `;
+                  }
                 )
                 .join("")
             : '<div style="color:var(--dim);padding:8px">No items configured. Add items below or load from home faction storage.</div>';
@@ -34806,6 +34825,25 @@ ignoreBlacklist: document.getElementById(
       function removeFuelTransportItem(idx) {
         if (!settings.fuel_transport?.items) return;
         settings.fuel_transport.items.splice(idx, 1);
+        rerenderCurrentSettings();
+      }
+
+      function editFuelTransportItem(idx) {
+        ftEditingItemIndex = idx;
+        rerenderCurrentSettings();
+      }
+
+      function saveFuelTransportItemEdit(idx) {
+        const qtyEl = document.getElementById(`ft-edit-qty-${idx}`);
+        const qty = parseInt(qtyEl?.value) || 1;
+        if (!settings.fuel_transport?.items?.[idx]) return;
+        settings.fuel_transport.items[idx].targetQuantity = Math.max(1, qty);
+        ftEditingItemIndex = -1;
+        rerenderCurrentSettings();
+      }
+
+      function cancelFuelTransportItemEdit() {
+        ftEditingItemIndex = -1;
         rerenderCurrentSettings();
       }
 

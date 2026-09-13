@@ -67,7 +67,7 @@ import {
   stockAfterburnerConsumables,
 } from "./afterburner.js";
 import { queryRemoteMarket, resolveMarketSource, getMarketSourceInfo } from "../client_sync_hooks.js";
-import { queryLocalMarket } from "../market_local_source.js";
+import { queryLocalMarket, noteLocalMarketUnavailable } from "../market_local_source.js";
 import { readSellOutcome, type SellFill } from "./sellOutcome.js";
 
 const MOBILE_STATION_IDS = new Set(["mobile_capitol", "mobile_capital", "frontier_station"]);
@@ -3403,6 +3403,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
             if (!destBuyer || destBuyer.quantity <= 0) {
               ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer gone at ${route!.destPoiName} — aborting`);
+              noteLocalMarketUnavailable(route!.destSystem, route!.destBaseId || route!.destPoi || route!.destOriginalPoi, route!.itemId, "buy");
               // Flip this run to return-to-origin right now so we head home with
               // the cargo instead of parking at the nearest random (possibly
               // undockable) station. The bot must put it back where it got it.
@@ -3581,11 +3582,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               ctx.log("trade", "Trade session completed successfully");
             } else {
               ctx.log("error", "Fallback sell command did not remove items from cargo");
+              noteLocalMarketUnavailable(route!.destSystem, route!.destBaseId || route!.destPoi || route!.destOriginalPoi, route!.itemId, "buy");
               await failFactionSession(bot.username, "Sell command did not remove items from cargo");
             }
           } else {
             const minPrice = itemMinSellPrice > 0 ? ` (minimum: ${itemMinSellPrice}cr)` : "";
             ctx.log("trade", `No viable buy orders for ${route!.itemName} at ${route!.destPoiName}${minPrice} — skipping sell`);
+            noteLocalMarketUnavailable(route!.destSystem, route!.destBaseId || route!.destPoi || route!.destOriginalPoi, route!.itemId, "buy");
             await failFactionSession(bot.username, "No viable buy orders at destination");
           }
         } else {

@@ -20205,6 +20205,7 @@
         const autoMinPrice = fc.autoMinPrice || 30;
         const autoMaxPrice = fc.autoMaxPrice || 50;
         const maxFuelCellsPerStation = fc.maxFuelCellsPerStation || 20000;
+        const militaryFuelCellsCount = fc.militaryFuelCellsCount || 10;
         const remoteCheckDelayMs = fc.remoteCheckDelayMs || 500;
         const remoteUpdateIntervalMinutes = fc.remoteUpdateIntervalMinutes || 60;
         const skipOutposts = fc.skipOutposts !== false;
@@ -20326,6 +20327,14 @@
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Military Fuel Cells (reserve)</div>
+        <div class="setting-hint">Number of <code>military_fuel_cell</code> items to carry for own refueling (not for sale). These are withdrawn from faction storage alongside regular fuel cells and used when stations have no fuel for refueling. Default: 10.</div>
+      </div>
+      <input type="number" id="set-fc-militaryFuelCellsCount" min="0" max="200" value="${militaryFuelCellsCount}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Use Remote Market Query</div>
         <div class="setting-hint">When enabled (default), query other connected clients for fresh fuel cell prices when local view_market fails. Uses very low bandwidth (~200 bytes per query). Disable to fall back to original local-only behavior.</div>
       </div>
@@ -20435,6 +20444,10 @@
             parseInt(
               document.getElementById("set-fc-maxFuelCellsPerStation").value,
             ) || 20000,
+          militaryFuelCellsCount:
+            parseInt(
+              document.getElementById("set-fc-militaryFuelCellsCount").value,
+            ) || 10,
           useRemoteMarketQuery:
             document.getElementById("set-fc-useRemoteMarketQuery")?.value === "true",
           remoteCheckDelayMs: Math.max(

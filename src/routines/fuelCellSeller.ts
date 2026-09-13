@@ -48,6 +48,7 @@ import { queryRemoteMarket } from "../client_sync_hooks.js";
 
 const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
+const MILITARY_FUEL_CELL_ITEM_ID = "military_fuel_cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
 /** Curated list of NPC stations. Used only as an exemption list: an NPC station
  *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
@@ -556,6 +557,8 @@ export function getFuelCellSellerSettings(username?: string): {
   skipOutposts: boolean;
   /** How long a learned "no market"/"docking denied" verdict is trusted (ms). */
   relearnMs: number;
+  /** Number of military_fuel_cell items to carry for own refueling (not for sale). */
+  militaryFuelCellsCount: number;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -589,6 +592,7 @@ export function getFuelCellSellerSettings(username?: string): {
     relearnMs: Number.isFinite(rawRelearn) && rawRelearn > 0
       ? Math.round(rawRelearn * 60 * 60 * 1000)
       : DEFAULT_RELEARN_HOURS * 60 * 60 * 1000,
+    militaryFuelCellsCount: (fc.militaryFuelCellsCount as number) || 10,
   };
 }
 
@@ -943,7 +947,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshCargo();
 
     const fuelCellItem = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
+    const militaryFuelCellItem = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
     let cargoQty = fuelCellItem?.quantity ?? 0;
+    const militaryCargoQty = militaryFuelCellItem?.quantity ?? 0;
 
     const atHomeStation = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
@@ -973,7 +979,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
       await bot.refreshCargo();
       const postReturnCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
+      const postReturnMilitary = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
       cargoQty = postReturnCargo?.quantity ?? 0;
+      const militaryCargoQtyAfterReturn = postReturnMilitary?.quantity ?? 0;
     } else if (!atHomeStation && cargoQty > 0) {
       ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
@@ -992,13 +1000,22 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         ctx.log("fc", "No cargo at home station — attempting to withdraw from faction storage");
         
         const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        //const withdrawResp = await bot.exec("faction_withdraw_items", { item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), }); //fixed by human!
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
           await ctx.sleep(10000);
           continue;
+        }
+
+        // Withdraw military fuel cells alongside regular fuel cells
+        const milFreeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+        const milWithdrawQty = Math.min(settings.militaryFuelCellsCount, maxItemsForCargo(milFreeSpace, MILITARY_FUEL_CELL_ITEM_ID));
+        if (milWithdrawQty > 0) {
+          const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milWithdrawQty });
+          if (!milWithdrawResp.error) {
+            ctx.log("fc", `Withdrew ${milWithdrawQty}x military fuel cells from faction storage`);
+          }
         }
 
         // Wait for potential caching delays before refreshing cargo
@@ -1315,11 +1332,16 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
 
     const checkCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
+    const checkMilCargo = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
     if (checkCargo && checkCargo.quantity > 0) {
       ctx.log("fc", `Depositing ${checkCargo.quantity}x remaining fuel cells`);
       await ensureDocked(ctx);
-      //await bot.exec("faction_deposit_items", { item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, });
-      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, }); //fixed by human!
+      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, });
+    }
+    if (checkMilCargo && checkMilCargo.quantity > 0) {
+      ctx.log("fc", `Depositing ${checkMilCargo.quantity}x remaining military fuel cells`);
+      await ensureDocked(ctx);
+      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: checkMilCargo.quantity, });
     }
 
 

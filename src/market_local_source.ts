@@ -37,6 +37,11 @@ const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
  *  own freshness window. */
 export const LOCAL_MARKET_STALE_MS = 30 * 60 * 1000;
 
+/** Individual entries older than this are dropped from query results so traders
+ *  don't plan long trips on data that was already stale when they left. Overlay
+ *  entries (from a live market routine in this process) bypass this check. */
+const LOCAL_MARKET_ENTRY_STALE_MS = 10 * 60 * 1000;
+
 /** Don't re-stat the (large) market file more than this often. */
 const STAT_THROTTLE_MS = 2_000;
 
@@ -64,6 +69,9 @@ interface LocalMarketItem {
   buyOrders: MarketOrderDetail[];
   sellOrders: MarketOrderDetail[];
   lastUpdated: string;
+  /** 'overlay' = live observation from a market routine in this process;
+   *  undefined = came from the parsed marketDetails.json index. */
+  source?: "overlay" | "index";
 }
 
 interface RawMarketDetails {
@@ -176,6 +184,7 @@ export function noteLocalMarketObservation(
       buyOrders: item.buyOrders || [],
       sellOrders: item.sellOrders || [],
       lastUpdated: stamp,
+      source: "overlay",
     });
   }
   pruneOverlay();
@@ -212,22 +221,38 @@ export function clearLocalMarketOverlay(): void {
  *
  * Clears the sell side for that station+item in both the live overlay and the
  * in-memory file index. The next real observation from a market bot restores it.
+ *
+ * Pass `side: "buy"` to clear buy orders instead (used by faction traders when
+ * a destination station has no viable buyers).
  */
-export function noteLocalMarketUnavailable(systemId: string, stationPoiId: string, itemId: string): void {
+export function noteLocalMarketUnavailable(
+  systemId: string,
+  stationPoiId: string,
+  itemId: string,
+  side?: "buy" | "sell",
+): void {
   if (!systemId || !stationPoiId || !itemId) return;
   const stationKey = `${systemId}/${stationPoiId}`;
+  const clearSell = !side || side === "sell";
+  const clearBuy = !side || side === "buy";
 
   const byStation = overlay.get(itemId);
   const live = byStation?.get(stationKey);
-  if (live && live.sellOrders.length > 0) {
-    byStation!.set(stationKey, { ...live, sellOrders: [] });
+  if (live) {
+    const updated = { ...live };
+    if (clearSell && updated.sellOrders.length > 0) updated.sellOrders = [];
+    if (clearBuy && updated.buyOrders.length > 0) updated.buyOrders = [];
+    if (updated.sellOrders.length !== live.sellOrders.length || updated.buyOrders.length !== live.buyOrders.length) {
+      byStation!.set(stationKey, updated);
+    }
   }
 
   const indexed = index?.byItem.get(itemId);
   if (indexed) {
     for (const entry of indexed) {
-      if (entry.systemId === systemId && entry.stationPoiId === stationPoiId && entry.sellOrders.length > 0) {
-        entry.sellOrders = [];
+      if (entry.systemId === systemId && entry.stationPoiId === stationPoiId) {
+        if (clearSell && entry.sellOrders.length > 0) entry.sellOrders = [];
+        if (clearBuy && entry.buyOrders.length > 0) entry.buyOrders = [];
       }
     }
   }
@@ -526,7 +551,12 @@ async function buildMarketResults(
   const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId } = opts;
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
+  const now = Date.now();
   for (const item of byStation.values()) {
+    if (item.source !== "overlay") {
+      const entryAge = now - Date.parse(item.lastUpdated);
+      if (!Number.isFinite(entryAge) || entryAge > LOCAL_MARKET_ENTRY_STALE_MS) continue;
+    }
     const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
     if (!orders || orders.length === 0) continue;
     let filtered = orders.filter((o) => o.quantity >= minQuantity);

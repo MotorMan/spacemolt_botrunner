@@ -37,11 +37,6 @@ const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
  *  own freshness window. */
 export const LOCAL_MARKET_STALE_MS = 30 * 60 * 1000;
 
-/** Individual entries older than this are dropped from query results so traders
- *  don't plan long trips on data that was already stale when they left. Overlay
- *  entries (from a live market routine in this process) bypass this check. */
-const LOCAL_MARKET_ENTRY_STALE_MS = 10 * 60 * 1000;
-
 /** Don't re-stat the (large) market file more than this often. */
 const STAT_THROTTLE_MS = 2_000;
 
@@ -551,12 +546,7 @@ async function buildMarketResults(
   const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId } = opts;
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
-  const now = Date.now();
   for (const item of byStation.values()) {
-    if (item.source !== "overlay") {
-      const entryAge = now - Date.parse(item.lastUpdated);
-      if (!Number.isFinite(entryAge) || entryAge > LOCAL_MARKET_ENTRY_STALE_MS) continue;
-    }
     const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
     if (!orders || orders.length === 0) continue;
     let filtered = orders.filter((o) => o.quantity >= minQuantity);

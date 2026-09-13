@@ -26,11 +26,13 @@ function saveItemsToMarketDetails(
       buyOrders: MarketOrderDetail[];
       sellOrders: MarketOrderDetail[];
     }> = [];
+    const presentItemIds = new Set<string>();
 
     for (const item of items) {
       const itemId = (item.item_id as string) || (item.id as string) || "";
       const itemName = (item.name as string) || (item.item_name as string) || itemId;
       if (!itemId) continue;
+      presentItemIds.add(itemId);
 
       const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order) => ({
         price: (order.price_each as number) || (order.price as number) || 0,
@@ -42,10 +44,32 @@ function saveItemsToMarketDetails(
         quantity: (order.quantity as number) || 0,
       })).filter((order) => order.price > 0 && order.quantity > 0);
 
+      const prev = marketDetailsStore.getData().items.find(
+        i => i.systemId === systemId && i.stationPoiId === stationKey && i.itemId === itemId
+      );
+      const prevBuyCount = prev?.buyOrders.length ?? -1;
+      const prevSellCount = prev?.sellOrders.length ?? -1;
+      if (prevBuyCount >= 0 && buyOrders.length === 0 && prevBuyCount > 0) {
+        console.log(`[market] ${stationKey}/${itemId}: buy orders REMOVED (was ${prevBuyCount})`);
+      }
+      if (prevSellCount >= 0 && sellOrders.length === 0 && prevSellCount > 0) {
+        console.log(`[market] ${stationKey}/${itemId}: sell orders REMOVED (was ${prevSellCount})`);
+      }
+      if (prevBuyCount >= 0 && buyOrders.length > 0 && prevBuyCount === 0) {
+        console.log(`[market] ${stationKey}/${itemId}: buy orders ADDED (${buyOrders.length})`);
+      }
+      if (prevSellCount >= 0 && sellOrders.length > 0 && prevSellCount === 0) {
+        console.log(`[market] ${stationKey}/${itemId}: sell orders ADDED (${sellOrders.length})`);
+      }
+
       obs.push({ itemId, itemName, buyOrders, sellOrders });
     }
 
     if (obs.length) {
+      const removed = marketDetailsStore.removeStationItems(systemId, stationKey, presentItemIds);
+      if (removed > 0) {
+        console.log(`[market] Removed ${removed} stale item(s) from ${stationKey} (not in latest update)`);
+      }
       marketDetailsStore.upsertItems(systemId, stationKey, stationName, obs);
     }
     return obs;
@@ -92,6 +116,15 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
     const cb = (entry: import("../marketstreamstore.js").MarketStreamEntry | null) => {
       if (!entry || !entry.items.length) return;
       try {
+        const prevEntry = marketStreamStore.getMarket(baseId);
+        const prevItems = prevEntry?.items ?? [];
+        const prevItemIds = new Set(prevItems.map(i => (i.item_id as string) || (i.id as string) || ""));
+        const newItemIds = new Set(entry.items.map(i => (i.item_id as string) || (i.id as string) || ""));
+        const added = [...newItemIds].filter(id => id && !prevItemIds.has(id));
+        const removed = [...prevItemIds].filter(id => id && !newItemIds.has(id));
+        if (added.length > 0 || removed.length > 0) {
+          console.log(`[market] ${baseId}: +${added.length}/-${removed.length} items (${added.slice(0,3).join(", ")}${added.length > 3 ? "..." : ""} / ${removed.slice(0,3).join(", ")}${removed.length > 3 ? "..." : ""})`);
+        }
         const isMobileCapital = baseId === "frontier_station" || poiId === "frontier_station" || poiId === "mobile_capital" || poiId === "mobile_capitol";
         const stationKey = isMobileCapital ? "frontier_station" : poiId;
         saveItemsToMarketDetails(systemId, stationKey, stationName, entry.items as Array<Record<string, unknown>>);

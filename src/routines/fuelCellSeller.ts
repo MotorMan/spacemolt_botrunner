@@ -1000,22 +1000,31 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         ctx.log("fc", "No cargo at home station — attempting to withdraw from faction storage");
         
         const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
+        
+        // Withdraw military fuel cells FIRST (3 cargo each, 100 fuel each) so they
+        // don't get crowded out by plain fuel_cells filling the hold.
+        const milSize = 3;
+        const milToWithdraw = Math.min(
+          settings.militaryFuelCellsCount || 0,
+          Math.floor(freeSpace / milSize),
+        );
+        if (milToWithdraw > 0) {
+          const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
+          if (!milWithdrawResp.error) {
+            ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
+          }
+        }
+
+        // Wait for caching then refresh cargo to get updated free space
+        await ctx.sleep(2000);
+        await bot.refreshCargo();
+        const remainingSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(remainingSpace, FUEL_CELL_ITEM_ID), });
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
           await ctx.sleep(10000);
           continue;
-        }
-
-        // Withdraw military fuel cells alongside regular fuel cells
-        const milFreeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        const milWithdrawQty = Math.min(settings.militaryFuelCellsCount, maxItemsForCargo(milFreeSpace, MILITARY_FUEL_CELL_ITEM_ID));
-        if (milWithdrawQty > 0) {
-          const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milWithdrawQty });
-          if (!milWithdrawResp.error) {
-            ctx.log("fc", `Withdrew ${milWithdrawQty}x military fuel cells from faction storage`);
-          }
         }
 
         // Wait for potential caching delays before refreshing cargo

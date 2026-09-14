@@ -2489,7 +2489,7 @@ async function ensureFueledCore(
   }
 
   // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
-  if (opts?.skipBlacklist && opts?.homeSystem) {
+  if (opts?.skipBlacklist && opts?.homeSystem && bot.state === "running") {
     const homeSystem = opts.homeSystem;
     const globalHome = getGlobalHomeBase();
     // Resolve the home station POI id: prefer the explicitly passed one, fall back
@@ -2624,7 +2624,7 @@ if (looted > 0) {
   // Try several stations in turn. If the station we fly to turns out to be empty
   // on arrival (reserve depleted / no fuel cells), remember it for THIS search
   // and move on to the next reachable station instead of looping forever on a dead one.
-  for (let stationAttempt = 0; stationAttempt < 6; stationAttempt++) {
+  for (let stationAttempt = 0; stationAttempt < 6 && bot.state === "running"; stationAttempt++) {
     if (!nearest) {
       for (let attempt = 0; attempt < 4 && !nearest; attempt++) {
         const candidate = await findReachableFuelStation(ctx, {
@@ -3086,6 +3086,7 @@ export async function navigateToSystem(
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
+    if (bot.state !== "running") return false;
     // If the socket dropped (server restart / blip), pause here until it's back
     // rather than hammering route queries / jumps against a dead connection.
     // The dispatch layer also blocks per-command, so this is defense-in-depth.
@@ -3200,8 +3201,11 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-    const navHome = opts.skipBlacklist ? getGlobalHomeBase() : { system: "", station: "" };
-    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot, homeSystem: navHome.system, homeStation: navHome.station });
+// NOTE: intentionally omit homeSystem/homeStation here. navigateToSystem is
+// itself the navigation primitive; passing homeSystem into its internal fuel
+// check causes ensureFueledCore to recursively call navigateToSystem again,
+// creating an infinite loop whenever fuel is low.
+    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
       if (fueled === "in_battle") {
         // Not a fuel problem — we're in a fight, and jumps are rejected while in
         // battle anyway. Abort navigation so the caller resolves combat first

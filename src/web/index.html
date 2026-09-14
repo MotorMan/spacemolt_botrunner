@@ -31575,6 +31575,7 @@ ignoreBlacklist: document.getElementById(
         const h = settings.hunter || {};
         const currentSystem = h.system || "";
         const refuelThreshold = h.refuelThreshold ?? 40;
+        const returnHomeOnFuelCellsRemaining = h.returnHomeOnFuelCellsRemaining ?? 2;
         const repairThreshold = h.repairThreshold ?? 30;
         const fleeThreshold = h.fleeThreshold ?? 20;
         const shieldRechargePct = h.shieldRechargePct ?? 80;
@@ -31840,6 +31841,14 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-hint">Return to station to refuel when fuel drops below this percentage.</div>
       </div>
       <input type="number" id="set-hunter-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Return Home When Fuel Cells Remaining ≤</div>
+        <div class="setting-hint">Go home to deposit loot and resupply when the number of fuel cells in cargo drops to this value or below. Set to 0 to disable.</div>
+      </div>
+      <input type="number" id="set-hunter-returnHomeOnFuelCellsRemaining" min="0" max="100" value="${h.returnHomeOnFuelCellsRemaining ?? 2}">
     </div>
 
     <div class="setting-row">
@@ -32174,6 +32183,10 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-hunter-refuelThreshold").value,
             ) || 40,
+          returnHomeOnFuelCellsRemaining:
+            parseInt(
+              document.getElementById("set-hunter-returnHomeOnFuelCellsRemaining").value,
+            ) || 2,
           repairThreshold:
             parseInt(
               document.getElementById("set-hunter-repairThreshold").value,

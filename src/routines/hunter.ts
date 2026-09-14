@@ -424,6 +424,7 @@ function getHunterSettings(username?: string): {
   patrolCycleMode: PatrolCycleMode;
   system: string;
   refuelThreshold: number;
+  returnHomeOnFuelCellsRemaining: number;
   repairThreshold: number;
   fleeThreshold: number;
   shieldRechargePct: number;
@@ -501,6 +502,7 @@ function getHunterSettings(username?: string): {
     system: (botOverrides.system as string) || (h.system as string) || "",
     refuelThreshold: (h.refuelThreshold as number) || 40,
     repairThreshold: (h.repairThreshold as number) || 30,
+    returnHomeOnFuelCellsRemaining: (h.returnHomeOnFuelCellsRemaining as number) || 2,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
 onlyNPCs: (h.onlyNPCs as boolean) !== false,
@@ -619,6 +621,69 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
     .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
   return repair < minRepairKits || shields < minShieldCharges;
+}
+
+function countFuelCellsInInventory(inventory: any[] | undefined): number {
+  return (inventory || [])
+    .filter(i => {
+      const id = (i.itemId || "").toLowerCase();
+      return id === "fuel_cell" || id === "premium_fuel_cell" || id === "military_fuel_cell";
+    })
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+}
+
+async function returnToHomeAndResupply(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  const homeSystem = settings.homeSystem || "";
+  const homeStation = settings.homeStation || "";
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking...`);
+  try {
+    if (homeSystem && bot.system !== homeSystem) {
+      await ensureUndocked(ctx);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("warn", `Could not navigate to home system ${homeSystem} — docking wherever possible`);
+      }
+    }
+
+    let docked = false;
+    if (homeStation && homeStation.includes("|")) {
+      const parts = homeStation.split("|");
+      const poi = parts[1] || parts[0];
+      docked = await ensureDocked(ctx, true, 0, poi ? { targetStationId: poi } : undefined);
+    } else if (homeStation) {
+      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
+    } else {
+      docked = await ensureDocked(ctx);
+    }
+
+    if (!docked) {
+      ctx.log("error", "Could not dock at home base — loot not deposited");
+      return;
+    }
+
+    await ensureHunterResupply(ctx);
+    await collectFromStorage(ctx);
+    await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    await ensureInsured(ctx);
+    await bot.checkSkills();
+    await ensureUndocked(ctx);
+    ctx.log("info", "Resupplied at home base — resuming patrol");
+  } catch (e) {
+    ctx.log("error", `Error returning to home base: ${e}`);
+  }
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
@@ -1808,6 +1873,16 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       continue;
     }
 
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      justResupplied = true;
+      continue;
+    }
+
     // ── Cargo full? ──
     await bot.refreshCargo();
     const cargoPct0 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
@@ -2085,25 +2160,35 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 // ── Hull check — retreat to a high-security system to repair ──
      await bot.refreshShip();
      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-     if (hullPct <= settings.repairThreshold) {
-       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
-       yield "emergency_repair";
-       const docked = await navigateToSafeStation(ctx, safetyOpts);
-       if (docked) {
-         await completeActiveMissions(ctx);
-         await repairShip(ctx);
-         await tryRefuel(ctx, { skipApprovedCheck: true });
-         await checkAndAcceptMissions(ctx);
-         await ensureInsured(ctx);
-         await bot.checkSkills();
-         await ensureUndocked(ctx);
-         await resubscribeObservationAfterMove(bot);
-       }
-       continue;
-     }
+if (hullPct <= settings.repairThreshold) {
+        ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
+        yield "emergency_repair";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (docked) {
+          await completeActiveMissions(ctx);
+          await repairShip(ctx);
+          await tryRefuel(ctx, { skipApprovedCheck: true });
+          await checkAndAcceptMissions(ctx);
+          await ensureInsured(ctx);
+          await bot.checkSkills();
+          await ensureUndocked(ctx);
+          await resubscribeObservationAfterMove(bot);
+        }
+        continue;
+      }
 
-    // ── Faction alert check — divert if an ally is nearby and under attack ──
-    yield "faction_alert_check";
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+  
+
+      // ── Faction alert check — divert if an ally is nearby and under attack ──
+      yield "faction_alert_check";
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
     if (alertTarget) {
       // CRITICAL: Check for existing battle before navigating
@@ -2732,12 +2817,22 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
          await bot.checkSkills();
          await ensureUndocked(ctx);
          await resubscribeObservationAfterMove(bot);
-       }
-       continue;
-     }
- 
-     // ── Faction alert check — divert if an ally is nearby and under attack ──
-     yield "faction_alert_check";
+        }
+        continue;
+      }
+
+
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
+      // ── Faction alert check — divert if an ally is nearby and under attack ──
+      yield "faction_alert_check";
      const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
      if (alertTarget && alertTarget === bot.system) {
        ctx.log("combat", `Faction alert! Responding in current system`);
@@ -3240,6 +3335,15 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       continue;
     }
 
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     // ── Faction alert check — only respond if in current system ──
     yield "faction_alert_check";
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
@@ -3463,6 +3567,15 @@ async function* pvpRoutine(ctx: RoutineContext): AsyncGenerator<string, void, vo
     await bot.refreshShip();
     logStatus(ctx);
 
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     // ── Ammo reload (in place, no travel) ──
     await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
 
@@ -3662,6 +3775,15 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
     const death = await handleDeath(ctx, s);
     if (death === "stop") return;
     if (death === "wait") continue;
+
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (s.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= s.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, s);
+      continue;
+    }
 
     // ── Instant battle detection via lib push events ──
     // bot.isInBattle() is set by the library the moment a battle push arrives
@@ -4122,6 +4244,15 @@ async function* fleetModeRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
       if (death === "wait") continue;
     }
 
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     // ── Detect: push flag first (free), slow API probe as missed-push insurance ──
     const pushDetected = bot.isInBattle();
     let status: FleetBattleSnapshot | null = null;
@@ -4238,6 +4369,15 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     const death = await handleDeath(ctx, settings);
     if (death === "stop") return;
     if (death === "wait") continue;
+
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
 
     const patrolList = settings.patrolSystems || [];
     if (patrolList.length === 0) {
@@ -4720,6 +4860,15 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     if (death === "stop") return;
     if (death === "wait") continue;
 
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      continue;
+    }
+
     const cycleMode = settings.patrolCycleMode || "sequential";
     let targetIndex: number;
 
@@ -4901,6 +5050,15 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const death = await handleDeath(ctx, currentSettings);
     if (death === "stop") return;
     if (death === "wait") continue;
+
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (currentSettings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= currentSettings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, currentSettings);
+      continue;
+    }
 
     const currentSafetyOpts = {
       fuelThresholdPct: currentSettings.refuelThreshold,
@@ -6482,6 +6640,15 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
         await ensureUndocked(ctx);
         await resubscribeObservationAfterMove(bot);
       }
+      continue;
+    }
+
+    // ── Low fuel cells check ──
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+      await returnToHomeAndResupply(ctx, settings);
       continue;
     }
 

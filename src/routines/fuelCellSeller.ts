@@ -1006,11 +1006,15 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if ((needRegular || needMilitary) && atHomeStationAfterMaintenance) {
       ctx.log("fc", `At home station — loading fuel cells (regular: ${cargoAfterMaintenance}, military: ${militaryAfterMaintenance}/${milTarget})`);
 
-      const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+      const cargoMax = bot.cargoMax || 825;
+      const cargoUsed = bot.cargo || 0;
+      const freeSpace = Math.max(0, cargoMax - cargoUsed);
 
-      // Step 1: top up military fuel cells first
-      const milSize = 3;
-      const milToWithdraw = Math.min(milDeficit, Math.floor(freeSpace / milSize));
+      // Compute both quantities from the SAME freeSpace snapshot so they can't
+      // disagree. Military cells cost 3 cargo each, regular cost 1 each.
+      const milToWithdraw = Math.min(milDeficit, Math.floor(freeSpace / 3));
+      const regularQty = Math.max(0, freeSpace - milToWithdraw * 3);
+
       if (milToWithdraw > 0) {
         const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
         if (milWithdrawResp.error) {
@@ -1020,15 +1024,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
       }
 
-      // Step 2: wait for cache, then load regular fuel cells into whatever space remains
-      await ctx.sleep(2000);
-      await bot.refreshCargo();
-      const remainingSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-      const regularQty = maxItemsForCargo(remainingSpace, FUEL_CELL_ITEM_ID);
-
       if (regularQty > 0) {
         const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: regularQty });
-
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
           await ctx.sleep(10000);

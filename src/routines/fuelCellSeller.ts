@@ -947,9 +947,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshCargo();
 
     const fuelCellItem = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const militaryFuelCellItem = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
     let cargoQty = fuelCellItem?.quantity ?? 0;
-    const militaryCargoQty = militaryFuelCellItem?.quantity ?? 0;
 
     const atHomeStation = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
@@ -992,59 +990,68 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     await bot.refreshCargo();
     const currentFuelCellCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
+    const currentMilitaryCargo = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
     const cargoAfterMaintenance = currentFuelCellCargo?.quantity ?? 0;
+    const militaryAfterMaintenance = currentMilitaryCargo?.quantity ?? 0;
     const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
-    if (cargoAfterMaintenance <= 0) {
-      if (atHomeStationAfterMaintenance) {
-        ctx.log("fc", "No cargo at home station — attempting to withdraw from faction storage");
-        
-        const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        
-        // Withdraw military fuel cells FIRST (3 cargo each, 100 fuel each) so they
-        // don't get crowded out by plain fuel_cells filling the hold.
-        const milSize = 3;
-        const milToWithdraw = Math.min(
-          settings.militaryFuelCellsCount || 0,
-          Math.floor(freeSpace / milSize),
-        );
-        if (milToWithdraw > 0) {
-          const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
-          if (!milWithdrawResp.error) {
-            ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
-          }
-        }
+    // Load both regular sellable fuel cells and military reserve cells when at home.
+    // Military cells are withdrawn first (3 cargo each) so they can't be crowded out
+    // by plain fuel_cells filling the hold.
+    const milTarget = settings.militaryFuelCellsCount || 0;
+    const milDeficit = Math.max(0, milTarget - militaryAfterMaintenance);
+    const needRegular = cargoAfterMaintenance <= 0;
+    const needMilitary = milDeficit > 0;
 
-        // Wait for caching then refresh cargo to get updated free space
-        await ctx.sleep(2000);
-        await bot.refreshCargo();
-        const remainingSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(remainingSpace, FUEL_CELL_ITEM_ID), });
+    if ((needRegular || needMilitary) && atHomeStationAfterMaintenance) {
+      ctx.log("fc", `At home station — loading fuel cells (regular: ${cargoAfterMaintenance}, military: ${militaryAfterMaintenance}/${milTarget})`);
+
+      const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+
+      // Step 1: top up military fuel cells first
+      const milSize = 3;
+      const milToWithdraw = Math.min(milDeficit, Math.floor(freeSpace / milSize));
+      if (milToWithdraw > 0) {
+        const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
+        if (milWithdrawResp.error) {
+          ctx.log("error", `Military fuel cell withdraw failed: ${milWithdrawResp.error.message}`);
+        } else {
+          ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
+        }
+      }
+
+      // Step 2: wait for cache, then load regular fuel cells into whatever space remains
+      await ctx.sleep(2000);
+      await bot.refreshCargo();
+      const remainingSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
+      const regularQty = maxItemsForCargo(remainingSpace, FUEL_CELL_ITEM_ID);
+
+      if (regularQty > 0) {
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: regularQty });
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
           await ctx.sleep(10000);
           continue;
         }
+      }
 
-        // Wait for potential caching delays before refreshing cargo
-        await ctx.sleep(2000);
-        await bot.refreshCargo();
-        const afterWithdraw = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-        const newCargoQty = afterWithdraw?.quantity ?? 0;
+      await ctx.sleep(2000);
+      await bot.refreshCargo();
+      const finalRegular = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID)?.quantity ?? 0;
+      const finalMil = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID)?.quantity ?? 0;
 
-        if (newCargoQty <= 0) {
-          ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
-          await ctx.sleep(10000);
-          continue;
-        }
-
-        ctx.log("fc", `Withdrew ${newCargoQty}x fuel cells from faction storage`);
-        cargoQty = newCargoQty;
-      } else {
-        ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
+      if (finalRegular <= 0 && finalMil <= 0) {
+        ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
+        await ctx.sleep(10000);
         continue;
       }
+
+      ctx.log("fc", `Loaded ${finalRegular}x fuel cells and ${finalMil}x military fuel cells`);
+      cargoQty = finalRegular;
+    } else if (needRegular && !atHomeStationAfterMaintenance) {
+      ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
+      continue;
     }
 
     let targetIdx = getNextStation(fcData, settings, cycleFilters);

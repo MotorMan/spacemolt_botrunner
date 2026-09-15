@@ -195,6 +195,62 @@ function isBrandedCreature(name: string | undefined): boolean {
 }
 
 /**
+ * Sort combat targets so the hunter always engages the most valuable pirate
+ * first. Ordering (highest priority first):
+ *
+ *   1. Non-station pirates sorted by tier (desc) → shield% (desc) → hull% (desc)
+ *      Higher-tier ships and those with more shields/hull remaining are engaged
+ *      first so the hunter focuses fire on the biggest threat before it can
+ *      damage us.
+ *   2. Stations are ALWAYS deprioritised to the end of the list. Boarding is not
+ *      currently supported on stations, and auto-targeting stations while active
+ *      pirates are still firing on us is wasteful. A station is only ever
+ *      auto-targeted when it is the very last NPC/pirate entity in the fight.
+ */
+function sortTargetsByPriority(targets: NearbyEntity[]): NearbyEntity[] {
+  const TIER_ORDER: Record<string, number> = {
+    small: 1,
+    medium: 2,
+    large: 3,
+    capitol: 4,
+    boss: 5,
+  };
+
+  function tierScore(e: NearbyEntity): number {
+    return TIER_ORDER[(e.tier || "").toLowerCase()] || 0;
+  }
+  function shieldPct(e: NearbyEntity): number {
+    if (!e.shield || !e.maxShield || e.maxShield <= 0) return 0;
+    return e.shield / e.maxShield;
+  }
+  function hullPct(e: NearbyEntity): number {
+    if (!e.hull || !e.maxHull || e.maxHull <= 0) return 0;
+    return e.hull / e.maxHull;
+  }
+
+  const stations: NearbyEntity[] = [];
+  const pirates: NearbyEntity[] = [];
+
+  for (const e of targets) {
+    if (isStationEntity(e)) {
+      stations.push(e);
+    } else {
+      pirates.push(e);
+    }
+  }
+
+  pirates.sort((a, b) => {
+    const td = tierScore(b) - tierScore(a);
+    if (td !== 0) return td;
+    const sd = shieldPct(b) - shieldPct(a);
+    if (sd !== 0) return sd;
+    return hullPct(b) - hullPct(a);
+  });
+
+  return [...pirates, ...stations];
+}
+
+/**
  * Used by the reactive battle-join paths (API battle detection while scanning /
  * navigating). If a battle we are NOT already part of contains a NON-leviathan
  * creature that another hunter is already fighting, we skip it — that creature is
@@ -2026,14 +2082,16 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           let targets = [...creatures, ...pirates];
           targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
-          if (targets.length === 0) {
+          const targetsToEngage = sortTargetsByPriority(targets);
+
+          if (targetsToEngage.length === 0) {
             // POI currently clear — stop re-scanning this POI for now
             break;
           }
 
           ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
 
-          for (const target of targets) {
+          for (const target of targetsToEngage) {
             if (bot.state !== "running") break;
 
             await bot.refreshShip();
@@ -2444,7 +2502,7 @@ if (hullPct <= settings.repairThreshold) {
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
+               const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)]);
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
@@ -2475,25 +2533,7 @@ if (hullPct <= settings.repairThreshold) {
       const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets2.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets2.filter(e => isStationEntity(e));
-
-      let targetsToEngage: NearbyEntity[];
-      if (settings.targetRandomly) {
-        const shuffledNonStation = [...nonStationTargets];
-        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
-        }
-        const shuffledStation = [...stationTargets];
-        for (let i = shuffledStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
-        }
-        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
-      } else {
-        targetsToEngage = [...nonStationTargets, ...stationTargets];
-      }
+      const targetsToEngage = sortTargetsByPriority(allTargets2);
 
       if (targetsToEngage.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -2952,7 +2992,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
+               const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)]);
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
@@ -2983,25 +3023,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const allTargets2 = allTargets;
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${poi.name}`);
 
-      const nonStationTargets = allTargets2.filter(e => !isStationEntity(e));
-      const stationTargets = allTargets2.filter(e => isStationEntity(e));
-
-      let targetsToEngage: NearbyEntity[];
-      if (settings.targetRandomly) {
-        const shuffledNonStation = [...nonStationTargets];
-        for (let i = shuffledNonStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledNonStation[i], shuffledNonStation[j]] = [shuffledNonStation[j], shuffledNonStation[i]];
-        }
-        const shuffledStation = [...stationTargets];
-        for (let i = shuffledStation.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [shuffledStation[i], shuffledStation[j]] = [shuffledStation[j], shuffledStation[i]];
-        }
-        targetsToEngage = [...shuffledNonStation, ...shuffledStation];
-      } else {
-        targetsToEngage = [...nonStationTargets, ...stationTargets];
-      }
+      const targetsToEngage = sortTargetsByPriority(allTargets2);
 
       if (targetsToEngage.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -3388,7 +3410,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               bot.trackNearbyPlayers(scanNearby.result);
               bot.trackWildlife(scanNearby.result);
               const scanEntities = parseNearby(scanNearby.result);
-              const scanTargets = [...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)];
+               const scanTargets = sortTargetsByPriority([...scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) && !isStationEntity(e)), ...pickCreatureTargets(scanEntities, bot.username, settings.huntCreatures, settings.maxCreaturesPerScan)]);
               for (const t of scanTargets) {
                 await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
               }
@@ -3417,8 +3439,16 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       ctx.log("combat", `Found ${pirate_targets.length} pirate(s), ${creature_targets.length} creature(s) at ${originalPoi}`);
 
+      const targetsToEngage = sortTargetsByPriority(targets);
+
+      if (targetsToEngage.length === 0) {
+        ctx.log("combat", `No targets at ${originalPoi}`);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+        continue;
+      }
+
 // Engage each target
-      for (const target of targets) {
+      for (const target of targetsToEngage) {
         if (bot.state !== "running") break;
 
         await bot.refreshShip();

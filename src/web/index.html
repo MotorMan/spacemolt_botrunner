@@ -6173,12 +6173,31 @@
         const routine =
           bot.routine ||
           (bot.state !== "running" ? getProfileSelectedRoutine() : null);
-        if (routine !== "miner" && routine !== "explorer") return "";
+        if (routine !== "miner" && routine !== "explorer" && routine !== "lb_c_ref") return "";
 
         const botSettings = settings[bot.username] || {};
-        const globalMiner = settings.miner || {};
+        const globalLbCRef = settings.lb_c_ref || {};
+        const lbCRef = (botSettings.lb_c_ref || globalLbCRef) as Record<string, unknown>;
 
-        // Resolve effective primary/secondary from legacy or new fields
+        if (routine === "lb_c_ref") {
+          return `
+    <div class="profile-card">
+      <div class="profile-card-header">LB-C-ReF Settings</div>
+      <div class="profile-card-body">
+        <div class="stat-grid" style="gap:6px 8px">
+          <span class="sl">Refuel Target</span>
+          <input type="text" id="pbs-lbcref-target" value="${esc((lbCRef.refuelTarget as string) || "")}" placeholder="bot username" style="font-size:11px;padding:2px 4px;width:120px">
+          <span class="sl">Interval (ms)</span>
+          <input type="number" id="pbs-lbcref-interval" value="${(lbCRef.refuelIntervalMs as number) || 1000}" min="100" step="100" style="font-size:11px;padding:2px 4px;width:90px">
+          <span class="sl">Qty</span>
+          <input type="number" id="pbs-lbcref-qty" value="${(lbCRef.refuelQuantity as number) || 1}" min="1" max="100" style="font-size:11px;padding:2px 4px;width:70px">
+        </div>
+        <button class="primary sm" onclick="savePerBotLbCRefSettings()" style="margin-top:8px">Save LB-C-ReF</button>
+      </div>
+    </div>`;
+        }
+
+        const globalMiner = settings.miner || {};
         const primary =
           botSettings.depositMode === "gift"
             ? `bot:${botSettings.depositBot || ""}`
@@ -6226,7 +6245,7 @@
           return opts.join("");
         }
 
-        return `
+         return `
     <div class="profile-card">
       <div class="profile-card-header">Deposit Settings</div>
       <div class="profile-card-body">
@@ -6275,6 +6294,28 @@
           depositBot,
           depositMode,
           depositFallback,
+        });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function savePerBotLbCRefSettings() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const target = document.getElementById("pbs-lbcref-target")?.value || "";
+        const interval = parseInt(document.getElementById("pbs-lbcref-interval")?.value || "1000", 10);
+        const qty = parseInt(document.getElementById("pbs-lbcref-qty")?.value || "1", 10);
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, {
+          lb_c_ref: {
+            refuelTarget: target,
+            refuelIntervalMs: Number.isFinite(interval) ? interval : 1000,
+            refuelQuantity: Number.isFinite(qty) ? qty : 1,
+          },
         });
         send({
           type: "saveSettings",

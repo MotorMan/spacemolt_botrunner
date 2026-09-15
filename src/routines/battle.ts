@@ -1417,22 +1417,23 @@ async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): P
 }
 
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
- *  Prefers boss-like names when present. Returns null if no valid enemy is listed yet. */
+ *  Prefers boss-like names when present. Stations are excluded — they cannot be
+ *  attacked. Returns null if no valid enemy is listed yet. */
 function pickRealBattleTarget(
   status: BattleStatus | null | undefined,
   ourSideId?: number,
 ): NearbyEntity | null {
   if (!status?.participants || status.participants.length === 0) return null;
-  
+
   // Validate ourSideId - must be a valid number from the sides present
   const validSides = status.sides?.map(s => s.side_id) || [];
-  const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId)) 
-    ? ourSideId 
+  const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId))
+    ? ourSideId
     : status.your_side_id;
-  
+
   // If we still don't have a valid side, we can't determine enemies
   if (ourSide === undefined || ourSide === null) return null;
-  
+
   const enemies = status.participants.filter(p =>
     p.side_id !== ourSide &&
     !p.is_destroyed &&
@@ -1440,12 +1441,19 @@ function pickRealBattleTarget(
   );
   if (enemies.length === 0) return null;
 
+  const nonStation = enemies.filter(p => {
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
+  const source = nonStation.length > 0 ? nonStation : enemies;
+
   // Prefer serious threats / bosses by name (covers Overlord, Grand Marshal, etc.)
-  const bossish = enemies.find(p => {
+  const bossish = source.find(p => {
     const name = (p.username || p.player_id || "").toLowerCase();
     return /overlord|grand marshal|warlord|admiral|nyx|korr|boss|alpha|omega|prime|executioner|sentinel|apex|razor|striker/.test(name);
   });
-  const sortedByShields = enemies.sort(
+  const sortedByShields = source.sort(
     (a, b) =>
       (a.shield_pct ?? a.shield_percent ?? 100) -
       (b.shield_pct ?? b.shield_percent ?? 100),

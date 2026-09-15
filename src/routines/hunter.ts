@@ -5277,7 +5277,11 @@ function pickLowestShieldsEnemy(
   const enemies = status.participants.filter(
     p => side === undefined || p.side_id !== side,
   );
-  const nonStation = enemies.filter(p => (p.ship_class || "").toLowerCase() !== "station");
+  const nonStation = enemies.filter(p => {
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
   const source = nonStation.length > 0 ? nonStation : enemies;
   const alive = source.filter(p => !p.is_destroyed && (p.player_id || p.username));
   if (alive.length === 0) return null;
@@ -5589,7 +5593,9 @@ export async function boardingSubroutine(
         const nextEnemy = status.participants.find(p => {
           if (p.side_id === status.your_side_id || p.is_destroyed) return false;
           if (p.player_id === target.id || p.username === target.name) return false;
-          if ((p.ship_class || "").toLowerCase() === "station") return false;
+          const shipClass = (p.ship_class || "").toLowerCase();
+          const kind = (p as any).kind || "";
+          if (shipClass === "station" || kind.toLowerCase() === "station") return false;
           return true;
         });
         if (nextEnemy) {
@@ -5737,7 +5743,9 @@ export async function boardingSubroutine(
            const closerEnemy = status.participants.find(p => {
              if (p.side_id === status.your_side_id || p.is_destroyed) return false;
              if (p.player_id === target.id || p.username === target.name) return false;
-             if ((p.ship_class || "").toLowerCase() === "station") return false;
+             const shipClass = (p.ship_class || "").toLowerCase();
+             const kind = (p as any).kind || "";
+             if (shipClass === "station" || kind.toLowerCase() === "station") return false;
              return true;
            });
           
@@ -5749,6 +5757,7 @@ export async function boardingSubroutine(
             await bot.exec("battle", { action: "stance", stance: "fire" });
             boardingActive = false;
             boardStanceIssued = false;
+            return "captured";
           } else {
             // No more enemies — battle should end soon
             ctx.log("combat", `✅ No more enemies after capturing ${target.name} — awaiting battle end`);
@@ -5782,7 +5791,9 @@ export async function boardingSubroutine(
              const nextEnemy = status.participants.find(p => {
                if (p.side_id === status.your_side_id || p.is_destroyed) return false;
                if (p.player_id === target.id || p.username === target.name) return false;
-               if ((p.ship_class || "").toLowerCase() === "station") return false;
+               const shipClass = (p.ship_class || "").toLowerCase();
+               const kind = (p as any).kind || "";
+               if (shipClass === "station" || kind.toLowerCase() === "station") return false;
                return true;
              });
             if (nextEnemy) {

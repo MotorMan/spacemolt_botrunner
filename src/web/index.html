@@ -938,6 +938,7 @@
           <button onclick="switchShipyardView('forsale')" id="shipyardViewForsale">Ships For Sale</button>
           <button onclick="switchShipyardView('battle')" id="shipyardViewBattle">Battle Sim</button>
           <button onclick="switchShipyardView('pricing')" id="shipyardViewPricing">Ship Pricing Calc</button>
+          <button onclick="switchShipyardView('bulkgift')" id="shipyardViewBulkgift">Bulk Gift</button>
         </div>
         <div id="shipyardManageView" style="display: flex; flex: 1; min-height: 0; flex-direction: column; padding: 16px; gap: 16px; overflow: hidden; position: relative;">
           <div class="faction-layout" style="flex: 1; min-height: 0;">
@@ -960,6 +961,9 @@
         </div>
         <div id="shipyardPricingView" style="display: none; flex: 1; min-height: 0; position: relative;">
           <iframe id="shipPricingFrame" src="/shippricingcalc.html" style="position: absolute; inset: 0; width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+        <div id="shipyardBulkgiftView" style="display: none; flex: 1; min-height: 0; position: relative; padding: 16px; overflow: auto;">
+          <div id="bulkGiftContent"></div>
         </div>
       </div>
 
@@ -1696,10 +1700,13 @@
         document.getElementById("shipyardViewForsale").classList.toggle("active", view === "forsale");
         document.getElementById("shipyardViewBattle").classList.toggle("active", view === "battle");
         document.getElementById("shipyardViewPricing").classList.toggle("active", view === "pricing");
+        document.getElementById("shipyardViewBulkgift").classList.toggle("active", view === "bulkgift");
         document.getElementById("shipyardManageView").style.display = view === "manage" ? "" : "none";
         document.getElementById("shipyardForsaleView").style.display = view === "forsale" ? "" : "none";
         document.getElementById("shipyardBattleView").style.display = view === "battle" ? "" : "none";
         document.getElementById("shipyardPricingView").style.display = view === "pricing" ? "" : "none";
+        document.getElementById("shipyardBulkgiftView").style.display = view === "bulkgift" ? "" : "none";
+        if (view === "bulkgift") renderBulkGiftView();
         if (view === "forsale") {
           const frame = document.getElementById("shipsforsaleFrame");
           if (frame) frame.src = frame.src;
@@ -37940,6 +37947,311 @@ ignoreBlacklist: document.getElementById(
             }
           },
         );
+      }
+
+      // ── Bulk Gift ──────────────────────────────────────────────
+
+      let bulkGiftState = {
+        running: false,
+        stopRequested: false,
+        currentBot: null,
+        shipType: "",
+        numberStart: 1,
+        numberEnd: 999,
+        recipients: [],
+        giftedShips: [],
+        totalShips: 0,
+        giftedCount: 0,
+      };
+
+      function renderBulkGiftView() {
+        const container = document.getElementById("bulkGiftContent");
+        if (!container) return;
+
+        const botOptions = bots
+          .map((b) => `<option value="${esc(b.username)}">${esc(b.username)}</option>`)
+          .join("");
+
+        container.innerHTML = `
+          <div style="display:flex;gap:16px;flex-direction:column;height:100%">
+            <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+              <label style="font-size:12px;color:var(--text-dim)">Gifting Bot:</label>
+              <select id="bulkGiftBot" style="font-size:12px;padding:4px 8px" onchange="onBulkGiftBotChange()">
+                <option value="">-- select bot --</option>
+                ${botOptions}
+              </select>
+              <label style="font-size:12px;color:var(--text-dim)">Ship Type:</label>
+              <select id="bulkGiftShipType" style="font-size:12px;padding:4px 8px" onchange="onBulkGiftShipTypeChange()">
+                <option value="">-- select ship type --</option>
+              </select>
+              <span style="font-size:12px;color:var(--text-dim)">Ship # Range:</span>
+              <input type="number" id="bulkGiftNumStart" value="1" min="1" style="width:70px;font-size:12px;padding:4px" title="Start number (inclusive)">
+              <span style="font-size:12px;color:var(--text-dim)">to</span>
+              <input type="number" id="bulkGiftNumEnd" value="999" min="1" style="width:70px;font-size:12px;padding:4px" title="End number (inclusive)">
+              <button class="sm primary" id="bulkGiftStartBtn" onclick="startBulkGift()" disabled>Start Gifting</button>
+              <button class="sm danger" id="bulkGiftStopBtn" onclick="stopBulkGift()" disabled>Stop</button>
+            </div>
+            <div style="display:flex;gap:12px;flex:1;min-height:0">
+              <div style="flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px">
+                <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--text-bright)">Recipients</div>
+                <div id="bulkGiftRecipients" style="flex:1;overflow-y:auto;font-size:12px;display:flex;flex-direction:column;gap:3px">
+                  <span style="color:var(--text-dim)">Select a gifting bot to load recipients.</span>
+                </div>
+                <div style="margin-top:6px;display:flex;gap:6px">
+                  <button class="sm" onclick="bulkGiftSelectAllRecipients()">Select All</button>
+                  <button class="sm" onclick="bulkGiftInvertRecipients()">Invert</button>
+                  <button class="sm" onclick="bulkGiftClearRecipients()">Clear</button>
+                </div>
+              </div>
+              <div style="flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px">
+                <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--text-bright)">Progress Log</div>
+                <div id="bulkGiftLog" style="flex:1;overflow-y:auto;font-size:11px;font-family:monospace;white-space:pre-wrap;color:var(--text-dim)"></div>
+                <div style="margin-top:6px;display:flex;gap:8px;font-size:12px">
+                  <span>Matched Ships: <strong id="bulkGiftMatchedCount">0</strong></span>
+                  <span>Gifted: <strong id="bulkGiftGiftedCount">0</strong></span>
+                  <span>Failed: <strong id="bulkGiftFailedCount">0</strong></span>
+                  <span>Remaining Recipients: <strong id="bulkGiftRemainingCount">0</strong></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+        const recipContainer = document.getElementById("bulkGiftRecipients");
+        if (recipContainer) {
+          recipContainer.addEventListener("change", updateBulkGiftStartBtn);
+        }
+      }
+
+      function onBulkGiftBotChange() {
+        const bot = document.getElementById("bulkGiftBot").value;
+        bulkGiftState.currentBot = bot || null;
+        populateBulkGiftShipTypes(bot);
+        populateBulkGiftRecipients(bot);
+        updateBulkGiftStartBtn();
+      }
+
+      function onBulkGiftShipTypeChange() {
+        updateBulkGiftStartBtn();
+      }
+
+      function populateBulkGiftShipTypes(bot) {
+        const sel = document.getElementById("bulkGiftShipType");
+        if (!sel) return;
+        sel.innerHTML = '<option value="">-- select ship type --</option>';
+        if (!bot) return;
+
+        sendExec(bot, "list_ships", undefined, (result) => {
+          if (!result.ok || !result.data) return;
+          const ships = Array.isArray(result.data) ? result.data : result.data.ships || result.data.owned_ships || [];
+          const typeSet = new Set();
+          for (const s of ships) {
+            const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || "";
+            if (cls) typeSet.add(cls);
+          }
+          for (const t of Array.from(typeSet).sort()) {
+            const opt = document.createElement("option");
+            opt.value = t;
+            opt.textContent = t;
+            sel.appendChild(opt);
+          }
+        });
+      }
+
+      function populateBulkGiftRecipients(bot) {
+        const container = document.getElementById("bulkGiftRecipients");
+        if (!container) return;
+        container.innerHTML = '<span style="color:var(--text-dim)">Loading recipients...</span>';
+
+        const allBots = [...bots];
+        if (!bot) {
+          container.innerHTML = '<span style="color:var(--text-dim)">Select a gifting bot to load recipients.</span>';
+          return;
+        }
+
+        const options = allBots
+          .filter((b) => b.username !== bot)
+          .map((b) => `<label style="display:flex;align-items:center;gap:6px;padding:2px 4px;cursor:pointer;border-radius:3px" onmouseover="this.style.background='var(--bg-primary)'" onmouseout="this.style.background='transparent'"><input type="checkbox" value="${esc(b.username)}" class="bulk-gift-recipient-cb"> ${esc(b.username)}</label>`)
+          .join("");
+
+        container.innerHTML = options || '<span style="color:var(--text-dim)">No other bots available.</span>';
+      }
+
+      function bulkGiftSelectAllRecipients() {
+        document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = true));
+      }
+
+      function bulkGiftInvertRecipients() {
+        document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = !cb.checked));
+      }
+
+      function bulkGiftClearRecipients() {
+        document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = false));
+      }
+
+      function getSelectedRecipients() {
+        return Array.from(document.querySelectorAll(".bulk-gift-recipient-cb:checked")).map((cb) => cb.value);
+      }
+
+      function updateBulkGiftStartBtn() {
+        const btn = document.getElementById("bulkGiftStartBtn");
+        if (!btn) return;
+        const bot = document.getElementById("bulkGiftBot")?.value;
+        const shipType = document.getElementById("bulkGiftShipType")?.value;
+        const recipients = getSelectedRecipients();
+        btn.disabled = !bot || !shipType || recipients.length === 0;
+      }
+
+      function parseShipName(name) {
+        if (!name || typeof name !== "string") return { base: "", num: null };
+        const m = name.match(/^(.+?)\s*(\d+)\s*$/);
+        if (m) return { base: m[1].trim(), num: parseInt(m[2], 10) };
+        return { base: name.trim(), num: null };
+      }
+
+      async function startBulkGift() {
+        const bot = document.getElementById("bulkGiftBot").value;
+        const shipType = document.getElementById("bulkGiftShipType").value;
+        const numStart = parseInt(document.getElementById("bulkGiftNumStart").value, 10) || 1;
+        const numEnd = parseInt(document.getElementById("bulkGiftNumEnd").value, 10) || 999;
+        const recipients = getSelectedRecipients();
+
+        if (!bot || !shipType || recipients.length === 0) return;
+
+        bulkGiftState = {
+          running: true,
+          stopRequested: false,
+          currentBot: bot,
+          shipType: shipType,
+          numberStart: numStart,
+          numberEnd: numEnd,
+          recipients: [...recipients],
+          giftedShips: [],
+          totalShips: 0,
+          giftedCount: 0,
+        };
+
+        document.getElementById("bulkGiftStartBtn").disabled = true;
+        document.getElementById("bulkGiftStopBtn").disabled = false;
+        document.getElementById("bulkGiftLog").textContent = "Fetching fleet...\n";
+
+        try {
+          await bulkGiftFetchAndRun(bot, shipType, numStart, numEnd);
+        } catch (e) {
+          bulkGiftLog(`Error: ${e.message || e}`);
+        } finally {
+          bulkGiftState.running = false;
+          document.getElementById("bulkGiftStartBtn").disabled = false;
+          document.getElementById("bulkGiftStopBtn").disabled = true;
+          updateBulkGiftCounts();
+        }
+      }
+
+      function stopBulkGift() {
+        bulkGiftState.stopRequested = true;
+        bulkGiftLog("Stop requested...");
+      }
+
+      function bulkGiftLog(msg) {
+        const log = document.getElementById("bulkGiftLog");
+        if (!log) return;
+        log.textContent += msg + "\n";
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function updateBulkGiftCounts() {
+        const matched = document.getElementById("bulkGiftMatchedCount");
+        const gifted = document.getElementById("bulkGiftGiftedCount");
+        const failed = document.getElementById("bulkGiftFailedCount");
+        const remaining = document.getElementById("bulkGiftRemainingCount");
+        if (matched) matched.textContent = bulkGiftState.totalShips;
+        if (gifted) gifted.textContent = bulkGiftState.giftedCount;
+        if (remaining) remaining.textContent = bulkGiftState.recipients.length;
+      }
+
+      function bulkGiftFetchAndRun(bot, shipType, numStart, numEnd) {
+        return new Promise((resolve, reject) => {
+          sendExec(bot, "list_ships", undefined, (result) => {
+            if (!result.ok || !result.data) {
+              reject(new Error("Failed to fetch fleet"));
+              return;
+            }
+            const ships = Array.isArray(result.data) ? result.data : result.data.ships || result.data.owned_ships || [];
+            const matched = [];
+            for (const s of ships) {
+              const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || "";
+              if (cls !== shipType) continue;
+              const name = s.name || s.ship_name || "";
+              const { base, num } = parseShipName(name);
+              if (num == null) continue;
+              if (num < numStart || num > numEnd) continue;
+              matched.push({ ship: s, id: s.id || s.ship_id, name: name, num: num });
+            }
+            matched.sort((a, b) => a.num - b.num);
+            bulkGiftState.totalShips = matched.length;
+            updateBulkGiftCounts();
+            bulkGiftLog(`Found ${matched.length} matching ships (${shipType} #${numStart}-${numEnd})`);
+            if (matched.length === 0) {
+              resolve();
+              return;
+            }
+            bulkGiftLoop(bot, matched).then(resolve).catch(reject);
+          });
+        });
+      }
+
+      function bulkGiftLoop(bot, matchedShips) {
+        return new Promise((resolve, reject) => {
+          let index = 0;
+          let failedCount = 0;
+
+          function next() {
+            if (bulkGiftState.stopRequested) {
+              bulkGiftLog("Stopped by user.");
+              resolve();
+              return;
+            }
+            if (index >= matchedShips.length || bulkGiftState.recipients.length === 0) {
+              bulkGiftLog(`Done. Gifted ${bulkGiftState.giftedCount}/${matchedShips.length} ships.`);
+              resolve();
+              return;
+            }
+            const { ship, id, name, num } = matchedShips[index];
+            const recipient = bulkGiftState.recipients[0];
+            index++;
+            bulkGiftLog(`Gifting ${name} (#${num}) to ${recipient}...`);
+            sendExec(
+              bot,
+              "storage",
+              {
+                action: "deposit",
+                target: recipient,
+                quantity: 1,
+                item_id: id,
+              },
+              (result) => {
+                if (bulkGiftState.stopRequested) {
+                  next();
+                  return;
+                }
+                if (result.ok) {
+                  bulkGiftState.giftedCount++;
+                  bulkGiftState.recipients.shift();
+                  bulkGiftState.giftedShips.push({ shipId: id, name: name, recipient: recipient });
+                  bulkGiftLog(`  ✓ Gifted to ${recipient}`);
+                } else {
+                  failedCount++;
+                  bulkGiftLog(`  ✗ Failed: ${result.error || "unknown"} — removing recipient`);
+                  bulkGiftState.recipients.shift();
+                }
+                const failedEl = document.getElementById("bulkGiftFailedCount");
+                if (failedEl) failedEl.textContent = failedCount;
+                updateBulkGiftCounts();
+                next();
+              },
+            );
+          }
+          next();
+        });
       }
 
       /** Load a ship from station into the active carrier's storage (bay) */

@@ -6177,7 +6177,7 @@
 
         const botSettings = settings[bot.username] || {};
         const globalLbCRef = settings.lb_c_ref || {};
-        const lbCRef = (botSettings.lb_c_ref || globalLbCRef) as Record<string, unknown>;
+        const lbCRef = (botSettings.lb_c_ref || globalLbCRef) || {};
 
         if (routine === "lb_c_ref") {
           return `
@@ -6186,11 +6186,11 @@
       <div class="profile-card-body">
         <div class="stat-grid" style="gap:6px 8px">
           <span class="sl">Refuel Target</span>
-          <input type="text" id="pbs-lbcref-target" value="${esc((lbCRef.refuelTarget as string) || "")}" placeholder="bot username" style="font-size:11px;padding:2px 4px;width:120px">
+          <input type="text" id="pbs-lbcref-target" value="${esc((lbCRef.refuelTarget || ""))}" placeholder="bot username" style="font-size:11px;padding:2px 4px;width:120px">
           <span class="sl">Interval (ms)</span>
-          <input type="number" id="pbs-lbcref-interval" value="${(lbCRef.refuelIntervalMs as number) || 1000}" min="100" step="100" style="font-size:11px;padding:2px 4px;width:90px">
+          <input type="number" id="pbs-lbcref-interval" value="${(lbCRef.refuelIntervalMs || 1000)}" min="100" step="100" style="font-size:11px;padding:2px 4px;width:90px">
           <span class="sl">Qty</span>
-          <input type="number" id="pbs-lbcref-qty" value="${(lbCRef.refuelQuantity as number) || 1}" min="1" max="100" style="font-size:11px;padding:2px 4px;width:70px">
+          <input type="number" id="pbs-lbcref-qty" value="${(lbCRef.refuelQuantity || 1)}" min="1" max="100" style="font-size:11px;padding:2px 4px;width:70px">
         </div>
         <button class="primary sm" onclick="savePerBotLbCRefSettings()" style="margin-top:8px">Save LB-C-ReF</button>
       </div>

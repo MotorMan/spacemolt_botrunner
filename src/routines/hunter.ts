@@ -5164,7 +5164,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
 // marines, so the subroutine keeps an eye on hull and bails to fire/brace if
 // things go badly.
 
-const BOARD_MAX_TICKS = 90;
+const BOARD_MAX_TICKS = 90000;
 const BOARD_TICK_MS = 10000;
 
 /**

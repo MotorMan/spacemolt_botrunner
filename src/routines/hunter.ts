@@ -5266,6 +5266,7 @@ function resolveMarineCommitment(fitMarines: number, configured: number): number
 /**
  * Pick the enemy with the lowest shields from a battle status.
  * Used by boarding to ensure we engage the most vulnerable target.
+ * Stations are excluded — boarding is not currently supported on stations.
  */
 function pickLowestShieldsEnemy(
   status: NonNullable<Awaited<ReturnType<typeof getBattleStatus>>>,
@@ -5276,7 +5277,9 @@ function pickLowestShieldsEnemy(
   const enemies = status.participants.filter(
     p => side === undefined || p.side_id !== side,
   );
-  const alive = enemies.filter(p => !p.is_destroyed && (p.player_id || p.username));
+  const nonStation = enemies.filter(p => (p.ship_class || "").toLowerCase() !== "station");
+  const source = nonStation.length > 0 ? nonStation : enemies;
+  const alive = source.filter(p => !p.is_destroyed && (p.player_id || p.username));
   if (alive.length === 0) return null;
   const sorted = alive.sort(
     (a, b) =>
@@ -5586,6 +5589,7 @@ export async function boardingSubroutine(
         const nextEnemy = status.participants.find(p => {
           if (p.side_id === status.your_side_id || p.is_destroyed) return false;
           if (p.player_id === target.id || p.username === target.name) return false;
+          if ((p.ship_class || "").toLowerCase() === "station") return false;
           return true;
         });
         if (nextEnemy) {
@@ -5729,12 +5733,13 @@ export async function boardingSubroutine(
         if (boardingOp.phase === "victory") {
           ctx.log("combat", `✅ Boarding: CAPTURED ${target.name}!`);
           
-          // Switch to the next closest enemy instead of staying locked on the captured ship
-          const closerEnemy = status.participants.find(p => {
-            if (p.side_id === status.your_side_id || p.is_destroyed) return false;
-            if (p.player_id === target.id || p.username === target.name) return false;
-            return true;
-          });
+           // Switch to the next closest enemy instead of staying locked on the captured ship
+           const closerEnemy = status.participants.find(p => {
+             if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+             if (p.player_id === target.id || p.username === target.name) return false;
+             if ((p.ship_class || "").toLowerCase() === "station") return false;
+             return true;
+           });
           
           if (closerEnemy) {
             const newTargetName = closerEnemy.username || closerEnemy.player_id || "unknown";
@@ -5774,11 +5779,12 @@ export async function boardingSubroutine(
           // eligible enemy so we can continue boarding in the next iteration.
           const targetGone = !targetParticipant || targetParticipant.is_destroyed;
           if (targetGone) {
-            const nextEnemy = status.participants.find(p => {
-              if (p.side_id === status.your_side_id || p.is_destroyed) return false;
-              if (p.player_id === target.id || p.username === target.name) return false;
-              return true;
-            });
+             const nextEnemy = status.participants.find(p => {
+               if (p.side_id === status.your_side_id || p.is_destroyed) return false;
+               if (p.player_id === target.id || p.username === target.name) return false;
+               if ((p.ship_class || "").toLowerCase() === "station") return false;
+               return true;
+             });
             if (nextEnemy) {
               const newTargetName = nextEnemy.username || nextEnemy.player_id || "unknown";
               ctx.log("combat", `🎯 Target ${target.name} captured/eliminated — switching to ${newTargetName}`);

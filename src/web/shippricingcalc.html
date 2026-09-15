@@ -21,6 +21,7 @@
     .spc-ship-name { font-weight:600; color:var(--text-bright); flex:1; min-width:140px; }
     .spc-ship-class { font-size:11px; color:var(--text-dim); }
     .spc-ship-total { font-size:14px; font-weight:700; color:var(--green); font-family:monospace; }
+    .spc-ship-price { font-size:14px; font-weight:700; color:var(--green); font-family:monospace; }
     .spc-ship-body { display:none; padding:0 12px 12px 12px; border-top:1px solid var(--border); }
     .spc-ship.expanded .spc-ship-body { display:block; }
     .spc-section { margin-top:10px; }
@@ -68,6 +69,7 @@
     let remoteMarketCache = new Map();
     let shipList = [];
     let shipStates = new Map();
+    let shipPricing = new Map();
     let fetchQueue = [];
     let isProcessing = false;
     let fetchBot = '';
@@ -117,14 +119,14 @@
         const buyData = await buyRes.json();
         const itemEntry = catalog.items[key] || {};
         const baseValue = itemEntry.base_value || 0;
-        const refined = isRefinedOreProduct(itemId);
+        const baseMat = isBaseMaterial(itemId);
         const module = isShipModule(itemId);
         let bestSell = null;
         let bestBuy = null;
         if (sellData.ok && sellData.results && sellData.results.length > 0) {
           const filtered = sellData.results.filter(r => {
-            if (refined && r.price < 15) return false;
-            if (module && r.price < 1000) return false;
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
             if (baseValue > 0 && r.price < baseValue) return false;
             return true;
           });
@@ -135,8 +137,8 @@
         }
         if (buyData.ok && buyData.results && buyData.results.length > 0) {
           const filtered = buyData.results.filter(r => {
-            if (refined && r.price < 15) return false;
-            if (module && r.price < 1000) return false;
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
             if (baseValue > 0 && r.price < baseValue) return false;
             return true;
           });
@@ -175,6 +177,11 @@
       return /ingot|plate|sheet|rod|powder|alloy/.test(id) && !/ore/.test(id);
     }
 
+    function isBaseMaterial(itemId) {
+      const id = (itemId || '').toLowerCase();
+      return /ore|ingot|plate|sheet|rod|powder|alloy/.test(id);
+    }
+
     function isShipModule(itemId) {
       const id = (itemId || '').toLowerCase();
       return /module|shield|engine|weapon|cloak|cpu|drive|compressor|expander|harvester|stabilizer|projector|hardener|bay|mount/.test(id);
@@ -188,17 +195,20 @@
       }
       const itemEntry = catalog.items[key] || {};
       const baseValue = itemEntry.base_value || 0;
-      const refined = isRefinedOreProduct(itemId);
+      const baseMat = isBaseMaterial(itemId);
       const module = isShipModule(itemId);
       let bestSell = null;
       let bestBuy = null;
       for (const entry of entries) {
         for (const o of (entry.sellOrders || [])) {
+          if (baseMat && o.price < 10) continue;
+          if (module && o.price < 2000) continue;
+          if (baseValue > 0 && o.price < baseValue) continue;
           if (!bestSell || o.price < bestSell.price) bestSell = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
         for (const o of (entry.buyOrders || [])) {
-          if (refined && o.price < 15) continue;
-          if (module && o.price < 1000) continue;
+          if (baseMat && o.price < 10) continue;
+          if (module && o.price < 2000) continue;
           if (baseValue > 0 && o.price < baseValue) continue;
           if (!bestBuy || o.price > bestBuy.price) bestBuy = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
@@ -337,6 +347,7 @@
         try {
           const shipInfo = await fetchShipDetails(fetchBot, shipId);
           const pricing = await computeShipPricing(shipInfo);
+          shipPricing.set(shipId, pricing);
           shipStates.set(shipId, 'loaded');
           if (body) {
             body.innerHTML = renderShipBody(shipId, shipInfo, pricing);
@@ -423,16 +434,16 @@
       let html = '';
       for (const s of shipList) {
         const shipId = s.id || s.ship_id || '';
-        const name = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
-        const displayName = name ? name + ' - ' + shipId : shipId;
-        const cls = s.ship_class || s.shipClass || '';
+        const hullType = (s.ship_class || s.class_id || s.type || '').trim();
+        const customName = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
+        const displayName = hullType + (customName ? ' - ' + customName : '') + ' - ' + shipId;
         const state = shipStates.get(shipId) || 'pending';
         const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
           '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
-          '    <span class="spc-ship-class">' + esc(cls) + '</span>' +
           '    <span class="spc-ship-status" id="ship-status-' + shipId + '">' + statusText + '</span>' +
+          '    <span class="spc-ship-price" id="ship-price-' + shipId + '"></span>' +
           '  </div>' +
           '  <div class="spc-ship-body" id="ship-body-' + shipId + '" style="display:none">' +
           '    <div class="spc-empty">Click ship to load pricing details</div>' +
@@ -451,6 +462,15 @@
       else if (state === 'error') el.textContent = 'Error';
       else if (state === 'queued') el.textContent = 'Queued';
       else el.textContent = 'Click to load';
+      const priceEl = document.getElementById('ship-price-' + shipId);
+      if (priceEl) {
+        if (state === 'loaded') {
+          const pricing = shipPricing.get(shipId);
+          priceEl.textContent = pricing ? pricing.total.toLocaleString() + 'cr' : '';
+        } else {
+          priceEl.textContent = '';
+        }
+      }
     }
 
     function updateAllShipStatuses() {
@@ -494,8 +514,8 @@
       const ship = (shipInfo.ship && typeof shipInfo.ship === 'object') ? shipInfo.ship : shipInfo;
       const cls = ship.class_name || ship.ship_class || '';
       const shipName = (ship.name || ship.ship_name || '').trim();
-      const displayName = shipName ? shipName + ' - ' + shipId : shipId;
-      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--text-dim)">' + esc(cls) + '</span></div>';
+      const displayName = cls + (shipName ? ' - ' + shipName : '') + ' - ' + shipId;
+      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--green);font-family:monospace;font-weight:700">' + pricing.total.toLocaleString() + 'cr</span></div>';
       html += '<div class="spc-section">';
       html += '<div class="spc-section-title">Hull Build Materials</div>';
       html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
@@ -512,7 +532,7 @@
         for (const m of pricing.modules) {
           html += '<tr><td>' + esc(m.modTypeId) + '</td><td class="spc-cost">' + m.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (m.source === 'market' ? 'market' : m.source === 'recipe' ? 'base' : m.source === 'base' ? 'base' : 'missing') + '">' + m.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(m.detail) + '</td></tr>';
         }
-        html += '</tbody></table>';
+        html += '</tbody><tfoot><tr><td colspan="2" style="text-align:right;font-weight:600">Modules Total</td><td class="spc-total">' + pricing.modules.reduce((sum, m) => sum + m.cost, 0).toLocaleString() + '</td><td></td></tr></tfoot></table>';
         const recipeMods = pricing.modules.filter(m => m.source === 'recipe' && m.recipeLines && m.recipeLines.length > 0);
         if (recipeMods.length > 0) {
           html += '<div style="margin-top:8px"><div class="spc-section-title">Module Recipe Materials</div>';

@@ -68,9 +68,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!resp.error) {
         refuelCount++;
         failCount = 0;
-        if (refuelCount % 50 === 0) {
-          ctx.log("system", `LB-C-ReF: refuelCount=${refuelCount} target=${settings.refuelTarget}`);
-        }
+        ctx.log("system", `LB-C-ReF: #${refuelCount} OK target=${settings.refuelTarget} qty=${settings.refuelQuantity}`);
       } else {
         failCount++;
         const msg = String(resp.error.message || "").toLowerCase();
@@ -79,7 +77,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
           await ctx.sleep(10000);
           continue;
         }
-        ctx.log("warn", `LB-C-ReF refuel error: ${resp.error.message}`);
+        ctx.log("warn", `LB-C-ReF refuel FAILED: ${resp.error.message}`);
         if (failCount >= 5) {
           ctx.log("error", `LB-C-ReF: ${failCount} consecutive refuel failures — breaking to dock`);
           break;

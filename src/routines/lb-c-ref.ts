@@ -3,7 +3,6 @@ import { enableCloakingIfPossible, ensureDocked, ensureUndocked, sleep, readSett
 
 interface LbCRefSettings {
   refuelTarget: string;
-  refuelIntervalMs: number;
   refuelQuantity: number;
 }
 
@@ -15,7 +14,6 @@ function getLbCRefSettings(botUsername?: string): LbCRefSettings {
   const raw = { ...global, ...botLbCRef };
   return {
     refuelTarget: typeof raw.refuelTarget === "string" ? raw.refuelTarget : "",
-    refuelIntervalMs: typeof raw.refuelIntervalMs === "number" ? raw.refuelIntervalMs : 1000,
     refuelQuantity: typeof raw.refuelQuantity === "number" ? raw.refuelQuantity : 1,
   };
 }
@@ -46,6 +44,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
 
     yield "refuel_loop";
     let refuelCount = 0;
+    let failCount = 0;
     while (bot.state === "running") {
       await bot.refreshShip();
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
@@ -65,19 +64,36 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
         target: settings.refuelTarget,
         quantity: settings.refuelQuantity,
       });
+
       if (!resp.error) {
         refuelCount++;
-        if (refuelCount % 100 === 0) {
+        failCount = 0;
+        if (refuelCount % 50 === 0) {
           ctx.log("system", `LB-C-ReF: refuelCount=${refuelCount} target=${settings.refuelTarget}`);
         }
       } else {
+        failCount++;
         const msg = String(resp.error.message || "").toLowerCase();
-        if (!/rate limit|too many requests|temporarily blocked/.test(msg)) {
-          ctx.log("warn", `LB-C-ReF refuel error: ${resp.error.message}`);
+        if (/rate limit|too many requests|temporarily blocked/.test(msg)) {
+          ctx.log("warn", `LB-C-ReF rate limited — backing off 10s`);
+          await ctx.sleep(10000);
+          continue;
+        }
+        ctx.log("warn", `LB-C-ReF refuel error: ${resp.error.message}`);
+        if (failCount >= 5) {
+          ctx.log("error", `LB-C-ReF: ${failCount} consecutive refuel failures — breaking to dock`);
+          break;
         }
       }
 
-      await ctx.sleep(settings.refuelIntervalMs);
+      const notifications = (resp as any).notifications || [];
+      for (const n of notifications) {
+        const notification = (n || {}) as Record<string, unknown>;
+        const notifMsg = ((notification.data as Record<string, unknown>) || {}).message as string || notification.message as string || "";
+        if (notifMsg) {
+          ctx.log("rescue", `LB-C-ReF notification: ${notifMsg}`);
+        }
+      }
     }
 
     yield "dock_and_refuel";

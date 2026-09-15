@@ -6187,8 +6187,6 @@
         <div class="stat-grid" style="gap:6px 8px">
           <span class="sl">Refuel Target</span>
           <input type="text" id="pbs-lbcref-target" value="${esc((lbCRef.refuelTarget || ""))}" placeholder="bot username" style="font-size:11px;padding:2px 4px;width:120px">
-          <span class="sl">Interval (ms)</span>
-          <input type="number" id="pbs-lbcref-interval" value="${(lbCRef.refuelIntervalMs || 1000)}" min="100" step="100" style="font-size:11px;padding:2px 4px;width:90px">
           <span class="sl">Qty</span>
           <input type="number" id="pbs-lbcref-qty" value="${(lbCRef.refuelQuantity || 1)}" min="1" max="100" style="font-size:11px;padding:2px 4px;width:70px">
         </div>
@@ -6307,13 +6305,11 @@
         const bot = getProfileBot();
         if (!bot) return;
         const target = document.getElementById("pbs-lbcref-target")?.value || "";
-        const interval = parseInt(document.getElementById("pbs-lbcref-interval")?.value || "1000", 10);
         const qty = parseInt(document.getElementById("pbs-lbcref-qty")?.value || "1", 10);
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, {
           lb_c_ref: {
             refuelTarget: target,
-            refuelIntervalMs: Number.isFinite(interval) ? interval : 1000,
             refuelQuantity: Number.isFinite(qty) ? qty : 1,
           },
         });

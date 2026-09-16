@@ -1293,17 +1293,12 @@ function findMoveJobs(
     }
 
     // Delivered progress. The settings mirror (`configItem.totalDelivered`) is
-    // the AUTHORITATIVE, reconcilable count (it is what the "Reconcile" button
-    // writes and what the dashboard shows). The activity-log progress is a
-    // fleet-wide cumulative that was previously NEVER cleared by a reset, so
-    // using Math.max() here let a stale activity-store value override a reset
-    // settings mirror and make the bot believe everything was already delivered
-    // (skipping every item). Prefer the settings mirror; only fall back to the
-    // activity store when the settings entry has no value at all. Both are kept
-    // in sync by updateDeliveryTracking during normal delivery.
-    const delivered = configItem.totalDelivered !== undefined
-      ? (configItem.totalDelivered || 0)
-      : (getItemProgress(bot.username, configItem.itemId)?.totalDelivered || 0);
+     // the AUTHORITATIVE, reconcilable count. Prefer it exclusively; the
+     // activity-log progress was previously never cleared by a reset and could
+     // drift ahead of reality, making the bot believe everything was already
+     // delivered and skip every item. updateDeliveryTracking keeps both in sync
+     // during normal delivery, so settings alone is sufficient.
+     const delivered = configItem.totalDelivered || 0;
 
     // Skip if this item's delivery target (if configured) is already met.
     if (configItem.totalToDeliver !== undefined && configItem.totalToDeliver > 0) {
@@ -1322,26 +1317,26 @@ function findMoveJobs(
     // Also count what's already in cargo hold
     const inCargo = bot.inventory.find(i => i.itemId === configItem.itemId)?.quantity || 0;
 
+    // Determine destination station early so inCargoForDest can use it.
+    const effectiveDestStation = configItem.shipLoadoutDestination || settings.destinationStation;
+    const effectiveDestSystem = resolveStationSystem(effectiveDestStation) || destSystem;
+
     // Only count cargo that is actually destined for this destination
     // (same shipLoadoutDestination or global destination).
     const inCargoForDest = bot.inventory
-      .filter((i) => {
-        if (i.itemId !== configItem.itemId) return false;
-        const ci = settings.items.find((item) => item.itemId === i.itemId);
-        if (!ci) return false;
-        const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
-        return itemDest === effectiveDestStation;
-      })
-      .reduce((sum, i) => sum + i.quantity, 0);
+       .filter((i) => {
+         if (i.itemId !== configItem.itemId) return false;
+         const ci = settings.items.find((item) => item.itemId === i.itemId);
+         if (!ci) return false;
+         const itemDest = ci.shipLoadoutDestination || settings.destinationStation;
+         return itemDest === effectiveDestStation;
+       })
+       .reduce((sum, i) => sum + i.quantity, 0);
 
-    // Total available = in storage + already in cargo
-    const totalAvailable = inStorage + inCargo;
-    
-    // Determine destination station - use shipLoadoutDestination if set, otherwise global destination
-    const effectiveDestStation = configItem.shipLoadoutDestination || settings.destinationStation;
-    const effectiveDestSystem = resolveStationSystem(effectiveDestStation) || destSystem;
-    
-    // Check how much is already claimed by other bots (quantity-based locking)
+     // Total available = in storage + already in cargo
+     const totalAvailable = inStorage + inCargo;
+
+     // Check how much is already claimed by other bots (quantity-based locking)
     let availableQty = getAvailableItemQuantity(
       configItem.itemId,
       totalAvailable,
@@ -1425,20 +1420,27 @@ function updateDeliveryTracking(
   settings: CargoMoverSettings
 ): void {
   const { bot } = ctx;
-  const all = readSettings();
-  const cargoMover = all.cargo_mover || {};
-  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
 
   let updated = false;
   for (let i = 0; i < itemIds.length; i++) {
     const itemId = itemIds[i];
     const qty = quantities[i];
+
+    // Re-read the LATEST settings from disk before mutating so concurrent
+    // writers from other movers cannot clobber this bot's update. Each item
+    // is written back individually to keep the window for collisions tiny.
+    const all = readSettings();
+    const cargoMover = all.cargo_mover || {};
+    const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
     const item = items.find((it) => it.itemId === itemId);
     if (item) {
       const current = (item.totalDelivered as number) || 0;
       item.totalDelivered = current + qty;
       updated = true;
       console.log(`[CargoMover] Updated ${itemId}: ${current} -> ${current + qty} delivered`);
+      writeSettings({ cargo_mover: { items } });
+    } else {
+      ctx.log("warn", `Could not find ${itemId} in cargo mover settings — delivered count not updated in settings`);
     }
 
     // Update coordination locks
@@ -1449,13 +1451,17 @@ function updateDeliveryTracking(
     // store can never drift ahead of what actually arrived — that divergence
     // was the root cause of the bot believing far more had been delivered than
     // the destination really held.
-    setItemProgressDelivered(bot.username, itemId, item ? (item.totalDelivered as number) : qty, {
-      itemName: item?.itemName as string | undefined,
-      targetQuantity: item?.totalToDeliver as number | undefined,
-      storageType: (item?.storageType as "faction" | "personal") || "faction",
+    const freshAll = readSettings();
+    const freshItems = (freshAll.cargo_mover?.items as Array<Record<string, unknown>>) || [];
+    const freshItem = freshItems.find((it) => it.itemId === itemId);
+    const authoritativeDelivered = freshItem ? ((freshItem.totalDelivered as number) || 0) : qty;
+    setItemProgressDelivered(bot.username, itemId, authoritativeDelivered, {
+      itemName: freshItem?.itemName as string | undefined,
+      targetQuantity: freshItem?.totalToDeliver as number | undefined,
+      storageType: (freshItem?.storageType as "faction" | "personal") || "faction",
     });
-    if (item) {
-      ctx.log("cargo", `  Progress for ${itemId}: ${item.totalDelivered}/${(item.totalToDeliver as number) || "?"} delivered (settings-authoritative)`);
+    if (freshItem) {
+      ctx.log("cargo", `  Progress for ${itemId}: ${authoritativeDelivered}/${(freshItem.totalToDeliver as number) || "?"} delivered (settings-authoritative)`);
     }
 
     // Log the delivery
@@ -1464,10 +1470,6 @@ function updateDeliveryTracking(
       quantity: qty,
       location: `${bot.system}/${bot.poi}`,
     });
-  }
-
-  if (updated) {
-    writeSettings({ cargo_mover: { items } });
   }
 }
 

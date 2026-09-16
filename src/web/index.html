@@ -38189,14 +38189,13 @@ ignoreBlacklist: document.getElementById(
               if (cls !== shipType) continue;
               const name = s.name || s.ship_name || "";
               const { base, num } = parseShipName(name);
-              if (num == null) continue;
-              if (num < numStart || num > numEnd) continue;
+              if (num != null && (num < numStart || num > numEnd)) continue;
               matched.push({ ship: s, id: s.id || s.ship_id, name: name, num: num });
             }
-            matched.sort((a, b) => a.num - b.num);
+            matched.sort((a, b) => (a.num ?? 0) - (b.num ?? 0));
             bulkGiftState.totalShips = matched.length;
             updateBulkGiftCounts();
-            bulkGiftLog(`Found ${matched.length} matching ships (${shipType} #${numStart}-${numEnd})`);
+            bulkGiftLog(`Found ${matched.length} matching ships (${shipType}${numStart > 1 || numEnd < 999 ? ` #${numStart}-${numEnd}` : ""})`);
             if (matched.length === 0) {
               resolve();
               return;

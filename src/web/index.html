@@ -38041,7 +38041,10 @@ ignoreBlacklist: document.getElementById(
         if (!bot) return;
 
         sendExec(bot, "list_ships", undefined, (result) => {
-          if (!result.ok || !result.data) return;
+          if (!result.ok || !result.data) {
+            bulkGiftLog(`Failed to load ship list for ${bot}: ${result.error || "no data"}`);
+            return;
+          }
           const ships = Array.isArray(result.data) ? result.data : result.data.ships || result.data.owned_ships || [];
           const typeSet = new Set();
           for (const s of ships) {
@@ -38054,6 +38057,7 @@ ignoreBlacklist: document.getElementById(
             opt.textContent = t;
             sel.appendChild(opt);
           }
+          updateBulkGiftStartBtn();
         });
       }
 
@@ -38078,14 +38082,17 @@ ignoreBlacklist: document.getElementById(
 
       function bulkGiftSelectAllRecipients() {
         document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = true));
+        updateBulkGiftStartBtn();
       }
 
       function bulkGiftInvertRecipients() {
         document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = !cb.checked));
+        updateBulkGiftStartBtn();
       }
 
       function bulkGiftClearRecipients() {
         document.querySelectorAll(".bulk-gift-recipient-cb").forEach((cb) => (cb.checked = false));
+        updateBulkGiftStartBtn();
       }
 
       function getSelectedRecipients() {

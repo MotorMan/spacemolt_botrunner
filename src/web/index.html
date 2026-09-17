@@ -37964,6 +37964,8 @@ ignoreBlacklist: document.getElementById(
         giftedCount: 0,
       };
 
+      let bulkGiftMode = "gift"; // 'gift' | 'switch'
+
       function renderBulkGiftView() {
         const container = document.getElementById("bulkGiftContent");
         if (!container) return;
@@ -37973,9 +37975,13 @@ ignoreBlacklist: document.getElementById(
           .join("");
 
         container.innerHTML = `
+          <div style="display:flex;gap:8px;align-items:center;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px">
+            <button class="sm ${bulkGiftMode === 'gift' ? 'primary' : ''}" onclick="setBulkGiftMode('gift')">Bulk Gift</button>
+            <button class="sm ${bulkGiftMode === 'switch' ? 'primary' : ''}" onclick="setBulkGiftMode('switch')">Bulk Switch</button>
+          </div>
           <div style="display:flex;gap:16px;flex-direction:column;height:100%">
             <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-              <label style="font-size:12px;color:var(--text-dim)">Gifting Bot:</label>
+              <label style="font-size:12px;color:var(--text-dim)">Bot:</label>
               <select id="bulkGiftBot" style="font-size:12px;padding:4px 8px" onchange="onBulkGiftBotChange()">
                 <option value="">-- select bot --</option>
                 ${botOptions}
@@ -37984,18 +37990,23 @@ ignoreBlacklist: document.getElementById(
               <select id="bulkGiftShipType" style="font-size:12px;padding:4px 8px" onchange="onBulkGiftShipTypeChange()">
                 <option value="">-- select ship type --</option>
               </select>
+              ${bulkGiftMode === 'gift' ? `
               <span style="font-size:12px;color:var(--text-dim)">Ship # Range:</span>
               <input type="number" id="bulkGiftNumStart" value="1" min="1" style="width:70px;font-size:12px;padding:4px" title="Start number (inclusive)">
               <span style="font-size:12px;color:var(--text-dim)">to</span>
               <input type="number" id="bulkGiftNumEnd" value="999" min="1" style="width:70px;font-size:12px;padding:4px" title="End number (inclusive)">
-              <button class="sm primary" id="bulkGiftStartBtn" onclick="startBulkGift()" disabled>Start Gifting</button>
+              <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+                <input type="checkbox" id="bulkGiftAutoSwitch" style="width:auto"> Auto-switch on receive
+              </label>
+              ` : ''}
+              <button class="sm primary" id="bulkGiftStartBtn" onclick="startBulkGift()" disabled>${bulkGiftMode === 'gift' ? 'Start Gifting' : 'Start Switching'}</button>
               <button class="sm danger" id="bulkGiftStopBtn" onclick="stopBulkGift()" disabled>Stop</button>
             </div>
             <div style="display:flex;gap:12px;flex:1;min-height:0">
               <div style="flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px">
                 <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--text-bright)">Recipients</div>
                 <div id="bulkGiftRecipients" style="flex:1;overflow-y:auto;font-size:12px;display:flex;flex-direction:column;gap:3px">
-                  <span style="color:var(--text-dim)">Select a gifting bot to load recipients.</span>
+                  <span style="color:var(--text-dim)">Select a bot to load recipients.</span>
                 </div>
                 <div style="margin-top:6px;display:flex;gap:6px">
                   <button class="sm" onclick="bulkGiftSelectAllRecipients()">Select All</button>
@@ -38008,7 +38019,7 @@ ignoreBlacklist: document.getElementById(
                 <div id="bulkGiftLog" style="flex:1;overflow-y:auto;font-size:11px;font-family:monospace;white-space:pre-wrap;color:var(--text-dim)"></div>
                 <div style="margin-top:6px;display:flex;gap:8px;font-size:12px">
                   <span>Matched Ships: <strong id="bulkGiftMatchedCount">0</strong></span>
-                  <span>Gifted: <strong id="bulkGiftGiftedCount">0</strong></span>
+                  <span>Processed: <strong id="bulkGiftGiftedCount">0</strong></span>
                   <span>Failed: <strong id="bulkGiftFailedCount">0</strong></span>
                   <span>Remaining Recipients: <strong id="bulkGiftRemainingCount">0</strong></span>
                 </div>
@@ -38020,6 +38031,12 @@ ignoreBlacklist: document.getElementById(
         if (recipContainer) {
           recipContainer.addEventListener("change", updateBulkGiftStartBtn);
         }
+        updateBulkGiftStartBtn();
+      }
+
+      function setBulkGiftMode(mode) {
+        bulkGiftMode = mode;
+        renderBulkGiftView();
       }
 
       function onBulkGiftBotChange() {
@@ -38139,10 +38156,14 @@ ignoreBlacklist: document.getElementById(
 
         document.getElementById("bulkGiftStartBtn").disabled = true;
         document.getElementById("bulkGiftStopBtn").disabled = false;
-        document.getElementById("bulkGiftLog").textContent = "Fetching fleet...\n";
+        document.getElementById("bulkGiftLog").textContent = (bulkGiftMode === 'switch' ? 'Starting bulk switch...' : 'Fetching fleet...') + "\n";
 
         try {
-          await bulkGiftFetchAndRun(bot, shipType, numStart, numEnd);
+          if (bulkGiftMode === 'switch') {
+            await bulkSwitchRun(bot, shipType);
+          } else {
+            await bulkGiftFetchAndRun(bot, shipType, numStart, numEnd);
+          }
         } catch (e) {
           bulkGiftLog(`Error: ${e.message || e}`);
         } finally {
@@ -38205,10 +38226,76 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
+      function bulkSwitchRun(bot, shipType) {
+        return new Promise((resolve, reject) => {
+          let processed = 0;
+          let failedCount = 0;
+          const recipients = bulkGiftState.recipients;
+
+          function next() {
+            if (bulkGiftState.stopRequested) {
+              bulkGiftLog("Stopped by user.");
+              resolve();
+              return;
+            }
+            if (processed >= recipients.length) {
+              bulkGiftLog(`Done. Switched ${processed - failedCount}/${recipients.length} bots.`);
+              resolve();
+              return;
+            }
+            const recipient = recipients[processed];
+            processed++;
+            bulkGiftLog(`Switching ${recipient} to ${shipType}...`);
+            sendExec(recipient, "list_ships", undefined, (listResult) => {
+              if (!listResult.ok || !listResult.data) {
+                bulkGiftLog(`  ✗ Failed to list ships for ${recipient}: ${listResult.error || "unknown"}`);
+                failedCount++;
+                const failedEl = document.getElementById("bulkGiftFailedCount");
+                if (failedEl) failedEl.textContent = failedCount;
+                updateBulkGiftCounts();
+                next();
+                return;
+              }
+              const ships = Array.isArray(listResult.data) ? listResult.data : listResult.data.ships || listResult.data.owned_ships || [];
+              const target = ships.find((s) => {
+                const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || "";
+                return cls === shipType;
+              });
+              if (!target) {
+                bulkGiftLog(`  ✗ ${recipient} has no ${shipType}`);
+                failedCount++;
+                const failedEl = document.getElementById("bulkGiftFailedCount");
+                if (failedEl) failedEl.textContent = failedCount;
+                updateBulkGiftCounts();
+                next();
+                return;
+              }
+              const targetId = target.id || target.ship_id;
+              const targetName = target.name || target.ship_name || shipType;
+              sendExec(recipient, "switch_ship", { ship_id: targetId }, (switchResult) => {
+                if (switchResult.ok) {
+                  bulkGiftLog(`  ✓ Switched ${recipient} to ${targetName}`);
+                  bulkGiftState.giftedCount++;
+                } else {
+                  bulkGiftLog(`  ✗ Switch failed for ${recipient}: ${switchResult.error || "unknown"}`);
+                  failedCount++;
+                }
+                const failedEl = document.getElementById("bulkGiftFailedCount");
+                if (failedEl) failedEl.textContent = failedCount;
+                updateBulkGiftCounts();
+                next();
+              });
+            });
+          }
+          next();
+        });
+      }
+
       function bulkGiftLoop(bot, matchedShips) {
         return new Promise((resolve, reject) => {
           let index = 0;
           let failedCount = 0;
+          const autoSwitch = document.getElementById("bulkGiftAutoSwitch")?.checked;
 
           function next() {
             if (bulkGiftState.stopRequested) {
@@ -38244,15 +38331,35 @@ ignoreBlacklist: document.getElementById(
                   bulkGiftState.recipients.shift();
                   bulkGiftState.giftedShips.push({ shipId: id, name: name, recipient: recipient });
                   bulkGiftLog(`  ✓ Gifted to ${recipient}`);
+                  if (autoSwitch) {
+                    bulkGiftLog(`  → Switching ${recipient} to ${name}...`);
+                    sendExec(
+                      recipient,
+                      "switch_ship",
+                      { ship_id: id },
+                      (switchResult) => {
+                        if (switchResult.ok) {
+                          bulkGiftLog(`  ✓ Switched ${recipient} to ${name}`);
+                        } else {
+                          bulkGiftLog(`  ✗ Switch failed for ${recipient}: ${switchResult.error || "unknown"}`);
+                        }
+                        updateBulkGiftCounts();
+                        next();
+                      },
+                    );
+                  } else {
+                    updateBulkGiftCounts();
+                    next();
+                  }
                 } else {
                   failedCount++;
                   bulkGiftLog(`  ✗ Failed: ${result.error || "unknown"} — removing recipient`);
                   bulkGiftState.recipients.shift();
+                  const failedEl = document.getElementById("bulkGiftFailedCount");
+                  if (failedEl) failedEl.textContent = failedCount;
+                  updateBulkGiftCounts();
+                  next();
                 }
-                const failedEl = document.getElementById("bulkGiftFailedCount");
-                if (failedEl) failedEl.textContent = failedCount;
-                updateBulkGiftCounts();
-                next();
               },
             );
           }

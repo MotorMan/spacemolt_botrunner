@@ -2041,6 +2041,13 @@ if (state && state.status !== "idle") {
 
     // --- State machine ---
     if (state.status === "idle") {
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        bot.initiateStop();
+        await ctx.sleep(5000);
+        return;
+      }
+
       // Check idle timeout - return home if stuck idle for too long
       const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
       if (isAwayFromHome && !bot.docked) {

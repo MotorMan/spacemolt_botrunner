@@ -38135,8 +38135,10 @@ ignoreBlacklist: document.getElementById(
       async function startBulkGift() {
         const bot = document.getElementById("bulkGiftBot").value;
         const shipType = document.getElementById("bulkGiftShipType").value;
-        const numStart = parseInt(document.getElementById("bulkGiftNumStart").value, 10) || 1;
-        const numEnd = parseInt(document.getElementById("bulkGiftNumEnd").value, 10) || 999;
+        const numStartEl = document.getElementById("bulkGiftNumStart");
+        const numEndEl = document.getElementById("bulkGiftNumEnd");
+        const numStart = numStartEl ? parseInt(numStartEl.value, 10) || 1 : 1;
+        const numEnd = numEndEl ? parseInt(numEndEl.value, 10) || 999 : 999;
         const recipients = getSelectedRecipients();
 
         if (!bot || !shipType || recipients.length === 0) return;

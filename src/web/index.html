@@ -15566,7 +15566,7 @@
     <div style="margin-top:12px;padding:10px;border:1px solid #b8860b;border-radius:6px;background:var(--card-bg)">
       <div style="font-weight:700;margin-bottom:4px;color:var(--text-bright)">⚡ Material Triggers (auto-refine when raw materials pile up)</div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
-        Enable a recipe to auto-craft when its INPUT materials rise above a <b>trigger</b> level, draining them back down to a <b>stop</b> level. Example: <code>refine_steel</code> with iron_ore trigger 490000 / stop 200000 waits until you have &gt;490k iron_ore, then refines in one batch until only 200k remains. Add one entry per required material (all must be above their trigger before it fires). Set <b>Don't run when output &ge;</b> to cap the result (e.e. hold at 20k of a grown good and only re-trigger once stock drops below it). Use <b>Priority</b> (lower = first) when several recipes share the same input — the highest-priority one consumes the surplus first, and lower-priority ones hold off if there isn't enough left for their own stop point.
+        Enable a recipe to auto-craft when its INPUT materials rise above a <b>trigger</b> level, draining them back down to a <b>stop</b> level. Example: <code>refine_steel</code> with iron_ore trigger 490000 / stop 200000 waits until you have &gt;490k iron_ore, then refines in one batch until only 200k remains. Add one entry per required material (all must be above their trigger before it fires). Set <b>Don't run when output &ge;</b> to cap the result (e.e. hold at 20k of a grown good and only re-trigger once stock drops below it). Use <b>Priority</b> (lower = first) when recipes share the same input — the highest-priority one consumes the surplus first, and lower-priority ones hold off if there isn't enough left for their own stop point. Use <b>Allow duplicate jobs</b> to queue additional runs even when a job is already in-flight (useful for slow recipes that would otherwise idle between batches).
       </div>
       <div id="recipeTriggersList"></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
@@ -16018,7 +16018,7 @@
       }
 
       // ── Material Triggers UI ──────────────────────────────────
-      // Manages currentProfile.recipeTriggers: { [recipeId]: { materials:[{item,triggerAt,stopAt}], maxOutput?, priority? } }.
+      // Manages currentProfile.recipeTriggers: { [recipeId]: { materials:[{item,triggerAt,stopAt}], maxOutput?, priority?, allowDuplicateJobs? } }.
       // Persisted automatically because it lives on the crafter profile object that
       // saveCrafterSettings() sends back to the server.
 
@@ -16166,6 +16166,10 @@
           <input type="number" min="0" value="${cfg.maxOutput || 0}" data-recipe="${esc(id)}" data-field="maxOutput" onchange="updateTriggerField(this)" style="width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px" title="Output cap: trigger won't fire while the output stock is at/above this">
           <span style="font-size:11px;color:var(--dim)">Priority</span>
           <input type="number" min="0" value="${cfg.priority != null ? cfg.priority : 100}" data-recipe="${esc(id)}" data-field="priority" onchange="updateTriggerField(this)" style="width:80px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:12px" title="Lower number fires first when recipes share the same input material">
+          <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px;cursor:pointer" title="Queue additional runs even if a job for this recipe is already in-flight">
+            <input type="checkbox" data-recipe="${esc(id)}" data-field="allowDuplicateJobs" ${cfg.allowDuplicateJobs ? 'checked' : ''} onchange="updateTriggerField(this)" style="width:auto">
+            Allow duplicate jobs
+          </label>
         </div>
         ${triggerRows || '<div style="font-size:11px;color:var(--dim);margin-left:16px">No materials yet.</div>'}
         <button class="sm" style="margin:4px 0 0 16px" onclick="addTriggerMaterial('${esc(id)}')">+ Add Material</button>
@@ -16250,6 +16254,8 @@
           cfg.maxOutput = parseInt(el.value, 10) || 0;
         } else if (field === "priority") {
           cfg.priority = parseInt(el.value, 10) || 0;
+        } else if (field === "allowDuplicateJobs") {
+          cfg.allowDuplicateJobs = el.checked;
         }
       }
 

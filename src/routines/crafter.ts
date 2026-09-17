@@ -162,6 +162,11 @@ export interface RecipeTriggerConfig {
   // the reduced stock (via the in-cycle budget) and hold off when there isn't
   // enough left to reach their own stop point.
   priority?: number;
+  // When true, the material trigger will queue additional runs even if a job
+  // for the same recipe is already in-flight. Useful for slow recipes where
+  // you want continuous production instead of waiting for the current batch
+  // to finish.
+  allowDuplicateJobs?: boolean;
 }
 
 interface CrafterProfile {
@@ -202,10 +207,12 @@ function normalizeRecipeTriggers(
       if (typeof obj.maxOutput === "number" && obj.maxOutput >= 0) maxOutput = obj.maxOutput;
       if (typeof obj.priority === "number") priority = obj.priority;
     }
+    const allowDuplicateJobs = (val as any)?.allowDuplicateJobs === true;
     if (materials.length > 0) {
       const cfg: RecipeTriggerConfig = { materials };
       if (maxOutput !== undefined) cfg.maxOutput = maxOutput;
       if (priority !== undefined) cfg.priority = priority;
+      if (allowDuplicateJobs) cfg.allowDuplicateJobs = true;
       out[recipeId] = cfg;
     }
   }
@@ -1323,6 +1330,7 @@ export async function processRecipeTriggers(
       ownFacilityMap,
       outputPerRun,
       countItemFn,
+      config.allowDuplicateJobs,
     );
     if (queueResult.success) {
       result.queued++;
@@ -1586,6 +1594,7 @@ export async function queueCraftJob(
   // first output and the smaller secondary outputs never get produced.
   outputPerRun: number = 0,
   rawCountItemFn?: (itemId: string) => number,
+  allowDuplicateJobs = false,
 ): Promise<{ success: boolean; error?: string; jobId?: string; queuedRuns?: number }> {
   const { log } = ctx;
 
@@ -1595,17 +1604,17 @@ export async function queueCraftJob(
    const outputQty = outputPerRun > 0
      ? outputPerRun
      : (recipe?.output_quantity || 1);
-   const originalRuns = Math.ceil(quantity / outputQty);
+    const originalRuns = Math.ceil(quantity / outputQty);
 
-   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-   }
+    if (!allowDuplicateJobs && tracker.hasPendingJob(recipeId, originalRuns)) {
+      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+    }
 
-   const { ok: queueOk, jobs: serverJobs } = await checkCraftingQueue(bot, recipes || [], true);
-   if (queueOk) tracker.syncWithServer(serverJobs);
-   if (tracker.hasPendingJob(recipeId, originalRuns)) {
-     return { success: true, error: "Job already queued", queuedRuns: originalRuns };
-   }
+    const { ok: queueOk, jobs: serverJobs } = await checkCraftingQueue(bot, recipes || [], true);
+    if (queueOk) tracker.syncWithServer(serverJobs);
+    if (!allowDuplicateJobs && tracker.hasPendingJob(recipeId, originalRuns)) {
+      return { success: true, error: "Job already queued", queuedRuns: originalRuns };
+    }
 
     const maxCraftable = calculateMaxCraftable(recipe, rawCountItemFn || countItemFn);
    const runs = Math.min(originalRuns, maxCraftable);

@@ -7,6 +7,15 @@ import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
 import { combatDebugLog } from "../debug.js";
 import { isBoardingClaimedByOther, releaseExpiredBoardingClaims } from "../boardingCooperation.js";
 
+async function waitForBattleUpdate(ctx: RoutineContext, beforeUpdate: number): Promise<void> {
+  for (let i = 0; i < 15; i++) {
+    await ctx.sleep(1000);
+    if (ctx.bot.currentBattle.lastUpdate > beforeUpdate) {
+      return;
+    }
+  }
+}
+
 /**
  * Returns true if the given display name belongs to a known creature (wildlife).
  * Creatures are NOT players — even with onlyNPCs=true the hunter should fight
@@ -980,7 +989,11 @@ export async function fightFreshBattle(
     const targetZoneNum = zoneOrder["engaged"];
     if (ourZoneNum < targetZoneNum) {
       ctx.log("combat", `↩️ Advancing from ${ourZone} to ${Object.keys(zoneOrder).find(k => zoneOrder[k] === ourZoneNum + 1) || "engaged"}...`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const msg = advResp.error.message.toLowerCase();
         if (msg.includes("no active battle") || msg.includes("not in battle")) {
@@ -1196,7 +1209,11 @@ export async function fightFreshBattle(
       const ourZoneNow = currentStatus.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
         ctx.log("combat", `↩️ Advancing from ${ourZoneNow} to engaged (enemy not in roster)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const adv = await bot.exec("battle", { action: "advance" });
+        if (!adv.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (adv.error) {
           const errMsg = adv.error.message.toLowerCase();
           if (errMsg.includes("not in battle") || errMsg.includes("no active battle")) {
@@ -1312,7 +1329,11 @@ export async function fightFreshBattle(
 
       if (ourZoneNow !== "engaged") {
         ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const advResp = await bot.exec("battle", { action: "advance" });
+        if (!advResp.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (advResp.error) {
           const errMsg = advResp.error.message.toLowerCase();
           if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -1382,7 +1403,11 @@ export async function fightFreshBattle(
         await ctx.sleep(10000);
       } else {
         ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to engaged (zoneDiff=${zoneDiff}, enemyZone=${enemyZone})`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const advResp = await bot.exec("battle", { action: "advance" });
+        if (!advResp.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (advResp.error) {
           const errMsg = advResp.error.message.toLowerCase();
           if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -1733,7 +1758,11 @@ export async function fightJoinedBattle(
     for (let z = ourZoneNum + 1; z <= targetZoneNum; z++) {
       const zoneName = Object.keys(zoneOrder).find(k => zoneOrder[k] === z) || "engaged";
       ctx.log("combat", `Advancing to ${zoneName}...`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const msg = advResp.error.message.toLowerCase();
         if (msg.includes("no active battle") || msg.includes("not in battle")) {
@@ -1990,7 +2019,11 @@ export async function fightJoinedBattle(
       await bot.exec("battle", { action: "target", target_id: currentTarget.id });
       const ourZoneNow = status.your_zone || "outer";
       if (ourZoneNow !== "engaged") {
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const adv = await bot.exec("battle", { action: "advance" });
+        if (!adv.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (adv.error && /not in battle/.test(adv.error.message.toLowerCase())) {
           ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
           await checkAndPraiseMorgThar(ctx, true);
@@ -2066,7 +2099,11 @@ export async function fightJoinedBattle(
 
       if (ourZoneNow !== "engaged") {
         ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        const beforeUpdate = bot.currentBattle.lastUpdate;
         const advResp = await bot.exec("battle", { action: "advance" });
+        if (!advResp.error) {
+          await waitForBattleUpdate(ctx, beforeUpdate);
+        }
         if (advResp.error) {
           const errMsg = advResp.error.message.toLowerCase();
           if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -2140,12 +2177,15 @@ export async function fightJoinedBattle(
     } else if (zoneDiff < -1) {
       // Enemy is ahead of us (e.g., we're at outer(0), enemy at inner(2)) - advance
       ctx.log("combat", `⚔️ Advancing from ${ourZone} to match enemy at ${enemyZone}`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
           ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
-          await checkAndPraiseMorgThar(ctx, true);
           return true;
         }
         ctx.log("error", `Advance failed: ${advResp.error.message}`);

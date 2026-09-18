@@ -1259,7 +1259,7 @@ async function hunterEngage(
     claimCreature(ctx, target);
   }
    const hsettings = getHunterSettings(ctx.bot.username);
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, isCreature);
+   return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, false);
 }
 
 // ── Boarding claim lock (non-API bot chat channel) ────────────

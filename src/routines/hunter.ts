@@ -554,8 +554,10 @@ function getHunterSettings(username?: string): {
     resolvedPatrolSystems = h.patrolSystems;
   }
 
+  const mode: HunterMode = ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode;
+
   return {
-    mode: ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode,
+    mode,
     patrolCycleMode: ((botOverrides.patrolCycleMode as PatrolCycleMode) || (h.patrolCycleMode as PatrolCycleMode) || "sequential") as PatrolCycleMode,
     system: (botOverrides.system as string) || (h.system as string) || "",
     refuelThreshold: (h.refuelThreshold as number) || 40,
@@ -563,12 +565,12 @@ function getHunterSettings(username?: string): {
     returnHomeOnFuelCellsRemaining: (h.returnHomeOnFuelCellsRemaining as number) || 2,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-onlyNPCs: (h.onlyNPCs as boolean) !== false,
-  huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
-  coordinateHunts: (h.coordinateHunts as boolean) !== false,
-  autoCloak: (h.autoCloak as boolean) ?? false,
-  cloakOnStart: (h.cloakOnStart as boolean) ?? false,
-  ammoThreshold: (h.ammoThreshold as number) || 5,
+    onlyNPCs: (h.onlyNPCs as boolean) !== false,
+    huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
+    coordinateHunts: (h.coordinateHunts as boolean) !== false,
+    autoCloak: (h.autoCloak as boolean) ?? false,
+    cloakOnStart: (h.cloakOnStart as boolean) ?? false,
+    ammoThreshold: (h.ammoThreshold as number) || 5,
     ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
     ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
@@ -581,8 +583,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
     stayInPoi: (botOverrides.stayInPoi as boolean) ?? (h.stayInPoi as boolean) ?? false,
-  homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || (getGlobalHomeBase().system as string) || "",
-  homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || (getGlobalHomeBase().station as string) || "",
+    homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || (getGlobalHomeBase().system as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || (getGlobalHomeBase().station as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
     desiredFuelCells: (h.desiredFuelCells as number) ?? -1,
@@ -592,21 +594,21 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
     disableResupply: (h.disableResupply as boolean) ?? false,
     pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
     patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
-  meatShield: (h.meatShield as boolean) ?? false,
-  stopOnDeath: (h.stopOnDeath as boolean) ?? false,
-  targetRandomly: (h.targetRandomly as boolean) ?? false,
-  combatDebug: (h.combatDebug as boolean) ?? false,
-  targetPlayer: (botOverrides.targetPlayer as string) || (h.targetPlayer as string) || "",
-  maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
-  creatureFarmLoopsPerSystem: ((botOverrides.creatureFarmLoopsPerSystem as number) || (h.creatureFarmLoopsPerSystem as number) || 3),
-  creatureFarmCargoFullPct: (h.creatureFarmCargoFullPct as number) ?? 95,
-  creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
-  creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
-   fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
-   fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
-   fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
-   fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
-    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? false,
+    meatShield: (h.meatShield as boolean) ?? false,
+    stopOnDeath: (h.stopOnDeath as boolean) ?? false,
+    targetRandomly: (h.targetRandomly as boolean) ?? false,
+    combatDebug: (h.combatDebug as boolean) ?? false,
+    targetPlayer: (botOverrides.targetPlayer as string) || (h.targetPlayer as string) || "",
+    maxCreaturesPerScan: (h.maxCreaturesPerScan as number) ?? 10,
+    creatureFarmLoopsPerSystem: ((botOverrides.creatureFarmLoopsPerSystem as number) || (h.creatureFarmLoopsPerSystem as number) || 3),
+    creatureFarmCargoFullPct: ((h.creatureFarmCargoFullPct as number) > 0 ? (h.creatureFarmCargoFullPct as number) : 95) / 100,
+    creatureFarmMaxPassesPerPoi: (h.creatureFarmMaxPassesPerPoi as number) ?? 6,
+    creatureFarmMaxSystemSweeps: (h.creatureFarmMaxSystemSweeps as number) ?? 40,
+    fleetIdlePollSeconds: (botOverrides.fleetIdlePollSeconds as number) ?? (h.fleetIdlePollSeconds as number) ?? 2,
+    fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
+    fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
+    fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
+    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? (mode === "boarding"),
     boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
     boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
     boardingPrizeDestination:
@@ -614,8 +616,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
       (botOverrides.boardingPrizeDestination as string) ||
       (h.boardingPrizeDestination as string) ||
       "",
-  creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
-  creatureFarmRoamJumps: (h.creatureFarmRoamJumps as number) ?? 1,
+    creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
+    creatureFarmRoamJumps: (botOverrides.creatureFarmRoamJumps as number) ?? (h.creatureFarmRoamJumps as number) ?? 1,
   };
 }
 
@@ -5415,12 +5417,12 @@ export async function boardingSubroutine(
     return "failed";
   }
 
-  // Detect boarding clamp module for latch strength info
+  // Detect boarding clamp module for latch strength info (optional)
   const clampInfo = getBoardingClampInfo(bot);
   if (clampInfo.hasClamp) {
     ctx.log("combat", `🛸 Boarding: ${clampInfo.moduleName} installed (latch strength: ${clampInfo.latchStrength})`);
   } else {
-    ctx.log("combat", "⚠️ Boarding: no boarding clamp module detected — boarding will require extreme precision (shields must be near 0)");
+    ctx.log("combat", `🛸 Boarding: ship has boarding capability — using configured shield threshold (${shieldThreshold}%)`);
   }
 
   // Resolve marine commitment
@@ -5667,7 +5669,7 @@ export async function boardingSubroutine(
          // When no boarding clamp is installed, we must wait until shields are completely
          // depleted (0%) before boarding — otherwise boarding will fail / not be available.
          // With a boarding clamp, the configured shieldThreshold applies normally.
-         const effectiveShieldThreshold = clampInfo.hasClamp ? shieldThreshold : 0;
+          const effectiveShieldThreshold = shieldThreshold;
 
           if (shieldPct !== null && shieldPct <= effectiveShieldThreshold) {
             ctx.log("combat", `🛸 Boarding: ${target.name} shields at ${shieldPct}% (≤ ${effectiveShieldThreshold}%) — initiating board stance with ${marines} marines!`);

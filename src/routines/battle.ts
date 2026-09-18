@@ -1306,22 +1306,13 @@ export async function fightFreshBattle(
 
     if (stayAtEngaged) {
       const ourZoneNow = status.your_zone || "outer";
+      const enemyZone = targetParticipant?.zone || "outer";
+      const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;
+      const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+
       if (ourZoneNow !== "engaged") {
-        if (zoneDiff > 1) {
-          ctx.log("combat", `↩️ Creature: retreating from ${ourZoneNow} to match enemy at ${enemyZone} (stay-at-engaged)`);
-          const retResp = await bot.exec("battle", { action: "retreat" });
-          if (retResp.error) {
-            const errMsg = retResp.error.message.toLowerCase();
-            if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-              ctx.log("combat", "✅ Battle ended (retreat failed: not in battle) - victory!");
-              await checkAndPraiseMorgThar(ctx, true);
-              await recloakAfterBattle(ctx, cloakOnStart);
-              return true;
-            }
-            ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-          }
-        } else {
-          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        if (ourZoneNum < enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} toward ${enemyZone} (stay-at-engaged)`);
           const adv = await bot.exec("battle", { action: "advance" });
           if (adv.error) {
             const errMsg = adv.error.message.toLowerCase();
@@ -1341,8 +1332,37 @@ export async function fightFreshBattle(
             }
             ctx.log("error", "Advance to engaged failed: " + adv.error.message);
           }
+        } else if (ourZoneNum > enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding, looking for closer target (stay-at-engaged)`);
+        } else {
+          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding for engaged (stay-at-engaged)`);
         }
       }
+
+      if (targetParticipant && status) {
+        const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+        const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
+        if (targetZoneNum <= ourNum - 2) {
+          const ourSideId = status.your_side_id;
+          const currentTargetId = target.id;
+          const currentTargetName = target.name;
+          const closerEnemy = status.participants.find(p => {
+            if ((ourSideId != null && p.side_id === ourSideId) || p.is_destroyed) return false;
+            if (p.player_id === currentTargetId || p.username === currentTargetName) return false;
+            const pZone = p.zone || "outer";
+            const pZoneNum = zoneDirMap[pZone] ?? 0;
+            return pZoneNum > targetZoneNum;
+          });
+          if (closerEnemy) {
+            ctx.log("combat", `🎯 Creature: switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled)`);
+            target = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+            await bot.exec("battle", { action: "target", target_id: target.id });
+            targetParticipant = closerEnemy;
+            await ctx.sleep(300);
+          }
+        }
+      }
+
       await attackTarget(ctx, target);
       await bot.exec("battle", { action: "target", target_id: target.id });
       await ctx.sleep(10000);
@@ -2043,22 +2063,13 @@ export async function fightJoinedBattle(
 
     if (stayAtEngaged) {
       const ourZoneNow = status.your_zone || "outer";
+      const enemyZone = targetParticipant?.zone || "outer";
+      const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;
+      const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+
       if (ourZoneNow !== "engaged") {
-        if (zoneDiff > 1) {
-          ctx.log("combat", `↩️ Creature: retreating from ${ourZoneNow} to match enemy at ${enemyZone} (stay-at-engaged)`);
-          const retResp = await bot.exec("battle", { action: "retreat" });
-          if (retResp.error) {
-            const errMsg = retResp.error.message.toLowerCase();
-            if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-              ctx.log("combat", "✅ Battle ended (retreat failed: not in battle) - victory!");
-              await checkAndPraiseMorgThar(ctx, true);
-              await recloakAfterBattle(ctx, cloakOnStart);
-              return true;
-            }
-            ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-          }
-        } else {
-          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+        if (ourZoneNum < enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} toward ${enemyZone} (stay-at-engaged)`);
           const adv = await bot.exec("battle", { action: "advance" });
           if (adv.error) {
             const errMsg = adv.error.message.toLowerCase();
@@ -2082,8 +2093,37 @@ export async function fightJoinedBattle(
             }
             ctx.log("error", "Advance to engaged failed: " + adv.error.message);
           }
+        } else if (ourZoneNum > enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding, looking for closer target (stay-at-engaged)`);
+        } else {
+          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding for engaged (stay-at-engaged)`);
         }
       }
+
+      if (targetParticipant && currentTarget && status) {
+        const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
+        const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
+        if (targetZoneNum <= ourNum - 2) {
+          const ourSideId = status.your_side_id;
+          const currentTargetId = currentTarget.id;
+          const currentTargetName = currentTarget.name;
+          const closerEnemy = status.participants.find(p => {
+            if ((ourSideId != null && p.side_id === ourSideId) || p.is_destroyed) return false;
+            if (p.player_id === currentTargetId || p.username === currentTargetName) return false;
+            const pZone = p.zone || "outer";
+            const pZoneNum = zoneDirMap[pZone] ?? 0;
+            return pZoneNum > targetZoneNum;
+          });
+          if (closerEnemy) {
+            ctx.log("combat", `🎯 Creature: switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled)`);
+            currentTarget = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            targetParticipant = closerEnemy;
+            await ctx.sleep(300);
+          }
+        }
+      }
+
       if (currentTarget) await doEngage(currentTarget);
       await ctx.sleep(10000);
       continue;

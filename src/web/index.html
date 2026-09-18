@@ -939,6 +939,7 @@
           <button onclick="switchShipyardView('battle')" id="shipyardViewBattle">Battle Sim</button>
           <button onclick="switchShipyardView('pricing')" id="shipyardViewPricing">Ship Pricing Calc</button>
           <button onclick="switchShipyardView('bulkgift')" id="shipyardViewBulkgift">Bulk Gift</button>
+          <button onclick="switchShipyardView('bulkrefit')" id="shipyardViewBulkrefit">Bulk Refit</button>
         </div>
         <div id="shipyardManageView" style="display: flex; flex: 1; min-height: 0; flex-direction: column; padding: 16px; gap: 16px; overflow: hidden; position: relative;">
           <div class="faction-layout" style="flex: 1; min-height: 0;">
@@ -964,6 +965,9 @@
         </div>
         <div id="shipyardBulkgiftView" style="display: none; flex: 1; min-height: 0; position: relative; padding: 16px; overflow: auto;">
           <div id="bulkGiftContent"></div>
+        </div>
+        <div id="shipyardBulkrefitView" style="display: none; flex: 1; min-height: 0; position: relative; padding: 16px; overflow: auto;">
+          <div id="bulkRefitContent"></div>
         </div>
       </div>
 
@@ -1701,12 +1705,15 @@
         document.getElementById("shipyardViewBattle").classList.toggle("active", view === "battle");
         document.getElementById("shipyardViewPricing").classList.toggle("active", view === "pricing");
         document.getElementById("shipyardViewBulkgift").classList.toggle("active", view === "bulkgift");
+        document.getElementById("shipyardViewBulkrefit").classList.toggle("active", view === "bulkrefit");
         document.getElementById("shipyardManageView").style.display = view === "manage" ? "" : "none";
         document.getElementById("shipyardForsaleView").style.display = view === "forsale" ? "" : "none";
         document.getElementById("shipyardBattleView").style.display = view === "battle" ? "" : "none";
         document.getElementById("shipyardPricingView").style.display = view === "pricing" ? "" : "none";
         document.getElementById("shipyardBulkgiftView").style.display = view === "bulkgift" ? "" : "none";
+        document.getElementById("shipyardBulkrefitView").style.display = view === "bulkrefit" ? "" : "none";
         if (view === "bulkgift") renderBulkGiftView();
+        if (view === "bulkrefit") renderBulkRefitView();
         if (view === "forsale") {
           const frame = document.getElementById("shipsforsaleFrame");
           if (frame) frame.src = frame.src;
@@ -38373,6 +38380,476 @@ ignoreBlacklist: document.getElementById(
           }
           next();
         });
+      }
+
+      // ── Bulk Refit ──────────────────────────────────────────────
+      let bulkRefitState = {
+        running: false,
+        stopRequested: false,
+        presetName: "",
+        targetModules: [],
+        recipients: [],
+        totalBots: 0,
+        processedCount: 0,
+        failedCount: 0,
+      };
+
+      function renderBulkRefitView() {
+        const container = document.getElementById("bulkRefitContent");
+        if (!container) return;
+
+        const botOptions = bots
+          .map((b) => `<option value="${esc(b.username)}">${esc(b.username)}</option>`)
+          .join("");
+
+        container.innerHTML = `
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px">
+            <label style="font-size:12px;color:var(--text-dim)">Module Preset:</label>
+            <select id="bulkRefitPreset" style="font-size:12px;padding:4px 8px;min-width:200px">
+              <option value="">-- select preset --</option>
+            </select>
+            <button class="sm primary" onclick="startBulkRefit()" id="bulkRefitStartBtn" disabled>Start Refit</button>
+            <button class="sm danger" onclick="stopBulkRefit()" id="bulkRefitStopBtn" disabled>Stop</button>
+          </div>
+          <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
+            <label style="font-size:12px;color:var(--text-dim)">Select Bots:</label>
+            <button class="sm" onclick="bulkRefitSelectAll()">Select All</button>
+            <button class="sm" onclick="bulkRefitInvert()">Invert</button>
+            <button class="sm" onclick="bulkRefitClear()">Clear</button>
+          </div>
+          <div style="display:flex;gap:12px;flex:1;min-height:0">
+            <div style="flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px">
+              <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--text-bright)">Recipients</div>
+              <div id="bulkRefitRecipients" style="flex:1;overflow-y:auto;font-size:12px;display:flex;flex-direction:column;gap:3px">
+                <span style="color:var(--text-dim)">Loading bots...</span>
+              </div>
+            </div>
+            <div style="flex:1;display:flex;flex-direction:column;min-height:0;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:8px">
+              <div style="font-size:12px;font-weight:700;margin-bottom:6px;color:var(--text-bright)">Progress Log</div>
+              <div id="bulkRefitLog" style="flex:1;overflow-y:auto;font-size:11px;font-family:monospace;white-space:pre-wrap;color:var(--text-dim)"></div>
+              <div style="margin-top:6px;display:flex;gap:8px;font-size:12px">
+                <span>Total: <strong id="bulkRefitTotal">0</strong></span>
+                <span>Processed: <strong id="bulkRefitProcessed">0</strong></span>
+                <span>Failed: <strong id="bulkRefitFailed">0</strong></span>
+              </div>
+            </div>
+          </div>
+        `;
+
+        const recipContainer = document.getElementById("bulkRefitRecipients");
+        if (recipContainer) {
+          recipContainer.addEventListener("change", updateBulkRefitStartBtn);
+        }
+
+        populateBulkRefitPresets();
+        populateBulkRefitRecipients();
+        updateBulkRefitStartBtn();
+      }
+
+      function populateBulkRefitPresets() {
+        const sel = document.getElementById("bulkRefitPreset");
+        if (!sel) return;
+        sel.innerHTML = '<option value="">-- select preset --</option>';
+        fetch("/api/module-loadouts")
+          .then((r) => r.json())
+          .then((data) => {
+            const presets = data.loadouts || {};
+            Object.keys(presets)
+              .sort()
+              .forEach((name) => {
+                const opt = document.createElement("option");
+                opt.value = name;
+                opt.textContent = name;
+                sel.appendChild(opt);
+              });
+            updateBulkRefitStartBtn();
+          })
+          .catch(() => {});
+      }
+
+      function populateBulkRefitRecipients() {
+        const container = document.getElementById("bulkRefitRecipients");
+        if (!container) return;
+        const options = bots
+          .map(
+            (b) =>
+              `<label style="display:flex;align-items:center;gap:6px;padding:2px 4px;cursor:pointer;border-radius:3px" onmouseover="this.style.background='var(--bg-primary)'" onmouseout="this.style.background='transparent'"><input type="checkbox" value="${esc(b.username)}" class="bulk-refit-recipient-cb"> ${esc(b.username)}</label>`
+          )
+          .join("");
+        container.innerHTML = options || '<span style="color:var(--text-dim)">No bots available.</span>';
+      }
+
+      function bulkRefitSelectAll() {
+        document.querySelectorAll(".bulk-refit-recipient-cb").forEach((cb) => (cb.checked = true));
+        updateBulkRefitStartBtn();
+      }
+
+      function bulkRefitInvert() {
+        document.querySelectorAll(".bulk-refit-recipient-cb").forEach((cb) => (cb.checked = !cb.checked));
+        updateBulkRefitStartBtn();
+      }
+
+      function bulkRefitClear() {
+        document.querySelectorAll(".bulk-refit-recipient-cb").forEach((cb) => (cb.checked = false));
+        updateBulkRefitStartBtn();
+      }
+
+      function getBulkRefitRecipients() {
+        return Array.from(document.querySelectorAll(".bulk-refit-recipient-cb:checked")).map((cb) => cb.value);
+      }
+
+      function updateBulkRefitStartBtn() {
+        const btn = document.getElementById("bulkRefitStartBtn");
+        if (!btn) return;
+        const preset = document.getElementById("bulkRefitPreset")?.value;
+        const recipients = getBulkRefitRecipients();
+        btn.disabled = !preset || recipients.length === 0;
+      }
+
+      function bulkRefitLog(msg) {
+        const log = document.getElementById("bulkRefitLog");
+        if (!log) return;
+        log.textContent += msg + "\n";
+        log.scrollTop = log.scrollHeight;
+      }
+
+      function updateBulkRefitCounts() {
+        const total = document.getElementById("bulkRefitTotal");
+        const processed = document.getElementById("bulkRefitProcessed");
+        const failed = document.getElementById("bulkRefitFailed");
+        if (total) total.textContent = bulkRefitState.totalBots;
+        if (processed) processed.textContent = bulkRefitState.processedCount;
+        if (failed) failed.textContent = bulkRefitState.failedCount;
+      }
+
+      async function startBulkRefit() {
+        const presetName = document.getElementById("bulkRefitPreset")?.value;
+        const recipients = getBulkRefitRecipients();
+        if (!presetName || recipients.length === 0) return;
+
+        let presets;
+        try {
+          const res = await fetch("/api/module-loadouts");
+          const data = await res.json();
+          presets = data.loadouts || {};
+        } catch (e) {
+          bulkRefitLog("Failed to load module presets");
+          return;
+        }
+
+        const preset = presets[presetName];
+        if (!preset || !preset.modules) {
+          bulkRefitLog("Preset not found");
+          return;
+        }
+
+        const targetModules = [
+          ...(preset.modules.weapons || []),
+          ...(preset.modules.defense || []),
+          ...(preset.modules.utility || []),
+        ];
+
+        // Pre-flight: check faction storage has enough for ALL bots
+        bulkRefitLog("Checking faction storage for required modules...");
+        const factionBot = bots.find((b) => b.state === "running" || b.state === "idle");
+        if (!factionBot) {
+          bulkRefitLog("No idle/running bot available to check faction storage");
+          return;
+        }
+
+        const factionStorage = await new Promise((resolve) => {
+          sendExec(factionBot.username, "view_faction_storage", undefined, (result) => {
+            if (!result.ok || !result.data) {
+              resolve([]);
+              return;
+            }
+            const items = result.data.items || result.data.storage || [];
+            resolve(
+              items.map((item) => ({
+                itemId: item.item_id || item.itemId,
+                name: item.name || "?",
+                quantity: item.quantity || 0,
+              }))
+            );
+          });
+        });
+
+        const factionMap = new Map();
+        for (const item of factionStorage) {
+          factionMap.set(item.itemId, item.quantity);
+        }
+
+        const totalNeeded = new Map();
+        for (const modId of targetModules) {
+          totalNeeded.set(modId, (totalNeeded.get(modId) || 0) + recipients.length);
+        }
+
+        const missing = [];
+        const shortage = [];
+        for (const [modId, needed] of totalNeeded) {
+          const available = factionMap.get(modId) || 0;
+          if (available < needed) {
+            const name = catalog.items?.[modId]?.name || modId;
+            if (available === 0) {
+              missing.push(`${name} (need ${needed}, have 0)`);
+            } else {
+              shortage.push(`${name} (need ${needed}, have ${available}, missing ${needed - available})`);
+            }
+          }
+        }
+
+        if (missing.length > 0 || shortage.length > 0) {
+          bulkRefitLog("ABORTED: Not enough modules in faction storage!");
+          if (missing.length > 0) {
+            bulkRefitLog("Missing entirely:");
+            missing.forEach((m) => bulkRefitLog(`  - ${m}`));
+          }
+          if (shortage.length > 0) {
+            bulkRefitLog("Shortage:");
+            shortage.forEach((s) => bulkRefitLog(`  - ${s}`));
+          }
+          return;
+        }
+
+        bulkRefitLog(`Pre-flight check passed. ${recipients.length} bots, preset: ${presetName}`);
+        for (const [modId, needed] of totalNeeded) {
+          const available = factionMap.get(modId) || 0;
+          const name = catalog.items?.[modId]?.name || modId;
+          bulkRefitLog(`  ${name}: need ${needed}, have ${available}`);
+        }
+
+        bulkRefitState = {
+          running: true,
+          stopRequested: false,
+          presetName: presetName,
+          targetModules: targetModules,
+          recipients: [...recipients],
+          totalBots: recipients.length,
+          processedCount: 0,
+          failedCount: 0,
+        };
+
+        document.getElementById("bulkRefitStartBtn").disabled = true;
+        document.getElementById("bulkRefitStopBtn").disabled = false;
+        bulkRefitLog("Starting bulk refit...");
+
+        try {
+          for (const recipient of bulkRefitState.recipients) {
+            if (bulkRefitState.stopRequested) {
+              bulkRefitLog("Stopped by user.");
+              break;
+            }
+            bulkRefitLog(`Refitting ${recipient}...`);
+            try {
+              await bulkRefitRunForBot(recipient);
+              bulkRefitState.processedCount++;
+              bulkRefitLog(`  ✓ ${recipient} refit complete`);
+            } catch (e) {
+              bulkRefitState.failedCount++;
+              bulkRefitLog(`  ✗ ${recipient} failed: ${e.message || e}`);
+            }
+            updateBulkRefitCounts();
+          }
+        } catch (e) {
+          bulkRefitLog(`Error: ${e.message || e}`);
+        } finally {
+          bulkRefitState.running = false;
+          document.getElementById("bulkRefitStartBtn").disabled = false;
+          document.getElementById("bulkRefitStopBtn").disabled = true;
+          updateBulkRefitCounts();
+        }
+      }
+
+      function stopBulkRefit() {
+        bulkRefitState.stopRequested = true;
+        bulkRefitLog("Stop requested...");
+      }
+
+      async function bulkRefitRunForBot(botName) {
+        return new Promise((resolve, reject) => {
+          sendExec(botName, "get_status", {}, (result) => {
+            if (!result.ok || !result.data) {
+              reject(new Error("Failed to get ship status"));
+              return;
+            }
+
+            const currentModules = result.data.modules || result.data.ship?.modules || [];
+            const removedModules = [];
+            const needed = [...bulkRefitState.targetModules];
+
+            for (const mod of currentModules) {
+              const catalogId = mod.type_id || mod.item_id || mod.definition_id;
+              const instanceId = mod.id || mod.module_id || mod.instance_id;
+
+              if (catalogId && instanceId) {
+                const idx = needed.indexOf(catalogId);
+                if (idx !== -1) {
+                  needed.splice(idx, 1);
+                } else {
+                  removedModules.push({ catalogId, instanceId });
+                }
+              }
+            }
+
+            if (needed.length === 0 && removedModules.length === 0) {
+              bulkRefitLog(`  Already matches preset`);
+              resolve();
+              return;
+            }
+
+            let uninstallIndex = 0;
+            function uninstallNext() {
+              if (uninstallIndex >= removedModules.length) {
+                bulkRefitLog(`  Uninstalled ${removedModules.length} modules`);
+                depositRemoved(botName, removedModules, 0, resolve, reject);
+                return;
+              }
+              const modInfo = removedModules[uninstallIndex];
+              sendExec(
+                botName,
+                "uninstall_mod",
+                { module_id: modInfo.instanceId },
+                (res) => {
+                  if (!res.ok) {
+                    bulkRefitLog(`  Failed to uninstall ${modInfo.catalogId}: ${res.error || "unknown"}`);
+                  }
+                  uninstallIndex++;
+                  setTimeout(uninstallNext, 400);
+                }
+              );
+            }
+            uninstallNext();
+          });
+        });
+      }
+
+      async function depositRemoved(botName, removedModules, index, resolve, reject) {
+        if (index >= removedModules.length) {
+          bulkRefitLog(`  Deposited removed modules`);
+          withdrawNeeded(botName, 0, resolve, reject);
+          return;
+        }
+        const mod = removedModules[index];
+        sendExec(
+          botName,
+          "storage",
+          {
+            action: "deposit",
+            target: "faction",
+            item_id: mod.catalogId,
+            quantity: 1,
+          },
+          (result) => {
+            if (!result.ok) {
+              bulkRefitLog(`  Failed to deposit ${mod.catalogId}: ${result.error || "unknown"}`);
+            }
+            setTimeout(() => depositRemoved(botName, removedModules, index + 1, resolve, reject), 400);
+          }
+        );
+      }
+
+      async function withdrawNeeded(botName, index, resolve, reject) {
+        const needed = bulkRefitState.targetModules;
+        if (index >= needed.length) {
+          bulkRefitLog(`  Withdrawn needed modules`);
+          cargoInstallLoop(botName, 0, resolve, reject);
+          return;
+        }
+        const modId = needed[index];
+        const modName = catalog.items?.[modId]?.name || modId;
+        if (isQuestItem(modId)) {
+          bulkRefitLog(`  Skipping faction withdraw for quest item ${modName}`);
+          setTimeout(() => withdrawNeeded(botName, index + 1, resolve, reject), 200);
+          return;
+        }
+        sendExec(
+          botName,
+          "storage",
+          {
+            action: "deposit",
+            target: "self",
+            item_id: modId,
+            quantity: 1,
+            source: "faction",
+          },
+          (result) => {
+            if (!result.ok) {
+              bulkRefitLog(`  Failed to withdraw ${modName}: ${result.error || "unknown"}`);
+            }
+            setTimeout(() => withdrawNeeded(botName, index + 1, resolve, reject), 400);
+          }
+        );
+      }
+
+      async function cargoInstallLoop(botName, index, resolve, reject) {
+        const needed = bulkRefitState.targetModules;
+        if (index >= needed.length) {
+          bulkRefitLog(`  Installed all modules`);
+          resolve();
+          return;
+        }
+
+        sendExec(botName, "get_cargo", {}, (cargoResult) => {
+          if (!cargoResult.ok || !cargoResult.data) {
+            bulkRefitLog(`  Failed to get cargo: ${cargoResult.error || "unknown"}`);
+            setTimeout(() => cargoInstallLoop(botName, index, resolve, reject), 2000);
+            return;
+          }
+
+          const cargoUsed = cargoResult.data.cargo_used || 0;
+          const cargoMax = cargoResult.data.cargo_max || 100;
+          const spaceLeft = cargoMax - cargoUsed;
+          const modulesWeCanLoad = Math.floor(spaceLeft / 10);
+
+          if (modulesWeCanLoad <= 0) {
+            bulkRefitLog(`  Not enough cargo space, waiting...`);
+            setTimeout(() => cargoInstallLoop(botName, index, resolve, reject), 2000);
+            return;
+          }
+
+          const batch = needed.slice(index, index + modulesWeCanLoad);
+          let batchIndex = 0;
+
+          function loadNext() {
+            if (batchIndex >= batch.length) {
+              installBatch(botName, batch, 0, index + batch.length, resolve, reject);
+              return;
+            }
+            const batchModId = batch[batchIndex];
+            sendExec(
+              botName,
+              "withdraw_items",
+              { item_id: batchModId, quantity: 1 },
+              (res) => {
+                if (!res.ok) {
+                  bulkRefitLog(`  Failed to load ${batchModId}: ${res.error || "unknown"}`);
+                }
+                batchIndex++;
+                setTimeout(loadNext, 300);
+              }
+            );
+          }
+          loadNext();
+        });
+      }
+
+      async function installBatch(botName, batch, idx, nextIndex, resolve, reject) {
+        if (idx >= batch.length) {
+          setTimeout(() => cargoInstallLoop(botName, nextIndex, resolve, reject), 600);
+          return;
+        }
+        const modId = batch[idx];
+        sendExec(
+          botName,
+          "install_mod",
+          { module_id: modId },
+          (res) => {
+            if (!res.ok) {
+              bulkRefitLog(`  Failed to install ${modId}: ${res.error || "unknown"}`);
+            }
+            setTimeout(() => installBatch(botName, batch, idx + 1, nextIndex, resolve, reject), 600);
+          }
+        );
       }
 
       /** Load a ship from station into the active carrier's storage (bay) */

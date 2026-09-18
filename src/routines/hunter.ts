@@ -1921,7 +1921,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     // sweep loop directly. `maxSweeps` is a hidden, non-UI safety ceiling so the
     // loop can never run away even if a bad loopsPerSystem value is supplied.
     const loopsPerSystem = settings.creatureFarmLoopsPerSystem > 0 ? settings.creatureFarmLoopsPerSystem : 3;
-    const cargoFullPct = (settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 95) / 100;
+    const cargoFullPct = settings.creatureFarmCargoFullPct > 0 ? settings.creatureFarmCargoFullPct : 0.95;
     const maxPasses = settings.creatureFarmMaxPassesPerPoi > 0 ? settings.creatureFarmMaxPassesPerPoi : 6;
     const maxSweeps = settings.creatureFarmMaxSystemSweeps > 0 ? settings.creatureFarmMaxSystemSweeps : 40;
     const loopCap = Math.min(loopsPerSystem, maxSweeps);

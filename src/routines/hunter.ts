@@ -2109,7 +2109,17 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
           await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
 
-          const entities = parseNearby(nearbyData);
+          // Re-fetch after potential battle — the old snapshot is now stale
+          const afterBattleResp = await getObservationOrNearby(bot);
+          const afterBattleData = afterBattleResp.result;
+          if (!afterBattleData) {
+            ctx.log("error", `No nearby data at ${poi.name} after battle check`);
+            break;
+          }
+          bot.trackNearbyPlayers(afterBattleData);
+          bot.trackWildlife(afterBattleData);
+
+          const entities = parseNearby(afterBattleData);
           const creatures = pickCreatureTargets(entities, bot.username, true, settings.maxCreaturesPerScan);
           const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
           let targets = [...creatures, ...pirates];
@@ -2139,6 +2149,20 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             }
 
             yield "engage";
+
+            const freshScanResp = await bot.exec("get_nearby");
+            let freshEntities: NearbyEntity[] = [];
+            if (!freshScanResp.error && freshScanResp.result) {
+              bot.trackNearbyPlayers(freshScanResp.result);
+              bot.trackWildlife(freshScanResp.result);
+              freshEntities = parseNearby(freshScanResp.result);
+            }
+            const stillPresent = freshEntities.find(e => e.id === target.id || e.name === target.name);
+            if (!stillPresent) {
+              ctx.log("combat", `⚠️ ${target.name} is no longer at this POI — skipping to next target`);
+              continue;
+            }
+
             const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
             if (won) {
               totalKills++;

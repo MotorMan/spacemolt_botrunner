@@ -1311,11 +1311,25 @@ export async function fightFreshBattle(
       const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
 
       if (ourZoneNow !== "engaged") {
-        if (ourZoneNum < enemyZoneNum) {
-          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} toward ${enemyZone} (stay-at-engaged)`);
-          const adv = await bot.exec("battle", { action: "advance" });
-          if (adv.error) {
-            const errMsg = adv.error.message.toLowerCase();
+        if (ourZoneNum > enemyZoneNum + 1) {
+          ctx.log("combat", `↩️ Retreating from ${ourZoneNow} to match enemy at ${enemyZone} (stay-at-engaged)`);
+          const retResp = await bot.exec("battle", { action: "retreat" });
+          if (retResp.error) {
+            const errMsg = retResp.error.message.toLowerCase();
+            if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+              ctx.log("combat", "✅ Battle ended (retreat failed: not in battle) - victory!");
+              await checkAndPraiseMorgThar(ctx, true);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return true;
+            }
+            ctx.log("error", "Retreat failed: " + retResp.error.message);
+          }
+          await ctx.sleep(10000);
+        } else {
+          ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+          const advResp = await bot.exec("battle", { action: "advance" });
+          if (advResp.error) {
+            const errMsg = advResp.error.message.toLowerCase();
             if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
               const stillInBattle = await getBattleStatus(ctx);
               if (stillInBattle) {
@@ -1330,12 +1344,15 @@ export async function fightFreshBattle(
               await recloakAfterBattle(ctx, cloakOnStart);
               return true;
             }
-            ctx.log("error", "Advance to engaged failed: " + adv.error.message);
+            ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
           }
-        } else if (ourZoneNum > enemyZoneNum) {
-          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding, looking for closer target (stay-at-engaged)`);
-        } else {
-          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding for engaged (stay-at-engaged)`);
+          await ctx.sleep(10000);
+        }
+      } else {
+        if (ourZoneNum > enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding at engaged (stay-at-engaged)`);
+        } else if (ourZoneNum === enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding at engaged (stay-at-engaged)`);
         }
       }
 
@@ -2068,11 +2085,25 @@ export async function fightJoinedBattle(
       const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
 
       if (ourZoneNow !== "engaged") {
-        if (ourZoneNum < enemyZoneNum) {
-          ctx.log("combat", `⚔️ Creature: advancing from ${ourZoneNow} toward ${enemyZone} (stay-at-engaged)`);
-          const adv = await bot.exec("battle", { action: "advance" });
-          if (adv.error) {
-            const errMsg = adv.error.message.toLowerCase();
+        if (ourZoneNum > enemyZoneNum + 1) {
+          ctx.log("combat", `↩️ Retreating from ${ourZoneNow} to match enemy at ${enemyZone} (stay-at-engaged)`);
+          const retResp = await bot.exec("battle", { action: "retreat" });
+          if (retResp.error) {
+            const errMsg = retResp.error.message.toLowerCase();
+            if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+              ctx.log("combat", "✅ Battle ended (retreat failed: not in battle) - victory!");
+              await checkAndPraiseMorgThar(ctx, true);
+              await recloakAfterBattle(ctx, cloakOnStart);
+              return true;
+            }
+            ctx.log("error", "Retreat failed: " + retResp.error.message);
+          }
+          await ctx.sleep(10000);
+        } else {
+          ctx.log("combat", `⚔️ Advancing from ${ourZoneNow} to engaged (stay-at-engaged)`);
+          const advResp = await bot.exec("battle", { action: "advance" });
+          if (advResp.error) {
+            const errMsg = advResp.error.message.toLowerCase();
             if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
               const stillInBattle = await getBattleStatus(ctx);
               if (stillInBattle) {
@@ -2091,12 +2122,15 @@ export async function fightJoinedBattle(
               await recloakAfterBattle(ctx, cloakOnStart);
               return true;
             }
-            ctx.log("error", "Advance to engaged failed: " + adv.error.message);
+            ctx.log("error", "Advance to engaged failed: " + advResp.error.message);
           }
-        } else if (ourZoneNum > enemyZoneNum) {
-          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding, looking for closer target (stay-at-engaged)`);
-        } else {
-          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding for engaged (stay-at-engaged)`);
+          await ctx.sleep(10000);
+        }
+      } else {
+        if (ourZoneNum > enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: ahead of ${enemyZone} at ${ourZoneNow} — holding at engaged (stay-at-engaged)`);
+        } else if (ourZoneNum === enemyZoneNum) {
+          ctx.log("combat", `⚔️ Creature: matched ${enemyZone} — holding at engaged (stay-at-engaged)`);
         }
       }
 

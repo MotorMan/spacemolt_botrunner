@@ -527,10 +527,12 @@ function getHunterSettings(username?: string): {
   fleetBattleConfirmSeconds: number;
   fleetFightPlayers: boolean;
   fleetUndockToFight: boolean;
-  boardingEnabled: boolean;
+   boardingEnabled: boolean;
   boardingShieldThreshold: number;
   boardingMarines: number;
   boardingPrizeDestination: string;
+  creatureFarmSystems: string[];
+  creatureFarmRoamJumps: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -612,6 +614,8 @@ onlyNPCs: (h.onlyNPCs as boolean) !== false,
       (botOverrides.boardingPrizeDestination as string) ||
       (h.boardingPrizeDestination as string) ||
       "",
+  creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
+  creatureFarmRoamJumps: (h.creatureFarmRoamJumps as number) ?? 1,
   };
 }
 
@@ -1845,43 +1849,70 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
   // true) is governed by the hunter.singleLoop setting. These persist for the
   // lifetime of the generator (the routine run).
   let sysIndex = 0;
+  let creatureFarmExpandedSystems: string[] = [];
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
     const profile = getHunterPatrolProfile(bot.username);
-    if (!profile || !profile.patrolSystems || profile.patrolSystems.length === 0) {
-      ctx.log("error", "creature_farm mode but no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments). Waiting 60s...");
+    if (!profile && (!settings.creatureFarmSystems || settings.creatureFarmSystems.length === 0)) {
+      ctx.log("error", "creature_farm mode but no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments) and no creatureFarmSystems configured. Waiting 60s...");
       await ctx.sleep(60000);
       continue;
     }
 
-    let effectiveSystems = profile.patrolSystems;
-    if (profile.creatureFarmCenterSystem && profile.creatureFarmPatrolRadius) {
-      const centerId = resolveSystemId(profile.creatureFarmCenterSystem);
-      if (centerId) {
-        const radiusSystems = findSystemsWithinRadius(centerId, profile.creatureFarmPatrolRadius);
-        if (radiusSystems.length > 0) {
-          for (let i = radiusSystems.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [radiusSystems[i], radiusSystems[j]] = [radiusSystems[j], radiusSystems[i]];
+    let effectiveSystems: string[];
+    if (settings.creatureFarmSystems && settings.creatureFarmSystems.length > 0) {
+      if (creatureFarmExpandedSystems.length === 0) {
+        const basePool = settings.creatureFarmSystems;
+        const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
+        if (settings.creatureFarmRoamJumps > 0) {
+          const resolvedBase = resolveSystemId(baseSystem);
+          if (resolvedBase) {
+            const expanded = findSystemsWithinRadius(resolvedBase, settings.creatureFarmRoamJumps);
+            creatureFarmExpandedSystems = expanded.length > 0 ? expanded : [resolvedBase];
+            ctx.log("info", `Creature farm random mode: base=${baseSystem}, expanded to ${creatureFarmExpandedSystems.length} systems (roam ${settings.creatureFarmRoamJumps} jumps)`);
+          } else {
+            creatureFarmExpandedSystems = basePool;
           }
-          effectiveSystems = radiusSystems;
-          ctx.log("info", `Creature farm radius mode: ${effectiveSystems.length} systems within ${profile.creatureFarmPatrolRadius} jumps of ${centerId}`);
         } else {
-          ctx.log("warn", `No systems found within ${profile.creatureFarmPatrolRadius} jumps of ${centerId} — falling back to profile patrolSystems`);
+          creatureFarmExpandedSystems = [baseSystem];
+          ctx.log("info", `Creature farm random mode: base=${baseSystem}, no roaming`);
         }
-      } else {
-        ctx.log("warn", `Could not resolve creature farm center system ${profile.creatureFarmCenterSystem} — falling back to profile patrolSystems`);
+      }
+      effectiveSystems = creatureFarmExpandedSystems;
+    } else {
+      effectiveSystems = profile!.patrolSystems;
+      if (profile!.creatureFarmCenterSystem && profile!.creatureFarmPatrolRadius) {
+        const centerId = resolveSystemId(profile!.creatureFarmCenterSystem);
+        if (centerId) {
+          const radiusSystems = findSystemsWithinRadius(centerId, profile!.creatureFarmPatrolRadius);
+          if (radiusSystems.length > 0) {
+            for (let i = radiusSystems.length - 1; i > 0; i--) {
+              const j = Math.floor(Math.random() * (i + 1));
+              [radiusSystems[i], radiusSystems[j]] = [radiusSystems[j], radiusSystems[i]];
+            }
+            effectiveSystems = radiusSystems;
+            ctx.log("info", `Creature farm radius mode: ${effectiveSystems.length} systems within ${profile!.creatureFarmPatrolRadius} jumps of ${centerId}`);
+          } else {
+            ctx.log("warn", `No systems found within ${profile!.creatureFarmPatrolRadius} jumps of ${centerId} — falling back to profile patrolSystems`);
+          }
+        } else {
+          ctx.log("warn", `Could not resolve creature farm center system ${profile!.creatureFarmCenterSystem} — falling back to profile patrolSystems`);
+        }
       }
     }
 
-    // Re-clamp the index if the assigned profile changed underneath us.
-    if (sysIndex >= effectiveSystems.length) sysIndex = 0;
+    if (sysIndex >= effectiveSystems.length) {
+      sysIndex = 0;
+      if (settings.creatureFarmSystems && settings.creatureFarmSystems.length > 0) {
+        creatureFarmExpandedSystems = [];
+      }
+    }
 
     const homeSystem = settings.homeSystem || "";
     const homeStation = settings.homeStation || "";
     const targetSystem = effectiveSystems[sysIndex];
-    const targetPois = profile.targetPois || [];
+    const targetPois = profile?.targetPois || [];
     // `loopsPerSystem` is the number of full POI sweeps to perform in this system
     // before advancing to the next profile system. This is the "loops" setting
     // the user configures (creatureFarmLoopsPerSystem); it drives the inner

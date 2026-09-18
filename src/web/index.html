@@ -13980,13 +13980,13 @@
           <div class="setting-label">Jump Timeout Buffer</div>
           <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
         </div>
-        <div style="display:flex;align-items:center;gap:8px">
-          <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
-          <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
-        </div>
-       </div>
+         <div style="display:flex;align-items:center;gap:8px">
+           <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
+           <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
+         </div>
+     </div>
 
-      <div class="setting-row">
+     <div class="setting-row">
         <div>
           <div class="setting-label">Disable Debug Log</div>
           <div class="setting-hint">Disable writing to debug log files (data/logs/{botName}_debug.log). Activity logs remain unaffected.</div>
@@ -19742,9 +19742,9 @@
           <select id="trade-buyer-add-select" onchange="updateTradeBuyerAddDetail()" style="flex:1;min-width:0"></select>
           <input type="number" id="trade-buyer-max-price" min="0" placeholder="Max price" style="width:100px">
           <button class="primary sm" onclick="addTradeBuyerItem()">+ Add</button>
-        </div>
-        <div id="trade-buyer-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
-      </div>
+         </div>
+       </div>
+     </div>
 
     <div class="setting-row">
       <div>
@@ -31888,7 +31888,62 @@ ignoreBlacklist: document.getElementById(
               </div>`;
               })()
             : ""
-        }
+         }
+       </div>
+     </div>
+
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:6px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Creature Farm Systems</div>
+        <div class="setting-hint">Configure a list of systems for creature hunting. The bot picks one randomly, then can roam within the specified jump radius to find creatures. Leave empty to use Hunter Patrol Profiles instead.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <input type="number" id="set-hunter-creatureFarmRoamJumps" min="0" max="20" value="${h.creatureFarmRoamJumps ?? 1}" style="width:120px">
+        <span style="font-size:12px;color:var(--text-dim)">Roam Jumps (0 = fixed system only)</span>
+      </div>
+      <div class="blacklist-section">
+        <div class="blacklist-header">
+          <span>Creature Farm Systems (${(h.creatureFarmSystems || []).length})</span>
+          <button class="sm primary" onclick="exportCreatureFarmSystems()">Export CSV</button>
+        </div>
+        <div class="blacklist-list">
+          ${
+            (h.creatureFarmSystems || []).length > 0
+              ? h.creatureFarmSystems
+                  .map((sysId) => {
+                    const sys = knownSystems.find((s) => s.id === sysId);
+                    const label = sys ? (sys.name ? `${sys.name} (${sys.id})` : sys.id) : sysId;
+                    return `
+                  <div class="blacklist-item">
+                    <span class="blacklist-name">${esc(label)}</span>
+                    <button class="small danger" onclick="removeFromCreatureFarmSystems('${esc(sysId)}')">Remove</button>
+                  </div>`;
+                  })
+                  .join("")
+              : '<div class="blacklist-empty">No creature farm systems configured. Add systems below.</div>'
+          }
+        </div>
+        <div class="blacklist-add" style="margin-top:12px">
+          <div class="blacklist-add-row">
+            <select id="creature-farm-system-select" style="flex:1;min-width:200px">
+              <option value="">(select a system)</option>
+              ${[...knownSystems]
+                .sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))
+                .map((s) => {
+                  const label = s.name ? `${s.name} (${s.id})` : s.id;
+                  return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+                })
+                .join("")}
+            </select>
+            <button class="primary sm" onclick="addToCreatureFarmSystemsFromSelect()">Add</button>
+          </div>
+          <div class="blacklist-divider"><span>OR</span></div>
+          <div class="blacklist-add-row">
+            <input type="text" id="creature-farm-manual-entry" placeholder="e.g., algol, bellatrix, zaniah" style="flex:1;min-width:200px">
+            <button class="primary sm" onclick="addToCreatureFarmSystemsFromText()">Add</button>
+          </div>
+          <div class="blacklist-hint">Enter system names or IDs, separated by commas. Systems must match exactly (case-insensitive).</div>
+        </div>
       </div>
     </div>
 
@@ -32343,6 +32398,14 @@ ignoreBlacklist: document.getElementById(
               document.getElementById("set-hunter-creatureFarmLoopsPerSystem")
                 .value,
             ) || 3,
+          creatureFarmSystems: Array.isArray(settings.hunter?.creatureFarmSystems)
+            ? settings.hunter.creatureFarmSystems
+            : [],
+          creatureFarmRoamJumps:
+            parseInt(
+              document.getElementById("set-hunter-creatureFarmRoamJumps")
+                .value,
+            ) || 1,
           boardingEnabled:
             document.getElementById("set-hunter-boardingEnabled")?.value === "true",
           boardingShieldThreshold:
@@ -32599,31 +32662,104 @@ ignoreBlacklist: document.getElementById(
          });
        }
 
-      function removeSystemFromCurrentHunterProfile(systemId) {
-        const idx = window._currentHunterPatrolIndex;
-        if (idx === undefined) return;
+       function removeSystemFromCurrentHunterProfile(systemId) {
+         const idx = window._currentHunterPatrolIndex;
+         if (idx === undefined) return;
 
-        const profile = settings.hunter.hunterPatrols[idx];
-        if (!profile.patrolSystems) return;
+         const profile = settings.hunter.hunterPatrols[idx];
+         if (!profile.patrolSystems) return;
 
-        // Remove only the first matching instance (so duplicates can be removed one at a time)
-        const lowerId = systemId.toLowerCase();
-        const removeIndex = profile.patrolSystems.findIndex(
-          (s) => s.toLowerCase() === lowerId,
-        );
-        if (removeIndex !== -1) {
-          profile.patrolSystems.splice(removeIndex, 1);
-        }
+         // Remove only the first matching instance (so duplicates can be removed one at a time)
+         const lowerId = systemId.toLowerCase();
+         const removeIndex = profile.patrolSystems.findIndex(
+           (s) => s.toLowerCase() === lowerId,
+         );
+         if (removeIndex !== -1) {
+           profile.patrolSystems.splice(removeIndex, 1);
+         }
 
-        rerenderCurrentSettings();
-        send({
-          type: "saveSettings",
-          routine: "hunter",
-          settings: settings.hunter,
-        });
-      }
+         rerenderCurrentSettings();
+         send({
+           type: "saveSettings",
+           routine: "hunter",
+           settings: settings.hunter,
+         });
+       }
 
-      // ── Escort settings ─────────────────────────────────────────
+       function addToCreatureFarmSystemsFromSelect() {
+         const select = document.getElementById("creature-farm-system-select");
+         const systemId = select.value;
+         if (!systemId) return;
+
+         if (!settings.hunter) settings.hunter = {};
+         if (!Array.isArray(settings.hunter.creatureFarmSystems)) {
+           settings.hunter.creatureFarmSystems = [];
+         }
+         if (!settings.hunter.creatureFarmSystems.includes(systemId)) {
+           settings.hunter.creatureFarmSystems.push(systemId);
+         }
+         rerenderCurrentSettings();
+       }
+
+       function addToCreatureFarmSystemsFromText() {
+         const input = document.getElementById("creature-farm-manual-entry");
+         const text = input.value.trim();
+         if (!text) return;
+
+         if (!settings.hunter) settings.hunter = {};
+         if (!Array.isArray(settings.hunter.creatureFarmSystems)) {
+           settings.hunter.creatureFarmSystems = [];
+         }
+
+         const systems = text
+           .split(",")
+           .map((s) => s.trim())
+           .filter((s) => s.length > 0);
+         for (const system of systems) {
+           const match = Object.entries(mapData).find(
+             ([id, data]) =>
+               id.toLowerCase() === system.toLowerCase() ||
+               (data.name || "").toLowerCase() === system.toLowerCase(),
+           );
+           const systemId = match ? match[0] : system;
+
+           if (!settings.hunter.creatureFarmSystems.includes(systemId)) {
+             settings.hunter.creatureFarmSystems.push(systemId);
+           }
+         }
+
+         input.value = "";
+         rerenderCurrentSettings();
+       }
+
+       function removeFromCreatureFarmSystems(systemId) {
+         if (!settings.hunter || !Array.isArray(settings.hunter.creatureFarmSystems)) return;
+         settings.hunter.creatureFarmSystems = settings.hunter.creatureFarmSystems.filter(
+           (s) => s.toLowerCase() !== systemId.toLowerCase(),
+         );
+         rerenderCurrentSettings();
+       }
+
+       function exportCreatureFarmSystems() {
+         const systems = (settings.hunter?.creatureFarmSystems || []).join(", ");
+         if (!systems) {
+           alert("No systems configured to export.");
+           return;
+         }
+         navigator.clipboard.writeText(systems).then(() => {
+           alert("Systems copied to clipboard:\n" + systems);
+         }).catch(() => {
+           const textarea = document.createElement("textarea");
+           textarea.value = systems;
+           document.body.appendChild(textarea);
+           textarea.select();
+           document.execCommand("copy");
+           document.body.removeChild(textarea);
+           alert("Systems copied to clipboard:\n" + systems);
+         });
+       }
+
+       // ── Escort settings ─────────────────────────────────────────
       function renderEscortSettings(panel) {
         const e = settings.escort || {};
         const globalRefuelThreshold = e.refuelThreshold ?? 40;

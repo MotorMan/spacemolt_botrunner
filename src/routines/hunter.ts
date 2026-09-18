@@ -1240,7 +1240,7 @@ function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCre
  */
 async function hunterEngage(
   ctx: RoutineContext,
-  target: { id: string; name: string; isCreature?: boolean },
+  target: { id: string; name: string; isCreature?: boolean; type?: string },
   fleeThreshold: number,
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
@@ -1251,7 +1251,7 @@ async function hunterEngage(
   onlyNPCs: boolean = false,
   cloakOnStart: boolean = false,
 ): Promise<boolean> {
-  const isCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
+  const isCreature = !!target.isCreature || target.type === "creature" || target.id.startsWith("crt_") || isCreatureName(target.name);
   if (!coordResponding) {
     broadcastHunterAssist(ctx, target, isCreature);
     claimCreature(ctx, target);

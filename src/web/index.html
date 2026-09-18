@@ -38636,50 +38636,30 @@ ignoreBlacklist: document.getElementById(
 
         try {
           const parallel = Math.max(1, parseInt(document.getElementById("bulkRefitParallel")?.value || "1", 10) || 1);
-          const queue = [...bulkRefitState.recipients];
-          let active = 0;
-          let done = false;
-
           bulkRefitLog(`Starting bulk refit... (parallel=${parallel})`);
 
-          const processNext = () => {
-            if (done) return;
-            while (active < parallel && queue.length > 0) {
-              const recipient = queue.shift();
-              active++;
-              bulkRefitLog(`Refitting ${recipient}...`);
-              bulkRefitRunForBot(recipient)
-                .then(() => {
+          for (let i = 0; i < bulkRefitState.recipients.length; i += parallel) {
+            if (bulkRefitState.stopRequested) {
+              bulkRefitLog("Stopped by user.");
+              break;
+            }
+            const batch = bulkRefitState.recipients.slice(i, i + parallel);
+            bulkRefitLog(`Batch ${Math.floor(i / parallel) + 1}: ${batch.join(", ")}`);
+
+            await Promise.all(
+              batch.map(async (recipient) => {
+                bulkRefitLog(`Refitting ${recipient}...`);
+                try {
+                  await bulkRefitRunForBot(recipient);
                   bulkRefitState.processedCount++;
                   bulkRefitLog(`  ✓ ${recipient} refit complete`);
-                })
-                .catch((e) => {
+                } catch (e) {
                   bulkRefitState.failedCount++;
                   bulkRefitLog(`  ✗ ${recipient} failed: ${e.message || e}`);
-                })
-                .finally(() => {
-                  active--;
-                  updateBulkRefitCounts();
-                  processNext();
-                });
-            }
-            if (active === 0 && queue.length === 0) {
-              done = true;
-            }
-          };
-
-          await new Promise((resolve) => {
-            const poll = setInterval(() => {
-              if (done || bulkRefitState.stopRequested) {
-                clearInterval(poll);
-                resolve();
-              }
-            }, 200);
-            processNext();
-          });
-
-          if (bulkRefitState.stopRequested) {
-            bulkRefitLog("Stopped by user.");
+                }
+                updateBulkRefitCounts();
+              })
+            );
           }
         } catch (e) {
           bulkRefitLog(`Error: ${e.message || e}`);

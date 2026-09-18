@@ -38405,7 +38405,7 @@ ignoreBlacklist: document.getElementById(
         container.innerHTML = `
           <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px">
             <label style="font-size:12px;color:var(--text-dim)">Module Preset:</label>
-            <select id="bulkRefitPreset" style="font-size:12px;padding:4px 8px;min-width:200px">
+            <select id="bulkRefitPreset" onchange="updateBulkRefitStartBtn()" style="font-size:12px;padding:4px 8px;min-width:200px">
               <option value="">-- select preset --</option>
             </select>
             <label style="font-size:12px;color:var(--text-dim)">Parallel:</label>
@@ -38527,7 +38527,10 @@ ignoreBlacklist: document.getElementById(
       async function startBulkRefit() {
         const presetName = document.getElementById("bulkRefitPreset")?.value;
         const recipients = getBulkRefitRecipients();
-        if (!presetName || recipients.length === 0) return;
+        if (!presetName || recipients.length === 0) {
+          bulkRefitLog("Select a module preset and at least one bot first.");
+          return;
+        }
 
         let presets;
         try {

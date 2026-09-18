@@ -430,7 +430,7 @@ async function handleFuelCheckFailure(
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "fleet" | "pvp" | "boarding";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "fleet" | "pvp" | "boarding";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -1724,7 +1724,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
-    if (initialSettings.mode === "creature_farm") {
+    if (initialSettings.mode === "creature_farm" || initialSettings.mode === "creature_farm_random") {
       yield* creatureFarmRoutine(ctx);
       return;
     }

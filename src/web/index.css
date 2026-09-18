@@ -2240,6 +2240,13 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   max-height: 300px;
   overflow-y: auto;
 }
+.blacklist-list-expand {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: none;
+  overflow-y: visible;
+}
 .blacklist-item {
   display: flex;
   align-items: center;

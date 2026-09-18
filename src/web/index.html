@@ -5316,6 +5316,7 @@
         <option value="patrol_radius"${hunterMode === "patrol_radius" ? " selected" : ""}>Patrol radius</option>
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
+        <option value="creature_farm_random"${hunterMode === "creature_farm_random" ? " selected" : ""}>Creature Farm (Random Systems)</option>
         <option value="fleet"${hunterMode === "fleet" ? " selected" : ""}>Fleet Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
         <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
@@ -31749,6 +31750,7 @@ ignoreBlacklist: document.getElementById(
           <option value="patrol_radius">Patrol radius</option>
           <option value="station_protection">Station Protection</option>
           <option value="creature_farm">Creature Farm</option>
+          <option value="creature_farm_random">Creature Farm (Random Systems)</option>
           <option value="fleet">Fleet Mode (idle until battle)</option>
           <option value="pvp">PVP (camp POI, attack player)</option>
           <option value="boarding">Boarding (patrol + board eligible targets)</option>
@@ -31906,7 +31908,7 @@ ignoreBlacklist: document.getElementById(
           <span>Creature Farm Systems (${(h.creatureFarmSystems || []).length})</span>
           <button class="sm primary" onclick="exportCreatureFarmSystems()">Export CSV</button>
         </div>
-        <div class="blacklist-list">
+        <div class="blacklist-list-expand">
           ${
             (h.creatureFarmSystems || []).length > 0
               ? h.creatureFarmSystems

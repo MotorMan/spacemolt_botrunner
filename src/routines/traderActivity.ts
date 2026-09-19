@@ -13,16 +13,19 @@ const ACTIVITY_FILE_TEMP = join(DATA_DIR, "traderActivity.json.tmp");
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
 
-export type TradeSessionState = "buying" | "in_transit" | "at_destination" | "selling" | "completed" | "abandoned" | "failed";
+export type TradeSessionState = "buying" | "awaiting_market" | "in_transit" | "at_destination" | "selling" | "returning_home" | "completed" | "abandoned" | "failed";
 
 export interface TradeSession {
   sessionId: string;
   botUsername: string;
+  routine: "trader" | "live_trader";
+  phase: TradeSessionState;
   itemId: string;
   itemName: string;
   sourceSystem: string;
   sourcePoi: string;
   sourcePoiName: string;
+  sourceBaseId?: string;
   buyPricePerUnit: number;
   quantityBought: number;
   totalSpent: number;
@@ -39,8 +42,23 @@ export interface TradeSession {
   investedCredits: number;
   expectedRevenue: number;
   expectedProfit: number;
+  actualQuantityAboard: number;
+  actualCreditsSpent: number;
+  actualSoldQuantity: number;
+  actualRevenue: number;
+  actualProfit: number;
+  creditsBeforeBuy?: number;
+  creditsBeforeSell?: number;
+  sourceOrderId?: string;
+  destOrderId?: string;
+  sourceDepth?: number;
+  destDepth?: number;
+  snapshotTick?: number;
+  snapshotUpdatedAt?: number;
+  routeClaimKey?: string;
   startedAt: string;
   lastUpdatedAt: string;
+  lastHeartbeat?: number;
   completedAt?: string;
   state: TradeSessionState;
   isFactionRoute?: boolean;
@@ -49,6 +67,7 @@ export interface TradeSession {
   returnToSource?: boolean;
   hasInsurance?: boolean;
   notes?: string;
+  lastRecoveryReason?: string;
   passengersOnboard?: Array<{
     citizenId: string;
     name: string;
@@ -86,8 +105,7 @@ export function loadTraderActivity(): TraderActivityData {
           console.warn(`Invalid trader activity data structure from ${file}`);
           continue;
         }
-        //console.log(`Loaded trader activity from ${file}`);
-        //return parsed;
+        return parsed as TraderActivityData;
       }
     } catch (err) {
       console.warn(`Could not load ${file}:`, err);
@@ -185,7 +203,13 @@ export async function startTradeSession(session: TradeSession): Promise<void> {
     activity.sessionHistory.unshift(activity.activeSession);
     if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);
   }
-  activity.activeSession = session;
+  activity.activeSession = {
+    ...session,
+    sessionId: session.sessionId || `${session.botUsername}_${Date.now()}`,
+    startedAt: session.startedAt || new Date().toISOString(),
+    lastUpdatedAt: new Date().toISOString(),
+    lastHeartbeat: Date.now(),
+  };
   await saveBotActivity(session.botUsername, activity);
 }
 
@@ -236,6 +260,7 @@ export async function abandonTradeSession(botUsername: string, reason: string): 
   const session = activity.activeSession;
   session.state = "abandoned";
   session.lastUpdatedAt = new Date().toISOString();
+  session.lastHeartbeat = Date.now();
   session.notes = (session.notes || "") + " | " + reason;
   if (!activity.sessionHistory) activity.sessionHistory = [];
   activity.sessionHistory.unshift(session);
@@ -243,6 +268,26 @@ export async function abandonTradeSession(botUsername: string, reason: string): 
   activity.activeSession = undefined;
   await saveBotActivity(botUsername, activity);
   return session;
+}
+
+export async function startLiveTradeSession(session: TradeSession): Promise<void> {
+  await startTradeSession({ ...session, routine: "live_trader", phase: session.phase || "buying" });
+}
+
+export async function updateLiveTradeSession(botUsername: string, updates: Partial<TradeSession>): Promise<TradeSession | null> {
+  return updateTradeSession(botUsername, { ...updates, lastHeartbeat: Date.now() });
+}
+
+export async function completeLiveTradeSession(botUsername: string, actualRevenue?: number, actualProfit?: number): Promise<TradeSession | null> {
+  return completeTradeSession(botUsername, actualRevenue, actualProfit);
+}
+
+export async function failLiveTradeSession(botUsername: string, reason: string): Promise<TradeSession | null> {
+  return failTradeSession(botUsername, reason);
+}
+
+export async function abandonLiveTradeSession(botUsername: string, reason: string): Promise<TradeSession | null> {
+  return abandonTradeSession(botUsername, reason);
 }
 
 export function getActiveSession(botUsername: string): TradeSession | undefined {
@@ -261,6 +306,8 @@ export function createTradeSession(params: {
   return {
     sessionId: botUsername + "_" + Date.now(),
     botUsername,
+    routine: "trader",
+    phase: isCargoRoute || (isFactionRoute && route.jumps === 0) ? "selling" : "buying",
     itemId: route.itemId,
     itemName: route.itemName,
     sourceSystem: route.sourceSystem,
@@ -282,6 +329,11 @@ export function createTradeSession(params: {
     investedCredits: investedCredits ?? route.buyPrice * route.buyQty,
     expectedRevenue: route.sellPrice * route.sellQty,
     expectedProfit: route.totalProfit,
+    actualQuantityAboard: 0,
+    actualCreditsSpent: 0,
+    actualSoldQuantity: 0,
+    actualRevenue: 0,
+    actualProfit: 0,
     startedAt: now,
     lastUpdatedAt: now,
     state: isCargoRoute || (isFactionRoute && route.jumps === 0) ? "selling" : "buying",

@@ -9,6 +9,7 @@ import {
 } from "../market_local_source.js";
 import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
 import { updateShipListings } from "../shipsforsale.js";
+import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
@@ -114,20 +115,34 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   function subscribeMarketUpdates(baseId: string, systemId: string, poiId: string, stationName: string) {
     unsubscribeMarketUpdates();
     const cb = (entry: import("../marketstreamstore.js").MarketStreamEntry | null) => {
-      if (!entry || !entry.items.length) return;
+      if (!entry) return;
       try {
-        const prevEntry = marketStreamStore.getMarket(baseId);
+        const prevEntry = marketStreamStore.getMarket(entry.baseId || "");
         const prevItems = prevEntry?.items ?? [];
         const prevItemIds = new Set(prevItems.map(i => (i.item_id as string) || (i.id as string) || ""));
         const newItemIds = new Set(entry.items.map(i => (i.item_id as string) || (i.id as string) || ""));
         const added = [...newItemIds].filter(id => id && !prevItemIds.has(id));
         const removed = [...prevItemIds].filter(id => id && !newItemIds.has(id));
         if (added.length > 0 || removed.length > 0) {
-          console.log(`[market] ${baseId}: +${added.length}/-${removed.length} items (${added.slice(0,3).join(", ")}${added.length > 3 ? "..." : ""} / ${removed.slice(0,3).join(", ")}${removed.length > 3 ? "..." : ""})`);
+          console.log(`[market] ${entry.baseId}: +${added.length}/-${removed.length} items (${added.slice(0,3).join(", ")}${added.length > 3 ? "..." : ""} / ${removed.slice(0,3).join(", ")}${removed.length > 3 ? "..." : ""})`);
         }
-        const isMobileCapital = baseId === "frontier_station" || poiId === "frontier_station" || poiId === "mobile_capital" || poiId === "mobile_capitol";
-        const stationKey = isMobileCapital ? "frontier_station" : poiId;
-        saveItemsToMarketDetails(systemId, stationKey, stationName, entry.items as Array<Record<string, unknown>>);
+        const isMobileCapital = entry.baseId === "frontier_station" || entry.poiId === "frontier_station" || entry.poiId === "mobile_capital" || entry.poiId === "mobile_capitol";
+        const stationKey = isMobileCapital ? "frontier_station" : entry.poiId || entry.baseId || "";
+        const stationName = entry.poiName || entry.baseId || "";
+        saveItemsToMarketDetails(entry.systemId || "", stationKey, stationName, entry.items as Array<Record<string, unknown>>);
+        recordMarketSnapshot(entry.baseId || "", {
+          baseId: entry.baseId,
+          systemId: entry.systemId,
+          poiId: entry.poiId,
+          poiName: entry.poiName,
+          updatedAt: entry.updatedAt,
+        }, entry.tick ?? 0, entry.items as Array<{
+          item_id: string;
+          item_name?: string;
+          sell_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+          buy_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+          [key: string]: unknown;
+        }>);
       } catch {
         /* ignore marketDetails errors from push updates */
       }
@@ -246,15 +261,33 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
           : [];
 
         if (baseId && items.length > 0) {
-          marketStreamStore.update(baseId, 0, items as any);
-
-          // Friendly station name, matching what the explorer writes, so both
-          // producers key marketDetails.json the same way.
           const mappedPoi = mapStore.getSystem(bot.system)?.pois.find((p) => p.id === bot.poi);
           const stationName = mappedPoi?.name
             || (snapshot.base_name as string)
             || (snapshot.station_name as string)
             || bot.poi;
+
+          marketStreamStore.update(baseId, 0, items as any, {
+            baseId,
+            systemId: bot.system,
+            poiId: bot.poi,
+            poiName: stationName,
+            updatedAt: Date.now(),
+          });
+
+          recordMarketSnapshot(baseId, {
+            baseId,
+            systemId: bot.system,
+            poiId: bot.poi,
+            poiName: stationName,
+            updatedAt: Date.now(),
+          }, 0, items as Array<{
+            item_id: string;
+            item_name?: string;
+            sell_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+            buy_orders?: Array<{ price?: number; price_each?: number; quantity?: number; source?: string; order_id?: string; id?: string }>;
+            [key: string]: unknown;
+          }>);
 
           const isMobileCapital =
             baseId === "frontier_station" ||

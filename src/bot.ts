@@ -1350,7 +1350,7 @@ docked = false;
    * game-server bandwidth.
    */
   private isTradeRoutine(): boolean {
-    return this._routine === "explorer" || this._routine === "trader" || this._routine === "market";
+    return this._routine === "explorer" || this._routine === "trader" || this._routine === "live_trader" || this._routine === "market";
   }
 
   /**
@@ -2762,7 +2762,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
   private handleMarketUpdate(payload: NotificationMarketUpdate): void {
     const baseId = payload.base_id;
     if (!baseId || !Array.isArray(payload.items)) return;
-    marketStreamStore.update(baseId, payload.tick, payload.items);
+    marketStreamStore.update(baseId, payload.tick, payload.items, {
+      baseId,
+      systemId: this.system,
+      poiId: this.poi,
+      poiName: mapStore.getSystem(this.system)?.pois.find((p) => p.id === this.poi)?.name || payload.base_name || this.location,
+      updatedAt: Date.now(),
+    });
 
     // Optional mirror into the dashboard's HTTP market cache, normalizing
     // the WS order-book shape (price_each) into what mapStore expects (price).

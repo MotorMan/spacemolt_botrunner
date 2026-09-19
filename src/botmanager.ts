@@ -7,6 +7,7 @@ import { crafterRoutine } from "./routines/crafter.js";
 import { rescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
+import { liveTraderRoutine } from "./routines/liveTrader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
@@ -521,6 +522,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   rescue: { name: "FuelRescue", fn: rescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
+  live_trader: { name: "Live Trader", fn: liveTraderRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
   fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },

@@ -1258,8 +1258,8 @@ async function hunterEngage(
     broadcastHunterAssist(ctx, target, isCreature);
     claimCreature(ctx, target);
   }
-   const hsettings = getHunterSettings(ctx.bot.username);
-   return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, false);
+  const hsettings = getHunterSettings(ctx.bot.username);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, isCreature);
 }
 
 // ── Boarding claim lock (non-API bot chat channel) ────────────
@@ -7075,9 +7075,9 @@ async function* engageBoardingTargetsAtCurrentPoi(
         broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
         claimCreature(ctx, target);
       }
-      const hsettings = getHunterSettings(ctx.bot.username);
-      const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
-       const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
+        const hsettings = getHunterSettings(ctx.bot.username);
+        const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
 
       if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
       if (won) {
@@ -7395,7 +7395,8 @@ async function* boardingSystemPass(
          claimCreature(ctx, target);
        }
        const hsettings = getHunterSettings(ctx.bot.username);
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold);
+        const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
+         const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
 
        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
        if (won) {

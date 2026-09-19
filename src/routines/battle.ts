@@ -29,6 +29,10 @@ export function isCreatureName(name: string | undefined): boolean {
   return wildlifeStore.hasCreatureName(name);
 }
 
+function isCreatureFightTarget(target: NearbyEntity | null | undefined): boolean {
+  return !!target?.isCreature || target?.type === "creature" || target?.id?.startsWith("crt_") || isCreatureName(target?.name);
+}
+
 // ── Types ─────────────────────────────────────────────
 
 export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
@@ -904,6 +908,9 @@ export async function fightFreshBattle(
   let tickCount = 0;
   let lastHull = bot.hull;
   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+  const originalTarget = target;
+  const fightAtEngaged = (): boolean =>
+    stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(target);
 
   ctx.log("combat", `🎯 Fighting fresh battle against ${target.name}...`);
 
@@ -1321,7 +1328,7 @@ export async function fightFreshBattle(
     // Stay within 1 zone of enemy to maintain firing range
     const zoneDiff = ourZoneNum - enemyZoneNum;
 
-    if (stayAtEngaged) {
+    if (fightAtEngaged()) {
       const ourZoneNow = status.your_zone || "outer";
       const enemyZone = targetParticipant?.zone || "outer";
       const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;
@@ -1996,6 +2003,9 @@ export async function fightJoinedBattle(
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+    const originalTarget = target;
+    const fightAtEngaged = (): boolean =>
+      stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(currentTarget);
 
     // If the enemy isn't in the participants roster (newer server combat code omits
     // them), we have no zone info for them. We still know who we're fighting via
@@ -2091,7 +2101,7 @@ export async function fightJoinedBattle(
     // We can hit if |enemyZoneNum - ourZoneNum| <= 1
     const zoneDiff = ourZoneNum - enemyZoneNum;
 
-    if (stayAtEngaged) {
+    if (fightAtEngaged()) {
       const ourZoneNow = status.your_zone || "outer";
       const enemyZone = targetParticipant?.zone || "outer";
       const ourZoneNum = zoneDirMap[ourZoneNow] ?? 0;

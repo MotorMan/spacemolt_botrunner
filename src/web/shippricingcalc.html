@@ -434,9 +434,9 @@
       let html = '';
       for (const s of shipList) {
         const shipId = s.id || s.ship_id || '';
-        const hullType = (s.ship_class || s.class_id || s.type || '').trim();
-        const customName = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
-        const displayName = hullType + (customName ? ' - ' + customName : '') + ' - ' + shipId;
+        const cls = (s.class_name || s.ship_class || s.class_id || s.type || '').trim();
+        const shipName = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
+        const displayName = cls + (shipName ? ' - ' + shipName : '') + ' - ' + shipId;
         const state = shipStates.get(shipId) || 'pending';
         const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +

@@ -9,7 +9,8 @@
  *   - cycle_patrols: Cycle through named patrol profiles
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
  *   - creature_farm: Farm creatures across a Hunter Patrol Profile's systems
- *   - fleet: Do nothing until pulled into a battle (fleet wingman), fight, then stand down
+ *   - creature_farm_random: Farm creatures across randomly selected systems
+ *   - fleet_arena: Stay in the current POI and do nothing until the fleet enters battle
  *   - pvp: Camp a single system POI (never move) and send an attack command every
  *          tick at a configured target player (hunter.targetPlayer / per-bot override)
  *
@@ -54,7 +55,7 @@
  *   combatDebug     — log all raw battle JSON to data/logs/combat_debug/{botName}_combat_debug.log (default: false)
  *   targetRandomly  — shuffle target order each scan (default: false)
  *
- * Fleet mode settings (mode = "fleet"):
+ * Fleet/Arena mode settings (mode = "fleet_arena"; legacy "fleet" is accepted):
  *   fleetIdlePollSeconds      — standby tick length in seconds (default: 2)
  *   fleetBattleConfirmSeconds — get_battle_status fallback poll interval, in case a
  *                               battle push event is missed (default: 10, 0 = push only)
@@ -430,7 +431,7 @@ async function handleFuelCheckFailure(
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "fleet" | "pvp" | "boarding";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "fleet_arena" | "fleet" | "pvp" | "boarding";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -475,7 +476,15 @@ function seededRandom(seed: number): () => number {
   };
 }
 
-function getHunterSettings(username?: string): {
+export function normalizeHunterMode(mode: HunterMode | string): HunterMode {
+  return mode === "fleet" ? "fleet_arena" : (mode as HunterMode);
+}
+
+export function isFleetArenaMode(mode: HunterMode | string): boolean {
+  return normalizeHunterMode(mode) === "fleet_arena";
+}
+
+export function getHunterSettings(username?: string): {
   mode: HunterMode;
   patrolCycleMode: PatrolCycleMode;
   system: string;
@@ -554,7 +563,8 @@ function getHunterSettings(username?: string): {
     resolvedPatrolSystems = h.patrolSystems;
   }
 
-  const mode: HunterMode = ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode;
+  const rawMode = ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode;
+  const mode = normalizeHunterMode(rawMode);
 
   return {
     mode,
@@ -579,7 +589,7 @@ function getHunterSettings(username?: string): {
     fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     disableScanCommandForPirates: (h.disableScanCommandForPirates as boolean) ?? false,
-    disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
+    disableWreckSalvaging: (botOverrides.disableWreckSalvaging as boolean) ?? (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
     stayInPoi: (botOverrides.stayInPoi as boolean) ?? (h.stayInPoi as boolean) ?? false,
@@ -1637,6 +1647,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
+  const isFleetArena = isFleetArenaMode(initialSettings.mode);
 
 // Observation setup removed: using polling instead of subscription
 
@@ -1651,7 +1662,12 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     // only run while docked) still works. This prevents the ship from getting stuck
     // undocked with a stale `docked` flag, which made every withdraw fail with not_docked.
     const wasDockedAtStart = bot.docked;
-    if (initialSettings.mode !== "station_protection" && initialSettings.cloakOnStart && !bot.isCloaked) {
+    if (
+      !isFleetArena &&
+      initialSettings.mode !== "station_protection" &&
+      initialSettings.cloakOnStart &&
+      !bot.isCloaked
+    ) {
       // Undock first if currently docked — the cloak command cannot enable while docked.
       if (bot.docked) {
         const undockResp = await bot.exec("undock");
@@ -1683,21 +1699,17 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // If we started the routine while docked at home base, refuel, repair, then restock
-    if (bot.docked) {
+    // Fleet/Arena mode never performs startup logistics or leaves its current POI.
+    if (bot.docked && !isFleetArena && initialSettings.mode !== "station_protection") {
       await repairShip(ctx);
       await tryRefuel(ctx, { skipApprovedCheck: true });
       await ensureHunterResupply(ctx);
-      // station_protection stays docked on purpose; fleet mode never moves itself
-      // (the fleet leader owns dock/undock/jump), so it also stays put.
-      if (initialSettings.mode !== "station_protection" && initialSettings.mode !== "fleet") {
-        await ensureUndocked(ctx);
-      }
+      await ensureUndocked(ctx);
       await ensureAmmoLoaded(ctx, initialSettings.ammoThreshold, initialSettings.maxReloadAttempts, initialSettings.ammoReloadAbsoluteThreshold, initialSettings.ammoReloadPercentThreshold);
     }
 
     // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
-    if (initialSettings.mode !== "station_protection") {
+    if (!isFleetArena && initialSettings.mode !== "station_protection") {
       await useRepairKits(ctx);
     }
 
@@ -1731,8 +1743,8 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
-    if (initialSettings.mode === "fleet") {
-      yield* fleetModeRoutine(ctx);
+    if (isFleetArenaMode(initialSettings.mode)) {
+      yield* fleetArenaModeRoutine(ctx);
       return;
     }
 
@@ -3969,7 +3981,7 @@ async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<st
   }
 }
 
-// ── Fleet Mode Routine ────────────────────────────────────────
+// ── Fleet/Arena Mode Routine ────────────────────────────────────────
 //
 // "Wingman" sub-routine for a hunter flying in an in-game fleet.
 //
@@ -4291,7 +4303,7 @@ async function fleetModeFight(
   );
 }
 
-async function* fleetModeRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+async function* fleetArenaModeRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
   await bot.refreshLocation();
@@ -4331,13 +4343,16 @@ async function* fleetModeRoutine(ctx: RoutineContext): AsyncGenerator<string, vo
       if (death === "wait") continue;
     }
 
-    // ── Low fuel cells check ──
-    await bot.refreshCargo();
-    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
+    // Fleet/Arena mode never performs cargo or fuel checks while standing by.
+    if (!isFleetArenaMode(settings.mode)) {
+      // ── Low fuel cells check ──
+      await bot.refreshCargo();
+      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+      if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
     }
 
     // ── Detect: push flag first (free), slow API probe as missed-push insurance ──

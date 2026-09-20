@@ -1485,6 +1485,15 @@
         gifting: true,
         crafting: true,
       };
+
+      function normalizeHunterMode(mode) {
+        return mode === "fleet" ? "fleet_arena" : mode;
+      }
+
+      function isFleetArenaMode(mode) {
+        return normalizeHunterMode(mode) === "fleet_arena";
+      }
+
       let wrecksScanned = false;
       let activeOreFilters = new Set();
       let battleState = {};
@@ -5304,7 +5313,7 @@
             getProfileSelectedRoutine() === "hunter");
         if (isHunter) {
           const botSettings = settings[bot.username] || {};
-          const hunterMode = botSettings.hunterMode || "roam_systems";
+          const hunterMode = normalizeHunterMode(botSettings.hunterMode || "roam_systems");
           actions += `
       <span class="profile-ore-label">Mode:</span>
       <select id="profile-hunterMode" onchange="saveProfileHunterMode()">
@@ -5317,7 +5326,7 @@
         <option value="station_protection"${hunterMode === "station_protection" ? " selected" : ""}>Station Protection</option>
         <option value="creature_farm"${hunterMode === "creature_farm" ? " selected" : ""}>Creature Farm</option>
         <option value="creature_farm_random"${hunterMode === "creature_farm_random" ? " selected" : ""}>Creature Farm (Random Systems)</option>
-        <option value="fleet"${hunterMode === "fleet" ? " selected" : ""}>Fleet Mode (idle until battle)</option>
+        <option value="fleet_arena"${hunterMode === "fleet_arena" ? " selected" : ""}>Fleet/Arena Mode (idle until battle)</option>
         <option value="pvp"${hunterMode === "pvp" ? " selected" : ""}>PVP (camp POI, attack player)</option>
         <option value="boarding"${hunterMode === "boarding" ? " selected" : ""}>Boarding (patrol + board eligible targets)</option>
           </select>`;
@@ -5342,10 +5351,10 @@
 
           // Per-bot hunter patrol profile selector. Used by patrol_systems,
           // cycle_patrols, and the creature_farm sub-routine (its route is a
-          // Hunter Patrol Profile). Fleet mode idles until the fleet pulls it
-          // into a battle, so no selector is shown for it.
+          // Hunter Patrol Profile). Fleet/arena mode idles until the fleet
+          // pulls it into a battle, so no selector is shown for it.
           const hunterSettings = settings.hunter || {};
-          if (hunterMode === "fleet") {
+          if (isFleetArenaMode(hunterMode)) {
             actions += `
       <span class="profile-ore-label" style="margin-left:8px" title="Fleet mode idles until the fleet leader starts a battle, then targets the attacker and fights. It never patrols or travels on its own.">Idle until fleet battle</span>`;
           } else {
@@ -31631,6 +31640,7 @@ ignoreBlacklist: document.getElementById(
       // ── Hunter ──────────────────────────────────────────────────
       function renderHunterSettings(panel) {
         const h = settings.hunter || {};
+        const hunterMode = normalizeHunterMode(h.hunterMode || h.mode || "roam_systems");
         const currentSystem = h.system || "";
         const refuelThreshold = h.refuelThreshold ?? 40;
         const returnHomeOnFuelCellsRemaining = h.returnHomeOnFuelCellsRemaining ?? 2;
@@ -31669,6 +31679,12 @@ ignoreBlacklist: document.getElementById(
         const boardingMarines = h.boardingMarines ?? 0;
         const boardingPrizeDestination = h.boardingPrizeDestination || "";
         const stayInPoi = h.stayInPoi ?? false;
+        const fleetIdlePollSeconds = h.fleetIdlePollSeconds ?? 2;
+        const fleetBattleConfirmSeconds = h.fleetBattleConfirmSeconds ?? 10;
+        const fleetFightPlayers = h.fleetFightPlayers ?? true;
+        const fleetUndockToFight = h.fleetUndockToFight ?? true;
+        const showBoardingSettings =
+          hunterMode === "boarding" || isFleetArenaMode(hunterMode);
 
         const tierOptions = ["small", "medium", "large", "capitol", "boss"];
         const tierOpts = tierOptions
@@ -31751,13 +31767,64 @@ ignoreBlacklist: document.getElementById(
           <option value="station_protection">Station Protection</option>
           <option value="creature_farm">Creature Farm</option>
           <option value="creature_farm_random">Creature Farm (Random Systems)</option>
-          <option value="fleet">Fleet Mode (idle until battle)</option>
+          <option value="fleet_arena">Fleet/Arena Mode (idle until battle)</option>
           <option value="pvp">PVP (camp POI, attack player)</option>
           <option value="boarding">Boarding (patrol + board eligible targets)</option>
         </select>
         <button class="primary" onclick="bulkSetHunterMode()">Apply to All Bots</button>
       </div>
     </div>
+
+    ${
+      isFleetArenaMode(hunterMode)
+        ? `
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px;padding:12px;background:var(--bg-secondary);border-radius:6px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Fleet/Arena Mode</div>
+        <div class="setting-hint">These controls apply to wingman hunters. They remain at their current POI and ignore cargo/fuel-cell resupply until pulled into a fleet battle.</div>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Fleet Idle Poll (seconds)</div>
+          <div class="setting-hint">Standby tick length while waiting for the fleet leader to start a battle.</div>
+        </div>
+        <input type="number" id="set-hunter-fleetIdlePollSeconds" min="1" max="30" value="${fleetIdlePollSeconds}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Battle Confirm Poll (seconds)</div>
+          <div class="setting-hint">Fallback poll interval if a battle push event is missed. Set to 0 for push-only detection.</div>
+        </div>
+        <input type="number" id="set-hunter-fleetBattleConfirmSeconds" min="0" max="60" value="${fleetBattleConfirmSeconds}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Fight Players in Fleet Battle</div>
+          <div class="setting-hint">Fight hostile players selected by the fleet leader. Disable to honor the global NPC-only restriction.</div>
+        </div>
+        <select id="set-hunter-fleetFightPlayers">
+          <option value="true"${fleetFightPlayers ? " selected" : ""}>Enabled</option>
+          <option value="false"${!fleetFightPlayers ? " selected" : ""}>Disabled</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Undock to Fight</div>
+          <div class="setting-hint">Undock when a battle starts while docked. The fleet leader remains responsible for fleet movement.</div>
+        </div>
+        <select id="set-hunter-fleetUndockToFight">
+          <option value="true"${fleetUndockToFight ? " selected" : ""}>Enabled</option>
+          <option value="false"${!fleetUndockToFight ? " selected" : ""}>Disabled</option>
+        </select>
+      </div>
+    </div>
+      `
+        : ""
+    }
 
     <div class="setting-row">
       <div>
@@ -32235,18 +32302,18 @@ ignoreBlacklist: document.getElementById(
       <input type="number" id="set-hunter-creatureFarmLoopsPerSystem" min="1" max="100" value="${h.creatureFarmLoopsPerSystem ?? 3}">
     </div>
 
-     <div class="setting-row">
-       <div>
-         <div class="setting-label">Boarding Mode</div>
-         <div class="setting-hint">When enabled (and ship has boarding capability + fit marines), the hunter switches to board stance on eligible targets with shields at or below the threshold instead of destroying them. Requires the "boarding" mode to be selected.</div>
-       </div>
+      <div class="setting-row" style="display:${showBoardingSettings ? "" : "none"}">
+        <div>
+          <div class="setting-label">Boarding Mode</div>
+          <div class="setting-hint">When enabled (and ship has boarding capability + fit marines), the hunter switches to board stance on eligible targets with shields at or below the threshold instead of destroying them. Available in Fleet/Arena or boarding mode.</div>
+        </div>
        <select id="set-hunter-boardingEnabled">
          <option value="false"${!boardingEnabled ? " selected" : ""}>Disabled</option>
          <option value="true"${boardingEnabled ? " selected" : ""}>Enabled</option>
        </select>
      </div>
 
-     <div class="setting-row" id="set-hunter-boardingShieldThreshold-row">
+      <div class="setting-row" id="set-hunter-boardingShieldThreshold-row" style="display:${showBoardingSettings ? "" : "none"}">
        <div>
          <div class="setting-label">Boarding Shield Threshold (%)</div>
          <div class="setting-hint">Shield percentage at or below which to attempt boarding. 0 = always try to board (no shield suppression needed). Default: 5.</div>
@@ -32254,7 +32321,7 @@ ignoreBlacklist: document.getElementById(
        <input type="number" id="set-hunter-boardingShieldThreshold" min="0" max="100" value="${boardingShieldThreshold}">
      </div>
 
-      <div class="setting-row" id="set-hunter-boardingMarines-row">
+      <div class="setting-row" id="set-hunter-boardingMarines-row" style="display:${showBoardingSettings ? "" : "none"}">
         <div>
           <div class="setting-label">Boarding Marines Committed</div>
           <div class="setting-hint">Number of marines to commit to the board stance. 0 = commit all fit marines aboard.</div>
@@ -32262,7 +32329,7 @@ ignoreBlacklist: document.getElementById(
          <input type="number" id="set-hunter-boardingMarines" min="0" value="${boardingMarines}">
        </div>
 
-      <div class="setting-row" id="set-hunter-boardingPrizeDestination-row">
+      <div class="setting-row" id="set-hunter-boardingPrizeDestination-row" style="display:${showBoardingSettings ? "" : "none"}">
         <div>
           <div class="setting-label">Boarding Prize Destination</div>
           <div class="setting-hint">Station to send captured prize ships to. Uses the same format as Home Station below (select from list or enter a station ID / base ID / base name). Leave empty to use the global Home Station.</div>
@@ -32291,6 +32358,9 @@ ignoreBlacklist: document.getElementById(
       }
 
       function saveHunterSettings() {
+        const fleetBattleConfirmSecondsValue = parseInt(
+          document.getElementById("set-hunter-fleetBattleConfirmSeconds")?.value,
+        );
         const s = {
           system: document.getElementById("set-hunter-system").value,
           refuelThreshold:
@@ -32389,6 +32459,18 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-stopOnDeath").value === "true",
           combatDebug:
             document.getElementById("set-hunter-combatDebug").value === "true",
+          mode: hunterMode,
+          fleetIdlePollSeconds:
+            parseInt(document.getElementById("set-hunter-fleetIdlePollSeconds")?.value) || 2,
+          fleetBattleConfirmSeconds: Number.isFinite(fleetBattleConfirmSecondsValue)
+            ? fleetBattleConfirmSecondsValue
+            : 10,
+          fleetFightPlayers:
+            document.getElementById("set-hunter-fleetFightPlayers")?.value ===
+            "true",
+          fleetUndockToFight:
+            document.getElementById("set-hunter-fleetUndockToFight")?.value ===
+            "true",
           targetPlayer: (document.getElementById("set-hunter-targetPlayer")?.value || "").trim(),
           hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols)
             ? settings.hunter.hunterPatrols

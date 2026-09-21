@@ -19,7 +19,10 @@ export class PriceOverridesStore {
   private timer: ReturnType<typeof setInterval> | null = null;
 
   private ensureLoaded(): Record<string, PriceOverride> {
-    if (Object.keys(this.data).length > 0 || existsSync(PRICE_OVERRIDES_FILE)) {
+    if (Object.keys(this.data).length > 0) {
+      return this.data;
+    }
+    if (existsSync(PRICE_OVERRIDES_FILE)) {
       try {
         const raw = readFileSync(PRICE_OVERRIDES_FILE, "utf-8");
         const parsed = JSON.parse(raw) as Record<string, PriceOverride>;
@@ -27,7 +30,7 @@ export class PriceOverridesStore {
           this.data = parsed;
         }
       } catch {
-        // Corrupt file — start fresh
+        this.data = {};
       }
     }
     this.startAutoPersist();

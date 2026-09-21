@@ -2670,10 +2670,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Startup: Refuel if docked (cloaking indicates docked status) ──
-    // If cloaking was just enabled or bot is already cloaked, we're docked - refuel
-    const isDocked = bot.docked || bot.isCloaked;
-    if (isDocked) {
+    // ── Startup: Refuel if actually docked ──
+    // Cloaking does NOT mean the bot is docked — a cloaked miner can be in the field.
+    // Only run startup refuel when bot.docked is actually true.
+    if (bot.docked) {
       ctx.log("mining", "Bot is docked - checking fuel at startup");
       await tryRefuel(ctx, { skipApprovedCheck: true });
     }

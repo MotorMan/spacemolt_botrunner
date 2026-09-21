@@ -2670,6 +2670,25 @@ if (!this.settings.fuel_service) {
               return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
             }
           }
+          if (url.pathname === "/api/ship-pricing/list-ship-for-sale" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string; ship_id?: string; price?: number };
+            if (!body.bot || !body.ship_id || !body.price) {
+              return Response.json({ error: "bot, ship_id, and price required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const result = await botInstance.exec("list_ship_for_sale", { id: body.ship_id, price: body.price });
+              if (result.error) {
+                return Response.json({ error: result.error.message || "list_ship_for_sale failed", data: result.result }, { status: 500 });
+              }
+              return Response.json({ ok: true, data: result.result });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
 
           // Serve index.css
 

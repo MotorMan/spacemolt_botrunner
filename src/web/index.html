@@ -36775,16 +36775,20 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
+      let _fleetRenderTimer = null;
       function renderFleetInline(username, ships, error) {
-        // Find panel body — it's the last child content area after the nav
-        const content = document.getElementById("shipyardContent");
-        const panelBody = content?.querySelector(".sy-panel-body");
-        if (!panelBody) {
-          // Fallback: re-render full content
-          renderFleetPanel(ships, username, error);
-          return;
-        }
-        panelBody.innerHTML = renderFleetPanel(ships, username, error);
+        if (_fleetRenderTimer) clearTimeout(_fleetRenderTimer);
+        _fleetRenderTimer = setTimeout(() => {
+          // Find panel body — it's the last child content area after the nav
+          const content = document.getElementById("shipyardContent");
+          const panelBody = content?.querySelector(".sy-panel-body");
+          if (!panelBody) {
+            // Fallback: re-render full content
+            renderFleetPanel(ships, username, error);
+            return;
+          }
+          panelBody.innerHTML = renderFleetPanel(ships, username, error);
+        }, 80);
       }
 
       function renderFleetPanel(ships, username, error) {
@@ -36804,6 +36808,20 @@ ignoreBlacklist: document.getElementById(
         if (!ships || ships.length === 0) {
           html += '<div class="faction-no-data">No ships owned</div>';
         } else {
+          const localOtherBotOpts = bots
+            .filter((b) => b.username !== username)
+            .map(
+              (b) =>
+                `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
+            )
+            .join("");
+          const allBotOptions =
+            localOtherBotOpts + getRemoteBotOptions(username);
+          const giftDatalist = allBotOptions
+            ? `<datalist id="shipGiftBotList">${allBotOptions}</datalist>`
+            : "";
+          html += giftDatalist;
+
           for (const s of ships) {
             const id = s.id || s.ship_id || "";
             const rawName = s.name || s.ship_name || "";
@@ -37238,26 +37256,10 @@ ignoreBlacklist: document.getElementById(
               isShipAtStation &&
               tierOk;
 
-            // Include local bots plus any remote bots reported by client-sync
-            // (Connect Clients), so shipping a ship to a bot on another client
-            // is just a dropdown pick like the profile Gifting section does.
-            const localOtherBotOpts = bots
-              .filter((b) => b.username !== username)
-              .map(
-                (b) =>
-                  `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
-              )
-              .join("");
-            const botOptions = localOtherBotOpts + getRemoteBotOptions(username);
             const giftDropdown =
               !isActive && !isBuilding && !isLoadedOnCarrier
                 ? `
-        <select class="ship-gift-bot-select" id="gift-select-${id}" onchange="handleGiftBotSelect('${esc(username)}','${esc(id)}',this)">
-          <option value="">Gift to...</option>
-          ${botOptions}
-          <option value="__custom__">Enter name...</option>
-        </select>
-        <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
+        <input type="text" class="ship-gift-bot-select" id="gift-select-${id}" list="shipGiftBotList" placeholder="Gift to..." autocomplete="off">
         <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${escJs(name)}')">Gift</button>
         <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name</button>
       `
@@ -38055,19 +38057,6 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
-      /** Handle gift bot dropdown selection - show/hide custom name input */
-      function handleGiftBotSelect(username, shipId, selectEl) {
-        const inputEl = document.getElementById(`gift-input-${shipId}`);
-        if (!inputEl) return;
-        if (selectEl.value === "__custom__") {
-          inputEl.style.display = "inline-block";
-          inputEl.focus();
-        } else {
-          inputEl.style.display = "none";
-          inputEl.value = "";
-        }
-      }
-
       function openNameShipModal(username) {
         document.getElementById("nameShipNewName").value = "";
         document.getElementById("nameShipModal").style.display = "flex";
@@ -38125,32 +38114,12 @@ ignoreBlacklist: document.getElementById(
       function shipGift(username, shipId, name) {
         if (!shipId) return;
 
-        // Get the selected bot from dropdown or custom input
-        const selectEl = document.getElementById(`gift-select-${shipId}`);
-        const inputEl = document.getElementById(`gift-input-${shipId}`);
-
-        let recipient = selectEl ? selectEl.value : "";
-
-        // If custom input is visible, use that value
-        if (inputEl && inputEl.style.display !== "none") {
-          recipient = inputEl.value.trim();
-        }
+        const inputEl = document.getElementById(`gift-select-${shipId}`);
+        let recipient = inputEl ? inputEl.value.trim() : "";
 
         if (!recipient) {
-          appendLine("system", "Please select a recipient for the gift");
+          appendLine("system", "Please enter a recipient for the gift");
           return;
-        }
-
-        if (
-          recipient === "__custom__" &&
-          inputEl &&
-          inputEl.style.display !== "none"
-        ) {
-          recipient = inputEl.value.trim();
-          if (!recipient) {
-            appendLine("system", "Please enter a recipient name");
-            return;
-          }
         }
 
         if (

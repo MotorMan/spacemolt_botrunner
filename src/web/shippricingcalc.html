@@ -54,7 +54,7 @@
       </div>
     </div>
     <div class="spc-bar" id="spcBar">
-      <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">2.42</b>x</span>
+      <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
       <input type="number" id="multiplier" value="2.42" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('multiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
       <span class="spc-stat" id="spcStats"></span>
     </div>
@@ -265,6 +265,7 @@
       const shipId = (ship.class_id || ship.type || ship.id || '').toLowerCase();
       const shipEntry = catalog.ships[shipId] || null;
       const baseHull = ship.base_hull || ship.max_hull || 0;
+      console.debug('computeShipPricing shipId=', shipId, 'shipEntry=', !!shipEntry, 'modules=', Array.isArray(shipData.modules) ? shipData.modules.length : 'n/a', 'shipDataKeys=', Object.keys(shipData));
 
       if (shipEntry && Array.isArray(shipEntry.build_materials)) {
         let hullCost = 0;
@@ -346,7 +347,9 @@
         updateShipStatus(shipId);
         try {
           const shipInfo = await fetchShipDetails(fetchBot, shipId);
+          console.debug('shipInfo for', shipId, shipInfo);
           const pricing = await computeShipPricing(shipInfo);
+          console.debug('pricing for', shipId, pricing);
           shipPricing.set(shipId, pricing);
           shipStates.set(shipId, 'loaded');
           if (body) {
@@ -366,6 +369,7 @@
             }
           }
         } catch (e) {
+          console.error('processQueue error for', shipId, e);
           shipStates.set(shipId, 'error');
           if (body) {
             body.innerHTML = '<div class="spc-empty">Failed to load ship details</div>';
@@ -427,6 +431,7 @@
           body: JSON.stringify({ bot, ship_id: shipId })
         });
         const json = await res.json();
+        console.debug('get_ship response for', shipId, json);
         if (json.ok && json.data) return json.data;
       } catch (e) {
         console.error('get_ship failed for', shipId, e);

@@ -56,11 +56,14 @@
   <div class="spc-layout">
     <div class="spc-header">
       <h3>Ship Pricing Calc</h3>
-      <div class="spc-controls">
-        <label>Bot:</label>
-        <select id="botSelect"><option value="">Select bot...</option></select>
-        <button class="primary" onclick="fetchShips()">Fetch Ships</button>
-      </div>
+    <div class="spc-controls">
+      <label>Bot:</label>
+      <select id="botSelect"><option value="">Select bot...</option></select>
+      <button class="primary" onclick="fetchShips()">Fetch Ships</button>
+      <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text-dim)">
+        <input type="checkbox" id="skipOffStationShips" checked onchange="onSkipFilterChange()"> Skip off-station ships
+      </label>
+    </div>
     </div>
     <div class="spc-bar" id="spcBar">
       <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
@@ -101,8 +104,10 @@
     let multiplier = 2.42;
     let listingMap = new Map();
     let shipInfoMap = new Map();
+    let shipLocations = new Map();
     let priceOverrides = new Map();
     let overrideModalTarget = null;
+    let currentBotLocation = null;
 
     async function loadCatalog() {
       try {
@@ -153,6 +158,48 @@
       } catch (e) {
         console.error('Failed to load price overrides:', e);
       }
+    }
+
+    async function loadBotLocation(bot) {
+      try {
+        const res = await fetch('/api/bots');
+        const data = await res.json();
+        const botStatus = Array.isArray(data) ? data.find(b => b.username === bot) : null;
+        if (botStatus) {
+          currentBotLocation = { system: botStatus.system || '', poi: botStatus.poi || '' };
+        } else {
+          currentBotLocation = null;
+        }
+      } catch (e) {
+        console.error('Failed to load bot location:', e);
+        currentBotLocation = null;
+      }
+    }
+
+    function onSkipFilterChange() {
+      if (!shipList.length) return;
+      const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
+      const ships = shipList;
+      const queuedShips = skipOffStation && currentBotLocation
+        ? ships.filter(s => {
+            const baseId = s.location_base_id || '';
+            return baseId === '' || baseId === currentBotLocation.poi;
+          })
+        : ships;
+      fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
+      shipStates.clear();
+      shipInfoMap.clear();
+      for (const s of ships) {
+        const sid = s.id || s.ship_id || '';
+        const inQueue = fetchQueue.includes(sid);
+        shipStates.set(sid, inQueue ? 'pending' : 'skipped');
+      }
+      renderShipList();
+      const skippedCount = ships.length - queuedShips.length;
+      const statsText = ships.length + ' ships' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped, click to load)' : ' queued (click to prioritize)');
+      const statsEl = document.getElementById('spcStats');
+      if (statsEl) statsEl.textContent = statsText;
+      processQueue();
     }
 
     async function setPriceOverride(itemId, price) {
@@ -643,17 +690,40 @@
         await loadMarketData();
         await fetchListings(bot);
         await loadPriceOverrides();
+        await loadBotLocation(bot);
         multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
         shipList = ships;
-        fetchQueue = ships.map(s => (s.id || s.ship_id || '')).filter(Boolean);
+        shipLocations.clear();
+        for (const s of ships) {
+          const sid = s.id || s.ship_id || '';
+          shipLocations.set(sid, {
+            location: s.location || '',
+            locationBaseId: s.location_base_id || '',
+            isActive: !!s.is_active,
+            listingId: s.listing_id || null,
+            listingPrice: s.listing_price || null,
+            listingBaseId: s.listing_base_id || null,
+          });
+        }
+        const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
+        const queuedShips = skipOffStation && currentBotLocation
+          ? ships.filter(s => {
+              const baseId = s.location_base_id || '';
+              return baseId === '' || baseId === currentBotLocation.poi;
+            })
+          : ships;
+        fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
         shipStates.clear();
         shipInfoMap.clear();
         for (const s of ships) {
           const sid = s.id || s.ship_id || '';
-          shipStates.set(sid, 'pending');
+          const inQueue = fetchQueue.includes(sid);
+          shipStates.set(sid, inQueue ? 'pending' : 'skipped');
         }
         renderShipList();
-        document.getElementById('spcStats').textContent = ships.length + ' ships queued (click to prioritize)';
+        const skippedCount = ships.length - queuedShips.length;
+        const statsText = ships.length + ' ships' + (skippedCount > 0 ? ' (' + skippedCount + ' skipped, click to load)' : ' queued (click to prioritize)');
+        document.getElementById('spcStats').textContent = statsText;
         processQueue();
       } catch (e) {
         content.innerHTML = '<div class="spc-empty">Error: ' + e.message + '</div>';
@@ -716,15 +786,19 @@
         const shipName = (s.name || s.ship_name || s.custom_name || s.customName || '').trim();
         const displayName = cls + (shipName ? ' - ' + shipName : '') + ' - ' + shipId;
         const state = shipStates.get(shipId) || 'pending';
-        const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
+        const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : state === 'skipped' ? 'Skipped (click to load)' : 'Click to load';
+        const locInfo = shipLocations.get(shipId) || {};
+        const locationText = locInfo.location || locInfo.locationBaseId || '';
         const listingEntry = listingMap.get(shipId) || null;
         const listingPrice = listingEntry ? listingEntry.price : null;
         const listingBadge = listingPrice != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
+        const locBadge = locationText ? ' <span style="font-size:10px;color:var(--text-dim);margin-left:4px">📍 ' + esc(locationText) + '</span>' : '';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
           '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
           '    <span class="spc-ship-status" id="ship-status-' + shipId + '">' + statusText + '</span>' +
           '    <span class="spc-ship-price" id="ship-price-' + shipId + '"></span>' +
+          locBadge +
           listingBadge +
           '  </div>' +
           '  <div class="spc-ship-body" id="ship-body-' + shipId + '" style="display:none">' +
@@ -743,6 +817,7 @@
       else if (state === 'loading') el.textContent = 'Loading...';
       else if (state === 'error') el.textContent = 'Error';
       else if (state === 'queued') el.textContent = 'Queued';
+      else if (state === 'skipped') el.textContent = 'Skipped';
       else el.textContent = 'Click to load';
       const priceEl = document.getElementById('ship-price-' + shipId);
       if (priceEl) {
@@ -819,6 +894,10 @@
           body.style.display = 'block';
         }
         return;
+      }
+      if (state === 'skipped') {
+        shipStates.set(shipId, 'pending');
+        updateShipStatus(shipId);
       }
       enqueueShip(shipId, true);
       card.classList.add('expanded');

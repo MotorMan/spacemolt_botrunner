@@ -174,15 +174,14 @@ async function checkFuelCellAdequacy(
 ): Promise<{ adequate: boolean; reason: string }> {
   const { fuel: currentFuel, cells, summary } = getCargoFuelCells(bot);
   const settings = await getMinerSettings(bot.username);
-  const minCells = settings.minimumFuelCells || 20;
+  const returnHomeThreshold = settings.returnHomeOnFuelCellsRemaining || 2;
 
   if (cells <= 0) {
     return { adequate: false, reason: `no fuel cells in cargo (${summary})` };
   }
 
-  // Quick gate: if below the configured minimum, treat as inadequate.
-  if (cells < minCells) {
-    return { adequate: false, reason: `only ${cells} fuel cell(s) in cargo (minimum: ${minCells})` };
+  if (returnHomeThreshold > 0 && cells <= returnHomeThreshold) {
+    return { adequate: false, reason: `only ${cells} fuel cell(s) in cargo (return-home threshold: ${returnHomeThreshold})` };
   }
 
   // Try to get route fuel estimates for both legs.
@@ -193,8 +192,7 @@ async function checkFuelCellAdequacy(
   if (toHome) estimatedTripFuel += toHome.estimatedFuel;
 
   if (estimatedTripFuel <= 0) {
-    // Can't estimate — rely on the minimum-cell count gate above.
-    return { adequate: true, reason: `cannot estimate route fuel, but ${cells} cells meets minimum` };
+    return { adequate: true, reason: `cannot estimate route fuel, but ${cells} cells is above return-home threshold` };
   }
 
   const bufferedNeed = estimatedTripFuel * 1.2;
@@ -2611,8 +2609,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!bot.docked) {
       await bot.refreshCargo();
       const startupFuelCells = getCargoFuelCells(bot);
-      const minCells = settings0.minimumFuelCells || 20;
-      const needsRestock = startupFuelCells.cells < minCells;
+      const returnHomeThreshold = settings0.returnHomeOnFuelCellsRemaining || 2;
+      const needsRestock = startupFuelCells.cells <= returnHomeThreshold;
       if (needsRestock) {
         const adequacy = await checkFuelCellAdequacy(ctx, homeSystem, homeSystem, bot);
         ctx.log("mining", `Started in the field with low fuel cells (${startupFuelCells.summary}) — ${adequacy.reason} — returning to home system ${homeSystem} to stock up before mining`);

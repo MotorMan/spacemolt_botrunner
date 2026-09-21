@@ -297,6 +297,32 @@ export async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean
   return false;
 }
 
+export async function hasModulatedMiningLaser(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.commands.spacemolt.get_ship();
+    const shipData = shipResp.structuredContent as Record<string, unknown> | undefined;
+    if (!shipData) return false;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+    const modName = (modObj?.name as string) || "";
+
+    const checkStr = `${modId} ${modName}`.toLowerCase();
+    if (checkStr.includes("modulated_mining_laser") || checkStr.includes("modulated mining laser")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Check if the ship has full deep core mining capability (both scanner and extractor).
  * Returns an object with detailed capability info.
@@ -2747,6 +2773,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       };
 
       const settings = await getMinerSettings(bot.username);
+      if (await hasModulatedMiningLaser(ctx, cachedModules)) {
+        settings.ignoreDepletion = true;
+      }
       const cargoThresholdRatio = settings.cargoThreshold / 100;
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,

@@ -100,6 +100,7 @@
     let fetchBot = '';
     let multiplier = 2.42;
     let listingMap = new Map();
+    let shipInfoMap = new Map();
     let priceOverrides = new Map();
     let overrideModalTarget = null;
 
@@ -583,6 +584,7 @@
           const pricing = await computeShipPricing(shipInfo);
           console.debug('pricing for', shipId, pricing);
           shipPricing.set(shipId, pricing);
+          shipInfoMap.set(shipId, shipInfo);
           shipStates.set(shipId, 'loaded');
           if (body) {
             body.innerHTML = renderShipBody(shipId, shipInfo, pricing);
@@ -645,6 +647,7 @@
         shipList = ships;
         fetchQueue = ships.map(s => (s.id || s.ship_id || '')).filter(Boolean);
         shipStates.clear();
+        shipInfoMap.clear();
         for (const s of ships) {
           const sid = s.id || s.ship_id || '';
           shipStates.set(sid, 'pending');
@@ -716,7 +719,7 @@
         const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
         const listingEntry = listingMap.get(shipId) || null;
         const listingPrice = listingEntry ? listingEntry.price : null;
-        const listingBadge = listingPrice != null ? ' <span title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
+        const listingBadge = listingPrice != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
           '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
@@ -755,6 +758,41 @@
     function updateAllShipStatuses() {
       for (const [shipId] of shipStates) {
         updateShipStatus(shipId);
+      }
+    }
+
+    function refreshShipListingBadge(shipId) {
+      const listingEntry = listingMap.get(shipId) || null;
+      const listingPrice = listingEntry ? listingEntry.price : null;
+      const card = document.getElementById('ship-card-' + shipId);
+      if (card) {
+        let badge = card.querySelector('.spc-listing-badge');
+        if (listingPrice != null) {
+          if (!badge) {
+            badge = document.createElement('span');
+            badge.className = 'spc-listing-badge';
+            badge.title = 'Listed for sale';
+            badge.style.fontSize = '11px';
+            const priceEl = card.querySelector('.spc-ship-price');
+            if (priceEl) {
+              priceEl.insertAdjacentElement('afterend', badge);
+            } else {
+              const head = card.querySelector('.spc-ship-head');
+              if (head) head.appendChild(badge);
+            }
+          }
+          badge.textContent = ' 🏷️ ' + listingPrice.toLocaleString() + 'cr';
+        } else if (badge) {
+          badge.remove();
+        }
+      }
+      const body = document.getElementById('ship-body-' + shipId);
+      if (body && card && card.classList.contains('expanded')) {
+        const shipInfo = shipInfoMap.get(shipId);
+        const pricing = shipPricing.get(shipId);
+        if (shipInfo && pricing) {
+          body.innerHTML = renderShipBody(shipId, shipInfo, pricing);
+        }
       }
     }
 
@@ -797,7 +835,7 @@
       const specialName = customName && customName !== cls ? customName : (baseName && baseName !== cls ? baseName : '');
       const displayName = cls + (specialName ? ' - ' + specialName : '') + ' - ' + shipId;
       const listingEntry = listingMap.get(shipId) || null;
-      const listingBadge = listingEntry && listingEntry.price != null ? ' <span title="Listed for sale" style="font-size:11px">🏷️ ' + listingEntry.price.toLocaleString() + 'cr</span>' : '';
+      const listingBadge = listingEntry && listingEntry.price != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingEntry.price.toLocaleString() + 'cr</span>' : '';
       let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--green);font-family:monospace;font-weight:700">' + pricing.total.toLocaleString() + 'cr</span>' + listingBadge + '</div>';
       html += '<div class="spc-section">';
       html += '<div class="spc-section-title">Hull Build Materials</div>';
@@ -861,6 +899,8 @@
         });
         const json = await res.json();
         if (json.ok) {
+          listingMap.set(shipId, { price });
+          refreshShipListingBadge(shipId);
           alert('Listed ' + shipId + ' for sale at ' + price.toLocaleString() + ' cr');
         } else {
           alert('List for sale failed: ' + (json.error || 'unknown'));

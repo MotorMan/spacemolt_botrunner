@@ -4993,6 +4993,7 @@
             bot.state !== "stopping" &&
             getProfileSelectedRoutine() === "miner");
         if (isMiner) {
+          ensureAllMiningOres();
           const botSettings = settings[bot.username] || {};
           const globalOre = (settings.miner || {}).targetOre || "";
           const botOre = botSettings.targetOre || "";
@@ -12816,6 +12817,20 @@
         if (c) return !!c.extracted_by;
         // Not in catalogue (e.g. a brand-new ore) — don't hide it.
         return true;
+      }
+
+      function ensureAllMiningOres() {
+        if (allMiningOres.length > 0) return;
+        const catalogMiningOres = Object.values(catalog.items || {})
+          .filter((it) => it.category === "ore" && isMineableResource(it.id || it.item_id))
+          .map((it) => ({ item_id: it.id || it.item_id, name: it.name || it.id }));
+        allMiningOres = catalogMiningOres.slice();
+        for (const o of knownOres) {
+          if (!allMiningOres.find((mm) => mm.item_id === o.item_id)) {
+            allMiningOres.push(o);
+          }
+        }
+        allMiningOres.sort((a, b) => a.name.localeCompare(b.name));
       }
 
       function buildOreFilters() {

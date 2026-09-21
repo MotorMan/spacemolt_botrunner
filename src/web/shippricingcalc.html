@@ -108,6 +108,117 @@
     let priceOverrides = new Map();
     let overrideModalTarget = null;
     let currentBotLocation = null;
+    let stationRef = null;
+    let stationColorMap = new Map();
+    let mapData = null;
+    let poiLookup = new Map();
+
+    function buildPoiLookup() {
+      poiLookup.clear();
+      if (!mapData || !mapData.systems) return;
+      const systems = mapData.systems;
+      if (Array.isArray(systems)) {
+        for (const sys of systems) {
+          for (const poi of (sys.pois || [])) {
+            registerPoi(poi);
+          }
+        }
+      } else if (typeof systems === 'object') {
+        for (const sys of Object.values(systems)) {
+          if (sys && typeof sys === 'object') {
+            for (const poi of (sys.pois || [])) {
+              registerPoi(poi);
+            }
+          }
+        }
+      }
+    }
+
+    function registerPoi(poi) {
+      if (!poi || !poi.id) return;
+      const idLower = poi.id.toLowerCase();
+      if (!poiLookup.has(idLower)) {
+        poiLookup.set(idLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+      }
+      if (poi.base_id) {
+        const baseLower = poi.base_id.toLowerCase();
+        if (!poiLookup.has(baseLower)) {
+          poiLookup.set(baseLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+      if (poi.base_name) {
+        const nameLower = poi.base_name.toLowerCase();
+        if (!poiLookup.has(nameLower)) {
+          poiLookup.set(nameLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+      if (poi.name) {
+        const nameLower = poi.name.toLowerCase();
+        if (!poiLookup.has(nameLower)) {
+          poiLookup.set(nameLower, { poiId: poi.id, baseId: poi.base_id || null, baseName: poi.base_name || null, name: poi.name || null });
+        }
+      }
+    }
+
+    function normalizeStationToken(token) {
+      if (!token) return '';
+      const lower = String(token).toLowerCase();
+      const poiEntry = poiLookup.get(lower);
+      if (poiEntry) {
+        const candidate = poiEntry.baseId || poiEntry.baseName || poiEntry.name || poiEntry.poiId;
+        return candidate.toLowerCase();
+      }
+      if (!stationRef) return lower;
+      const byId = stationRef.by_station_id?.[lower];
+      if (byId) return byId.station_id.toLowerCase();
+      const byUnder = stationRef.by_underline_name?.[lower];
+      if (byUnder) return byUnder.station_id.toLowerCase();
+      return lower;
+    }
+
+    function stationsMatch(a, b) {
+      if (!a || !b) return false;
+      const na = normalizeStationToken(a);
+      const nb = normalizeStationToken(b);
+      if (na === nb) return true;
+      if (!stationRef) return false;
+      const infoA = stationRef.by_station_id?.[na] || stationRef.by_underline_name?.[na];
+      const infoB = stationRef.by_station_id?.[nb] || stationRef.by_underline_name?.[nb];
+      if (!infoA || !infoB) return false;
+      if (infoA.system_id && infoB.system_id && infoA.system_id.toLowerCase() !== infoB.system_id.toLowerCase()) return false;
+      return infoA.station_id.toLowerCase() === infoB.station_id.toLowerCase();
+    }
+
+    function getStationColor(stationToken) {
+      const key = normalizeStationToken(stationToken);
+      if (!key) return 'var(--text-dim)';
+      if (!stationColorMap.has(key)) {
+        let hash = 0;
+        for (let i = 0; i < key.length; i++) hash = ((hash << 5) - hash) + key.charCodeAt(i);
+        const hue = Math.abs(hash) % 360;
+        stationColorMap.set(key, `hsl(${hue}, 70%, 65%)`);
+      }
+      return stationColorMap.get(key);
+    }
+
+    async function loadStationRef() {
+      try {
+        const [stationRes, mapRes] = await Promise.all([
+          fetch('/api/stationRef'),
+          fetch('/data/map.json')
+        ]);
+        const stationData = await stationRes.json().catch(() => null);
+        const mapJson = await mapRes.json().catch(() => null);
+        stationRef = stationData || null;
+        mapData = mapJson || null;
+        buildPoiLookup();
+      } catch (e) {
+        console.error('Failed to load stationRef/map:', e);
+        stationRef = null;
+        mapData = null;
+        poiLookup.clear();
+      }
+    }
 
     async function loadCatalog() {
       try {
@@ -166,7 +277,8 @@
         const data = await res.json();
         const botStatus = Array.isArray(data) ? data.find(b => b.username === bot) : null;
         if (botStatus) {
-          currentBotLocation = { system: botStatus.system || '', poi: botStatus.poi || '' };
+          const poi = botStatus.poi || '';
+          currentBotLocation = { system: botStatus.system || '', poi };
         } else {
           currentBotLocation = null;
         }
@@ -180,10 +292,11 @@
       if (!shipList.length) return;
       const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
       const ships = shipList;
-      const queuedShips = skipOffStation && currentBotLocation
+      const botPoi = currentBotLocation?.poi || '';
+      const queuedShips = skipOffStation && botPoi
         ? ships.filter(s => {
-            const baseId = s.location_base_id || '';
-            return baseId === '' || baseId === currentBotLocation.poi;
+            const shipBaseId = s.location_base_id || '';
+            return shipBaseId === '' || stationsMatch(shipBaseId, botPoi);
           })
         : ships;
       fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
@@ -691,6 +804,7 @@
         await fetchListings(bot);
         await loadPriceOverrides();
         await loadBotLocation(bot);
+        await loadStationRef();
         multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
         shipList = ships;
         shipLocations.clear();
@@ -706,10 +820,11 @@
           });
         }
         const skipOffStation = document.getElementById('skipOffStationShips')?.checked;
-        const queuedShips = skipOffStation && currentBotLocation
+        const botPoi = currentBotLocation?.poi || '';
+        const queuedShips = skipOffStation && botPoi
           ? ships.filter(s => {
-              const baseId = s.location_base_id || '';
-              return baseId === '' || baseId === currentBotLocation.poi;
+              const shipBaseId = s.location_base_id || '';
+              return shipBaseId === '' || stationsMatch(shipBaseId, botPoi);
             })
           : ships;
         fetchQueue = queuedShips.map(s => (s.id || s.ship_id || '')).filter(Boolean);
@@ -792,7 +907,7 @@
         const listingEntry = listingMap.get(shipId) || null;
         const listingPrice = listingEntry ? listingEntry.price : null;
         const listingBadge = listingPrice != null ? ' <span class="spc-listing-badge" title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
-        const locBadge = locationText ? ' <span style="font-size:10px;color:var(--text-dim);margin-left:4px">📍 ' + esc(locationText) + '</span>' : '';
+        const locBadge = locationText ? ' <span style="font-size:10px;margin-left:4px">📍 <span style="color:' + getStationColor(locationText) + '">' + esc(locationText) + '</span></span>' : '';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
           '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +

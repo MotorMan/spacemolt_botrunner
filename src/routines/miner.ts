@@ -35,6 +35,7 @@ import {
   isFuelCellItem,
   getCargoFuelCells,
   estimateRouteFuel,
+  waitForTransitCompletion,
 } from "./common.js";
 import {
   getRadioactiveCapability,
@@ -2502,6 +2503,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   await bot.refreshStatus();
+
+  // ── CRITICAL FIX: Check if bot is mid-transit after client restart ──
+  // If the client restarted while jumping/traveling, bot.system may be "unknown"
+  // and ore routing will fail. Wait for the in-flight transit to complete first.
+  await bot.refreshPOI();
+  if (bot.inTransit) {
+    ctx.log("travel", `Bot is already in transit (${bot.transitType}) after restart — waiting for completion before mining`);
+    const transitCompleted = await waitForTransitCompletion(ctx, 180);
+    if (!transitCompleted) {
+      ctx.log("error", "Transit did not complete within timeout — cannot start mining safely");
+      yield "error";
+      return;
+    }
+    await bot.refreshLocation();
+  }
+
   const settings0 = await getMinerSettings(bot.username);
   const homeSystem = settings0.homeSystem || bot.system;
   const cargoThresholdRatio = settings0.cargoThreshold / 100;

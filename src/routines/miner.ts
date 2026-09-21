@@ -7798,7 +7798,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
           : (cargoDelta.oreId && cargoDelta.quantity > 0 ? cargoDelta.quantity : 1);
         const richness = (responseData.richness as number) ?? 0;
         const resourceType = (responseData.resource_type as string) ?? (responseData.type as string) ?? "";
-        const poiName = (responseData.poi_name as string) ?? (responseData.location as string) ?? miningPoi?.name ?? "";
+        const poiName = (typeof responseData.poi_name === "string" ? responseData.poi_name : undefined) ?? (typeof responseData.location === "string" ? responseData.location : undefined) ?? miningPoi?.name ?? "";
         
         // Build a detailed summary of what was mined
         const summaryParts = [`Mined ${quantity}x ${oreName || "unknown"}`];

@@ -41,6 +41,15 @@
     .spc-bar { display:flex; gap:12px; align-items:center; padding:8px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; flex-shrink:0; flex-wrap:wrap; }
     .spc-stat { font-size:12px; color:var(--text-dim); }
     .spc-stat b { color:var(--text-bright); }
+    .override-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center; }
+    .override-modal { background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:16px; min-width:320px; max-width:90vw; }
+    .override-modal h4 { margin:0 0 12px 0; color:var(--text-bright); font-size:14px; }
+    .override-modal input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:14px; font-family:monospace; margin-bottom:12px; box-sizing:border-box; }
+    .override-modal-btns { display:flex; gap:8px; justify-content:flex-end; }
+    .override-modal-btns button { padding:6px 14px; border-radius:4px; cursor:pointer; font-size:12px; border:1px solid var(--border); }
+    .override-modal-btns .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .override-modal-btns .btn-cancel { background:transparent; color:var(--text); }
+    .override-badge { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; font-weight:600; background:#2d1b00; color:var(--yellow); margin-left:4px; }
   </style>
 </head>
 <body>
@@ -57,10 +66,25 @@
       <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
       <input type="number" id="multiplier" value="42" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('multiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
       <span class="spc-stat" id="spcStats"></span>
+      <span class="spc-stat" style="cursor:pointer" onclick="var el=document.getElementById('overrideList');el.style.display=el.style.display==='none'?'flex':'none'" title="Click to toggle overrides">
+        Overrides: <b id="overrideCount" style="color:var(--yellow)">0</b>
+      </span>
       <button onclick="refreshMarketData()">Refresh Market Data</button>
+      <div id="overrideList" style="display:none;width:100%;margin-top:4px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--border);border-radius:4px;flex-wrap:wrap;gap:4px;align-items:center"></div>
     </div>
     <div class="spc-content" id="spcContent">
       <div class="spc-empty">Select a bot and click Fetch Ships to begin.</div>
+    </div>
+  </div>
+
+  <div id="overrideModal" class="override-modal-overlay" onclick="if(event.target===this)hideOverrideModal()">
+    <div class="override-modal">
+      <h4 id="overrideItemLabel">Override price</h4>
+      <input type="number" id="overridePriceInput" inputmode="numeric" onkeydown="if(event.key==='Enter')submitOverride();if(event.key==='Escape')hideOverrideModal()">
+      <div class="override-modal-btns">
+        <button class="btn-cancel" onclick="hideOverrideModal()">Cancel</button>
+        <button class="btn-primary" onclick="submitOverride()">Set Override</button>
+      </div>
     </div>
   </div>
 
@@ -76,6 +100,8 @@
     let fetchBot = '';
     let multiplier = 2.42;
     let listingMap = new Map();
+    let priceOverrides = new Map();
+    let overrideModalTarget = null;
 
     async function loadCatalog() {
       try {
@@ -111,9 +137,168 @@
       }
     }
 
+    async function loadPriceOverrides() {
+      try {
+        const res = await fetch('/api/price-overrides');
+        const data = await res.json();
+        priceOverrides.clear();
+        for (const [itemId, info] of Object.entries(data)) {
+          if (info && typeof info.price === 'number') {
+            priceOverrides.set(itemId.toLowerCase(), info.price);
+          }
+        }
+        updateOverridesBar();
+        refreshAllLoadedShips();
+      } catch (e) {
+        console.error('Failed to load price overrides:', e);
+      }
+    }
+
+    async function setPriceOverride(itemId, price) {
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemId, price })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.set(itemId.toLowerCase(), price);
+          updateOverridesBar();
+          refreshAllLoadedShips();
+          return true;
+        }
+      } catch (e) {
+        console.error('Failed to set price override:', e);
+      }
+      return false;
+    }
+
+    async function removePriceOverride(itemId) {
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemId })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.delete(itemId.toLowerCase());
+          updateOverridesBar();
+          refreshAllLoadedShips();
+        }
+      } catch (e) {
+        console.error('Failed to remove price override:', e);
+      }
+    }
+
+    async function clearAllOverrides() {
+      if (!confirm('Clear ALL price overrides?')) return;
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        const json = await res.json();
+        if (json.ok) {
+          priceOverrides.clear();
+          updateOverridesBar();
+          refreshAllLoadedShips();
+        }
+      } catch (e) {
+        console.error('Failed to clear overrides:', e);
+      }
+    }
+
+    function refreshAllLoadedShips() {
+      for (const [shipId, state] of shipStates) {
+        if (state === 'loaded') {
+          enqueueShip(shipId);
+        }
+      }
+    }
+
+    function getOverridePrice(itemId) {
+      const key = (itemId || '').toLowerCase();
+      return priceOverrides.get(key) || null;
+    }
+
+    function hasOverride(itemId) {
+      return priceOverrides.has((itemId || '').toLowerCase());
+    }
+
+    function updateOverridesBar() {
+      const countEl = document.getElementById('overrideCount');
+      const listEl = document.getElementById('overrideList');
+      if (countEl) {
+        countEl.textContent = priceOverrides.size;
+      }
+      if (listEl) {
+        if (priceOverrides.size === 0) {
+          listEl.innerHTML = '<span style="color:var(--text-dim);font-size:11px">No overrides</span>';
+        } else {
+          let html = '';
+          for (const [itemId, price] of priceOverrides) {
+            html += '<span style="display:inline-flex;align-items:center;gap:4px;background:#2d1b00;color:var(--yellow);padding:2px 6px;border-radius:3px;font-size:11px;font-family:monospace">' +
+              esc(itemId) + ': ' + price.toLocaleString() + 'cr' +
+              ' <button onclick="removePriceOverride(\'' + esc(itemId) + '\')" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:12px;padding:0 2px" title="Remove override">×</button>' +
+              '</span> ';
+          }
+          html += '<button onclick="clearAllOverrides()" style="background:none;border:1px solid var(--border);color:var(--red);cursor:pointer;font-size:10px;padding:2px 6px;border-radius:3px;margin-left:4px">Clear All</button>';
+          listEl.innerHTML = html;
+        }
+      }
+    }
+
+    function showOverrideModal(itemId, currentPrice) {
+      overrideModalTarget = itemId;
+      const modal = document.getElementById('overrideModal');
+      const input = document.getElementById('overridePriceInput');
+      const label = document.getElementById('overrideItemLabel');
+      if (modal && input && label) {
+        label.textContent = 'Override price for: ' + itemId;
+        input.value = currentPrice != null ? currentPrice : '';
+        modal.style.display = 'flex';
+        input.focus();
+        input.select();
+      }
+    }
+
+    function hideOverrideModal() {
+      const modal = document.getElementById('overrideModal');
+      if (modal) modal.style.display = 'none';
+      overrideModalTarget = null;
+    }
+
+    async function submitOverride() {
+      const input = document.getElementById('overridePriceInput');
+      if (!input || !overrideModalTarget) return;
+      const price = parseInt(input.value, 10);
+      if (!Number.isFinite(price) || price <= 0) {
+        alert('Enter a valid positive price');
+        return;
+      }
+      const ok = await setPriceOverride(overrideModalTarget, price);
+      hideOverrideModal();
+      if (ok) {
+        const itemId = overrideModalTarget;
+      }
+    }
+
+    function onItemPriceClick(itemId, currentPrice) {
+      showOverrideModal(itemId, currentPrice);
+    }
+
     async function queryRemoteMarket(itemId) {
       const key = (itemId || '').toLowerCase();
       if (remoteMarketCache.has(key)) return remoteMarketCache.get(key) || null;
+      const overridePrice = getOverridePrice(itemId);
+      if (overridePrice != null) {
+        const result = { bestSell: { price: overridePrice, qty: 0, station: 'override' }, bestBuy: null };
+        remoteMarketCache.set(key, result);
+        return result;
+      }
       let bestSell = null;
       let bestBuy = null;
       const filterResults = (sellData, buyData) => {
@@ -126,6 +311,7 @@
             if (baseMat && r.price < 10) return false;
             if (module && r.price < 2000) return false;
             if (baseValue > 0 && r.price < baseValue) return false;
+            if (baseValue > 0 && r.price > baseValue * 100) return false;
             return true;
           });
           if (filtered.length > 0) {
@@ -138,6 +324,7 @@
             if (baseMat && r.price < 10) return false;
             if (module && r.price < 2000) return false;
             if (baseValue > 0 && r.price < baseValue) return false;
+            if (baseValue > 0 && r.price > baseValue * 100) return false;
             return true;
           });
           if (filtered.length > 0) {
@@ -243,12 +430,14 @@
           if (baseMat && o.price < 10) continue;
           if (module && o.price < 2000) continue;
           if (baseValue > 0 && o.price < baseValue) continue;
+          if (baseValue > 0 && o.price > baseValue * 100) continue;
           if (!bestSell || o.price < bestSell.price) bestSell = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
         for (const o of (entry.buyOrders || [])) {
           if (baseMat && o.price < 10) continue;
           if (module && o.price < 2000) continue;
           if (baseValue > 0 && o.price < baseValue) continue;
+          if (baseValue > 0 && o.price > baseValue * 100) continue;
           if (!bestBuy || o.price > bestBuy.price) bestBuy = { price: o.price, qty: o.quantity, station: entry.stationName };
         }
       }
@@ -265,6 +454,10 @@
     }
 
     async function resolveItemPrice(itemId, baseValue) {
+      const overridePrice = getOverridePrice(itemId);
+      if (overridePrice != null) {
+        return { price: overridePrice, source: 'override', detail: 'manual override ' + overridePrice.toLocaleString() + 'cr' };
+      }
       const mp = await getMarketPriceAsync(itemId);
       if (mp && mp.bestSell) {
         return { price: mp.bestSell.price, source: 'market', detail: 'lowest sell ' + mp.bestSell.price.toLocaleString() + 'cr (' + mp.bestSell.qty + 'x @ ' + mp.bestSell.station + ')' };
@@ -447,6 +640,7 @@
         await loadCatalog();
         await loadMarketData();
         await fetchListings(bot);
+        await loadPriceOverrides();
         multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
         shipList = ships;
         fetchQueue = ships.map(s => (s.id || s.ship_id || '')).filter(Boolean);
@@ -609,7 +803,8 @@
       html += '<div class="spc-section-title">Hull Build Materials</div>';
       html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
       for (const l of pricing.hull.lines) {
-        html += '<tr><td>' + esc(l.itemId) + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : l.source === 'base' ? 'base' : 'missing') + '">' + l.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(l.detail) + '</td></tr>';
+        const isOverridden = hasOverride(l.itemId);
+        html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : l.source === 'override' ? 'market' : l.source === 'base' ? 'base' : 'missing') + '">' + l.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(l.detail) + '</td></tr>';
       }
       html += '</tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Hull Total</td><td class="spc-total">' + pricing.hull.cost.toLocaleString() + '</td><td colspan="2"></td></tr></tfoot></table></div>';
       html += '<div class="spc-section">';
@@ -619,7 +814,8 @@
       } else {
         html += '<table class="spc-table"><thead><tr><th>Module</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
         for (const m of pricing.modules) {
-          html += '<tr><td>' + esc(m.modTypeId) + '</td><td class="spc-cost">' + m.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (m.source === 'market' ? 'market' : m.source === 'recipe' ? 'base' : m.source === 'base' ? 'base' : 'missing') + '">' + m.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(m.detail) + '</td></tr>';
+          const isOverridden = hasOverride(m.modTypeId);
+          html += '<tr><td>' + esc(m.modTypeId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td class="spc-cost" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(m.modTypeId) + '\',' + m.cost + ')" title="Click to set price override">' + m.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (m.source === 'market' ? 'market' : m.source === 'recipe' ? 'base' : m.source === 'base' ? 'base' : 'missing') + '">' + m.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(m.detail) + '</td></tr>';
         }
         html += '</tbody><tfoot><tr><td colspan="2" style="text-align:right;font-weight:600">Modules Total</td><td class="spc-total">' + pricing.modules.reduce((sum, m) => sum + m.cost, 0).toLocaleString() + '</td><td></td></tr></tfoot></table>';
         const recipeMods = pricing.modules.filter(m => m.source === 'recipe' && m.recipeLines && m.recipeLines.length > 0);
@@ -628,7 +824,8 @@
           for (const m of recipeMods) {
             html += '<table class="spc-table" style="margin-bottom:6px"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th></tr></thead><tbody>';
             for (const l of m.recipeLines) {
-              html += '<tr><td>' + esc(l.itemId) + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : 'base') + '">' + l.source + '</span></td></tr>';
+              const isOverridden = hasOverride(l.itemId);
+              html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : 'base') + '">' + l.source + '</span></td></tr>';
             }
             html += '</tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Recipe Total</td><td class="spc-total">' + m.cost.toLocaleString() + '</td><td></td></tr></tfoot></table>';
           }
@@ -679,6 +876,7 @@
     }
 
     populateBotSelect();
+    loadPriceOverrides();
   </script>
 </body>
 </html>

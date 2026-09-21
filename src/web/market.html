@@ -36,6 +36,14 @@
     select option { background:#000 !important; color:#fff !important; }
     select option:hover, select option:focus, select option:active { background:#2a2a2a !important; }
     select option[selected], select option:checked { background:var(--accent) !important; color:#fff !important; }
+    .override-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.7); z-index:1000; align-items:center; justify-content:center; }
+    .override-modal { background:var(--bg-card); border:1px solid var(--border); border-radius:8px; padding:16px; min-width:320px; max-width:90vw; }
+    .override-modal h4 { margin:0 0 12px 0; color:var(--text-bright); font-size:14px; }
+    .override-modal input { width:100%; padding:8px 10px; border:1px solid var(--border); border-radius:4px; background:#000; color:#fff; font-size:14px; font-family:monospace; margin-bottom:12px; box-sizing:border-box; }
+    .override-modal-btns { display:flex; gap:8px; justify-content:flex-end; }
+    .override-modal-btns button { padding:6px 14px; border-radius:4px; cursor:pointer; font-size:12px; border:1px solid var(--border); }
+    .override-modal-btns .btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+    .override-modal-btns .btn-cancel { background:transparent; color:var(--text); }
   </style>
 </head>
 <body>
@@ -63,6 +71,17 @@
     </div>
   </div>
 
+  <div id="marketOverrideModal" class="override-modal-overlay" onclick="if(event.target===this)hideMarketOverrideModal()">
+    <div class="override-modal">
+      <h4 id="marketOverrideItemLabel">Set price override</h4>
+      <input type="number" id="marketOverridePriceInput" inputmode="numeric" onkeydown="if(event.key==='Enter')submitMarketOverride();if(event.key==='Escape')hideMarketOverrideModal()">
+      <div class="override-modal-btns">
+        <button class="btn-cancel" onclick="hideMarketOverrideModal()">Cancel</button>
+        <button class="btn-primary" onclick="submitMarketOverride()">Set Override</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let mapData = {};
     let marketDetails = { items: [] };
@@ -79,6 +98,7 @@
     let wsHeartbeatTimer = null;
     let wsWatchdogTimer = null;
     let wsLastMsg = Date.now();
+    let marketOverrides = new Map();
 
     async function loadCatalog() {
       try {
@@ -279,9 +299,25 @@ function getItemCategory(itemId, itemName) {
           }
         }
         await loadCatalog();
+        await loadMarketOverrides();
         renderMarket();
       } catch (e) {
         console.error('Failed to load data:', e);
+      }
+    }
+
+    async function loadMarketOverrides() {
+      try {
+        const res = await fetch('/api/price-overrides');
+        const data = await res.json();
+        marketOverrides.clear();
+        for (const [itemId, info] of Object.entries(data)) {
+          if (info && typeof info.price === 'number') {
+            marketOverrides.set(itemId.toLowerCase(), info.price);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to load market overrides:', e);
       }
     }
 
@@ -443,6 +479,7 @@ function getItemCategory(itemId, itemName) {
               <th onclick="sortItems('demand')" style="text-align:center">Demand${getSortIndicator('demand')}</th>
               <th onclick="sortItems('supply')" style="text-align:center">Supply${getSortIndicator('supply')}</th>
               <th onclick="sortItems('profit')">Profit${getSortIndicator('profit')}</th>
+              <th style="width:50px">Override</th>
             </tr>
           </thead>
           <tbody>
@@ -487,6 +524,8 @@ function getItemCategory(itemId, itemName) {
           const data = itemMap.get(itemId);
           const profit = prices.avgSell - prices.avgBuy;
           const profitColor = profit > 0 ? 'var(--green)' : profit < 0 ? 'var(--red)' : 'var(--text-dim)';
+          const overridePrice = marketOverrides.get(itemId.toLowerCase());
+          const overrideBadge = overridePrice != null ? ' <span style="display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:#2d1b00;color:var(--yellow);cursor:pointer" onclick="event.stopPropagation();showMarketOverrideModal(\'' + itemId + '\',' + overridePrice + ')" title="Override price: ' + overridePrice.toLocaleString() + 'cr">OVR ' + overridePrice.toLocaleString() + 'cr</span>' : ' <span style="display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;background:#21262d;color:var(--text-dim);cursor:pointer" onclick="event.stopPropagation();showMarketOverrideModal(\'' + itemId + '\',null)" title="Click to set price override">+OVR</span>';
           html += `
             <tr class="item-row" data-item="${itemId}" onclick="showStationDetails(this, ${JSON.stringify(data.stations).replace(/"/g, '&quot;')})">
               <td></td>
@@ -497,10 +536,11 @@ function getItemCategory(itemId, itemName) {
               <td style="text-align:center">${data.totalBuy.toLocaleString()}</td>
               <td style="text-align:center">${data.totalSell.toLocaleString()}</td>
               <td style="color:${profitColor};font-weight:500">${profit > 0 ? '+' : ''}${profit.toLocaleString()} cr</td>
+              <td>${overrideBadge}</td>
             </tr>
             <tr class="station-detail" style="display:none">
               <td></td>
-              <td colspan="6" style="font-size:11px;color:var(--text-dim);padding:8px 12px">
+              <td colspan="7" style="font-size:11px;color:var(--text-dim);padding:8px 12px">
               </td>
             </tr>
           `;
@@ -585,6 +625,55 @@ function getItemCategory(itemId, itemName) {
       const d = document.createElement('div');
       d.textContent = String(s);
       return d.innerHTML;
+    }
+
+    let marketOverrideTarget = null;
+
+    function showMarketOverrideModal(itemId, currentPrice) {
+      marketOverrideTarget = itemId;
+      const modal = document.getElementById('marketOverrideModal');
+      const input = document.getElementById('marketOverridePriceInput');
+      const label = document.getElementById('marketOverrideItemLabel');
+      if (modal && input && label) {
+        label.textContent = 'Override price for: ' + itemId;
+        input.value = currentPrice != null ? currentPrice : '';
+        modal.style.display = 'flex';
+        input.focus();
+        input.select();
+      }
+    }
+
+    function hideMarketOverrideModal() {
+      const modal = document.getElementById('marketOverrideModal');
+      if (modal) modal.style.display = 'none';
+      marketOverrideTarget = null;
+    }
+
+    async function submitMarketOverride() {
+      const input = document.getElementById('marketOverridePriceInput');
+      if (!input || !marketOverrideTarget) return;
+      const price = parseInt(input.value, 10);
+      if (!Number.isFinite(price) || price <= 0) {
+        alert('Enter a valid positive price');
+        return;
+      }
+      try {
+        const res = await fetch('/api/price-overrides', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemId: marketOverrideTarget, price })
+        });
+        const json = await res.json();
+        if (json.ok) {
+          marketOverrides.set(marketOverrideTarget.toLowerCase(), price);
+          renderMarket();
+          hideMarketOverrideModal();
+        } else {
+          alert('Failed to set override: ' + (json.error || 'unknown'));
+        }
+      } catch (e) {
+        alert('Failed to set override: ' + e.message);
+      }
     }
 
     connect();

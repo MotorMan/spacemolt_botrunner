@@ -17,6 +17,7 @@ import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSyn
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, resolveMarketSource } from "../client_sync_hooks.js";
 import { queryLocalMarket, getLocalMarketStatus } from "../market_local_source.js";
 import { marketDetailsStore } from "../marketdetailsstore.js";
+import { priceOverridesStore } from "../priceoverrides.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
 import { reconcileDeliveredWithDestination, getCargoMoverSettings, resetCargoMoverAllTracking } from "../routines/cargo_mover.js";
@@ -1005,6 +1006,37 @@ if (!this.settings.fuel_service) {
               "Cache-Control": "no-store",
             },
           });
+        }
+        if (url.pathname === "/api/price-overrides") {
+          if (req.method === "GET") {
+            return Response.json(priceOverridesStore.getAll());
+          }
+          if (req.method === "POST") {
+            try {
+              const body = (await req.json().catch(() => ({}))) as { itemId?: string; price?: number };
+              const price = typeof body.price === "number" ? body.price : NaN;
+              if (!body.itemId || !Number.isFinite(price) || price <= 0) {
+                return Response.json({ error: "itemId and positive price required" }, { status: 400 });
+              }
+              priceOverridesStore.set(body.itemId, price);
+              return Response.json({ ok: true, itemId: body.itemId, price });
+            } catch {
+              return Response.json({ error: "invalid request body" }, { status: 400 });
+            }
+          }
+          if (req.method === "DELETE") {
+            try {
+              const body = (await req.json().catch(() => ({}))) as { itemId?: string };
+              if (body.itemId) {
+                priceOverridesStore.remove(body.itemId);
+                return Response.json({ ok: true, itemId: body.itemId });
+              }
+              priceOverridesStore.clearAll();
+              return Response.json({ ok: true });
+            } catch {
+              return Response.json({ error: "invalid request body" }, { status: 400 });
+            }
+          }
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });

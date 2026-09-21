@@ -30329,9 +30329,17 @@ async function fetchPersonalFacilityTypes(username) {
       <div class="setting-row">
         <div>
           <div class="setting-label">Minimum Fuel Cells</div>
-          <div class="setting-hint">Minimum military fuel cells each miner must carry (military_fuel_cell = 100 fuel / 3 space). Default 20 prevents stranding at distant stations.</div>
+          <div class="setting-hint">Required number of fuel cells the miner must carry to leave the station. Default 20 prevents stranding at distant stations.</div>
         </div>
         <input type="number" id="set-miner-minimumFuelCells" min="0" max="1000" value="${m.minimumFuelCells ?? 20}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Return Home When Fuel Cells Remaining ≤</div>
+          <div class="setting-hint">Go home to deposit loot and resupply when the number of fuel cells in cargo drops to this value or below. Set to 0 to disable. Default 2 prevents stranding without forcing unnecessary returns after using a single cell.</div>
+        </div>
+        <input type="number" id="set-miner-returnHomeOnFuelCellsRemaining" min="0" max="100" value="${m.returnHomeOnFuelCellsRemaining ?? 2}" style="width:80px" />
       </div>
 
       <div class="setting-row">
@@ -30958,6 +30966,13 @@ async function fetchPersonalFacilityTypes(username) {
                 document.getElementById("set-miner-minimumFuelCells").value,
               );
               return Number.isNaN(v) ? 20 : v;
+            })(),
+          returnHomeOnFuelCellsRemaining:
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-miner-returnHomeOnFuelCellsRemaining").value,
+              );
+              return Number.isNaN(v) ? 2 : v;
             })(),
           desiredEmergencyWarpDevices:
             (() => {

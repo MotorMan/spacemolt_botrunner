@@ -526,9 +526,10 @@ async function getMinerSettings(username?: string): Promise<{
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
-  maxJumps: number;
-  minimumFuelCells: number;
-  noMidMiningRetarget: boolean;
+   maxJumps: number;
+   minimumFuelCells: number;
+   returnHomeOnFuelCellsRemaining: number;
+   noMidMiningRetarget: boolean;
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
   desiredEmergencyWarpDevices: number;
@@ -638,6 +639,7 @@ iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
+    returnHomeOnFuelCellsRemaining: (m.returnHomeOnFuelCellsRemaining as number) ?? 2,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
     enableCloak: (m.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
@@ -2755,6 +2757,36 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // Get blacklist - use empty if cloaked and cloakIgnoreBlacklist enabled
       const blacklist = getMiningBlacklist(settings, bot.isCloaked);
+
+      // ── Low fuel cells check ──
+      // Return home to deposit loot and resupply when fuel cells drop to or below
+      // the configured threshold. This is separate from minimumFuelCells, which
+      // controls how many cells the miner must carry when leaving the station.
+      await bot.refreshCargo();
+      const fuelCellCount = getCargoFuelCells(bot).cells;
+      if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home to deposit and resupply`);
+        yield "return_home";
+        yield "pre_return_fuel";
+        const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!returnFueled) {
+          const { pois: currentPois } = await getSystemInfo(ctx);
+          const currentStation = findStation(currentPois);
+          if (currentStation) {
+            await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
+          }
+        }
+        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (!homeArrived) {
+          ctx.log("error", "Failed to return to home system — will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+        await ensureDocked(ctx);
+        await ensureFuelCellsStocked(ctx);
+        ctx.log("mining", "Restocked fuel cells at home — restarting mining cycle");
+        continue;
+      }
 
     // ── Flock state heartbeat for leader ──
     // Update flock state file immediately at cycle start if we're the leader

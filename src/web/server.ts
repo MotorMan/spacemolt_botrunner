@@ -2689,6 +2689,25 @@ if (!this.settings.fuel_service) {
               return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
             }
           }
+          if (url.pathname === "/api/ship-pricing/browse-ships" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const result = await botInstance.exec("browse_ships");
+              if (result.error) {
+                return Response.json({ error: result.error.message || "browse_ships failed", data: result.result }, { status: 500 });
+              }
+              return Response.json({ ok: true, data: result.result });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
 
           // Serve index.css
 

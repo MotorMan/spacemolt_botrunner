@@ -74,6 +74,7 @@
     let isProcessing = false;
     let fetchBot = '';
     let multiplier = 2.42;
+    let listingMap = new Map();
 
     async function loadCatalog() {
       try {
@@ -407,6 +408,7 @@
         }
         await loadCatalog();
         await loadMarketData();
+        await fetchListings(bot);
         multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
         shipList = ships;
         fetchQueue = ships.map(s => (s.id || s.ship_id || '')).filter(Boolean);
@@ -439,6 +441,33 @@
       return null;
     }
 
+    async function fetchListings(bot) {
+      try {
+        const res = await fetch('/api/ship-pricing/browse-ships', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (json.ok && json.data) {
+          const d = json.data;
+          const listings = Array.isArray(d) ? d : (d.listings || d.ships || []);
+          listingMap = new Map();
+          for (const l of listings) {
+            const sid = l.ship_id || l.id;
+            const lid = l.listing_id || l.listingId || l.id;
+            const price = l.price;
+            if (sid) listingMap.set(sid, { listingId: lid, price });
+          }
+        } else {
+          listingMap = new Map();
+        }
+      } catch (e) {
+        console.error('browse_ships failed', e);
+        listingMap = new Map();
+      }
+    }
+
     function renderShipList() {
       const content = document.getElementById('spcContent');
       if (shipList.length === 0) {
@@ -453,11 +482,15 @@
         const displayName = cls + (shipName ? ' - ' + shipName : '') + ' - ' + shipId;
         const state = shipStates.get(shipId) || 'pending';
         const statusText = state === 'loaded' ? 'Loaded' : state === 'loading' ? 'Loading...' : state === 'error' ? 'Error' : 'Click to load';
+        const listingEntry = listingMap.get(shipId) || null;
+        const listingPrice = listingEntry ? listingEntry.price : null;
+        const listingBadge = listingPrice != null ? ' <span title="Listed for sale" style="font-size:11px">🏷️ ' + listingPrice.toLocaleString() + 'cr</span>' : '';
         html += '<div class="spc-ship" id="ship-card-' + shipId + '" data-ship-id="' + shipId + '">' +
           '  <div class="spc-ship-head" onclick="onShipClick(\'' + shipId + '\')">' +
           '    <span class="spc-ship-name">' + esc(displayName) + '</span>' +
           '    <span class="spc-ship-status" id="ship-status-' + shipId + '">' + statusText + '</span>' +
           '    <span class="spc-ship-price" id="ship-price-' + shipId + '"></span>' +
+          listingBadge +
           '  </div>' +
           '  <div class="spc-ship-body" id="ship-body-' + shipId + '" style="display:none">' +
           '    <div class="spc-empty">Click ship to load pricing details</div>' +
@@ -531,7 +564,9 @@
       const baseName = (ship.name || ship.ship_name || '').trim();
       const specialName = customName && customName !== cls ? customName : (baseName && baseName !== cls ? baseName : '');
       const displayName = cls + (specialName ? ' - ' + specialName : '') + ' - ' + shipId;
-      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--green);font-family:monospace;font-weight:700">' + pricing.total.toLocaleString() + 'cr</span></div>';
+      const listingEntry = listingMap.get(shipId) || null;
+      const listingBadge = listingEntry && listingEntry.price != null ? ' <span title="Listed for sale" style="font-size:11px">🏷️ ' + listingEntry.price.toLocaleString() + 'cr</span>' : '';
+      let html = '<div class="spc-ship-head" style="padding:8px 0"><b>' + esc(displayName) + '</b> <span style="color:var(--green);font-family:monospace;font-weight:700">' + pricing.total.toLocaleString() + 'cr</span>' + listingBadge + '</div>';
       html += '<div class="spc-section">';
       html += '<div class="spc-section-title">Hull Build Materials</div>';
       html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';

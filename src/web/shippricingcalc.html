@@ -567,21 +567,21 @@
       html += '<div class="spc-section-title">List Ship for Sale</div>';
       html += '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
       html += '<input type="text" id="list-price-' + shipId + '" value="' + pricing.total + '" inputmode="numeric" maxlength="9" style="width:120px;font-size:12px;padding:4px 8px;border:1px solid var(--border);border-radius:4px;background:#000;color:#fff;font-family:monospace">';
-      html += '<button class="primary" onclick="listShipForSale(\'' + shipId + '\', ' + JSON.stringify(shipName) + ')">List for Sale</button>';
+      html += '<button class="primary" onclick="listShipForSale(\'' + shipId + '\')">List for Sale</button>';
       html += '<span style="font-size:11px;color:var(--text-dim)">1% listing fee applies</span>';
       html += '</div></div>';
       return html;
     }
 
-    async function listShipForSale(shipId, shipName) {
+    async function listShipForSale(shipId) {
       const priceInput = document.getElementById('list-price-' + shipId);
       const price = priceInput ? parseInt(priceInput.value, 10) : NaN;
       if (!Number.isFinite(price) || price <= 0) {
-        alert('Enter a valid price before listing ' + (shipName || shipId) + ' for sale');
+        alert('Enter a valid price before listing ' + shipId + ' for sale');
         if (priceInput) priceInput.focus();
         return;
       }
-      if (!confirm('List ' + (shipName || shipId) + ' for sale at ' + price.toLocaleString() + ' credits?\nA 1% listing fee (non-refundable) will be charged.')) return;
+      if (!confirm('List ' + shipId + ' for sale at ' + price.toLocaleString() + ' credits?\nA 1% listing fee (non-refundable) will be charged.')) return;
       const bot = fetchBot;
       try {
         const res = await fetch('/api/ship-pricing/list-ship-for-sale', {
@@ -591,7 +591,7 @@
         });
         const json = await res.json();
         if (json.ok) {
-          alert('Listed ' + (shipName || shipId) + ' for sale at ' + price.toLocaleString() + ' cr');
+          alert('Listed ' + shipId + ' for sale at ' + price.toLocaleString() + ' cr');
         } else {
           alert('List for sale failed: ' + (json.error || 'unknown'));
         }

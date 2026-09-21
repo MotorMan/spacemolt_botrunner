@@ -2726,6 +2726,28 @@ if (!this.settings.fuel_service) {
               if (result.error) {
                 return Response.json({ error: result.error.message || "list_ship_for_sale failed", data: result.result }, { status: 500 });
               }
+              const structuredContent = (result.result as Record<string, unknown> | null)?.structuredContent as Record<string, unknown> | undefined;
+              const details = structuredContent?.details as Record<string, unknown> | undefined;
+              const listingId = (details?.listing_id as string | undefined) || null;
+              return Response.json({ ok: true, data: result.result, listingId });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
+          if (url.pathname === "/api/ship-pricing/cancel-ship-listing" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string; listing_id?: string };
+            if (!body.bot || !body.listing_id) {
+              return Response.json({ error: "bot and listing_id required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const result = await botInstance.exec("cancel_ship_listing", { id: body.listing_id });
+              if (result.error) {
+                return Response.json({ error: result.error.message || "cancel_ship_listing failed", data: result.result }, { status: 500 });
+              }
               return Response.json({ ok: true, data: result.result });
             } catch (err) {
               return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });

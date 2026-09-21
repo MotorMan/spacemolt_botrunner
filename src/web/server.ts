@@ -16,6 +16,7 @@ import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPa
 import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
 import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, resolveMarketSource } from "../client_sync_hooks.js";
 import { queryLocalMarket, getLocalMarketStatus } from "../market_local_source.js";
+import { marketDetailsStore } from "../marketdetailsstore.js";
 import { getAllInsuranceRecords, getInsuranceRecord } from "../insuranceTracker.js";
 import { getCargoMoverItemStatuses } from "../routines/cargoMoverActivity.js";
 import { reconcileDeliveredWithDestination, getCargoMoverSettings, resetCargoMoverAllTracking } from "../routines/cargo_mover.js";
@@ -995,6 +996,15 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/api/bandwidth") {
           const bandwidth = getTotalBandwidth();
           return Response.json(bandwidth);
+        }
+        if (url.pathname === "/api/market") {
+          const data = marketDetailsStore.getData();
+          return new Response(JSON.stringify(data), {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            },
+          });
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });

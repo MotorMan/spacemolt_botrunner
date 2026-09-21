@@ -88,7 +88,7 @@
 
     async function loadMarketData() {
       try {
-        const res = await fetch('/data/marketDetails.json');
+        const res = await fetch('/data/marketDetails.json?t=' + Date.now(), { cache: 'no-store' });
         const data = await res.json();
         marketIndex.clear();
         for (const entry of (data.items || [])) {
@@ -114,6 +114,38 @@
     async function queryRemoteMarket(itemId) {
       const key = (itemId || '').toLowerCase();
       if (remoteMarketCache.has(key)) return remoteMarketCache.get(key) || null;
+      let bestSell = null;
+      let bestBuy = null;
+      const filterResults = (sellData, buyData) => {
+        const itemEntry = catalog.items[key] || {};
+        const baseValue = itemEntry.base_value || 0;
+        const baseMat = isBaseMaterial(itemId);
+        const module = isShipModule(itemId);
+        if (sellData && sellData.results && sellData.results.length > 0) {
+          const filtered = sellData.results.filter(r => {
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestSell = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+        if (buyData && buyData.results && buyData.results.length > 0) {
+          const filtered = buyData.results.filter(r => {
+            if (baseMat && r.price < 10) return false;
+            if (module && r.price < 2000) return false;
+            if (baseValue > 0 && r.price < baseValue) return false;
+            return true;
+          });
+          if (filtered.length > 0) {
+            const best = filtered[0];
+            bestBuy = { price: best.price, qty: best.quantity, station: best.stationName };
+          }
+        }
+      };
       try {
         const [sellRes, buyRes] = await Promise.all([
           fetch('/api/client-sync/market-query', {
@@ -129,43 +161,38 @@
         ]);
         const sellData = await sellRes.json();
         const buyData = await buyRes.json();
-        const itemEntry = catalog.items[key] || {};
-        const baseValue = itemEntry.base_value || 0;
-        const baseMat = isBaseMaterial(itemId);
-        const module = isShipModule(itemId);
-        let bestSell = null;
-        let bestBuy = null;
-        if (sellData.ok && sellData.results && sellData.results.length > 0) {
-          const filtered = sellData.results.filter(r => {
-            if (baseMat && r.price < 10) return false;
-            if (module && r.price < 2000) return false;
-            if (baseValue > 0 && r.price < baseValue) return false;
-            return true;
-          });
-          if (filtered.length > 0) {
-            const best = filtered[0];
-            bestSell = { price: best.price, qty: best.quantity, station: best.stationName };
-          }
-        }
-        if (buyData.ok && buyData.results && buyData.results.length > 0) {
-          const filtered = buyData.results.filter(r => {
-            if (baseMat && r.price < 10) return false;
-            if (module && r.price < 2000) return false;
-            if (baseValue > 0 && r.price < baseValue) return false;
-            return true;
-          });
-          if (filtered.length > 0) {
-            const best = filtered[0];
-            bestBuy = { price: best.price, qty: best.quantity, station: best.stationName };
-          }
-        }
+        filterResults(sellData, buyData);
         if (bestSell || bestBuy) {
           const result = { bestSell, bestBuy };
           remoteMarketCache.set(key, result);
           return result;
         }
       } catch (e) {
-        console.error('Remote market query failed for', itemId, e);
+        console.warn('Primary market query failed for', itemId, e);
+      }
+      try {
+        const [sellRes, buyRes] = await Promise.all([
+          fetch('/api/client-sync/market-query-handler', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'buy' })
+          }),
+          fetch('/api/client-sync/market-query-handler', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId, tradeType: 'sell' })
+          })
+        ]);
+        const sellData = await sellRes.json();
+        const buyData = await buyRes.json();
+        filterResults(sellData, buyData);
+        if (bestSell || bestBuy) {
+          const result = { bestSell, bestBuy };
+          remoteMarketCache.set(key, result);
+          return result;
+        }
+      } catch (e) {
+        console.warn('Fallback market query failed for', itemId, e);
       }
       remoteMarketCache.set(key, null);
       return null;

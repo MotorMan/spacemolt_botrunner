@@ -262,11 +262,21 @@ function getItemCategory(itemId, itemName) {
         const mapRes = await fetch('/data/map.json');
         mapData = await mapRes.json();
         mobileCapitol = mapData.mobile_capitol || null;
-        const mdRes = await fetch('/data/marketDetails.json');
-        if (mdRes.ok) {
+        let mdRes;
+        try {
+          mdRes = await fetch('/api/market');
+        } catch {
+          mdRes = null;
+        }
+        if (mdRes && mdRes.ok) {
           marketDetails = await mdRes.json();
         } else {
-          marketDetails = { items: [] };
+          const fallback = await fetch('/data/marketDetails.json');
+          if (fallback.ok) {
+            marketDetails = await fallback.json();
+          } else {
+            marketDetails = { items: [] };
+          }
         }
         await loadCatalog();
         renderMarket();

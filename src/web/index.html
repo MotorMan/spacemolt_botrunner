@@ -2244,9 +2244,12 @@
               .then((r) => r.json())
               .catch(() => ({ flockGroups: [], assignments: {} })),
             fetch("/data/map.json").then((r) => r.json()),
-            fetch("/data/marketDetails.json")
+            fetch("/api/market")
               .then((r) => r.json())
-              .catch(() => ({ items: [] })),
+              .catch(() => fetch("/data/marketDetails.json").then((r) => r.json()).catch(() => ({ items: [] })))
+              .then((data) => {
+                marketDetails = data || { items: [] };
+              }),
             fetch("/api/stats").then((r) => r.json()),
             fetch("/api/catalog").then((r) => r.json()),
             fetch("/api/logs/main").then((r) => r.json()),
@@ -2518,13 +2521,14 @@
               }
               break;
              case "mapData":
-               mapData = msg.data.systems || msg.data || {};
-               fetch("/data/marketDetails.json")
-                 .then((r) => r.json())
-                 .then((data) => {
-                   marketDetails = data || { items: [] };
-                 })
-                 .catch(() => {});
+                mapData = msg.data.systems || msg.data || {};
+                fetch("/api/market")
+                  .then((r) => r.json())
+                  .catch(() => fetch("/data/marketDetails.json").then((r) => r.json()).catch(() => ({ items: [] })))
+                  .then((data) => {
+                    marketDetails = data || { items: [] };
+                  })
+                  .catch(() => {});
                renderMapStats();
                // Refresh the open settings tab so newly-registered stations
                // (e.g. from a just-connected bot) show up in the pickers.
@@ -2716,16 +2720,17 @@
               handleExecResult(msg);
               break;
              case "mapUpdate":
-               if (msg.mapData) mapData = msg.mapData;
-               knownOres = msg.knownOres || knownOres;
-               // Refresh market details from disk so the market overview reflects
-               // the latest subscription / view_market snapshots.
-               fetch("/data/marketDetails.json")
-                 .then((r) => r.json())
-                 .then((data) => {
-                   marketDetails = data || { items: [] };
-                 })
-                 .catch(() => {});
+                if (msg.mapData) mapData = msg.mapData;
+                knownOres = msg.knownOres || knownOres;
+                // Refresh market details from disk so the market overview reflects
+                // the latest subscription / view_market snapshots.
+                fetch("/api/market")
+                  .then((r) => r.json())
+                  .catch(() => fetch("/data/marketDetails.json").then((r) => r.json()).catch(() => ({ items: [] })))
+                  .then((data) => {
+                    marketDetails = data || { items: [] };
+                  })
+                  .catch(() => {});
                // Re-render map tab if it's active
                if (
                  document
@@ -12118,8 +12123,9 @@
       let marketSortAsc = false;
 
       function renderMarketPage() {
-        fetch("/data/marketDetails.json")
+        fetch("/api/market")
           .then((r) => r.json())
+          .catch(() => fetch("/data/marketDetails.json").then((r) => r.json()).catch(() => ({ items: [] })))
           .then((data) => {
             marketDetails = data || { items: [] };
           })

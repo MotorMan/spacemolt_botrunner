@@ -18,6 +18,7 @@ import {
   isEmpireSystem,
   getBotCustomsStats,
 } from "../customs.js";
+import { join } from "path";
 
 // ── Emergency Warp Stabilizer ────────────────────────────────
 
@@ -3067,7 +3068,7 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; skipApprovedCheck?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -3205,7 +3206,7 @@ export async function navigateToSystem(
 // itself the navigation primitive; passing homeSystem into its internal fuel
 // check causes ensureFueledCore to recursively call navigateToSystem again,
 // creating an infinite loop whenever fuel is low.
-    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipFleeCheck: opts.isCombatBot });
+    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipApprovedCheck, skipFleeCheck: opts.isCombatBot });
       if (fueled === "in_battle") {
         // Not a fuel problem — we're in a fight, and jumps are rejected while in
         // battle anyway. Abort navigation so the caller resolves combat first
@@ -4766,12 +4767,14 @@ export async function detectAndRecoverFromDeath(ctx: RoutineContext): Promise<bo
 
 // ── Settings ─────────────────────────────────────────────────
 
+const DATA_DIR = join(import.meta.dir, "..", "..", "data");
+
 /** Read settings from data/settings.json. */
 export function readSettings(): Record<string, Record<string, unknown>> {
   try {
     const { readFileSync, existsSync } = require("fs");
     const { join } = require("path");
-    const file = join(process.cwd(), "data", "settings.json");
+    const file = join(DATA_DIR, "settings.json");
     if (existsSync(file)) {
       const content = readFileSync(file, "utf-8");
       const parsed = JSON.parse(content);
@@ -4787,7 +4790,7 @@ export function readSettings(): Record<string, Record<string, unknown>> {
 export function writeSettings(updates: Record<string, Record<string, unknown>>): void {
   const { writeFileSync, existsSync, mkdirSync, readFileSync } = require("fs");
   const { join } = require("path");
-  const dir = join(process.cwd(), "data");
+  const dir = DATA_DIR;
   const file = join(dir, "settings.json");
 
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });

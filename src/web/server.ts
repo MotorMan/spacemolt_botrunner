@@ -97,7 +97,7 @@ type WSData = { id: number };
 
 // ── Settings persistence ───────────────────────────────────
 
-const DATA_DIR = join(process.cwd(), "data");
+const DATA_DIR = join(import.meta.dir, "..", "..", "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
@@ -1121,7 +1121,7 @@ if (!this.settings.fuel_service) {
           return Response.json({ stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} });
         }
         if (url.pathname === "/api/faction-station-map") {
-          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          const CACHE_DIR = join(DATA_DIR, "factionStorage");
           if (!existsSync(CACHE_DIR)) {
             return Response.json({});
           }
@@ -1411,7 +1411,7 @@ if (!this.settings.fuel_service) {
           }
         }
         if (url.pathname === "/data/rawMissions.json") {
-          const rawMissionsPath = join(process.cwd(), "data", "rawMissions.json");
+          const rawMissionsPath = join(DATA_DIR, "rawMissions.json");
           if (existsSync(rawMissionsPath)) {
             return new Response(readFileSync(rawMissionsPath, "utf-8"), {
               headers: {
@@ -1498,7 +1498,7 @@ if (!this.settings.fuel_service) {
             }
           }
 
-          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          const CACHE_DIR = join(DATA_DIR, "factionStorage");
           
           if (!existsSync(CACHE_DIR)) {
             return Response.json({ items: [], factionName: "", station: "" });
@@ -1593,7 +1593,7 @@ if (!this.settings.fuel_service) {
         
         if (url.pathname === "/api/faction-storage/list") {
           // List all available faction storage caches
-          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          const CACHE_DIR = join(DATA_DIR, "factionStorage");
           if (!existsSync(CACHE_DIR)) {
             return Response.json({ caches: [] });
           }
@@ -1641,7 +1641,7 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
           const settings = this.settings;
           const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
-          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          const CACHE_DIR = join(DATA_DIR, "factionStorage");
 
           const stationsData: Array<{ stationId: string; systemId: string; fuelReserve: number; fuelCapacity: number }> = [];
 
@@ -1733,7 +1733,7 @@ if (!this.settings.fuel_service) {
         if (url.pathname.startsWith("/api/logs/")) {
           const botName = decodeURIComponent(url.pathname.slice("/api/logs/".length));
           const tail = parseInt(url.searchParams.get("tail") || "200");
-          const logPath = join(process.cwd(), "data", "logs", `${botName}_debug.log`);
+          const logPath = join(DATA_DIR, "logs", `${botName}_debug.log`);
           if (!existsSync(logPath)) {
             return Response.json({ lines: [] });
           }
@@ -1747,7 +1747,7 @@ if (!this.settings.fuel_service) {
 
         // GET /api/skills - Extract skills from last get_status in each bot's log
         if (url.pathname === "/api/skills" && req.method === "GET") {
-          const logsDir = join(process.cwd(), "data", "logs");
+          const logsDir = join(DATA_DIR, "logs");
           if (!existsSync(logsDir)) {
             return Response.json({ bots: {} });
           }
@@ -1799,7 +1799,7 @@ if (!this.settings.fuel_service) {
         // Flock state endpoint
         if (url.pathname.startsWith("/api/flock/") && req.method === "GET") {
           const flockName = decodeURIComponent(url.pathname.slice("/api/flock/".length));
-          const flockPath = join(process.cwd(), "data", "flock_signals", `${flockName}.json`);
+          const flockPath = join(DATA_DIR, "flock_signals", `${flockName}.json`);
           if (!existsSync(flockPath)) {
             return new Response("Flock not found", { status: 404 });
           }
@@ -1932,7 +1932,7 @@ if (!this.settings.fuel_service) {
           }
           if (url.pathname.startsWith("/api/client-sync/coordination") && req.method === "GET") {
             const file = url.searchParams.get("file") || "";
-            const path = join(process.cwd(), "data", file);
+            const path = join(DATA_DIR, file);
             if (!existsSync(path)) return new Response("not found", { status: 404, headers: cors });
             try {
               const raw = readFileSync(path, "utf-8");
@@ -2137,7 +2137,7 @@ if (!this.settings.fuel_service) {
 
           if (url.pathname === "/api/client-sync/local-files" && req.method === "GET") {
             if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
-            const dataDir = join(process.cwd(), "data");
+            const dataDir = DATA_DIR;
             const files: FileEntry[] = listSyncedFiles(dataDir);
             return Response.json({ files }, { headers: cors });
           }
@@ -2145,7 +2145,7 @@ if (!this.settings.fuel_service) {
             if (!fileAuthOk) return new Response("unauthorized", { status: 401, headers: cors });
             const relPath = url.searchParams.get("path") || "";
             if (!isPathSynced(relPath)) return new Response("not allowed", { status: 403, headers: cors });
-            const dataDir = join(process.cwd(), "data");
+            const dataDir = DATA_DIR;
             const content = readSyncedFile(dataDir, relPath);
             if (content === null) return new Response("not found", { status: 404, headers: cors });
             return new Response(content, { status: 200, headers: { ...cors, "Content-Type": "application/json" } });
@@ -2157,7 +2157,7 @@ if (!this.settings.fuel_service) {
               return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
             }
             if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
-            const dataDir = join(process.cwd(), "data");
+            const dataDir = DATA_DIR;
             const hash = mergeIntoFile(dataDir, body.path, body.content);
             if (hash === null) return Response.json({ ok: false, error: "merge failed" }, { status: 500, headers: cors });
             return Response.json({ ok: true, hash }, { headers: cors });
@@ -2169,7 +2169,7 @@ if (!this.settings.fuel_service) {
               return Response.json({ ok: false, error: "path and content required" }, { status: 400, headers: cors });
             }
             if (!isPathSynced(body.path)) return Response.json({ ok: false, error: "not allowed" }, { status: 403, headers: cors });
-            const dataDir = join(process.cwd(), "data");
+            const dataDir = DATA_DIR;
             const hash = seedIntoFile(dataDir, body.path, body.content);
             if (hash === null) return Response.json({ ok: false, error: "seed failed" }, { status: 500, headers: cors });
             return Response.json({ ok: true, hash, seeded: true }, { headers: cors });

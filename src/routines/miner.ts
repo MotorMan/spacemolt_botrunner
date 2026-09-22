@@ -175,7 +175,7 @@ async function checkFuelCellAdequacy(
 ): Promise<{ adequate: boolean; reason: string }> {
   const { fuel: currentFuel, cells, summary } = getCargoFuelCells(bot);
   const settings = await getMinerSettings(bot.username);
-  const returnHomeThreshold = settings.returnHomeOnFuelCellsRemaining || 2;
+  const returnHomeThreshold = settings.returnHomeOnFuelCellsRemaining ?? 2;
 
   if (cells <= 0) {
     return { adequate: false, reason: `no fuel cells in cargo (${summary})` };
@@ -2647,7 +2647,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!bot.docked) {
       await bot.refreshCargo();
       const startupFuelCells = getCargoFuelCells(bot);
-      const returnHomeThreshold = settings0.returnHomeOnFuelCellsRemaining || 2;
+      const returnHomeThreshold = settings0.returnHomeOnFuelCellsRemaining ?? 2;
       const needsRestock = startupFuelCells.cells <= returnHomeThreshold;
       if (needsRestock) {
         const adequacy = await checkFuelCellAdequacy(ctx, homeSystem, homeSystem, bot);

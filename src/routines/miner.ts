@@ -1150,7 +1150,7 @@ function hasLocalMiningPoiOfType(
     } else if (miningType === "ice") {
       if (isIceFieldPoi(poi.type)) return true;
     } else if (miningType === "radioactive") {
-      if (isOreBeltPoi(poi.type) || !hidden) return true;
+      if (isOreBeltPoi(poi.type)) return true;
     }
   }
   return false;

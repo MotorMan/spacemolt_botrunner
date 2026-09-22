@@ -32495,7 +32495,7 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-stopOnDeath").value === "true",
           combatDebug:
             document.getElementById("set-hunter-combatDebug").value === "true",
-          mode: hunterMode,
+          mode: (settings.hunter?.hunterMode || settings.hunter?.mode || "roam_systems"),
           fleetIdlePollSeconds:
             parseInt(document.getElementById("set-hunter-fleetIdlePollSeconds")?.value) || 2,
           fleetBattleConfirmSeconds: Number.isFinite(fleetBattleConfirmSecondsValue)

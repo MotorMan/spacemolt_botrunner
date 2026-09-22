@@ -766,17 +766,6 @@ export async function engageTarget(
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
 
-  // Disable cloak before attacking if cloakOnStart is enabled
-  if (cloakOnStart && bot.isCloaked) {
-    ctx.log("combat", `Disabling cloak before attacking ${target.name}...`);
-    const cloakResp = await bot.exec("cloak", { enable: false });
-    if (!cloakResp.error) {
-      bot.isCloaked = false;
-    } else {
-      ctx.log("warn", `Failed to disable cloak: ${cloakResp.error.message}`);
-    }
-  }
-
   if (!skipScan) {
     let scanResp = await bot.exec("scan", { target_id: target.id });
     if (scanResp.error) {

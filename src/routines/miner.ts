@@ -2778,8 +2778,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // ── Compute total mining power for quota target selection ──
-       const totalMiningPower = getTotalMiningPower(cachedModules || []);
-       const hasModulatedLaser = await hasModulatedMiningLaser(ctx, cachedModules);
+        let totalMiningPower = getTotalMiningPower(cachedModules || []);
+        const hasModulatedLaser = await hasModulatedMiningLaser(ctx, cachedModules);
+        
+        if (hasModulatedLaser) {
+          totalMiningPower = 1;
+          ctx.log("mining", `Modulated Mining Laser detected — overriding equipment total mining power to 1 (was ${getTotalMiningPower(cachedModules || [])})`);
+        }
        
        // ── CRITICAL FIX: Early fuel check at start of cycle ──
       // This prevents the miner from starting routine operations with low fuel
@@ -6335,7 +6340,13 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
       const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
       totalMiningPower = getTotalMiningPower(modules);
       
-      const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower, await hasModulatedMiningLaser(ctx, cachedModules || undefined));
+      const hasModulatedLaserMid = await hasModulatedMiningLaser(ctx, cachedModules || undefined);
+      if (hasModulatedLaserMid) {
+        totalMiningPower = 1;
+        ctx.log("mining", `Modulated Mining Laser detected — overriding equipment total mining power to 1 (was ${getTotalMiningPower(modules)})`);
+      }
+      
+      const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower, hasModulatedLaserMid);
       if (!powerCheck.canMine) {
         ctx.log("mining", `Power check failed: ${powerCheck.reason}`);
         ctx.log("mining", `Deposit too sparse - equipment power (${totalMiningPower}) exceeds 4x supported_power (${supportedPower})`);

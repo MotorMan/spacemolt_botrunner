@@ -1639,6 +1639,7 @@ export function findFirstAvailableQuotaTarget(
   depletionTimeoutMs: number,
   canMineHiddenRadioactive: boolean,
   canMineHiddenIce: boolean,
+  canMineHiddenPois: boolean,
   excludeTargets?: string | string[],
   skipPirateSystems?: boolean,
   totalMiningPower?: number,
@@ -1707,6 +1708,7 @@ export function findFirstAvailableQuotaTarget(
       depletionTimeoutMs,
       canMineHiddenRadioactive,
       canMineHiddenIce,
+      canMineHiddenPois,
       totalMiningPower ?? 0,
       botUsername,
       skipPirateSystems ?? true,
@@ -1746,6 +1748,7 @@ function getReachableOreLocations(
   depletionTimeoutMs: number,
   canMineHiddenRadioactive: boolean,
   canMineHiddenIce: boolean,
+  canMineHiddenPois: boolean,
   totalMiningPower: number,
   botUsername: string | undefined,
   skipPirateSystems: boolean,
@@ -1773,6 +1776,8 @@ function getReachableOreLocations(
       if (poi.hidden === true && !canMineHiddenRadioactive) continue;
     } else if (miningType === "ice") {
       if (poi.hidden === true && !canMineHiddenIce) continue;
+    } else if (miningType === "ore") {
+      if (poi.hidden === true && !canMineHiddenPois) continue;
     }
 
     // Depletion (skip if still under lockout)
@@ -3772,7 +3777,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true;
         // Only filter by hidden status - trust map data
-        if (miningType === "ore") return true;
+        if (miningType === "ore") {
+          if (poi.hidden === true && !canMineHiddenPois) return false;
+          return true;
+        }
         if (miningType === "radioactive") {
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
           return true;
@@ -3821,26 +3829,29 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
          return true;
        });
 
-       const afterPoiFilter = allLocations.filter(loc => {
-        const sys = mapStore.getSystem(loc.systemId);
-        const poi = sys?.pois.find(p => p.id === loc.poiId);
-        if (!poi) return true;
-        // Only filter by hidden status - trust map data
-        if (miningType === "ore") return true;
-        if (miningType === "radioactive") {
-          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-          return true;
-        }
-        if (miningType === "gas") {
-          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-          return true;
-        }
-        if (miningType === "ice") {
-          if (poi.hidden === true && !canMineHiddenIce) return false;
-          return true;
-        }
-        return true;
-      });
+        const afterPoiFilter = allLocations.filter(loc => {
+         const sys = mapStore.getSystem(loc.systemId);
+         const poi = sys?.pois.find(p => p.id === loc.poiId);
+         if (!poi) return true;
+         // Only filter by hidden status - trust map data
+         if (miningType === "ore") {
+           if (poi.hidden === true && !canMineHiddenPois) return false;
+           return true;
+         }
+         if (miningType === "radioactive") {
+           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+           return true;
+         }
+         if (miningType === "gas") {
+           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+           return true;
+         }
+         if (miningType === "ice") {
+           if (poi.hidden === true && !canMineHiddenIce) return false;
+           return true;
+         }
+         return true;
+       });
       const afterDepletionFilter = afterPoiFilter.filter(loc => {
         if (settings.ignoreDepletion) {
           if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
@@ -3924,26 +3935,29 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 // Ignore depletion for alternative targets to allow selection of POIs that may have respawned
             const availableQuotaTarget = findFirstAvailableQuotaTarget(
               quotaTargetsToUse, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-              canMineHiddenRadioactive, canMineHiddenIce, originalTarget, true, totalMiningPower, bot.username,
+              canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, originalTarget, true, totalMiningPower, bot.username,
               blacklist, bot.system, maxJumps, hasModulatedLaser
             );
           if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
             effectiveTarget = availableQuotaTarget;
             ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
             // Re-check locations with new target
-            const newLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
-              const sys = mapStore.getSystem(loc.systemId);
-              const poi = sys?.pois.find(p => p.id === loc.poiId);
-              if (!poi) return true;
-              // Only filter by hidden status - trust map data
-              if (miningType === "ore") return true;
-              if (miningType === "radioactive") {
-                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                return true;
-              }
-              if (miningType === "gas") {
-                return true;
-              }
+             const newLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
+               const sys = mapStore.getSystem(loc.systemId);
+               const poi = sys?.pois.find(p => p.id === loc.poiId);
+               if (!poi) return true;
+               // Only filter by hidden status - trust map data
+               if (miningType === "ore") {
+                 if (poi.hidden === true && !canMineHiddenPois) return false;
+                 return true;
+               }
+               if (miningType === "radioactive") {
+                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                 return true;
+               }
+               if (miningType === "gas") {
+                 return true;
+               }
               if (miningType === "ice") {
                 if (poi.hidden === true && !canMineHiddenIce) return false;
                 return true;
@@ -4144,6 +4158,28 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         if (!chosenLoc) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps`);
           
+          // CRITICAL FIX: For forced targets (global override), NEVER switch to a different ore.
+          // Deep sleep and retry on the next cycle instead.
+          if (hasGlobalTarget) {
+            ctx.log("error", `Forced target ${effectiveTarget} has no accessible locations within ${maxJumps} jumps — deep sleeping instead of switching targets`);
+            const candidateOres = [effectiveTarget, ...Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore))];
+            const decision = await handleNoReachableTarget(
+              ctx, settings, miningType, totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+              candidateOres, quotas, bot.factionStorage, hasModulatedLaser
+            );
+            if (decision === "retry") {
+              excludedNavSystems.clear();
+              continue;
+            }
+            await reportNoViableTargetsAndDeepSleep(
+              ctx, settings, miningType, totalMiningPower, blacklist,
+              canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+              hasModulatedLaser,
+            );
+            continue;
+          }
+          
           // Loop through ALL quota ores to find one with locations within range
           // This ensures we try every available ore before giving up
           let foundAlternative = false;
@@ -4160,7 +4196,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
               // Only filter by hidden status - trust map data
-              if (miningType === "ore") return true;
+              if (miningType === "ore") {
+                if (poi.hidden === true && !canMineHiddenPois) return false;
+                return true;
+              }
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return true;
@@ -4845,7 +4884,9 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
         if (p.id === bot.poi) return false;
-        // No filtering by POI type - trust the map data
+        // Skip hidden POIs for ore miners who can't mine them
+        if (miningType === "ore" && p.hidden === true && !canMineHiddenPois) return false;
+        // Match POI type - trust the map data
         const isMatchingPoi = (miningType === "ore") ||
           (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
@@ -4881,12 +4922,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         // CRITICAL FIX: Find a new quota target that actually has viable locations
         // (not just the current target which may have all locations filtered out as "too sparse")
         let searchTarget = effectiveTarget;
-        if (Object.keys(quotas).length > 0) {
+        if (!hasGlobalTarget && Object.keys(quotas).length > 0) {
           // Exclude current target since we know it has no viable locations
           const excludeTarget = effectiveTarget ? [effectiveTarget] : undefined;
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username,
+            canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username,
             blacklist, bot.system, maxJumps, hasModulatedLaser
           );
           if (newTarget && newTarget !== effectiveTarget) {
@@ -4904,8 +4945,11 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (!poi) return true;
-          // No filtering by POI type - trust the map data from findOreLocations
-          if (miningType === "ore") return true;
+           // No filtering by POI type - trust the map data from findOreLocations
+           if (miningType === "ore") {
+             if (poi.hidden === true && !canMineHiddenPois) return false;
+             return true;
+           }
           if (miningType === "radioactive") {
             const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                               (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
@@ -5058,6 +5102,25 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               bot.system = chosen.systemId;
             const chosenPoi = pois.find(p => p.id === chosen.poiId);
             if (!chosenPoi) {
+              if (hasGlobalTarget) {
+                ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) not found in current system for forced target ${effectiveTarget} — deep sleeping instead of switching targets`);
+                const candidateOres = [effectiveTarget, ...Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore))];
+                const decision = await handleNoReachableTarget(
+                  ctx, settings, miningType, totalMiningPower, blacklist,
+                  canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+                  candidateOres, quotas, bot.factionStorage, hasModulatedLaser
+                );
+                if (decision === "retry") {
+                  excludedNavSystems.clear();
+                  continue;
+                }
+                await reportNoViableTargetsAndDeepSleep(
+                  ctx, settings, miningType, totalMiningPower, blacklist,
+                  canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+                  hasModulatedLaser,
+                );
+                continue;
+              }
               ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) not found in current system — clearing target and returning home`);
               effectiveTarget = "";
               targetResource = "";
@@ -5084,6 +5147,25 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               miningPoi = { id: chosenPoi.id, name: chosenPoi.name };
               ctx.log("mining", `Will travel to ${chosenPoi.name} @ ${chosen.systemName}`);
             } else {
+              if (hasGlobalTarget) {
+                ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) in ${chosen.systemName} is not accessible for forced target ${effectiveTarget} — deep sleeping instead of switching targets`);
+                const candidateOres = [effectiveTarget, ...Object.keys(quotas).filter(ore => quotas[ore] > 0 && !isDeepCoreOre(ore))];
+                const decision = await handleNoReachableTarget(
+                  ctx, settings, miningType, totalMiningPower, blacklist,
+                  canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+                  candidateOres, quotas, bot.factionStorage, hasModulatedLaser
+                );
+                if (decision === "retry") {
+                  excludedNavSystems.clear();
+                  continue;
+                }
+                await reportNoViableTargetsAndDeepSleep(
+                  ctx, settings, miningType, totalMiningPower, blacklist,
+                  canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+                  hasModulatedLaser,
+                );
+                continue;
+              }
               ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) in ${chosen.systemName} is not a valid ${resourceLabel} POI — clearing target and returning home to retry next cycle`);
                  effectiveTarget = "";
                  targetResource = "";

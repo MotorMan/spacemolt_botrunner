@@ -1229,7 +1229,7 @@ async function reportNoViableTargetsAndDeepSleep(
         }
         if (viable) {
           const hasScanData = loc.minutesSinceScan !== Infinity;
-          if (hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
+          if (!hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
             viable = false; reason = `low remaining (${loc.remaining}) + unknown power`;
           } else if (!hasModulatedMiningLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
             viable = false;
@@ -1787,8 +1787,9 @@ function getReachableOreLocations(
     }
 
     // Power compatibility (skip deposits too sparse for our mining power)
+    // Modulated mining lasers can adjust to power 1, so they bypass the low-remaining + unknown-power filter
     const hasScanData = loc.minutesSinceScan !== Infinity;
-    const lowRemUnknown = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+    const lowRemUnknown = !hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
     if (lowRemUnknown) continue;
     if (totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4 && !hasModulatedMiningLaser) continue;
 
@@ -1889,12 +1890,12 @@ function pickTargetFromQuotasOrClosest(
     if (current > target) continue;
 
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
-    const hasViableLocations = rawLocations.some((loc: any) => {
-      const hasScanData = loc.minutesSinceScan !== Infinity;
-      const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-      if (isLowRemainingWithUnknownPower) {
-        return false;
-      }
+      const hasViableLocations = rawLocations.some((loc: any) => {
+        const hasScanData = loc.minutesSinceScan !== Infinity;
+        const isLowRemainingWithUnknownPower = !hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        if (isLowRemainingWithUnknownPower) {
+          return false;
+        }
 
       if (!hasModulatedMiningLaser && totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
         return false;
@@ -3796,13 +3797,13 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
          return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
        }).filter(loc => {
          // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-         // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+         // Modulated mining lasers bypass this since they can adjust to power 1
          const hasScanData = loc.minutesSinceScan !== Infinity;
-         const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+         const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
          if (isLowRemainingWithUnknownPower) {
            return false;
          }
-          // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+         // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
           if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
            return false;
          }
@@ -3850,9 +3851,9 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
       });
       const afterPowerFilter = afterDepletionFilter.filter(loc => {
         // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-        // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+        // Modulated mining lasers bypass this since they can adjust to power 1
         const hasScanData = loc.minutesSinceScan !== Infinity;
-        const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
         if (isLowRemainingWithUnknownPower) {
           return false;
         }
@@ -3959,23 +3960,24 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               if (resourceEntry?.depleted) {
                 return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
               }
-              // Otherwise check ores_found depletion
-              if (!oreEntry?.depleted) return true;
-              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-            }).filter(loc => {
-              // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-              const hasScanData = loc.minutesSinceScan !== Infinity;
-              const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-              if (isLowRemainingWithUnknownPower) {
-                return false;
-              }
-              // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-              if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-                return false;
-              }
-              return true;
-            });
-            if (newLocations.length > 0) {
+               // Otherwise check ores_found depletion
+               if (!oreEntry?.depleted) return true;
+               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+             }).filter(loc => {
+               // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+               // Modulated mining lasers bypass this since they can adjust to power 1
+               const hasScanData = loc.minutesSinceScan !== Infinity;
+               const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+               if (isLowRemainingWithUnknownPower) {
+                 return false;
+               }
+               // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+               if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                 return false;
+               }
+               return true;
+             });
+             if (newLocations.length > 0) {
               locations.push(...newLocations);
               ctx.log("mining", `Found ${newLocations.length} locations for quota target "${effectiveTarget}"`);
             }
@@ -4174,21 +4176,22 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
               const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
               if (!oreEntry?.depleted) return true;
               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-            }).filter(loc => {
-              // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-              const hasScanData = loc.minutesSinceScan !== Infinity;
-              const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-              if (isLowRemainingWithUnknownPower) {
-                return false;
-              }
-              // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-              if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-                return false;
-              }
-              return true;
-            });
-            
-            if (altLocations.length === 0) {
+             }).filter(loc => {
+               // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+               // Modulated mining lasers bypass this since they can adjust to power 1
+               const hasScanData = loc.minutesSinceScan !== Infinity;
+               const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+               if (isLowRemainingWithUnknownPower) {
+                 return false;
+               }
+               // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+               if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                 return false;
+               }
+               return true;
+             });
+             
+             if (altLocations.length === 0) {
               ctx.log("mining", `No locations found for ${oreId} — trying next ore`);
               continue;
             }
@@ -4920,14 +4923,14 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               }
             }
             // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-            // This prevents high-power miners from wasting time on low-density deposits that haven't been scouted
+            // Modulated mining lasers bypass this since they can adjust to power 1
             const hasScanData = loc.minutesSinceScan !== Infinity;
-            const isLowRemainingWithUnknownPower = hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+            const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
             if (isLowRemainingWithUnknownPower) {
               return false;
             }
             // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-            if (!hasModulatedMiningLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
               return false;
             }
             // No depletion filtering - trust the map data

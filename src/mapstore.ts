@@ -1589,21 +1589,14 @@ class MapStore {
         const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
         // Skip POIs that don't have this specific ore/resource
-        // CRITICAL FIX: If resources data exists (from get_poi scans), the ore MUST be in resources.
-        // ores_found alone is stale history and can lead to death loops when the ore is no longer there.
-        // Only trust ores_found if resources data doesn't exist for this POI at all (undefined, not empty array).
-        const hasResourcesData = poi.resources !== undefined;
-        if (hasResourcesData) {
-          // We have scan data - ore must be in resources to be valid
-          // An empty resources array [] means the ore was scanned and is NOT present
-          if (!resource) {
-            continue;
-          }
-        } else {
-          // No scan data - fall back to mining history (ores_found)
-          if (!ore && !resource) {
-            continue;
-          }
+        // CRITICAL FIX: If scan data exists and includes the ore, require it to be present in resources.
+        // But if scan data exists and does NOT include the ore, still allow the POI when ores_found
+        // has mining history for this ore. This prevents basic radioactive/ore POIs from being
+        // wrongly discarded solely because get_poi didn't list that ore in its resources array.
+        const hasScanDataForOre = !!resource;
+        const hasMiningHistoryForOre = !!ore;
+        if (poi.resources !== undefined && !hasScanDataForOre && !hasMiningHistoryForOre) {
+          continue;
         }
 
         const remaining = resource?.remaining ?? 0;

@@ -38781,9 +38781,9 @@ ignoreBlacklist: document.getElementById(
 
         // Pre-flight: check faction storage has enough for ALL bots
         bulkRefitLog("Checking faction storage for required modules...");
-        const factionBot = bots.find((b) => b.state === "running" || b.state === "idle");
+        const factionBot = bots.find((b) => recipients.includes(b.username) && (b.state === "running" || b.state === "idle"));
         if (!factionBot) {
-          bulkRefitLog("No idle/running bot available to check faction storage");
+          bulkRefitLog("No selected idle/running bot available to check faction storage");
           return;
         }
 

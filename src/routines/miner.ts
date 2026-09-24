@@ -4838,7 +4838,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         const maxRemaining = (targetResource?.max_remaining as number) ?? 0;
         ctx.log("mining", `Pre-scan: ${effectiveTarget} — scanResources=${scanResources.length}, remaining=${remaining}/${maxRemaining}, knownTarget=${knownTarget}, canMineHere=${canMineHere}, miningPoi=${miningPoi?.id}`);
         if (miningPoi) {
-          if (remaining <= 0 && maxRemaining > 0) {
+          if (targetResource && remaining <= 0) {
             const sysData = mapStore.getSystem(bot.system);
             const existingPoi = sysData?.pois.find(p => p.id === bot.poi);
             const existingOreEntry = existingPoi?.ores_found.find(o => o.item_id === effectiveTarget);
@@ -4987,6 +4987,10 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               return false;
             }
             // No depletion filtering - trust the map data
+            // Skip POIs that are completely empty and have never produced anything
+            if (loc.remaining === 0 && loc.maxRemaining === 0 && loc.totalMined === 0) {
+              return false;
+            }
             return true;
           });
 

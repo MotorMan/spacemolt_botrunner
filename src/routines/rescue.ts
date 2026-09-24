@@ -97,6 +97,7 @@ import {
   registerCooperationHandler,
   unregisterCooperationHandler,
   recordRoundRobinComplete,
+  getOtherClaimsForMayday,
   type RescueClaim,
 } from "../cooperation/rescueCooperation.js";
 
@@ -3031,9 +3032,75 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           logCategory = "mayday";
           ctx.log("mayday", `🚨 Selecting MAYDAY target: ${maydayTarget.username}`);
         } else if (targets.length > 0) {
-          // Pick most critical from fresh scan, sorted by lowest fuel
-          selectedTarget = targets[0];
-          ctx.log("rescue", `🎯 Selecting from fleet scan: ${selectedTarget.username} at ${selectedTarget.fuelPct}% fuel`);
+          // Shuffle stranded bots and pick randomly so the rescue fleet spreads out
+          // instead of every bot chasing the same most-critical target every cycle.
+          // Also coordinate via claim broadcast: other rescue bots that see the
+          // claim back out of their own duplicate pick, so the fleet disperses.
+          const shuffled = [...targets].sort(() => Math.random() - 0.5);
+          let pickedFleetTarget: RescueTarget | null = null;
+
+          for (const candidate of shuffled) {
+            // Broadcast claim for candidate so other rescue bots back out
+            const myClaim: RescueClaim = {
+              type: "RESCUE_CLAIM",
+              player: candidate.username,
+              system: candidate.system,
+              poi: candidate.poi,
+              timestamp: new Date().toISOString(),
+              jumps: 0,
+              botName: bot.username,
+            };
+
+            const sendResult = await broadcastRescueClaim(bot, myClaim);
+            if (sendResult.ok) {
+              ctx.log("coop", `📧 Broadcast fleet claim: ${candidate.username} at ${candidate.system}`);
+            }
+
+            // Wait briefly for cross-bot claims to arrive (Bot Chat is relay-latent)
+            const fleetWaitMs = 2000;
+            ctx.log("coop", `⏱ Waiting ${fleetWaitMs / 1000}s for fleet claims...`);
+            await ctx.sleep(fleetWaitMs);
+
+            // Check if another bot already claimed this target
+            const otherClaims = getOtherClaimsForMayday(
+              candidate.username,
+              candidate.system,
+              candidate.poi,
+              bot.username
+            );
+
+            if (otherClaims.length > 0) {
+              const myDistance = await calculateJumpsToTarget(bot, candidate.system, settings.ignoreBlacklist);
+
+              const othersCloser = otherClaims.some((c) => {
+                if (c.jumps >= 0 && myDistance >= 0 && c.jumps < myDistance) return true;
+                if (c.jumps < 0 && myDistance >= 0) return true;
+                return false;
+              });
+
+              if (othersCloser) {
+                ctx.log("coop", `🤝 Another bot is closer to ${candidate.username} (${otherClaims[0].jumps} jumps vs ours ${myDistance}) - trying next target`);
+                continue;
+              }
+
+              // Same distance: deterministic alphabetical tiebreaker so both bots
+              // make the same decision and never yield-loop each other
+              const othersSameDist = otherClaims.filter((c) => c.jumps === myDistance);
+              if (othersSameDist.length > 0) {
+                const sortedOthers = [...othersSameDist].sort((a, b) => a.botName.localeCompare(b.botName));
+                if (bot.username > sortedOthers[0].botName) {
+                  ctx.log("coop", `🤝 Tie on distance to ${candidate.username} - yielding to ${sortedOthers[0].botName} alphabetically`);
+                  continue;
+                }
+              }
+            }
+
+            pickedFleetTarget = candidate;
+            ctx.log("rescue", `🎯 Fleet rescue selected randomly: ${pickedFleetTarget.username} at ${pickedFleetTarget.fuelPct}% fuel (${targets.length} candidates)`);
+            break;
+          }
+
+          selectedTarget = pickedFleetTarget;
         }
       }
 

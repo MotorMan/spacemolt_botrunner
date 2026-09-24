@@ -385,7 +385,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       return; // Cancel routine
     }
 
-    const MAX_NAV_ATTEMPTS = 3;
+    const MAX_NAV_ATTEMPTS = 9999;
     let navAttempts = 0;
     // Final battle check before navigation
     if (await checkAndFleeFromBattle(ctx, "return_home")) {

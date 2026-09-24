@@ -4587,6 +4587,22 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     }
   }
 }
+async function waitForPendingActionSettle(ctx: RoutineContext, label: string): Promise<void> {
+  const { bot } = ctx;
+  for (let i = 0; i < 5; i++) {
+    const resp = await bot.refreshLocation();
+    if (!resp.error) return;
+    const msg = resp.error.message || "";
+    const isPending = resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress");
+    if (isPending) {
+      ctx.log("system", `${label} pending — waiting 2s (attempt ${i + 1}/5)...`);
+      await new Promise(r => setTimeout(r, 2000));
+    } else {
+      return;
+    }
+  }
+}
+
 /** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
 export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
@@ -4606,6 +4622,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   // Treat injured crew/marines before doing anything else
   await treatPersonnel(ctx);
+  await waitForPendingActionSettle(ctx, "treat_personnel");
 
   // Recruit fresh crew and marines up to ship capacity
   await bot.refreshShip();
@@ -4615,6 +4632,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const marineDeficit = Math.max(0, maxMarines - (bot.fitMarines ?? 0));
   if (crewDeficit > 0 || marineDeficit > 0) {
     await recruitPersonnel(ctx, crewDeficit, marineDeficit);
+    await waitForPendingActionSettle(ctx, "recruit_personnel");
   }
 
   await bot.refreshLocation();

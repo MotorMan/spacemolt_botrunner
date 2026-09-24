@@ -4978,6 +4978,10 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (isLowRemainingWithUnknownPower) {
               return false;
             }
+            // Skip POIs that have been scanned and show 0 remaining — they are empty
+            if (hasScanData && loc.remaining <= 0) {
+              return false;
+            }
             // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
             if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
               return false;

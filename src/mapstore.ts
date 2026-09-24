@@ -1579,6 +1579,9 @@ class MapStore {
         if (targetRemaining <= 0 && targetMaxRemaining > 0) {
           continue;
         }
+        if (targetRemaining <= 0 && targetResource) {
+          continue;
+        }
         if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) {
           continue;
         }

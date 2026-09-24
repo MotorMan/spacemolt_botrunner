@@ -1371,6 +1371,24 @@ function jumpsBetweenSystems(fromSystem: string, toSystem: string): number | nul
   return route.length - 1;
 }
 
+/** Check if a stranded bot has fuel cells in their cargo and should be skipped
+ *  until they run out. Covers the 3 fuel cell variants: `fuel_cell`,
+ *  `premium_fuel_cell`, and `military_fuel_cell`.
+ */
+function botHasFuelCellReserve(bot: BotStatus): boolean {
+  const inv = bot.inventory;
+  if (!Array.isArray(inv)) return false;
+  for (const item of inv) {
+    const id = (item.itemId || "").toLowerCase();
+    const qty = typeof item.quantity === "number" ? item.quantity : 0;
+    if (qty <= 0) continue;
+    if (id === "fuel_cell" || id === "premium_fuel_cell" || id === "military_fuel_cell") {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Find bots that need fuel rescue. */
 function findStrandedBots(
   fleet: BotStatus[],
@@ -1383,6 +1401,9 @@ function findStrandedBots(
     if (bot.state !== "running" && bot.state !== "idle") continue;
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct <= fuelThreshold) {
+      if (botHasFuelCellReserve(bot)) {
+        continue;
+      }
       targets.push({
         username: bot.username,
         system: bot.system,

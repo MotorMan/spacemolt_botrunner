@@ -805,7 +805,8 @@ export class StationWebServer {
           const r = (resp.result ?? {}) as Record<string, unknown>;
           const base = (r.base as Record<string, unknown>) ?? {};
           const baseId = (base.id as string) || (base.poi_id as string) || "";
-          if (baseId && row.stationId && baseId !== row.stationId) {
+          const atMonitoredStation = !baseId || !row.stationId || baseId === row.stationId;
+          if (!atMonitoredStation) {
             state = "MISMATCH";
           }
           const condition = (r.condition as Record<string, unknown>) ?? {};
@@ -823,14 +824,17 @@ export class StationWebServer {
           const jobs = await this.readCraftQueue(botInstance, row.bot, queueCache);
           const fuelCraft = this.summarizeFuelCraft(jobs, row.stationId, name);
           // Gun ammo + facility maintenance stock (faction storage only).
-          // Reaching this branch already means the drone is docked here, so a
-          // faction-storage read is allowed.
-          const supplies = await this.readSupplies(
-            row,
-            botInstance,
-            true,
-            prev?.supplies ?? lastGood?.supplies ?? null,
-          );
+          // Only read live supplies when the drone is actually at the monitored
+          // station; otherwise we would ingest the wrong station's faction
+          // storage and red-flag a healthy station.
+          const supplies = atMonitoredStation
+            ? await this.readSupplies(
+                row,
+                botInstance,
+                true,
+                prev?.supplies ?? lastGood?.supplies ?? null,
+              )
+            : (prev?.supplies ?? lastGood?.supplies ?? null);
           const snapshot: StationSnapshot = {
             stationId: row.stationId,
             stationName: name,
@@ -1148,9 +1152,11 @@ export class StationWebServer {
   }
 
   /**
-   * Stock held in THIS station's faction storage. Other routines cache their
-   * reads under the plain station/POI id while a docked read is keyed
-   * "system|poi", so every alias is checked and the freshest one wins.
+   * Stock held in THIS station's faction storage. The docked-drone read is
+   * already keyed "system|poi", which is the same key the rest of the botrunner
+   * uses for the station the bot is physically at. Only that key is consulted
+   * here so we cannot accidentally pick up a fresher cache entry that belongs
+   * to a different station.
    */
   private async readFactionStock(
     botInstance: Bot,
@@ -1160,7 +1166,6 @@ export class StationWebServer {
   ): Promise<SupplyStock> {
     const faction = botInstance.faction || "unknown";
     const dockedKey = `${botInstance.system}|${botInstance.poi}`;
-    const keys = [dockedKey, row.stationId, botInstance.poi].filter((k): k is string => !!k);
 
     const toStock = (
       entries: { itemId: string; quantity: number; name?: string }[],
@@ -1175,12 +1180,11 @@ export class StationWebServer {
       return { stock, names };
     };
 
-    let best: { at: number; entries: { itemId: string; quantity: number; name?: string }[] } | null = null;
-    for (const key of new Set(keys)) {
-      const cached = getFactionStorageCache(faction, key);
-      if (!cached?.entries) continue;
-      const at = cached.lastUpdated || 0;
-      if (!best || at > best.at) best = { at, entries: cached.entries };
+    let best: { at: number; entries: { itemId: string; quantity: number; name?: string }[] } | null =
+      null;
+    const cached = getFactionStorageCache(faction, dockedKey);
+    if (cached?.entries) {
+      best = { at: cached.lastUpdated || 0, entries: cached.entries };
     }
 
     const fresh = !!best && Date.now() - best.at <= ttlMs;

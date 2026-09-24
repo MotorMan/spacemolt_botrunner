@@ -2756,6 +2756,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // re-run target selection so the miner picks the next best system/ore instead
     // of falling back to local mining. Cleared whenever a navigation succeeds.
     const excludedNavSystems = new Set<string>();
+    const triedAndRejectedTargets = new Set<string>();
 
     while (bot.state === "running") {
       // ── Death recovery ──
@@ -3152,6 +3153,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       resourceLabel = (targetResource === settings.targetOre && targetResource !== "") ? "ore" : (targetResource === settings.targetIce && targetResource !== "" ? "ice" : "gas");
     }
 
+    // CRITICAL FIX: If this global target was already rejected this cycle,
+    // clear it so we fall back to quota rotation instead of retrying the same ore.
+    if (targetResource && triedAndRejectedTargets.has(targetResource)) {
+      ctx.log("mining", `Global target "${targetResource}" previously rejected — clearing to try quota rotation`);
+      targetResource = "";
+    }
+
     // ── STRIP MINER RESTRICTION ──
     // Strip miners can ONLY mine basic ores (iron/copper) - cannot mine rarer ores
     // If strip miner is equipped and target is not a common ore, override to iron_ore
@@ -3215,7 +3223,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("debug", `Quota/mining mode: miningType="${miningType}", useDeepCore=${useDeepCore}, lead_deficit_ore will be filtered by ${miningType} POI check in findOreLocations → findFirstAvailableQuotaTarget`);
 
     // ── Determine priority target (global target or quota pick) ──
-    const hasGlobalTarget = !!targetResource;
+    let hasGlobalTarget = !!targetResource;
     if (hasGlobalTarget) {
       ctx.log("mining", `Global ${resourceLabel} target configured: ${targetResource} — overriding quotas`);
     } else {
@@ -3276,7 +3284,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-    const priorityTarget = hasGlobalTarget ? targetResource : quotaTargetResource;
+      // CRITICAL FIX: If this quota target was already rejected this cycle,
+      // clear it so we pick a different quota target instead of retrying.
+      if (quotaTargetResource && triedAndRejectedTargets.has(quotaTargetResource)) {
+        ctx.log("mining", `Quota target "${quotaTargetResource}" previously rejected — clearing to pick different quota target`);
+        quotaTargetResource = "";
+      }
+
+    let priorityTarget = hasGlobalTarget ? targetResource : quotaTargetResource;
 
     // ── Recovered session handling ──
     // CRITICAL FIX: Always validate recovered session against current quotas
@@ -3394,8 +3409,26 @@ if (shouldAbandon) {
 
     // ── Determine effective target ──
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
+    if (effectiveTarget && triedAndRejectedTargets.has(effectiveTarget)) {
+      ctx.log("mining", `Skipping previously rejected target "${effectiveTarget}" — will select fresh target`);
+      effectiveTarget = "";
+    }
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
     const maxJumps = settings.maxJumps || 10;
+    if (!effectiveTarget && !hasGlobalTarget && Object.keys(quotas).length > 0) {
+      const freshTarget = findFirstAvailableQuotaTarget(
+        quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+        canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois,
+        Array.from(triedAndRejectedTargets), !bot.isCloaked, totalMiningPower, bot.username,
+        blacklist, bot.system, maxJumps, hasModulatedLaser
+      );
+      if (freshTarget) {
+        effectiveTarget = freshTarget;
+        quotaTargetResource = freshTarget;
+        priorityTarget = freshTarget;
+        ctx.log("mining", `Fresh quota target selected after rejection: "${effectiveTarget}"`);
+      }
+    }
 
     // CRITICAL FIX: If session is in returning_home state, return home instead of mining
     // This catches both full cargo and session Was returning_home
@@ -3910,6 +3943,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
         if (Object.keys(quotas).length > 0) {
           const originalTarget = effectiveTarget;
           ctx.log("mining", `Target "${originalTarget}" not available — searching for first available quota target`);
+          triedAndRejectedTargets.add(originalTarget);
 
           // For deep core miners, when global target fails, restrict to deep core quotas only
           // This prevents deep core miners from falling back to basic ores

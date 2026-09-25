@@ -23907,7 +23907,7 @@ When responding:
       }
 
       function matsInlineHtml(mats, stockMap) {
-        console.log("[MATS_DEBUG] matsInlineHtml called, mats:", mats, "stockMap keys:", stockMap ? Object.keys(stockMap).length : 0);
+        console.log("[MATS_DEBUG] inline mats:", mats, "stock keys:", stockMap ? Object.keys(stockMap).length : 0, "mats length:", mats ? mats.length : 0);
         if (!Array.isArray(mats) || !mats.length) return "";
         return " - " + matsAvailabilityHtml(mats, stockMap);
       }
@@ -24092,7 +24092,7 @@ When responding:
         <span id="ff-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${factionCount} types</span>
       </div>
       <div id="factionBuildableTypes">
-        ${types.length > 0 ? renderFactionBuildableTypesListHtml(types, username) : `<button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`}
+        ${types.length > 0 ? renderFactionBuildableTypesListHtml(types, username, buildStorageMap(profileFactionStorage || globalFactionStorage || [])) : `<button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`}
       </div>
     </div>
     <div class="faction-section" style="margin-top:16px">
@@ -26609,26 +26609,12 @@ When responding:
           return;
         }
 
-        container.innerHTML = types
-          .map((t) => {
-            const typeId = t.facility_type || t.type || t.id || "";
-            const catalogDetail = getCatalogFacility(typeId);
-            const detail = catalogDetail || t;
-            const cost = detail.cost ?? detail.credits ?? detail.price ?? detail.build_cost ?? 0;
-            const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
-            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1">
-      <div class="fc-name">${esc(detail.name || typeId)}</div>
-      <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
-      <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
-        ${factionOwnedBadge(typeId)}
-        <button class="sm" onclick="showFactionBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
-      </div>
-    </div>`;
-          })
-          .join("");
+        const factionStock = buildStorageMap(profileFactionStorage || globalFactionStorage || []);
+        container.innerHTML = renderFactionBuildableTypesListHtml(types, username, factionStock);
       }
 
-      function renderFactionBuildableTypesListHtml(types, username) {
+      function renderFactionBuildableTypesListHtml(types, username, factionStock) {
+        console.log("[MATS_DEBUG] renderFactionBuildableTypesListHtml called, types:", types.length, "factionStock keys:", factionStock ? Object.keys(factionStock).length : 0);
         return types
           .map((t) => {
             const typeId = t.facility_type || t.type || t.id || "";
@@ -26636,8 +26622,13 @@ When responding:
             const detail = catalogDetail || t;
             const cost = detail.cost ?? detail.credits ?? detail.price ?? detail.build_cost ?? 0;
             const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
-            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1">
-      <div class="fc-name">${esc(detail.name || typeId)}</div>
+            const mats = detail.build_materials || [];
+            console.log("[MATS_DEBUG] facility:", detail.name || typeId, "build_materials:", mats.length, "sample:", mats.slice(0, 2));
+            const matsInline = mats.length
+              ? " - " + matsAvailabilityHtml(mats, factionStock)
+              : "";
+            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1"><!-- FACTION_MATERIALS_MOD -->
+      <div class="fc-name">${esc(detail.name || typeId)}${matsInline}</div>
       <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
         ${factionOwnedBadge(typeId)}
@@ -26694,15 +26685,12 @@ When responding:
         const buildTime = detail.build_time ?? 0;
         const buildTimeStr = buildTime ? `${buildTime}s` : "";
 
+        const factionStock = buildStorageMap(profileFactionStorage || globalFactionStorage || []);
         const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || [];
         let matsHtml = "";
         if (Array.isArray(mats) && mats.length > 0) {
           matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
-            mats.map((m) => {
-              const mName = m.name || m.item_name || m.item_id || m.resource || "?";
-              const mQty = m.quantity || m.count || m.amount || 1;
-              return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
-            }).join(", ") + "</div>";
+            matsAvailabilityHtml(mats, factionStock) + "</div>";
         } else if (typeof mats === "object" && !Array.isArray(mats) && Object.keys(mats).length > 0) {
           matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
             Object.entries(mats).map(([k, v]) => `<span style="color:var(--text)">${v}x ${esc(k)}</span>`).join(", ") + "</div>";

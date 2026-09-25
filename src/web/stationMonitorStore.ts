@@ -133,6 +133,8 @@ export interface StationSnapshot {
   fuelCraft?: FuelCraftStatus | null;
   /** Optional: absent in snapshots written before supply tracking existed. */
   supplies?: SupplyStatus | null;
+  /** Faction storage stock (item_id -> qty) for build-material availability checks. */
+  factionStock?: Record<string, number> | null;
   /** True when the station's docked drone reports an active battle involving this station. */
   combatAlert?: boolean;
   /** Battle id of the active (or most recent) combat alert. */

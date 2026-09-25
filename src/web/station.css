@@ -717,6 +717,9 @@ pre.snap {
 .build-card .bc-meta { font-size: 11px; color: var(--on-surface-variant); font-family: var(--font-data); }
 .build-card .bc-cost { color: var(--tertiary-fixed-dim); }
 .build-card .bc-needs { font-size: 10px; color: var(--primary-fixed-dim); font-family: var(--font-data); }
+.build-card .bc-mats { font-size: 11px; color: var(--on-surface-variant); font-family: var(--font-data); }
+.build-card .mat-ok { color: var(--secondary-fixed-dim); }
+.build-card .mat-bad { color: #ff6b6b; }
 .build-search { width: 100%; background: rgba(12, 14, 18, 0.6); border: 1px solid var(--outline-variant); color: var(--on-surface); padding: 6px 10px; font-size: 12px; font-family: var(--font-data); margin-bottom: 10px; }
 .build-count { font-size: 11px; color: var(--on-surface-variant); font-family: var(--font-data); margin-bottom: 6px; }
 

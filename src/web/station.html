@@ -801,6 +801,7 @@
     upgrades: {},
     catCache: {},
     supplies: null,           // server-evaluated ammo/maintenance stock for this station
+    factionStock: null,       // faction storage stock (item_id -> qty) for build-material checks
     buildCategory: "service",
     buildSearch: "",
     buildList: [],
@@ -889,10 +890,13 @@
         detailState.lifeSupport = j.snapshot.lifeSupport || {};
         detailState.power = j.snapshot.power || {};
         detailState.supplies = j.snapshot.supplies || null;
+        detailState.factionStock = j.snapshot.factionStock || null;
         detailState.combatAlert = !!j.snapshot.combatAlert;
         detailState.battleId = j.snapshot.battleId || null;
         document.getElementById("detail-name").textContent = j.snapshot.stationName || detailId;
       } else {
+        detailState.base = detailState.base || {};
+        detailState.factionStock = null;
         document.getElementById("detail-name").textContent = detailId;
       }
     } catch {
@@ -1369,10 +1373,16 @@
     }
   }
 
-  function matsHtml(mats) {
+  function matsHtml(mats, stock) {
     if (!Array.isArray(mats) || !mats.length) return "";
-    return '<div class="bc-meta">Build mats: ' +
-      mats.map((m) => `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`).join(", ") + "</div>";
+    const parts = mats.map((m) => {
+      const have = stock ? (stock[m.item_id] ?? 0) : null;
+      const ok = have !== null && have >= m.quantity;
+      const cls = ok ? "mat-ok" : "mat-bad";
+      const label = `${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}`;
+      return have !== null ? `<span class="${cls}">${label}</span>` : esc(label);
+    }).join(", ");
+    return `<div class="bc-mats">${parts}</div>`;
   }
   function needsHtml(maint) {
     if (!Array.isArray(maint) || !maint.length) return "";
@@ -1391,7 +1401,7 @@
         <div class="bc-name">${esc(f.name || f.id)}</div>
         <div class="bc-meta">${esc(f.category)}${f.level ? " · Lv" + f.level : ""}${f.build_cost ? ' · <span class="bc-cost">' + Number(f.build_cost).toLocaleString() + "cr</span>" : ""}</div>
         <div class="bc-meta">${esc(f.description || "")}</div>
-        ${matsHtml(f.build_materials)}
+        ${matsHtml(f.build_materials, detailState.factionStock)}
         ${needsHtml(f.maintenance_inputs)}
         <div style="margin-top:4px"><button class="primary-btn sm" data-act="build">Build</button></div>
       </div>`).join("");

@@ -101,6 +101,8 @@ export interface StationView {
   fuelCraft: FuelCraftStatus | null;
   /** Gun-ammo + facility-maintenance stock state (drives the yellow/red card tiers). */
   supplies: SupplyStatus | null;
+  /** Faction storage stock (item_id -> qty) for build-material availability checks. */
+  factionStock: Record<string, number> | null;
   /** True when the station's docked drone reports an active battle involving this station. */
   combatAlert: boolean;
   /** Battle id of the active (or most recent) combat alert. */
@@ -835,6 +837,12 @@ export class StationWebServer {
                 prev?.supplies ?? lastGood?.supplies ?? null,
               )
             : (prev?.supplies ?? lastGood?.supplies ?? null);
+          const factionStockRaw = atMonitoredStation
+            ? await this.readFactionStock(botInstance, row, true, Math.max(1, this.config.supplyRefreshMin) * 60_000)
+            : null;
+          const factionStock = factionStockRaw?.stock
+            ? Object.fromEntries(factionStockRaw.stock)
+            : null;
           const snapshot: StationSnapshot = {
             stationId: row.stationId,
             stationName: name,
@@ -849,6 +857,7 @@ export class StationWebServer {
             wrecked,
             fuelCraft,
             supplies,
+            factionStock,
             combatAlert: battle.combatAlert,
             battleId: battle.battleId,
           };
@@ -871,6 +880,7 @@ export class StationWebServer {
             factionFuelCapacity: snapshot.factionFuelCapacity,
             fuelCraft,
             supplies,
+            factionStock,
             combatAlert: battle.combatAlert,
             battleId: battle.battleId,
             lastError: null,
@@ -914,6 +924,7 @@ export class StationWebServer {
       // Same for supplies: an undocked/offline drone can't read faction storage,
       // and inventing an "out of ammo" state there would be a false alarm.
       supplies: prev?.supplies ?? lastGood?.supplies ?? null,
+      factionStock: prev?.factionStock ?? lastGood?.factionStock ?? null,
       combatAlert: battle.combatAlert,
       battleId: battle.battleId,
       lastError,
@@ -1283,6 +1294,7 @@ export class StationWebServer {
         factionFuelCapacity: snap?.factionFuelCapacity ?? 0,
         fuelCraft: snap?.fuelCraft ?? null,
         supplies: snap?.supplies ?? null,
+        factionStock: snap?.factionStock ?? null,
         combatAlert: snap?.combatAlert ?? false,
         battleId: snap?.battleId ?? null,
         lastError: null,

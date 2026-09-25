@@ -1373,6 +1373,16 @@
     }
   }
 
+  function matsInline(mats, stock) {
+    if (!Array.isArray(mats) || !mats.length) return "";
+    const parts = mats.map((m) => {
+      const have = stock ? (stock[m.item_id] ?? 0) : null;
+      const ok = have !== null && have >= m.quantity;
+      const cls = ok ? "mat-ok" : "mat-bad";
+      return `<span class="${cls}">${num(m.quantity)}x ${esc(m.name || m.item_id || "?")}</span>`;
+    }).join(", ");
+    return " - " + parts;
+  }
   function matsHtml(mats, stock) {
     if (!Array.isArray(mats) || !mats.length) return "";
     const parts = mats.map((m) => {
@@ -1398,7 +1408,7 @@
     ).join("");
     const list = detailState.buildList.map((f) => `
       <div class="build-card" data-type="${esc(f.id)}">
-        <div class="bc-name">${esc(f.name || f.id)}</div>
+        <div class="bc-name">${esc(f.name || f.id)}${matsInline(f.build_materials, detailState.factionStock)}</div>
         <div class="bc-meta">${esc(f.category)}${f.level ? " · Lv" + f.level : ""}${f.build_cost ? ' · <span class="bc-cost">' + Number(f.build_cost).toLocaleString() + "cr</span>" : ""}</div>
         <div class="bc-meta">${esc(f.description || "")}</div>
         ${matsHtml(f.build_materials, detailState.factionStock)}

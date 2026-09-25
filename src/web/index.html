@@ -23906,6 +23906,11 @@ When responding:
         return parts;
       }
 
+      function matsInlineHtml(mats, stockMap) {
+        if (!Array.isArray(mats) || !mats.length) return "";
+        return " - " + matsAvailabilityHtml(mats, stockMap);
+      }
+
       // ── Faction Facilities ───────────────────────────────────────
 
       function fetchFactionBuildOptions(username) {
@@ -23960,7 +23965,7 @@ When responding:
                       : "";
                     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px">
         <div>
-          <span style="color:var(--text);font-weight:500">${esc(name)}</span>
+          <span style="color:var(--text);font-weight:500">${esc(name)}${matsInlineHtml(mats, stockMap)}</span>
           ${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${esc(costStr)}</span>` : ""}
           <span style="color:var(--text-dim);margin-left:6px;font-size:10px">${esc(typeId)}</span>
           ${desc ? `<div style="color:var(--text-dim);font-size:11px;margin-top:2px">${esc(desc)}</div>` : ""}
@@ -24865,7 +24870,7 @@ When responding:
                 "</div>";
             }
             return `<div id="sf-type-${esc(typeId)}" class="faction-card" style="opacity:1">
-      <div class="fc-name">${esc(t.name || typeId)}</div>
+      <div class="fc-name">${esc(t.name || typeId)}${matsInlineHtml(mats, factionStock)}</div>
       <div class="fc-detail">${esc(t.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       ${matsHtml}
       ${maintHtml}

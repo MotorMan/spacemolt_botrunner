@@ -23907,6 +23907,7 @@ When responding:
       }
 
       function matsInlineHtml(mats, stockMap) {
+        console.log("[MATS_DEBUG] matsInlineHtml called, mats:", mats, "stockMap keys:", stockMap ? Object.keys(stockMap).length : 0);
         if (!Array.isArray(mats) || !mats.length) return "";
         return " - " + matsAvailabilityHtml(mats, stockMap);
       }
@@ -23963,7 +23964,7 @@ When responding:
                     const matsHtml = mats.length
                       ? `<div style="margin-top:4px;font-size:11px"><span style="color:var(--text-dim)">Build mats:</span> ${matsAvailabilityHtml(mats, stockMap)}</div>`
                       : "";
-                    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px">
+                    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px"><!-- MATERIALS_MOD --><div>
         <div>
           <span style="color:var(--text);font-weight:500">${esc(name)}${matsInlineHtml(mats, stockMap)}</span>
           ${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${esc(costStr)}</span>` : ""}
@@ -24869,8 +24870,7 @@ When responding:
                   .join(", ") +
                 "</div>";
             }
-            return `<div id="sf-type-${esc(typeId)}" class="faction-card" style="opacity:1">
-      <div class="fc-name">${esc(t.name || typeId)}${matsInlineHtml(mats, factionStock)}</div>
+            return `<div id="sf-type-${esc(typeId)}" class="faction-card" style="opacity:1"><!-- MATERIALS_MOD --><div class="fc-name">${esc(t.name || typeId)}${matsInlineHtml(mats, factionStock)}</div>
       <div class="fc-detail">${esc(t.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       ${matsHtml}
       ${maintHtml}

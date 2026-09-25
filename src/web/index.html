@@ -23880,6 +23880,32 @@ When responding:
         });
       }
 
+      function buildStorageMap(items) {
+        const map = {};
+        for (const item of items || []) {
+          const id = item.item_id || item.itemId || "";
+          const qty = item.quantity || item.count || 0;
+          if (id) map[id] = qty;
+        }
+        return map;
+      }
+
+      function matsAvailabilityHtml(mats, stockMap) {
+        if (!Array.isArray(mats) || !mats.length) return "";
+        const parts = mats
+          .map((m) => {
+            const id = m.item_id || "";
+            const name = m.name || m.item_id || "?";
+            const qty = m.quantity || 1;
+            const have = stockMap ? stockMap[id] ?? null : null;
+            const ok = have !== null && have >= qty;
+            const color = have !== null ? (ok ? "var(--green)" : "var(--red)") : "var(--text)";
+            return `<span style="color:${color}">${qty}x ${esc(name)}</span>`;
+          })
+          .join(", ");
+        return parts;
+      }
+
       // ── Faction Facilities ───────────────────────────────────────
 
       function fetchFactionBuildOptions(username) {
@@ -23889,49 +23915,63 @@ When responding:
           '<div class="faction-no-data">Loading faction facility types...</div>';
         sendExec(
           username,
-          "facility",
-          { action: "types", category: "faction" },
-          (result) => {
-            if (!result.ok || !result.data) {
-              panel.innerHTML = `<div class="faction-no-data">Could not load types: ${esc(result.error || "unknown")}</div>
-        <pre style="font-size:10px;color:var(--text-dim);margin-top:4px">${esc(JSON.stringify(result.data, null, 2))}</pre>`;
-              return;
-            }
-            const d = result.data;
-            const types = Array.isArray(d)
-              ? d
-              : Array.isArray(d.types)
-                ? d.types
-                : Array.isArray(d.facilities)
-                  ? d.facilities
-                  : [];
-            if (types.length === 0) {
-              // Might be a category overview — dump raw for debugging
-              panel.innerHTML = `<div class="faction-no-data">No faction types returned</div>
-        <pre style="font-size:10px;color:var(--text-dim);margin-top:4px;white-space:pre-wrap">${esc(JSON.stringify(d, null, 2))}</pre>`;
-              return;
-            }
-            panel.innerHTML = types
-              .map((t) => {
-                const typeId = t.facility_type || t.type || t.id || "";
-                const name = t.name || typeId || "?";
-                const desc = t.description || "";
-                const cost =
-                  t.cost ?? t.credits ?? t.price ?? t.credit_cost ?? "";
-                const costStr = cost
-                  ? `${Number(cost).toLocaleString()}cr`
-                  : "";
-                return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px">
+          "view_faction_storage",
+          undefined,
+          (storageResult) => {
+            const stockMap = storageResult.ok && storageResult.data
+              ? buildStorageMap(storageResult.data.items || storageResult.data.storage || [])
+              : {};
+            sendExec(
+              username,
+              "facility",
+              { action: "types", category: "faction" },
+              (result) => {
+                if (!result.ok || !result.data) {
+                  panel.innerHTML = `<div class="faction-no-data">Could not load types: ${esc(result.error || "unknown")}</div>
+          <pre style="font-size:10px;color:var(--text-dim);margin-top:4px">${esc(JSON.stringify(result.data, null, 2))}</pre>`;
+                  return;
+                }
+                const d = result.data;
+                const types = Array.isArray(d)
+                  ? d
+                  : Array.isArray(d.types)
+                    ? d.types
+                    : Array.isArray(d.facilities)
+                      ? d.facilities
+                      : [];
+                if (types.length === 0) {
+                  panel.innerHTML = `<div class="faction-no-data">No faction types returned</div>
+          <pre style="font-size:10px;color:var(--text-dim);margin-top:4px;white-space:pre-wrap">${esc(JSON.stringify(d, null, 2))}</pre>`;
+                  return;
+                }
+                panel.innerHTML = types
+                  .map((t) => {
+                    const typeId = t.facility_type || t.type || t.id || "";
+                    const name = t.name || typeId || "?";
+                    const desc = t.description || "";
+                    const cost =
+                      t.cost ?? t.credits ?? t.price ?? t.credit_cost ?? "";
+                    const costStr = cost
+                      ? `${Number(cost).toLocaleString()}cr`
+                      : "";
+                    const mats = t.build_materials || [];
+                    const matsHtml = mats.length
+                      ? `<div style="margin-top:4px;font-size:11px"><span style="color:var(--text-dim)">Build mats:</span> ${matsAvailabilityHtml(mats, stockMap)}</div>`
+                      : "";
+                    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d;font-size:12px">
         <div>
           <span style="color:var(--text);font-weight:500">${esc(name)}</span>
           ${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${esc(costStr)}</span>` : ""}
           <span style="color:var(--text-dim);margin-left:6px;font-size:10px">${esc(typeId)}</span>
           ${desc ? `<div style="color:var(--text-dim);font-size:11px;margin-top:2px">${esc(desc)}</div>` : ""}
+          ${matsHtml}
         </div>
         <button class="primary sm" style="font-size:10px" onclick="factionBuildFacilityFromStorage('${esc(username)}','${esc(typeId)}','${esc(name)}')">Build</button>
       </div>`;
-              })
-              .join("");
+                  })
+                  .join("");
+              },
+            );
           },
         );
       }
@@ -24792,10 +24832,11 @@ When responding:
             '<div class="faction-no-data">No station facility types in this category.</div>';
           return;
         }
-        container.innerHTML = renderStationBuildableTypesListHtml(types, username);
+        const factionStock = buildStorageMap(profileFactionStorage || globalFactionStorage || []);
+        container.innerHTML = renderStationBuildableTypesListHtml(types, username, factionStock);
       }
 
-      function renderStationBuildableTypesListHtml(types, username) {
+      function renderStationBuildableTypesListHtml(types, username, factionStock) {
         return types
           .map((t) => {
             const typeId = t.facility_type || t.type || t.id || "";
@@ -24806,13 +24847,7 @@ When responding:
             if (Array.isArray(mats) && mats.length > 0) {
               matsHtml =
                 '<div style="margin-top:4px;font-size:11px"><span style="color:var(--text-dim)">Build mats:</span> ' +
-                mats
-                  .map((m) => {
-                    const mName = m.name || m.item_id || "?";
-                    const mQty = m.quantity || 1;
-                    return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
-                  })
-                  .join(", ") +
+                matsAvailabilityHtml(mats, factionStock) +
                 "</div>";
             }
             const maint = t.maintenance_inputs || [];
@@ -24855,11 +24890,10 @@ When responding:
         const cost = detail.build_cost ?? detail.cost ?? detail.credits ?? 0;
         const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
         const mats = detail.build_materials || [];
+        const factionStock = buildStorageMap(profileFactionStorage || globalFactionStorage || []);
         const matsHtml = Array.isArray(mats) && mats.length
           ? '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
-            mats
-              .map((m) => `<span style="color:var(--text)">${(m.quantity || 1)}x ${esc(m.name || m.item_id || "?")}</span>`)
-              .join(", ") +
+            matsAvailabilityHtml(mats, factionStock) +
             "</div>"
           : "";
         const maint = detail.maintenance_inputs || [];

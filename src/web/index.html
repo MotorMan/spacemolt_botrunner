@@ -23907,7 +23907,6 @@ When responding:
       }
 
       function matsInlineHtml(mats, stockMap) {
-        console.log("[MATS_DEBUG] inline mats:", mats, "stock keys:", stockMap ? Object.keys(stockMap).length : 0, "mats length:", mats ? mats.length : 0);
         if (!Array.isArray(mats) || !mats.length) return "";
         return " - " + matsAvailabilityHtml(mats, stockMap);
       }
@@ -26614,7 +26613,6 @@ When responding:
       }
 
       function renderFactionBuildableTypesListHtml(types, username, factionStock) {
-        console.log("[MATS_DEBUG] renderFactionBuildableTypesListHtml called, types:", types.length, "factionStock keys:", factionStock ? Object.keys(factionStock).length : 0);
         return types
           .map((t) => {
             const typeId = t.facility_type || t.type || t.id || "";
@@ -26623,7 +26621,6 @@ When responding:
             const cost = detail.cost ?? detail.credits ?? detail.price ?? detail.build_cost ?? 0;
             const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
             const mats = detail.build_materials || [];
-            console.log("[MATS_DEBUG] facility:", detail.name || typeId, "build_materials:", mats.length, "sample:", mats.slice(0, 2));
             const matsInline = mats.length
               ? " - " + matsAvailabilityHtml(mats, factionStock)
               : "";

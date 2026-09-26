@@ -37,6 +37,7 @@
     .spc-badge-market { background:#0d2818; color:var(--green); }
     .spc-badge-base { background:#2d1b00; color:var(--yellow); }
     .spc-badge-missing { background:#2d0000; color:var(--red); }
+    .spc-badge-tax { background:#0d1b2d; color:#60a5fa; }
     .spc-empty { text-align:center; padding:40px; color:var(--text-dim); }
     .spc-bar { display:flex; gap:12px; align-items:center; padding:8px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; flex-shrink:0; flex-wrap:wrap; }
     .spc-stat { font-size:12px; color:var(--text-dim); }
@@ -66,8 +67,13 @@
     </div>
     </div>
     <div class="spc-bar" id="spcBar">
-      <span class="spc-stat">Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
+      <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;font-size:12px;color:var(--text-dim)">
+        <input type="checkbox" id="useTaxEstimate" checked onchange="onPricingModeChange()"> Use game-assessed ship values
+      </label>
+      <span class="spc-stat">Base/Market Multiplier (missing prices): <b id="multiplierVal">42</b>x</span>
       <input type="number" id="multiplier" value="42" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('multiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
+      <span class="spc-stat">Tax-Estimate Multiplier: <b id="taxMultiplierVal">1.20</b>x</span>
+      <input type="number" id="taxMultiplier" value="1.20" step="0.01" min="1" style="width:70px;font-size:12px;padding:4px 8px;" onchange="document.getElementById('taxMultiplierVal').textContent=parseFloat(this.value||1).toFixed(2)">
       <span class="spc-stat" id="spcStats"></span>
       <span class="spc-stat" style="cursor:pointer" onclick="var el=document.getElementById('overrideList');el.style.display=el.style.display==='none'?'flex':'none'" title="Click to toggle overrides">
         Overrides: <b id="overrideCount" style="color:var(--yellow)">0</b>
@@ -112,6 +118,8 @@
     let stationColorMap = new Map();
     let mapData = null;
     let poiLookup = new Map();
+    let taxEstimateMap = new Map();
+    let useTaxEstimate = true;
 
     function buildPoiLookup() {
       poiLookup.clear();
@@ -313,6 +321,16 @@
       const statsEl = document.getElementById('spcStats');
       if (statsEl) statsEl.textContent = statsText;
       processQueue();
+    }
+
+    function onPricingModeChange() {
+      const checkbox = document.getElementById('useTaxEstimate');
+      const multInput = document.getElementById('multiplier');
+      const taxMultInput = document.getElementById('taxMultiplier');
+      useTaxEstimate = !!checkbox?.checked;
+      if (multInput) multInput.disabled = useTaxEstimate;
+      if (taxMultInput) taxMultInput.disabled = !useTaxEstimate;
+      refreshAllLoadedShips();
     }
 
     async function setPriceOverride(itemId, price) {
@@ -652,13 +670,34 @@
     }
 
     async function computeShipPricing(shipData) {
-      const result = { hull: { cost: 0, lines: [] }, modules: [], total: 0 };
+      const result = { hull: { cost: 0, lines: [] }, modules: [], total: 0, source: 'base', detail: '' };
       if (!shipData) return result;
       const ship = (shipData.ship && typeof shipData.ship === 'object') ? shipData.ship : shipData;
       const shipId = (ship.class_id || ship.type || ship.id || '').toLowerCase();
       const shipEntry = catalog.ships[shipId] || null;
       const baseHull = ship.base_hull || ship.max_hull || 0;
       console.debug('computeShipPricing shipId=', shipId, 'shipEntry=', !!shipEntry, 'modules=', Array.isArray(shipData.modules) ? shipData.modules.length : 'n/a', 'shipDataKeys=', Object.keys(shipData));
+
+      if (useTaxEstimate) {
+        const originalShipId = (
+          shipData.id || shipData.ship_id ||
+          ship.id || ship.ship_id ||
+          ship.class_id || ship.type || ''
+        ).toLowerCase();
+        const assessedValue = taxEstimateMap.get(originalShipId) || 0;
+        const taxMult = parseFloat(document.getElementById('taxMultiplier')?.value || 1.20);
+        const pricedValue = assessedValue > 0 ? Math.floor(assessedValue * taxMult) : 0;
+        result.hull.cost = pricedValue;
+        if (assessedValue > 0) {
+          result.hull.lines.push({ itemId: 'game-assessed-value', qty: 1, unitPrice: assessedValue, cost: pricedValue, source: 'tax', detail: 'assessed ' + assessedValue.toLocaleString() + 'cr × ' + taxMult.toFixed(2) + ' (tax estimate)' });
+        } else {
+          result.hull.lines.push({ itemId: 'no-tax-data', qty: 1, unitPrice: 0, cost: 0, source: 'missing', detail: 'no assessed value in tax estimate for this ship' });
+        }
+        result.total = pricedValue;
+        result.source = 'tax';
+        result.detail = assessedValue > 0 ? 'game-assessed value ' + assessedValue.toLocaleString() + 'cr × ' + taxMult.toFixed(2) : 'no tax estimate data available';
+        return result;
+      }
 
       if (shipEntry && Array.isArray(shipEntry.build_materials)) {
         let hullCost = 0;
@@ -805,7 +844,14 @@
         await loadPriceOverrides();
         await loadBotLocation(bot);
         await loadStationRef();
-        multiplier = parseFloat(document.getElementById('multiplier').value) || 2.42;
+        await fetchTaxEstimate(bot);
+        const checkbox = document.getElementById('useTaxEstimate');
+        useTaxEstimate = checkbox ? checkbox.checked : true;
+        const multInput = document.getElementById('multiplier');
+        const taxMultInput = document.getElementById('taxMultiplier');
+        multiplier = parseFloat(multInput?.value || 2.42);
+        if (multInput) multInput.disabled = useTaxEstimate;
+        if (taxMultInput) taxMultInput.disabled = !useTaxEstimate;
         shipList = ships;
         shipLocations.clear();
         for (const s of ships) {
@@ -885,6 +931,28 @@
       } catch (e) {
         console.error('browse_ships failed', e);
         listingMap = new Map();
+      }
+    }
+
+    async function fetchTaxEstimate(bot) {
+      try {
+        const res = await fetch('/api/ship-pricing/tax-estimate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bot })
+        });
+        const json = await res.json();
+        if (json.ok && json.ships) {
+          taxEstimateMap = new Map();
+          for (const [shipId, value] of Object.entries(json.ships)) {
+            taxEstimateMap.set(shipId, value);
+          }
+        } else {
+          taxEstimateMap = new Map();
+        }
+      } catch (e) {
+        console.error('tax-estimate failed', e);
+        taxEstimateMap = new Map();
       }
     }
 
@@ -1036,7 +1104,7 @@
       html += '<table class="spc-table"><thead><tr><th>Item</th><th>Qty</th><th>Unit Price</th><th>Cost</th><th>Source</th><th>Detail</th></tr></thead><tbody>';
       for (const l of pricing.hull.lines) {
         const isOverridden = hasOverride(l.itemId);
-        html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : l.source === 'override' ? 'market' : l.source === 'base' ? 'base' : 'missing') + '">' + l.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(l.detail) + '</td></tr>';
+        html += '<tr><td>' + esc(l.itemId) + (isOverridden ? ' <span class="override-badge">OVR</span>' : '') + '</td><td style="text-align:right">' + l.qty + '</td><td class="spc-price" style="cursor:pointer" onclick="onItemPriceClick(\'' + esc(l.itemId) + '\',' + l.unitPrice + ')" title="Click to set price override">' + l.unitPrice.toLocaleString() + '</td><td class="spc-cost">' + l.cost.toLocaleString() + '</td><td><span class="spc-badge spc-badge-' + (l.source === 'market' ? 'market' : l.source === 'override' ? 'market' : l.source === 'base' ? 'base' : l.source === 'tax' ? 'tax' : 'missing') + '">' + l.source + '</span></td><td style="font-size:10px;color:var(--text-dim)">' + esc(l.detail) + '</td></tr>';
       }
       html += '</tbody><tfoot><tr><td colspan="3" style="text-align:right;font-weight:600">Hull Total</td><td class="spc-total">' + pricing.hull.cost.toLocaleString() + '</td><td colspan="2"></td></tr></tfoot></table></div>';
       html += '<div class="spc-section">';
@@ -1144,6 +1212,7 @@
 
     populateBotSelect();
     loadPriceOverrides();
+    onPricingModeChange();
   </script>
 </body>
 </html>

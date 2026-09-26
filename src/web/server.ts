@@ -2772,6 +2772,35 @@ if (!this.settings.fuel_service) {
               return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
             }
           }
+          if (url.pathname === "/api/ship-pricing/tax-estimate" && req.method === "POST") {
+            const body = (await req.json().catch(() => ({}))) as { bot?: string };
+            if (!body.bot) {
+              return Response.json({ error: "bot required" }, { status: 400 });
+            }
+            const botInstance = getBot(body.bot);
+            if (!botInstance) {
+              return Response.json({ error: `bot ${body.bot} not found` }, { status: 404 });
+            }
+            try {
+              const result = await botInstance.exec("get_tax_estimate", {});
+              if (result.error) {
+                return Response.json({ error: result.error.message || "get_tax_estimate failed", data: result.result }, { status: 500 });
+              }
+              const taxData = (result.result as Record<string, unknown>) || {};
+              const shipValues: Record<string, number> = {};
+              const assessedByShip = taxData.assessed_property_by_ship as Array<{ ship_id: string; value: number }> | undefined;
+              if (Array.isArray(assessedByShip)) {
+                for (const entry of assessedByShip) {
+                  if (entry && entry.ship_id) {
+                    shipValues[entry.ship_id] = entry.value;
+                  }
+                }
+              }
+              return Response.json({ ok: true, ships: shipValues, assessed_property_value: taxData.assessed_property_value || 0 });
+            } catch (err) {
+              return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 500 });
+            }
+          }
 
           // Serve index.css
 

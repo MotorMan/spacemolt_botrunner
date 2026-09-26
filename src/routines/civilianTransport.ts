@@ -28,6 +28,18 @@ import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 
+// HTML markup for log lines rendered in the web UI.
+const HTML_RESET = "</span>";
+const HTML_BOLD_RED = '<span class="ansi-red ansi-bright">';
+const HTML_RED = '<span class="ansi-red">';
+const HTML_GREEN = '<span class="ansi-green">';
+const HTML_YELLOW = '<span class="ansi-yellow">';
+const HTML_CYAN = '<span class="ansi-cyan">';
+
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
+}
+
 // ── Cloaking module detection and enablement ────────────────────────────────
 
 async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
@@ -1930,7 +1942,7 @@ if (state && state.status !== "idle") {
 
   while (bot.state === "running") {
     yield state.status;
-    ctx.log("transport", `Main loop: status=${state.status}, route.length=${state.route.length}, currentRouteIndex=${state.currentRouteIndex}, onboard=${state.onboardPassengers.length}`);
+    ctx.log("transport", `Loop: status=${span(state.status, "ansi-cyan")}, route=${state.route.length > 0 ? span(`${state.route.length} waypoints`, "ansi-green") : span("none", "ansi-red")}, onboard=${state.onboardPassengers.length}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -2275,20 +2287,15 @@ if (state && state.status !== "idle") {
       }
 
       if (skipped.length > 0) {
-        ctx.log("transport", `Skipped ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${s.reason})`).join(", ")}`);
+        ctx.log("transport", `${span("Skipped", "ansi-yellow")} ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${span(s.reason, "ansi-yellow")})`).join(", ")}`);
       }
 
-      // For multi-destination tours, plan the route FIRST so loading order follows it.
-      // This prevents stranding nearby passengers when distant destinations fill berths first.
-      ctx.log("transport", `Determining destinations for ${waiting.length} waiting passengers`);
       const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number; origDest: string }> = [];
+      const unresolvedWaiting: string[] = [];
       for (const [destId, ps] of byDest.entries()) {
-        ctx.log("transport", `resolveDestination for waiting passenger: ${destId} (name: ${ps[0]?.destination_name || destId}, system: ${ps[0]?.destination_system || 'none'})`);
         const resolved = await resolveDestination(ctx, bot, destId, ps[0]?.destination_name || destId, ps[0]?.destination_system);
-        if (resolved) {
-          ctx.log("transport", `Resolved waiting ${destId} -> system=${resolved.system}, poi=${resolved.poi}`);
-        } else {
-          ctx.log("transport", `FAILED to resolve waiting passenger ${destId}`);
+        if (!resolved) {
+          unresolvedWaiting.push(ps[0]?.destination_name || destId);
         }
         destDrafts.push({ system: resolved?.system || "", poi: resolved?.poi || destId, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
@@ -2296,18 +2303,14 @@ if (state && state.status !== "idle") {
       const currentPoi = bot.poi || "";
       const filteredDrafts = destDrafts.filter(d => {
         if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === currentPoi.toLowerCase()) {
-          ctx.log("transport", `Filtering out passenger already at destination: ${d.poiName}`);
           return false;
         }
         return true;
       });
       const plannedRoute = await planTourRoute(bot.system || "", filteredDrafts.filter(d => d.system), settings.maxJumps, bot);
-      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${filteredDrafts.filter(d => !d.system).length} could not resolve`);
-      for (const d of filteredDrafts.filter(d => !d.system)) {
-        ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
+      if (unresolvedWaiting.length > 0) {
+        ctx.log("transport", `${span("Unresolved", "ansi-red")} ${unresolvedWaiting.length} destinations: ${unresolvedWaiting.join(", ")}`);
       }
-      const outsideJumpLimit = filteredDrafts.filter(d => !d.system);
-
       const atDestinationCount = destDrafts.length - filteredDrafts.length;
       if (atDestinationCount > 0) {
         ctx.log("transport", `${atDestinationCount} passengers already at their destination - considering delivered`);
@@ -2478,17 +2481,16 @@ if (state && state.status !== "idle") {
                 destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
               }
             }
-const routeDests = Array.from(destMap.values()).filter(d => {
-        if (d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
-          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
-          return false;
-        }
-        return d.system;
-      });
+            const routeDests = Array.from(destMap.values()).filter(d => {
+              if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
+                return false;
+              }
+              return d.system;
+            });
             state.route = await planTourRoute(bot.system || "", routeDests, 6, bot);
             state.currentRouteIndex = 0;
             state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
-            ctx.log("transport", `Route recalculated: ${state.route.map(d => d.poiName).join(" → ")}`);
+            ctx.log("transport", `Route: ${span(state.route.map(d => d.poiName).join(" → "), "ansi-cyan")}`);
             usedEconomy = verifyParsed.berths_used.economy;
             usedBusiness = verifyParsed.berths_used.business;
             usedFirst = verifyParsed.berths_used.first;
@@ -2544,42 +2546,38 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       }
 
       if (skipped.length > 0) {
-        ctx.log("transport", `Skipped ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${s.reason})`).join(", ")}`);
+        ctx.log("transport", `${span("Skipped", "ansi-yellow")} ${skipped.length} passengers: ${skipped.map(s => `${s.name} (${span(s.reason, "ansi-yellow")})`).join(", ")}`);
       }
-      ctx.log("transport", `Loaded ${aboard.length} passengers this round:`);
+      ctx.log("transport", `${span("Loaded", "ansi-green")} ${aboard.length} passengers this round:`);
       for (const p of aboard) {
-        ctx.log("transport", `  - ${p.name} | class=${p.class} | destination=${p.destination_name} (${p.destination_system || 'unknown system'})`);
+        ctx.log("transport", `  - ${p.name} | class=${span(p.class, "ansi-cyan")} | destination=${p.destination_name} (${p.destination_system || 'unknown system'})`);
       }
 
-      // Build route from aboard passengers
       const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+      const unresolvedAboard: string[] = [];
       for (const p of aboard) {
         const existing = destMap.get(p.destination);
-        if (existing) {
-          existing.count++;
-          continue;
-        }
-        ctx.log("transport", `resolveDestination for aboard passenger: ${p.destination} (name: ${p.destination_name}, system: ${p.destination_system || 'none'})`);
+        if (existing) { existing.count++; continue; }
         const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
         if (resolved) {
           destMap.set(p.destination, { ...resolved, count: 1 });
-          ctx.log("transport", `Resolved aboard ${p.destination} -> system=${resolved.system}, poi=${resolved.poi}`);
         } else {
           destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
-          ctx.log("transport", `FAILED to resolve aboard passenger ${p.destination}`);
+          unresolvedAboard.push(p.destination_name || p.destination);
         }
       }
 
       const routeDests = Array.from(destMap.values()).filter(d => {
         if (d.system && d.system.toLowerCase() === bot.system.toLowerCase() && d.poi.toLowerCase() === bot.poi.toLowerCase()) {
-          ctx.log("transport", `Filtering out route destination same as current station: ${d.poi}`);
           return false;
         }
         return d.system;
       });
-      ctx.log("transport", `Route destinations: ${routeDests.length} valid out of ${destMap.size}`);
       const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
-      ctx.log("transport", `planTourRoute result: ${planned.length} waypoints, currentSystem=${bot.system || 'none'}`);
+      if (unresolvedAboard.length > 0) {
+        ctx.log("transport", `${span("Unresolved", "ansi-red")} ${unresolvedAboard.length} aboard destinations: ${unresolvedAboard.join(", ")}`);
+      }
+      ctx.log("transport", `Route: ${span(planned.map(d => d.poiName).join(" → "), "ansi-cyan") || span("none", "ansi-red")}`);
 
       const aboardIds = new Set(aboard.map(p => p.citizen_id || p.name));
       state.onboardPassengers = state.onboardPassengers.filter(op => aboardIds.has(op.citizenId));
@@ -2731,12 +2729,12 @@ const routeDests = Array.from(destMap.values()).filter(d => {
         continue;
       }
 
-      ctx.log("transport", `${onboard.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      ctx.log("transport", `${span(`${onboard.length} passengers`, "ansi-green")}. Route: ${span(planned.map(d => d.poiName).join(" → "), "ansi-cyan")}`);
       if (isMidas && onboard.length > 0) {
-        ctx.log("transport", `MIDAS: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
+        ctx.log("transport", `${span("MIDAS", "ansi-yellow")}: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
       }
       if (planned.length === 0 && onboard.length > 0) {
-        ctx.log("transport", `WARNING: ${onboard.length} passengers but empty route!`);
+        ctx.log("transport", `${span("WARNING", "ansi-red")}: ${onboard.length} passengers but empty route!`);
         for (const p of onboard) {
           ctx.log("transport", `  - Passenger ${p.name} -> ${p.destination} (system: ${p.destinationSystem || 'none'})`);
         }
@@ -2844,7 +2842,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       }
 
       const waypoint = state.route[state.currentRouteIndex];
-      ctx.log("transport", `Processing waypoint ${state.currentRouteIndex + 1}/${state.route.length}: system=${waypoint.system}, poi=${waypoint.poi}`);
+      ctx.log("transport", `Waypoint ${span(`${state.currentRouteIndex + 1}/${state.route.length}`, "ansi-cyan")}: ${span(waypoint.system, "ansi-yellow")} / ${waypoint.poiName}`);
 
       if (waypoint.system !== bot.system) {
         ctx.log("transport", `Navigating to system ${waypoint.system}`);
@@ -2985,7 +2983,7 @@ const routeDests = Array.from(destMap.values()).filter(d => {
       if (state.currentRouteIndex >= state.route.length) {
         state.status = "completed";
         state.currentDestination = null;
-        ctx.log("transport", `Run complete. Revenue: ${state.totalFaresEarned}cr, Delivered: ${boundHere.length}`);
+        ctx.log("transport", `${span("Run complete", "ansi-green")}. Revenue: ${span(`${state.totalFaresEarned}cr`, "ansi-yellow")}, Delivered: ${boundHere.length}`);
       } else {
         const next = state.route[state.currentRouteIndex];
         state.currentDestination = next.poiName;

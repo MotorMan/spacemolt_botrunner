@@ -7710,7 +7710,7 @@
           );
           setStatus(`Cancelling...`);
 
-          sendExec(profileBot, "job_cancel", { job_ids: jobIds }, (r) => {
+          sendExec(profileBot, "facility", { action: "job_cancel", job_ids: jobIds }, (r) => {
             if (r.ok) {
               const cancelled =
                 (r.data &&

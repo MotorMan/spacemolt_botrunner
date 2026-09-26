@@ -4641,7 +4641,7 @@
                         return `
                       <div class="skills-item">
                         <span class="skills-name ${skillClass}">${esc(friendlyName)}</span>
-                        <span class="skills-level">Lv ${level}${xpDisplay ? ' <span class="skills-xp">' + xpDisplay + "</span>" : ""}</span>
+                        <span class="skills-level ${skillClass}">Lv ${level}${xpDisplay ? ' <span class="skills-xp">' + xpDisplay + "</span>" : ""}</span>
                       </div>
                     `;
                       })

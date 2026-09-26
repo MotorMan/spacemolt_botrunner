@@ -2360,6 +2360,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .skills-name.piracy { color: var(--red); font-weight: 600; }
 .skills-name.engineering { color: #a371f7; }
 .skills-name.navigation { color: var(--cyan); }
+.skills-level.piloting { color: var(--green); font-weight: 600; }
+.skills-level.combat { color: var(--yellow); }
+.skills-level.piracy { color: var(--red); font-weight: 600; }
+.skills-level.engineering { color: #a371f7; }
+.skills-level.navigation { color: var(--cyan); }
 .skills-empty {
   color: var(--text-dim);
   font-style: italic;

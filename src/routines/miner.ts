@@ -123,13 +123,17 @@ async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[])
 async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
   const { bot } = ctx;
 
-  // First check if already cloaked (from get_status)
   if (bot.isCloaked) {
+    const hasCloak = await hasCloakingModule(ctx, cachedModules);
+    if (!hasCloak) {
+      ctx.log("warn", "Bot reports as cloaked but has no cloaking module — clearing stale cloak state");
+      bot.isCloaked = false;
+      return false;
+    }
     ctx.log("mining", "Bot is already cloaked - no action needed");
     return true;
   }
 
-  // Check if we have a cloaking module
   const hasCloak = await hasCloakingModule(ctx, cachedModules);
   if (!hasCloak) {
     ctx.log("mining", "No cloaking module detected - cannot enable cloak");
@@ -2820,16 +2824,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         settings.ignoreDepletion = true;
         ctx.log("mining", "Modulated Mining Laser detected — ignoring depletion lockout for this cycle");
       }
+      const hasCloak = await hasCloakingModule(ctx, cachedModules);
       const cargoThresholdRatio = settings.cargoThreshold / 100;
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
-        skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+        skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
+        ignoreBlacklistWhenCloaked: false,
       };
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
       
-      // Get blacklist - use empty if cloaked and cloakIgnoreBlacklist enabled
-      const blacklist = getMiningBlacklist(settings, bot.isCloaked);
+      // Get blacklist - use empty only if bot actually has a cloaking module and is cloaked
+      const blacklist = getMiningBlacklist(settings, hasCloak && bot.isCloaked);
 
       // ── Low fuel cells check ──
       // Return home to deposit loot and resupply when fuel cells drop to or below
@@ -3419,7 +3425,7 @@ if (shouldAbandon) {
       const freshTarget = findFirstAvailableQuotaTarget(
         quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
         canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois,
-        Array.from(triedAndRejectedTargets), !bot.isCloaked, totalMiningPower, bot.username,
+        Array.from(triedAndRejectedTargets), !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
         blacklist, bot.system, maxJumps, hasModulatedLaser
       );
       if (freshTarget) {
@@ -4593,7 +4599,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
 
       const travelOpts = {
         ...safetyOpts,
-        skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+        skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
         onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
           const chatChannel = getBotChatChannel();
           chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
@@ -4961,7 +4967,7 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           const excludeTarget = effectiveTarget ? [effectiveTarget] : undefined;
           const newTarget = findFirstAvailableQuotaTarget(
             quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-            canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, excludeTarget, !bot.isCloaked, totalMiningPower, bot.username,
+            canMineHiddenRadioactive, canMineHiddenIce, canMineHiddenPois, excludeTarget, !(hasCloak && bot.isCloaked), totalMiningPower, bot.username,
             blacklist, bot.system, maxJumps, hasModulatedLaser
           );
           if (newTarget && newTarget !== effectiveTarget) {
@@ -5430,7 +5436,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
     // the inline notification check here is redundant and QueryResult carries no .notifications.
 
     // Check for pirates in nearby response (skip if cloaked with cloakIgnoreBlacklist)
-    const isCloakedIgnoringBlacklist = bot.isCloaked && settings.cloakIgnoreBlacklist;
+    const isCloakedIgnoringBlacklist = hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist;
     if (!isCloakedIgnoringBlacklist && nearbyResp.structuredContent && typeof nearbyResp.structuredContent === "object") {
       bot.trackWildlife(nearbyResp.structuredContent);
       const { checkAndFleeFromPirates } = await import("./common.js");
@@ -6068,7 +6074,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
 
                   const travelOpts = {
                     ...safetyOpts,
-                    skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+                    skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
                     onJump: async (jumpNumber: number) => {
                       // Check if target POI is still available
                       const sys = mapStore.getSystem(bestLoc.systemId);
@@ -6306,7 +6312,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
                         if (chosen.systemId !== bot.system) {
                           const travelOpts = {
                             ...safetyOpts,
-                            skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+        skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
                             onJump: async (jumpNumber: number) => {
                               // Check if target POI is still available
                               const sys = mapStore.getSystem(chosen.systemId);
@@ -7657,7 +7663,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId} (${newPoiName}) - stayOutUntilFull`);
               const travelOpts = {
                 ...safetyOpts,
-                skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
+                skipBlacklist: hasCloak && bot.isCloaked && settings.cloakIgnoreBlacklist,
                 onJump: async (jumpNumber: number) => {
                   // Check if target POI is still available
                   const sys = mapStore.getSystem(newSystemId);

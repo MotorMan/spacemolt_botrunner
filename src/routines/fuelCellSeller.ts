@@ -1394,7 +1394,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const deposits: Record<string, number> = {};
 
     if (settings.preStageMode === "preStage") {
-      // Pre-stage mode: deposit items to station storage instead of listing
+      // Pre-stage mode: deposit items to faction storage at each station,
+      // falling back to station storage if faction storage is unavailable.
       for (const itemConfig of settings.sellItems) {
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
@@ -1403,19 +1404,34 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const toDeposit = Math.min(inCargo, itemConfig.maxPerStation - alreadyDeposited);
         if (toDeposit <= 0) continue;
 
-        const depositResp = await bot.exec("storage", {
+        // Try faction storage first
+        const factionResp = await bot.exec("storage", {
           action: 'deposit',
           source: 'cargo',
-          target: 'station',
+          target: 'faction',
           item_id: itemConfig.itemId,
           quantity: toDeposit,
         });
 
-        if (depositResp.error) {
-          ctx.log("error", `Pre-stage deposit failed for ${itemConfig.itemName}: ${depositResp.error.message}`);
-        } else {
-          ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} station storage`);
+        if (!factionResp.error) {
+          ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} faction storage`);
           deposits[itemConfig.itemId] = toDeposit;
+        } else {
+          // Fallback to station storage if faction storage fails
+          const stationResp = await bot.exec("storage", {
+            action: 'deposit',
+            source: 'cargo',
+            target: 'station',
+            item_id: itemConfig.itemId,
+            quantity: toDeposit,
+          });
+
+          if (!stationResp.error) {
+            ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} station storage (faction storage unavailable)`);
+            deposits[itemConfig.itemId] = toDeposit;
+          } else {
+            ctx.log("error", `Pre-stage deposit failed for ${itemConfig.itemName}: faction=${factionResp.error.message}, station=${stationResp.error.message}`);
+          }
         }
 
         await ctx.sleep(1000);

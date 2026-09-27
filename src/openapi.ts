@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 /** Live V2 OpenAPI spec URL. */
 export const OPENAPI_V2_URL = "https://game.spacemolt.com/api/v2/openapi.json";
@@ -146,7 +147,8 @@ export function saveOpenApiV2Spec(spec: any, destDir: string = process.cwd()): S
   let saved = false;
   if (!existsSync(filePath)) {
     mkdirSync(destDir, { recursive: true });
-    writeFileSync(filePath, JSON.stringify(spec, null, 2));
+    const payload = JSON.stringify(spec, null, 2);
+    safeWriteFileSync(filePath, payload, Buffer.byteLength(payload, "utf-8"));
     saved = true;
   }
   return { meta, path: filePath, saved };

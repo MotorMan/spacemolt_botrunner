@@ -3,6 +3,7 @@ import { writeFileSync, existsSync, readFileSync, mkdirSync, readdirSync, unlink
 import { writeFile, unlink } from "fs/promises";
 import { join } from "path";
 import { onWildlifeUpdate, isSyncPushEnabled } from "./client_sync_hooks.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 import { perf } from "./perf.js";
 
 const CREATURES_DIR = join(process.cwd(), "data", "creatures");
@@ -288,9 +289,8 @@ export class WildlifeStore {
 
   private writeSystemFileSync(sys: SystemWildlife): void {
     this.ensureDir();
-    // No pretty-print: these files are machine-read only and `null, 2` tripled
-    // their size (and the write cost) for nothing.
-    writeFileSync(this.systemFilePath(sys.system), JSON.stringify(sys) + "\n", "utf-8");
+    const payload = JSON.stringify(sys) + "\n";
+    safeWriteFileSync(this.systemFilePath(sys.system), payload, Buffer.byteLength(payload, "utf-8"));
   }
 
   setBotName(name: string): void {
@@ -780,7 +780,8 @@ export class WildlifeStore {
         if (Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey) {
           if (existsSync(path)) unlinkSync(path);
         } else {
-          writeFileSync(path, JSON.stringify(entry.sys) + "\n", "utf-8");
+          const payload = JSON.stringify(entry.sys) + "\n";
+        safeWriteFileSync(path, payload, Buffer.byteLength(payload, "utf-8"));
         }
         written++;
       } catch (err) {

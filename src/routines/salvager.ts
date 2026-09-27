@@ -2,6 +2,7 @@ import type { Routine, RoutineContext } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
 import { mapStore } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
    isMinablePoi,
    isStationPoi,
@@ -563,7 +564,8 @@ function sendEscortSignal(
       const escortDir = join(process.cwd(), "data", "escort_signals");
       if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
       const signalFile = join(escortDir, `${bot.username}.signal`);
-      writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+      const payload = JSON.stringify({ action, systemId, timestamp: Date.now() });
+      safeWriteFileSync(signalFile, payload, Buffer.byteLength(payload, "utf-8"));
       resolve();
     });
   }

@@ -30,6 +30,7 @@ import {
   flushAllCoordinationData as flushAllFtCoordinationData,
 } from "../routines/fuelTransferCoordination.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
+import { refreshDiskSpaceState, getCurrentState, setAlertCallback as setDiskSpaceAlertCallback, setEmergencyCallback as setDiskSpaceEmergencyCallback, formatBytes, isWriteSafe, safeWriteFileSync, startMonitoring as startDiskSpaceMonitoring, stopMonitoring as stopDiskSpaceMonitoring, setThreshold as setDiskSpaceThreshold, getThreshold as getDiskSpaceThreshold, getPendingWrites, type DiskSpaceState } from "../diskSpaceGuard.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -48,7 +49,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring" | "bulkSetHunterMode";
+  type: "start" | "stop" | "stop_after_cycle" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc" | "setClerkKey" | "listClerkPlayers" | "addClerkBots" | "setPerformanceMonitoring" | "bulkSetHunterMode" | "checkDiskSpace" | "discardPendingWrite" | "retryPendingWrites" | "setDiskSpaceThreshold";
   bot?: string;
   routine?: string;
   username?: string;
@@ -126,7 +127,9 @@ function loadMainLogs(): MainLogs {
 
 function saveMainLogs(logs: MainLogs): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(MAIN_LOG_FILE, JSON.stringify(logs, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(logs, null, 2) + "\n";
+  const ok = safeWriteFileSync(MAIN_LOG_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+  if (!ok) console.warn(`[DiskSpace] main_logs.json write blocked`);
 }
 
 function loadSettings(): RoutineSettings {
@@ -249,7 +252,8 @@ function saveLastUsedRoutine(botUsername: string, routine: string): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   const data = loadLastUsedRoutines();
   data[botUsername] = routine;
-  writeFileSync(LAST_USED_ROUTINE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  safeWriteFileSync(LAST_USED_ROUTINE_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 function getLastUsedRoutine(botUsername: string): string | null {
@@ -315,7 +319,8 @@ function scheduleActiveBotsSave(statuses: BotStatus[]): void {
     try {
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
       const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
-      writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n";
+      safeWriteFileSync(ACTIVE_BOTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
     } catch (err) {
       console.warn(`Warning: failed to save activeBots.json —`, err);
     }
@@ -333,7 +338,8 @@ function flushActiveBotsSave(): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     const clean = latestActiveStatuses.map(({ offline, ...rest }) => rest);
-    writeFileSync(ACTIVE_BOTS_FILE, JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify({ bots: clean } as ActiveBotsFile, null, 2) + "\n";
+    safeWriteFileSync(ACTIVE_BOTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.warn(`Warning: failed to flush activeBots.json —`, err);
   }
@@ -360,7 +366,9 @@ export function saveStoppedState(botUsername: string, reason: "user" | "emergenc
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   const data = loadStoppedState();
   data[botUsername] = reason;
-  writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  const ok = safeWriteFileSync(STOPPED_STATE_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+  if (!ok) console.warn(`[DiskSpace] stoppedState.json write blocked`);
 }
 
 export function getStoppedState(botUsername: string): "user" | "emergency" | true | null {
@@ -372,7 +380,9 @@ export function clearStoppedState(botUsername: string): void {
   const data = loadStoppedState();
   if (data[botUsername] !== undefined) {
     delete data[botUsername];
-    writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    const ok = safeWriteFileSync(STOPPED_STATE_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+    if (!ok) console.warn(`[DiskSpace] stoppedState.json clear write blocked`);
   }
 }
 
@@ -421,8 +431,11 @@ export function getStationBlacklist(): string[] {
 
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  const { writeFileSync } = require("fs");
-  writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(s, null, 2) + "\n";
+  const ok = safeWriteFileSync(SETTINGS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+  if (!ok) {
+    console.warn(`[DiskSpace] settings.json write blocked — buffered for retry`);
+  }
 }
 
 // ── Flock settings persistence (separate file) ──────────────
@@ -445,7 +458,9 @@ function loadFlockSettings(): FlockSettingsData {
 
 function saveFlockSettings(data: FlockSettingsData): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(FLOCK_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  const ok = safeWriteFileSync(FLOCK_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+  if (!ok) console.warn(`[DiskSpace] flock.json write blocked`);
 }
 
 // ── Static file serving ──────────────────────────────────────
@@ -531,9 +546,9 @@ function loadStats(): StatsFile {
 
 function saveStats(s: StatsFile): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFile(STATS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8", (err) => {
-    if (err) console.warn(`Warning: failed to save stats.json —`, err);
-  });
+  const payload = JSON.stringify(s, null, 2) + "\n";
+  const ok = safeWriteFileSync(STATS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+  if (!ok) console.warn(`[DiskSpace] stats.json write blocked`);
 }
 
 function todayStr(): string {
@@ -865,14 +880,20 @@ if (!this.settings.fuel_service) {
       this.settings.botAssignments = {};
     }
     (this.settings.botAssignments as Record<string, string>)[username] = routine;
-    saveSettings(this.settings);
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    const payload = JSON.stringify(this.settings, null, 2) + "\n";
+    const ok = safeWriteFileSync(SETTINGS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+    if (!ok) console.warn(`[DiskSpace] settings.json (bot assignment) write blocked`);
   }
 
   clearBotAssignment(username: string): void {
     const assignments = this.settings.botAssignments as Record<string, string> | undefined;
     if (assignments && username in assignments) {
       delete assignments[username];
-      saveSettings(this.settings);
+      if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+      const payload = JSON.stringify(this.settings, null, 2) + "\n";
+      const ok = safeWriteFileSync(SETTINGS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+      if (!ok) console.warn(`[DiskSpace] settings.json (clear assignment) write blocked`);
     }
   }
 
@@ -1352,6 +1373,19 @@ if (!this.settings.fuel_service) {
         }
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
+        }
+        if (url.pathname === "/api/disk-space" && req.method === "GET") {
+          const state = getCurrentState();
+          const refreshed = refreshDiskSpaceState(DATA_DIR);
+          return Response.json({
+            freeBytes: refreshed.freeBytes,
+            totalBytes: refreshed.totalBytes,
+            isLow: refreshed.isLow,
+            thresholdBytes: refreshed.thresholdBytes,
+            formattedFree: formatBytes(refreshed.freeBytes),
+            formattedThreshold: formatBytes(refreshed.thresholdBytes),
+            pendingWrites: getPendingWrites().length,
+          });
         }
         if (url.pathname === "/data/catalog.json") {
           const catalogPath = join(DATA_DIR, "catalog.json");
@@ -2420,7 +2454,8 @@ if (!this.settings.fuel_service) {
             }
           }
           fileData.crafting = loadouts;
-          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+          const payload = JSON.stringify(fileData, null, 2) + "\n";
+          safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
         }
 
         function loadShipLoadouts(): Record<string, ShipLoadout> {
@@ -2447,7 +2482,8 @@ if (!this.settings.fuel_service) {
             }
           }
           fileData.ship = loadouts;
-          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+          const payload = JSON.stringify(fileData, null, 2) + "\n";
+          safeWriteFileSync(LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
         }
 
         function loadModuleLoadouts(): Record<string, ModuleLoadout> {
@@ -2469,12 +2505,13 @@ if (!this.settings.fuel_service) {
               const migrated = old.moduleLoadouts || {};
               if (Object.keys(migrated).length > 0) {
                 if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-                writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(migrated, null, 2) + "\n", "utf-8");
+                const payload = JSON.stringify(migrated, null, 2) + "\n";
+                safeWriteFileSync(MODULE_LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
                 console.log(`Migrated ${Object.keys(migrated).length} module presets to data/moduleLoadouts.json`);
 
-                // Strip from old file to prevent future mix-ups
                 delete old.moduleLoadouts;
-                writeFileSync(LOADOUTS_FILE, JSON.stringify(old, null, 2) + "\n", "utf-8");
+                const payload2 = JSON.stringify(old, null, 2) + "\n";
+                safeWriteFileSync(LOADOUTS_FILE, payload2, Buffer.byteLength(payload2, "utf-8"));
               }
               return migrated;
             } catch (err) {
@@ -2486,7 +2523,8 @@ if (!this.settings.fuel_service) {
 
         function saveModuleLoadouts(loadouts: Record<string, ModuleLoadout>): void {
           if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-          writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+          const payload = JSON.stringify(loadouts, null, 2) + "\n";
+          safeWriteFileSync(MODULE_LOADOUTS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
         }
 
         // GET /api/crafting-loadouts - Load all loadouts
@@ -3559,5 +3597,18 @@ if (!this.settings.fuel_service) {
 
   broadcastSkillsUpdate(bot: string, skills: Record<string, { level: number; xp: number; nextLevelXp: number }>): void {
     this.broadcast({ type: "skillsUpdate", bot, skills });
+  }
+
+  broadcastDiskSpaceAlert(state: DiskSpaceState): void {
+    this.broadcast({
+      type: "diskSpaceAlert",
+      freeBytes: state.freeBytes,
+      totalBytes: state.totalBytes,
+      isLow: state.isLow,
+      thresholdBytes: state.thresholdBytes,
+      formattedFree: formatBytes(state.freeBytes),
+      formattedThreshold: formatBytes(state.thresholdBytes),
+      lastCheck: state.lastCheck,
+    });
   }
 }

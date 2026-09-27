@@ -19,6 +19,7 @@
  */
 import { writeFileSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import type { Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
 import {
@@ -308,7 +309,8 @@ interface LexSnapshot {
 }
 
 function saveSnapshot(snapshot: LexSnapshot): void {
-  writeFileSync(LEX_SELLER_FILE, JSON.stringify(snapshot, null, 2));
+  const payload = JSON.stringify(snapshot, null, 2);
+  safeWriteFileSync(LEX_SELLER_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Routine ─────────────────────────────────────────────────

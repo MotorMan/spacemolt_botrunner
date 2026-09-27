@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 export interface StationFacilityCacheEntry {
   facility_id: string;
@@ -39,7 +40,8 @@ function saveToDisk(key: string, data: StationFacilityCache): void {
   try {
     ensureCacheDir();
     const cacheFile = join(CACHE_DIR, `${sanitizeFilename(key)}.json`);
-    writeFileSync(cacheFile, JSON.stringify(data, null, 2), "utf-8");
+    const payload = JSON.stringify(data, null, 2);
+    safeWriteFileSync(cacheFile, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (e) {
     console.log("Error writing station facility cache:", e);
   }

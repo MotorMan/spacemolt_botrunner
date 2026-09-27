@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const CONFIG_FILE = join(DATA_DIR, "stationMonitor.json");
@@ -345,7 +346,8 @@ export function loadBattleLog(): StationBattleLog {
 
 export function saveBattleLog(log: StationBattleLog): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(BATTLE_LOG_FILE, JSON.stringify(log, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(log, null, 2) + "\n";
+  safeWriteFileSync(BATTLE_LOG_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 function genId(): string {
@@ -480,7 +482,8 @@ export function saveStationConfig(config: StationConfig): void {
     consumableLowDays: clampConsumableDays(config.consumableLowDays),
     supplyRefreshMin: clampSupplyRefreshMin(config.supplyRefreshMin),
   };
-  writeFileSync(CONFIG_FILE, JSON.stringify(clean, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(clean, null, 2) + "\n";
+  safeWriteFileSync(CONFIG_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 export function loadSnapshots(): StationSnapshots {
@@ -497,5 +500,6 @@ export function loadSnapshots(): StationSnapshots {
 
 export function saveSnapshots(snapshots: StationSnapshots): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(SNAPSHOT_FILE, JSON.stringify(snapshots, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(snapshots, null, 2) + "\n";
+  safeWriteFileSync(SNAPSHOT_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }

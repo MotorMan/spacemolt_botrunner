@@ -7,6 +7,18 @@
     <link rel="stylesheet" href="/index.css" />
   </head>
   <body>
+    <div id="diskSpaceAlertBanner" class="disk-space-alert-banner" style="display:none">
+      <span class="disk-space-alert-icon">⚠️</span>
+      <div class="disk-space-alert-text">
+        <div class="disk-space-alert-title">Low Disk Space!</div>
+        <div class="disk-space-alert-desc" id="diskSpaceAlertDesc">Free space is below the safety threshold.</div>
+      </div>
+      <div class="disk-space-alert-actions" id="diskSpaceAlertActions">
+        <button class="disk-space-quick-btn" onclick="retryPendingDiskWrites()">Retry Writes</button>
+        <button class="disk-space-quick-btn danger" onclick="discardAllPendingDiskWrites()">Discard Pending</button>
+        <button class="disk-space-quick-btn" onclick="emergencyReturnHome()">Emergency Return Home</button>
+      </div>
+    </div>
     <header>
       <div style="display: flex; align-items: center">
         <h1 id="appTitle">SpaceMolt Commander</h1>
@@ -1475,6 +1487,10 @@
       let mapData = {};
       let marketDetails = { items: [] };
       let activeSettingsTab = "general";
+      let diskSpaceLow = false;
+      let diskSpaceFreeBytes = 0;
+      let diskSpaceThresholdBytes = 100 * 1024 * 1024;
+      let pendingDiskWrites = 0;
       let mapLoading = false;
       let profileBot = null;
       let manualCollapseState = {
@@ -2853,6 +2869,23 @@
               if (msg.sender && msg.content) {
                 triggerEmpireAlert(msg.sender, msg.content, msg.botUsername);
               }
+              break;
+            case "diskSpaceAlert":
+              diskSpaceLow = !!msg.isLow;
+              diskSpaceFreeBytes = msg.freeBytes || 0;
+              diskSpaceThresholdBytes = msg.thresholdBytes || 100 * 1024 * 1024;
+              pendingDiskWrites = msg.pendingWrites || 0;
+              const banner = document.getElementById("diskSpaceAlertBanner");
+              const desc = document.getElementById("diskSpaceAlertDesc");
+              if (banner) {
+                banner.style.display = diskSpaceLow ? "flex" : "none";
+                if (desc) {
+                  desc.textContent = diskSpaceLow
+                    ? `Free space: ${formatBytes(diskSpaceFreeBytes)} (threshold: ${formatBytes(diskSpaceThresholdBytes)}). Pending buffered writes: ${pendingDiskWrites}.`
+                    : "Disk space is healthy.";
+                }
+              }
+              applyWindowTitle();
               break;
           }
         };
@@ -13996,7 +14029,7 @@
        </div>
      </div>
 
-<div class="setting-row">
+      <div class="setting-row">
         <div>
           <div class="setting-label">Jump Timeout Buffer</div>
           <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
@@ -14006,6 +14039,17 @@
            <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
          </div>
      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disk Space Safety Threshold</div>
+          <div class="setting-hint">Minimum free disk space to allow file writes. When free space drops below this, writes are buffered and an alert is shown. At critically low space (&lt;10 MB), the client will return all bots home and shut down.</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="set-general-diskSpaceThresholdMB" min="0" max="10240" step="50" value="${(typeof general.diskSpaceThresholdMB === "number" ? general.diskSpaceThresholdMB : 100)}" style="width:100px" />
+          <span style="color:var(--text-secondary);font-size:12px">MB free</span>
+        </div>
+      </div>
 
      <div class="setting-row">
         <div>
@@ -14193,6 +14237,10 @@
           jumpBuffer:
             parseInt(document.getElementById("set-general-jumpBuffer").value) ||
             10,
+          diskSpaceThresholdMB:
+            parseInt(
+              document.getElementById("set-general-diskSpaceThresholdMB").value,
+            ) || 100,
           approvedFuelStations,
           disableDebugLog: document.getElementById(
             "set-general-disableDebugLog",
@@ -14392,21 +14440,33 @@
         return String(text || "").replace(/\[c:[^\]]+\]/g, "").replace(/\[\/c\]/g, "");
       }
 
+      function formatBytes(bytes) {
+        if (typeof bytes !== "number" || !Number.isFinite(bytes)) return "0 B";
+        if (bytes < 1024) return Math.round(bytes) + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+        if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+        return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
+      }
+
       function applyWindowTitle() {
         const tabTitle =
           (settings.general && settings.general.windowTitle) || "";
         const headerTitle =
           (settings.general && settings.general.headerTitle) || "";
+        const lowSpaceSuffix = diskSpaceLow ? " [LOW SPACE!]" : "";
         // Browser tab title is plain text only (no color codes allowed).
         document.title = stripColorCodes(
-          tabTitle.trim() ? tabTitle.trim() : "SpaceMolt Commander",
+          (tabTitle.trim() ? tabTitle.trim() : "SpaceMolt Commander") + lowSpaceSuffix,
         );
         // In-app header renders colors and can be a different/longer title.
         const h1 = document.getElementById("appTitle");
-        if (h1)
-          h1.innerHTML = parseColorCodes(
-            headerTitle.trim() ? headerTitle.trim() : "SpaceMolt Commander",
-          );
+        if (h1) {
+          const baseHeader = headerTitle.trim() ? headerTitle.trim() : "SpaceMolt Commander";
+          h1.innerHTML = diskSpaceLow
+            ? parseColorCodes("[c:red]" + baseHeader + " — LOW SPACE![/c]")
+            : parseColorCodes(baseHeader);
+          h1.style.color = diskSpaceLow ? "var(--danger-color, #ff4444)" : "";
+        }
       }
 
       function updateHeaderTitlePreview() {
@@ -21453,6 +21513,17 @@ When responding:
         }
         appendLine("system", "Emergency Return Home initiated for all bots...");
         send({ type: "emergencyReturn" });
+      }
+
+      function retryPendingDiskWrites() {
+        appendLine("system", "Retrying pending disk writes...");
+        send({ type: "retryPendingWrites" });
+      }
+
+      function discardAllPendingDiskWrites() {
+        if (!confirm("Discard all pending buffered writes? This will keep the current on-disk versions and lose the un-saved changes.")) return;
+        appendLine("system", "Discarding all pending disk writes...");
+        send({ type: "discardPendingWrite", writeKey: "__all__" });
       }
 
       // ── Clerk (headless client) account management ────────────

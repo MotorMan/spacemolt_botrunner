@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { rename, writeFile } from "fs/promises";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const PRICE_OVERRIDES_FILE = join(DATA_DIR, "priceOverrides.json");
@@ -123,12 +124,9 @@ export class PriceOverridesStore {
     try {
       const text = this.serialize();
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      try {
-        writeFileSync(PRICE_OVERRIDES_TMP, text, "utf-8");
-        renameSync(PRICE_OVERRIDES_TMP, PRICE_OVERRIDES_FILE);
-      } catch {
-        writeFileSync(PRICE_OVERRIDES_FILE, text, "utf-8");
-      }
+      const payload = Buffer.byteLength(text, "utf-8");
+      safeWriteFileSync(PRICE_OVERRIDES_TMP, text, payload);
+      renameSync(PRICE_OVERRIDES_TMP, PRICE_OVERRIDES_FILE);
       this.dirty = false;
       return true;
     } catch (err) {

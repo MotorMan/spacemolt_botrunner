@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { getSpacemoltClient } from "./libClient.js";
 import { debugLog } from "./debug.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 export interface CatalogItem {
   id: string;
@@ -268,8 +269,8 @@ class CatalogStore {
         ...this.extra,
       };
       const json = JSON.stringify(out, null, 2) + "\n";
-      writeFileSync(CATALOG_FILE, json, "utf-8");
-      debugLog("catalog", `Catalog written to ${CATALOG_FILE} (${json.length} bytes)`);
+      const ok = safeWriteFileSync(CATALOG_FILE, json, Buffer.byteLength(json, "utf-8"));
+      if (ok) debugLog("catalog", `Catalog written to ${CATALOG_FILE} (${json.length} bytes)`);
     } catch (err) {
       // Log error but don't throw - catalog is still usable from memory
       console.error("Error writing catalog:", err);

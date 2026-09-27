@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const FULL_CIVILIANS_INFO_FILE = join(process.cwd(), "data", "fullCiviliansInfo.json");
 
@@ -97,7 +98,7 @@ export class CivilianStore {
         business: Array.from(this.civilians.values()).filter(c => c.accommodationClass === "business").length,
         first: Array.from(this.civilians.values()).filter(c => c.accommodationClass === "first").length,
       };
-      writeFileSync(FULL_CIVILIANS_INFO_FILE, JSON.stringify(this.data, null, 2), "utf-8");
+      safeWriteFileSync(FULL_CIVILIANS_INFO_FILE, JSON.stringify(this.data, null, 2), Buffer.byteLength(JSON.stringify(this.data, null, 2), "utf-8"));
     } catch (err) {
       console.error("[CivilianStore] Save failed:", err);
     }

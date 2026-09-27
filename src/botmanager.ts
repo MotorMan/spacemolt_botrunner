@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine, type BotStatus } from "./bot.js";
 import { minerRoutine } from "./routines/miner.js";
@@ -43,6 +43,7 @@ import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { flushStationFacilityCache } from "./stationFacilityCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings, saveSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState, getClerkApiKeys, getClerkConfig, setClerkConfig } from "./web/server.js";
+import { startMonitoring as startDiskSpaceMonitoring, setAlertCallback as setDiskSpaceAlertCallback, setEmergencyCallback as setDiskSpaceEmergencyCallback, refreshDiskSpaceState, setThreshold as setDiskSpaceThreshold, formatBytes, retryBufferedWrites, discardAllWrites, getPendingWrites, discardWrite } from "./diskSpaceGuard.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { StationWebServer } from "./web/stationserver.js";
 import { chatBuffer } from "./chatbuffer.js";
@@ -1339,6 +1340,14 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleSetPerformanceMonitoring(action);
     case "bulkSetHunterMode":
       return handleBulkSetHunterMode(action);
+    case "checkDiskSpace":
+      return handleCheckDiskSpace();
+    case "discardPendingWrite":
+      return handleDiscardPendingWrite(action);
+    case "retryPendingWrites":
+      return handleRetryPendingWrites();
+    case "setDiskSpaceThreshold":
+      return handleSetDiskSpaceThreshold(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -1397,7 +1406,9 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
     const current = existsSync(flockFile) ? JSON.parse(require("fs").readFileSync(flockFile, "utf-8")) : { flockGroups: [], assignments: {} };
     if (s.flockGroups !== undefined) current.flockGroups = s.flockGroups;
     if (s.assignments !== undefined) current.assignments = s.assignments;
-    writeFileSync(flockFile, JSON.stringify(current, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(current, null, 2) + "\n";
+    const { safeWriteFileSync } = await import("./diskSpaceGuard.js");
+    safeWriteFileSync(flockFile, payload, Buffer.byteLength(payload, "utf-8"));
     server.logSystem(`Flock settings saved`);
     return { ok: true, message: `flock settings saved` };
   }
@@ -1528,6 +1539,66 @@ async function handleBulkSetHunterMode(action: WebAction): Promise<WebActionResu
   saveSettings(server.settings);
   server.logSystem(`Bulk set hunter mode to "${mode}" for ${allBots.length} bot(s)`);
   return { ok: true, message: `Updated hunter mode to "${mode}" for ${allBots.length} bot(s)` };
+}
+
+async function handleCheckDiskSpace(): Promise<WebActionResult> {
+  const state = refreshDiskSpaceState(BASE_DIR);
+  server.broadcastJson({
+    type: "diskSpaceAlert",
+    freeBytes: state.freeBytes,
+    totalBytes: state.totalBytes,
+    isLow: state.isLow,
+    thresholdBytes: state.thresholdBytes,
+    formattedFree: formatBytes(state.freeBytes),
+    formattedThreshold: formatBytes(state.thresholdBytes),
+    pendingWrites: getPendingWrites().length,
+  });
+  return {
+    ok: true,
+    message: `Free space: ${formatBytes(state.freeBytes)} (threshold: ${formatBytes(state.thresholdBytes)})`,
+    data: {
+      freeBytes: state.freeBytes,
+      totalBytes: state.totalBytes,
+      isLow: state.isLow,
+      thresholdBytes: state.thresholdBytes,
+      formattedFree: formatBytes(state.freeBytes),
+      formattedThreshold: formatBytes(state.thresholdBytes),
+      pendingWrites: getPendingWrites().length,
+    },
+  };
+}
+
+async function handleDiscardPendingWrite(action: WebAction): Promise<WebActionResult> {
+  const key = (action as any).writeKey as string | undefined;
+  if (!key) return { ok: false, error: "writeKey required" };
+  if (key === "__all__") {
+    const count = discardAllWrites();
+    server.logSystem(`Discarded ALL pending disk-space writes (${count} entries)`);
+    return { ok: true, message: `Discarded ${count} pending writes` };
+  }
+  const removed = discardWrite(key);
+  server.logSystem(`Discarded pending disk-space write: ${key} (removed: ${removed})`);
+  return { ok: true, message: removed ? "Pending write discarded" : "Pending write not found" };
+}
+
+async function handleRetryPendingWrites(): Promise<WebActionResult> {
+  const result = await retryBufferedWrites();
+  server.logSystem(`Retried pending writes: ${result.succeeded.length} succeeded, ${result.failed.length} still pending`);
+  return {
+    ok: true,
+    message: `Retried: ${result.succeeded.length} succeeded, ${result.failed.length} still pending`,
+    data: { succeeded: result.succeeded, failed: result.failed },
+  };
+}
+
+async function handleSetDiskSpaceThreshold(action: WebAction): Promise<WebActionResult> {
+  const threshold = (action as any).thresholdBytes as number | undefined;
+  if (typeof threshold !== "number" || threshold < 0) {
+    return { ok: false, error: "thresholdBytes must be a non-negative number" };
+  }
+  setDiskSpaceThreshold(threshold);
+  server.logSystem(`Disk space threshold set to ${formatBytes(threshold)}`);
+  return { ok: true, message: `Disk space threshold set to ${formatBytes(threshold)}` };
 }
 
 async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {
@@ -2602,6 +2673,28 @@ async function main(): Promise<void> {
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES).sort();
   server.onAction = handleAction;
+
+  const generalSettingsForDisk = (loadSettings().general as Record<string, unknown>) || {};
+  const diskThreshold = typeof generalSettingsForDisk.diskSpaceThresholdMB === "number"
+    ? (generalSettingsForDisk.diskSpaceThresholdMB as number) * 1024 * 1024
+    : 100 * 1024 * 1024;
+  setDiskSpaceThreshold(diskThreshold);
+  setDiskSpaceAlertCallback((state) => {
+    server?.broadcastDiskSpaceAlert(state);
+    server?.logSystem(`LOW DISK SPACE: ${formatBytes(state.freeBytes)} free (threshold: ${formatBytes(state.thresholdBytes)})`);
+  });
+  setDiskSpaceEmergencyCallback(async (state) => {
+    server.logSystem(`CRITICAL DISK SPACE: ${formatBytes(state.freeBytes)} free — initiating emergency return home + shutdown`);
+    server.broadcastDiskSpaceAlert(state);
+    const result = await handleEmergencyReturn();
+    server.logSystem(`Emergency return home completed: ${result.message}`);
+    await new Promise((r) => setTimeout(r, 5000));
+    server.logSystem("Shutting down due to critically low disk space");
+    gracefulShutdown("low_disk_space");
+  });
+  startDiskSpaceMonitoring(BASE_DIR, 60_000);
+  server.logSystem(`Disk space monitoring started (threshold: ${formatBytes(diskThreshold)})`);
+
   server.logSystem(
     `Routine resume mode resolved: ${instantResumeEnabled ? "instant (resume each bot on its own login)" : "wait-for-all (resume after every bot connects)"}. ` +
     `Change it in Settings → General → Routine Resume.`,

@@ -30,6 +30,75 @@ body {
   overflow-y: auto;
 }
 
+/* ── Disk Space Alert Banner ─────────────────────── */
+.disk-space-alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: repeating-linear-gradient(
+    45deg,
+    #3d0c0c,
+    #3d0c0c 10px,
+    #5a1010 10px,
+    #5a1010 20px
+  );
+  border-bottom: 2px solid var(--red);
+  animation: disk-space-flash 1.5s ease-in-out infinite alternate;
+}
+.disk-space-alert-icon {
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.disk-space-alert-text {
+  flex: 1;
+  min-width: 0;
+}
+.disk-space-alert-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--red);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.disk-space-alert-desc {
+  font-size: 12px;
+  color: var(--text);
+  margin-top: 2px;
+}
+.disk-space-alert-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.disk-space-quick-btn {
+  padding: 6px 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.disk-space-quick-btn:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--text-dim);
+}
+.disk-space-quick-btn.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.disk-space-quick-btn.danger:hover {
+  background: #3d0c0c;
+}
+
+@keyframes disk-space-flash {
+  0% { border-bottom-color: var(--red); }
+  50% { border-bottom-color: var(--yellow); }
+  100% { border-bottom-color: var(--red); }
+}
+
 /* ── Header ─────────────────────────────────────── */
 header {
   display: flex;

@@ -5,6 +5,7 @@ import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { onCoordinationUpdate } from "../client_sync_hooks.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   registerMinerTarget as registerCoordinationTarget,
   unregisterMinerTarget as unregisterCoordinationTarget,
@@ -2090,7 +2091,8 @@ async function signalEscort(
     const escortDir = join(process.cwd(), "data", "escort_signals");
     if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
     const signalFile = join(escortDir, `${bot.username}.signal`);
-    writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+    const payload = JSON.stringify({ action, systemId, timestamp: Date.now() });
+    safeWriteFileSync(signalFile, payload, Buffer.byteLength(payload, "utf-8"));
     void onCoordinationUpdate("escort", { action, systemId, timestamp: Date.now() });
   }
 }
@@ -2884,7 +2886,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const raw = readFileSync(flockPath, "utf-8");
             const existingState = JSON.parse(raw) as FlockState;
             existingState.lastUpdate = Date.now();
-            writeFileSync(flockPath, JSON.stringify(existingState, null, 2));
+            const payload = JSON.stringify(existingState, null, 2);
+            safeWriteFileSync(flockPath, payload, Buffer.byteLength(payload, "utf-8"));
           } catch {
             // Ignore errors - the regular flock logic will handle updates
           }

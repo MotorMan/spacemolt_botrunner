@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import { onPlayerNameUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
@@ -168,7 +169,7 @@ export class PlayerNameStore {
       try {
         this._fullInfoDirty = false;
         this.fullPlayerInfo.lastUpdated = new Date().toISOString();
-        writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo), "utf-8");
+        safeWriteFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo), Buffer.byteLength(JSON.stringify(this.fullPlayerInfo), "utf-8"));
       } catch (err) {
         this._fullInfoDirty = true;
         const msg = err instanceof Error ? err.message : String(err);
@@ -757,7 +758,7 @@ export class PlayerNameStore {
           pirate_count: this.pirates.size,
           empire_npc_count: this.empireNpcs.size,
         };
-        writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data), "utf-8");
+        safeWriteFileSync(PLAYER_NAMES_FILE, JSON.stringify(data), Buffer.byteLength(JSON.stringify(data), "utf-8"));
       } catch (err) {
         this._namesDirty = true;
         const msg = err instanceof Error ? err.message : String(err);

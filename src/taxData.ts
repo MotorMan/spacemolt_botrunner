@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
@@ -71,7 +72,7 @@ export function loadTaxesData(): TaxesData {
 
 export function saveTaxesData(data: TaxesData): void {
   ensureDataDir();
-  writeFileSync(TAXES_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  safeWriteFileSync(TAXES_FILE, JSON.stringify(data, null, 2) + "\n", Buffer.byteLength(JSON.stringify(data, null, 2) + "\n", "utf-8"));
 }
 
 export function hasTaxEstimateChanged(
@@ -137,5 +138,5 @@ export function saveFactionTaxEstimate(estimate: FactionTaxEstimate): void {
     lastUpdated: Date.now(),
   };
   const factionTaxesFile = join(DATA_DIR, "faction_taxes.json");
-  writeFileSync(factionTaxesFile, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  safeWriteFileSync(factionTaxesFile, JSON.stringify(data, null, 2) + "\n", Buffer.byteLength(JSON.stringify(data, null, 2) + "\n", "utf-8"));
 }

@@ -5,6 +5,7 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const QUEUE_FILE = join(DATA_DIR, "rescueQueue.json");
@@ -82,7 +83,8 @@ export function loadRescueQueue(): RescueQueueData {
 export function saveRescueQueue(data: RescueQueueData): void {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(QUEUE_FILE, JSON.stringify(data, null, 2) + "\n");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(QUEUE_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error saving rescueQueue.json:", err);
   }

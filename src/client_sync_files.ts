@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
 import { dirname, join, normalize, relative } from "path";
 import { perf } from "./perf.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 /**
  * File-based client sync.
@@ -194,7 +195,7 @@ export function mergeIntoFile(dataDir: string, relPath: string, incoming: string
 
   const out = JSON.stringify(current) + "\n";
   mkdirSync(dirname(abs), { recursive: true });
-  writeFileSync(abs, out, "utf-8");
+  safeWriteFileSync(abs, out, Buffer.byteLength(out, "utf-8"));
   return hashContent(out);
 }
 
@@ -212,7 +213,7 @@ export function seedIntoFile(dataDir: string, relPath: string, content: string):
   }
   const out = JSON.stringify(safeParse(content) ?? content) + "\n";
   mkdirSync(dirname(abs), { recursive: true });
-  writeFileSync(abs, out, "utf-8");
+  safeWriteFileSync(abs, out, Buffer.byteLength(out, "utf-8"));
   return hashContent(out);
 }
 

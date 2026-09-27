@@ -1,6 +1,9 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import type { StationRef } from "../stationRef.js";
+import { join, dirname } from "path";
+import { existsSync, mkdirSync } from "fs";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -799,12 +802,11 @@ function loadAllData(): { runs: Record<string, TransportState>; fleet: FleetData
 
 function saveAllData(data: { runs: Record<string, TransportState>; fleet: FleetData }): void {
   try {
-    const fs = require("fs");
-    const path = require("path");
-    const full = path.join(process.cwd(), DATA_FILE);
-    const dir = path.dirname(full);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(full, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const full = join(process.cwd(), DATA_FILE);
+    const dir = dirname(full);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(full, payload, Buffer.byteLength(payload, "utf-8"));
     void onCivilianTransportUpdate({ manifest: data });
   } catch (err) {
     console.error("Failed to save civilianTransport state:", err);

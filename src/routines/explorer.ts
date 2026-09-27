@@ -4,6 +4,7 @@ import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "../bot_chat_channel.js";
 import type { FaintSignature } from "../wildlivestore.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   type SystemPOI,
   type Connection,
@@ -89,7 +90,8 @@ function saveRawMissions(data: RawMissionsData): void {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   data.lastSaved = now();
-  writeFileSync(RAW_MISSIONS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  safeWriteFileSync(RAW_MISSIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 function now(): string {

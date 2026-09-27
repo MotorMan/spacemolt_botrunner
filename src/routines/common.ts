@@ -12,6 +12,7 @@ import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleSta
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist, getStationBlacklist, isCustomsDisabled } from "../web/server.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
@@ -4808,7 +4809,8 @@ export function writeSettings(updates: Record<string, Record<string, unknown>>):
     existing[key] = { ...(existing[key] || {}), ...val };
   }
 
-  writeFileSync(file, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(existing, null, 2) + "\n";
+  safeWriteFileSync(file, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 export function isCombatDebugEnabled(): boolean {

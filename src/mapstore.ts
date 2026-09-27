@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, writeFile, copyFile
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
+import { safeCopyFileSync, safeWriteFileSync } from "./diskSpaceGuard.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 import { perf } from "./perf.js";
@@ -510,7 +511,9 @@ class MapStore {
       this.dirty = false;
       this.data.last_saved = now();
       if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-      writeFileSync(MAP_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+      const payload = JSON.stringify(this.data, null, 2) + "\n";
+      const ok = safeWriteFileSync(MAP_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+      if (!ok) console.warn(`[DiskSpace] map.json write blocked`);
     }
   }
 
@@ -530,14 +533,16 @@ class MapStore {
 
   private performBackup(): void {
     const timestamp = this.getTimestamp();
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
     for (const file of BACKUP_FILES) {
       const src = join(DATA_DIR, file);
       if (existsSync(src)) {
         const dest = join(BACKUP_DIR, `${file}_${timestamp}`);
-        try {
-          copyFileSync(src, dest);
-        } catch (e) {
-          log("error", `Failed to backup ${file}: ${e}`);
+        const ok = safeCopyFileSync(src, dest);
+        if (!ok) {
+          log("error", `Disk space low — backup skipped for ${file}`);
         }
       }
     }

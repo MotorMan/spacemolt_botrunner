@@ -23,6 +23,7 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 import type { Routine, RoutineContext, Bot } from "../bot.js";
 import { mapStore, type StoredPOI } from "../mapstore.js";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -190,7 +191,8 @@ function loadFCStationsData(): FCStationsData {
 }
 
 function saveFCStationsData(data: FCStationsData): void {
-  writeFileSync(FC_STATIONS_FILE, JSON.stringify(data, null, 2));
+  const payload = JSON.stringify(data, null, 2);
+  safeWriteFileSync(FC_STATIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Station eligibility ──────────────────────────────────────

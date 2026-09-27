@@ -22,6 +22,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { rename, writeFile } from "fs/promises";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 import { perf } from "./perf.js";
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -278,21 +279,24 @@ class MarketDetailsStore {
   /** Blocking persist for shutdown paths. */
   flushSync(): boolean {
     if (!this.dirty) return false;
+    const text = this.serialize();
     try {
-      const text = this.serialize();
       ensureDataDir();
-      try {
-        writeFileSync(MARKET_DETAILS_TMP, text, "utf-8");
-        renameSync(MARKET_DETAILS_TMP, MARKET_DETAILS_FILE);
-      } catch {
-        writeFileSync(MARKET_DETAILS_FILE, text, "utf-8");
-      }
+      const payload = Buffer.byteLength(text, "utf-8");
+      safeWriteFileSync(MARKET_DETAILS_TMP, text, payload);
+      renameSync(MARKET_DETAILS_TMP, MARKET_DETAILS_FILE);
       this.dirty = false;
       return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[MarketDetails] Save failed: ${msg}`);
-      return false;
+    } catch {
+      try {
+        safeWriteFileSync(MARKET_DETAILS_FILE, text, Buffer.byteLength(text, "utf-8"));
+        this.dirty = false;
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[MarketDetails] Save failed: ${msg}`);
+        return false;
+      }
     }
   }
 }

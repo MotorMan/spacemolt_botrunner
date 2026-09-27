@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const TRACKING_FILE = join(DATA_DIR, "fuelServiceState.json");
@@ -87,7 +88,8 @@ function loadState(): FuelServiceState {
 function saveState(data: FuelServiceState): void {
   ensureDataDir();
   try {
-    writeFileSync(TRACKING_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    safeWriteFileSync(TRACKING_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Failed to save fuelServiceState.json:", err);
   }

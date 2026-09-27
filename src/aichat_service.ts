@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } fr
 import { join } from "path";
 import type { Bot } from "./bot.js";
 import { sleep } from "./routines/common.js";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -206,7 +207,8 @@ function loadDailyUpdates(): DailyUpdatesData {
 function saveDailyUpdates(updates: DailyUpdatesData): void {
    const dir = join(process.cwd(), "data");
    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-   writeFileSync(DAILY_UPDATES_FILE, JSON.stringify(updates, null, 2) + "\n", "utf-8");
+   const payload = JSON.stringify(updates, null, 2) + "\n";
+   safeWriteFileSync(DAILY_UPDATES_FILE, payload, Buffer.byteLength(payload, "utf-8"));
  }
 
 function getAiChatSettings(): {
@@ -316,7 +318,8 @@ function loadMemory(): AiChatMemory {
 function saveMemory(mem: AiChatMemory): void {
   const dir = join(process.cwd(), "data");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(MEMORY_FILE, JSON.stringify(mem, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(mem, null, 2) + "\n";
+  safeWriteFileSync(MEMORY_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Default personality ──────────────────────────────────────
@@ -436,7 +439,8 @@ function logImportantMessage(msg: ChatMessage): void {
       botReceived: msg.botUsername || "unknown",
     });
 
-    writeFileSync(IMPORTANT_MESSAGES_FILE, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+    const payload = JSON.stringify(messages, null, 2) + "\n";
+    safeWriteFileSync(IMPORTANT_MESSAGES_FILE, payload, Buffer.byteLength(payload, "utf-8"));
   } catch (err) {
     console.error("Error logging important message:", err);
   }

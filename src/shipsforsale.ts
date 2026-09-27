@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
@@ -63,7 +64,8 @@ export function saveShipsForSale(data: ShipsForSaleData): void {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   data.lastSaved = now();
-  writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(data, null, 2) + "\n";
+  safeWriteFileSync(SHIPS_FOR_SALE_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 export function cleanupExpiredShipListings(data: ShipsForSaleData): number {

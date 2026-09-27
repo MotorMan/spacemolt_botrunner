@@ -17,6 +17,7 @@ import { catalogStore } from "../catalogstore.js";
 import { readSettings } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { safeWriteFileSync } from "../diskSpaceGuard.js";
 import { refreshOpenApiV2Spec, deriveOpenApiMeta } from "../openapi.js";
 
 // ── Types ────────────────────────────────────────────────────
@@ -112,7 +113,8 @@ function loadMemory(): AiMemory {
 function saveMemory(mem: AiMemory): void {
   const dir = join(process.cwd(), "data");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(MEMORY_FILE, JSON.stringify(mem, null, 2) + "\n", "utf-8");
+  const payload = JSON.stringify(mem, null, 2) + "\n";
+  safeWriteFileSync(MEMORY_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
 // ── Game documentation ────────────────────────────────────────

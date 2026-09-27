@@ -3811,7 +3811,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   // against the API before skipping — otherwise loot is left behind.
   if (bot.isInBattle()) {
     const liveStatus = await getBattleStatus(ctx);
-    if (liveStatus) {
+    if (liveStatus && liveStatus.is_participant) {
       ctx.log("combat", `Not scavenging while in battle`);
       return 0;
     }

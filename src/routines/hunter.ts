@@ -2714,8 +2714,10 @@ if (hullPct <= settings.repairThreshold) {
             }
           }
 
-          yield "loot";
-          await scavengeWrecks(ctx);
+           if (!settings.disableWreckSalvaging) {
+             yield "loot";
+             await scavengeWrecks(ctx);
+           }
 
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
@@ -4560,7 +4562,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
           const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
-            await scavengeWrecks(ctx);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
@@ -5077,7 +5079,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
           const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
-            await scavengeWrecks(ctx);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);

@@ -19,7 +19,7 @@
  *
  * Tracks placed orders in data/fcStations.json.
  */
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import type { Routine, RoutineContext, Bot } from "../bot.js";
 import { mapStore, type StoredPOI } from "../mapstore.js";
@@ -52,9 +52,11 @@ const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
 const MILITARY_FUEL_CELL_ITEM_ID = "military_fuel_cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
+const FC_PRESTAGE_LEDGER_FILE = "data/fcPreStageLedger.json";
+const FC_PRESTAGE_LOCK_FILE = "data/fcPreStage.lock";
 /** Curated list of NPC stations. Used only as an exemption list: an NPC station
  *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
- *  station with a market and must never be mistaken for a faction outpost. */
+ *  station with a market and must never be mistaken as a faction outpost. */
 const STATION_REF_FILE = "data/stationRef.json";
 
 /** Pacing between remote `view_orders` queries. The server tolerates ~2/s, so 500ms
@@ -843,6 +845,143 @@ function totalSellCargoQty(bot: Bot, settings: ReturnType<typeof getFuelCellSell
   return settings.sellItems.reduce((sum, i) => sum + getSellItemCargo(bot, i.itemId), 0);
 }
 
+interface PreStageLedgerEntry {
+  quantity: number;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+interface PreStageLedger {
+  version: number;
+  entries: Record<string, PreStageLedgerEntry>;
+}
+
+function emptyPreStageLedger(): PreStageLedger {
+  return { version: 1, entries: {} };
+}
+
+function loadPreStageLedger(): PreStageLedger {
+  try {
+    if (!existsSync(FC_PRESTAGE_LEDGER_FILE)) return emptyPreStageLedger();
+    const raw = readFileSync(FC_PRESTAGE_LEDGER_FILE, "utf-8");
+    const data = JSON.parse(raw) as PreStageLedger;
+    if (!data.entries || typeof data.entries !== "object") data.entries = {};
+    return data;
+  } catch {
+    return emptyPreStageLedger();
+  }
+}
+
+function savePreStageLedger(ledger: PreStageLedger): void {
+  writeFileSync(FC_PRESTAGE_LEDGER_FILE, JSON.stringify(ledger, null, 2));
+}
+
+function ledgerKey(stationId: string, itemId: string): string {
+  return `${stationId}|${itemId}`;
+}
+
+function getLedgerQty(ledger: PreStageLedger, stationId: string, itemId: string): number {
+  const entry = ledger.entries[ledgerKey(stationId, itemId)];
+  return entry?.quantity ?? 0;
+}
+
+function setLedgerQty(ledger: PreStageLedger, stationId: string, itemId: string, qty: number, botName: string): void {
+  ledger.entries[ledgerKey(stationId, itemId)] = {
+    quantity: qty,
+    updatedAt: new Date().toISOString(),
+    updatedBy: botName,
+  };
+}
+
+async function withPreStageLock(bot: Bot, fn: () => Promise<void>): Promise<void> {
+  const lockDir = FC_PRESTAGE_LOCK_FILE;
+  const start = Date.now();
+  const timeout = 30_000;
+  while (Date.now() - start < timeout) {
+    try {
+      mkdirSync(lockDir, { recursive: true });
+      await fn();
+      return;
+    } catch (err) {
+      if (err && (err as any).code === "EEXIST") {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+  bot.log("warn", "Pre-stage lock timeout — proceeding without lock");
+  await fn();
+}
+
+async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<number> {
+  // Try faction storage first
+  try {
+    const factionResp = await bot.exec("view_faction_storage", { station_id: stationId });
+    if (!factionResp.error && factionResp.result) {
+      const result = factionResp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+      const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
+      if (found) return found.quantity ?? found.qty ?? 0;
+    }
+  } catch {
+    // ignore faction storage errors
+  }
+
+  // Fallback to station storage
+  try {
+    const stationResp = await bot.exec("view_storage", { station_id: stationId });
+    if (!stationResp.error && stationResp.result) {
+      const result = stationResp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+      const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
+      if (found) return found.quantity ?? found.qty ?? 0;
+    }
+  } catch {
+    // ignore station storage errors
+  }
+
+  return 0;
+}
+
+/**
+ * Build a priority list of stations that still need pre-staging for any sell item.
+ * Consults the shared ledger and remote storage to avoid redundant trips.
+ */
+async function buildPreStagePlan(
+  ctx: RoutineContext,
+  bot: Bot,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): Promise<Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }>> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const ledger = loadPreStageLedger();
+  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }> = [];
+
+  for (const { entry, idx } of eligible) {
+    const needByItem: Record<string, number> = {};
+    let hasNeed = false;
+
+    for (const itemConfig of settings.sellItems) {
+      const remoteQty = await getRemoteStorageQty(bot, entry.poiId, itemConfig.itemId);
+      const ledgerQty = getLedgerQty(ledger, entry.poiId, itemConfig.itemId);
+      const knownQty = Math.max(remoteQty, ledgerQty);
+      const need = Math.max(0, itemConfig.maxPerStation - knownQty);
+      if (need > 0) {
+        needByItem[itemConfig.itemId] = need;
+        hasNeed = true;
+      }
+    }
+
+    if (hasNeed) {
+      plan.push({ idx, entry, needByItem });
+    }
+  }
+
+  return plan;
+}
+
 /**
  * Cancel existing sell orders at a station whose price has drifted beyond the
  * configured threshold from the current optimal price. Returns the list of
@@ -1209,24 +1348,36 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
 
     let targetIdx = getNextStation(fcData, settings, cycleFilters);
-    if (targetIdx < 0) {
-      if (fcData.stations.length === 0) {
-        ctx.log("fc", "No stations tracked — initializing station list from mapStore...");
-        fcData.stations = initializeFCStations(settings);
-        fcData.currentStationIndex = 0;
-      } else {
-        // Never rebuild a populated list here: that would throw away the learned
-        // "no market" / "docking denied" verdicts and every order count with them.
-        ctx.log("fc", "No sellable station selected — re-syncing station list with the map");
-        syncFCStations(ctx, fcData, settings);
-      }
-      saveFCStationsData(fcData);
+    let preStagePlan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }> = [];
 
-      targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true));
-      if (targetIdx < 0) {
-        ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
-        await ctx.sleep(60000);
+    if (settings.preStageMode === "preStage") {
+      preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters);
+      if (preStagePlan.length === 0) {
+        ctx.log("fc", "All stations already stocked — returning home");
+        yield "return_home";
+        if (bot.system !== settings.homeSystem) {
+          await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        }
         continue;
+      }
+      targetIdx = preStagePlan[0].idx;
+    } else {
+      if (targetIdx < 0) {
+        if (fcData.stations.length === 0) {
+          ctx.log("fc", "No stations tracked — initializing station list from mapStore...");
+          fcData.stations = initializeFCStations(settings);
+          fcData.currentStationIndex = 0;
+        } else {
+          syncFCStations(ctx, fcData, settings);
+        }
+        saveFCStationsData(fcData);
+
+        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true));
+        if (targetIdx < 0) {
+          ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
+          await ctx.sleep(60000);
+          continue;
+        }
       }
     }
 
@@ -1398,13 +1549,21 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if (settings.preStageMode === "preStage") {
       // Pre-stage mode: deposit items to faction storage at each station,
       // falling back to station storage if faction storage is unavailable.
+      const planEntry = preStagePlan.find(p => p.idx === targetIdx);
+      const needByItem = planEntry?.needByItem ?? {};
+
       for (const itemConfig of settings.sellItems) {
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
 
-        const alreadyDeposited = target.deposits[itemConfig.itemId] || 0;
-        const toDeposit = Math.min(inCargo, itemConfig.maxPerStation - alreadyDeposited);
-        if (toDeposit <= 0) continue;
+        // Re-check remote storage on arrival to avoid over-depositing
+        const remoteQty = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
+        const knownQty = Math.max(remoteQty, target.deposits[itemConfig.itemId] || 0);
+        const toDeposit = Math.min(inCargo, Math.max(0, itemConfig.maxPerStation - knownQty));
+        if (toDeposit <= 0) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: already at ${knownQty}/${itemConfig.maxPerStation}`);
+          continue;
+        }
 
         // Try faction storage first
         const factionResp = await bot.exec("storage", {
@@ -1437,6 +1596,18 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
 
         await ctx.sleep(1000);
+      }
+
+      // Update shared ledger with successful deposits
+      if (Object.keys(deposits).length > 0) {
+        await withPreStageLock(bot, async () => {
+          const ledger = loadPreStageLedger();
+          for (const [itemId, qty] of Object.entries(deposits)) {
+            const current = getLedgerQty(ledger, target.poiId, itemId);
+            setLedgerQty(ledger, target.poiId, itemId, current + qty, bot.username);
+          }
+          savePreStageLedger(ledger);
+        });
       }
     } else {
       // Normal mode: calculate prices and create sell orders

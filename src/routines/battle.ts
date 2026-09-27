@@ -134,6 +134,7 @@ export interface NearbyEntity {
   isPirate: boolean;
   isCreature?: boolean;
   creatureId?: string;
+  species?: string;
   tier?: PirateTier;
   isBoss?: boolean;
   hull?: number;
@@ -246,6 +247,7 @@ let rawEntities: Array<Record<string, unknown>> = [];
         id: creatureId,
         name: (c.name as string) || "",
         type: "creature",
+        species: (c.species as string) || "",
         faction: "",
         isNPC: true,
         isPirate: false,

@@ -21,7 +21,7 @@
  */
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
-import type { Routine, RoutineContext } from "../bot.js";
+import type { Routine, RoutineContext, Bot } from "../bot.js";
 import { mapStore, type StoredPOI } from "../mapstore.js";
 import {
   ensureDocked,
@@ -42,6 +42,7 @@ import {
   type BattleState,
   getBattleStatus,
   fleeFromBattle,
+  getItemSize,
 } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { queryRemoteMarket } from "../client_sync_hooks.js";
@@ -70,6 +71,7 @@ const UNKNOWN_STATION_RELEARN_MS = 24 * 60 * 60 * 1000;
 const FILTER_CACHE_MS = 10_000;
 
 interface FCOrder {
+  itemId: string;
   orderId: string;
   quantity: number;
   remaining: number;
@@ -87,6 +89,16 @@ export type FCSkipReason =
   | "no_market"
   | "dock_denied"
   | "unknown_station";
+
+export interface SellItemConfig {
+  itemId: string;
+  itemName: string;
+  maxPerStation: number;
+  priceMode: "manual" | "auto";
+  autoMinPrice: number;
+  autoMaxPrice: number;
+  baseTargetPrice: number;
+}
 
 const SKIP_LABELS: Record<FCSkipReason, string> = {
   pirate_system: "pirate system",
@@ -114,6 +126,8 @@ export interface FCStationEntry {
   activeOrders: FCOrder[];
   lastVisit: string | null;
   lastPrice: number | null;
+  /** Pre-staged deposits in station storage, keyed by itemId. */
+  deposits: Record<string, number>;
   /** Learned verdict from a real server answer ("no market", docking refused, …). */
   learnedSkip?: FCSkipReason | null;
   /** When the verdict was learned — drives the relearn window. */
@@ -162,6 +176,7 @@ function loadFCStationsData(): FCStationsData {
       activeOrders: station.activeOrders ?? [],
       lastVisit: station.lastVisit ?? null,
       lastPrice: station.lastPrice ?? null,
+      deposits: station.deposits ?? {},
       learnedSkip: station.learnedSkip ?? null,
       learnedSkipAt: station.learnedSkipAt ?? null,
       learnedSkipDetail: station.learnedSkipDetail ?? null,
@@ -429,6 +444,7 @@ export function classifyStationError(message: string | undefined | null): FCSkip
 async function checkStationOrdersRemote(
   ctx: RoutineContext,
   stationEntry: FCStationEntry,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): Promise<{ ok: boolean; learned: FCSkipReason | null }> {
   const { bot } = ctx;
 
@@ -450,10 +466,11 @@ async function checkStationOrdersRemote(
     const ordersData = ordersResp.result as Record<string, unknown>;
     const orders = Array.isArray(ordersData.orders) ? ordersData.orders : [];
 
-    // Filter for fuel_cell sell orders
-    const fcOrders = orders.filter((o: any) => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
+    const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+    const sellOrders = orders.filter((o: any) => sellItemIds.has(o.item_id) && o.side === "sell");
 
-    const activeOrders = fcOrders.map((o: any) => ({
+    const activeOrders = sellOrders.map((o: any) => ({
+      itemId: o.item_id,
       orderId: o.order_id,
       quantity: o.quantity,
       remaining: o.remaining,
@@ -516,7 +533,7 @@ async function updateAllStationsFromRemote(
     if (i > 0) await ctx.sleep(settings.remoteCheckDelayMs);
 
     ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${eligible.length})`);
-    const result = await checkStationOrdersRemote(ctx, station);
+    const result = await checkStationOrdersRemote(ctx, station, settings);
 
     if (result.ok) {
       successCount++;
@@ -537,27 +554,46 @@ async function updateAllStationsFromRemote(
   saveFCStationsData(data);
 }
 
+function defaultSellItems(settings: {
+  maxFuelCellsPerStation: number;
+  priceMode: string;
+  autoMinPrice: number;
+  autoMaxPrice: number;
+  baseTargetPrice: number;
+}): SellItemConfig[] {
+  return [
+    {
+      itemId: FUEL_CELL_ITEM_ID,
+      itemName: FUEL_CELL_ITEM_NAME,
+      maxPerStation: settings.maxFuelCellsPerStation,
+      priceMode: settings.priceMode as "manual" | "auto",
+      autoMinPrice: settings.autoMinPrice,
+      autoMaxPrice: settings.autoMaxPrice,
+      baseTargetPrice: settings.baseTargetPrice,
+    },
+  ];
+}
+
 export function getFuelCellSellerSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
   fuelCostPerJump: number;
   refuelThreshold: number;
   repairThreshold: number;
+  sellItems: SellItemConfig[];
+  preStageMode: "none" | "preStage";
+  enablePriceUpdates: boolean;
+  priceUpdateThreshold: number;
+  maxFuelCellsPerStation: number;
   priceMode: "manual" | "auto";
   baseTargetPrice: number;
   autoMinPrice: number;
   autoMaxPrice: number;
-  maxFuelCellsPerStation: number;
   useRemoteMarketQuery: boolean;
-  /** Delay between remote `view_orders` queries during a sweep (ms). */
   remoteCheckDelayMs: number;
-  /** How often a full remote order sweep runs (ms). */
   remoteUpdateIntervalMs: number;
-  /** Skip faction deployable outposts (nobody outside the faction can dock). */
   skipOutposts: boolean;
-  /** How long a learned "no market"/"docking denied" verdict is trusted (ms). */
   relearnMs: number;
-  /** Number of military_fuel_cell items to carry for own refueling (not for sale). */
   militaryFuelCellsCount: number;
 } {
   const all = readSettings();
@@ -570,17 +606,49 @@ export function getFuelCellSellerSettings(username?: string): {
   const rawDelay = Number(fc.remoteCheckDelayMs ?? DEFAULT_REMOTE_CHECK_DELAY_MS);
   const rawInterval = Number(fc.remoteUpdateIntervalMinutes ?? 60);
   const rawRelearn = Number(fc.relearnHours ?? DEFAULT_RELEARN_HOURS);
+  const maxFuelCellsPerStation = (fc.maxFuelCellsPerStation as number) || 20000;
+  const baseTargetPrice = (fc.baseTargetPrice as number) || 40;
+  const autoMinPrice = (fc.autoMinPrice as number) || 30;
+  const autoMaxPrice = (fc.autoMaxPrice as number) || 50;
+
+  let sellItems: SellItemConfig[] = [];
+  const rawSellItems = fc.sellItems as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(rawSellItems) && rawSellItems.length > 0) {
+    sellItems = rawSellItems
+      .filter(i => i.itemId && typeof i.itemId === "string")
+      .map(i => ({
+        itemId: i.itemId as string,
+        itemName: (i.itemName as string) || i.itemId as string,
+        maxPerStation: (i.maxPerStation as number) || maxFuelCellsPerStation,
+        priceMode: (i.priceMode as "manual" | "auto") || priceMode,
+        autoMinPrice: (i.autoMinPrice as number) || autoMinPrice,
+        autoMaxPrice: (i.autoMaxPrice as number) || autoMaxPrice,
+        baseTargetPrice: (i.baseTargetPrice as number) || baseTargetPrice,
+      }));
+  }
+  if (sellItems.length === 0) {
+    sellItems = defaultSellItems({ maxFuelCellsPerStation, priceMode, autoMinPrice, autoMaxPrice, baseTargetPrice });
+  }
+
+  const preStageMode = (fc.preStageMode as "none" | "preStage") || "none";
+  const enablePriceUpdates = (fc.enablePriceUpdates as boolean) ?? false;
+  const priceUpdateThreshold = (fc.priceUpdateThreshold as number) || 10;
+
   return {
     homeSystem: (botOverrides?.homeSystem as string) || (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
     homeStation: (botOverrides?.homeStation as string) || (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
     fuelCostPerJump: (fc.fuelCostPerJump as number) || 10,
     refuelThreshold: (fc.refuelThreshold as number) || 35,
     repairThreshold: (fc.repairThreshold as number) || 80,
+    sellItems,
+    preStageMode,
+    enablePriceUpdates,
+    priceUpdateThreshold,
+    maxFuelCellsPerStation,
     priceMode,
-    baseTargetPrice: (fc.baseTargetPrice as number) || 40,
-    autoMinPrice: (fc.autoMinPrice as number) || 30,
-    autoMaxPrice: (fc.autoMaxPrice as number) || 50,
-    maxFuelCellsPerStation: (fc.maxFuelCellsPerStation as number) || 20000,
+    baseTargetPrice,
+    autoMinPrice,
+    autoMaxPrice,
     useRemoteMarketQuery: (fc.useRemoteMarketQuery as boolean) ?? true,
     remoteCheckDelayMs: Number.isFinite(rawDelay)
       ? Math.max(MIN_REMOTE_CHECK_DELAY_MS, Math.round(rawDelay))
@@ -642,6 +710,7 @@ function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSetti
         activeOrders: [],
         lastVisit: null,
         lastPrice: null,
+        deposits: {},
         learnedSkip: null,
         learnedSkipAt: null,
         learnedSkipDetail: null,
@@ -705,57 +774,138 @@ function syncFCStations(
 /** Keep an auto-computed price inside the user's safe band. A lowball order on
  *  the market (or any garbage signal) must never drag our listing below the
  *  configured minimum — that is exactly how a 40cr order got posted. */
-function clampToPriceBand(price: number, settings: ReturnType<typeof getFuelCellSellerSettings>): number {
+function clampToPriceBand(price: number, itemConfig: SellItemConfig): number {
   const rounded = Math.round(price);
-  return Math.min(settings.autoMaxPrice, Math.max(settings.autoMinPrice, rounded));
+  return Math.min(itemConfig.autoMaxPrice, Math.max(itemConfig.autoMinPrice, rounded));
 }
 
 async function getOptimalPrice(
   ctx: RoutineContext,
   marketData: unknown,
-  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  itemConfig: SellItemConfig,
 ): Promise<number> {
   const { bot } = ctx;
 
-  if (settings.priceMode === "manual") {
-    return settings.baseTargetPrice;
+  if (itemConfig.priceMode === "manual") {
+    return itemConfig.baseTargetPrice;
   }
 
-  // Fallback when we have no market to price against: the midpoint of the safe
-  // band, NEVER the legacy baseTargetPrice default (which is 40cr).
-  const bandMidpoint = Math.round((settings.autoMinPrice + settings.autoMaxPrice) / 2);
+  const bandMidpoint = Math.round((itemConfig.autoMinPrice + itemConfig.autoMaxPrice) / 2);
 
   if (!marketData || typeof marketData !== "object") {
-    return clampToPriceBand(bandMidpoint, settings);
+    return clampToPriceBand(bandMidpoint, itemConfig);
   }
 
   const md = marketData as Record<string, unknown>;
   const items = Array.isArray(md) ? md : Array.isArray(md.items) ? md.items : [];
-  const fcItem = items.find(i => (i as Record<string, unknown>).item_id === FUEL_CELL_ITEM_ID);
-  if (!fcItem) {
-    return clampToPriceBand(bandMidpoint, settings);
+  const targetItem = items.find(i => (i as Record<string, unknown>).item_id === itemConfig.itemId);
+  if (!targetItem) {
+    return clampToPriceBand(bandMidpoint, itemConfig);
   }
 
-  const fi = fcItem as Record<string, unknown>;
+  const fi = targetItem as Record<string, unknown>;
   const bestSell = (fi.best_sell as number) || 0;
   const bestBuy = (fi.best_buy as number) || 0;
 
-  // Prefer the market midpoint when we have both sides, then the nearest single
-  // side — but every candidate is clamped to the safe band so a lowball sell
-  // order can't be matched/undercut blindly.
   if (bestSell > 0 && bestBuy > 0) {
-    return clampToPriceBand((bestBuy + bestSell) / 2, settings);
+    return clampToPriceBand((bestBuy + bestSell) / 2, itemConfig);
   }
 
   if (bestSell > 0) {
-    return clampToPriceBand(bestSell, settings);
+    return clampToPriceBand(bestSell, itemConfig);
   }
 
   if (bestBuy > 0) {
-    return clampToPriceBand(bestBuy, settings);
+    return clampToPriceBand(bestBuy, itemConfig);
   }
 
-  return clampToPriceBand(bandMidpoint, settings);
+  return clampToPriceBand(bandMidpoint, itemConfig);
+}
+
+function getSellItemConfig(
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  itemId: string,
+): SellItemConfig | undefined {
+  return settings.sellItems.find(i => i.itemId === itemId);
+}
+
+function getSellItemCargo(bot: Bot, itemId: string): number {
+  return bot.inventory.find(i => i.itemId === itemId)?.quantity ?? 0;
+}
+
+function hasAnySellCargo(bot: Bot, settings: ReturnType<typeof getFuelCellSellerSettings>): boolean {
+  return settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+}
+
+function totalSellCargoQty(bot: Bot, settings: ReturnType<typeof getFuelCellSellerSettings>): number {
+  return settings.sellItems.reduce((sum, i) => sum + getSellItemCargo(bot, i.itemId), 0);
+}
+
+/**
+ * Cancel existing sell orders at a station whose price has drifted beyond the
+ * configured threshold from the current optimal price. Returns the list of
+ * cancelled order IDs.
+ */
+async function updateStationPrices(
+  ctx: RoutineContext,
+  bot: Bot,
+  stationEntry: FCStationEntry,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): Promise<string[]> {
+  if (!settings.enablePriceUpdates) return [];
+  if (stationEntry.activeOrders.length === 0) return [];
+
+  const cancelled: string[] = [];
+  const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+
+  for (const order of stationEntry.activeOrders) {
+    if (!sellItemIds.has(order.itemId)) continue;
+    const itemConfig = getSellItemConfig(settings, order.itemId);
+    if (!itemConfig) continue;
+
+    let marketData: unknown = null;
+    const marketResp = await bot.exec("view_market", { item_id: order.itemId });
+    if (!marketResp.error && marketResp.result) {
+      marketData = marketResp.result;
+    } else if (settings.useRemoteMarketQuery !== false) {
+      try {
+        const result = await queryRemoteMarket({ itemId: order.itemId, tradeType: "sell", requesterSystemId: bot.system });
+        if (result.ok && result.results.length > 0) {
+          const best = result.results[0];
+          marketData = {
+            items: [{
+              item_id: order.itemId,
+              best_sell: best.price,
+              best_buy: best.price,
+            }],
+          };
+        }
+      } catch {
+        // ignore remote query failures for price updates
+      }
+    }
+
+    const optimalPrice = await getOptimalPrice(ctx, marketData, itemConfig);
+    const currentPrice = order.priceEach;
+    if (currentPrice <= 0) continue;
+
+    const drift = Math.abs(optimalPrice - currentPrice) / currentPrice;
+    if (drift * 100 >= settings.priceUpdateThreshold) {
+      ctx.log(
+        "fc",
+        `Price drift on ${order.itemId} order ${order.orderId}: current=${currentPrice}cr optimal=${optimalPrice}cr (${(drift * 100).toFixed(1)}% >= ${settings.priceUpdateThreshold}%) — cancelling`,
+      );
+      const cancelResp = await bot.exec("cancel_order", { order_id: order.orderId });
+      if (!cancelResp.error) {
+        cancelled.push(order.orderId);
+      } else {
+        ctx.log("error", `Cancel order ${order.orderId} failed: ${cancelResp.error.message}`);
+      }
+      await ctx.sleep(2000);
+    }
+  }
+
+  return cancelled;
 }
 
 /**
@@ -771,41 +921,37 @@ function getNextStation(
   const { eligible } = partitionStations(data, settings, filters);
   if (eligible.length === 0) return -1;
 
-  // Always prioritize the home station if it can accept more orders
+  // Always prioritize the home station if it can accept more orders for any sell item
   const home = eligible.find(({ entry }) =>
     entry.systemId === data.homeSystem && entry.poiId === data.homeStation
   );
-  if (home && home.entry.ordersUnsold < settings.maxFuelCellsPerStation) {
+  if (home && settings.sellItems.some(item => home.entry.ordersUnsold < item.maxPerStation)) {
     return home.idx;
   }
 
-  // Prioritize stations with lowest unsold (highest demand), then closest, then oldest visit
+  // Prioritize stations with lowest total unsold (highest demand), then closest, then oldest visit
   const stationPriority = eligible.map(({ entry: station, idx }) => {
     const cost = estimateFuelCost(data.homeSystem, station.systemId, settings.fuelCostPerJump).cost;
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
-    const isNearCap = station.ordersUnsold >= settings.maxFuelCellsPerStation;
+    const isNearCap = settings.sellItems.every(item => station.ordersUnsold >= item.maxPerStation);
     return {
       idx,
       ordersUnsold: station.ordersUnsold,
       cost,
       lastVisit,
       isNearCap,
-      // Priority: low unsold first, then low cost, then old lastVisit
-      // But skip near cap stations
       priorityScore: isNearCap ? 999999 : station.ordersUnsold,
       tieBreaker: cost,
       lastTie: lastVisit,
     };
   });
 
-  // Sort by priorityScore ascending (low unsold first), then cost ascending, then lastVisit ascending
   stationPriority.sort((a, b) => {
     if (a.priorityScore !== b.priorityScore) return a.priorityScore - b.priorityScore;
     if (a.tieBreaker !== b.tieBreaker) return a.tieBreaker - b.tieBreaker;
     return a.lastTie - b.lastTie;
   });
 
-  // Always pick the best (first in sorted)
   return stationPriority[0].idx;
 }
 
@@ -908,7 +1054,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       return;
     }
     const allStationsFull = sellable.length > 0
-      && sellable.every(({ entry }) => entry.ordersUnsold >= settings.maxFuelCellsPerStation);
+      && sellable.every(({ entry }) => {
+        const unsold = entry.ordersUnsold || 0;
+        return settings.sellItems.every(item => unsold >= item.maxPerStation);
+      });
     if (allStationsFull) {
       ctx.log("fc", "All stations are at or above capacity — stopping routine");
       return;
@@ -946,13 +1095,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshStatus();
     await bot.refreshCargo();
 
-    const fuelCellItem = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    let cargoQty = fuelCellItem?.quantity ?? 0;
-
     const atHomeStation = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
+    const hasCargo = hasAnySellCargo(bot, settings);
 
     // Restart recovery: empty cargo not at home → return home; full cargo → proceed to station
-    if (!atHomeStation && cargoQty <= 0) {
+    if (!atHomeStation && !hasCargo) {
       ctx.log("fc", `Restart recovery: empty cargo not at home (${bot.system}/${bot.poi}) — returning home`);
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
@@ -976,11 +1123,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         bot.poi = settings.homeStation;
       }
       await bot.refreshCargo();
-      const postReturnCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-      const postReturnMilitary = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
-      cargoQty = postReturnCargo?.quantity ?? 0;
-      const militaryCargoQtyAfterReturn = postReturnMilitary?.quantity ?? 0;
-    } else if (!atHomeStation && cargoQty > 0) {
+    } else if (!atHomeStation && hasCargo) {
       ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
 
@@ -989,31 +1132,24 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await repairShip(ctx);
 
     await bot.refreshCargo();
-    const currentFuelCellCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const currentMilitaryCargo = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
-    const cargoAfterMaintenance = currentFuelCellCargo?.quantity ?? 0;
-    const militaryAfterMaintenance = currentMilitaryCargo?.quantity ?? 0;
     const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
-    // Load both regular sellable fuel cells and military reserve cells when at home.
-    // Military cells are withdrawn first (3 cargo each) so they can't be crowded out
-    // by plain fuel_cells filling the hold.
     const milTarget = settings.militaryFuelCellsCount || 0;
-    const milDeficit = Math.max(0, milTarget - militaryAfterMaintenance);
-    const needRegular = cargoAfterMaintenance <= 0;
+    const currentMilitaryCargo = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+    const milDeficit = Math.max(0, milTarget - currentMilitaryCargo);
+
+    const needSellItems = settings.sellItems.some(item => getSellItemCargo(bot, item.itemId) <= 0);
     const needMilitary = milDeficit > 0;
 
-    if ((needRegular || needMilitary) && atHomeStationAfterMaintenance) {
-      ctx.log("fc", `At home station — loading fuel cells (regular: ${cargoAfterMaintenance}, military: ${militaryAfterMaintenance}/${milTarget})`);
+    if ((needSellItems || needMilitary) && atHomeStationAfterMaintenance) {
+      ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
 
       const cargoMax = bot.cargoMax || 825;
       const cargoUsed = bot.cargo || 0;
       const freeSpace = Math.max(0, cargoMax - cargoUsed);
 
-      // Compute both quantities from the SAME freeSpace snapshot so they can't
-      // disagree. Military cells cost 3 cargo each, regular cost 1 each.
+      // Load military reserve first (3 cargo each) so sell items can fill remaining space
       const milToWithdraw = Math.min(milDeficit, Math.floor(freeSpace / 3));
-      const regularQty = Math.max(0, freeSpace - milToWithdraw * 3);
 
       if (milToWithdraw > 0) {
         const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
@@ -1024,29 +1160,48 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
       }
 
-      if (regularQty > 0) {
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: regularQty });
-        if (withdrawResp.error) {
-          ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
-          await ctx.sleep(10000);
-          continue;
-        }
-      }
-
       await ctx.sleep(2000);
       await bot.refreshCargo();
-      const finalRegular = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID)?.quantity ?? 0;
-      const finalMil = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID)?.quantity ?? 0;
+      const cargoAfterMil = bot.cargo || 0;
+      const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterMil);
 
-      if (finalRegular <= 0 && finalMil <= 0) {
+      // Load sell items in priority order until cargo is full
+      for (const itemConfig of settings.sellItems) {
+        const currentQty = getSellItemCargo(bot, itemConfig.itemId);
+        const needQty = Math.max(0, itemConfig.maxPerStation - currentQty);
+        if (needQty <= 0) continue;
+
+        const itemSize = getItemSize(itemConfig.itemId);
+        const canFit = Math.min(needQty, Math.floor(remainingFreeSpace / itemSize));
+        if (canFit <= 0) break;
+
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: itemConfig.itemId, quantity: canFit });
+        if (withdrawResp.error) {
+          ctx.log("error", `Withdraw ${itemConfig.itemName} failed: ${withdrawResp.error.message}`);
+          continue;
+        }
+        ctx.log("fc", `Withdrew ${canFit}x ${itemConfig.itemName} from faction storage`);
+        await ctx.sleep(1000);
+        await bot.refreshCargo();
+        const newUsed = bot.cargo || 0;
+        if (newUsed >= cargoMax) break;
+      }
+
+      await bot.refreshCargo();
+      const sellItemsSummary = settings.sellItems.map(i => {
+        const qty = getSellItemCargo(bot, i.itemId);
+        return `${qty}x ${i.itemName}`;
+      }).join(", ");
+      const finalMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      ctx.log("fc", `Loaded: ${sellItemsSummary}, ${finalMil}x military fuel cells`);
+
+      const anySellCargo = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (!anySellCargo && finalMil <= 0) {
         ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
         await ctx.sleep(10000);
         continue;
       }
-
-      ctx.log("fc", `Loaded ${finalRegular}x fuel cells and ${finalMil}x military fuel cells`);
-      cargoQty = finalRegular;
-    } else if (needRegular && !atHomeStationAfterMaintenance) {
+    } else if (needSellItems && !atHomeStationAfterMaintenance) {
       ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
       continue;
     }
@@ -1093,11 +1248,19 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     ctx.log("fc", `Target: ${target.poiName} in ${target.systemId}`);
 
     await bot.refreshCargo();
-    const preTravelCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    if (!preTravelCargo || preTravelCargo.quantity <= 0) {
-      ctx.log("fc", "No cargo before travel — returning home to restock");
+
+    const hasSellCargo = hasAnySellCargo(bot, settings);
+    if (!hasSellCargo) {
+      ctx.log("fc", "No sell cargo before travel — returning home to restock");
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!fueled) {
+          ctx.log("error", "Cannot refuel for return journey");
+          await ctx.sleep(60000);
+          continue;
+        }
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
       if (bot.poi !== settings.homeStation) {
@@ -1149,9 +1312,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const dockResp = await bot.exec("dock");
 
     if (dockResp.error && !dockResp.error.message.includes("already")) {
-      // A restricted station (private / faction-only) answers with an access
-      // denial. Remember it so we never fly here again instead of retrying it
-      // on the next pass.
       const dockSkip = classifyStationError(dockResp.error.message);
       if (dockSkip) {
         markStationLearnedSkip(ctx, target, dockSkip, dockResp.error.message);
@@ -1166,15 +1326,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     ctx.log("fc", `Docked at ${target.poiName}`);
 
     await bot.refreshCargo();
-    const inCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const availableQty = inCargo?.quantity ?? 0;
-
-    if (availableQty <= 0) {
-      ctx.log("fc", "No fuel cells in cargo — returning home");
-      yield "return_home";
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-      continue;
-    }
 
     // Get current active orders at this station
     let currentStationOrders: FCOrder[] = [];
@@ -1182,9 +1333,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if (!ordersResp.error && ordersResp.result) {
       const ordersData = ordersResp.result as Record<string, unknown>;
       const orders = (ordersData.orders as any[]) || [];
-      // Filter for fuel_cell sell orders
-      const fcOrders = orders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-      currentStationOrders = fcOrders.map(o => ({
+      const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+      const sellOrders = orders.filter(o => sellItemIds.has(o.item_id) && o.side === "sell");
+      currentStationOrders = sellOrders.map(o => ({
+        itemId: o.item_id,
         orderId: o.order_id,
         quantity: o.quantity,
         remaining: o.remaining,
@@ -1193,8 +1345,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         createdAt: o.created_at,
       }));
     } else if (ordersResp.error) {
-      // "That station does not have a market" — the station is dockable but can
-      // never host a sell order. Remember it and move on with the cargo aboard.
       const orderSkip = classifyStationError(ordersResp.error.message);
       if (orderSkip) {
         markStationLearnedSkip(ctx, target, orderSkip, ordersResp.error.message);
@@ -1205,108 +1355,172 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       ctx.log("fc", `view_orders failed at ${target.poiName}: ${ordersResp.error.message.split("\n")[0]}`);
     }
 
-    const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
-    const quantityToPlace = availableQty;
-    if (quantityToPlace <= 0) {
-      ctx.log("fc", `No fuel cells available — returning home`);
-      yield "return_home";
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-      continue;
-    }
-
-    // Get market data for pricing
-    let marketData: unknown = null;
-    const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
-    if (!marketResp.error && marketResp.result) {
-      marketData = marketResp.result;
-    } else {
-      const marketSkip = classifyStationError(marketResp.error?.message);
-      if (marketSkip) {
-        markStationLearnedSkip(ctx, target, marketSkip, marketResp.error?.message);
-        fcData.currentStationIndex = targetIdx;
-        saveFCStationsData(fcData);
-        continue;
-      }
-      if (settings.useRemoteMarketQuery !== false) {
-        // Fallback to remote market query if local view_market failed
-        ctx.log("fc", "[RemoteMarket] view_market failed, trying remote market query for fuel_cell pricing...");
-        try {
-          const result = await queryRemoteMarket({ itemId: FUEL_CELL_ITEM_ID, tradeType: "sell", requesterSystemId: bot.system });
-          if (result.ok && result.results.length > 0) {
-            const best = result.results[0];
-            ctx.log("fc", `[RemoteMarket] Got remote fuel_cell price: ${best.price}cr @ ${best.stationName} (qty: ${best.quantity})`);
-            // Build synthetic marketData for getOptimalPrice
-            marketData = {
-              items: [{
-                item_id: FUEL_CELL_ITEM_ID,
-                best_sell: best.price,
-                best_buy: best.price,
-                sell_quantity: best.quantity,
-                buy_quantity: best.quantity,
-              }],
-            };
-          } else {
-            ctx.log("fc", `[RemoteMarket] No remote fuel_cell data available: ${result.error || "no results"}`);
-          }
-        } catch (err) {
-          ctx.log("fc", `[RemoteMarket] Remote query failed: ${err instanceof Error ? err.message : String(err)}`);
+    // Run price updates if enabled — cancel orders whose price has drifted
+    if (settings.enablePriceUpdates) {
+      await bot.refreshCargo();
+      const cancelledIds = await updateStationPrices(ctx, bot, {
+        ...target,
+        activeOrders: currentStationOrders,
+        ordersPlaced: 0,
+        ordersUnsold: currentStationOrders.reduce((sum, o) => sum + o.remaining, 0),
+        deposits: target.deposits ?? {},
+      }, settings);
+      if (cancelledIds.length > 0) {
+        // Re-read orders after cancels
+        const reResp = await bot.exec("view_orders", { scope: "personal" });
+        if (!reResp.error && reResp.result) {
+          const reOrdersData = reResp.result as Record<string, unknown>;
+          const reOrders = (reOrdersData.orders as any[]) || [];
+          const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+          currentStationOrders = reOrders
+            .filter(o => sellItemIds.has(o.item_id) && o.side === "sell")
+            .map(o => ({
+              itemId: o.item_id,
+              orderId: o.order_id,
+              quantity: o.quantity,
+              remaining: o.remaining,
+              filledQuantity: o.filled_quantity,
+              priceEach: o.price_each,
+              createdAt: o.created_at,
+            }));
         }
       }
     }
 
-    let price: number | null = null;
-    price = await getOptimalPrice(ctx, marketData, settings);
-
-    // Hard safety net: auto-pricing must never produce an order outside the
-    // configured band (the 40cr incident). Clamp before posting.
-    if (settings.priceMode === "auto") {
-      const clamped = Math.min(settings.autoMaxPrice, Math.max(settings.autoMinPrice, Math.round(price!)));
-      if (clamped !== price) {
-        ctx.log("fc", `Price ${price}cr outside safe band [${settings.autoMinPrice}, ${settings.autoMaxPrice}] — clamping to ${clamped}cr`);
-      }
-      price = clamped;
-    }
-
-    ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (current unsold: ${currentUnsold})`);
-
+    // For each sell item in cargo, either create orders or pre-stage to station storage
     let ordersPlacedCount = 0;
+    let lastPrice: number | null = null;
+    const sellItemsToPlace: Array<{ itemConfig: SellItemConfig; qty: number; price: number }> = [];
+    const deposits: Record<string, number> = {};
 
-    if (quantityToPlace > 0) {
-      const createResp = await bot.exec("create_sell_order", {
-        item_id: FUEL_CELL_ITEM_ID,
-        quantity: quantityToPlace,
-        price_each: price!,
-      });
+    if (settings.preStageMode === "preStage") {
+      // Pre-stage mode: deposit items to station storage instead of listing
+      for (const itemConfig of settings.sellItems) {
+        const inCargo = getSellItemCargo(bot, itemConfig.itemId);
+        if (inCargo <= 0) continue;
 
-      if (createResp.error) {
-        ctx.log("error", `Create sell order failed: ${createResp.error.message}`);
-        const createSkip = classifyStationError(createResp.error.message);
-        if (createSkip) {
-          markStationLearnedSkip(ctx, target, createSkip, createResp.error.message);
-          fcData.currentStationIndex = targetIdx;
-          saveFCStationsData(fcData);
-          continue;
-        }
-      } else {
-        ctx.log("fc", `Listed ${quantityToPlace}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
+        const alreadyDeposited = target.deposits[itemConfig.itemId] || 0;
+        const toDeposit = Math.min(inCargo, itemConfig.maxPerStation - alreadyDeposited);
+        if (toDeposit <= 0) continue;
 
-        // Refresh orders after creating new one
-        const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
-        if (!updatedOrdersResp.error && updatedOrdersResp.result) {
-          const updatedOrdersData = updatedOrdersResp.result as Record<string, unknown>;
-          const updatedOrders = (updatedOrdersData.orders as any[]) || [];
-          const updatedFcOrders = updatedOrders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
-          currentStationOrders = updatedFcOrders.map(o => ({
-            orderId: o.order_id,
-            quantity: o.quantity,
-            remaining: o.remaining,
-            filledQuantity: o.filled_quantity,
-            priceEach: o.price_each,
-            createdAt: o.created_at,
-          }));
+        const depositResp = await bot.exec("storage", {
+          action: 'deposit',
+          source: 'cargo',
+          target: 'station',
+          item_id: itemConfig.itemId,
+          quantity: toDeposit,
+        });
+
+        if (depositResp.error) {
+          ctx.log("error", `Pre-stage deposit failed for ${itemConfig.itemName}: ${depositResp.error.message}`);
+        } else {
+          ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} station storage`);
+          deposits[itemConfig.itemId] = toDeposit;
         }
 
-        ordersPlacedCount = quantityToPlace;
+        await ctx.sleep(1000);
+      }
+    } else {
+      // Normal mode: calculate prices and create sell orders
+      for (const itemConfig of settings.sellItems) {
+        const inCargo = getSellItemCargo(bot, itemConfig.itemId);
+        if (inCargo <= 0) continue;
+
+        const existingForItem = currentStationOrders.filter(o => o.itemId === itemConfig.itemId);
+        const currentUnsold = existingForItem.reduce((sum, o) => sum + o.remaining, 0);
+        const quantityToPlace = Math.min(inCargo, itemConfig.maxPerStation - currentUnsold);
+
+        if (quantityToPlace <= 0) continue;
+
+        let marketData: unknown = null;
+        const marketResp = await bot.exec("view_market", { item_id: itemConfig.itemId });
+        if (!marketResp.error && marketResp.result) {
+          marketData = marketResp.result;
+        } else {
+          const marketSkip = classifyStationError(marketResp.error?.message);
+          if (marketSkip) {
+            markStationLearnedSkip(ctx, target, marketSkip, marketResp.error?.message);
+            fcData.currentStationIndex = targetIdx;
+            saveFCStationsData(fcData);
+            continue;
+          }
+          if (settings.useRemoteMarketQuery !== false) {
+            try {
+              const result = await queryRemoteMarket({ itemId: itemConfig.itemId, tradeType: "sell", requesterSystemId: bot.system });
+              if (result.ok && result.results.length > 0) {
+                const best = result.results[0];
+                marketData = {
+                  items: [{
+                    item_id: itemConfig.itemId,
+                    best_sell: best.price,
+                    best_buy: best.price,
+                    sell_quantity: best.quantity,
+                    buy_quantity: best.quantity,
+                  }],
+                };
+              }
+            } catch (err) {
+              ctx.log("fc", `[RemoteMarket] Remote query failed for ${itemConfig.itemName}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          }
+        }
+
+        const price = await getOptimalPrice(ctx, marketData, itemConfig);
+        const clampedPrice = itemConfig.priceMode === "auto"
+          ? Math.min(itemConfig.autoMaxPrice, Math.max(itemConfig.autoMinPrice, Math.round(price)))
+          : price;
+
+        if (clampedPrice !== price && itemConfig.priceMode === "auto") {
+          ctx.log("fc", `${itemConfig.itemName} price ${price}cr outside safe band [${itemConfig.autoMinPrice}, ${itemConfig.autoMaxPrice}] — clamping to ${clampedPrice}cr`);
+        }
+
+        sellItemsToPlace.push({ itemConfig, qty: quantityToPlace, price: clampedPrice });
+      }
+
+      if (sellItemsToPlace.length > 0) {
+        ctx.log("fc", `Creating sell orders for ${sellItemsToPlace.map(s => `${s.qty}x ${s.itemConfig.itemName} @ ${s.price}cr`).join(", ")}`);
+      }
+
+      for (const placement of sellItemsToPlace) {
+        const createResp = await bot.exec("create_sell_order", {
+          item_id: placement.itemConfig.itemId,
+          quantity: placement.qty,
+          price_each: placement.price,
+        });
+
+        if (createResp.error) {
+          ctx.log("error", `Create sell order failed for ${placement.itemConfig.itemName}: ${createResp.error.message}`);
+          const createSkip = classifyStationError(createResp.error.message);
+          if (createSkip) {
+            markStationLearnedSkip(ctx, target, createSkip, createResp.error.message);
+            fcData.currentStationIndex = targetIdx;
+            saveFCStationsData(fcData);
+            continue;
+          }
+        } else {
+          ctx.log("fc", `Listed ${placement.qty}x ${placement.itemConfig.itemName} @ ${placement.price}cr`);
+          ordersPlacedCount += placement.qty;
+          lastPrice = placement.price;
+
+          await bot.refreshCargo();
+          const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
+          if (!updatedOrdersResp.error && updatedOrdersResp.result) {
+            const updatedOrdersData = updatedOrdersResp.result as Record<string, unknown>;
+            const updatedOrders = (updatedOrdersData.orders as any[]) || [];
+            const sellItemIds = new Set(settings.sellItems.map(i => i.itemId));
+            currentStationOrders = updatedOrders
+              .filter(o => sellItemIds.has(o.item_id) && o.side === "sell")
+              .map(o => ({
+                itemId: o.item_id,
+                orderId: o.order_id,
+                quantity: o.quantity,
+                remaining: o.remaining,
+                filledQuantity: o.filled_quantity,
+                priceEach: o.price_each,
+                createdAt: o.created_at,
+              }));
+          }
+        }
       }
     }
 
@@ -1315,50 +1529,64 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     currentStation.ordersPlaced += ordersPlacedCount;
     currentStation.ordersUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
     currentStation.activeOrders = currentStationOrders;
-    if (ordersPlacedCount > 0) {
-      currentStation.lastPrice = price;
+    if (lastPrice !== null) {
+      currentStation.lastPrice = lastPrice;
     }
     currentStation.lastVisit = new Date().toISOString();
+    if (Object.keys(deposits).length > 0) {
+      currentStation.deposits = { ...(currentStation.deposits ?? {}), ...deposits };
+    }
 
     fcData.currentStationIndex = targetIdx;
     saveFCStationsData(fcData);
 
     await bot.refreshCargo();
 
-    yield "return_home";
-    ctx.log("travel", `Returning to ${settings.homeSystem}...`);
+    const allSellItemsDepleted = !settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted;
 
-    if (bot.system !== settings.homeSystem) {
-      await ensureUndocked(ctx);
+    if (shouldReturnHome) {
+      yield "return_home";
+      ctx.log("travel", `Returning to ${settings.homeSystem}...`);
 
-      // Refuel at target station before long journey home - use higher threshold
-      const returnThreshold = Math.max(60, settings.refuelThreshold + 20);
-      ctx.log("fc", `Pre-return fuel check: ${Math.round((bot.fuel / (bot.maxFuel || 1)) * 100)}%, refueling if below ${returnThreshold}%...`);
-      const fueled = await ensureFueled(ctx, returnThreshold);
-      if (!fueled) {
-        ctx.log("error", "Failed to refuel before return journey");
-        await ctx.sleep(30000);
-        continue;
+      if (bot.system !== settings.homeSystem) {
+        await ensureUndocked(ctx);
+
+        const returnThreshold = Math.max(60, settings.refuelThreshold + 20);
+        ctx.log("fc", `Pre-return fuel check: ${Math.round((bot.fuel / (bot.maxFuel || 1)) * 100)}%, refueling if below ${returnThreshold}%...`);
+        const fueled = await ensureFueled(ctx, returnThreshold);
+        if (!fueled) {
+          ctx.log("error", "Failed to refuel before return journey");
+          await ctx.sleep(30000);
+          continue;
+        }
+
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
 
-      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-    }
+      // Deposit any remaining sell items and military cells
+      for (const itemConfig of settings.sellItems) {
+        const remaining = getSellItemCargo(bot, itemConfig.itemId);
+        if (remaining > 0) {
+          ctx.log("fc", `Depositing ${remaining}x remaining ${itemConfig.itemName}`);
+          await ensureDocked(ctx);
+          await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: itemConfig.itemId, quantity: remaining });
+        }
+      }
+      const remainingMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      if (remainingMil > 0) {
+        ctx.log("fc", `Depositing ${remainingMil}x remaining military fuel cells`);
+        await ensureDocked(ctx);
+        await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: remainingMil });
+      }
 
-    const checkCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-    const checkMilCargo = bot.inventory.find(i => i.itemId === MILITARY_FUEL_CELL_ITEM_ID);
-    if (checkCargo && checkCargo.quantity > 0) {
-      ctx.log("fc", `Depositing ${checkCargo.quantity}x remaining fuel cells`);
-      await ensureDocked(ctx);
-      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, });
+      saveFCStationsData(fcData);
+      ctx.log("fc", "Pre-stage run complete — returned home");
+    } else {
+      // Pre-stage mode: undock and continue to next station
+      await ensureUndocked(ctx);
+      ctx.log("fc", `Pre-stage: continuing to next station (${totalSellCargoQty(bot, settings)} items remaining in cargo)`);
     }
-    if (checkMilCargo && checkMilCargo.quantity > 0) {
-      ctx.log("fc", `Depositing ${checkMilCargo.quantity}x remaining military fuel cells`);
-      await ensureDocked(ctx);
-      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: checkMilCargo.quantity, });
-    }
-
-
-    saveFCStationsData(fcData);
 
     ctx.log("fc", `Loop complete. Next station index: ${targetIdx}`);
   }

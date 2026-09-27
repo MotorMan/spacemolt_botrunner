@@ -161,12 +161,11 @@ function getObservationDebugLine(bot: Bot): string {
      return "observation: disabled (using polling)";
    }
 
-const RAINBOW_LEVIATHAN_NAME = "Rainbow Leviathan";
 
-function prioritizeRainbowLeviathan(creatures: NearbyEntity[]): NearbyEntity[] {
+function prioritizeLeviathans(creatures: NearbyEntity[]): NearbyEntity[] {
   if (!creatures.length) return creatures;
-  const prioritized = creatures.filter(e => e.name === RAINBOW_LEVIATHAN_NAME);
-  const rest = creatures.filter(e => e.name !== RAINBOW_LEVIATHAN_NAME);
+  const prioritized = creatures.filter(e => isLeviathanCreature(e.name, e.species));
+  const rest = creatures.filter(e => !isLeviathanCreature(e.name, e.species));
   return [...prioritized, ...rest];
 }
 
@@ -178,9 +177,10 @@ function prioritizeRainbowLeviathan(creatures: NearbyEntity[]): NearbyEntity[] {
  * Currently only Rainbow Leviathan spawns, but the match is generic so any
  * future leviathan variant is still coordinated.
  */
-function isLeviathanCreature(name: string | undefined): boolean {
-  if (!name) return false;
-  return name.toLowerCase().includes("leviathan");
+function isLeviathanCreature(name: string | undefined, species?: string): boolean {
+  if (name && name.toLowerCase().includes("leviathan")) return true;
+  if (species && species.toLowerCase().includes("leviathan")) return true;
+  return false;
 }
 
 /**
@@ -1233,7 +1233,7 @@ function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCre
   const unclaimed = creatures.filter(e =>
     isLeviathanCreature(e.name) || !isCreatureClaimedByOther(e.id, username),
   );
-  const result = prioritizeRainbowLeviathan(unclaimed).slice(0, Math.max(0, max));
+  const result = prioritizeLeviathans(unclaimed).slice(0, Math.max(0, max));
   // Claim the creatures we're handing back so a bot scanning on the same tick skips
   // them (selection is the sync point — the process-shared map prevents two hunters
   // from both picking the same one-shot creature). Leviathans are never claimed.
@@ -1868,14 +1868,20 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
     const profile = getHunterPatrolProfile(bot.username);
-    if (!profile && (!settings.creatureFarmSystems || settings.creatureFarmSystems.length === 0)) {
-      ctx.log("error", "creature_farm mode but no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments) and no creatureFarmSystems configured. Waiting 60s...");
+    if (
+      (settings.mode === "creature_farm" && !profile) ||
+      (settings.mode === "creature_farm_random" && (!settings.creatureFarmSystems || settings.creatureFarmSystems.length === 0))
+    ) {
+      const missing = settings.mode === "creature_farm"
+        ? "no Hunter Patrol Profile assigned (set hunter.hunterPatrols + hunter.botHunterPatrolAssignments)"
+        : "no creatureFarmSystems configured";
+      ctx.log("error", `${settings.mode} mode but ${missing}. Waiting 60s...`);
       await ctx.sleep(60000);
       continue;
     }
 
     let effectiveSystems: string[];
-    if (settings.creatureFarmSystems && settings.creatureFarmSystems.length > 0) {
+    if (settings.mode === "creature_farm_random") {
       if (creatureFarmExpandedSystems.length === 0) {
         const basePool = settings.creatureFarmSystems;
         const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
@@ -1918,7 +1924,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (sysIndex >= effectiveSystems.length) {
       sysIndex = 0;
-      if (settings.creatureFarmSystems && settings.creatureFarmSystems.length > 0) {
+      if (settings.mode === "creature_farm_random") {
         creatureFarmExpandedSystems = [];
       }
     }

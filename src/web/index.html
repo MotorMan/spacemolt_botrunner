@@ -20288,6 +20288,15 @@
         const remoteUpdateIntervalMinutes = fc.remoteUpdateIntervalMinutes || 60;
         const skipOutposts = fc.skipOutposts !== false;
         const relearnHours = fc.relearnHours || 168;
+        const preStageMode = fc.preStageMode || "none";
+        const enablePriceUpdates = fc.enablePriceUpdates !== false;
+        const priceUpdateThreshold = fc.priceUpdateThreshold || 10;
+        let sellItemsJson = "";
+        try {
+          sellItemsJson = JSON.stringify(fc.sellItems || []);
+        } catch {
+          sellItemsJson = "[]";
+        }
 
         // Build home system dropdown options from mapData
         const sysOpts = ['<option value="">(select home system)</option>'];
@@ -20451,6 +20460,44 @@
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Pre-Stage Mode</div>
+        <div class="setting-hint">When enabled, the bot moves sell items from faction storage to each station's storage without listing them. This lets a separate market routine list them later when prices are favorable. Disabled = normal behavior (list immediately at each station).</div>
+      </div>
+      <select id="set-fc-preStageMode">
+        <option value="none" ${preStageMode === "none" ? "selected" : ""}>Disabled (list at each station)</option>
+        <option value="preStage" ${preStageMode === "preStage" ? "selected" : ""}>Pre-Stage (deposit to station storage)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable Price Updates</div>
+        <div class="setting-hint">When enabled, the bot will check existing sell orders and cancel/re-list them if the market price has drifted beyond the threshold. This requires visiting each station.</div>
+      </div>
+      <select id="set-fc-enablePriceUpdates">
+        <option value="true" ${enablePriceUpdates ? "selected" : ""}>Enabled</option>
+        <option value="false" ${!enablePriceUpdates ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Price Update Threshold (%)</div>
+        <div class="setting-hint">Minimum price drift percentage that triggers a cancel and re-list. Only used when price updates are enabled.</div>
+      </div>
+      <input type="number" id="set-fc-priceUpdateThreshold" min="1" max="100" value="${priceUpdateThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Sell Items (JSON)</div>
+        <div class="setting-hint">Array of items to sell. Leave empty to use default fuel_cell. Example: <code>[{"itemId":"fuel_cell","itemName":"Fuel Cell","maxPerStation":20000,"priceMode":"auto","autoMinPrice":30,"autoMaxPrice":50,"baseTargetPrice":40}]</code></div>
+      </div>
+      <textarea id="set-fc-sellItems" rows="4" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;font-family:monospace;font-size:12px">${esc(sellItemsJson)}</textarea>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Re-test Excluded Stations After (hours)</div>
         <div class="setting-hint">A station that answered "does not have a market" or refused docking is skipped for this long before it gets one more chance (player stations can add a market later).</div>
       </div>
@@ -20494,6 +20541,14 @@
       }
 
       function saveFuelCellSellerSettings() {
+        let sellItems = [];
+        try {
+          const raw = document.getElementById("set-fc-sellItems")?.value || "[]";
+          sellItems = JSON.parse(raw);
+          if (!Array.isArray(sellItems)) sellItems = [];
+        } catch {
+          sellItems = [];
+        }
         const s = {
           homeSystem: document.getElementById("set-fc-homeSystem").value.trim(),
           homeStation: document
@@ -20544,6 +20599,14 @@
           relearnHours:
             parseInt(document.getElementById("set-fc-relearnHours")?.value) ||
             168,
+          preStageMode:
+            document.getElementById("set-fc-preStageMode")?.value || "none",
+          enablePriceUpdates:
+            document.getElementById("set-fc-enablePriceUpdates")?.value === "true",
+          priceUpdateThreshold:
+            parseInt(document.getElementById("set-fc-priceUpdateThreshold")?.value) ||
+            10,
+          sellItems,
         };
         send({
           type: "saveSettings",

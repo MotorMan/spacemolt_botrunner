@@ -4915,34 +4915,43 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  // 3. Military fuel cells — fill the rest (prefer faction storage)
+  // 3. Fuel cells — fill the rest (prefer faction storage, densest first)
   if (!hs.disableResupply) {
-    const fuelCellSize = getItemSize("military_fuel_cell");
-    if (freeSpace >= fuelCellSize) {
-      const desiredFuel = hs.desiredFuelCells ?? -1;
-      let fuelQty: number;
-      if (desiredFuel >= 0) {
-        fuelQty = Math.max(0, desiredFuel - currentFuel);
-        fuelQty = Math.min(fuelQty, Math.floor(freeSpace / fuelCellSize));
-      } else {
-        fuelQty = Math.floor(freeSpace / fuelCellSize);
-      }
+    const fuelTypes = [
+      { id: "military_fuel_cell", size: getItemSize("military_fuel_cell") },
+      { id: "premium_fuel_cell", size: getItemSize("premium_fuel_cell") },
+      { id: "fuel_cell", size: getItemSize("fuel_cell") },
+    ];
+    const desiredFuel = hs.desiredFuelCells ?? -1;
+    const fillCargo = desiredFuel < 0;
+    let remainingNeed = fillCargo ? 0 : Math.max(0, desiredFuel - currentFuel);
+    for (const { id, size } of fuelTypes) {
+      if (!fillCargo && remainingNeed <= 0) break;
+      if (freeSpace < size) continue;
+      const maxFit = Math.floor(freeSpace / size);
+      const qty = fillCargo ? maxFit : Math.min(remainingNeed, maxFit);
+      if (qty <= 0) continue;
+
       if (allowBuying) {
-        const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
+        const fuelResp = await bot.exec("buy", { item_id: id, quantity: qty });
         if (!fuelResp.error) {
-          ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+          ctx.log("trade", `Resupplied ${qty} ${id}`);
+          freeSpace -= qty * size;
+          if (!fillCargo) remainingNeed -= qty;
         }
       } else {
         const wResp = await bot.exec("storage", {
           action: "withdraw",
           target: "faction",
-          item_id: "military_fuel_cell",
-          quantity: fuelQty
+          item_id: id,
+          quantity: qty
         });
         if (!wResp.error) {
-          ctx.log("trade", `Withdrew ${fuelQty} military fuel cells from faction storage`);
+          ctx.log("trade", `Withdrew ${qty} ${id} from faction storage`);
+          freeSpace -= qty * size;
+          if (!fillCargo) remainingNeed -= qty;
         } else {
-          ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
+          ctx.log("trade", `${id}: relying on faction storage (${qty} needed)`);
         }
       }
     }

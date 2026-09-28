@@ -2673,10 +2673,11 @@
                 if (statusEl) statusEl.textContent = "Key saved. Click 'List Players'.";
               }
               break;
-            case "settings_updated":
+             case "settings_updated":
               const prevSystemBlacklist = settings.system_blacklist;
               const prevStationBlacklist = settings.station_blacklist;
               const prevFcSellItems = settings.fuel_cell_seller?.sellItems;
+              const prevFcLoadouts = settings.fuel_cell_seller?.blockedStationLoadouts;
               settings = msg.settings;
               if (settingsPanelDirty()) {
                 if (activeSettingsTab === "system_blacklist") {
@@ -2688,6 +2689,9 @@
                 if (activeSettingsTab === "fuel_cell_seller") {
                   if (prevFcSellItems) {
                     settings.fuel_cell_seller = Object.assign({}, settings.fuel_cell_seller, { sellItems: prevFcSellItems });
+                  }
+                  if (prevFcLoadouts !== undefined) {
+                    settings.fuel_cell_seller = Object.assign({}, settings.fuel_cell_seller, { blockedStationLoadouts: prevFcLoadouts });
                   }
                 }
               }
@@ -13625,6 +13629,12 @@
             if (!savedSet.has(s)) return true;
           }
         }
+        const loadoutList = document.getElementById("fc-loadout-list");
+        if (loadoutList) {
+          const savedLoadouts = Array.isArray(fc.blockedStationLoadouts) ? fc.blockedStationLoadouts : [];
+          const rendered = loadoutList.querySelectorAll("[data-loadout-index]");
+          if (rendered.length !== savedLoadouts.length) return true;
+        }
         return false;
       }
 
@@ -20581,14 +20591,15 @@
         <table class="settings-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
           <thead>
             <tr style="border-bottom:1px solid var(--border)">
-              <th style="text-align:left;padding:4px">Item</th>
-              <th style="text-align:left;padding:4px;width:110px">Max/Station</th>
-              <th style="text-align:left;padding:4px;width:90px">Price Mode</th>
-              <th style="text-align:left;padding:4px;width:80px">Min Price</th>
-              <th style="text-align:left;padding:4px;width:80px">Max Price</th>
-              <th style="text-align:left;padding:4px;width:80px">Target Price</th>
-              <th style="text-align:left;padding:4px;min-width:220px">Blocked Stations</th>
-              <th style="text-align:center;padding:4px;width:90px">Item</th>
+               <th style="text-align:left;padding:4px">Item</th>
+               <th style="text-align:left;padding:4px;width:110px">Max/Station</th>
+               <th style="text-align:left;padding:4px;width:90px">Price Mode</th>
+               <th style="text-align:left;padding:4px;width:80px">Min Price</th>
+               <th style="text-align:left;padding:4px;width:80px">Max Price</th>
+               <th style="text-align:left;padding:4px;width:80px">Target Price</th>
+               <th style="text-align:left;padding:4px;width:40px"></th>
+               <th style="text-align:left;padding:4px;min-width:220px">Blocked Stations</th>
+               <th style="text-align:center;padding:4px;width:90px">Item</th>
             </tr>
           </thead>
           <tbody id="fc-sell-items-body">
@@ -20603,9 +20614,10 @@
                 const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
                 return `<span class="tag" data-station="${esc(stationVal)}" style="margin:2px">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
               }).join("");
-              return `
-                <tr data-item-id="${esc(item.itemId)}">
-                  <td style="padding:4px">${esc(itemName)}</td>
+               return `
+                 <tr data-item-id="${esc(item.itemId)}">
+                   <td style="padding:4px;width:40px;text-align:center"><input type="radio" name="fc-selected-item" value="${esc(item.itemId)}" ${idx === 0 ? "checked" : ""} onclick="window._fcSelectedItemId='${escJs(item.itemId)}'" title="Select this item for loadout actions"/></td>
+                   <td style="padding:4px">${esc(itemName)}</td>
                   <td style="padding:4px"><input type="number" min="0" max="999999" value="${item.maxPerStation || 0}" data-field="maxPerStation" style="width:100px" /></td>
                   <td style="padding:4px">
                     <select data-field="priceMode" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;width:80px">
@@ -20619,10 +20631,11 @@
                   <td style="padding:4px">
                     <div style="display:flex;flex-direction:column;gap:4px">
                        <div id="fc-blocked-${esc(item.itemId)}" style="display:flex;flex-wrap:wrap;gap:4px;align-items:center">${blockedHtml}</div>
-                      <div style="display:flex;gap:4px">
-                        <select id="fc-blocked-select-${esc(item.itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
-                          <option value="">(add blocked station)</option>
-                           ${(() => {
+                       <div style="display:flex;gap:4px">
+                         <select id="fc-blocked-select-${esc(item.itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
+                           <option value="">(add blocked station)</option>
+                           ${getFcLoadoutOptions()}
+                            ${(() => {
                              const blockedSet = new Set(blockedStations);
                              const stationList = [];
                              for (const [sysId, sys] of Object.entries(mapData || {})) {
@@ -20653,22 +20666,61 @@
             }).join("") : ""}
           </tbody>
         </table>
-        <div style="display:flex;gap:8px;align-items:center">
-          <select id="new-fc-sell-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">
-            <option value="">(select item to add)</option>
-            ${Object.values(catalog.items || {})
-              .sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))
-              .map((item) => `<option value="${esc(item.item_id || item.id)}">${esc(item.name || item.id)}</option>`)
-              .join("")}
-          </select>
-          <button class="sm primary" onclick="addFcSellItem()">Add Item</button>
-        </div>
-      </div>
-    </div>
+         <div style="display:flex;gap:8px;align-items:center">
+           <select id="new-fc-sell-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">
+             <option value="">(select item to add)</option>
+             ${Object.values(catalog.items || {})
+               .sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))
+               .map((item) => `<option value="${esc(item.item_id || item.id)}">${esc(item.name || item.id)}</option>`)
+               .join("")}
+           </select>
+           <button class="sm primary" onclick="addFcSellItem()">Add Item</button>
+         </div>
+       </div>
+     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Re-test Excluded Stations After (hours)</div>
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Blocked Station Loadouts</div>
+         <div class="setting-hint">Save reusable blocked-station lists. Apply one to the selected sell item, or manage the preset list.</div>
+       </div>
+       <div style="width:100%">
+         <div id="fc-loadout-editor" style="display:flex;flex-direction:column;gap:8px">
+           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+             <select id="fc-loadout-select" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:220px">
+               <option value="">(select loadout)</option>
+               ${(() => {
+                 const loadouts = ((fc && fc.blockedStationLoadouts) || []);
+                 return loadouts.map((l, i) => `<option value="${esc(String(i))}">${esc(l.name || "Loadout " + (i + 1))} (${(l.stations || []).length})</option>`).join("");
+               })()}
+             </select>
+             <button class="sm" onclick="applyFcBlockedLoadoutToSelectedItem()">Apply to selected item</button>
+           </div>
+           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+             <input type="text" id="fc-loadout-name" placeholder="New loadout name" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:180px" />
+             <button class="sm primary" onclick="saveFcBlockedLoadoutFromSelectedItem()">Save selected item's blocked stations as loadout</button>
+           </div>
+           <div id="fc-loadout-list" style="display:flex;flex-direction:column;gap:4px">
+             ${(() => {
+               const loadouts = ((fc && fc.blockedStationLoadouts) || []);
+               if (!loadouts.length) return `<div style="color:var(--text-muted);font-size:12px">No saved loadouts.</div>`;
+               return loadouts.map((l, i) => {
+                 const stations = (l.stations || []).slice(0, 8).join(", ");
+                 const more = (l.stations || []).length > 8 ? ` +${(l.stations || []).length - 8} more` : "";
+                 return `<div data-loadout-index="${i}" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px">
+                   <div style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc((l.stations || []).join(", "))}">${esc(l.name || "Loadout " + (i + 1))}: ${esc(stations)}${esc(more)}</div>
+                   <button class="sm danger" onclick="deleteFcBlockedLoadout(${i})">Delete</button>
+                 </div>`;
+               }).join("");
+             })()}
+           </div>
+         </div>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Re-test Excluded Stations After (hours)</div>
         <div class="setting-hint">A station that answered "does not have a market" or refused docking is skipped for this long before it gets one more chance (player stations can add a market later).</div>
       </div>
       <input type="number" id="set-fc-relearnHours" min="1" max="8760" value="${relearnHours}">
@@ -20710,6 +20762,16 @@
         stationSelect.innerHTML = stationOpts.join("");
       }
 
+      function getFcLoadoutOptions() {
+        const loadouts = ((settings && settings.fuel_cell_seller && settings.fuel_cell_seller.blockedStationLoadouts) || []);
+        if (!loadouts.length) return "";
+        const opts = loadouts.map((l, i) => {
+          const name = l.name || "Loadout " + (i + 1);
+          return `<option value="__loadout__${i}">${esc("(loadout) " + name)}</option>`;
+        });
+        return `<option value="">────────</option>` + opts.join("");
+      }
+
       function addFcSellItem() {
         const sel = document.getElementById("new-fc-sell-item");
         if (!sel || !sel.value) return;
@@ -20720,6 +20782,7 @@
         const tr = document.createElement("tr");
         tr.setAttribute("data-item-id", itemId);
         tr.innerHTML = `
+          <td style="padding:4px;width:40px;text-align:center"><input type="radio" name="fc-selected-item" value="${esc(itemId)}" checked title="Select this item for loadout actions"/></td>
           <td style="padding:4px">${esc(itemName)}</td>
           <td style="padding:4px"><input type="number" min="0" max="999999" value="20000" data-field="maxPerStation" style="width:100px" /></td>
           <td style="padding:4px">
@@ -20735,9 +20798,10 @@
              <div style="display:flex;flex-direction:column;gap:4px">
                <div id="fc-blocked-${esc(itemId)}" style="display:flex;flex-wrap:wrap;gap:4px;align-items:center"></div>
               <div style="display:flex;gap:4px">
-                <select id="fc-blocked-select-${esc(itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
-                  <option value="">(add blocked station)</option>
-                  ${(() => {
+                 <select id="fc-blocked-select-${esc(itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
+                   <option value="">(add blocked station)</option>
+                   ${getFcLoadoutOptions()}
+                   ${(() => {
                     const stationList = [];
                     for (const [sysId, sys] of Object.entries(mapData || {})) {
                       const sysName = sys.name || sysId;
@@ -20770,6 +20834,34 @@
         const stationVal = select.value;
         const container = document.getElementById("fc-blocked-" + itemId);
         if (!container) return;
+        if (typeof stationVal === "string" && stationVal.startsWith("__loadout__")) {
+          const loadoutIndex = parseInt(stationVal.replace("__loadout__", ""), 10);
+          const loadouts = ((settings && settings.fuel_cell_seller && settings.fuel_cell_seller.blockedStationLoadouts) || []);
+          const loadout = loadouts[loadoutIndex];
+          if (loadout && Array.isArray(loadout.stations)) {
+            const existing = new Set();
+            for (const tag of container.querySelectorAll("span[data-station]")) {
+              existing.add(tag.getAttribute("data-station") || "");
+            }
+            for (const stationVal2 of loadout.stations) {
+              if (existing.has(stationVal2)) continue;
+              const parts = stationVal2.split("|");
+              const sysId = parts.length > 1 ? parts[0] : "";
+              const poiId = parts.length > 1 ? parts[1] : parts[0];
+              const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
+              const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal2);
+              const tag = document.createElement("span");
+              tag.className = "tag";
+              tag.style.margin = "2px";
+              tag.setAttribute("data-station", stationVal2);
+              tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal2)}')" title="Remove station">✕</button>`;
+              container.appendChild(tag);
+              existing.add(stationVal2);
+            }
+          }
+          select.value = "";
+          return;
+        }
         const parts = stationVal.split("|");
         const sysId = parts.length > 1 ? parts[0] : "";
         const poiId = parts.length > 1 ? parts[1] : parts[0];
@@ -20784,6 +20876,76 @@
         const optionToRemove = select.querySelector(`option[value="${esc(stationVal)}"]`);
         if (optionToRemove) optionToRemove.remove();
         select.value = "";
+      }
+
+      function applyFcBlockedLoadoutToSelectedItem() {
+        const select = document.getElementById("fc-loadout-select");
+        if (!select || !select.value) return;
+        const loadoutIndex = parseInt(select.value, 10);
+        const loadouts = ((settings && settings.fuel_cell_seller && settings.fuel_cell_seller.blockedStationLoadouts) || []);
+        const loadout = loadouts[loadoutIndex];
+        if (!loadout) return;
+        const itemId = window._fcSelectedItemId;
+        if (!itemId) {
+          alert("Select a sell item row first.");
+          return;
+        }
+        const container = document.getElementById("fc-blocked-" + itemId);
+        if (!container) return;
+        const existing = new Set();
+        for (const tag of container.querySelectorAll("span[data-station]")) {
+          existing.add(tag.getAttribute("data-station") || "");
+        }
+        let added = 0;
+        for (const stationVal of (loadout.stations || [])) {
+          if (existing.has(stationVal)) continue;
+          const parts = stationVal.split("|");
+          const sysId = parts.length > 1 ? parts[0] : "";
+          const poiId = parts.length > 1 ? parts[1] : parts[0];
+          const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
+          const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
+          const tag = document.createElement("span");
+          tag.className = "tag";
+          tag.style.margin = "2px";
+          tag.setAttribute("data-station", stationVal);
+          tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station">✕</button>`;
+          container.appendChild(tag);
+          existing.add(stationVal);
+          added++;
+        }
+        select.value = "";
+      }
+
+      function saveFcBlockedLoadoutFromSelectedItem() {
+        const nameInput = document.getElementById("fc-loadout-name");
+        const name = nameInput ? nameInput.value.trim() : "";
+        if (!name) {
+          alert("Enter a loadout name first.");
+          return;
+        }
+        const itemId = window._fcSelectedItemId;
+        if (!itemId) {
+          alert("Select a sell item row first.");
+          return;
+        }
+        const container = document.getElementById("fc-blocked-" + itemId);
+        if (!container) return;
+        const stations = [];
+        for (const tag of container.querySelectorAll("span[data-station]")) {
+          const v = tag.getAttribute("data-station");
+          if (v) stations.push(v);
+        }
+        if (!settings.fuel_cell_seller) settings.fuel_cell_seller = {};
+        if (!Array.isArray(settings.fuel_cell_seller.blockedStationLoadouts)) settings.fuel_cell_seller.blockedStationLoadouts = [];
+        settings.fuel_cell_seller.blockedStationLoadouts.push({ name, stations });
+        if (nameInput) nameInput.value = "";
+        rerenderCurrentSettings();
+      }
+
+      function deleteFcBlockedLoadout(index) {
+        if (!settings.fuel_cell_seller || !Array.isArray(settings.fuel_cell_seller.blockedStationLoadouts)) return;
+        settings.fuel_cell_seller.blockedStationLoadouts.splice(index, 1);
+        rerenderCurrentSettings();
       }
 
       function removeFcBlockedStation(btn, stationVal) {
@@ -20912,6 +21074,8 @@
             parseInt(document.getElementById("set-fc-priceUpdateThreshold")?.value) ||
             10,
           sellItems,
+          blockedStationLoadouts:
+            ((settings && settings.fuel_cell_seller && settings.fuel_cell_seller.blockedStationLoadouts) || []),
         };
         send({
           type: "saveSettings",

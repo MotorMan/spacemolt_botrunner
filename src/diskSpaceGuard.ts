@@ -1,4 +1,4 @@
-import { statSync, writeFileSync, writeFile } from "fs";
+import { statSync, writeFileSync, writeFile, statfsSync } from "fs";
 import { dirname } from "path";
 import { execSync } from "child_process";
 import { platform } from "os";
@@ -55,35 +55,16 @@ export function setEmergencyCallback(cb: EmergencyCallback | null): void {
 
 function getWindowsDiskSpace(driveRoot: string): { freeBytes: number; totalBytes: number } | null {
   try {
-    const output = execSync(`fsutil volume diskfree ${driveRoot}`, { encoding: "utf-8" });
-    const freeMatch = output.match(/Total free bytes\s*:\s*(\d+)/);
-    const totalMatch = output.match(/Total bytes\s*:\s*(\d+)/);
-    if (freeMatch && totalMatch) {
-      return {
-        freeBytes: parseInt(freeMatch[1], 10),
-        totalBytes: parseInt(totalMatch[1], 10),
-      };
-    }
+    const stats = statfsSync(driveRoot);
+    const freeBytes = stats.bsize * stats.bavail;
+    const totalBytes = stats.bsize * stats.blocks;
+    return {
+      freeBytes,
+      totalBytes,
+    };
   } catch {
-    // fallback to wmic
-    try {
-      const output = execSync(`wmic logicaldisk where "DeviceID='${driveRoot.replace(":\\", "")}'" get Size,FreeSpace /format:csv`, { encoding: "utf-8" });
-      const lines = output.split("\n").filter((line) => line.trim());
-      if (lines.length >= 2) {
-        const parts = lines[1].split(",");
-        if (parts.length >= 3) {
-          const freeBytes = parseInt(parts[1], 10);
-          const totalBytes = parseInt(parts[2], 10);
-          if (Number.isFinite(freeBytes) && Number.isFinite(totalBytes)) {
-            return { freeBytes, totalBytes };
-          }
-        }
-      }
-    } catch {
-      // ignore
-    }
+    return null;
   }
-  return null;
 }
 
 export function checkFreeSpace(path: string): { freeBytes: number; totalBytes: number } | null {

@@ -20550,10 +20550,55 @@
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Sell Items (JSON)</div>
-        <div class="setting-hint">Array of items to sell. Leave empty to use default fuel_cell. Example: <code>[{"itemId":"fuel_cell","itemName":"Fuel Cell","maxPerStation":20000,"priceMode":"auto","autoMinPrice":30,"autoMaxPrice":50,"baseTargetPrice":40}]</code></div>
+        <div class="setting-label">Sell Items</div>
+        <div class="setting-hint">Select items to sell. Leave empty to use the default fuel_cell.</div>
       </div>
-      <textarea id="set-fc-sellItems" rows="4" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;font-family:monospace;font-size:12px">${esc(sellItemsJson)}</textarea>
+      <div style="width:100%">
+        <table class="settings-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+          <thead>
+            <tr style="border-bottom:1px solid var(--border)">
+              <th style="text-align:left;padding:4px">Item</th>
+              <th style="text-align:left;padding:4px;width:110px">Max/Station</th>
+              <th style="text-align:left;padding:4px;width:90px">Price Mode</th>
+              <th style="text-align:left;padding:4px;width:80px">Min Price</th>
+              <th style="text-align:left;padding:4px;width:80px">Max Price</th>
+              <th style="text-align:left;padding:4px;width:80px">Target Price</th>
+              <th style="width:60px"></th>
+            </tr>
+          </thead>
+          <tbody id="fc-sell-items-body">
+            ${fc.sellItems && fc.sellItems.length > 0 ? fc.sellItems.map((item, idx) => {
+              const itemName = (catalog.items && catalog.items[item.itemId]) ? (catalog.items[item.itemId].name || item.itemId) : (item.itemName || item.itemId);
+              return `
+                <tr data-item-id="${esc(item.itemId)}">
+                  <td style="padding:4px">${esc(itemName)}</td>
+                  <td style="padding:4px"><input type="number" min="0" max="999999" value="${item.maxPerStation || 0}" data-field="maxPerStation" style="width:100px" /></td>
+                  <td style="padding:4px">
+                    <select data-field="priceMode" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;width:80px">
+                      <option value="auto" ${item.priceMode !== "manual" ? "selected" : ""}>Auto</option>
+                      <option value="manual" ${item.priceMode === "manual" ? "selected" : ""}>Manual</option>
+                    </select>
+                  </td>
+                  <td style="padding:4px"><input type="number" min="0" value="${item.autoMinPrice || 0}" data-field="autoMinPrice" style="width:70px" /></td>
+                  <td style="padding:4px"><input type="number" min="0" value="${item.autoMaxPrice || 0}" data-field="autoMaxPrice" style="width:70px" /></td>
+                  <td style="padding:4px"><input type="number" min="0" value="${item.baseTargetPrice || 0}" data-field="baseTargetPrice" style="width:70px" /></td>
+                  <td style="text-align:center"><button class="btn-icon" onclick="removeFcSellItem(this)" title="Remove">✕</button></td>
+                </tr>
+              `;
+            }).join("") : ""}
+          </tbody>
+        </table>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="new-fc-sell-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">
+            <option value="">(select item to add)</option>
+            ${Object.values(catalog.items || {})
+              .sort((a, b) => (a.name || a.id || "").localeCompare(b.name || b.id || ""))
+              .map((item) => `<option value="${esc(item.item_id || item.id)}">${esc(item.name || item.id)}</option>`)
+              .join("")}
+          </select>
+          <button class="sm primary" onclick="addFcSellItem()">Add Item</button>
+        </div>
+      </div>
     </div>
 
     <div class="setting-row">
@@ -20600,15 +20645,70 @@
         stationSelect.innerHTML = stationOpts.join("");
       }
 
-      function saveFuelCellSellerSettings() {
-        let sellItems = [];
-        try {
-          const raw = document.getElementById("set-fc-sellItems")?.value || "[]";
-          sellItems = JSON.parse(raw);
-          if (!Array.isArray(sellItems)) sellItems = [];
-        } catch {
-          sellItems = [];
+      function addFcSellItem() {
+        const sel = document.getElementById("new-fc-sell-item");
+        if (!sel || !sel.value) return;
+        const itemId = sel.value.trim();
+        const itemName = (catalog.items && catalog.items[itemId]) ? (catalog.items[itemId].name || itemId) : itemId;
+        const tbody = document.getElementById("fc-sell-items-body");
+        if (!tbody) return;
+        const tr = document.createElement("tr");
+        tr.setAttribute("data-item-id", itemId);
+        tr.innerHTML = `
+          <td style="padding:4px">${esc(itemName)}</td>
+          <td style="padding:4px"><input type="number" min="0" max="999999" value="20000" data-field="maxPerStation" style="width:100px" /></td>
+          <td style="padding:4px">
+            <select data-field="priceMode" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;width:80px">
+              <option value="auto" selected>Auto</option>
+              <option value="manual">Manual</option>
+            </select>
+          </td>
+          <td style="padding:4px"><input type="number" min="0" value="30" data-field="autoMinPrice" style="width:70px" /></td>
+          <td style="padding:4px"><input type="number" min="0" value="50" data-field="autoMaxPrice" style="width:70px" /></td>
+          <td style="padding:4px"><input type="number" min="0" value="40" data-field="baseTargetPrice" style="width:70px" /></td>
+          <td style="text-align:center"><button class="btn-icon" onclick="removeFcSellItem(this)" title="Remove">✕</button></td>
+        `;
+        tbody.appendChild(tr);
+        sel.value = "";
+      }
+
+      function removeFcSellItem(btn) {
+        const row = btn.closest("tr");
+        if (row) row.remove();
+      }
+
+      function collectFcSellItems() {
+        const tbody = document.getElementById("fc-sell-items-body");
+        if (!tbody) return [];
+        const rows = tbody.querySelectorAll("tr[data-item-id]");
+        const items = [];
+        for (const row of rows) {
+          const itemId = row.getAttribute("data-item-id");
+          if (!itemId) continue;
+          const get = (field) => {
+            const el = row.querySelector(`[data-field="${field}"]`);
+            if (!el) return undefined;
+            const v = el.value;
+            if (field === "priceMode") return v || "auto";
+            const n = parseInt(v, 10);
+            return Number.isFinite(n) ? n : 0;
+          };
+          const itemName = (catalog.items && catalog.items[itemId]) ? (catalog.items[itemId].name || itemId) : itemId;
+          items.push({
+            itemId,
+            itemName,
+            maxPerStation: get("maxPerStation") || 20000,
+            priceMode: get("priceMode") || "auto",
+            autoMinPrice: get("autoMinPrice") || 30,
+            autoMaxPrice: get("autoMaxPrice") || 50,
+            baseTargetPrice: get("baseTargetPrice") || 40,
+          });
         }
+        return items;
+      }
+
+      function saveFuelCellSellerSettings() {
+        const sellItems = collectFcSellItems();
         const s = {
           homeSystem: document.getElementById("set-fc-homeSystem").value.trim(),
           homeStation: document

@@ -1730,7 +1730,13 @@
         }
         if (view === "routine") {
           const frame = document.getElementById("marketRoutineFrame");
-          if (frame) frame.src = frame.src;
+          if (frame) {
+            try {
+              frame.contentWindow.location.reload();
+            } catch {
+              frame.src = frame.src;
+            }
+          }
         }
       }
 

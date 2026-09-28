@@ -1320,6 +1320,7 @@ if (!this.settings.fuel_service) {
           }
           if (req.method === "POST") {
             const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> };
+            console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [] });
             if (!this.settings.market_routine) this.settings.market_routine = {};
             if (body.global) {
               this.settings.market_routine.globalItems = body.global;

@@ -62,26 +62,7 @@
   <div class="section">
     <h2>Per-Bot Settings</h2>
     <div class="hint">Override or extend the global watch list for individual market bots. Bots with no per-bot items inherit the global list.</div>
-    <div class="toolbar">
-      <select id="botSelect">
-        <option value="">-- select bot --</option>
-      </select>
-      <button class="btn" id="addBotOverrideBtn">Enable Per-Bot Override</button>
-      <span class="hint" id="botStatus"></span>
-    </div>
-    <div id="perBotArea" style="display:none">
-      <div class="toolbar" style="margin-top:8px">
-        <select id="botItemSelect">
-          <option value="">-- select item --</option>
-        </select>
-        <input type="number" id="botMinPrice" placeholder="Min sell price" min="0" step="1" />
-        <button class="btn" id="botAddBtn">Add</button>
-      </div>
-      <div id="botItems"></div>
-      <div style="margin-top:8px">
-        <button class="btn danger sm" id="clearBotOverrideBtn">Clear Per-Bot Override (use global)</button>
-      </div>
-    </div>
+    <div id="allBotsGrid" class="bot-grid"></div>
   </div>
 </div>
 
@@ -130,11 +111,95 @@
   async function loadBots() {
     const data = await api("/api/bots");
     allBots = Array.isArray(data) ? data : [];
-    const marketBots = allBots.filter(b => b.routine === "market" || b.state === "running");
-    const botSel = document.getElementById("botSelect");
-    botSel.innerHTML = '<option value="">-- select bot --</option>' +
-      marketBots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join("");
   }
+
+  function getMarketBots() {
+    return allBots.filter(b => {
+      const routine = (b.routine || "").toLowerCase();
+      return routine === "market" || routine.includes("market");
+    });
+  }
+
+  function renderAllBotsGrid() {
+    const grid = document.getElementById("allBotsGrid");
+    const marketBots = getMarketBots();
+    if (!marketBots.length) {
+      grid.innerHTML = '<div class="empty">No market bots detected. Start bots with the market routine to see them here.</div>';
+      return;
+    }
+    grid.innerHTML = marketBots.map(bot => {
+      const items = perBot[bot.username] || [];
+      return `<div class="bot-card" data-bot="${esc(bot.username)}">
+        <h3>${esc(bot.username)} <span style="font-weight:normal;color:var(--text-dim);font-size:12px">${items.length ? items.length + " item" + (items.length === 1 ? "" : "s") : "inherits global"}</span></h3>
+        <div class="bot-items">
+          ${items.length ? items.map((it, idx) => `<div class="item-row">
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(it.itemName || it.itemId)}">${esc(it.itemName || it.itemId)}</span>
+            <input type="number" value="${it.minSellPrice}" data-bot="${esc(bot.username)}" data-idx="${idx}" class="bot-price-input" min="0" step="1" style="width:80px" />
+            <button class="btn danger sm" data-remove-bot="${esc(bot.username)}" data-remove-idx="${idx}">Remove</button>
+          </div>`).join("") : '<div class="empty">No per-bot items. Inherits global list.</div>'}
+        </div>
+        <div class="toolbar" style="margin-top:8px">
+          <select class="botItemSelect" data-bot="${esc(bot.username)}">
+            <option value="">-- select item --</option>
+            ${factionItems.map(i => `<option value="${esc(i.itemId)}" data-name="${esc(i.itemName)}">${esc(i.itemName)}</option>`).join("")}
+          </select>
+          <input type="number" class="botMinPrice" data-bot="${esc(bot.username)}" placeholder="Price" min="0" step="1" style="width:80px" />
+          <button class="btn sm" data-add-bot="${esc(bot.username)}">Add</button>
+        </div>
+      </div>`;
+    }).join("");
+  }
+
+  window._removeBotItem = function (botName, idx) {
+    if (perBot[botName]) {
+      perBot[botName].splice(idx, 1);
+      if (!perBot[botName].length) delete perBot[botName];
+    }
+    renderAllBotsGrid();
+    saveSettings();
+  };
+
+  document.getElementById("allBotsGrid").addEventListener("click", async (e) => {
+    const target = e.target;
+    if (target.matches("[data-add-bot]")) {
+      const botName = target.getAttribute("data-add-bot");
+      const sel = document.querySelector(`.botItemSelect[data-bot="${CSS.escape(botName)}"]`);
+      const priceInput = document.querySelector(`.botMinPrice[data-bot="${CSS.escape(botName)}"]`);
+      if (!sel || !priceInput) return;
+      const itemId = sel.value;
+      const itemName = sel.options[sel.selectedIndex]?.dataset?.name || itemId;
+      const minSellPrice = parseInt(priceInput.value, 10) || 0;
+      if (!itemId) return;
+      if (!perBot[botName]) perBot[botName] = [];
+      if (perBot[botName].some(i => i.itemId === itemId)) {
+        alert("Item already in this bot's list.");
+        return;
+      }
+      perBot[botName].push({ itemId, itemName, minSellPrice });
+      priceInput.value = "";
+      renderAllBotsGrid();
+      await saveSettings();
+    }
+    if (target.matches("[data-remove-bot]")) {
+      const botName = target.getAttribute("data-remove-bot");
+      const idx = parseInt(target.getAttribute("data-remove-idx"), 10);
+      if (!isNaN(idx)) {
+        window._removeBotItem(botName, idx);
+      }
+    }
+  });
+
+  document.getElementById("allBotsGrid").addEventListener("input", async (e) => {
+    const target = e.target;
+    if (target.classList.contains("bot-price-input")) {
+      const botName = target.getAttribute("data-bot");
+      const idx = parseInt(target.getAttribute("data-idx"), 10);
+      if (!isNaN(idx) && botName && perBot[botName] && perBot[botName][idx]) {
+        perBot[botName][idx].minSellPrice = parseInt(target.value, 10) || 0;
+        await saveSettings();
+      }
+    }
+  });
 
   async function loadFactionStorage() {
     try {
@@ -161,13 +226,6 @@
     }
   }
 
-  function populateItemSelects() {
-    const opts = factionItems.map(i => `<option value="${esc(i.itemId)}" data-name="${esc(i.itemName)}">${esc(i.itemName)} (${esc(i.itemId)})</option>`).join("");
-    const fallback = '<option value="">-- select item --</option>';
-    document.getElementById("globalItemSelect").innerHTML = fallback + opts;
-    document.getElementById("botItemSelect").innerHTML = fallback + opts;
-  }
-
   function renderGlobalItems() {
     const container = document.getElementById("globalItems");
     if (!globalItems.length) {
@@ -184,43 +242,9 @@
       `).join("") + `</tbody></table>`;
   }
 
-  function renderPerBotSection() {
-    const container = document.getElementById("botItems");
-    const botSel = document.getElementById("botSelect");
-    const botName = botSel.value;
-    const area = document.getElementById("perBotArea");
-    if (!botName) {
-      area.style.display = "none";
-      container.innerHTML = "";
-      return;
-    }
-    area.style.display = "";
-    const items = perBot[botName] || [];
-    if (!items.length) {
-      container.innerHTML = '<div class="empty">No per-bot items configured. This bot inherits the global list.</div>';
-      return;
-    }
-    container.innerHTML = `<table><thead><tr><th>Item</th><th>Min Sell Price</th><th></th></tr></thead><tbody>` +
-      items.map((it, idx) => `
-        <tr>
-          <td>${esc(it.itemName || it.itemId)}</td>
-          <td><input type="number" value="${it.minSellPrice}" data-idx="${idx}" class="bot-price-input" min="0" step="1" style="width:100px" /></td>
-          <td><button class="btn danger sm" onclick="window._removeBotItem('${esc(botName)}', ${idx})">Remove</button></td>
-        </tr>
-      `).join("") + `</tbody></table>`;
-  }
-
   window._removeGlobalItem = function (idx) {
     globalItems.splice(idx, 1);
     renderGlobalItems();
-  };
-
-  window._removeBotItem = function (botName, idx) {
-    if (perBot[botName]) {
-      perBot[botName].splice(idx, 1);
-      if (!perBot[botName].length) delete perBot[botName];
-    }
-    renderPerBotSection();
   };
 
   document.getElementById("globalAddBtn").addEventListener("click", async () => {
@@ -240,50 +264,11 @@
     await saveSettings();
   });
 
-  document.getElementById("botAddBtn").addEventListener("click", async () => {
-    const botName = document.getElementById("botSelect").value;
-    const sel = document.getElementById("botItemSelect");
-    const priceInput = document.getElementById("botMinPrice");
-    const itemId = sel.value;
-    const itemName = sel.options[sel.selectedIndex]?.dataset?.name || itemId;
-    const minSellPrice = parseInt(priceInput.value, 10) || 0;
-    if (!botName || !itemId) return;
-    if (!perBot[botName]) perBot[botName] = [];
-    if (perBot[botName].some(i => i.itemId === itemId)) {
-      alert("Item already in this bot's list.");
-      return;
-    }
-    perBot[botName].push({ itemId, itemName, minSellPrice });
-    priceInput.value = "";
-    renderPerBotSection();
-    await saveSettings();
-  });
-
-  document.getElementById("addBotOverrideBtn").addEventListener("click", async () => {
-    const botName = document.getElementById("botSelect").value;
-    if (!botName) return;
-    if (!perBot[botName]) perBot[botName] = [];
-    document.getElementById("perBotArea").style.display = "";
-    renderPerBotSection();
-    await saveSettings();
-  });
-
-  document.getElementById("clearBotOverrideBtn").addEventListener("click", async () => {
-    const botName = document.getElementById("botSelect").value;
-    if (!botName) return;
-    if (!confirm(`Clear per-bot override for ${botName}? It will inherit the global list.`)) return;
-    delete perBot[botName];
-    renderPerBotSection();
-    await saveSettings();
-  });
-
   document.getElementById("loadStorageBtn").addEventListener("click", loadFactionStorage);
 
   document.getElementById("saveBtn").addEventListener("click", async () => {
     await saveSettings();
   });
-
-  document.getElementById("botSelect").addEventListener("change", renderPerBotSection);
 
   document.getElementById("globalItems").addEventListener("input", async (e) => {
     if (e.target.classList.contains("global-price-input")) {
@@ -295,27 +280,16 @@
     }
   });
 
-  document.getElementById("botItems").addEventListener("input", async (e) => {
-    if (e.target.classList.contains("bot-price-input")) {
-      const botName = document.getElementById("botSelect").value;
-      const idx = parseInt(e.target.dataset.idx, 10);
-      if (!isNaN(idx) && botName && perBot[botName] && perBot[botName][idx]) {
-        perBot[botName][idx].minSellPrice = parseInt(e.target.value, 10) || 0;
-        await saveSettings();
-      }
-    }
-  });
-
   async function init() {
     await loadBots();
     await loadSettings();
-    const marketBots = allBots.filter(b => b.routine === "market" || b.state === "running");
+    const marketBots = getMarketBots();
     for (const bot of marketBots) {
       if (!(bot.username in perBot)) {
         perBot[bot.username] = [];
       }
     }
-    renderPerBotSection();
+    renderAllBotsGrid();
     const settings = await api("/api/settings");
     const general = settings.general || {};
     const station = general.factionStorageStation || "";

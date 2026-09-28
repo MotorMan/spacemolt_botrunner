@@ -1646,11 +1646,9 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
         return; // bail out immediately, do not wait
       }
       if (msg.includes("credit") || msg.includes("fuel_source") || msg.includes("insufficient")) {
-        const sold = await sellAllCargo(ctx);
-        if (sold > 0) {
-          await bot.refreshShip();
-          continue;
-        }
+        ctx.log("error", `Insufficient credits to refuel — will wait for station restock or credits`);
+        if (consecutiveErrors >= 2) break;
+        continue;
       }
       if (consecutiveErrors >= 2) break;
       continue;
@@ -1675,23 +1673,6 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
     ctx.log("system", `Fuel still at ${fuelPct}% — waiting at station (attempt ${attempt}/${REFUEL_WAIT_RETRIES})...`);
     await sleep(REFUEL_WAIT_INTERVAL);
 
-    // Retry: sell + refuel
-    await sellAllCargo(ctx);
-    const refuelResp = await bot.exec("refuel");
-     if (refuelResp.error) {
-       const msg = refuelResp.error.message.toLowerCase();
-       if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
-         // Reserve empty / no cargo cells — try faction/station storage or market before giving up.
-           if (bot.docked) {
-            const recovered = await acquireFuelCellsAndRefuel(ctx);
-            await bot.refreshShip();
-            fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-            if (recovered && fuelPct >= 50) return;
-          }
-         ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
-         break;
-       }
-     }
     await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= 50) {

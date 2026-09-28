@@ -1,5 +1,7 @@
 import { statSync, writeFileSync, writeFile } from "fs";
 import { dirname } from "path";
+import { execSync } from "child_process";
+import { platform } from "os";
 
 export interface DiskSpaceState {
   freeBytes: number;
@@ -51,6 +53,39 @@ export function setEmergencyCallback(cb: EmergencyCallback | null): void {
   onEmergency = cb;
 }
 
+function getWindowsDiskSpace(driveRoot: string): { freeBytes: number; totalBytes: number } | null {
+  try {
+    const output = execSync(`fsutil volume diskfree ${driveRoot}`, { encoding: "utf-8" });
+    const freeMatch = output.match(/Total free bytes\s*:\s*(\d+)/);
+    const totalMatch = output.match(/Total bytes\s*:\s*(\d+)/);
+    if (freeMatch && totalMatch) {
+      return {
+        freeBytes: parseInt(freeMatch[1], 10),
+        totalBytes: parseInt(totalMatch[1], 10),
+      };
+    }
+  } catch {
+    // fallback to wmic
+    try {
+      const output = execSync(`wmic logicaldisk where "DeviceID='${driveRoot.replace(":\\", "")}'" get Size,FreeSpace /format:csv`, { encoding: "utf-8" });
+      const lines = output.split("\n").filter((line) => line.trim());
+      if (lines.length >= 2) {
+        const parts = lines[1].split(",");
+        if (parts.length >= 3) {
+          const freeBytes = parseInt(parts[1], 10);
+          const totalBytes = parseInt(parts[2], 10);
+          if (Number.isFinite(freeBytes) && Number.isFinite(totalBytes)) {
+            return { freeBytes, totalBytes };
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
+}
+
 export function checkFreeSpace(path: string): { freeBytes: number; totalBytes: number } | null {
   try {
     const resolved = require("path").resolve(path);
@@ -60,6 +95,18 @@ export function checkFreeSpace(path: string): { freeBytes: number; totalBytes: n
       checkPath = dirname(checkPath);
       attempts++;
     }
+
+    if (platform() === "win32") {
+      const driveMatch = checkPath.match(/^([A-Za-z]):\\(.+)$/);
+      if (driveMatch) {
+        const driveRoot = `${driveMatch[1]}:\\`;
+        const winSpace = getWindowsDiskSpace(driveRoot);
+        if (winSpace) {
+          return winSpace;
+        }
+      }
+    }
+
     const stats = statSync(checkPath);
     const freeBytes = (stats as unknown as { bavail?: number }).bavail ?? (stats as unknown as { avail?: number }).avail ?? 0;
     const totalBytes = (stats as unknown as { blocks?: number }).blocks ?? (stats as unknown as { size?: number }).size ?? 0;

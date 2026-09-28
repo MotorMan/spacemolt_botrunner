@@ -101,6 +101,7 @@ export interface SellItemConfig {
   autoMinPrice: number;
   autoMaxPrice: number;
   baseTargetPrice: number;
+  blockedStations: string[];
 }
 
 const SKIP_LABELS: Record<FCSkipReason, string> = {
@@ -574,6 +575,7 @@ function defaultSellItems(settings: {
       autoMinPrice: settings.autoMinPrice,
       autoMaxPrice: settings.autoMaxPrice,
       baseTargetPrice: settings.baseTargetPrice,
+      blockedStations: [],
     },
   ];
 }
@@ -628,6 +630,7 @@ export function getFuelCellSellerSettings(username?: string): {
         autoMinPrice: (i.autoMinPrice as number) || autoMinPrice,
         autoMaxPrice: (i.autoMaxPrice as number) || autoMaxPrice,
         baseTargetPrice: (i.baseTargetPrice as number) || baseTargetPrice,
+        blockedStations: Array.isArray(i.blockedStations) ? i.blockedStations.filter((s: unknown) => typeof s === "string") : [],
       }));
   }
   if (sellItems.length === 0) {
@@ -964,6 +967,10 @@ async function buildPreStagePlan(
     let hasNeed = false;
 
     for (const itemConfig of settings.sellItems) {
+      if (itemConfig.blockedStations.includes(entry.poiId) || itemConfig.blockedStations.includes(`${entry.systemId}|${entry.poiId}`)) {
+        continue;
+      }
+
       const remoteQty = await getRemoteStorageQty(bot, entry.poiId, itemConfig.itemId);
       const ledgerQty = getLedgerQty(ledger, entry.poiId, itemConfig.itemId);
       const knownQty = Math.max(remoteQty, ledgerQty);
@@ -1555,6 +1562,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       for (const itemConfig of settings.sellItems) {
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
+
+        if (itemConfig.blockedStations.includes(target.poiId) || itemConfig.blockedStations.includes(`${target.systemId}|${target.poiId}`)) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: blocked for this item`);
+          continue;
+        }
 
         // Re-check remote storage on arrival to avoid over-depositing
         const remoteQty = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);

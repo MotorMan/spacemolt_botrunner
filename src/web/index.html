@@ -20563,12 +20563,21 @@
               <th style="text-align:left;padding:4px;width:80px">Min Price</th>
               <th style="text-align:left;padding:4px;width:80px">Max Price</th>
               <th style="text-align:left;padding:4px;width:80px">Target Price</th>
+              <th style="text-align:left;padding:4px">Blocked Stations</th>
               <th style="width:60px"></th>
             </tr>
           </thead>
           <tbody id="fc-sell-items-body">
             ${fc.sellItems && fc.sellItems.length > 0 ? fc.sellItems.map((item, idx) => {
               const itemName = (catalog.items && catalog.items[item.itemId]) ? (catalog.items[item.itemId].name || item.itemId) : (item.itemName || item.itemId);
+              const blockedStations = Array.isArray(item.blockedStations) ? item.blockedStations : [];
+              const blockedHtml = blockedStations.map((stationVal) => {
+                const parts = stationVal.split("|");
+                const poiId = parts.length > 1 ? parts[1] : parts[0];
+                const sysId = parts.length > 1 ? parts[0] : "";
+                const stationName = poiId ? (catalog.items && catalog.items[poiId] ? (catalog.items[poiId].name || poiId) : poiId) : stationVal;
+                return `<span class="tag" style="margin:2px">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove">✕</button></span>`;
+              }).join("");
               return `
                 <tr data-item-id="${esc(item.itemId)}">
                   <td style="padding:4px">${esc(itemName)}</td>
@@ -20582,6 +20591,33 @@
                   <td style="padding:4px"><input type="number" min="0" value="${item.autoMinPrice || 0}" data-field="autoMinPrice" style="width:70px" /></td>
                   <td style="padding:4px"><input type="number" min="0" value="${item.autoMaxPrice || 0}" data-field="autoMaxPrice" style="width:70px" /></td>
                   <td style="padding:4px"><input type="number" min="0" value="${item.baseTargetPrice || 0}" data-field="baseTargetPrice" style="width:70px" /></td>
+                  <td style="padding:4px">
+                    <div style="display:flex;flex-direction:column;gap:4px">
+                      <div id="fc-blocked-${esc(item.itemId)}">${blockedHtml}</div>
+                      <div style="display:flex;gap:4px">
+                        <select id="fc-blocked-select-${esc(item.itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
+                          <option value="">(add blocked station)</option>
+                          ${(() => {
+                            const stationList = [];
+                            for (const [sysId, sys] of Object.entries(mapData || {})) {
+                              const sysName = sys.name || sysId;
+                              for (const poi of [...(sys.pois || [])].sort((a, b) =>
+                                (a.base_name || a.name || a.id || "").localeCompare(b.base_name || b.name || b.id || ""),
+                              )) {
+                                if (!(poi.has_base || poi.base_id)) continue;
+                                const val = sysId + "|" + poi.id;
+                                const label = poi.base_name || poi.name || poi.id;
+                                stationList.push({ val, label: `${label} (${sysName})` });
+                              }
+                            }
+                            stationList.sort((a, b) => a.label.localeCompare(b.label));
+                            return stationList.map((s) => `<option value="${esc(s.val)}">${esc(s.label)}</option>`).join("");
+                          })()}
+                        </select>
+                        <button class="sm" onclick="addFcBlockedStation('${esc(item.itemId)}')" title="Add blocked station">+</button>
+                      </div>
+                    </div>
+                  </td>
                   <td style="text-align:center"><button class="btn-icon" onclick="removeFcSellItem(this)" title="Remove">✕</button></td>
                 </tr>
               `;
@@ -20666,10 +20702,60 @@
           <td style="padding:4px"><input type="number" min="0" value="30" data-field="autoMinPrice" style="width:70px" /></td>
           <td style="padding:4px"><input type="number" min="0" value="50" data-field="autoMaxPrice" style="width:70px" /></td>
           <td style="padding:4px"><input type="number" min="0" value="40" data-field="baseTargetPrice" style="width:70px" /></td>
+          <td style="padding:4px">
+            <div style="display:flex;flex-direction:column;gap:4px">
+              <div id="fc-blocked-${esc(itemId)}"></div>
+              <div style="display:flex;gap:4px">
+                <select id="fc-blocked-select-${esc(itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
+                  <option value="">(add blocked station)</option>
+                  ${(() => {
+                    const stationList = [];
+                    for (const [sysId, sys] of Object.entries(mapData || {})) {
+                      const sysName = sys.name || sysId;
+                      for (const poi of [...(sys.pois || [])].sort((a, b) =>
+                        (a.base_name || a.name || a.id || "").localeCompare(b.base_name || b.name || b.id || ""),
+                      )) {
+                        if (!(poi.has_base || poi.base_id)) continue;
+                        const val = sysId + "|" + poi.id;
+                        const label = poi.base_name || poi.name || poi.id;
+                        stationList.push({ val, label: `${label} (${sysName})` });
+                      }
+                    }
+                    stationList.sort((a, b) => a.label.localeCompare(b.label));
+                    return stationList.map((s) => `<option value="${esc(s.val)}">${esc(s.label)}</option>`).join("");
+                  })()}
+                </select>
+                <button class="sm" onclick="addFcBlockedStation('${esc(itemId)}')" title="Add blocked station">+</button>
+              </div>
+            </div>
+          </td>
           <td style="text-align:center"><button class="btn-icon" onclick="removeFcSellItem(this)" title="Remove">✕</button></td>
         `;
         tbody.appendChild(tr);
         sel.value = "";
+      }
+
+      function addFcBlockedStation(itemId) {
+        const select = document.getElementById("fc-blocked-select-" + itemId);
+        if (!select || !select.value) return;
+        const stationVal = select.value;
+        const container = document.getElementById("fc-blocked-" + itemId);
+        if (!container) return;
+        const parts = stationVal.split("|");
+        const poiId = parts.length > 1 ? parts[1] : parts[0];
+        const stationName = (catalog.items && catalog.items[poiId]) ? (catalog.items[poiId].name || poiId) : poiId;
+        const tag = document.createElement("span");
+        tag.className = "tag";
+        tag.style.margin = "2px";
+        tag.setAttribute("data-station", stationVal);
+        tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove">✕</button>`;
+        container.appendChild(tag);
+        select.value = "";
+      }
+
+      function removeFcBlockedStation(btn, stationVal) {
+        const tag = btn.closest("span[data-station]");
+        if (tag) tag.remove();
       }
 
       function removeFcSellItem(btn) {
@@ -20693,6 +20779,14 @@
             const n = parseInt(v, 10);
             return Number.isFinite(n) ? n : 0;
           };
+          const blockedContainer = row.querySelector(`[id^="fc-blocked-"]`);
+          const blockedStations = [];
+          if (blockedContainer) {
+            const tags = blockedContainer.querySelectorAll("span[data-station]");
+            for (const tag of tags) {
+              blockedStations.push(tag.getAttribute("data-station") || "");
+            }
+          }
           const itemName = (catalog.items && catalog.items[itemId]) ? (catalog.items[itemId].name || itemId) : itemId;
           items.push({
             itemId,
@@ -20702,6 +20796,7 @@
             autoMinPrice: get("autoMinPrice") || 30,
             autoMaxPrice: get("autoMaxPrice") || 50,
             baseTargetPrice: get("baseTargetPrice") || 40,
+            blockedStations,
           });
         }
         return items;

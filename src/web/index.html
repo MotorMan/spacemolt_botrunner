@@ -20563,8 +20563,8 @@
               <th style="text-align:left;padding:4px;width:80px">Min Price</th>
               <th style="text-align:left;padding:4px;width:80px">Max Price</th>
               <th style="text-align:left;padding:4px;width:80px">Target Price</th>
-              <th style="text-align:left;padding:4px">Blocked Stations</th>
-              <th style="width:60px"></th>
+              <th style="text-align:left;padding:4px;min-width:220px">Blocked Stations</th>
+              <th style="text-align:center;padding:4px;width:90px">Item</th>
             </tr>
           </thead>
           <tbody id="fc-sell-items-body">
@@ -20573,10 +20573,11 @@
               const blockedStations = Array.isArray(item.blockedStations) ? item.blockedStations : [];
               const blockedHtml = blockedStations.map((stationVal) => {
                 const parts = stationVal.split("|");
-                const poiId = parts.length > 1 ? parts[1] : parts[0];
                 const sysId = parts.length > 1 ? parts[0] : "";
-                const stationName = poiId ? (catalog.items && catalog.items[poiId] ? (catalog.items[poiId].name || poiId) : poiId) : stationVal;
-                return `<span class="tag" style="margin:2px">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove">✕</button></span>`;
+                const poiId = parts.length > 1 ? parts[1] : parts[0];
+                const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
+                const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
+                return `<span class="tag" style="margin:2px;white-space:nowrap">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
               }).join("");
               return `
                 <tr data-item-id="${esc(item.itemId)}">
@@ -20618,7 +20619,9 @@
                       </div>
                     </div>
                   </td>
-                  <td style="text-align:center"><button class="btn-icon" onclick="removeFcSellItem(this)" title="Remove">✕</button></td>
+                  <td style="text-align:center;padding:4px;white-space:nowrap">
+                    <button class="sm danger" onclick="if(confirm('Remove this sell item and all its blocked stations?')) removeFcSellItem(this)" title="Remove sell item">Remove</button>
+                  </td>
                 </tr>
               `;
             }).join("") : ""}
@@ -20742,13 +20745,15 @@
         const container = document.getElementById("fc-blocked-" + itemId);
         if (!container) return;
         const parts = stationVal.split("|");
+        const sysId = parts.length > 1 ? parts[0] : "";
         const poiId = parts.length > 1 ? parts[1] : parts[0];
-        const stationName = (catalog.items && catalog.items[poiId]) ? (catalog.items[poiId].name || poiId) : poiId;
+        const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
+        const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
         const tag = document.createElement("span");
         tag.className = "tag";
         tag.style.margin = "2px";
         tag.setAttribute("data-station", stationVal);
-        tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove">✕</button>`;
+        tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove station">✕</button>`;
         container.appendChild(tag);
         select.value = "";
       }

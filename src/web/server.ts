@@ -3058,6 +3058,17 @@ if (!this.settings.fuel_service) {
           });
         }
 
+        // Serve market-routine-settings.html for market routine settings route
+        if (url.pathname === "/market-routine-settings.html") {
+          const routinePath = join(import.meta.dir, "market-routine-settings.html");
+          return new Response(readFileSync(routinePath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve lexSeller.html for the LEx Seller (Local Exchange Seller) UI
         if (url.pathname === "/lexSeller.html") {
           const lexPath = join(import.meta.dir, "lexSeller.html");

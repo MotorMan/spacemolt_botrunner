@@ -20577,7 +20577,7 @@
                 const poiId = parts.length > 1 ? parts[1] : parts[0];
                 const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
                 const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
-                return `<span class="tag" data-station="${esc(stationVal)}" style="margin:2px;white-space:nowrap">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
+                return `<span class="tag" data-station="${esc(stationVal)}" style="margin:2px">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
               }).join("");
               return `
                 <tr data-item-id="${esc(item.itemId)}">
@@ -20594,7 +20594,7 @@
                   <td style="padding:4px"><input type="number" min="0" value="${item.baseTargetPrice || 0}" data-field="baseTargetPrice" style="width:70px" /></td>
                   <td style="padding:4px">
                     <div style="display:flex;flex-direction:column;gap:4px">
-                      <div id="fc-blocked-${esc(item.itemId)}">${blockedHtml}</div>
+                       <div id="fc-blocked-${esc(item.itemId)}" style="display:flex;flex-wrap:wrap;gap:4px;align-items:center">${blockedHtml}</div>
                       <div style="display:flex;gap:4px">
                         <select id="fc-blocked-select-${esc(item.itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
                           <option value="">(add blocked station)</option>
@@ -20708,8 +20708,8 @@
           <td style="padding:4px"><input type="number" min="0" value="50" data-field="autoMaxPrice" style="width:70px" /></td>
           <td style="padding:4px"><input type="number" min="0" value="40" data-field="baseTargetPrice" style="width:70px" /></td>
           <td style="padding:4px">
-            <div style="display:flex;flex-direction:column;gap:4px">
-              <div id="fc-blocked-${esc(itemId)}"></div>
+             <div style="display:flex;flex-direction:column;gap:4px">
+               <div id="fc-blocked-${esc(itemId)}" style="display:flex;flex-wrap:wrap;gap:4px;align-items:center"></div>
               <div style="display:flex;gap:4px">
                 <select id="fc-blocked-select-${esc(itemId)}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:2px 4px;flex:1;font-size:11px">
                   <option value="">(add blocked station)</option>
@@ -20757,12 +20757,31 @@
         tag.setAttribute("data-station", stationVal);
         tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station">✕</button>`;
         container.appendChild(tag);
+        const optionToRemove = select.querySelector(`option[value="${esc(stationVal)}"]`);
+        if (optionToRemove) optionToRemove.remove();
         select.value = "";
       }
 
       function removeFcBlockedStation(btn, stationVal) {
         const tag = btn.closest("span[data-station]");
         if (tag) tag.remove();
+        const itemId = tag?.closest("tr[data-item-id]")?.getAttribute("data-item-id");
+        if (!itemId) return;
+        const select = document.getElementById("fc-blocked-select-" + itemId);
+        if (!select) return;
+        const exists = select.querySelector(`option[value="${esc(stationVal)}"]`);
+        if (!exists) {
+          const option = document.createElement("option");
+          option.value = stationVal;
+          const parts = stationVal.split("|");
+          const sysId = parts.length > 1 ? parts[0] : "";
+          const poiId = parts.length > 1 ? parts[1] : parts[0];
+          const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
+          const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
+          const sysName = mapData[sysId]?.name || sysId;
+          option.textContent = `${stationName} (${sysName})`;
+          select.appendChild(option);
+        }
       }
 
       function removeFcSellItem(btn) {

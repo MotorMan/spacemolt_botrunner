@@ -388,10 +388,19 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
 
             const cargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
             const cargoQty = cargoItem?.quantity || 0;
+            const freeSpace = (bot.cargoMax || 0) - (bot.cargo || 0);
 
-            if (cargoQty <= 0) {
+            if (freeSpace <= 0 && cargoQty <= 0) continue;
+
+            let sellQty = Math.min(buyQty, cargoQty + Math.max(0, freeSpace));
+            sellQty = Math.max(0, sellQty);
+
+            if (sellQty <= 0) continue;
+
+            let needWithdraw = Math.max(0, sellQty - cargoQty);
+            if (needWithdraw > 0) {
               try {
-                const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: watchedItem.itemId, quantity: buyQty });
+                const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: watchedItem.itemId, quantity: needWithdraw });
                 if (wResp.error) {
                   ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
                   continue;
@@ -401,12 +410,6 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
                 continue;
               }
             }
-
-            const updatedCargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-            const updatedCargoQty = updatedCargoItem?.quantity || 0;
-            const sellQty = Math.min(buyQty, updatedCargoQty);
-
-            if (sellQty <= 0) continue;
 
             try {
               const sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: watchedItem.minSellPrice });

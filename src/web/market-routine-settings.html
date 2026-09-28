@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Market Routine Settings</title>
+<link rel="stylesheet" href="/index.css" />
+<style>
+  body { background: var(--bg-primary); color: var(--text-primary); font-family: var(--font-body); }
+  .page-wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .page-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; }
+  .page-header h1 { margin: 0; font-size: 22px; }
+  .section { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .section h2 { margin: 0 0 12px 0; font-size: 16px; color: var(--text-bright); }
+  .section h3 { margin: 0 0 8px 0; font-size: 14px; color: var(--text-bright); }
+  .item-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .item-row select, .item-row input { padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); font-size: 13px; }
+  .item-row input[type="number"] { width: 100px; }
+  .item-row input[type="text"] { flex: 1; min-width: 180px; }
+  .btn { padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); cursor: pointer; font-size: 13px; }
+  .btn:hover { background: var(--bg-tertiary); }
+  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.danger { background: var(--error); color: #fff; border-color: var(--error); }
+  .btn.sm { padding: 4px 8px; font-size: 12px; }
+  .bot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .bot-card { background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
+  .bot-card h3 { margin: 0 0 8px 0; font-size: 14px; display: flex; align-items: center; justify-content: space-between; }
+  .bot-card .badge { font-size: 11px; padding: 2px 6px; border-radius: 3px; background: var(--accent); color: #fff; }
+  .hint { font-size: 12px; color: var(--text-dim); margin-top: 4px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar select, .toolbar input { padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); font-size: 13px; }
+  .empty { color: var(--text-dim); font-size: 13px; padding: 8px 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--text-dim); font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="page-wrap">
+  <div class="page-header">
+    <h1>Market Routine Settings</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn primary" id="saveBtn">Save Settings</button>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Global Watch List</h2>
+    <div class="hint">Items watched by every market bot, unless a bot has its own per-bot list configured below.</div>
+    <div class="toolbar">
+      <select id="globalItemSelect">
+        <option value="">-- select item --</option>
+      </select>
+      <input type="number" id="globalMinPrice" placeholder="Min sell price" min="0" step="1" />
+      <button class="btn" id="globalAddBtn">Add</button>
+      <button class="btn sm" id="loadStorageBtn">Load Faction Storage Items</button>
+      <span class="hint" id="globalStatus"></span>
+    </div>
+    <div id="globalItems"></div>
+  </div>
+
+  <div class="section">
+    <h2>Per-Bot Settings</h2>
+    <div class="hint">Override or extend the global watch list for individual market bots. Bots with no per-bot items inherit the global list.</div>
+    <div class="toolbar">
+      <select id="botSelect">
+        <option value="">-- select bot --</option>
+      </select>
+      <button class="btn" id="addBotOverrideBtn">Enable Per-Bot Override</button>
+      <span class="hint" id="botStatus"></span>
+    </div>
+    <div id="perBotArea" style="display:none">
+      <div class="toolbar" style="margin-top:8px">
+        <select id="botItemSelect">
+          <option value="">-- select item --</option>
+        </select>
+        <input type="number" id="botMinPrice" placeholder="Min sell price" min="0" step="1" />
+        <button class="btn" id="botAddBtn">Add</button>
+      </div>
+      <div id="botItems"></div>
+      <div style="margin-top:8px">
+        <button class="btn danger sm" id="clearBotOverrideBtn">Clear Per-Bot Override (use global)</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  let globalItems = [];
+  let perBot = {};
+  let allBots = [];
+  let factionItems = [];
+
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  async function api(path, opts) {
+    const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...opts });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function loadSettings() {
+    const data = await api("/api/market-routine-settings");
+    globalItems = Array.isArray(data.global) ? data.global : [];
+    perBot = data.perBot || {};
+    renderGlobalItems();
+    renderPerBotSection();
+  }
+
+  async function saveSettings() {
+    await api("/api/market-routine-settings", { method: "POST", body: JSON.stringify({ global: globalItems, perBot }) });
+    document.getElementById("saveBtn").textContent = "Saved!";
+    setTimeout(() => { document.getElementById("saveBtn").textContent = "Save Settings"; }, 1500);
+  }
+
+  async function loadBots() {
+    const data = await api("/api/bots");
+    allBots = Array.isArray(data) ? data : [];
+    const marketBots = allBots.filter(b => b.routine === "market" || b.state === "running");
+    const botSel = document.getElementById("botSelect");
+    botSel.innerHTML = '<option value="">-- select bot --</option>' +
+      marketBots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join("");
+  }
+
+  async function loadFactionStorage() {
+    try {
+      const list = await api("/api/faction-storage/list");
+      const caches = list.caches || [];
+      if (!caches.length) {
+        factionItems = [];
+        alert("No faction storage caches found.");
+        return;
+      }
+      const settings = await api("/api/settings");
+      const general = settings.general || {};
+      const station = general.factionStorageStation || "";
+      const faction = general.factionName || "";
+      let cache = caches.find(c => c.station === station && c.factionName === faction);
+      if (!cache) cache = caches[0];
+      const data = await api(`/api/faction-storage?station=${encodeURIComponent(cache.station)}&faction=${encodeURIComponent(cache.factionName)}`);
+      factionItems = (data.items || []).map(i => ({ itemId: i.itemId || i.item_id || "", itemName: i.name || i.item_name || i.itemId || i.item_id || "" }));
+      populateItemSelects();
+      document.getElementById("globalStatus").textContent = `Loaded ${factionItems.length} items from ${cache.factionName} @ ${cache.station}`;
+    } catch (e) {
+      console.error(e);
+      alert("Failed to load faction storage: " + e.message);
+    }
+  }
+
+  function populateItemSelects() {
+    const opts = factionItems.map(i => `<option value="${esc(i.itemId)}" data-name="${esc(i.itemName)}">${esc(i.itemName)} (${esc(i.itemId)})</option>`).join("");
+    const fallback = '<option value="">-- select item --</option>';
+    document.getElementById("globalItemSelect").innerHTML = fallback + opts;
+    document.getElementById("botItemSelect").innerHTML = fallback + opts;
+  }
+
+  function renderGlobalItems() {
+    const container = document.getElementById("globalItems");
+    if (!globalItems.length) {
+      container.innerHTML = '<div class="empty">No global items configured.</div>';
+      return;
+    }
+    container.innerHTML = `<table><thead><tr><th>Item</th><th>Min Sell Price</th><th></th></tr></thead><tbody>` +
+      globalItems.map((it, idx) => `
+        <tr>
+          <td>${esc(it.itemName || it.itemId)}</td>
+          <td><input type="number" value="${it.minSellPrice}" data-idx="${idx}" class="global-price-input" min="0" step="1" style="width:100px" /></td>
+          <td><button class="btn danger sm" onclick="window._removeGlobalItem(${idx})">Remove</button></td>
+        </tr>
+      `).join("") + `</tbody></table>`;
+  }
+
+  function renderPerBotSection() {
+    const container = document.getElementById("botItems");
+    const botSel = document.getElementById("botSelect");
+    const botName = botSel.value;
+    const area = document.getElementById("perBotArea");
+    if (!botName) {
+      area.style.display = "none";
+      container.innerHTML = "";
+      return;
+    }
+    area.style.display = "";
+    const items = perBot[botName] || [];
+    if (!items.length) {
+      container.innerHTML = '<div class="empty">No per-bot items configured. This bot inherits the global list.</div>';
+      return;
+    }
+    container.innerHTML = `<table><thead><tr><th>Item</th><th>Min Sell Price</th><th></th></tr></thead><tbody>` +
+      items.map((it, idx) => `
+        <tr>
+          <td>${esc(it.itemName || it.itemId)}</td>
+          <td><input type="number" value="${it.minSellPrice}" data-idx="${idx}" class="bot-price-input" min="0" step="1" style="width:100px" /></td>
+          <td><button class="btn danger sm" onclick="window._removeBotItem('${esc(botName)}', ${idx})">Remove</button></td>
+        </tr>
+      `).join("") + `</tbody></table>`;
+  }
+
+  window._removeGlobalItem = function (idx) {
+    globalItems.splice(idx, 1);
+    renderGlobalItems();
+  };
+
+  window._removeBotItem = function (botName, idx) {
+    if (perBot[botName]) {
+      perBot[botName].splice(idx, 1);
+      if (!perBot[botName].length) delete perBot[botName];
+    }
+    renderPerBotSection();
+  };
+
+  document.getElementById("globalAddBtn").addEventListener("click", async () => {
+    const sel = document.getElementById("globalItemSelect");
+    const priceInput = document.getElementById("globalMinPrice");
+    const itemId = sel.value;
+    const itemName = sel.options[sel.selectedIndex]?.dataset?.name || itemId;
+    const minSellPrice = parseInt(priceInput.value, 10) || 0;
+    if (!itemId) return;
+    if (globalItems.some(i => i.itemId === itemId)) {
+      alert("Item already in global list.");
+      return;
+    }
+    globalItems.push({ itemId, itemName, minSellPrice });
+    priceInput.value = "";
+    renderGlobalItems();
+    await saveSettings();
+  });
+
+  document.getElementById("botAddBtn").addEventListener("click", async () => {
+    const botName = document.getElementById("botSelect").value;
+    const sel = document.getElementById("botItemSelect");
+    const priceInput = document.getElementById("botMinPrice");
+    const itemId = sel.value;
+    const itemName = sel.options[sel.selectedIndex]?.dataset?.name || itemId;
+    const minSellPrice = parseInt(priceInput.value, 10) || 0;
+    if (!botName || !itemId) return;
+    if (!perBot[botName]) perBot[botName] = [];
+    if (perBot[botName].some(i => i.itemId === itemId)) {
+      alert("Item already in this bot's list.");
+      return;
+    }
+    perBot[botName].push({ itemId, itemName, minSellPrice });
+    priceInput.value = "";
+    renderPerBotSection();
+    await saveSettings();
+  });
+
+  document.getElementById("addBotOverrideBtn").addEventListener("click", async () => {
+    const botName = document.getElementById("botSelect").value;
+    if (!botName) return;
+    if (!perBot[botName]) perBot[botName] = [];
+    document.getElementById("perBotArea").style.display = "";
+    renderPerBotSection();
+    await saveSettings();
+  });
+
+  document.getElementById("clearBotOverrideBtn").addEventListener("click", async () => {
+    const botName = document.getElementById("botSelect").value;
+    if (!botName) return;
+    if (!confirm(`Clear per-bot override for ${botName}? It will inherit the global list.`)) return;
+    delete perBot[botName];
+    renderPerBotSection();
+    await saveSettings();
+  });
+
+  document.getElementById("loadStorageBtn").addEventListener("click", loadFactionStorage);
+
+  document.getElementById("saveBtn").addEventListener("click", async () => {
+    await saveSettings();
+  });
+
+  document.getElementById("botSelect").addEventListener("change", renderPerBotSection);
+
+  document.getElementById("globalItems").addEventListener("input", async (e) => {
+    if (e.target.classList.contains("global-price-input")) {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && globalItems[idx]) {
+        globalItems[idx].minSellPrice = parseInt(e.target.value, 10) || 0;
+        await saveSettings();
+      }
+    }
+  });
+
+  document.getElementById("botItems").addEventListener("input", async (e) => {
+    if (e.target.classList.contains("bot-price-input")) {
+      const botName = document.getElementById("botSelect").value;
+      const idx = parseInt(e.target.dataset.idx, 10);
+      if (!isNaN(idx) && botName && perBot[botName] && perBot[botName][idx]) {
+        perBot[botName][idx].minSellPrice = parseInt(e.target.value, 10) || 0;
+        await saveSettings();
+      }
+    }
+  });
+
+  async function init() {
+    await loadBots();
+    await loadSettings();
+    const settings = await api("/api/settings");
+    const general = settings.general || {};
+    const station = general.factionStorageStation || "";
+    const faction = general.factionName || "";
+    if (station) {
+      await loadFactionStorage();
+    }
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>

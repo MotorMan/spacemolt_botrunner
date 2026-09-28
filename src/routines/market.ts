@@ -10,6 +10,7 @@ import {
 import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
 import { updateShipListings } from "../shipsforsale.js";
 import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
+import { loadSettings } from "../web/server.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
@@ -92,6 +93,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let lastShipBrowseAt = 0;
   const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
   let wasConnected = bot.isConnected();
+  const placedOrders = new Map<string, { price: number; quantity: number }>();
 
   // Observation subscription: collect the player/pirate/empire-NPC data this bot
   // sees at every station (same intent as the get_nearby feed, but via the live
@@ -313,6 +315,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
 
           subscribeMarketUpdates(baseId, bot.system, bot.poi, stationName);
           currentBaseId = baseId;
+          placedOrders.clear();
 
           ctx.log("info", `Market subscription active: ${items.length} items at ${baseId}`);
 
@@ -352,6 +355,75 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", `browse_ships error: ${err instanceof Error ? err.message : String(err)}`);
       }
       lastShipBrowseAt = Date.now();
+    }
+
+    try {
+      const settings = loadSettings();
+      const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+      const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
+      const perBotItems = (botSettings.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+      const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
+
+      if (effectiveItems.length > 0 && currentBaseId) {
+        const entry = marketStreamStore.getMarket(currentBaseId);
+        if (entry && entry.items) {
+          for (const watchedItem of effectiveItems) {
+            const marketItem = entry.items.find(i => (i.item_id as string) === watchedItem.itemId);
+            if (!marketItem || !marketItem.buy_orders || marketItem.buy_orders.length === 0) continue;
+
+            const bestBuy = marketItem.buy_orders
+              .filter(o => (o.price_each as number) > 0 && (o.quantity as number) > 0)
+              .sort((a, b) => (b.price_each as number) - (a.price_each as number))[0];
+
+            if (!bestBuy) continue;
+
+            const buyPrice = bestBuy.price_each as number;
+            const buyQty = bestBuy.quantity as number;
+
+            if (buyPrice < watchedItem.minSellPrice) continue;
+
+            const orderKey = `${watchedItem.itemId}:${buyPrice}:${buyQty}`;
+            const lastOrder = placedOrders.get(watchedItem.itemId);
+            if (lastOrder && lastOrder.price === buyPrice && lastOrder.quantity === buyQty) continue;
+
+            const cargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+            const cargoQty = cargoItem?.quantity || 0;
+
+            if (cargoQty <= 0) {
+              try {
+                const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: watchedItem.itemId, quantity: buyQty });
+                if (wResp.error) {
+                  ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
+                  continue;
+                }
+              } catch (e) {
+                ctx.log("warn", `Market routine: withdraw exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+                continue;
+              }
+            }
+
+            const updatedCargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+            const updatedCargoQty = updatedCargoItem?.quantity || 0;
+            const sellQty = Math.min(buyQty, updatedCargoQty);
+
+            if (sellQty <= 0) continue;
+
+            try {
+              const sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: watchedItem.minSellPrice });
+              if (sellResp.error) {
+                ctx.log("error", `Market routine: create_sell_order failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
+              } else {
+                ctx.log("trade", `Market routine: placed sell order ${sellQty}x ${watchedItem.itemName} @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`);
+                placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
+              }
+            } catch (e) {
+              ctx.log("error", `Market routine: create_sell_order exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+            }
+          }
+        }
+      }
+    } catch {
+      /* ignore market routine settings errors */
     }
 
     await ctx.sleep(30000);

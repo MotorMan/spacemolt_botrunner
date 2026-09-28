@@ -1303,6 +1303,42 @@ if (!this.settings.fuel_service) {
             return Response.json({ ok: true });
           }
         }
+        if (url.pathname === "/api/market-routine-settings") {
+          if (req.method === "GET") {
+            const settings = this.settings;
+            const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+            const perBot: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> = {};
+            for (const [key, value] of Object.entries(settings)) {
+              if (key === "market_routine" || key === "general" || key === "clerk" || key === "flock" || key === "botAssignments") continue;
+              const obj = value as Record<string, unknown> | undefined;
+              const items = obj?.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number}> | undefined;
+              if (items && items.length > 0) {
+                perBot[key] = items;
+              }
+            }
+            return Response.json({ global: globalItems, perBot });
+          }
+          if (req.method === "POST") {
+            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> };
+            if (!this.settings.market_routine) this.settings.market_routine = {};
+            if (body.global) {
+              this.settings.market_routine.globalItems = body.global;
+            }
+            if (body.perBot) {
+              for (const [botName, items] of Object.entries(body.perBot)) {
+                if (items && items.length > 0) {
+                  this.settings[botName] = { ...(this.settings[botName] as Record<string, unknown> || {}), marketRoutineItems: items };
+                } else {
+                  if (this.settings[botName]) {
+                    delete (this.settings[botName] as Record<string, unknown>).marketRoutineItems;
+                  }
+                }
+              }
+            }
+            saveSettings(this.settings);
+            return Response.json({ ok: true });
+          }
+        }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
         }

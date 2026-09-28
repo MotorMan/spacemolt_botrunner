@@ -20577,7 +20577,7 @@
                 const poiId = parts.length > 1 ? parts[1] : parts[0];
                 const poi = (mapData[sysId]?.pois || []).find(p => p.id === poiId);
                 const stationName = poi ? (poi.base_name || poi.name || poiId) : (poiId || stationVal);
-                return `<span class="tag" style="margin:2px;white-space:nowrap">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
+                return `<span class="tag" data-station="${esc(stationVal)}" style="margin:2px;white-space:nowrap">${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station" style="margin-left:2px;font-size:10px">✕</button></span>`;
               }).join("");
               return `
                 <tr data-item-id="${esc(item.itemId)}">
@@ -20755,7 +20755,7 @@
         tag.className = "tag";
         tag.style.margin = "2px";
         tag.setAttribute("data-station", stationVal);
-        tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${esc(stationVal)}')" title="Remove station">✕</button>`;
+        tag.innerHTML = `${esc(stationName)}<button class="btn-icon" onclick="removeFcBlockedStation(this, '${escJs(stationVal)}')" title="Remove station">✕</button>`;
         container.appendChild(tag);
         select.value = "";
       }
@@ -20786,7 +20786,7 @@
             const n = parseInt(v, 10);
             return Number.isFinite(n) ? n : 0;
           };
-          const blockedContainer = row.querySelector(`[id^="fc-blocked-"]`);
+          const blockedContainer = row.querySelector("div[id^='fc-blocked-']");
           const blockedStations = [];
           if (blockedContainer) {
             const tags = blockedContainer.querySelectorAll("span[data-station]");

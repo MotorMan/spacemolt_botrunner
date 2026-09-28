@@ -2674,9 +2674,9 @@
               }
               break;
             case "settings_updated":
-              // Settings were updated on disk by a bot routine (e.g., cargo mover delivery tracking)
               const prevSystemBlacklist = settings.system_blacklist;
               const prevStationBlacklist = settings.station_blacklist;
+              const prevFcSellItems = settings.fuel_cell_seller?.sellItems;
               settings = msg.settings;
               if (settingsPanelDirty()) {
                 if (activeSettingsTab === "system_blacklist") {
@@ -2684,6 +2684,11 @@
                 }
                 if (activeSettingsTab === "station_blacklist") {
                   settings.station_blacklist = prevStationBlacklist;
+                }
+                if (activeSettingsTab === "fuel_cell_seller") {
+                  if (prevFcSellItems) {
+                    settings.fuel_cell_seller = Object.assign({}, settings.fuel_cell_seller, { sellItems: prevFcSellItems });
+                  }
                 }
               }
               applyWindowTitle();
@@ -13605,6 +13610,24 @@
         return false;
       }
 
+      function fuelCellSellerTabDirty() {
+        if (activeSettingsTab !== "fuel_cell_seller") return false;
+        const fc = settings.fuel_cell_seller || {};
+        const sellItems = Array.isArray(fc.sellItems) ? fc.sellItems : [];
+        for (const item of sellItems) {
+          const container = document.getElementById("fc-blocked-" + item.itemId);
+          if (!container) continue;
+          const domTags = Array.from(container.querySelectorAll("span[data-station]"));
+          const domSet = new Set(domTags.map((t) => t.getAttribute("data-station") || ""));
+          const savedSet = new Set((item.blockedStations || []).filter((s) => typeof s === "string"));
+          if (domSet.size !== savedSet.size) return true;
+          for (const s of domSet) {
+            if (!savedSet.has(s)) return true;
+          }
+        }
+        return false;
+      }
+
       // Generic guard: true when the open settings tab has unsaved edits in the
       // DOM. This generalizes the miner-quotas-specific minerQuotaTabDirty()
       // guard so every settings page is protected against background refreshes
@@ -13637,6 +13660,7 @@
         if (minerQuotaTabDirty()) return true;
         if (systemBlacklistTabDirty()) return true;
         if (stationBlacklistTabDirty()) return true;
+        if (fuelCellSellerTabDirty()) return true;
         return false;
       }
 

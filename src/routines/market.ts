@@ -360,6 +360,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
     try {
       const settings = loadSettings();
       const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+      const useSellCommand = !!((settings.market_routine as Record<string, unknown>) || {}).useSellCommand;
       const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
       const perBotItems = (botSettings.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
       const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
@@ -412,15 +413,35 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
             }
 
             try {
-              const sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: watchedItem.minSellPrice });
-              if (sellResp.error) {
-                ctx.log("error", `Market routine: create_sell_order failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
+              let sellResp;
+              if (useSellCommand) {
+                sellResp = await bot.exec("sell", { item_id: watchedItem.itemId, quantity: sellQty });
               } else {
-                ctx.log("trade", `Market routine: placed sell order ${sellQty}x ${watchedItem.itemName} @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`);
+                sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: watchedItem.minSellPrice });
+              }
+              if (sellResp.error) {
+                ctx.log("error", `Market routine: ${useSellCommand ? "sell" : "create_sell_order"} failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
+              } else {
+                ctx.log("trade", `Market routine: sold ${sellQty}x ${watchedItem.itemName}${useSellCommand ? " via sell command" : ` @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`}`);
                 placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
+
+                const remaining = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+                const remainingQty = remaining?.quantity || 0;
+                if (remainingQty > 0) {
+                  try {
+                    const depositResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: watchedItem.itemId, quantity: remainingQty });
+                    if (depositResp.error) {
+                      ctx.log("warn", `Market routine: failed to deposit leftover ${remainingQty}x ${watchedItem.itemName}: ${depositResp.error.message}`);
+                    } else {
+                      ctx.log("trade", `Market routine: deposited leftover ${remainingQty}x ${watchedItem.itemName} back to faction storage`);
+                    }
+                  } catch (e) {
+                    ctx.log("warn", `Market routine: deposit exception for leftover ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }
               }
             } catch (e) {
-              ctx.log("error", `Market routine: create_sell_order exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+              ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
             }
           }
         }

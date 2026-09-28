@@ -1307,6 +1307,7 @@ if (!this.settings.fuel_service) {
           if (req.method === "GET") {
             const settings = this.settings;
             const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+            const useSellCommand = !!((settings.market_routine as Record<string, unknown>) || {}).useSellCommand;
             const perBot: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> = {};
             for (const [key, value] of Object.entries(settings)) {
               if (key === "market_routine" || key === "general" || key === "clerk" || key === "flock" || key === "botAssignments") continue;
@@ -1316,14 +1317,17 @@ if (!this.settings.fuel_service) {
                 perBot[key] = items;
               }
             }
-            return Response.json({ global: globalItems, perBot });
+            return Response.json({ global: globalItems, perBot, useSellCommand });
           }
           if (req.method === "POST") {
-            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> };
-            console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [] });
+            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>>; useSellCommand?: boolean };
+            console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [], useSellCommand: body.useSellCommand });
             if (!this.settings.market_routine) this.settings.market_routine = {};
             if (body.global) {
               this.settings.market_routine.globalItems = body.global;
+            }
+            if (body.useSellCommand !== undefined) {
+              this.settings.market_routine.useSellCommand = body.useSellCommand;
             }
             if (body.perBot) {
               for (const [botName, items] of Object.entries(body.perBot)) {

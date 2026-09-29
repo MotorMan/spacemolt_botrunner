@@ -54,6 +54,8 @@ const MILITARY_FUEL_CELL_ITEM_ID = "military_fuel_cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
 const FC_PRESTAGE_LEDGER_FILE = "data/fcPreStageLedger.json";
 const FC_PRESTAGE_LOCK_FILE = "data/fcPreStage.lock";
+const FC_PRESTAGE_RESERVATIONS_FILE = "data/fcPreStageReservations.json";
+const RESERVATION_TIMEOUT_MS = 15 * 60 * 1000;
 /** Curated list of NPC stations. Used only as an exemption list: an NPC station
  *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
  *  station with a market and must never be mistaken as a faction outpost. */
@@ -917,6 +919,62 @@ async function withPreStageLock(bot: Bot, fn: () => Promise<void>): Promise<void
   await fn();
 }
 
+function loadReservations(): Record<string, { botName: string; reservedAt: string }> {
+  try {
+    if (!existsSync(FC_PRESTAGE_RESERVATIONS_FILE)) return {};
+    const raw = readFileSync(FC_PRESTAGE_RESERVATIONS_FILE, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+}
+
+function saveReservations(reservations: Record<string, { botName: string; reservedAt: string }>): void {
+  const payload = JSON.stringify(reservations, null, 2);
+  safeWriteFileSync(FC_PRESTAGE_RESERVATIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
+}
+
+function cleanExpiredReservations(reservations: Record<string, { botName: string; reservedAt: string }>): void {
+  const now = Date.now();
+  for (const [stationId, res] of Object.entries(reservations)) {
+    const reservedAt = new Date(res.reservedAt).getTime();
+    if (now - reservedAt > RESERVATION_TIMEOUT_MS) {
+      delete reservations[stationId];
+    }
+  }
+}
+
+function reserveStation(
+  reservations: Record<string, { botName: string; reservedAt: string }>,
+  stationId: string,
+  botName: string,
+): void {
+  reservations[stationId] = { botName, reservedAt: new Date().toISOString() };
+}
+
+function clearStationReservation(
+  reservations: Record<string, { botName: string; reservedAt: string }>,
+  stationId: string,
+  botName: string,
+): void {
+  const res = reservations[stationId];
+  if (res && res.botName === botName) {
+    delete reservations[stationId];
+  }
+}
+
+function isStationReserved(
+  reservations: Record<string, { botName: string; reservedAt: string }>,
+  stationId: string,
+  botName: string,
+): boolean {
+  const res = reservations[stationId];
+  if (!res) return false;
+  const reservedAt = new Date(res.reservedAt).getTime();
+  if (Date.now() - reservedAt > RESERVATION_TIMEOUT_MS) return false;
+  return res.botName !== botName;
+}
+
 async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<number> {
   // Try faction storage first
   try {
@@ -1367,7 +1425,31 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
         continue;
       }
-      targetIdx = preStagePlan[0].idx;
+
+      let selectedPlanIdx = -1;
+      await withPreStageLock(bot, async () => {
+        const reservations = loadReservations();
+        cleanExpiredReservations(reservations);
+
+        const planOffset = fcData.currentStationIndex % preStagePlan.length;
+        for (let i = 0; i < preStagePlan.length; i++) {
+          const candidatePlanIdx = (planOffset + i) % preStagePlan.length;
+          const candidate = preStagePlan[candidatePlanIdx];
+          if (!isStationReserved(reservations, candidate.entry.poiId, bot.username)) {
+            selectedPlanIdx = candidatePlanIdx;
+            targetIdx = candidate.idx;
+            reserveStation(reservations, candidate.entry.poiId, bot.username);
+            saveReservations(reservations);
+            break;
+          }
+        }
+      });
+
+      if (selectedPlanIdx < 0) {
+        ctx.log("fc", "All stations in pre-stage plan are reserved by other bots — waiting");
+        await ctx.sleep(30000);
+        continue;
+      }
     } else {
       if (targetIdx < 0) {
         if (fcData.stations.length === 0) {
@@ -1460,6 +1542,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       if (!travelResult.success) {
         ctx.log("error", `Travel to ${target.poiName} failed${travelResult.usedHint ? ` after redirect to ${travelResult.hintSystem}` : ''} — skipping station`);
+        if (settings.preStageMode === "preStage") {
+          const reservations = loadReservations();
+          clearStationReservation(reservations, target.poiId, bot.username);
+          saveReservations(reservations);
+        }
         fcData.currentStationIndex = targetIdx;
         saveFCStationsData(fcData);
         continue;
@@ -1477,6 +1564,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         markStationLearnedSkip(ctx, target, dockSkip, dockResp.error.message);
       }
       ctx.log("error", `Dock failed: ${dockResp.error.message} — skipping station`);
+      if (settings.preStageMode === "preStage") {
+        const reservations = loadReservations();
+        clearStationReservation(reservations, target.poiId, bot.username);
+        saveReservations(reservations);
+      }
       fcData.currentStationIndex = targetIdx;
       saveFCStationsData(fcData);
       continue;
@@ -1508,6 +1600,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const orderSkip = classifyStationError(ordersResp.error.message);
       if (orderSkip) {
         markStationLearnedSkip(ctx, target, orderSkip, ordersResp.error.message);
+        if (settings.preStageMode === "preStage") {
+          const reservations = loadReservations();
+          clearStationReservation(reservations, target.poiId, bot.username);
+          saveReservations(reservations);
+        }
         fcData.currentStationIndex = targetIdx;
         saveFCStationsData(fcData);
         continue;
@@ -1738,7 +1835,21 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       currentStation.deposits = { ...(currentStation.deposits ?? {}), ...deposits };
     }
 
-    fcData.currentStationIndex = targetIdx;
+    if (settings.preStageMode === "preStage" && preStagePlan.length > 0) {
+      const currentPlanIdx = preStagePlan.findIndex(p => p.idx === targetIdx);
+      if (currentPlanIdx >= 0) {
+        const nextPlanIdx = (currentPlanIdx + 1) % preStagePlan.length;
+        fcData.currentStationIndex = preStagePlan[nextPlanIdx].idx;
+      } else {
+        fcData.currentStationIndex = (targetIdx + 1) % fcData.stations.length;
+      }
+
+      const reservations = loadReservations();
+      clearStationReservation(reservations, target.poiId, bot.username);
+      saveReservations(reservations);
+    } else {
+      fcData.currentStationIndex = targetIdx;
+    }
     saveFCStationsData(fcData);
 
     await bot.refreshCargo();

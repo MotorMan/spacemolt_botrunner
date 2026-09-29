@@ -1025,7 +1025,11 @@ async function buildPreStagePlan(
     let hasNeed = false;
 
     for (const itemConfig of settings.sellItems) {
-      if (itemConfig.blockedStations.includes(entry.poiId) || itemConfig.blockedStations.includes(`${entry.systemId}|${entry.poiId}`)) {
+      if (
+        itemConfig.blockedStations.some(
+          b => b.toLowerCase() === entry.poiId.toLowerCase() || b.toLowerCase() === `${entry.systemId}|${entry.poiId}`.toLowerCase(),
+        )
+      ) {
         continue;
       }
 
@@ -1660,7 +1664,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
 
-        if (itemConfig.blockedStations.includes(target.poiId) || itemConfig.blockedStations.includes(`${target.systemId}|${target.poiId}`)) {
+        if (
+          itemConfig.blockedStations.some(
+            b => b.toLowerCase() === target.poiId.toLowerCase() || b.toLowerCase() === `${target.systemId}|${target.poiId}`.toLowerCase(),
+          )
+        ) {
           ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: blocked for this item`);
           continue;
         }

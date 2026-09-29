@@ -169,27 +169,37 @@ async function tryProcessSellableItems(
 
       if (preloadTarget > 0) {
         try {
-          const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
-          const stationItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
+          const parsedStation = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+          const stationItem = parsedStation.find(s => s.itemId === watchedItem.itemId);
           const stationQty = stationItem?.quantity || 0;
           const needPreload = Math.max(0, preloadTarget - stationQty);
 
           if (needPreload > 0) {
+            const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+            const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
+            const factionQty = factionItem?.quantity || 0;
             const freeSpace = (bot.cargoMax || 0) - (bot.cargo || 0);
             const itemS = itemSize(watchedItem.itemId);
             const maxFit = Math.floor(freeSpace / Math.max(1, itemS));
-            const canMove = Math.min(needPreload, cargoQty, maxFit);
+            const canMove = Math.min(needPreload, factionQty, maxFit);
 
             if (canMove > 0) {
-              const depResp = await bot.exec("storage", {
-                action: "deposit",
-                target: "station",
+              const wResp = await bot.exec("storage", {
+                action: "withdraw",
+                target: "faction",
                 item_id: watchedItem.itemId,
                 quantity: canMove,
               });
-              if (!depResp.error) {
-                ctx.log("trade", `Market routine: preloaded ${canMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
-                if (cargoItem) cargoItem.quantity = Math.max(0, cargoQty - canMove);
+              if (!wResp.error) {
+                const dResp = await bot.exec("storage", {
+                  action: "deposit",
+                  target: "self",
+                  item_id: watchedItem.itemId,
+                  quantity: canMove,
+                });
+                if (!dResp.error) {
+                  ctx.log("trade", `Market routine: preloaded ${canMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
+                }
               }
             }
           }
@@ -247,7 +257,7 @@ async function tryProcessSellableItems(
       if (stationDepositQty > 0) {
         const depResp = await bot.exec("storage", {
           action: "deposit",
-          target: "station",
+          target: "self",
           item_id: watchedItem.itemId,
           quantity: stationDepositQty,
         });

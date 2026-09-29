@@ -132,6 +132,8 @@ async function tryProcessSellableItems(
 
       if (sellQty <= 0) continue;
 
+      ctx.log("trade", `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`);
+
       let needWithdraw = Math.max(0, sellQty - cargoQty);
       if (needWithdraw > 0) {
         try {

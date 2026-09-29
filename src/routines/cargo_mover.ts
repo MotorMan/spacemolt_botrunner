@@ -142,6 +142,9 @@ interface CargoMoverSettings {
   bulkSeedMode: boolean;
   /** Amount per item to seed during seed-base mode. */
   bulkSeedAmount: number;
+  /** When true, bulk move will include fuel cells (premium, military, energy)
+   *  as regular cargo instead of skipping them. */
+  bulkMoveFuelCells: boolean;
 }
 
 export function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -193,6 +196,7 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     bulkOrder: (t.bulkOrder as "alphabetical" | "reverse_alphabetical" | "random") || "alphabetical",
     bulkSeedMode: (t.bulkSeedMode as boolean) ?? false,
     bulkSeedAmount: (t.bulkSeedAmount as number) || 10,
+    bulkMoveFuelCells: (t.bulkMoveFuelCells as boolean) ?? false,
   };
 }
 
@@ -327,14 +331,17 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
-/** Item ids that should NEVER be bulk-moved (operational fuel/energy cells). */
-function isBulkSkipItem(itemId: string): boolean {
+/** Item ids that should NEVER be bulk-moved (operational fuel/energy cells).
+ *  When `settings.bulkMoveFuelCells` is true, fuel cells are treated as ordinary
+ *  cargo and are not skipped. */
+function isBulkSkipItem(itemId: string, settings?: CargoMoverSettings): boolean {
   const lower = itemId.toLowerCase();
-  return (
+  const isFuelCell =
     lower === "premium_fuel_cell" ||
     lower === "military_fuel_cell" ||
-    lower.includes("energy_cell")
-  );
+    lower.includes("energy_cell");
+  if (settings?.bulkMoveFuelCells && isFuelCell) return false;
+  return isFuelCell;
 }
 
 function isHazardousItem(itemId: string): boolean {
@@ -346,11 +353,14 @@ function isHazardousItem(itemId: string): boolean {
  *  fuel — premium, energy, and the military reserve — i.e. NOT an item the user
  *  explicitly asked to move. When a fuel cell IS listed in `settings.items` it
  *  is ordinary cargo and must be both loaded AND deposited like any other item,
- *  so this returns false and the special handling below is bypassed. */
+ *  so this returns false and the special handling below is bypassed.
+ *  When `settings.bulkMoveFuelCells` is true, all fuel cells are treated as
+ *  ordinary cargo regardless. */
 function isOperationalFuelCell(itemId: string, settings: CargoMoverSettings): boolean {
   const lower = itemId.toLowerCase();
   const isFuelCell = lower === "premium_fuel_cell" || lower === "military_fuel_cell" || lower.includes("energy_cell");
   if (!isFuelCell) return false;
+  if (settings.bulkMoveFuelCells) return false;
   const configured = settings.items.some((ci) => ci.itemId.toLowerCase() === lower);
   return !configured;
 }
@@ -943,14 +953,13 @@ function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
 async function bulkStationToFaction(
   ctx: RoutineContext,
   excludeFuel = true,
+  settings?: CargoMoverSettings,
 ): Promise<number> {
   const { bot } = ctx;
   await bot.refreshStorage();
   const candidates = bot.storage.filter((i) => {
     if (i.quantity <= 0) return false;
-    if (excludeFuel) {
-      if (isBulkSkipItem(i.itemId)) return false;
-    }
+    if (excludeFuel && isBulkSkipItem(i.itemId, settings)) return false;
     return true;
   });
   if (candidates.length === 0) return 0;
@@ -997,6 +1006,7 @@ async function bulkWithdrawFromStorage(
   ctx: RoutineContext,
   requested: Array<{ itemId: string; quantity: number }>,
   storageType: 'faction' | 'personal',
+  settings?: CargoMoverSettings,
 ): Promise<Map<string, number>> {
   const { bot } = ctx;
   const valid = requested.filter((r) => r.itemId && r.quantity > 0);
@@ -1074,7 +1084,7 @@ async function bulkWithdrawFromStorage(
   // it here keeps station storage empty after every single load attempt.)
   if (storageType === 'faction' && moved.size < valid.length) {
     try {
-      const recovered = await bulkStationToFaction(ctx, true);
+      const recovered = await bulkStationToFaction(ctx, true, settings);
       if (recovered > 0) {
         ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) left in station storage back to faction`);
       }
@@ -1667,7 +1677,7 @@ function planBulkItems(
 const { bot } = ctx;
    let candidates = sourceItems.filter((i) => {
       if (!i.itemId || i.quantity <= 0) return false;
-      if (isBulkSkipItem(i.itemId)) return false;
+      if (isBulkSkipItem(i.itemId, settings)) return false;
       // Skip hazardous items unless the bot has lead-lined cargo hold modules.
       if (isHazardousItem(i.itemId) && bot.hasLeadLinedCargoHold === false) {
         ctx.log("cargo", `  ⏭️ Skipping ${i.name}: hazardous item (no lead-lined cargo module)`);
@@ -1779,7 +1789,7 @@ async function runBulkMovePhase(
   // filled, crash, stop, battle). Push them back to faction BEFORE we plan/load
   // so they're counted correctly and never lost in personal storage.
   try {
-    const recovered = await bulkStationToFaction(ctx, true);
+    const recovered = await bulkStationToFaction(ctx, true, settings);
     if (recovered > 0) {
       ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction before loading`);
     }
@@ -1814,13 +1824,13 @@ async function runBulkMovePhase(
   // holds, which is exactly how a bot gets stuck hauling a full cargo it can't
   // unload. Dump whenever orphaned cargo is present.
   const bulkHasOrphanCargo = bot.inventory.some(
-    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId),
+    (i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings),
   );
   if (bot.inventory.length > 0 && (bulkFullness >= 0.9 || bulkHasOrphanCargo)) {
     ctx.log("cargo", `🧹 Bulk move startup: hold ${Math.round(bulkFullness * 100)}% full (orphan cargo present: ${bulkHasOrphanCargo}) — emptying to storage before loading`);
     for (const item of [...bot.inventory]) {
       if (item.quantity <= 0) continue;
-      if (isBulkSkipItem(item.itemId)) continue;
+      if (isBulkSkipItem(item.itemId, settings)) continue;
       const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (!dResp.error) {
         ctx.log("cargo", `🧹 Bulk startup: emptied ${item.quantity}x ${item.name} to faction storage`);
@@ -1863,7 +1873,7 @@ async function runBulkMovePhase(
       // Seed pass found nothing new to bring in — that means every sourced item
       // already has a presence at the destination, so seeding is complete.
       const allPresent = bot.factionStorage
-        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId) && i.quantity <= settings.bulkIgnoreOver)
+        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings) && i.quantity <= settings.bulkIgnoreOver)
         .every((i) => destHas.has(i.itemId));
       if (allPresent) {
         ctx.log("cargo", `✅ Seed pass complete — every sourced item now has a presence at the destination. Disabling seed mode and switching to FULL moves.`);
@@ -1932,7 +1942,7 @@ async function runBulkMovePhase(
 
     if (batch.length === 0) break;
 
-    const moved = await bulkWithdrawFromStorage(ctx, batch, "faction");
+    const moved = await bulkWithdrawFromStorage(ctx, batch, "faction", settings);
     if (moved.size > 0) loadedAny = true;
     for (const [itemId, qty] of moved) {
       const p = planned.find((pp) => pp.itemId === itemId);
@@ -1973,7 +1983,7 @@ async function runBulkMovePhase(
   const deliverItems = bot.inventory
     .filter((item) => {
       if (item.quantity <= 0) return false;
-      if (isBulkSkipItem(item.itemId)) return false;
+      if (isBulkSkipItem(item.itemId, settings)) return false;
       return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings) > 0;
     })
     .map((item) => ({
@@ -2000,7 +2010,7 @@ async function runBulkMovePhase(
     await bot.refreshCargo();
     const remainingInCargo = bot.inventory.filter((item) => {
       if (item.quantity <= 0) return false;
-      if (isBulkSkipItem(item.itemId)) return false;
+      if (isBulkSkipItem(item.itemId, settings)) return false;
       const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
       return depositQty > 0;
     });
@@ -2028,7 +2038,7 @@ async function runBulkMovePhase(
   // it is never stranded in personal storage. We are docked at the SOURCE
   // station here, so this deposits into the source's faction storage.
   try {
-    const recovered = await bulkStationToFaction(ctx, true);
+    const recovered = await bulkStationToFaction(ctx, true, settings);
     if (recovered > 0) {
       ctx.log("cargo", `🧹 Recovered ${recovered} item type(s) from station storage back to faction after delivery`);
     }
@@ -2380,7 +2390,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           location: `${bot.system}/${bot.poi}`,
         });
         await bot.refreshCargo();
-        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId))) {
+        if (bot.inventory.some((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, gSettings))) {
           await deliverCargoAboard(ctx, gSettings);
         }
         for (const item of gSettings.items) {

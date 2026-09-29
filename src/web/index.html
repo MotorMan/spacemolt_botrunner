@@ -34391,6 +34391,7 @@ ignoreBlacklist: document.getElementById(
         const bulkOrder = cm.bulkOrder || "alphabetical";
         const bulkSeedMode = cm.bulkSeedMode ?? false;
         const bulkSeedAmount = cm.bulkSeedAmount ?? 10;
+        const bulkMoveFuelCells = cm.bulkMoveFuelCells ?? false;
 
         // Build station options from mapData
         let sourceStationOpts = '<option value="">(not set)</option>';
@@ -34775,14 +34776,22 @@ ignoreBlacklist: document.getElementById(
           <label><input type="checkbox" id="set-cm-bulkSeedMode" ${bulkSeedMode ? "checked" : ""} onchange="saveCargoMoverSettings()"> Seed mode</label>
         </div>
 
-        <div class="setting-row">
-          <div>
-            <div class="setting-label">Seed Amount</div>
-            <div class="setting-hint">How many of each item to seed during seed mode</div>
-          </div>
-          <input type="number" id="set-cm-bulkSeedAmount" min="1" value="${bulkSeedAmount}" onchange="saveCargoMoverSettings()">
-        </div>
-      </div>
+         <div class="setting-row">
+           <div>
+             <div class="setting-label">Seed Amount</div>
+             <div class="setting-hint">How many of each item to seed during seed mode</div>
+           </div>
+           <input type="number" id="set-cm-bulkSeedAmount" min="1" value="${bulkSeedAmount}" onchange="saveCargoMoverSettings()">
+         </div>
+
+         <div class="setting-row">
+           <div>
+             <div class="setting-label">Move Fuel Cells</div>
+             <div class="setting-hint">Include premium, military, and energy cells as regular cargo in bulk moves (otherwise they are skipped)</div>
+           </div>
+           <label><input type="checkbox" id="set-cm-bulkMoveFuelCells" ${bulkMoveFuelCells ? "checked" : ""} onchange="saveCargoMoverSettings()"> Enabled</label>
+         </div>
+       </div>
     </div>
 
     <div class="settings-save-bar">
@@ -35189,6 +35198,8 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-cm-bulkSeedAmount")?.value,
             ) || 10,
+          bulkMoveFuelCells:
+            document.getElementById("set-cm-bulkMoveFuelCells")?.checked ?? false,
         };
 
         send({ type: "saveSettings", routine: "cargo_mover", settings: s });

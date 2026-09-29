@@ -11,6 +11,7 @@ import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstor
 import { updateShipListings } from "../shipsforsale.js";
 import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
 import { loadSettings } from "../web/server.js";
+import { readSellOutcome } from "./sellOutcome.js";
 
 function saveItemsToMarketDetails(
   systemId: string,
@@ -96,12 +97,12 @@ async function tryProcessSellableItems(
   try {
     const settings = loadSettings();
     const globalItems =
-      (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadPct: number }>) ||
+      (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{ itemId: string; itemName: string; minSellPrice: number }>) ||
       [];
     const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
     const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
     const perBotItems =
-      (botSettings.marketRoutineItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadPct: number }>) || [];
+      (botSettings.marketRoutineItems as Array<{ itemId: string; itemName: string; minSellPrice: number }>) || [];
     const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
 
     if (effectiveItems.length === 0) return;
@@ -144,179 +145,120 @@ async function tryProcessSellableItems(
         continue;
       }
 
-      const processedOrderKeys = new Set<string>();
+      const qualifyingAboveFloor = qualifyingBuyOrders.filter(o => o.price >= watchedItem.minSellPrice);
 
-      for (const buyOrder of qualifyingBuyOrders) {
-        const orderKey = `${watchedItem.itemId}:${buyOrder.price}:${buyOrder.quantity}`;
-        if (processedOrderKeys.has(orderKey)) continue;
-        processedOrderKeys.add(orderKey);
+      if (qualifyingAboveFloor.length === 0) continue;
 
-        const buyPrice = buyOrder.price;
-        const buyQty = buyOrder.quantity;
+      const totalQty = qualifyingAboveFloor.reduce((sum, o) => sum + o.quantity, 0);
+      const minBuyPrice = Math.min(...qualifyingAboveFloor.map(o => o.price));
 
-        if (buyPrice < watchedItem.minSellPrice) continue;
+      const lastOrder = placedOrders.get(watchedItem.itemId);
+      if (lastOrder && lastOrder.price === minBuyPrice && lastOrder.quantity === totalQty) continue;
 
-        const lastOrder = placedOrders.get(watchedItem.itemId);
-        if (lastOrder && lastOrder.price === buyPrice && lastOrder.quantity === buyQty) continue;
+      const cargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+      const cargoQty = cargoItem?.quantity || 0;
+      const freeSpace = (bot.cargoMax || 0) - (bot.cargo || 0);
 
-        const cargoItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-        const cargoQty = cargoItem?.quantity || 0;
-        const freeSpace = (bot.cargoMax || 0) - (bot.cargo || 0);
+      if (freeSpace <= 0 && cargoQty <= 0) continue;
 
-        if (freeSpace <= 0 && cargoQty <= 0) continue;
+      let sellQty = Math.min(totalQty, cargoQty + Math.max(0, freeSpace));
+      sellQty = Math.max(0, sellQty);
 
-        let sellQty = Math.min(buyQty, cargoQty + Math.max(0, freeSpace));
-        sellQty = Math.max(0, sellQty);
+      if (sellQty <= 0) continue;
 
-        if (sellQty <= 0) continue;
+      ctx.log(
+        "trade",
+        `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} (floor ${watchedItem.minSellPrice}cr, book min ${minBuyPrice}cr)`,
+      );
 
-        const preloadPct = Math.max(0, Math.min(100, watchedItem.preloadPct || 0));
-        if (preloadPct > 0) {
+      const cargoAfterPreload = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
+      let needWithdraw = Math.max(0, sellQty - cargoAfterPreload);
+
+      if (needWithdraw > 0) {
+        try {
+          const parsedStorage = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+          const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
+          const storageQty = storageItem?.quantity || 0;
           const itemS = itemSize(watchedItem.itemId);
-          const maxCargoUnits = Math.floor((bot.cargoMax || 0) / itemS);
-          const preloadTarget = Math.floor((maxCargoUnits * preloadPct) / 100);
-          const needPreload = Math.max(0, preloadTarget - cargoQty);
+          const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+          const maxFit = Math.floor(availableSpace / itemS);
+          const actualWithdraw = Math.min(needWithdraw, storageQty, maxFit);
 
-          if (needPreload > 0) {
-            try {
-              const parsedStorage = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
-              const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
-              const storageQty = storageItem?.quantity || 0;
-              const withdrawQty = Math.min(needPreload, storageQty, Math.floor(freeSpace / itemS));
-
-              if (withdrawQty > 0) {
-                const wResp = await bot.exec("storage", {
-                  action: "withdraw",
-                  target: "faction",
-                  item_id: watchedItem.itemId,
-                  quantity: withdrawQty,
-                });
-                if (!wResp.error) {
-                  ctx.log(
-                    "trade",
-                    `Market routine: preloaded ${withdrawQty}x ${watchedItem.itemName} from faction storage (${preloadPct}% target)`,
-                  );
-                  const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-                  if (invItem) {
-                    invItem.quantity += withdrawQty;
-                  } else {
-                    bot.inventory.push({ itemId: watchedItem.itemId, name: watchedItem.itemName, quantity: withdrawQty });
-                  }
-                }
-              }
-            } catch {
-              /* ignore preload errors, attempt sell anyway */
-            }
-          }
-        }
-
-        ctx.log(
-          "trade",
-          `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} (floor ${watchedItem.minSellPrice}cr, buy order @ ${buyPrice}cr)`,
-        );
-
-        const cargoAfterPreload = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
-        let needWithdraw = Math.max(0, sellQty - cargoAfterPreload);
-
-        if (needWithdraw > 0) {
-          try {
-            const parsedStorage = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
-            const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
-            const storageQty = storageItem?.quantity || 0;
-            const itemS = itemSize(watchedItem.itemId);
-            const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
-            const maxFit = Math.floor(availableSpace / itemS);
-            const actualWithdraw = Math.min(needWithdraw, storageQty, maxFit);
-
-            if (actualWithdraw > 0) {
-              const wResp = await bot.exec("storage", {
-                action: "withdraw",
-                target: "faction",
-                item_id: watchedItem.itemId,
-                quantity: actualWithdraw,
-              });
-              if (wResp.error) {
-                ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
-                continue;
-              }
-              ctx.log("trade", `Market routine: withdrew ${actualWithdraw}x ${watchedItem.itemName} from faction storage to cargo`);
-              const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-              if (invItem) {
-                invItem.quantity += actualWithdraw;
-              } else {
-                bot.inventory.push({ itemId: watchedItem.itemId, name: watchedItem.itemName, quantity: actualWithdraw });
-              }
-            } else {
-              ctx.log("warn", `Market routine: insufficient faction storage (${storageQty} avail, need ${needWithdraw}) for ${watchedItem.itemName}`);
+          if (actualWithdraw > 0) {
+            const wResp = await bot.exec("storage", {
+              action: "withdraw",
+              target: "faction",
+              item_id: watchedItem.itemId,
+              quantity: actualWithdraw,
+            });
+            if (wResp.error) {
+              ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
               continue;
             }
-          } catch (e) {
-            ctx.log("warn", `Market routine: withdraw exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+            ctx.log("trade", `Market routine: withdrew ${actualWithdraw}x ${watchedItem.itemName} from faction storage to cargo`);
+            const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+            if (invItem) {
+              invItem.quantity += actualWithdraw;
+            } else {
+              bot.inventory.push({ itemId: watchedItem.itemId, name: watchedItem.itemName, quantity: actualWithdraw });
+            }
+          } else {
+            ctx.log("warn", `Market routine: insufficient faction storage (${storageQty} avail, need ${needWithdraw}) for ${watchedItem.itemName}`);
             continue;
           }
-        }
-
-        const cargoAfterWithdraw = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
-        const itemS = itemSize(watchedItem.itemId);
-        const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
-        const maxFit = Math.floor(availableSpace / itemS);
-        sellQty = Math.max(0, Math.min(sellQty, cargoAfterWithdraw, maxFit));
-
-        if (sellQty <= 0) continue;
-
-        try {
-          let sellResp;
-          if (sellToStationOrdersOnly) {
-            sellResp = await bot.exec("create_sell_order", {
-              item_id: watchedItem.itemId,
-              quantity: sellQty,
-              price_each: buyPrice,
-            });
-          } else {
-            const cargoAfterWithdraw = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
-            const needForOrder = Math.max(0, sellQty - cargoAfterWithdraw);
-
-            if (needForOrder > 0) {
-              const depResp = await bot.exec("storage", {
-                action: "deposit",
-                target: "station",
-                item_id: watchedItem.itemId,
-                quantity: needForOrder,
-              });
-              if (depResp.error) {
-                ctx.log("warn", `Market routine: failed to deposit ${watchedItem.itemName} to station storage: ${depResp.error.message}`);
-                continue;
-              }
-              ctx.log("trade", `Market routine: deposited ${needForOrder}x ${watchedItem.itemName} to station storage for sell order`);
-            }
-
-            sellResp = await bot.exec("create_sell_order", {
-              item_id: watchedItem.itemId,
-              quantity: sellQty,
-              price_each: buyPrice,
-            });
-            if (!sellResp.error) {
-              const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-              if (invItem) {
-                invItem.quantity = Math.max(0, invItem.quantity - Math.min(cargoAfterWithdraw, sellQty));
-              }
-            }
-          }
-          if (sellResp.error) {
-            ctx.log(
-              "error",
-              `Market routine: create_sell_order failed for ${watchedItem.itemName}: ${sellResp.error.message}`,
-            );
-          } else {
-            ctx.log(
-              "trade",
-              `Market routine: listed ${sellQty}x ${watchedItem.itemName} @ ${buyPrice}cr (floor ${watchedItem.minSellPrice}cr)`,
-            );
-            placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
-          }
         } catch (e) {
-          ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+          ctx.log("warn", `Market routine: withdraw exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+          continue;
         }
+      }
+
+      const cargoAfterWithdraw = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
+      const itemS = itemSize(watchedItem.itemId);
+      const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+      const maxFit = Math.floor(availableSpace / itemS);
+      sellQty = Math.max(0, Math.min(sellQty, cargoAfterWithdraw, maxFit));
+
+      if (sellQty <= 0) continue;
+
+      const stationDepositQty = Math.max(0, sellQty - cargoAfterWithdraw);
+      if (stationDepositQty > 0) {
+        const depResp = await bot.exec("storage", {
+          action: "deposit",
+          target: "station",
+          item_id: watchedItem.itemId,
+          quantity: stationDepositQty,
+        });
+        if (depResp.error) {
+          ctx.log("warn", `Market routine: failed to deposit ${watchedItem.itemName} to station storage: ${depResp.error.message}`);
+          continue;
+        }
+        ctx.log("trade", `Market routine: deposited ${stationDepositQty}x ${watchedItem.itemName} to station storage`);
+      }
+
+      try {
+        const sellResp = await bot.exec("create_sell_order", {
+          item_id: watchedItem.itemId,
+          quantity: sellQty,
+          price_each: minBuyPrice,
+        });
+        if (sellResp.error) {
+          ctx.log(
+            "error",
+            `Market routine: create_sell_order failed for ${watchedItem.itemName}: ${sellResp.error.message}`,
+          );
+        } else {
+          const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+          if (invItem) {
+            invItem.quantity = Math.max(0, invItem.quantity - Math.min(cargoAfterWithdraw, sellQty));
+          }
+          ctx.log(
+            "trade",
+            `Market routine: listed ${sellQty}x ${watchedItem.itemName} @ ${minBuyPrice}cr (floor ${watchedItem.minSellPrice}cr, ${qualifyingAboveFloor.length} buy orders)`,
+          );
+          placedOrders.set(watchedItem.itemId, { price: minBuyPrice, quantity: totalQty });
+        }
+      } catch (e) {
+        ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   } catch {

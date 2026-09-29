@@ -141,7 +141,6 @@
           ${items.length ? items.map((it, idx) => `<div class="item-row">
             <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(it.itemName || it.itemId)}">${esc(it.itemName || it.itemId)}</span>
             <input type="number" value="${it.minSellPrice ?? 0}" data-bot="${esc(bot.username)}" data-idx="${idx}" class="bot-price-input" min="0" step="1" style="width:80px" />
-            <input type="number" value="${it.preloadPct ?? 0}" data-bot="${esc(bot.username)}" data-idx="${idx}" class="bot-preload-input" min="0" max="100" step="1" style="width:70px" title="Preload %" />
             <button class="btn danger sm" data-remove-bot="${esc(bot.username)}" data-remove-idx="${idx}">Remove</button>
           </div>`).join("") : '<div class="empty">No per-bot items. Inherits global list.</div>'}
         </div>
@@ -151,7 +150,6 @@
             ${factionItems.map(i => `<option value="${esc(i.itemId)}" data-name="${esc(i.itemName)}">${esc(i.itemName)}</option>`).join("")}
           </select>
           <input type="number" class="botMinPrice" data-bot="${esc(bot.username)}" placeholder="Price" min="0" step="1" style="width:80px" />
-          <input type="number" class="botPreloadPct" data-bot="${esc(bot.username)}" placeholder="Preload %" min="0" max="100" step="1" style="width:70px" title="Preload % of cargo capacity" />
           <button class="btn sm" data-add-bot="${esc(bot.username)}">Add</button>
         </div>
       </div>`;
@@ -174,21 +172,18 @@
       const botName = target.getAttribute("data-add-bot");
       const sel = document.querySelector(`.botItemSelect[data-bot="${CSS.escape(botName)}"]`);
       const priceInput = document.querySelector(`.botMinPrice[data-bot="${CSS.escape(botName)}"]`);
-      const preloadInput = document.querySelector(`.botPreloadPct[data-bot="${CSS.escape(botName)}"]`);
       if (!sel || !priceInput) return;
       const itemId = sel.value;
       const itemName = sel.options[sel.selectedIndex]?.dataset?.name || itemId;
       const minSellPrice = parseInt(priceInput.value, 10) || 0;
-      const preloadPct = preloadInput ? Math.max(0, Math.min(100, parseInt(preloadInput.value, 10) || 0)) : 0;
       if (!itemId) return;
       if (!perBot[botName]) perBot[botName] = [];
       if (perBot[botName].some(i => i.itemId === itemId)) {
         alert("Item already in this bot's list.");
         return;
       }
-      perBot[botName].push({ itemId, itemName, minSellPrice, preloadPct });
+      perBot[botName].push({ itemId, itemName, minSellPrice });
       priceInput.value = "";
-      if (preloadInput) preloadInput.value = "";
       renderAllBotsGrid();
       await saveSettings();
     }
@@ -208,14 +203,6 @@
       const idx = parseInt(target.getAttribute("data-idx"), 10);
       if (!isNaN(idx) && botName && perBot[botName] && perBot[botName][idx]) {
         perBot[botName][idx].minSellPrice = parseInt(target.value, 10) || 0;
-        await saveSettings();
-      }
-    }
-    if (target.classList.contains("bot-preload-input")) {
-      const botName = target.getAttribute("data-bot");
-      const idx = parseInt(target.getAttribute("data-idx"), 10);
-      if (!isNaN(idx) && botName && perBot[botName] && perBot[botName][idx]) {
-        perBot[botName][idx].preloadPct = Math.max(0, Math.min(100, parseInt(target.value, 10) || 0));
         await saveSettings();
       }
     }
@@ -263,12 +250,11 @@
       container.innerHTML = '<div class="empty">No global items configured.</div>';
       return;
     }
-    container.innerHTML = `<table><thead><tr><th>Item</th><th>Min Sell Price</th><th>Preload %</th><th></th></tr></thead><tbody>` +
+    container.innerHTML = `<table><thead><tr><th>Item</th><th>Min Sell Price</th><th></th></tr></thead><tbody>` +
       globalItems.map((it, idx) => `
         <tr>
           <td>${esc(it.itemName || it.itemId)}</td>
           <td><input type="number" value="${it.minSellPrice ?? 0}" data-idx="${idx}" class="global-price-input" min="0" step="1" style="width:100px" /></td>
-          <td><input type="number" value="${it.preloadPct ?? 0}" data-idx="${idx}" class="global-preload-input" min="0" max="100" step="1" style="width:70px" title="Preload this % of cargo capacity from faction storage (0 = off)" /></td>
           <td><button class="btn danger sm" onclick="window._removeGlobalItem(${idx})">Remove</button></td>
         </tr>
       `).join("") + `</tbody></table>`;
@@ -291,7 +277,7 @@
       alert("Item already in global list.");
       return;
     }
-    globalItems.push({ itemId, itemName, minSellPrice, preloadPct: 0 });
+    globalItems.push({ itemId, itemName, minSellPrice });
     priceInput.value = "";
     renderGlobalItems();
     await saveSettings();
@@ -304,18 +290,10 @@
   });
 
   document.getElementById("globalItems").addEventListener("input", async (e) => {
-    const target = e.target;
-    if (target.classList.contains("global-price-input")) {
-      const idx = parseInt(target.dataset.idx, 10);
+    if (e.target.classList.contains("global-price-input")) {
+      const idx = parseInt(e.target.dataset.idx, 10);
       if (!isNaN(idx) && globalItems[idx]) {
-        globalItems[idx].minSellPrice = parseInt(target.value, 10) || 0;
-        await saveSettings();
-      }
-    }
-    if (target.classList.contains("global-preload-input")) {
-      const idx = parseInt(target.dataset.idx, 10);
-      if (!isNaN(idx) && globalItems[idx]) {
-        globalItems[idx].preloadPct = Math.max(0, Math.min(100, parseInt(target.value, 10) || 0));
+        globalItems[idx].minSellPrice = parseInt(e.target.value, 10) || 0;
         await saveSettings();
       }
     }

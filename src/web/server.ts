@@ -1306,13 +1306,13 @@ if (!this.settings.fuel_service) {
         if (url.pathname === "/api/market-routine-settings") {
           if (req.method === "GET") {
             const settings = this.settings;
-            const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
+            const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>) || [];
             const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
-            const perBot: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>> = {};
+            const perBot: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>> = {};
             for (const [key, value] of Object.entries(settings)) {
               if (key === "market_routine" || key === "general" || key === "clerk" || key === "flock" || key === "botAssignments") continue;
               const obj = value as Record<string, unknown> | undefined;
-              const items = obj?.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number}> | undefined;
+              const items = obj?.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}> | undefined;
               if (items && items.length > 0) {
                 perBot[key] = items;
               }
@@ -1320,7 +1320,7 @@ if (!this.settings.fuel_service) {
             return Response.json({ global: globalItems, perBot, sellToStationOrdersOnly });
           }
           if (req.method === "POST") {
-            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number}>>; sellToStationOrdersOnly?: boolean };
+            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>>; sellToStationOrdersOnly?: boolean };
             console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [], sellToStationOrdersOnly: body.sellToStationOrdersOnly });
             if (!this.settings.market_routine) this.settings.market_routine = {};
             if (body.global) {

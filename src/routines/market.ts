@@ -97,12 +97,12 @@ async function tryProcessSellableItems(
   try {
     const settings = loadSettings();
     const globalItems =
-      (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{ itemId: string; itemName: string; minSellPrice: number }>) ||
+      (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadToStation: number }>) ||
       [];
     const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
     const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
     const perBotItems =
-      (botSettings.marketRoutineItems as Array<{ itemId: string; itemName: string; minSellPrice: number }>) || [];
+      (botSettings.marketRoutineItems as Array<{ itemId: string; itemName: string; minSellPrice: number; preloadToStation: number }>) || [];
     const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
 
     if (effectiveItems.length === 0) return;
@@ -161,18 +161,45 @@ async function tryProcessSellableItems(
 
       if (freeSpace <= 0 && cargoQty <= 0) continue;
 
-      let sellQty = Math.min(totalQty, cargoQty + Math.max(0, freeSpace));
-      sellQty = Math.max(0, sellQty);
+      let sellQty = totalQty;
 
       if (sellQty <= 0) continue;
 
-      ctx.log(
-        "trade",
-        `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} (floor ${watchedItem.minSellPrice}cr, book min ${minBuyPrice}cr)`,
-      );
+      const preloadTarget = Math.max(0, watchedItem.preloadToStation || 0);
+
+      if (preloadTarget > 0) {
+        try {
+          const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+          const stationItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
+          const stationQty = stationItem?.quantity || 0;
+          const needPreload = Math.max(0, preloadTarget - stationQty);
+
+          if (needPreload > 0) {
+            const freeSpace = (bot.cargoMax || 0) - (bot.cargo || 0);
+            const itemS = itemSize(watchedItem.itemId);
+            const maxFit = Math.floor(freeSpace / Math.max(1, itemS));
+            const canMove = Math.min(needPreload, cargoQty, maxFit);
+
+            if (canMove > 0) {
+              const depResp = await bot.exec("storage", {
+                action: "deposit",
+                target: "station",
+                item_id: watchedItem.itemId,
+                quantity: canMove,
+              });
+              if (!depResp.error) {
+                ctx.log("trade", `Market routine: preloaded ${canMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
+                if (cargoItem) cargoItem.quantity = Math.max(0, cargoQty - canMove);
+              }
+            }
+          }
+        } catch {
+          /* ignore preload errors, continue to sell attempt */
+        }
+      }
 
       const cargoAfterPreload = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
-      let needWithdraw = Math.max(0, sellQty - cargoAfterPreload);
+      let needWithdraw = Math.max(0, totalQty - cargoAfterPreload);
 
       if (needWithdraw > 0) {
         try {
@@ -213,14 +240,10 @@ async function tryProcessSellableItems(
       }
 
       const cargoAfterWithdraw = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
-      const itemS = itemSize(watchedItem.itemId);
-      const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
-      const maxFit = Math.floor(availableSpace / itemS);
-      sellQty = Math.max(0, Math.min(sellQty, cargoAfterWithdraw, maxFit));
 
       if (sellQty <= 0) continue;
 
-      const stationDepositQty = Math.max(0, sellQty - cargoAfterWithdraw);
+      const stationDepositQty = cargoAfterWithdraw;
       if (stationDepositQty > 0) {
         const depResp = await bot.exec("storage", {
           action: "deposit",
@@ -238,7 +261,7 @@ async function tryProcessSellableItems(
       try {
         const sellResp = await bot.exec("create_sell_order", {
           item_id: watchedItem.itemId,
-          quantity: sellQty,
+          quantity: totalQty,
           price_each: minBuyPrice,
         });
         if (sellResp.error) {
@@ -249,11 +272,11 @@ async function tryProcessSellableItems(
         } else {
           const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
           if (invItem) {
-            invItem.quantity = Math.max(0, invItem.quantity - Math.min(cargoAfterWithdraw, sellQty));
+            invItem.quantity = Math.max(0, invItem.quantity - Math.min(cargoAfterWithdraw, totalQty));
           }
           ctx.log(
             "trade",
-            `Market routine: listed ${sellQty}x ${watchedItem.itemName} @ ${minBuyPrice}cr (floor ${watchedItem.minSellPrice}cr, ${qualifyingAboveFloor.length} buy orders)`,
+            `Market routine: listed ${totalQty}x ${watchedItem.itemName} @ ${minBuyPrice}cr (floor ${watchedItem.minSellPrice}cr, ${qualifyingAboveFloor.length} buy orders)`,
           );
           placedOrders.set(watchedItem.itemId, { price: minBuyPrice, quantity: totalQty });
         }

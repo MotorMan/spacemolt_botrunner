@@ -134,10 +134,6 @@ async function tryProcessSellableItems(
         })
         .sort((a, b) => b.price - a.price);
 
-      const totalQualifyingDepth = qualifyingBuyOrders
-        .filter(o => o.price >= watchedItem.minSellPrice)
-        .reduce((sum, o) => sum + o.quantity, 0);
-
       if (qualifyingBuyOrders.length === 0) {
         if (sellToStationOrdersOnly && marketItem.buy_orders.length > 0) {
           ctx.log(
@@ -173,10 +169,6 @@ async function tryProcessSellableItems(
         sellQty = Math.max(0, sellQty);
 
         if (sellQty <= 0) continue;
-
-        if (watchedItem.minSellPrice > 0 && totalQualifyingDepth > 0) {
-          sellQty = Math.min(sellQty, totalQualifyingDepth);
-        }
 
         const preloadPct = Math.max(0, Math.min(100, watchedItem.preloadPct || 0));
         if (preloadPct > 0) {
@@ -220,7 +212,7 @@ async function tryProcessSellableItems(
 
         ctx.log(
           "trade",
-          `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`,
+          `Market routine: attempting to sell ${sellQty}x ${watchedItem.itemName} (floor ${watchedItem.minSellPrice}cr, buy order @ ${buyPrice}cr)`,
         );
 
         const cargoAfterPreload = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
@@ -301,7 +293,7 @@ async function tryProcessSellableItems(
             sellResp = await bot.exec("create_sell_order", {
               item_id: watchedItem.itemId,
               quantity: sellQty,
-              price_each: watchedItem.minSellPrice,
+              price_each: buyPrice,
             });
             if (!sellResp.error) {
               const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
@@ -318,7 +310,7 @@ async function tryProcessSellableItems(
           } else {
             ctx.log(
               "trade",
-              `Market routine: listed ${sellQty}x ${watchedItem.itemName} @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`,
+              `Market routine: listed ${sellQty}x ${watchedItem.itemName} @ ${buyPrice}cr (floor ${watchedItem.minSellPrice}cr)`,
             );
             placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
           }

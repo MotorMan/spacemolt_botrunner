@@ -44,6 +44,10 @@
         <input type="checkbox" id="useSellCommand" />
         Use sell command (station-side, up to 100k)
       </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+        <input type="checkbox" id="sellToStationOrdersOnly" />
+        Only sell to station buy orders
+      </label>
       <button class="btn primary" id="saveBtn">Save Settings</button>
     </div>
   </div>
@@ -92,6 +96,7 @@
     globalItems = Array.isArray(data.global) ? data.global : [];
     perBot = data.perBot || {};
     document.getElementById("useSellCommand").checked = !!data.useSellCommand;
+    document.getElementById("sellToStationOrdersOnly").checked = !!data.sellToStationOrdersOnly;
     renderGlobalItems();
     renderPerBotSection();
   }
@@ -99,7 +104,8 @@
   async function saveSettings() {
     try {
       const useSellCommand = document.getElementById("useSellCommand").checked;
-      const res = await fetch("/api/market-routine-settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ global: globalItems, perBot, useSellCommand }) });
+      const sellToStationOrdersOnly = document.getElementById("sellToStationOrdersOnly").checked;
+      const res = await fetch("/api/market-routine-settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ global: globalItems, perBot, useSellCommand, sellToStationOrdersOnly }) });
       if (!res.ok) {
         const txt = await res.text().catch(() => "");
         throw new Error(`HTTP ${res.status}${txt ? ": " + txt : ""}`);

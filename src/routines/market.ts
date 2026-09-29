@@ -361,6 +361,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       const settings = loadSettings();
       const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
       const useSellCommand = !!((settings.market_routine as Record<string, unknown>) || {}).useSellCommand;
+      const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
       const botSettings = (settings[bot.username] as Record<string, unknown>) || {};
       const perBotItems = (botSettings.marketRoutineItems as Array<{itemId: string; itemName: string; minSellPrice: number}>) || [];
       const effectiveItems = perBotItems.length > 0 ? perBotItems : globalItems;
@@ -374,6 +375,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
 
             const bestBuy = marketItem.buy_orders
               .filter(o => (o.price_each as number) > 0 && (o.quantity as number) > 0)
+              .filter(o => !sellToStationOrdersOnly || (o.source as string) === "station")
               .sort((a, b) => (b.price_each as number) - (a.price_each as number))[0];
 
             if (!bestBuy) continue;

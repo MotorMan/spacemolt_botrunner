@@ -142,6 +142,12 @@ async function tryProcessSellableItems(
             ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
             continue;
           }
+          const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+          if (invItem) {
+            invItem.quantity += needWithdraw;
+          } else {
+            bot.inventory.push({ itemId: watchedItem.itemId, name: watchedItem.itemName, quantity: needWithdraw });
+          }
         } catch (e) {
           ctx.log("warn", `Market routine: withdraw exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
           continue;
@@ -158,23 +164,13 @@ async function tryProcessSellableItems(
         if (sellResp.error) {
           ctx.log("error", `Market routine: ${useSellCommand ? "sell" : "create_sell_order"} failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
         } else {
-          ctx.log("trade", `Market routine: sold ${sellQty}x ${watchedItem.itemName}${useSellCommand ? " via sell command" : ` @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`}`);
-          placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
-
-          const remaining = bot.inventory.find(c => c.itemId === watchedItem.itemId);
-          const remainingQty = remaining?.quantity || 0;
-          if (remainingQty > 0) {
-            try {
-              const depositResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: watchedItem.itemId, quantity: remainingQty });
-              if (depositResp.error) {
-                ctx.log("warn", `Market routine: failed to deposit leftover ${remainingQty}x ${watchedItem.itemName}: ${depositResp.error.message}`);
-              } else {
-                ctx.log("trade", `Market routine: deposited leftover ${remainingQty}x ${watchedItem.itemName} back to faction storage`);
-              }
-            } catch (e) {
-              ctx.log("warn", `Market routine: deposit exception for leftover ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
-            }
+          const actualSold = ((sellResp.result as Record<string, unknown> | undefined)?.quantity as number | undefined) ?? sellQty;
+          const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
+          if (invItem) {
+            invItem.quantity = Math.max(0, invItem.quantity - actualSold);
           }
+          ctx.log("trade", `Market routine: sold ${actualSold}x ${watchedItem.itemName}${useSellCommand ? " via sell command" : ` @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`}`);
+          placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
         }
       } catch (e) {
         ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);

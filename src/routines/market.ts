@@ -180,7 +180,7 @@ async function tryProcessSellableItems(
 
           if (needPreload > 0) {
             try {
-              const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+              const parsedStorage = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
               const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
               const storageQty = storageItem?.quantity || 0;
               const withdrawQty = Math.min(needPreload, storageQty, Math.floor(freeSpace / itemS));
@@ -221,7 +221,7 @@ async function tryProcessSellableItems(
 
         if (needWithdraw > 0) {
           try {
-            const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+            const parsedStorage = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
             const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
             const storageQty = storageItem?.quantity || 0;
             const itemS = itemSize(watchedItem.itemId);

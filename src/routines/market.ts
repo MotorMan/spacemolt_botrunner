@@ -39,11 +39,13 @@ function saveItemsToMarketDetails(
       const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order) => ({
         price: (order.price_each as number) || (order.price as number) || 0,
         quantity: (order.quantity as number) || 0,
+        source: (order.source as string) || undefined,
       })).filter((order) => order.price > 0 && order.quantity > 0);
 
       const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map((order) => ({
         price: (order.price_each as number) || (order.price as number) || 0,
         quantity: (order.quantity as number) || 0,
+        source: (order.source as string) || undefined,
       })).filter((order) => order.price > 0 && order.quantity > 0);
 
       const prev = marketDetailsStore.getData().items.find(
@@ -106,10 +108,19 @@ async function tryProcessSellableItems(
       const marketItem = items.find(i => (i.item_id as string) === watchedItem.itemId);
       if (!marketItem || !marketItem.buy_orders || marketItem.buy_orders.length === 0) continue;
 
+      const allSources = [...new Set(marketItem.buy_orders.map(o => (o.source as string) || "").filter(Boolean))];
+
       const bestBuy = marketItem.buy_orders
         .filter(o => (o.price_each as number) > 0 && (o.quantity as number) > 0)
-        .filter(o => !sellToStationOrdersOnly || (o.source as string) === "station")
+        .filter(o => {
+          if (!sellToStationOrdersOnly) return true;
+          return String(o.source || "").toLowerCase() === "station";
+        })
         .sort((a, b) => (b.price_each as number) - (a.price_each as number))[0];
+
+      if (sellToStationOrdersOnly && !bestBuy && marketItem.buy_orders.length > 0) {
+        ctx.log("trade", `Market routine: ${watchedItem.itemName} - no station buy orders at ${bot.poi} (${marketItem.buy_orders.length} total, sources: ${allSources.join(", ") || "none"})`);
+      }
 
       if (!bestBuy) continue;
 
@@ -142,6 +153,7 @@ async function tryProcessSellableItems(
             ctx.log("warn", `Market routine: failed to withdraw ${watchedItem.itemName}: ${wResp.error.message}`);
             continue;
           }
+          ctx.log("trade", `Market routine: withdrew ${needWithdraw}x ${watchedItem.itemName} from faction storage to cargo`);
           const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
           if (invItem) {
             invItem.quantity += needWithdraw;
@@ -156,20 +168,22 @@ async function tryProcessSellableItems(
 
       try {
         let sellResp;
-        if (useSellCommand) {
+        if (sellToStationOrdersOnly) {
+          sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: buyPrice });
+        } else if (useSellCommand) {
           sellResp = await bot.exec("sell", { item_id: watchedItem.itemId, quantity: sellQty });
         } else {
           sellResp = await bot.exec("create_sell_order", { item_id: watchedItem.itemId, quantity: sellQty, price_each: watchedItem.minSellPrice });
         }
         if (sellResp.error) {
-          ctx.log("error", `Market routine: ${useSellCommand ? "sell" : "create_sell_order"} failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
+          ctx.log("error", `Market routine: ${sellToStationOrdersOnly ? "create_sell_order" : useSellCommand ? "sell" : "create_sell_order"} failed for ${watchedItem.itemName}: ${sellResp.error.message}`);
         } else {
           const actualSold = ((sellResp.result as Record<string, unknown> | undefined)?.quantity as number | undefined) ?? sellQty;
           const invItem = bot.inventory.find(c => c.itemId === watchedItem.itemId);
           if (invItem) {
             invItem.quantity = Math.max(0, invItem.quantity - actualSold);
           }
-          ctx.log("trade", `Market routine: sold ${actualSold}x ${watchedItem.itemName}${useSellCommand ? " via sell command" : ` @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`}`);
+          ctx.log("trade", `Market routine: sold ${actualSold}x ${watchedItem.itemName}${sellToStationOrdersOnly ? ` via create_sell_order @ ${buyPrice}cr (station-only)` : useSellCommand ? " via sell command" : ` @ ${watchedItem.minSellPrice}cr (buy order @ ${buyPrice}cr)`}`);
           placedOrders.set(watchedItem.itemId, { price: buyPrice, quantity: buyQty });
         }
       } catch (e) {

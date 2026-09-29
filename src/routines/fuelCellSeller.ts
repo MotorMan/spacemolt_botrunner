@@ -608,7 +608,6 @@ export function getFuelCellSellerSettings(username?: string): {
   const general = (all.general as Record<string, unknown>) || {};
   const t = all.fuel_cell_seller as Record<string, unknown> | undefined;
   const fc = t || {};
-  const botOverrides = username ? (all[username] as Record<string, unknown>) : undefined;
   const priceModeVal = (fc.priceMode as string) || "auto";
   const priceMode: "manual" | "auto" = priceModeVal === "manual" ? "manual" : "auto";
   const rawDelay = Number(fc.remoteCheckDelayMs ?? DEFAULT_REMOTE_CHECK_DELAY_MS);
@@ -644,8 +643,8 @@ export function getFuelCellSellerSettings(username?: string): {
   const priceUpdateThreshold = (fc.priceUpdateThreshold as number) || 10;
 
   return {
-    homeSystem: (botOverrides?.homeSystem as string) || (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
-    homeStation: (botOverrides?.homeStation as string) || (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
+    homeSystem: (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
+    homeStation: (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
     fuelCostPerJump: (fc.fuelCostPerJump as number) || 10,
     refuelThreshold: (fc.refuelThreshold as number) || 35,
     repairThreshold: (fc.repairThreshold as number) || 80,

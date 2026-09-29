@@ -452,7 +452,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       /* ignore market routine settings errors */
     }
 
-    await ctx.sleep(30000);
+    await ctx.sleep(10000);
   }
 
   unsubscribeMarketUpdates();

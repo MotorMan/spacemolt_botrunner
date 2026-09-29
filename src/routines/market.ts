@@ -161,56 +161,34 @@ async function tryProcessSellableItems(
 
       const preloadTarget = Math.max(0, watchedItem.preloadToStation || 0);
 
-      if (preloadTarget > 0) {
-        try {
-          const parsedStation = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
-          const stationItem = parsedStation.find(s => s.itemId === watchedItem.itemId);
-          const stationQty = stationItem?.quantity || 0;
-          const needPreload = Math.max(0, preloadTarget - stationQty);
+      const parsedStationForSell = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+      const stationItemForSell = parsedStationForSell.find(s => s.itemId === watchedItem.itemId);
+      const stationQtyForSell = stationItemForSell?.quantity || 0;
+      const sellShortfall = Math.max(0, totalQty - stationQtyForSell);
 
-          if (needPreload > 0) {
-            const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
-            const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
-            const factionQty = factionItem?.quantity || 0;
-            const actualMove = Math.min(needPreload, factionQty);
+      if (sellShortfall > 0) {
+        const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+        const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
+        const factionQty = factionItem?.quantity || 0;
+        const actualMove = Math.min(sellShortfall, factionQty);
 
-            if (actualMove > 0) {
-              const dResp = await bot.exec("storage", {
-                action: "deposit",
-                target: "self",
-                source: "faction",
-                item_id: watchedItem.itemId,
-                quantity: actualMove,
-              });
-              if (!dResp.error) {
-                ctx.log("trade", `Market routine: preloaded ${actualMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
-              }
-            }
+        if (actualMove > 0) {
+          const dResp = await bot.exec("storage", {
+            action: "deposit",
+            target: "self",
+            source: "faction",
+            item_id: watchedItem.itemId,
+            quantity: actualMove,
+          });
+          if (dResp.error) {
+            ctx.log("warn", `Market routine: failed to deposit ${watchedItem.itemName} to station storage for sell: ${dResp.error.message}`);
+            continue;
           }
-        } catch {
-          /* ignore preload errors, continue to sell attempt */
-        }
-      }
-
-      const parsedFactionForSell = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
-      const factionItemForSell = parsedFactionForSell.find(s => s.itemId === watchedItem.itemId);
-      const factionQtyForSell = factionItemForSell?.quantity || 0;
-      const directStationQty = Math.max(0, totalQty - preloadTarget);
-      const actualDirectMove = Math.min(directStationQty, factionQtyForSell);
-
-      if (actualDirectMove > 0) {
-        const dResp = await bot.exec("storage", {
-          action: "deposit",
-          target: "self",
-          source: "faction",
-          item_id: watchedItem.itemId,
-          quantity: actualDirectMove,
-        });
-        if (dResp.error) {
-          ctx.log("warn", `Market routine: failed to deposit ${watchedItem.itemName} to station storage: ${dResp.error.message}`);
+          ctx.log("trade", `Market routine: deposited ${actualMove}x ${watchedItem.itemName} to station storage for sell order`);
+        } else {
+          ctx.log("warn", `Market routine: insufficient faction storage (${factionQty} avail, need ${sellShortfall}) for ${watchedItem.itemName} sell`);
           continue;
         }
-        ctx.log("trade", `Market routine: deposited ${actualDirectMove}x ${watchedItem.itemName} to station storage for sell order`);
       }
 
       try {
@@ -233,6 +211,37 @@ async function tryProcessSellableItems(
         }
       } catch (e) {
         ctx.log("error", `Market routine: sell exception for ${watchedItem.itemName}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      if (preloadTarget > 0) {
+        try {
+          const parsedStation = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+          const stationItem = parsedStation.find(s => s.itemId === watchedItem.itemId);
+          const stationQty = stationItem?.quantity || 0;
+          const needPreload = Math.max(0, preloadTarget - stationQty);
+
+          if (needPreload > 0) {
+            const parsedFaction = bot.parseItemList((await bot.exec("view_storage", { target: "faction" })).result, "storage");
+            const factionItem = parsedFaction.find(s => s.itemId === watchedItem.itemId);
+            const factionQty = factionItem?.quantity || 0;
+            const actualMove = Math.min(needPreload, factionQty);
+
+            if (actualMove > 0) {
+              const dResp = await bot.exec("storage", {
+                action: "deposit",
+                target: "self",
+                source: "faction",
+                item_id: watchedItem.itemId,
+                quantity: actualMove,
+              });
+              if (!dResp.error) {
+                ctx.log("trade", `Market routine: replenished ${actualMove}x ${watchedItem.itemName} to station storage (target ${preloadTarget})`);
+              }
+            }
+          }
+        } catch {
+          /* ignore replenish errors */
+        }
       }
     }
   } catch {

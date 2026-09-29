@@ -163,6 +163,7 @@
       </div>`;
     }).join("");
   }
+  const renderPerBotSection = renderAllBotsGrid;
 
   window._removeBotItem = function (botName, idx) {
     if (perBot[botName]) {
@@ -226,6 +227,17 @@
     }
   });
 
+  function populateItemSelects() {
+    const options = factionItems.map(i => `<option value="${esc(i.itemId)}" data-name="${esc(i.itemName)}">${esc(i.itemName)}</option>`).join("");
+    const globalSel = document.getElementById("globalItemSelect");
+    if (globalSel) {
+      globalSel.innerHTML = '<option value="">-- select item --</option>' + options;
+    }
+    document.querySelectorAll(".botItemSelect").forEach(sel => {
+      sel.innerHTML = '<option value="">-- select item --</option>' + options;
+    });
+  }
+
   async function loadFactionStorage() {
     try {
       const list = await api("/api/faction-storage/list");
@@ -271,6 +283,7 @@
   window._removeGlobalItem = function (idx) {
     globalItems.splice(idx, 1);
     renderGlobalItems();
+    saveSettings();
   };
 
   document.getElementById("globalAddBtn").addEventListener("click", async () => {

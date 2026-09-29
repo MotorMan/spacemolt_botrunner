@@ -243,6 +243,15 @@ export function isDeepCoreOre(resourceId: string): boolean {
 }
 
 /**
+ * Deep core deposits no longer obey standard power limits.
+ * Returns true when the standard mining power / supported_power checks
+ * should be skipped for the given ore.
+ */
+function shouldEnforceStandardMiningLimits(oreId: string, hasModulatedLaser: boolean | undefined): boolean {
+  return !hasModulatedLaser && !isDeepCoreOre(oreId);
+}
+
+/**
  * Check if the ship has a deep core survey scanner equipped.
  * This is required to detect hidden POIs and deep core ores.
  */
@@ -1093,11 +1102,12 @@ function getTotalMiningPower(modules: unknown[]): number {
 function checkDepositPowerCompatibility(
   totalMiningPower: number,
   supportedPower: number | undefined,
+  oreId: string,
   hasModulatedMiningLaser?: boolean,
 ): { canMine: boolean; reason: string; effectivePower: number; requiredPower: number } {
-  // Modulated mining laser can adjust down to mining_power 1, so bypass sparse-deposit checks
-  if (hasModulatedMiningLaser) {
-    return { canMine: true, reason: "modulated mining laser bypass", effectivePower: totalMiningPower, requiredPower: supportedPower ?? 0 };
+  // Deep core deposits and modulated mining lasers bypass standard power checks
+  if (!shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser)) {
+    return { canMine: true, reason: isDeepCoreOre(oreId) ? "deep core bypass" : "modulated mining laser bypass", effectivePower: totalMiningPower, requiredPower: supportedPower ?? 0 };
   }
 
   // If supported_power is not available, assume we can mine
@@ -1234,9 +1244,9 @@ async function reportNoViableTargetsAndDeepSleep(
         }
         if (viable) {
           const hasScanData = loc.minutesSinceScan !== Infinity;
-          if (!hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
+          if (shouldEnforceStandardMiningLimits(ore, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0)) {
             viable = false; reason = `low remaining (${loc.remaining}) + unknown power`;
-          } else if (!hasModulatedMiningLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+          } else if (shouldEnforceStandardMiningLimits(ore, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
             viable = false;
             reason = `too sparse: our power ${totalMiningPower} > 4x deposit power req ${loc.supportedPower}`;
           } else if (totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0) {
@@ -1588,7 +1598,7 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (!hasModulatedMiningLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
         return true;
@@ -1608,7 +1618,7 @@ export function pickTargetFromQuotas(
       if (jettisonSet.has(resourceId.toLowerCase())) continue;
       const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
-        if (!hasModulatedMiningLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+        if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
           return false;
         }
         return true;
@@ -1799,9 +1809,9 @@ function getReachableOreLocations(
     // Power compatibility (skip deposits too sparse for our mining power)
     // Modulated mining lasers can adjust to power 1, so they bypass the low-remaining + unknown-power filter
     const hasScanData = loc.minutesSinceScan !== Infinity;
-    const lowRemUnknown = !hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+    const lowRemUnknown = shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
     if (lowRemUnknown) continue;
-    if (totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4 && !hasModulatedMiningLaser) continue;
+    if (shouldEnforceStandardMiningLimits(oreId, hasModulatedMiningLaser) && totalMiningPower > 0 && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) continue;
 
     // Coordination: skip over capacity systems
     if (settings.enableCoordination && settings.maxBotsPerSystem > 0 && botUsername) {
@@ -1902,12 +1912,12 @@ function pickTargetFromQuotasOrClosest(
     const rawLocations = mapStore.findOreLocations(resourceId, undefined, false);
       const hasViableLocations = rawLocations.some((loc: any) => {
         const hasScanData = loc.minutesSinceScan !== Infinity;
-        const isLowRemainingWithUnknownPower = !hasModulatedMiningLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+        const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
         if (isLowRemainingWithUnknownPower) {
           return false;
         }
 
-      if (!hasModulatedMiningLaser && totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+      if (shouldEnforceStandardMiningLimits(resourceId, hasModulatedMiningLaser) && totalMiningPower && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
         return false;
       }
 
@@ -3858,10 +3868,10 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
          if (isLowRemainingWithUnknownPower) {
            return false;
          }
-         // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-          if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-           return false;
-         }
+          // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+           if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            return false;
+          }
          // Coordination: reject systems that are already at max bot capacity
          if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
            if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
@@ -3916,17 +3926,17 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
           return false;
         }
 // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-          if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-                 return false;
-               }
-               // Coordination: reject systems that are already at max bot capacity
-               if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
-                 if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
-                   return false;
-                 }
-               }
-               return true;
-             });
+          if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            return false;
+          }
+          // Coordination: reject systems that are already at max bot capacity
+          if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+            if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+              return false;
+            }
+          }
+          return true;
+        });
 
       if (locations.length === 0) {
         const debugLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0);
@@ -3986,104 +3996,110 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
             ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
             // Re-check locations with new target
              const newLocations = mapStore.findOreLocations(effectiveTarget, blacklist, blacklist.length > 0).filter(loc => {
-               const sys = mapStore.getSystem(loc.systemId);
-               const poi = sys?.pois.find(p => p.id === loc.poiId);
-               if (!poi) return true;
-               // Only filter by hidden status - trust map data
-               if (miningType === "ore") {
-                 if (poi.hidden === true && !canMineHiddenPois) return false;
-                 return true;
-               }
-               if (miningType === "radioactive") {
-                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                 return true;
-               }
-               if (miningType === "gas") {
-                 return true;
-               }
-              if (miningType === "ice") {
-                if (poi.hidden === true && !canMineHiddenIce) return false;
-                return true;
-              }
-              return true;
-            }).filter(loc => {
-              if (settings.ignoreDepletion) {
-                if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
-                  return false;
+                const sys = mapStore.getSystem(loc.systemId);
+                const poi = sys?.pois.find(p => p.id === loc.poiId);
+                if (!poi) return true;
+                // Only filter by hidden status - trust map data
+                if (miningType === "ore") {
+                  if (poi.hidden === true && !canMineHiddenPois) return false;
+                  return true;
                 }
-                return true;
-              }
-              const sys = mapStore.getSystem(loc.systemId);
-              const poi = sys?.pois.find(p => p.id === loc.poiId);
-              // Check both ores_found (mining history) AND resources (scan data) for depletion status
-              const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
-              const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
-              // If resourceEntry exists and shows depleted, check expiry
-              if (resourceEntry?.depleted) {
-                return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
-              }
-               // Otherwise check ores_found depletion
-               if (!oreEntry?.depleted) return true;
-               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-             }).filter(loc => {
-               // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
-               // Modulated mining lasers bypass this since they can adjust to power 1
-               const hasScanData = loc.minutesSinceScan !== Infinity;
-               const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
-               if (isLowRemainingWithUnknownPower) {
-                 return false;
-               }
-               // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-               if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
-                 return false;
+                if (miningType === "radioactive") {
+                  if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                  return true;
+                }
+                if (miningType === "gas") {
+                  return true;
+                }
+               if (miningType === "ice") {
+                 if (poi.hidden === true && !canMineHiddenIce) return false;
+                 return true;
                }
                return true;
-             });
-             if (newLocations.length > 0) {
-              locations.push(...newLocations);
-              ctx.log("mining", `Found ${newLocations.length} locations for quota target "${effectiveTarget}"`);
-            }
-          } else if (availableQuotaTarget === originalTarget) {
-            ctx.log("mining", `Quota target "${originalTarget}" is the only available option — proceeding`);
-          } else {
-            ctx.log("warn", `No quota targets have available locations for "${originalTarget}"`);
-          }
-          // If we still have no concrete location, decide local vs retry.
-          // Local mining is ONLY acceptable when every quota ore is full; otherwise
-          // we deep-sleep and retry (we keep searching rather than mine locally).
-          if (locations.length === 0) {
-            const candidateOres = [originalTarget, ...Object.keys(quotas)];
-            if (!hasLocalMiningPoiOfType(bot.system, miningType, canMineHiddenRadioactive, canMineHiddenIce)) {
-            const decision = await handleNoReachableTarget(
-              ctx, settings, miningType, totalMiningPower, blacklist,
-              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
-              candidateOres, quotas, bot.factionStorage, hasModulatedLaser
-            );
-              if (decision === "retry") {
-                excludedNavSystems.clear();
-                continue;
-              }
-              await reportNoViableTargetsAndDeepSleep(
-                ctx, settings, miningType, totalMiningPower, blacklist,
-                canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
-                hasModulatedLaser,
-              );
-              continue;
-            }
-            const decision = await handleNoReachableTarget(
-              ctx, settings, miningType, totalMiningPower, blacklist,
-              canMineHiddenRadioactive, canMineHiddenIce, bot.username,
-              candidateOres, quotas, bot.factionStorage,
-            );
-            if (decision === "retry") {
-              excludedNavSystems.clear();
-              continue;
-            }
-            targetSystemId = bot.system;
-          }
-        }
-      } else {
-        let scoredLocations: Array<{
+             }).filter(loc => {
+               if (settings.ignoreDepletion) {
+                 if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                   return false;
+                 }
+                 return true;
+               }
+               const sys = mapStore.getSystem(loc.systemId);
+               const poi = sys?.pois.find(p => p.id === loc.poiId);
+               // Check both ores_found (mining history) AND resources (scan data) for depletion status
+               const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+               const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+               // If resourceEntry exists and shows depleted, check expiry
+               if (resourceEntry?.depleted) {
+                 return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+               }
+                // Otherwise check ores_found depletion
+                if (!oreEntry?.depleted) return true;
+                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+              }).filter(loc => {
+                // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
+                // Modulated mining lasers bypass this since they can adjust to power 1
+                const hasScanData = loc.minutesSinceScan !== Infinity;
+                const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+                if (isLowRemainingWithUnknownPower) {
+                  return false;
+                }
+                // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
+                if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+                  return false;
+                }
+                // Coordination: reject systems that are already at max bot capacity
+                if (settings.enableCoordination && settings.maxBotsPerSystem > 0) {
+                  if (isSystemOvercrowded(loc.systemId, settings.maxBotsPerSystem, bot.username)) {
+                    return false;
+                  }
+                }
+                return true;
+              });
+              if (newLocations.length > 0) {
+               locations.push(...newLocations);
+               ctx.log("mining", `Found ${newLocations.length} locations for quota target "${effectiveTarget}"`);
+             }
+           } else if (availableQuotaTarget === originalTarget) {
+             ctx.log("mining", `Quota target "${originalTarget}" is the only available option — proceeding`);
+           } else {
+             ctx.log("warn", `No quota targets have available locations for "${originalTarget}"`);
+           }
+           // If we still have no concrete location, decide local vs retry.
+           // Local mining is ONLY acceptable when every quota ore is full; otherwise
+           // we deep-sleep and retry (we keep searching rather than mine locally).
+           if (locations.length === 0) {
+             const candidateOres = [originalTarget, ...Object.keys(quotas)];
+             if (!hasLocalMiningPoiOfType(bot.system, miningType, canMineHiddenRadioactive, canMineHiddenIce)) {
+             const decision = await handleNoReachableTarget(
+               ctx, settings, miningType, totalMiningPower, blacklist,
+               canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+               candidateOres, quotas, bot.factionStorage, hasModulatedLaser
+             );
+               if (decision === "retry") {
+                 excludedNavSystems.clear();
+                 continue;
+               }
+               await reportNoViableTargetsAndDeepSleep(
+                 ctx, settings, miningType, totalMiningPower, blacklist,
+                 canMineHiddenRadioactive, canMineHiddenIce, bot.username, candidateOres,
+                 hasModulatedLaser,
+               );
+               continue;
+             }
+             const decision = await handleNoReachableTarget(
+               ctx, settings, miningType, totalMiningPower, blacklist,
+               canMineHiddenRadioactive, canMineHiddenIce, bot.username,
+               candidateOres, quotas, bot.factionStorage,
+             );
+             if (decision === "retry") {
+               excludedNavSystems.clear();
+               continue;
+             }
+             targetSystemId = bot.system;
+           }
+         }
+       } else {
+         let scoredLocations: Array<{
           systemId: string;
           systemName: string;
           poiId: string;
@@ -4267,12 +4283,12 @@ const allLocations = mapStore.findOreLocations(effectiveTarget, blacklist, black
                // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
                // Modulated mining lasers bypass this since they can adjust to power 1
                const hasScanData = loc.minutesSinceScan !== Infinity;
-               const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+               const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
                if (isLowRemainingWithUnknownPower) {
                  return false;
                }
                // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-               if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+               if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
                  return false;
                }
                return true;
@@ -5017,7 +5033,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             // Skip POIs where we have scan data showing remaining <= 300 and no supported_power
             // Modulated mining lasers bypass this since they can adjust to power 1
             const hasScanData = loc.minutesSinceScan !== Infinity;
-            const isLowRemainingWithUnknownPower = !hasModulatedLaser && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
+            const isLowRemainingWithUnknownPower = shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && hasScanData && loc.remaining <= 300 && (!loc.supportedPower || loc.supportedPower <= 0);
             if (isLowRemainingWithUnknownPower) {
               return false;
             }
@@ -5026,7 +5042,7 @@ if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               return false;
             }
             // Skip POIs where our mining power exceeds 4x the supported_power (too sparse)
-            if (!hasModulatedLaser && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
+            if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && loc.supportedPower && loc.supportedPower > 0 && totalMiningPower > loc.supportedPower * 4) {
               return false;
             }
             // No depletion filtering - trust the map data
@@ -6479,7 +6495,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
         ctx.log("mining", `Modulated Mining Laser detected — overriding equipment total mining power to 1 (was ${getTotalMiningPower(modules)})`);
       }
       
-      const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower, hasModulatedLaserMid);
+      const powerCheck = checkDepositPowerCompatibility(totalMiningPower, supportedPower, effectiveTarget, hasModulatedLaserMid);
       if (!powerCheck.canMine) {
         ctx.log("mining", `Power check failed: ${powerCheck.reason}`);
         ctx.log("mining", `Deposit too sparse - equipment power (${totalMiningPower}) exceeds 4x supported_power (${supportedPower})`);
@@ -6515,7 +6531,7 @@ if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
               if (remaining > 0) {
                 if (!settings.ignoreDepletion && oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
                   ctx.log("debug", `Skipping depleted POI ${altPoi.name} (ore depleted at ${oreEntry.depleted_at}, lockout still active)`);
-                } else if (!hasModulatedLaser && totalMiningPower > 0 && resourceEntry.supported_power && totalMiningPower > resourceEntry.supported_power * 4) {
+                 } else if (shouldEnforceStandardMiningLimits(effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && resourceEntry.supported_power && totalMiningPower > resourceEntry.supported_power * 4) {
                   ctx.log("debug", `Skipping ${altPoi.name}: deposit too sparse (supported_power=${resourceEntry.supported_power}, equipment=${totalMiningPower})`);
                 } else {
                   newTarget = effectiveTarget;
@@ -7554,7 +7570,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                  if (r.remaining <= 0 && r.max_remaining > 0) return false;
          if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
          if (r.depleted && !isDepletionExpired(r.depleted_at, depletionTimeoutMs)) return false;
-                 if (!hasModulatedLaser && r.supported_power && r.supported_power > 0 && totalMiningPower > r.supported_power * 4) return false;
+                  if (shouldEnforceStandardMiningLimits(r.resource_id, hasModulatedLaser) && r.supported_power && r.supported_power > 0 && totalMiningPower > r.supported_power * 4) return false;
                  return true;
                });
 
@@ -7624,7 +7640,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                    }
 
                    // Check supported_power for high-power miners
-                   if (!hasModulatedLaser && totalMiningPower > 0 && resourceEntry?.supported_power && resourceEntry.supported_power > 0 && totalMiningPower > resourceEntry.supported_power * 4) {
+                    if (shouldEnforceStandardMiningLimits(loc.resourceId || effectiveTarget, hasModulatedLaser) && totalMiningPower > 0 && resourceEntry?.supported_power && resourceEntry.supported_power > 0 && totalMiningPower > resourceEntry.supported_power * 4) {
                      continue;
                    }
 
@@ -8078,7 +8094,7 @@ const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
     // - Refuel and continue mining instead of returning home
     // This prevents depositing at random stations during refuel detours
     const isCargoFull = fillRatio >= cargoThresholdRatio;
-    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull && settings.stayOutUntilFull;
+    const shouldStayOutDueToFuel = isFuelLowStop && !isCargoFull;
 
     const shouldReturnHome = settings.noMidMiningRetarget
       ? (bot.system !== homeSystem && homeSystem)

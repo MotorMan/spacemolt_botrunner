@@ -180,10 +180,9 @@ async function tryProcessSellableItems(
 
           if (needPreload > 0) {
             try {
-              const storageResp = await bot.exec("view_storage");
-              const storageItems = ((storageResp.result as Record<string, unknown>)?.storage as Array<Record<string, unknown>>) || [];
-              const storageItem = storageItems.find(s => (s.item_id as string) === watchedItem.itemId);
-              const storageQty = storageItem ? ((storageItem.quantity as number) || (storageItem.count as number) || 0) : 0;
+              const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+              const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
+              const storageQty = storageItem?.quantity || 0;
               const withdrawQty = Math.min(needPreload, storageQty, Math.floor(freeSpace / itemS));
 
               if (withdrawQty > 0) {
@@ -222,11 +221,10 @@ async function tryProcessSellableItems(
 
         if (needWithdraw > 0) {
           try {
+            const parsedStorage = bot.parseItemList((await bot.exec("view_storage")).result, "storage");
+            const storageItem = parsedStorage.find(s => s.itemId === watchedItem.itemId);
+            const storageQty = storageItem?.quantity || 0;
             const itemS = itemSize(watchedItem.itemId);
-            const storageResp = await bot.exec("view_storage");
-            const storageItems = ((storageResp.result as Record<string, unknown>)?.storage as Array<Record<string, unknown>>) || [];
-            const storageItem = storageItems.find(s => (s.item_id as string) === watchedItem.itemId);
-            const storageQty = storageItem ? ((storageItem.quantity as number) || (storageItem.count as number) || 0) : 0;
             const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
             const maxFit = Math.floor(availableSpace / itemS);
             const actualWithdraw = Math.min(needWithdraw, storageQty, maxFit);
@@ -258,6 +256,14 @@ async function tryProcessSellableItems(
             continue;
           }
         }
+
+        const cargoAfterWithdraw = bot.inventory.find(c => c.itemId === watchedItem.itemId)?.quantity || 0;
+        const itemS = itemSize(watchedItem.itemId);
+        const availableSpace = Math.max(0, (bot.cargoMax || 0) - (bot.cargo || 0));
+        const maxFit = Math.floor(availableSpace / itemS);
+        sellQty = Math.max(0, Math.min(sellQty, cargoAfterWithdraw, maxFit));
+
+        if (sellQty <= 0) continue;
 
         try {
           let sellResp;

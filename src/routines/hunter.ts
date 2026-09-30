@@ -4684,18 +4684,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const marineDeficit = Math.max(0, maxMarines - (bot.fitMarines ?? 0));
   if (crewDeficit > 0 || marineDeficit > 0) {
     await recruitPersonnel(ctx, crewDeficit, marineDeficit);
-    // recruit_personnel is a 1-tick mutation. Wait for it to settle before
-    // issuing dock / undock / storage commands, which would otherwise hit
-    // "Another action is already pending" and cascade into failures.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await ctx.sleep(2000);
-      const shipResp = await bot.refreshShip();
-      if (!shipResp.error) break;
-      const msg = shipResp.error.message || "";
-      if (!msg.includes("action is already pending") && !msg.includes("Another action is already pending") && !msg.includes("already in progress")) {
-        break;
-      }
-    }
+    await ctx.sleep(11_000);
   }
 
   await bot.refreshLocation();

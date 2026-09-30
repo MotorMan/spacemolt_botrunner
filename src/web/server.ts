@@ -2123,6 +2123,15 @@ if (!this.settings.fuel_service) {
             const ok = this.syncMaster?.coordinationSync(body);
             return Response.json({ ok: !!ok }, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/creature-claim" && req.method === "POST") {
+            const body = await req.json() as import("../client_sync_types.js").CreatureClaimPayload;
+            const ok = this.syncMaster?.registerCreatureClaim(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/creature-claims" && req.method === "GET") {
+            const claims = this.syncMaster?.getCreatureClaims() ?? [];
+            return Response.json(claims, { headers: cors });
+          }
           if (url.pathname === "/api/client-sync/player-names-update" && req.method === "POST") {
             const body = await req.json() as PlayerNamePayload;
             const ok = this.syncMaster?.playerNamesUpdate(body);

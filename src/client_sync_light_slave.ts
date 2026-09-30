@@ -1,4 +1,4 @@
-import { type SyncSettings, type MarketQueryRequest, type MarketQueryResult } from "./client_sync_types.js";
+import { type SyncSettings, type MarketQueryRequest, type MarketQueryResult, type CreatureClaimPayload } from "./client_sync_types.js";
 import { botChatChannel } from "./bot_chat_channel.js";
 
 /**
@@ -51,6 +51,7 @@ export class ClientSyncLightSlave {
    *  cycle from the presence of a local `data/marketDetails.json`; we only tell
    *  the master we can answer market queries when we really can. */
   private hasMarketData = false;
+  private pendingCreatureClaims: CreatureClaimPayload[] = [];
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -90,6 +91,40 @@ export class ClientSyncLightSlave {
       await this.pushChat();
     } catch {
       // best-effort; the next poll cycle will retry
+    }
+  }
+
+  public queueCreatureClaim(claim: CreatureClaimPayload): void {
+    this.pendingCreatureClaims.push(claim);
+  }
+
+  private async pushCreatureClaims(): Promise<void> {
+    if (!this.clientId || !this.pendingCreatureClaims.length) return;
+    const claims = this.pendingCreatureClaims.splice(0, this.pendingCreatureClaims.length);
+    try {
+      await Promise.all(claims.map(claim => this.request<{ ok: boolean }>("/api/client-sync/creature-claim", { method: "POST" }, claim)));
+    } catch {
+      // best-effort; if this fails, the claim still exists locally and will be retried next cycle
+    }
+  }
+
+  private async pullCreatureClaims(): Promise<void> {
+    const claims = await this.request<CreatureClaimPayload[]>("/api/client-sync/creature-claims");
+    if (!Array.isArray(claims)) return;
+    for (const claim of claims) {
+      botChatChannel.send({
+        sender: claim.claimer,
+        recipients: [],
+        channel: "coordination",
+        content: `[CREATURE CLAIM] ${claim.claimer} claiming ${claim.targetName} (${claim.targetId}) at ${claim.system}/${claim.poi}`,
+        metadata: {
+          type: "creature_claim",
+          system: claim.system,
+          poi: claim.poi,
+          targetName: claim.targetName,
+          targetId: claim.targetId,
+        },
+      });
     }
   }
 
@@ -463,6 +498,8 @@ export class ClientSyncLightSlave {
       }
       await this.pushChat();
       await this.pullChat();
+      await this.pushCreatureClaims();
+      await this.pullCreatureClaims();
       // Fleet-wide catalog convergence: the master elects ONE client to fetch
       // catalog.json from the gameserver and relays that single copy to the
       // rest of us — so we don't all hammer the (rate-limited) endpoint and end

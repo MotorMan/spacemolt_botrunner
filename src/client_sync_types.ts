@@ -71,6 +71,15 @@ export interface CoordinationPayload {
   data: unknown;
 }
 
+export interface CreatureClaimPayload {
+  claimer: string;
+  targetId: string;
+  targetName: string;
+  system: string;
+  poi: string;
+  expiresAt: number;
+}
+
 export interface PlayerNamePayload {
   name: string;
   faction?: string;

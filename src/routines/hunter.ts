@@ -1249,9 +1249,16 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
       targetId: target.id,
     },
   });
-  const syncLight = (globalThis as any).syncLight as { pushChatNow?: () => Promise<void> } | undefined;
-  if (syncLight?.pushChatNow) {
-    syncLight.pushChatNow().catch(() => {});
+  const syncLight = (globalThis as any).syncLight as { queueCreatureClaim?: (claim: any) => void } | undefined;
+  if (syncLight?.queueCreatureClaim) {
+    syncLight.queueCreatureClaim({
+      claimer: bot.username,
+      targetId: target.id,
+      targetName: target.name,
+      system: bot.system,
+      poi: bot.poi,
+      expiresAt: Date.now() + CREATURE_CLAIM_TTL_MS,
+    });
   }
 }
 

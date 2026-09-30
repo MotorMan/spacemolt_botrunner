@@ -18,6 +18,7 @@ import type {
   PoiPayload,
   MarketPayload,
   CoordinationPayload,
+  CreatureClaimPayload,
   PlayerNamePayload,
   PassengerPayload,
   BotStatusPush,
@@ -73,6 +74,7 @@ export class ClientSyncMaster {
    * same primary even though each client only knows its own local settings.
    */
   private designatedMaydayPrimary: string | null = null;
+  private creatureClaims = new Map<string, { claimer: string; targetName: string; system: string; poi: string; expiresAt: number }>();
 
   // ── Catalog orchestration ──────────────────────────────────
   // Instead of every connected client independently downloading the gameserver's
@@ -560,6 +562,37 @@ export class ClientSyncMaster {
 
   public coordinationSync(_payload: CoordinationPayload): boolean {
     return true;
+  }
+
+  public registerCreatureClaim(payload: CreatureClaimPayload): boolean {
+    this.creatureClaims.set(payload.targetId, {
+      claimer: payload.claimer,
+      targetName: payload.targetName,
+      system: payload.system,
+      poi: payload.poi,
+      expiresAt: payload.expiresAt,
+    });
+    return true;
+  }
+
+  public getCreatureClaims(): CreatureClaimPayload[] {
+    const now = Date.now();
+    const out: CreatureClaimPayload[] = [];
+    for (const [targetId, claim] of this.creatureClaims) {
+      if (claim.expiresAt <= now) {
+        this.creatureClaims.delete(targetId);
+        continue;
+      }
+      out.push({
+        claimer: claim.claimer,
+        targetId,
+        targetName: claim.targetName,
+        system: claim.system,
+        poi: claim.poi,
+        expiresAt: claim.expiresAt,
+      });
+    }
+    return out;
   }
 
   public playerNamesUpdate(_payload: PlayerNamePayload): boolean {

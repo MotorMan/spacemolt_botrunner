@@ -2848,9 +2848,10 @@ async function main(): Promise<void> {
 
   // Set up bot-to-bot chat channel logging
   botChatChannel.onGlobalMessage((msg: BotChatMessage) => {
+    if (msg.channel === "coordination") return;
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    const recipientInfo = msg.recipients.length > 0 
-      ? ` -> ${msg.recipients.join(", ")}` 
+    const recipientInfo = msg.recipients.length > 0
+      ? ` -> ${msg.recipients.join(", ")}`
       : " -> [broadcast]";
     const line = `${timestamp} [BOT_CHAT] [${msg.channel}] ${msg.sender}${recipientInfo}: ${msg.content}`;
     server.logSystem(line);

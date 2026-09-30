@@ -1224,12 +1224,11 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
   if (!bot.system || !bot.poi) return;
   const settings = getHunterSettings(bot.username);
   if (settings.coordinationMode === "off") return;
-  // Only non-leviathan creatures are claimed — leviathans keep the assist broadcast.
-  // Branded creatures are never claimed — they belong to another faction.
   const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
   if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name)) return;
+  const existing = creatureClaims.get(target.id);
+  if (existing && existing.claimer === bot.username) return;
   creatureClaims.set(target.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
-  ctx.log("combat", `[coordination] ${bot.username} claimed ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`);
   botChatChannel.send({
     sender: bot.username,
     recipients: [],
@@ -1257,11 +1256,7 @@ function isCreatureClaimedByOther(creatureId: string, username: string): boolean
     creatureClaims.delete(creatureId);
     return false;
   }
-  const result = claim.claimer !== username;
-  if (result) {
-    console.log(`[coordination] ${username} skipping ${creatureId}: already claimed by ${claim.claimer}`);
-  }
-  return result;
+  return claim.claimer !== username;
 }
 
 /**
@@ -1277,9 +1272,7 @@ function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCre
     isLeviathanCreature(e.name) || coordinationMode !== "avoid" || !isCreatureClaimedByOther(e.id, username),
   );
   const result = prioritizeLeviathans(unclaimed).slice(0, Math.max(0, max));
-  if (result.length > 0) {
-    console.log(`[coordination] ${username} selected creatures: ${result.map(c => `${c.name}(${c.id})`).join(", ")} (mode=${coordinationMode}, nearby=${creatures.length}, unclaimed=${unclaimed.length})`);
-  }
+  return result;
   // Claim the creatures we're handing back so a bot scanning on the same tick skips
   // them (selection is the sync point — the process-shared map prevents two hunters
   // from both picking the same one-shot creature). Leviathans are never claimed.
@@ -1375,10 +1368,12 @@ function ensureHunterCoordListener(username: string): void {
       coordRequests.get(username)!.push(req);
     } else if (meta.type === "creature_claim") {
       const targetId = (meta.targetId as string) || "";
-      if (targetId) {
-        creatureClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
-        console.log(`[coordination] ${username} received claim from ${msg.sender} for ${targetId}`);
-      }
+      if (!targetId) return;
+      const incomingClaimer = (msg.sender || "").trim();
+      if (!incomingClaimer) return;
+      const existing = creatureClaims.get(targetId);
+      if (existing && existing.claimer === incomingClaimer) return;
+      creatureClaims.set(targetId, { claimer: incomingClaimer, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
     } else if (meta.type === "hunter_boarding_claim") {
       const targetId = (meta.targetId as string) || "";
       if (targetId) {

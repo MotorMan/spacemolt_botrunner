@@ -32266,6 +32266,7 @@ ignoreBlacklist: document.getElementById(
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
         const coordinateHunts = h.coordinateHunts !== false;
+        const coordinationMode = h.coordinationMode || (coordinateHunts ? "avoid" : "off");
         const responseRange = h.responseRange ?? 3;
         const maxAttackTier = h.maxAttackTier || "large";
         const fleeFromTier = h.fleeFromTier || "boss";
@@ -32750,12 +32751,13 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Coordinated Hunts (Bot Chat)</div>
-        <div class="setting-hint">When engaging a creature or pirate, broadcast on the bot chat channel so other hunters in the same POI pull in and join the fight. Disable to hunt solo.</div>
+        <div class="setting-label">Hunter Coordination Mode</div>
+        <div class="setting-hint">Controls how hunters in the same POI share targets via the bot chat channel. Off disables coordination. Assist calls every hunter into every creature fight (leviathans always assisted). Avoid claims non-leviathan creatures so other hunters skip them, while leviathans still get the full wing.</div>
       </div>
-      <select id="set-hunter-coordinateHunts">
-        <option value="true"${coordinateHunts ? " selected" : ""}>Enabled</option>
-        <option value="false"${!coordinateHunts ? " selected" : ""}>Disabled</option>
+      <select id="set-hunter-coordinationMode">
+        <option value="off"${coordinationMode === "off" ? " selected" : ""}>Off</option>
+        <option value="assist"${coordinationMode === "assist" ? " selected" : ""}>Assist</option>
+        <option value="avoid"${coordinationMode === "avoid" ? " selected" : ""}>Avoid</option>
       </select>
     </div>
 
@@ -33046,8 +33048,8 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-onlyNPCs").value === "true",
           huntCreatures:
             document.getElementById("set-hunter-huntCreatures").value === "true",
-          coordinateHunts:
-            document.getElementById("set-hunter-coordinateHunts").value === "true",
+          coordinationMode:
+            document.getElementById("set-hunter-coordinationMode").value || "off",
           maxAttackTier: document.getElementById("set-hunter-maxAttackTier")
             .value,
           fleeFromTier: document.getElementById("set-hunter-fleeFromTier")

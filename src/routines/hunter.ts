@@ -1207,7 +1207,7 @@ let coordResponding = false;
 
 /** How long a claim stays valid before it is treated as stale (ms). Covers the case
  *  where the claiming bot dies mid-fight and never releases the lock. */
-const CREATURE_CLAIM_TTL_MS = 90 * 1000;
+const CREATURE_CLAIM_TTL_MS = 5 * 60 * 1000;
 /** Map<creatureId, { claimer, expires }> — shared across all bots in this process. */
 const creatureClaims = new Map<string, { claimer: string; expires: number }>();
 
@@ -1229,6 +1229,7 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
   const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
   if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name)) return;
   creatureClaims.set(target.id, { claimer: bot.username, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+  ctx.log("combat", `[coordination] ${bot.username} claimed ${target.name} (${target.id}) at ${bot.system}/${bot.poi}`);
   botChatChannel.send({
     sender: bot.username,
     recipients: [],
@@ -1252,7 +1253,11 @@ function isCreatureClaimedByOther(creatureId: string, username: string): boolean
     creatureClaims.delete(creatureId);
     return false;
   }
-  return claim.claimer !== username;
+  const result = claim.claimer !== username;
+  if (result) {
+    console.log(`[coordination] ${username} skipping ${creatureId}: already claimed by ${claim.claimer}`);
+  }
+  return result;
 }
 
 /**
@@ -1268,6 +1273,9 @@ function pickCreatureTargets(entities: NearbyEntity[], username: string, huntCre
     isLeviathanCreature(e.name) || coordinationMode !== "avoid" || !isCreatureClaimedByOther(e.id, username),
   );
   const result = prioritizeLeviathans(unclaimed).slice(0, Math.max(0, max));
+  if (result.length > 0) {
+    console.log(`[coordination] ${username} selected creatures: ${result.map(c => `${c.name}(${c.id})`).join(", ")} (mode=${coordinationMode}, nearby=${creatures.length}, unclaimed=${unclaimed.length})`);
+  }
   // Claim the creatures we're handing back so a bot scanning on the same tick skips
   // them (selection is the sync point — the process-shared map prevents two hunters
   // from both picking the same one-shot creature). Leviathans are never claimed.
@@ -1365,6 +1373,7 @@ function ensureHunterCoordListener(username: string): void {
       const targetId = (meta.targetId as string) || "";
       if (targetId) {
         creatureClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + CREATURE_CLAIM_TTL_MS });
+        console.log(`[coordination] ${username} received claim from ${msg.sender} for ${targetId}`);
       }
     } else if (meta.type === "hunter_boarding_claim") {
       const targetId = (meta.targetId as string) || "";
@@ -4649,13 +4658,13 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
 }
 async function waitForPendingActionSettle(ctx: RoutineContext, label: string): Promise<void> {
   const { bot } = ctx;
-  for (let i = 0; i < 5; i++) {
-    const resp = await bot.refreshLocation();
+  for (let i = 0; i < 10; i++) {
+    const resp = await bot.exec("get_ship");
     if (!resp.error) return;
     const msg = resp.error.message || "";
-    const isPending = resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress");
+    const isPending = resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress") || msg.includes("Another action is already pending");
     if (isPending) {
-      ctx.log("system", `${label} pending — waiting 2s (attempt ${i + 1}/5)...`);
+      ctx.log("system", `${label} pending — waiting 2s (attempt ${i + 1}/10)...`);
       await new Promise(r => setTimeout(r, 2000));
     } else {
       return;

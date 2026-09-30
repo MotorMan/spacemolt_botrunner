@@ -464,14 +464,7 @@ export class ClientSyncMaster {
     if (c) c.lastSeen = Date.now();
   }
 
-  public chatRelay(body: { channel: string; content: string; sender?: string; clientId?: string }): { ok: boolean } {
-    // Relay a client's non-API bot-chat message into this master's in-memory
-    // bot chat channel so routines on the master (mayday calls, periodic status
-    // checks, …) can see it. The message is tagged with the originating client
-    // label so every connected client (slave + light) that pulls `chat-history`
-    // sees the union of all clients' bot chat. This is what lets the lightweight
-    // connect mode share the cross-client bot chat channel without any of the
-    // heavy file sync that the full slave mode does.
+  public chatRelay(body: { channel: string; content: string; sender?: string; clientId?: string; metadata?: Record<string, unknown> }): { ok: boolean } {
     const client = body.clientId ? this.clients.get(body.clientId) : undefined;
     const label = client?.label;
     const prefix = label ? `[${label}] ` : "";
@@ -480,6 +473,7 @@ export class ClientSyncMaster {
       recipients: [],
       channel: (body.channel as any) || "general",
       content: String(body.content || ""),
+      metadata: body.metadata,
     });
     return { ok: true };
   }

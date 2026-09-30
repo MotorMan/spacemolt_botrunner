@@ -239,18 +239,14 @@ export class ClientSyncLightSlave {
     for (const m of history) {
       const sig = `${m.sender}|${m.channel}|${m.content}|${m.timestamp}`;
       if (sig === this.lastRelayedChat) continue;
-      // Only relay messages generated on THIS client: our own bot chat handler
-      // tags local sends, but to be safe we relay everything newer than the last
-      // relayed cursor. The master tags the source client label so other clients
-      // can distinguish them, and we skip our own echoed messages on pull.
       try {
         await this.request<{ ok: boolean }>("/api/client-sync/chat-relay", { method: "POST" }, {
           channel: m.channel,
           content: m.content,
           sender: m.sender,
+          metadata: m.metadata,
         });
       } catch {
-        // leave cursor unchanged so we retry next cycle
         break;
       }
       this.lastRelayedChat = sig;
@@ -269,13 +265,14 @@ export class ClientSyncLightSlave {
     const local = botChatChannel.getHistory(undefined, 200);
     const seen = new Set(local.map((m) => `${m.sender}|${m.channel}|${m.content}|${m.timestamp}`));
     for (const m of data) {
-      const sig = `${m.sender}|${m.channel}|${m.content}|${m.timestamp}`;
+      const sig = `${m.sender || ""}|${m.channel || ""}|${m.content || ""}|${m.timestamp || ""}`;
       if (seen.has(sig)) continue;
       botChatChannel.send({
         sender: String(m.sender || "remote"),
         recipients: [],
         channel: (m.channel as any) || "general",
         content: String(m.content || ""),
+        metadata: m.metadata as Record<string, unknown> | undefined,
       });
     }
   }

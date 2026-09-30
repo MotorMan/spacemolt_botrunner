@@ -2072,7 +2072,7 @@ if (!this.settings.fuel_service) {
             return Response.json(result, { headers: testCors });
           }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
-            const body = await req.json() as { channel: string; content: string; sender?: string };
+            const body = await req.json() as { channel: string; content: string; sender?: string; metadata?: Record<string, unknown> };
             const clientId = req.headers.get("x-client-id") || "";
             const result = this.syncMaster?.chatRelay({ ...body, clientId });
             return Response.json(result ?? { ok: false }, { headers: cors });

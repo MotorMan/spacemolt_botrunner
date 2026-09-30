@@ -63,7 +63,7 @@ export class ClientSyncLightSlave {
     const intervalMs = Math.max(5, this.settings.pollIntervalSec * 1000);
     // Treat the link as stale after ~4 missed poll cycles (min 30s). The master
     // prunes silent clients at 10min, so this is well within that window and
-    // lets a client self-heal long before the master forgets it.
+    // lets a client self-heal long before the master forgets us.
     this.staleMs = Math.max(30000, intervalMs * 4);
     this.timer = setInterval(() => this.pollCycle(), intervalMs);
     this.pollCycle();
@@ -81,6 +81,16 @@ export class ClientSyncLightSlave {
 
   public getState(): { connected: boolean; lastSync: number; lastError: string | null; connectionState: string; lastConnectAttempt: number } {
     return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError, connectionState: this.connectionState, lastConnectAttempt: this.lastConnectAttempt };
+  }
+
+  /** Push any pending local bot-chat messages to the master immediately, outside the normal poll cycle. */
+  public async pushChatNow(): Promise<void> {
+    if (!this.running) return;
+    try {
+      await this.pushChat();
+    } catch {
+      // best-effort; the next poll cycle will retry
+    }
   }
 
   /** Whether this node currently can serve market data queries. */

@@ -1243,6 +1243,10 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
       targetId: target.id,
     },
   });
+  const syncLight = (globalThis as any).syncLight as { pushChatNow?: () => Promise<void> } | undefined;
+  if (syncLight?.pushChatNow) {
+    syncLight.pushChatNow().catch(() => {});
+  }
 }
 
 /** True if a different hunter has an active claim on this creatureId. */

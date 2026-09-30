@@ -32289,6 +32289,8 @@ ignoreBlacklist: document.getElementById(
         const boardingPrizeDestination = h.boardingPrizeDestination || "";
         const stayInPoi = h.stayInPoi ?? false;
         const fleetIdlePollSeconds = h.fleetIdlePollSeconds ?? 2;
+        const creatureFarmRecordKills = h.creatureFarmRecordKills ?? true;
+        const creatureFarmUseHistoricalData = h.creatureFarmUseHistoricalData ?? false;
         const fleetBattleConfirmSeconds = h.fleetBattleConfirmSeconds ?? 10;
         const fleetFightPlayers = h.fleetFightPlayers ?? true;
         const fleetUndockToFight = h.fleetUndockToFight ?? true;
@@ -32950,19 +32952,41 @@ ignoreBlacklist: document.getElementById(
       </div>
 
        <div class="setting-row">
-        <div>
-          <div class="setting-label">Stay in POI (boarding mode)</div>
-          <div class="setting-hint">When enabled in boarding mode, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs and systems. Recommended with a fixed patrol profile or single system.</div>
-        </div>
-        <select id="set-hunter-stayInPoi">
-          <option value="false"${!stayInPoi ? " selected" : ""}>Disabled (patrol between POIs)</option>
-          <option value="true"${stayInPoi ? " selected" : ""}>Enabled (stay at current POI)</option>
-        </select>
-      </div>
+         <div>
+           <div class="setting-label">Stay in POI (boarding mode)</div>
+           <div class="setting-hint">When enabled in boarding mode, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs and systems. Recommended with a fixed patrol profile or single system.</div>
+         </div>
+         <select id="set-hunter-stayInPoi">
+           <option value="false"${!stayInPoi ? " selected" : ""}>Disabled (patrol between POIs)</option>
+           <option value="true"${stayInPoi ? " selected" : ""}>Enabled (stay at current POI)</option>
+         </select>
+       </div>
 
-      <div class="settings-save-bar">
-      <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
-    </div>
+       <div class="setting-row">
+         <div>
+           <div class="setting-label">Record Creature Kills</div>
+           <div class="setting-hint">Save creature kill data (system, POI, species, count) to data/creature_kills.json for historical system scoring. Keep enabled to build up the dataset.</div>
+         </div>
+         <select id="set-hunter-creatureFarmRecordKills">
+           <option value="true"${creatureFarmRecordKills ? " selected" : ""}>Enabled (record kills)</option>
+           <option value="false"${!creatureFarmRecordKills ? " selected" : ""}>Disabled</option>
+         </select>
+       </div>
+
+       <div class="setting-row">
+         <div>
+           <div class="setting-label">Use Historical Data for System Selection</div>
+           <div class="setting-hint">When enabled, creature_farm_random mode will prefer systems with more historical creature kills. Requires creature_kills.json to have data. Keep disabled until you have enough recorded data.</div>
+         </div>
+         <select id="set-hunter-creatureFarmUseHistoricalData">
+           <option value="false"${!creatureFarmUseHistoricalData ? " selected" : ""}>Disabled (pure random)</option>
+           <option value="true"${creatureFarmUseHistoricalData ? " selected" : ""}>Enabled (prefer productive systems)</option>
+         </select>
+       </div>
+
+       <div class="settings-save-bar">
+       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
+     </div>
   `;
       }
 
@@ -33113,6 +33137,10 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-hunter-boardingPrizeDestination")?.value.trim() || "",
           stayInPoi:
             document.getElementById("set-hunter-stayInPoi")?.value === "true",
+          creatureFarmRecordKills:
+            document.getElementById("set-hunter-creatureFarmRecordKills")?.value === "true",
+          creatureFarmUseHistoricalData:
+            document.getElementById("set-hunter-creatureFarmUseHistoricalData")?.value === "true",
         };
         send({ type: "saveSettings", routine: "hunter", settings: s });
         settings.hunter = s;

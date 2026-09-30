@@ -75,6 +75,7 @@ import { getSystemBlacklist } from "../web/server.js";
 import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common.js";
 import { combatDebugLog } from "../debug.js";
 import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
+import { creatureKillStore } from "../creaturekillstore.js";
 import {
   findStation,
   isStationPoi,
@@ -193,6 +194,21 @@ function isLeviathanCreature(name: string | undefined, species?: string): boolea
 function isBrandedCreature(name: string | undefined): boolean {
   if (!name) return false;
   return name.toLowerCase().includes("branded");
+}
+
+/**
+ * Record a creature kill to the historical data store for later system scoring.
+ * Only records when creatureFarmRecordKills is enabled and the target is actually
+ * a creature (not a pirate).
+ */
+function recordCreatureKill(bot: Bot, target: NearbyEntity): void {
+  const settings = getHunterSettings(bot.username);
+  if (!settings.creatureFarmRecordKills) return;
+  if (!bot.system || !bot.poi) return;
+  const isCreature = !!(target as any).isCreature || (target as any).type === "creature" || isCreatureName(target.name);
+  if (!isCreature) return;
+  const species = (target as any).species || target.name || "unknown";
+  creatureKillStore.recordKill(bot.system, bot.poi, species);
 }
 
 /**
@@ -540,8 +556,10 @@ export function getHunterSettings(username?: string): {
   boardingShieldThreshold: number;
   boardingMarines: number;
   boardingPrizeDestination: string;
-  creatureFarmSystems: string[];
+   creatureFarmSystems: string[];
   creatureFarmRoamJumps: number;
+  creatureFarmRecordKills: boolean;
+  creatureFarmUseHistoricalData: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -628,6 +646,8 @@ export function getHunterSettings(username?: string): {
       "",
     creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
     creatureFarmRoamJumps: (botOverrides.creatureFarmRoamJumps as number) ?? (h.creatureFarmRoamJumps as number) ?? 1,
+    creatureFarmRecordKills: (h.creatureFarmRecordKills as boolean) ?? true,
+    creatureFarmUseHistoricalData: (h.creatureFarmUseHistoricalData as boolean) ?? false,
   };
 }
 
@@ -1899,7 +1919,22 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
           ctx.log("info", `Creature farm random mode: base=${baseSystem}, no roaming`);
         }
       }
-      effectiveSystems = creatureFarmExpandedSystems;
+
+      if (settings.creatureFarmUseHistoricalData) {
+        const totals = creatureKillStore.getAllSystemTotals();
+        const scored = creatureFarmExpandedSystems
+          .map(sysId => ({ system: sysId, score: totals[sysId] || 0 }))
+          .sort((a, b) => b.score - a.score);
+        effectiveSystems = scored.map(s => s.system);
+        const topScore = scored[0]?.score || 0;
+        if (topScore > 0) {
+          ctx.log("info", `Creature farm random: sorted by historical kills (top: ${topScore} in ${scored[0].system})`);
+        } else {
+          ctx.log("info", "Creature farm random: no historical data yet — using random order");
+        }
+      } else {
+        effectiveSystems = creatureFarmExpandedSystems;
+      }
     } else {
       effectiveSystems = profile!.patrolSystems;
       if (profile!.creatureFarmCenterSystem && profile!.creatureFarmPatrolRadius) {
@@ -2185,6 +2220,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             if (won) {
               totalKills++;
               sweepKills++;
+              recordCreatureKill(bot, target);
               ctx.log("combat", `Kill #${totalKills} (${target.name}) — looting before next...`);
               if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
               const cset = getHunterSettings(bot.username);
@@ -2672,6 +2708,7 @@ if (hullPct <= settings.repairThreshold) {
         if (won) {
           totalKills++;
           patrolKills++;
+          recordCreatureKill(bot, target);
           ctx.log("combat", `Kill #${totalKills} — checking for new threats before looting...`);
 
           // CRITICAL: Check for new pirates before looting (safety first!)
@@ -3143,6 +3180,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         if (won) {
           totalKills++;
           patrolKills++;
+          recordCreatureKill(bot, target);
           ctx.log("combat", `Kill #${totalKills} — checking for new threats before looting...`);
 
           // Safety check for new threats
@@ -4562,6 +4600,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
           const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
+            recordCreatureKill(bot, target);
             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
@@ -5088,6 +5127,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
           const won = await hunterEngage(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
           if (won) {
             totalKills++;
+            recordCreatureKill(bot, target);
             if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
             // top up shields (this path previously had no shield recharge after kills)
             const csettings = getHunterSettings(bot.username);
@@ -5255,6 +5295,7 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
           const won = await hunterEngage(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold, currentSettings.onlyNPCs, currentSettings.cloakOnStart);
           if (won) {
             totalKills++;
+            recordCreatureKill(bot, target);
             await scavengeWrecks(ctx);
             const csettings = getHunterSettings(bot.username);
             await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
@@ -7621,7 +7662,14 @@ async function* boardingSystemPass(
   return [totalKills, totalBoardings];
 }
 
-
+// Flush creature kill store on exit so no data is lost.
+process.on("exit", () => {
+  try {
+    creatureKillStore.flushSync();
+  } catch {
+    // nothing useful to do while exiting
+  }
+});
 
 
 

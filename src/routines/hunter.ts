@@ -65,6 +65,9 @@
  *   boardingEnabled          — when true, the hunter switches to boarding stance on eligible targets with low shields instead of killing them (default: false)
  *   boardingShieldThreshold   — shield % at or below which to attempt boarding (default: 5)
  *   boardingMarines           — marines to commit to the board stance (0 = all fit marines on board; default: 0)
+ *   boardingShieldChargePct   — when in boarding mode, reserve this % of cargo capacity for shield_charge items (default: 0 = use normal desiredShieldCharges logic)
+ *   boardingBraceOnRetreat    — switch to brace stance while retreating from a stronghold after clearing all pirates (default: false)
+ *   boardingPrizeDestination  — optional per-profile prize destination for boarding mode
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -565,10 +568,12 @@ export function getHunterSettings(username?: string): {
   fleetBattleConfirmSeconds: number;
   fleetFightPlayers: boolean;
   fleetUndockToFight: boolean;
-   boardingEnabled: boolean;
+    boardingEnabled: boolean;
   boardingShieldThreshold: number;
   boardingMarines: number;
   boardingPrizeDestination: string;
+  boardingShieldChargePct: number;
+  boardingBraceOnRetreat: boolean;
    creatureFarmSystems: string[];
   creatureFarmRoamJumps: number;
   creatureFarmRecordKills: boolean;
@@ -658,6 +663,8 @@ export function getHunterSettings(username?: string): {
       (botOverrides.boardingPrizeDestination as string) ||
       (h.boardingPrizeDestination as string) ||
       "",
+    boardingShieldChargePct: (botOverrides.boardingShieldChargePct as number) ?? (h.boardingShieldChargePct as number) ?? 0,
+    boardingBraceOnRetreat: (botOverrides.boardingBraceOnRetreat as boolean) ?? (h.boardingBraceOnRetreat as boolean) ?? false,
     creatureFarmSystems: Array.isArray(h.creatureFarmSystems) ? h.creatureFarmSystems : [],
     creatureFarmRoamJumps: (botOverrides.creatureFarmRoamJumps as number) ?? (h.creatureFarmRoamJumps as number) ?? 1,
     creatureFarmRecordKills: (h.creatureFarmRecordKills as boolean) ?? true,
@@ -4893,7 +4900,17 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   if (!hs.disableResupply) {
     const shieldIds = ["shield_charge"];
     let gotShield = false;
-    const shieldToGet = Math.max(0, desiredShield - currentShield);
+    let shieldToGet = Math.max(0, desiredShield - currentShield);
+
+    if (hs.mode === "boarding" && (hs.boardingShieldChargePct ?? 0) > 0) {
+      const pct = hs.boardingShieldChargePct as number;
+      const shieldSize = getItemSize("shield_charge");
+      const shieldTargetCount = Math.floor((bot.cargoMax * (pct / 100)) / shieldSize);
+      const boardingShieldNeed = Math.max(0, shieldTargetCount - currentShield);
+      shieldToGet = Math.min(shieldToGet, boardingShieldNeed);
+      ctx.log("trade", `Boarding mode shield reserve: targeting ${pct}% of cargo = ${shieldTargetCount} shield_charge (need ${boardingShieldNeed} more)`);
+    }
+
     for (const shId of shieldIds) {
       const shSize = getItemSize(shId);
       const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
@@ -4910,6 +4927,8 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
         freeSpace -= shQty * shSize;
         gotShield = true;
         break;
+      } else {
+        ctx.log("trade", `${shId}: relying on faction storage (${shQty} needed)`);
       }
     }
     if (!gotShield) {
@@ -6795,6 +6814,43 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
   return false;
 }
 
+/**
+ * After clearing all pirates in a stronghold, retreat to outer, optionally
+ * brace, flee from the remaining station attackers, and re-cloak.
+ *
+ * This is the post-clear sequence for boarding mode: once every non-station
+ * enemy is captured or destroyed, the station is still firing on us. We
+ * explicitly disengage so the bot can safely claim prizes and resume the
+ * patrol loop without tanking unnecessary station damage.
+ */
+async function retreatFromStronghold(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+
+  if (settings.boardingBraceOnRetreat) {
+    ctx.log("combat", "Boarding retreat: bracing to reduce incoming damage");
+    await bot.exec("battle", { action: "stance", stance: "brace" });
+    await ctx.sleep(1000);
+  }
+
+  ctx.log("combat", "Boarding retreat: fleeing stronghold (retreat to outer + flee stance)");
+  await bot.exec("battle", { action: "stance", stance: "flee" });
+  await ctx.sleep(1000);
+  await bot.exec("battle", { action: "retreat" });
+  await ctx.sleep(1000);
+
+  const fled = await fleeFromBattle(ctx, true, 35000);
+  if (fled) {
+    ctx.log("combat", "Boarding retreat: successfully fled stronghold");
+  } else {
+    ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
+  }
+
+  await recloakAfterBattle(ctx, settings.cloakOnStart);
+}
+
 // ── Boarding Routine (patrol mode with boarding) ──────────────────
 //
 // Similar patrol flow to roam_systems / cycle_patrols, but when boarding is
@@ -7218,6 +7274,15 @@ async function* engageBoardingTargetsAtCurrentPoi(
     if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
   }
 
+  // After clearing all pirates at this POI, retreat from any remaining
+  // station attackers before looting/claiming prizes.
+  const inBattleAfterSweep = await getBattleStatus(ctx);
+  if (inBattleAfterSweep) {
+    await retreatFromStronghold(ctx, settings);
+  }
+
+  // After processing all targets at this POI, check for any prizes left behind
+  // (from battles that happened before we arrived, or from captures we missed)
   yield "check_prizes";
   const prizeCheckResp = await bot.exec("get_nearby");
   if (!prizeCheckResp.error && prizeCheckResp.result) {
@@ -7531,13 +7596,20 @@ async function* boardingSystemPass(
            ctx.log("combat", "Low on repair kits or shield charges — ending sweep to resupply");
            break;
          }
-        }
       }
     }
+  }
 
-    // After processing all targets at this POI, check for any prizes left behind
-    // (from battles that happened before we arrived, or from captures we missed)
-    yield "check_prizes";
+  // After clearing all pirates at this POI, retreat from any remaining
+  // station attackers before looting/claiming prizes.
+  const inBattleAfterSweep = await getBattleStatus(ctx);
+  if (inBattleAfterSweep) {
+    await retreatFromStronghold(ctx, settings);
+  }
+
+  // After processing all targets at this POI, check for any prizes left behind
+  // (from battles that happened before we arrived, or from captures we missed)
+  yield "check_prizes";
     const prizeCheckResp = await bot.exec("get_nearby");
     if (!prizeCheckResp.error && prizeCheckResp.result) {
       const prizesAtPoi = getNearbyPrizes(prizeCheckResp.result);

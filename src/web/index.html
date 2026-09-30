@@ -32288,6 +32288,8 @@ ignoreBlacklist: document.getElementById(
         const boardingShieldThreshold = h.boardingShieldThreshold ?? 5;
         const boardingMarines = h.boardingMarines ?? 0;
         const boardingPrizeDestination = h.boardingPrizeDestination || "";
+        const boardingShieldChargePct = h.boardingShieldChargePct ?? 0;
+        const boardingBraceOnRetreat = h.boardingBraceOnRetreat ?? false;
         const stayInPoi = h.stayInPoi ?? false;
         const fleetIdlePollSeconds = h.fleetIdlePollSeconds ?? 2;
         const creatureFarmRecordKills = h.creatureFarmRecordKills ?? true;
@@ -32953,6 +32955,25 @@ ignoreBlacklist: document.getElementById(
         </select>
       </div>
 
+      <div class="setting-row" id="set-hunter-boardingShieldChargePct-row" style="display:${showBoardingSettings ? "" : "none"}">
+        <div>
+          <div class="setting-label">Boarding Shield Charge Reserve (%)</div>
+          <div class="setting-hint">Reserve this percentage of cargo capacity for shield_charge items when in boarding mode. The rest of cargo can be filled with ammo, fuel cells, and repair kits. 0 = use the normal desired shield charge count instead.</div>
+        </div>
+        <input type="number" id="set-hunter-boardingShieldChargePct" min="0" max="100" value="${boardingShieldChargePct}">
+      </div>
+
+      <div class="setting-row" id="set-hunter-boardingBraceOnRetreat-row" style="display:${showBoardingSettings ? "" : "none"}">
+        <div>
+          <div class="setting-label">Brace on Stronghold Retreat</div>
+          <div class="setting-hint">Switch to brace stance while retreating from a pirate stronghold after clearing all pirates. Brace reduces incoming damage and increases shield regen during the escape. Disabled by default.</div>
+        </div>
+        <select id="set-hunter-boardingBraceOnRetreat">
+          <option value="false"${!boardingBraceOnRetreat ? " selected" : ""}>Disabled</option>
+          <option value="true"${boardingBraceOnRetreat ? " selected" : ""}>Enabled</option>
+        </select>
+      </div>
+
        <div class="setting-row">
          <div>
            <div class="setting-label">Stay in POI (boarding mode)</div>
@@ -33137,6 +33158,12 @@ ignoreBlacklist: document.getElementById(
             ) || 0,
           boardingPrizeDestination:
             document.getElementById("set-hunter-boardingPrizeDestination")?.value.trim() || "",
+          boardingShieldChargePct:
+            parseInt(
+              document.getElementById("set-hunter-boardingShieldChargePct")?.value,
+            ) || 0,
+          boardingBraceOnRetreat:
+            document.getElementById("set-hunter-boardingBraceOnRetreat")?.value === "true",
           stayInPoi:
             document.getElementById("set-hunter-stayInPoi")?.value === "true",
           creatureFarmRecordKills:

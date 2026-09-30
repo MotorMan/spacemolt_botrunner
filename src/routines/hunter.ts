@@ -4656,22 +4656,6 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     }
   }
 }
-async function waitForPendingActionSettle(ctx: RoutineContext, label: string): Promise<void> {
-  const { bot } = ctx;
-  for (let i = 0; i < 10; i++) {
-    const resp = await bot.exec("get_ship");
-    if (!resp.error) return;
-    const msg = resp.error.message || "";
-    const isPending = resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress") || msg.includes("Another action is already pending");
-    if (isPending) {
-      ctx.log("system", `${label} pending — waiting 2s (attempt ${i + 1}/10)...`);
-      await new Promise(r => setTimeout(r, 2000));
-    } else {
-      return;
-    }
-  }
-}
-
 /** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
 export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
@@ -4691,7 +4675,6 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   // Treat injured crew/marines before doing anything else
   await treatPersonnel(ctx);
-  await waitForPendingActionSettle(ctx, "treat_personnel");
 
   // Recruit fresh crew and marines up to ship capacity
   await bot.refreshShip();
@@ -4701,7 +4684,18 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const marineDeficit = Math.max(0, maxMarines - (bot.fitMarines ?? 0));
   if (crewDeficit > 0 || marineDeficit > 0) {
     await recruitPersonnel(ctx, crewDeficit, marineDeficit);
-    await waitForPendingActionSettle(ctx, "recruit_personnel");
+    // recruit_personnel is a 1-tick mutation. Wait for it to settle before
+    // issuing dock / undock / storage commands, which would otherwise hit
+    // "Another action is already pending" and cascade into failures.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await ctx.sleep(2000);
+      const shipResp = await bot.refreshShip();
+      if (!shipResp.error) break;
+      const msg = shipResp.error.message || "";
+      if (!msg.includes("action is already pending") && !msg.includes("Another action is already pending") && !msg.includes("already in progress")) {
+        break;
+      }
+    }
   }
 
   await bot.refreshLocation();

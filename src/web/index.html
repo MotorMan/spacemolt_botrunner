@@ -38812,15 +38812,18 @@ ignoreBlacklist: document.getElementById(
               <select id="bulkGiftShipType" style="font-size:12px;padding:4px 8px" onchange="onBulkGiftShipTypeChange()">
                 <option value="">-- select ship type --</option>
               </select>
-              ${bulkGiftMode === 'gift' ? `
-              <span style="font-size:12px;color:var(--text-dim)">Ship # Range:</span>
-              <input type="number" id="bulkGiftNumStart" value="1" min="1" style="width:70px;font-size:12px;padding:4px" title="Start number (inclusive)">
-              <span style="font-size:12px;color:var(--text-dim)">to</span>
-              <input type="number" id="bulkGiftNumEnd" value="999" min="1" style="width:70px;font-size:12px;padding:4px" title="End number (inclusive)">
-              <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
-                <input type="checkbox" id="bulkGiftAutoSwitch" style="width:auto"> Auto-switch on receive
-              </label>
-              ` : ''}
+               ${bulkGiftMode === 'gift' ? `
+               <span style="font-size:12px;color:var(--text-dim)">Ship # Range:</span>
+               <input type="number" id="bulkGiftNumStart" value="1" min="1" style="width:70px;font-size:12px;padding:4px" title="Start number (inclusive)">
+               <span style="font-size:12px;color:var(--text-dim)">to</span>
+               <input type="number" id="bulkGiftNumEnd" value="999" min="1" style="width:70px;font-size:12px;padding:4px" title="End number (inclusive)">
+               <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+                 <input type="checkbox" id="bulkGiftStationOnly" style="width:auto" checked> Only at current station
+               </label>
+               <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer">
+                 <input type="checkbox" id="bulkGiftAutoSwitch" style="width:auto"> Auto-switch on receive
+               </label>
+               ` : ''}
               <button class="sm primary" id="bulkGiftStartBtn" onclick="startBulkGift()" disabled>${bulkGiftMode === 'gift' ? 'Start Gifting' : 'Start Switching'}</button>
               <button class="sm danger" id="bulkGiftStopBtn" onclick="stopBulkGift()" disabled>Stop</button>
             </div>
@@ -39020,6 +39023,106 @@ ignoreBlacklist: document.getElementById(
         if (remaining) remaining.textContent = bulkGiftState.recipients.length;
       }
 
+      function isShipAtCurrentStation(ship, botObj) {
+        if (!botObj) return false;
+
+        const rawLocation = ship.location || ship.system || "";
+        const isLoadedOnCarrier = typeof rawLocation === "string" && rawLocation.toLowerCase().includes("loaded on");
+        if (isLoadedOnCarrier) return false;
+
+        const isActive = ship.active || ship.is_active;
+        if (isActive) return false;
+
+        const botSystem = botObj.system || "";
+        const botLocation = botObj.location || "";
+        const botPoi = botObj.poi || "";
+
+        if (!botSystem && !botLocation) return false;
+
+        let shipSystemId = "";
+        if (ship.system && !ship.system.toLowerCase().includes("loaded on")) {
+          shipSystemId = Object.keys(mapData).find(
+            (key) => mapData[key]?.name === ship.system
+          ) || ship.system;
+        } else if (rawLocation && !rawLocation.toLowerCase().includes("loaded on")) {
+          if (rawLocation.includes(" - ")) {
+            const systemName = rawLocation.split(" - ")[0];
+            shipSystemId = Object.keys(mapData).find(
+              (key) => mapData[key]?.name === systemName
+            ) || systemName;
+          } else {
+            const lower = rawLocation.toLowerCase().replace(/^stored at\s+/i, "").trim();
+            for (const [sysId, sys] of Object.entries(mapData)) {
+              for (const poi of (sys.pois || [])) {
+                const poiName = (poi.name || poi.id || "").toLowerCase();
+                if (poiName === lower) {
+                  shipSystemId = sysId;
+                  break;
+                }
+              }
+              if (shipSystemId) break;
+            }
+            if (!shipSystemId) shipSystemId = rawLocation;
+          }
+        } else {
+          shipSystemId = rawLocation;
+        }
+
+        if (shipSystemId && botSystem && shipSystemId.toLowerCase() === botSystem.toLowerCase()) {
+          return true;
+        }
+
+        function namesMatch(a, b) {
+          if (!a || !b) return false;
+          let na = String(a).toLowerCase().replace(/^stored at\s+/i, "").replace(/^loaded on\s*carrier\s*/i, "").trim();
+          let nb = String(b).toLowerCase().replace(/^stored at\s+/i, "").replace(/^loaded on\s*carrier\s*/i, "").trim();
+          if (!na || !nb) return false;
+          if (na === nb) return true;
+          if (na.includes(nb) || nb.includes(na)) return true;
+          const stripSuffix = (s) => s.replace(/\b(station|dock|outpost|terminal|depot|base|port|harbor|landing)\b/gi, "").trim();
+          na = stripSuffix(na);
+          nb = stripSuffix(nb);
+          if (!na || !nb) return false;
+          if (na === nb) return true;
+          if (na.includes(nb) || nb.includes(na)) return true;
+          const wa = na.split(/\s+/).filter(Boolean);
+          const wb = nb.split(/\s+/).filter(Boolean);
+          if (!wa.length || !wb.length) return false;
+          const [shorter, longer] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+          const allMatch = shorter.every((w) => longer.some((lw) => lw.includes(w) || w.includes(lw)));
+          if (!allMatch) return false;
+          return shorter.length / longer.length >= 0.5;
+        }
+
+        const loc = resolveLocation ? resolveLocation(rawLocation) || rawLocation : rawLocation;
+        if (namesMatch(loc, botLocation)) return true;
+
+        const normalizeStationName = (l) => {
+          if (!l) return "";
+          let s = String(l).replace(/^stored at\s+/i, "").replace(/^loaded on\s*carrier\s*/i, "").trim();
+          if (s.includes(" - ")) s = s.split(" - ").pop().trim();
+          return s.toLowerCase().replace(/_/g, " ");
+        };
+
+        const currentStationName = botPoi ? normalizeStationName(resolveLocation ? resolveLocation(botSystem, botPoi) : botLocation) : normalizeStationName(botLocation);
+        const shipStationName = normalizeStationName(rawLocation);
+        if (namesMatch(shipStationName, currentStationName)) return true;
+
+        const normalizedBotLocation = botLocation.toLowerCase().replace(/^stored at\s+/i, "").replace(/^loaded on\s*carrier\s*/i, "").replace(/_/g, " ").trim();
+        const normalizedShipLocation = rawLocation.toLowerCase().replace(/^stored at\s+/i, "").replace(/^loaded on\s*carrier\s*/i, "").replace(/_/g, " ").trim();
+        const directMatch = normalizedBotLocation && normalizedShipLocation &&
+          (normalizedBotLocation.includes(normalizedShipLocation) || normalizedShipLocation.includes(normalizedBotLocation));
+        if (directMatch) return true;
+
+        const alphaOnlyBot = normalizedBotLocation.replace(/[^a-z0-9]/g, "");
+        const alphaOnlyShip = normalizedShipLocation.replace(/[^a-z0-9]/g, "");
+        const alphaMatch = alphaOnlyBot && alphaOnlyShip &&
+          (alphaOnlyBot.includes(alphaOnlyShip) || alphaOnlyShip.includes(alphaOnlyBot));
+        if (alphaMatch) return true;
+
+        return false;
+      }
+
       function bulkGiftFetchAndRun(bot, shipType, numStart, numEnd) {
         return new Promise((resolve, reject) => {
           sendExec(bot, "list_ships", undefined, (result) => {
@@ -39029,18 +39132,21 @@ ignoreBlacklist: document.getElementById(
             }
             const ships = Array.isArray(result.data) ? result.data : result.data.ships || result.data.owned_ships || [];
             const matched = [];
+            const stationOnly = document.getElementById("bulkGiftStationOnly")?.checked;
+            const botObj = bots.find((b) => b.username === bot);
             for (const s of ships) {
               const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || "";
               if (cls !== shipType) continue;
               const name = s.name || s.ship_name || "";
               const { base, num } = parseShipName(name);
               if (num != null && (num < numStart || num > numEnd)) continue;
+              if (stationOnly && !isShipAtCurrentStation(s, botObj)) continue;
               matched.push({ ship: s, id: s.id || s.ship_id, name: name, num: num });
             }
             matched.sort((a, b) => (a.num ?? 0) - (b.num ?? 0));
             bulkGiftState.totalShips = matched.length;
             updateBulkGiftCounts();
-            bulkGiftLog(`Found ${matched.length} matching ships (${shipType}${numStart > 1 || numEnd < 999 ? ` #${numStart}-${numEnd}` : ""})`);
+            bulkGiftLog(`Found ${matched.length} matching ships (${shipType}${numStart > 1 || numEnd < 999 ? ` #${numStart}-${numEnd}` : ""}${stationOnly ? " [station only]" : ""})`);
             if (matched.length === 0) {
               resolve();
               return;

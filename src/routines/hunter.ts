@@ -6111,14 +6111,22 @@ const servicedPrizeCache = new Map<string, number>();
 
 async function refuelSelfAfterPrize(ctx: RoutineContext, transferredFuel: number): Promise<void> {
   const { bot } = ctx;
-  if (!bot.docked) return;
-  if (transferredFuel <= 0) return;
 
   await bot.refreshShip();
-  const deficit = Math.max(0, bot.maxFuel - bot.fuel);
-  if (deficit <= 0) return;
+  if (!bot.docked) {
+    ctx.log("trade", "Self-refuel: not docked — skipping self-refuel after prize refuel");
+    return;
+  }
 
-  const targetAdd = Math.ceil(transferredFuel / 100) * 100;
+  const deficit = Math.max(0, bot.maxFuel - bot.fuel);
+  if (deficit <= 0) {
+    ctx.log("trade", "Self-refuel: ship already full — no refuel needed");
+    return;
+  }
+
+  const targetAdd = transferredFuel > 0
+    ? Math.ceil(transferredFuel / 100) * 100
+    : Math.ceil(deficit / 100) * 100;
   const actualAdd = Math.min(targetAdd, deficit);
   if (actualAdd <= 0) return;
 
@@ -6210,7 +6218,7 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
         ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
         const retryResult = retry.result as Record<string, unknown> | undefined;
         const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
-        if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
+        await refuelSelfAfterPrize(ctx, transferred);
         return true;
       }
       const retryMsg = retry.error.message.toLowerCase();
@@ -6231,7 +6239,7 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
         ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after pending wait`);
         const retryResult = retry.result as Record<string, unknown> | undefined;
         const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
-        if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
+        await refuelSelfAfterPrize(ctx, transferred);
         return true;
       }
       const retryMsg = retry.error.message.toLowerCase();
@@ -6249,7 +6257,7 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
           ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
           const retry2Result = retry2.result as Record<string, unknown> | undefined;
           const transferred = Math.abs((retry2Result?.fuel as number) || (retry2Result?.quantity as number) || 0);
-          if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
+          await refuelSelfAfterPrize(ctx, transferred);
           return true;
         }
       }
@@ -6266,9 +6274,7 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
   if (action === "refuel") {
     const result = resp.result as Record<string, unknown> | undefined;
     const transferred = Math.abs((result?.fuel as number) || (result?.quantity as number) || quantity || 0);
-    if (transferred > 0) {
-      await refuelSelfAfterPrize(ctx, transferred);
-    }
+    await refuelSelfAfterPrize(ctx, transferred);
   }
 
   return true;

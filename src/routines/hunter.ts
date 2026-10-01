@@ -6960,20 +6960,30 @@ async function retreatFromStronghold(
 
   if (settings.boardingBraceOnRetreat) {
     ctx.log("combat", "Boarding retreat: bracing to reduce incoming damage while retreating");
-    await bot.exec("battle", { action: "stance", stance: "brace" });
-    await ctx.sleep(1000);
+    const braceResp = await bot.exec("battle", { action: "stance", stance: "brace" });
+    if (braceResp.error) {
+      ctx.log("warn", `Boarding retreat: brace failed: ${braceResp.error.message}`);
+    }
+    await ctx.sleep(10000);
   }
 
   ctx.log("combat", "Boarding retreat: moving to outer range (3 retreats)");
   for (let i = 0; i < 3; i++) {
     ctx.log("combat", `Boarding retreat: retreat ${i + 1}/3`);
-    await bot.exec("battle", { action: "retreat" });
-    await ctx.sleep(2000);
+    const retreatResp = await bot.exec("battle", { action: "retreat" });
+    await ctx.sleep(10000);
+
+    if (retreatResp.error) {
+      ctx.log("warn", `Boarding retreat: retreat ${i + 1}/3 failed: ${retreatResp.error.message}`);
+    }
   }
 
   ctx.log("combat", "Boarding retreat: switching to flee stance");
-  await bot.exec("battle", { action: "stance", stance: "flee" });
-  await ctx.sleep(1000);
+  const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+  if (fleeResp.error) {
+    ctx.log("warn", `Boarding retreat: flee stance failed: ${fleeResp.error.message}`);
+  }
+  await ctx.sleep(10000);
 
   for (let retry = 0; retry < 3; retry++) {
     const status = await getBattleStatus(ctx);

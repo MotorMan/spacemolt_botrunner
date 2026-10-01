@@ -322,6 +322,7 @@ function selectShip() {
         <option value="cpu">Sort by CPU (high to low)</option>
         <option value="power">Sort by PWR (high to low)</option>
         <option value="cpu_power">Lowest CPU, Highest PWR</option>
+        ${category === 'weapons' ? '<option value="dpt">Sort by Dmg/tick (high to low)</option>' : ''}
       `;
       sortSelect.value = moduleSortMode[category] || 'none';
       sortSelect.onchange = () => {
@@ -361,6 +362,12 @@ function selectShip() {
           const bPwr = b.power_usage || b.power_cost || b.power || 0;
           return bPwr - aPwr;
         });
+      } else if (sortValue === 'dpt') {
+        sortedModules.sort((a, b) => {
+          const aDpt = (a.damage || 0) / (a.cooldown || 1);
+          const bDpt = (b.damage || 0) / (b.cooldown || 1);
+          return bDpt - aDpt;
+        });
       }
 
       sortedModules.forEach(module => {
@@ -370,8 +377,11 @@ function selectShip() {
         if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
         if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
         if (module.damage) details.push(`Dmg: ${module.damage}`);
-        if (module.reach) details.push(`Reach: ${module.reach}`);
-        if (module.cooldown) details.push(`Cooldown: ${module.cooldown}`);
+        if (module.cooldown) details.push(`CD: ${module.cooldown}`);
+        if (category === 'weapons' && module.damage && module.cooldown) {
+          const dpt = (module.damage / module.cooldown).toFixed(2);
+          details.push(`Dmg/tick: ${dpt}`);
+        }
         if (module.mining_power) details.push(`Mining: ${module.mining_power}`);
         if (module.shield_bonus) details.push(`Shield: +${module.shield_bonus}`);
         if (module.armor_bonus) details.push(`Armor: +${module.armor_bonus}`);

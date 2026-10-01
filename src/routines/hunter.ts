@@ -6848,15 +6848,16 @@ async function retreatFromStronghold(
   await bot.exec("battle", { action: "retreat" });
   await ctx.sleep(1000);
 
-  const fled = await fleeFromBattle(ctx, true, 35000);
-  if (fled) {
-    ctx.log("combat", "Boarding retreat: successfully fled stronghold");
-  } else {
-    ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
-  }
+   const fled = await fleeFromBattle(ctx, true, 35000);
+   if (fled) {
+     ctx.log("combat", "Boarding retreat: successfully fled stronghold");
+   } else {
+     ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
+   }
 
-  await recloakAfterBattle(ctx, settings.cloakOnStart);
-}
+-  await retreatFromStronghold(ctx, settings);
++  await recloakAfterBattle(ctx, settings.cloakOnStart);
+ }
 
 // ── Boarding Routine (patrol mode with boarding) ──────────────────
 //
@@ -7160,26 +7161,27 @@ async function* engageBoardingTargetsAtCurrentPoi(
             settings.cloakOnStart,
           );
 
-          if (result === "captured") {
-            totalKills++;
-            totalBoardings++;
-            ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-            await recloakAfterBattle(ctx, settings.cloakOnStart);
-            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-            await useRepairKits(ctx);
-            await bot.refreshCargo();
-            await bot.refreshStatus();
-            const recoveries = bot.prizeRecoveries;
-            if (recoveries.length > 0) {
-              const cap = recoveries[0];
-              ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
-            }
-            const recovered = await recoverPrize(ctx, settings, target.id);
-            if (recovered) {
-              ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
-            } else {
-              ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
-            }
+           if (result === "captured") {
+             totalKills++;
+             totalBoardings++;
+              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+-             await retreatFromStronghold(ctx, settings);
++             await retreatFromStronghold(ctx, settings);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              if (recoveries.length > 0) {
+                const cap = recoveries[0];
+                ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+              }
+               const recovered = await recoverPrize(ctx, settings, target.id);
+              if (recovered) {
+                ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+              } else {
+                ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
+              }
 
             yield "safety_check";
             const postCaptureResp = await bot.exec("get_nearby");
@@ -7195,7 +7197,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await recloakAfterBattle(ctx, settings.cloakOnStart);
+            await retreatFromStronghold(ctx, settings);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -7304,9 +7306,10 @@ async function* engageBoardingTargetsAtCurrentPoi(
     await serviceAnyStalledPrizes(ctx);
   }
 
-  await recloakAfterBattle(ctx, settings.cloakOnStart);
-  return [totalKills, totalBoardings];
-}
+-  await retreatFromStronghold(ctx, settings);
++  await recloakAfterBattle(ctx, settings.cloakOnStart);
+   return [totalKills, totalBoardings];
+ }
 
 /**
  * Perform a single patrol pass through all POIs in the current system,
@@ -7486,34 +7489,35 @@ async function* boardingSystemPass(
             settings.cloakOnStart,
           );
 
-          if (result === "captured") {
-            totalKills++;
-            totalBoardings++;
-             ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-             await recloakAfterBattle(ctx, settings.cloakOnStart);
-             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-             await useRepairKits(ctx);
-             await bot.refreshCargo();
-             await bot.refreshStatus();
-             const recoveries = bot.prizeRecoveries;
-             if (recoveries.length > 0) {
-               const cap = recoveries[0];
-               ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
-             }
-              const recovered = await recoverPrize(ctx, settings, target.id);
-             if (recovered) {
-               ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
-             } else {
-               ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
-             }
+           if (result === "captured") {
+             totalKills++;
+             totalBoardings++;
+              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+-             await retreatFromStronghold(ctx, settings);
++             await retreatFromStronghold(ctx, settings);
+              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
+              await bot.refreshCargo();
+              await bot.refreshStatus();
+              const recoveries = bot.prizeRecoveries;
+              if (recoveries.length > 0) {
+                const cap = recoveries[0];
+                ctx.log("combat", `📦 Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+              }
+               const recovered = await recoverPrize(ctx, settings, target.id);
+              if (recovered) {
+                ctx.log("combat", `🏆 Prize from ${target.name} successfully recovered!`);
+              } else {
+                ctx.log("combat", `⚠️ Could not recover prize from ${target.name} — another pilot may have claimed it, or the prize is at a different POI in this system`);
+              }
 
-             yield "safety_check";
-             const postCaptureResp = await bot.exec("get_nearby");
-             if (!postCaptureResp.error) {
-               bot.trackNearbyPlayers(postCaptureResp.result);
-               bot.trackWildlife(postCaptureResp.result);
-             }
-            continue;
+              yield "safety_check";
+              const postCaptureResp = await bot.exec("get_nearby");
+              if (!postCaptureResp.error) {
+                bot.trackNearbyPlayers(postCaptureResp.result);
+                bot.trackWildlife(postCaptureResp.result);
+              }
+             continue;
           } else if (result === "target_eliminated") {
             totalKills++;
             ctx.log("combat", `Kill #${totalKills} (${target.name}) — target eliminated`);
@@ -7521,7 +7525,7 @@ async function* boardingSystemPass(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await recloakAfterBattle(ctx, settings.cloakOnStart);
+            await retreatFromStronghold(ctx, settings);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -7741,9 +7745,10 @@ async function* boardingSystemPass(
     ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);
   }
 
-  await recloakAfterBattle(ctx, settings.cloakOnStart);
-  return [totalKills, totalBoardings];
-}
+-  await retreatFromStronghold(ctx, settings);
++  await recloakAfterBattle(ctx, settings.cloakOnStart);
+   return [totalKills, totalBoardings];
+ }
 
 // Flush creature kill store on exit so no data is lost.
 process.on("exit", () => {

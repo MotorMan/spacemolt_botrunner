@@ -112,6 +112,7 @@ import {
   topUpShields,
   useRepairKits,
   acquireFuelCellsAndRefuel,
+  getFuelCellFuelValue,
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
@@ -4914,7 +4915,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       const shieldSize = getItemSize("shield_charge");
       const shieldTargetCount = Math.floor((bot.cargoMax * (pct / 100)) / shieldSize);
       const boardingShieldNeed = Math.max(0, shieldTargetCount - currentShield);
-      shieldToGet = Math.min(shieldToGet, boardingShieldNeed);
+      shieldToGet = boardingShieldNeed;
       ctx.log("trade", `Boarding mode shield reserve: targeting ${pct}% of cargo = ${shieldTargetCount} shield_charge (need ${boardingShieldNeed} more)`);
     }
 
@@ -6108,6 +6109,60 @@ async function isPrizeStillAtPoi(ctx: RoutineContext, recovery: { prize_id: stri
 const SERVICED_PRIZE_CACHE_TTL_MS = 60 * 1000;
 const servicedPrizeCache = new Map<string, number>();
 
+async function refuelSelfAfterPrize(ctx: RoutineContext, transferredFuel: number): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+  if (transferredFuel <= 0) return;
+
+  await bot.refreshShip();
+  const deficit = Math.max(0, bot.maxFuel - bot.fuel);
+  if (deficit <= 0) return;
+
+  const targetAdd = Math.ceil(transferredFuel / 100) * 100;
+  const actualAdd = Math.min(targetAdd, deficit);
+  if (actualAdd <= 0) return;
+
+  const cellsNeeded = Math.ceil(actualAdd / 100);
+
+  const cellTypes = ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"];
+  let withdrawn = 0;
+
+  for (const cellId of cellTypes) {
+    if (withdrawn >= cellsNeeded) break;
+    const remaining = cellsNeeded - withdrawn;
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: cellId,
+      quantity: remaining,
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Self-refuel: withdrew ${remaining} ${cellId} from faction storage`);
+      withdrawn += remaining;
+      break;
+    }
+  }
+
+  if (withdrawn <= 0) {
+    ctx.log("trade", "Self-refuel: no fuel cells available in faction storage");
+    return;
+  }
+
+  await bot.refreshCargo();
+
+  for (let i = 0; i < withdrawn && bot.state === "running"; i++) {
+    const rResp = await bot.exec("refuel");
+    if (rResp.error) {
+      ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${withdrawn}: ${rResp.error.message}`);
+      break;
+    }
+    await bot.refreshShip();
+    if (bot.fuel >= bot.maxFuel) break;
+  }
+
+  ctx.log("trade", `Self-refuel complete: added ${actualAdd} fuel (${withdrawn} cells)`);
+}
+
 /**
  * Service a prize (refuel/repair) via spacemolt_salvage service_prize.
  */
@@ -6153,6 +6208,9 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
       if (!retry.error) {
         servicedPrizeCache.set(cacheKey, Date.now());
         ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+        const retryResult = retry.result as Record<string, unknown> | undefined;
+        const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
+        if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
         return true;
       }
       const retryMsg = retry.error.message.toLowerCase();
@@ -6171,6 +6229,9 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
       if (!retry.error) {
         servicedPrizeCache.set(cacheKey, Date.now());
         ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after pending wait`);
+        const retryResult = retry.result as Record<string, unknown> | undefined;
+        const transferred = Math.abs((retryResult?.fuel as number) || (retryResult?.quantity as number) || 0);
+        if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
         return true;
       }
       const retryMsg = retry.error.message.toLowerCase();
@@ -6186,6 +6247,9 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
         if (!retry2.error) {
           servicedPrizeCache.set(cacheKey, Date.now());
           ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+          const retry2Result = retry2.result as Record<string, unknown> | undefined;
+          const transferred = Math.abs((retry2Result?.fuel as number) || (retry2Result?.quantity as number) || 0);
+          if (transferred > 0) await refuelSelfAfterPrize(ctx, transferred);
           return true;
         }
       }
@@ -6198,6 +6262,15 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
 
   servicedPrizeCache.set(cacheKey, Date.now());
   ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action})`);
+
+  if (action === "refuel") {
+    const result = resp.result as Record<string, unknown> | undefined;
+    const transferred = Math.abs((result?.fuel as number) || (result?.quantity as number) || quantity || 0);
+    if (transferred > 0) {
+      await refuelSelfAfterPrize(ctx, transferred);
+    }
+  }
+
   return true;
 }
 

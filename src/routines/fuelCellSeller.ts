@@ -1007,6 +1007,8 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
 /**
  * Build a priority list of stations that still need pre-staging for any sell item.
  * Consults the shared ledger and remote storage to avoid redundant trips.
+ * Stations are sorted by priority: most depleted (highest total need) first,
+ * then by fuel cost (cheapest first), then by oldest last visit.
  */
 async function buildPreStagePlan(
   ctx: RoutineContext,
@@ -1017,11 +1019,11 @@ async function buildPreStagePlan(
 ): Promise<Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }>> {
   const { eligible } = partitionStations(data, settings, filters);
   const ledger = loadPreStageLedger();
-  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }> = [];
+  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number>; totalNeed: number }> = [];
 
   for (const { entry, idx } of eligible) {
     const needByItem: Record<string, number> = {};
-    let hasNeed = false;
+    let totalNeed = 0;
 
     for (const itemConfig of settings.sellItems) {
       if (
@@ -1038,16 +1040,26 @@ async function buildPreStagePlan(
       const need = Math.max(0, itemConfig.maxPerStation - knownQty);
       if (need > 0) {
         needByItem[itemConfig.itemId] = need;
-        hasNeed = true;
+        totalNeed += need;
       }
     }
 
-    if (hasNeed) {
-      plan.push({ idx, entry, needByItem });
+    if (totalNeed > 0) {
+      plan.push({ idx, entry, needByItem, totalNeed });
     }
   }
 
-  return plan;
+  plan.sort((a, b) => {
+    if (a.totalNeed !== b.totalNeed) return b.totalNeed - a.totalNeed;
+    const costA = estimateFuelCost(data.homeSystem, a.entry.systemId, settings.fuelCostPerJump).cost;
+    const costB = estimateFuelCost(data.homeSystem, b.entry.systemId, settings.fuelCostPerJump).cost;
+    if (costA !== costB) return costA - costB;
+    const lastA = a.entry.lastVisit ? new Date(a.entry.lastVisit).getTime() : 0;
+    const lastB = b.entry.lastVisit ? new Date(b.entry.lastVisit).getTime() : 0;
+    return lastA - lastB;
+  });
+
+  return plan.map(({ idx, entry, needByItem }) => ({ idx, entry, needByItem }));
 }
 
 /**

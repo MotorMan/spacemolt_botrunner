@@ -6873,15 +6873,20 @@ async function retreatFromStronghold(
   const { bot } = ctx;
 
   if (settings.boardingBraceOnRetreat) {
-    ctx.log("combat", "Boarding retreat: bracing to reduce incoming damage");
+    ctx.log("combat", "Boarding retreat: bracing to reduce incoming damage while retreating");
     await bot.exec("battle", { action: "stance", stance: "brace" });
     await ctx.sleep(1000);
   }
 
-  ctx.log("combat", "Boarding retreat: fleeing stronghold (retreat to outer + flee stance)");
+  ctx.log("combat", "Boarding retreat: moving to outer range (3 retreats)");
+  for (let i = 0; i < 3; i++) {
+    ctx.log("combat", `Boarding retreat: retreat ${i + 1}/3`);
+    await bot.exec("battle", { action: "retreat" });
+    await ctx.sleep(2000);
+  }
+
+  ctx.log("combat", "Boarding retreat: switching to flee stance");
   await bot.exec("battle", { action: "stance", stance: "flee" });
-  await ctx.sleep(1000);
-  await bot.exec("battle", { action: "retreat" });
   await ctx.sleep(1000);
 
   for (let retry = 0; retry < 3; retry++) {
@@ -6891,7 +6896,7 @@ async function retreatFromStronghold(
       return;
     }
     if (retry > 0) {
-      ctx.log("combat", `Boarding retreat: still in battle after retreat — waiting before re-cloak attempt ${retry + 1}/3`);
+      ctx.log("combat", `Boarding retreat: still in battle after flee — waiting before re-cloak attempt ${retry + 1}/3`);
       await ctx.sleep(3000);
     }
   }

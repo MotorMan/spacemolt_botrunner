@@ -6119,6 +6119,14 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
     return true;
   }
 
+  if (action === "refuel") {
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct < 50) {
+      ctx.log("combat", `ServicePrize: ship fuel at ${fuelPct}% — topping up before prize refuel`);
+      await acquireFuelCellsAndRefuel(ctx);
+    }
+  }
+
   const payload: Record<string, unknown> = {
     id: recovery.prize_id,
     service_action: action,
@@ -6154,6 +6162,34 @@ async function servicePrize(ctx: RoutineContext, recovery: { prize_id: string; s
         return true;
       }
       ctx.log("error", `ServicePrize retry failed (${action}): ${retry.error.message}`);
+      return false;
+    }
+    if (msg.includes("another action is already pending") || msg.includes("already pending")) {
+      ctx.log("combat", `ServicePrize: action already pending — waiting before retry`);
+      await ctx.sleep(3000);
+      const retry = await bot.exec("service_prize", payload);
+      if (!retry.error) {
+        servicedPrizeCache.set(cacheKey, Date.now());
+        ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after pending wait`);
+        return true;
+      }
+      const retryMsg = retry.error.message.toLowerCase();
+      if (retryMsg.includes("fuel_full")) {
+        ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} already fully fueled (pending retry)`);
+        servicedPrizeCache.set(cacheKey, Date.now());
+        return true;
+      }
+      if (retryMsg.includes("insufficient_resources") && action === "refuel") {
+        ctx.log("combat", `ServicePrize: insufficient resources after pending wait — topping up ship fuel`);
+        await acquireFuelCellsAndRefuel(ctx);
+        const retry2 = await bot.exec("service_prize", payload);
+        if (!retry2.error) {
+          servicedPrizeCache.set(cacheKey, Date.now());
+          ctx.log("combat", `✅ Prize ${recovery.ship_class || recovery.prize_id} serviced (${action}) after refueling ship`);
+          return true;
+        }
+      }
+      ctx.log("error", `ServicePrize pending retry failed (${action}): ${retry.error.message}`);
       return false;
     }
     ctx.log("error", `ServicePrize failed (${action}): ${resp.error.message}`);

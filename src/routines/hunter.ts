@@ -6855,8 +6855,7 @@ async function retreatFromStronghold(
      ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
    }
 
--  await retreatFromStronghold(ctx, settings);
-+  await recloakAfterBattle(ctx, settings.cloakOnStart);
+  await recloakAfterBattle(ctx, settings.cloakOnStart);
  }
 
 // ── Boarding Routine (patrol mode with boarding) ──────────────────
@@ -7164,10 +7163,9 @@ async function* engageBoardingTargetsAtCurrentPoi(
            if (result === "captured") {
              totalKills++;
              totalBoardings++;
-              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
--             await retreatFromStronghold(ctx, settings);
-+             await retreatFromStronghold(ctx, settings);
-              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+              await recloakAfterBattle(ctx, settings.cloakOnStart);
+               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
               await bot.refreshStatus();
@@ -7197,7 +7195,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await retreatFromStronghold(ctx, settings);
+            await recloakAfterBattle(ctx, settings.cloakOnStart);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -7306,8 +7304,6 @@ async function* engageBoardingTargetsAtCurrentPoi(
     await serviceAnyStalledPrizes(ctx);
   }
 
--  await retreatFromStronghold(ctx, settings);
-+  await recloakAfterBattle(ctx, settings.cloakOnStart);
    return [totalKills, totalBoardings];
  }
 
@@ -7493,8 +7489,7 @@ async function* boardingSystemPass(
              totalKills++;
              totalBoardings++;
               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
--             await retreatFromStronghold(ctx, settings);
-+             await retreatFromStronghold(ctx, settings);
+              await recloakAfterBattle(ctx, settings.cloakOnStart);
               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
@@ -7525,7 +7520,7 @@ async function* boardingSystemPass(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await retreatFromStronghold(ctx, settings);
+            await recloakAfterBattle(ctx, settings.cloakOnStart);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -7745,8 +7740,6 @@ async function* boardingSystemPass(
     ctx.log("system", `Patrol sweep done — ${totalKills} kill(s), ${totalBoardings} boarding(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);
   }
 
--  await retreatFromStronghold(ctx, settings);
-+  await recloakAfterBattle(ctx, settings.cloakOnStart);
    return [totalKills, totalBoardings];
  }
 

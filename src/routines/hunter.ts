@@ -6848,13 +6848,17 @@ async function retreatFromStronghold(
   await bot.exec("battle", { action: "retreat" });
   await ctx.sleep(1000);
 
-  const fled = await fleeFromBattle(ctx, true, 35000);
-  if (fled) {
-    ctx.log("combat", "Boarding retreat: successfully fled stronghold");
-  } else {
-    ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
+  for (let retry = 0; retry < 3; retry++) {
+    const status = await getBattleStatus(ctx);
+    if (!status) {
+      await recloakAfterBattle(ctx, settings.cloakOnStart);
+      return;
+    }
+    if (retry > 0) {
+      ctx.log("combat", `Boarding retreat: still in battle after retreat — waiting before re-cloak attempt ${retry + 1}/3`);
+      await ctx.sleep(3000);
+    }
   }
-
   await recloakAfterBattle(ctx, settings.cloakOnStart);
 }
 
@@ -7184,13 +7188,12 @@ async function* engageBoardingTargetsAtCurrentPoi(
             settings.cloakOnStart,
           );
 
-            if (result === "captured") {
-              totalKills++;
-              totalBoardings++;
-                ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-               await recloakAfterBattle(ctx, settings.cloakOnStart);
-               await maybeFleeStationAfterBoarding(ctx, settings);
-                await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+             if (result === "captured") {
+               totalKills++;
+               totalBoardings++;
+                 ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+                await maybeFleeStationAfterBoarding(ctx, settings);
+                 await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
               await bot.refreshStatus();
@@ -7510,13 +7513,12 @@ async function* boardingSystemPass(
             settings.cloakOnStart,
           );
 
-           if (result === "captured") {
-             totalKills++;
-             totalBoardings++;
-              ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-              await recloakAfterBattle(ctx, settings.cloakOnStart);
-              await maybeFleeStationAfterBoarding(ctx, settings);
-              await useRepairKits(ctx);
+            if (result === "captured") {
+              totalKills++;
+              totalBoardings++;
+               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+               await maybeFleeStationAfterBoarding(ctx, settings);
+               await useRepairKits(ctx);
               await bot.refreshCargo();
               await bot.refreshStatus();
               const recoveries = bot.prizeRecoveries;

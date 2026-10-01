@@ -6848,15 +6848,39 @@ async function retreatFromStronghold(
   await bot.exec("battle", { action: "retreat" });
   await ctx.sleep(1000);
 
-   const fled = await fleeFromBattle(ctx, true, 35000);
-   if (fled) {
-     ctx.log("combat", "Boarding retreat: successfully fled stronghold");
-   } else {
-     ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
-   }
+  const fled = await fleeFromBattle(ctx, true, 35000);
+  if (fled) {
+    ctx.log("combat", "Boarding retreat: successfully fled stronghold");
+  } else {
+    ctx.log("warn", "Boarding retreat: flee did not confirm disengage — continuing anyway");
+  }
 
   await recloakAfterBattle(ctx, settings.cloakOnStart);
- }
+}
+
+/**
+ * If we are still in a battle after boarding and the only remaining enemies
+ * are stations, flee that battle so prize claims can proceed.
+ */
+async function maybeFleeStationAfterBoarding(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const status = await getBattleStatus(ctx);
+  if (!status) return;
+
+  const nonStationEnemies = status.participants.filter(p => {
+    if (p.side_id === status.your_side_id) return false;
+    const shipClass = (p.ship_class || "").toLowerCase();
+    const kind = (p as any).kind || "";
+    return shipClass !== "station" && kind.toLowerCase() !== "station";
+  });
+
+  if (nonStationEnemies.length === 0) {
+    ctx.log("combat", "Boarding cleanup: only station enemies remain — fleeing battle");
+    await retreatFromStronghold(ctx, settings);
+  }
+}
 
 // ── Boarding Routine (patrol mode with boarding) ──────────────────
 //
@@ -7160,12 +7184,13 @@ async function* engageBoardingTargetsAtCurrentPoi(
             settings.cloakOnStart,
           );
 
-           if (result === "captured") {
-             totalKills++;
-             totalBoardings++;
-               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-              await recloakAfterBattle(ctx, settings.cloakOnStart);
-               await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+            if (result === "captured") {
+              totalKills++;
+              totalBoardings++;
+                ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
+               await recloakAfterBattle(ctx, settings.cloakOnStart);
+               await maybeFleeStationAfterBoarding(ctx, settings);
+                await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
               await useRepairKits(ctx);
               await bot.refreshCargo();
               await bot.refreshStatus();
@@ -7195,7 +7220,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await recloakAfterBattle(ctx, settings.cloakOnStart);
+            await maybeFleeStationAfterBoarding(ctx, settings);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");
@@ -7490,7 +7515,7 @@ async function* boardingSystemPass(
              totalBoardings++;
               ctx.log("combat", `🎉 ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
               await recloakAfterBattle(ctx, settings.cloakOnStart);
-              await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+              await maybeFleeStationAfterBoarding(ctx, settings);
               await useRepairKits(ctx);
               await bot.refreshCargo();
               await bot.refreshStatus();
@@ -7520,7 +7545,7 @@ async function* boardingSystemPass(
             await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
             await useRepairKits(ctx);
             await bot.refreshCargo();
-            await recloakAfterBattle(ctx, settings.cloakOnStart);
+            await maybeFleeStationAfterBoarding(ctx, settings);
 
             yield "safety_check";
             const postKillResp = await bot.exec("get_nearby");

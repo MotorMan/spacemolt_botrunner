@@ -6522,10 +6522,16 @@ async function findAndClaimPrizeAcrossSystem(ctx: RoutineContext, settings: Retu
              }
              
              return true;
-            } else if (newStatus === "available") {
-              ctx.log("combat", `⚠️ FindPrize: prize still shows as "available" after claim — may have failed silently`);
-              continue;
-            }
+             } else if (newStatus === "available") {
+               ctx.log("combat", `⚠️ FindPrize: prize still shows as "available" after claim (verification lag) — treating as success`);
+               if (verifyPrize.ship_id && verifyPrize.prize_id) {
+                 const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+                 if (existing) {
+                   bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+                 }
+               }
+               return true;
+             }
           }
         }
 
@@ -6674,8 +6680,15 @@ async function claimPrizeAtCurrentPoi(ctx: RoutineContext, settings: ReturnType<
         
         return true;
       } else if (newStatus === "available") {
-        ctx.log("combat", `⚠️ ClaimPrize: prize still shows as "available" after claim command — may have failed silently`);
-        return false;
+        ctx.log("combat", `⚠️ ClaimPrize: prize still shows as "available" after claim command (verification lag) — treating as success`);
+        // Update the tracker with the confirmed prize_id if visible
+        if (verifyPrize.ship_id && verifyPrize.prize_id) {
+          const existing = bot.getCapturedPrizeByShipId(verifyPrize.ship_id);
+          if (existing) {
+            bot.registerCapturedPrize(verifyPrize.ship_id, verifyPrize.ship_class || existing.ship_class, existing.battle_id, verifyPrize.prize_id);
+          }
+        }
+        return true;
       }
     }
   }
@@ -6804,8 +6817,11 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
           }
         }
 
-        ctx.log("combat", "RecoverPrize: all available prizes processed — moving on");
-        return false;
+        // No prizes visible at all, and no active recovery — the prize may still
+        // be spawning. Do NOT give up; wait and retry on the next tick.
+        ctx.log("combat", `RecoverPrize: no prizes visible and no active recovery — prize may still be spawning, waiting (tick ${waitTick}/${maxWaitTicks})`);
+        await ctx.sleep(5000);
+        continue;
       }
 
       const stalled = nearbyPrizes.find(p => {
@@ -6860,13 +6876,10 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
           p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
         );
         if (!targetPrize) {
-          ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not at POI — removing stale tracker entry`);
-          bot.capturedPrizeTracker.delete(targetEntry.ship_id);
-          if (bot.capturedPrizeTracker.size === 0) {
-            ctx.log("combat", `RecoverPrize: no more tracked captured prizes — aborting`);
-            return false;
-          }
-          await ctx.sleep(3000);
+          // Prize not visible yet — it may still be spawning. Do NOT delete the
+          // tracker entry; wait and retry instead.
+          ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not yet visible — waiting for spawn (tick ${waitTick}/${maxWaitTicks})`);
+          await ctx.sleep(5000);
           continue;
         }
         if (targetPrize.status === "available" || (targetPrize.status === "claimed" && !targetPrize.wait_reason)) {

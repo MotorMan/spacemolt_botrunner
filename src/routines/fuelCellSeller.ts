@@ -581,13 +581,16 @@ async function checkStationStorageRemote(
   settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): Promise<boolean> {
   const updates: Record<string, number> = {};
+  const storageFlags: Record<string, { hasFaction: boolean; hasStation: boolean }> = {};
 
   for (const itemConfig of settings.sellItems) {
-    const qty = await getRemoteStorageQty(ctx.bot, stationEntry.poiId, itemConfig.itemId);
-    updates[itemConfig.itemId] = qty;
+    const result = await getRemoteStorageQty(ctx.bot, stationEntry.poiId, itemConfig.itemId);
+    updates[itemConfig.itemId] = result.qty;
+    storageFlags[itemConfig.itemId] = { hasFaction: result.hasFactionStorage, hasStation: result.hasStationStorage };
   }
 
-  stationEntry.deposits = { ...(stationEntry.deposits ?? {}), ...updates };
+  const hasAnyStorage = Object.values(storageFlags).some(f => f.hasFaction || f.hasStation);
+  stationEntry.deposits = hasAnyStorage ? { ...(stationEntry.deposits ?? {}), ...updates } : {};
   stationEntry.lastVisit = new Date().toISOString();
 
   ctx.log(
@@ -624,13 +627,15 @@ async function refreshAllStationStorage(
 
     const station = eligible[i].entry;
     const updates: Record<string, number> = {};
+    let hasAnyStorage = false;
 
     for (const itemConfig of settings.sellItems) {
-      const qty = await getRemoteStorageQty(bot, station.poiId, itemConfig.itemId);
-      updates[itemConfig.itemId] = qty;
+      const result = await getRemoteStorageQty(bot, station.poiId, itemConfig.itemId);
+      updates[itemConfig.itemId] = result.qty;
+      if (result.hasFactionStorage || result.hasStationStorage) hasAnyStorage = true;
     }
 
-    station.deposits = { ...(station.deposits ?? {}), ...updates };
+    station.deposits = hasAnyStorage ? { ...(station.deposits ?? {}), ...updates } : {};
     station.lastVisit = new Date().toISOString();
 
     if (i < count - 1) {
@@ -1055,15 +1060,25 @@ function isStationReserved(
   return res.botName !== botName;
 }
 
-async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<number> {
+interface StorageCheckResult {
+  qty: number;
+  hasFactionStorage: boolean;
+  hasStationStorage: boolean;
+}
+
+async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<StorageCheckResult> {
+  let hasFactionStorage = false;
+  let hasStationStorage = false;
+
   // Try faction storage first
   try {
     const factionResp = await bot.exec("view_faction_storage", { station_id: stationId });
     if (!factionResp.error && factionResp.result) {
+      hasFactionStorage = true;
       const result = factionResp.result as Record<string, unknown>;
       const items = Array.isArray(result.items) ? result.items : [];
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
-      if (found) return found.quantity ?? found.qty ?? 0;
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: true, hasStationStorage: false };
     }
   } catch {
     // ignore faction storage errors
@@ -1073,16 +1088,17 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
   try {
     const stationResp = await bot.exec("view_storage", { station_id: stationId });
     if (!stationResp.error && stationResp.result) {
+      hasStationStorage = true;
       const result = stationResp.result as Record<string, unknown>;
       const items = Array.isArray(result.items) ? result.items : [];
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
-      if (found) return found.quantity ?? found.qty ?? 0;
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: false, hasStationStorage: true };
     }
   } catch {
     // ignore station storage errors
   }
 
-  return 0;
+  return { qty: 0, hasFactionStorage, hasStationStorage };
 }
 
 /**
@@ -1105,6 +1121,10 @@ async function buildPreStagePlan(
   for (const { entry, idx } of eligible) {
     const needByItem: Record<string, number> = {};
     let totalNeed = 0;
+
+    if (Object.keys(entry.deposits ?? {}).length === 0) {
+      continue;
+    }
 
     for (const itemConfig of settings.sellItems) {
       if (
@@ -1767,8 +1787,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
 
         // Re-check remote storage on arrival to avoid over-depositing
-        const remoteQty = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
-        const knownQty = remoteQty;
+        const remoteResult = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
+        if (!remoteResult.hasFactionStorage && !remoteResult.hasStationStorage) {
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: no faction storage or station storage available`);
+          continue;
+        }
+        const knownQty = remoteResult.qty;
         const toDeposit = Math.min(inCargo, Math.max(0, itemConfig.maxPerStation - knownQty));
         if (toDeposit <= 0) {
           ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: already at ${knownQty}/${itemConfig.maxPerStation}`);

@@ -540,25 +540,106 @@ async function updateAllStationsFromRemote(
     if (i > 0) await ctx.sleep(settings.remoteCheckDelayMs);
 
     ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${eligible.length})`);
-    const result = await checkStationOrdersRemote(ctx, station, settings);
 
-    if (result.ok) {
-      successCount++;
+    if (settings.preStageMode === "preStage") {
+      try {
+        await checkStationStorageRemote(ctx, station, settings);
+        successCount++;
+      } catch (error) {
+        ctx.log("error", `Storage check error for ${station.poiName}: ${error}`);
+        failCount++;
+      }
     } else {
-      failCount++;
-      if (result.learned) learnedCount++;
+      const result = await checkStationOrdersRemote(ctx, station, settings);
+      if (result.ok) {
+        successCount++;
+      } else {
+        failCount++;
+        if (result.learned) learnedCount++;
+      }
     }
 
-    // Save after each station so we don't lose progress
     saveFCStationsData(data);
   }
 
+  const mode = settings.preStageMode === "preStage" ? "storage" : "orders";
   ctx.log(
     "fc",
-    `Remote update complete: ${successCount} succeeded, ${failCount} failed` +
+    `Remote update complete (${mode}): ${successCount} succeeded, ${failCount} failed` +
       (learnedCount > 0 ? ` (${learnedCount} newly excluded)` : ""),
   );
   saveFCStationsData(data);
+}
+
+/**
+ * Check faction storage at a specific station remotely.
+ * Updates the station entry's deposits. Returns whether the check succeeded.
+ */
+async function checkStationStorageRemote(
+  ctx: RoutineContext,
+  stationEntry: FCStationEntry,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): Promise<boolean> {
+  const updates: Record<string, number> = {};
+
+  for (const itemConfig of settings.sellItems) {
+    const qty = await getRemoteStorageQty(ctx.bot, stationEntry.poiId, itemConfig.itemId);
+    updates[itemConfig.itemId] = qty;
+  }
+
+  stationEntry.deposits = { ...(stationEntry.deposits ?? {}), ...updates };
+  stationEntry.lastVisit = new Date().toISOString();
+
+  ctx.log(
+    "fc",
+    `Storage check: ${stationEntry.poiName} - ` +
+      Object.entries(updates).map(([id, qty]) => `${qty}x ${id}`).join(", "),
+  );
+  return true;
+}
+
+/**
+ * Refresh faction storage counts for all eligible stations.
+ * Called at home base to keep the priority list accurate.
+ */
+async function refreshAllStationStorage(
+  ctx: RoutineContext,
+  bot: Bot,
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): Promise<void> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const count = eligible.length;
+
+  if (count === 0) return;
+
+  ctx.log("fc", `Refreshing faction storage for ${count} stations...`);
+
+  for (let i = 0; i < count; i++) {
+    if (bot.state !== "running") {
+      ctx.log("fc", "Bot stopped, aborting storage refresh");
+      break;
+    }
+
+    const station = eligible[i].entry;
+    const updates: Record<string, number> = {};
+
+    for (const itemConfig of settings.sellItems) {
+      const qty = await getRemoteStorageQty(bot, station.poiId, itemConfig.itemId);
+      updates[itemConfig.itemId] = qty;
+    }
+
+    station.deposits = { ...(station.deposits ?? {}), ...updates };
+    station.lastVisit = new Date().toISOString();
+
+    if (i < count - 1) {
+      await ctx.sleep(settings.remoteCheckDelayMs);
+    }
+  }
+
+  saveFCStationsData(data);
+  ctx.log("fc", `Storage refresh complete for ${count} stations`);
 }
 
 function defaultSellItems(settings: {
@@ -1006,7 +1087,8 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
 
 /**
  * Build a priority list of stations that still need pre-staging for any sell item.
- * Consults the shared ledger and remote storage to avoid redundant trips.
+ * Uses the refreshed deposits field (faction storage counts synced at home base)
+ * so the priority list reflects actual station stock, not stale ledger entries.
  * Stations are sorted by priority: most depleted (highest total need) first,
  * then by fuel cost (cheapest first), then by oldest last visit.
  */
@@ -1018,7 +1100,6 @@ async function buildPreStagePlan(
   filters: { systems: Set<string>; stations: Set<string> },
 ): Promise<Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }>> {
   const { eligible } = partitionStations(data, settings, filters);
-  const ledger = loadPreStageLedger();
   const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number>; totalNeed: number }> = [];
 
   for (const { entry, idx } of eligible) {
@@ -1034,9 +1115,7 @@ async function buildPreStagePlan(
         continue;
       }
 
-      const remoteQty = await getRemoteStorageQty(bot, entry.poiId, itemConfig.itemId);
-      const ledgerQty = getLedgerQty(ledger, entry.poiId, itemConfig.itemId);
-      const knownQty = Math.max(remoteQty, ledgerQty);
+      const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
       const need = Math.max(0, itemConfig.maxPerStation - knownQty);
       if (need > 0) {
         needByItem[itemConfig.itemId] = need;
@@ -1416,6 +1495,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const finalMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
       ctx.log("fc", `Loaded: ${sellItemsSummary}, ${finalMil}x military fuel cells`);
 
+      await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
+
       const anySellCargo = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
       if (!anySellCargo && finalMil <= 0) {
         ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
@@ -1686,7 +1767,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         // Re-check remote storage on arrival to avoid over-depositing
         const remoteQty = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
-        const knownQty = Math.max(remoteQty, target.deposits[itemConfig.itemId] || 0);
+        const knownQty = remoteQty;
         const toDeposit = Math.min(inCargo, Math.max(0, itemConfig.maxPerStation - knownQty));
         if (toDeposit <= 0) {
           ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: already at ${knownQty}/${itemConfig.maxPerStation}`);
@@ -1725,19 +1806,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         await ctx.sleep(1000);
       }
-
-      // Update shared ledger with successful deposits
-      if (Object.keys(deposits).length > 0) {
-        await withPreStageLock(bot, async () => {
-          const ledger = loadPreStageLedger();
-          for (const [itemId, qty] of Object.entries(deposits)) {
-            const current = getLedgerQty(ledger, target.poiId, itemId);
-            setLedgerQty(ledger, target.poiId, itemId, current + qty, bot.username);
-          }
-          savePreStageLedger(ledger);
-        });
-      }
-    } else {
       // Normal mode: calculate prices and create sell orders
       for (const itemConfig of settings.sellItems) {
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
@@ -1851,7 +1919,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
     currentStation.lastVisit = new Date().toISOString();
     if (Object.keys(deposits).length > 0) {
-      currentStation.deposits = { ...(currentStation.deposits ?? {}), ...deposits };
+      const updated = { ...(currentStation.deposits ?? {}) };
+      for (const [itemId, qty] of Object.entries(deposits)) {
+        updated[itemId] = (updated[itemId] || 0) + qty;
+      }
+      currentStation.deposits = updated;
     }
 
     if (settings.preStageMode === "preStage" && preStagePlan.length > 0) {

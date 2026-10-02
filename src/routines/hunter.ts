@@ -6113,11 +6113,6 @@ async function refuelSelfAfterPrize(ctx: RoutineContext, transferredFuel: number
   const { bot } = ctx;
 
   await bot.refreshShip();
-  if (!bot.docked) {
-    ctx.log("trade", "Self-refuel: not docked — skipping self-refuel after prize refuel");
-    return;
-  }
-
   const deficit = Math.max(0, bot.maxFuel - bot.fuel);
   if (deficit <= 0) {
     ctx.log("trade", "Self-refuel: ship already full — no refuel needed");
@@ -6132,43 +6127,69 @@ async function refuelSelfAfterPrize(ctx: RoutineContext, transferredFuel: number
 
   const cellsNeeded = Math.ceil(actualAdd / 100);
 
-  const cellTypes = ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"];
-  let withdrawn = 0;
+  if (bot.docked) {
+    const cellTypes = ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"];
+    let withdrawn = 0;
 
-  for (const cellId of cellTypes) {
-    if (withdrawn >= cellsNeeded) break;
-    const remaining = cellsNeeded - withdrawn;
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: cellId,
-      quantity: remaining,
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Self-refuel: withdrew ${remaining} ${cellId} from faction storage`);
-      withdrawn += remaining;
-      break;
+    for (const cellId of cellTypes) {
+      if (withdrawn >= cellsNeeded) break;
+      const remaining = cellsNeeded - withdrawn;
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: cellId,
+        quantity: remaining,
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Self-refuel: withdrew ${remaining} ${cellId} from faction storage`);
+        withdrawn += remaining;
+        break;
+      }
     }
-  }
 
-  if (withdrawn <= 0) {
-    ctx.log("trade", "Self-refuel: no fuel cells available in faction storage");
+    if (withdrawn <= 0) {
+      ctx.log("trade", "Self-refuel: no fuel cells available in faction storage");
+      return;
+    }
+
+    await bot.refreshCargo();
+
+    for (let i = 0; i < withdrawn && bot.state === "running"; i++) {
+      const rResp = await bot.exec("refuel");
+      if (rResp.error) {
+        ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${withdrawn}: ${rResp.error.message}`);
+        break;
+      }
+      await bot.refreshShip();
+      if (bot.fuel >= bot.maxFuel) break;
+    }
+
+    ctx.log("trade", `Self-refuel complete: added ${actualAdd} fuel (${withdrawn} cells)`);
     return;
   }
 
+  ctx.log("trade", "Self-refuel: not docked — attempting refuel from cargo fuel cells");
   await bot.refreshCargo();
+  const cargoCells = bot.inventory
+    .filter((i) => ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"].includes(i.itemId))
+    .reduce((s, i) => s + (i.quantity || 0), 0);
 
-  for (let i = 0; i < withdrawn && bot.state === "running"; i++) {
+  if (cargoCells <= 0) {
+    ctx.log("trade", "Self-refuel: no cargo fuel cells available while undocked — skipping");
+    return;
+  }
+
+  for (let i = 0; i < cellsNeeded && bot.state === "running"; i++) {
     const rResp = await bot.exec("refuel");
     if (rResp.error) {
-      ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${withdrawn}: ${rResp.error.message}`);
+      ctx.log("error", `Self-refuel: refuel failed at cell ${i + 1}/${cellsNeeded}: ${rResp.error.message}`);
       break;
     }
     await bot.refreshShip();
     if (bot.fuel >= bot.maxFuel) break;
   }
 
-  ctx.log("trade", `Self-refuel complete: added ${actualAdd} fuel (${withdrawn} cells)`);
+  ctx.log("trade", `Self-refuel complete from cargo: added up to ${actualAdd} fuel`);
 }
 
 /**

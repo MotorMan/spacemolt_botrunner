@@ -1527,7 +1527,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const reservations = loadReservations();
         cleanExpiredReservations(reservations);
 
-        const planOffset = fcData.currentStationIndex % preStagePlan.length;
+        const lastPlanIdx = preStagePlan.findIndex(p => p.idx === fcData.currentStationIndex);
+        const planOffset = lastPlanIdx >= 0 ? (lastPlanIdx + 1) % preStagePlan.length : 0;
         for (let i = 0; i < preStagePlan.length; i++) {
           const candidatePlanIdx = (planOffset + i) % preStagePlan.length;
           const candidate = preStagePlan[candidatePlanIdx];

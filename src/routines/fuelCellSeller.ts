@@ -1831,6 +1831,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         await ctx.sleep(1000);
       }
+    } else {
       // Normal mode: calculate prices and create sell orders
       for (const itemConfig of settings.sellItems) {
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);

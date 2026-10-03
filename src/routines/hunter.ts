@@ -612,7 +612,7 @@ export function getHunterSettings(username?: string): {
     returnHomeOnFuelCellsRemaining: (h.returnHomeOnFuelCellsRemaining as number) || 2,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-    onlyNPCs: (h.onlyNPCs as boolean) !== false,
+    onlyNPCs: h.onlyNPCs !== false && h.onlyNPCs !== "false",
     huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
     coordinateHunts: (h.coordinateHunts as boolean) !== false,
     coordinationMode: resolveCoordinationMode(h.coordinationMode, (h.coordinateHunts as boolean) !== false),
@@ -4380,7 +4380,7 @@ async function fleetModeFight(
     settings.repairThreshold,
     true,                               // canFlee — bail out when hull hits fleeThreshold
     settings.shieldRechargePct ?? 80,   // percentage; fightJoinedBattle divides by 100
-    !settings.fleetFightPlayers,        // onlyNPCs — the leader picked the target, so default off
+    settings.onlyNPCs && !settings.fleetFightPlayers,        // onlyNPCs — fleet leader picks targets, but still honour global onlyNPCs unless fleetFightPlayers is enabled
     settings.cloakOnStart,
   );
 }

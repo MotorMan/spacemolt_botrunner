@@ -496,6 +496,7 @@ export interface BattleParticipant {
   damage_taken?: number;
   kill_count?: number;
   survived?: boolean;
+  is_npc?: boolean;
 }
 
 export interface BattleSide {

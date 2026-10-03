@@ -1456,11 +1456,9 @@ const PLAYER_KEYWORDS = ["pirate", "drifter", "raider", "outlaw", "bandit", "cor
  */
 async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): Promise<boolean> {
   if (!name) return false;
-  // Fast local checks first.
   if (isCreatureName(name)) return false;
   const lower = name.toLowerCase();
-  if (PLAYER_KEYWORDS.some(kw => lower.includes(kw))) return false; // pirate keyword
-  // Fall back to the live nearby scan to see if this name is a creature/pirate.
+  if (PLAYER_KEYWORDS.some(kw => lower.includes(kw))) return false;
   try {
     const resp = await ctx.bot.exec("get_nearby");
     if (!resp.error && resp.result) {
@@ -1469,14 +1467,16 @@ async function isGenuinePlayer(ctx: RoutineContext, name: string | undefined): P
         e.name === name || e.name.toLowerCase() === lower || e.name.toLowerCase().includes(lower)
       );
       if (match) {
-        if (isCreatureTarget(match, true)) return false;       // creature -> not a player
-        if (isPirateTarget(match, false, "boss")) return false; // pirate -> not a player
+        if (match.isCreature) return false;
+        if (match.isNPC) return false;
+        if (match.isPirate) return false;
+        return true;
       }
     }
   } catch {
-    /* non-fatal — fall through to treating as a player */
+    /* non-fatal */
   }
-  return true;
+  return false;
 }
 
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
@@ -1874,11 +1874,13 @@ export async function fightJoinedBattle(
         targetParticipant = status.participants.find(
           p => p.player_id === better.id || p.username === better.name
         );
-        // Check if new target is a real player (not a creature/pirate) and we should flee
-        if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
-          ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
-          await emergencyFleeSpam(ctx, `target switched to player`);
-          return false;
+        if (onlyNPCs && targetParticipant) {
+          const participantRaw = targetParticipant as unknown as Record<string, unknown>;
+          if (!participantRaw.is_npc && await isGenuinePlayer(ctx, targetParticipant.username)) {
+            ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+            await emergencyFleeSpam(ctx, `target switched to player`);
+            return false;
+          }
         }
       } else if (!better) {
         // Newer server combat code omits enemies from participants, so pickRealBattleTarget
@@ -1949,10 +1951,13 @@ export async function fightJoinedBattle(
       continue;
     }
 
-    if (onlyNPCs && targetParticipant && await isGenuinePlayer(ctx, targetParticipant.username)) {
-      ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
-      await emergencyFleeSpam(ctx, `target is a player`);
-      return false;
+    if (onlyNPCs && targetParticipant) {
+      const participantRaw = targetParticipant as unknown as Record<string, unknown>;
+      if (!participantRaw.is_npc && await isGenuinePlayer(ctx, targetParticipant.username)) {
+        ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+        await emergencyFleeSpam(ctx, `target is a player`);
+        return false;
+      }
     }
 
     await bot.refreshShip();

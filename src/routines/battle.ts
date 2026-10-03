@@ -1745,6 +1745,28 @@ export async function fightJoinedBattle(
   }
   await ctx.sleep(10000);
 
+  // Immediate readiness check after engaging — do not blindly advance if we're
+  // already critically wounded or can top-up shields before moving into range.
+  await bot.refreshShip();
+  const startHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  const startShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+  if (startHullPct <= fleeThreshold && canFlee) {
+    ctx.log("combat", `🚨 Hull ${startHullPct}% ≤ fleeThreshold (${fleeThreshold}%) on battle start — emergency flee!`);
+    await emergencyFleeSpam(ctx, `critical hull ${startHullPct}% on battle start`);
+    return false;
+  }
+  if (repairThreshold > 0 && startShieldPct <= repairThreshold && shieldRechargePct > 0) {
+    ctx.log("combat", `🛡️ Shields ${startShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging before advancing`);
+    await topUpShields(ctx, shieldRechargePct / 100);
+    await ctx.sleep(10000);
+  }
+  if (repairThreshold > 0 && startHullPct <= repairThreshold) {
+    ctx.log("combat", `🛠️ Hull ${startHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing before advancing`);
+    if (await useRepairKits(ctx)) {
+      await ctx.sleep(10000);
+    }
+  }
+
   // Ensure we're at engaged zone before entering combat loop
   const postSetupStatus = await getBattleStatus(ctx);
   let ourZone = postSetupStatus?.your_zone || "outer";
@@ -1798,6 +1820,27 @@ export async function fightJoinedBattle(
         ctx.log("error", `Advance to ${zoneName} failed: ${advResp.error.message}`);
       }
       await ctx.sleep(10000);
+      
+      // Check hull/shield after each advance step — we may be taking fire while closing distance
+      await bot.refreshShip();
+      const advHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      const advShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+      if (advHullPct <= fleeThreshold && canFlee) {
+        ctx.log("combat", `🚨 Hull ${advHullPct}% ≤ fleeThreshold (${fleeThreshold}%) during advance — emergency flee!`);
+        await emergencyFleeSpam(ctx, `critical hull ${advHullPct}% during advance`);
+        return false;
+      }
+      if (repairThreshold > 0 && advShieldPct <= repairThreshold && shieldRechargePct > 0) {
+        ctx.log("combat", `🛡️ Shields ${advShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging during advance`);
+        await topUpShields(ctx, shieldRechargePct / 100);
+        await ctx.sleep(10000);
+      }
+      if (repairThreshold > 0 && advHullPct <= repairThreshold) {
+        ctx.log("combat", `🛠️ Hull ${advHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing during advance`);
+        if (await useRepairKits(ctx)) {
+          await ctx.sleep(10000);
+        }
+      }
     }
   }
 
@@ -1823,7 +1866,34 @@ export async function fightJoinedBattle(
       return true;
     }
 
-    // If our current target is no longer in the battle (destroyed, fled, or was wrong to begin with),
+    // Immediate hull/shield check at the start of every combat tick — do not
+    // wait for target-switching logic to decide whether we're in danger.
+    await bot.refreshShip();
+    const tickHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    const tickShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+    if (tickHullPct <= fleeThreshold && canFlee) {
+      ctx.log("combat", `🚨 Hull ${tickHullPct}% ≤ fleeThreshold (${fleeThreshold}%) — emergency flee!`);
+      await emergencyFleeSpam(ctx, `critical hull ${tickHullPct}%`);
+      return false;
+    }
+    if (repairThreshold > 0 && tickShieldPct <= repairThreshold && shieldRechargePct > 0) {
+      ctx.log("combat", `🛡️ Shields ${tickShieldPct}% ≤ repairThreshold (${repairThreshold}%) — recharging in combat`);
+      await topUpShields(ctx, shieldRechargePct / 100);
+      await ctx.sleep(10000);
+      continue;
+    }
+    if (repairThreshold > 0 && tickHullPct <= repairThreshold) {
+      ctx.log("combat", `🛠️ Hull ${tickHullPct}% ≤ repairThreshold (${repairThreshold}%) — repairing in combat`);
+      if (await useRepairKits(ctx)) {
+        await ctx.sleep(10000);
+        continue;
+      }
+    }
+
+  const hullPct = tickHullPct;
+  const shieldPct = tickShieldPct;
+
+  // If our current target is no longer in the battle (destroyed, fled, or was wrong to begin with),
     // pick a fresh real enemy from the actual participants. This fixes the "targeting Frazzlebite
     // while Overlord Nyx is the one hitting us" case after an attack timeout.
     let targetParticipant = status.participants.find(
@@ -1957,28 +2027,6 @@ export async function fightJoinedBattle(
         ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
         await emergencyFleeSpam(ctx, `target is a player`);
         return false;
-      }
-    }
-
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
-
-    // In-combat emergency field repair / shield top-up (hunter style)
-    // Only skip firing if we actually consumed items this tick (prevents infinite loop when out of stock).
-    if (repairThreshold > 0) {
-      let didAction = false;
-      if (hullPct <= repairThreshold) {
-        ctx.log("combat", `🛠️ Hull ${hullPct}% ≤ repairThreshold — using repair kits in combat!`);
-        if (await useRepairKits(ctx)) didAction = true;
-      }
-      if (shieldPct <= repairThreshold) {
-        ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, shieldRechargePct / 100)) didAction = true;
-      }
-      if (didAction) {
-        await ctx.sleep(10000);
-        continue;
       }
     }
 

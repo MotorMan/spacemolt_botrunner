@@ -17551,7 +17551,7 @@
           `<span class="resp-cmd">Beginning cargo → install loop</span>`,
         );
 
-        let remaining = [...neededModules];
+        let remaining = [...neededModules].reverse();
 
         while (remaining.length > 0) {
           // Get current cargo space
@@ -17562,9 +17562,18 @@
           const cargoUsed = cargoResult?.data?.cargo_used || 0;
           const cargoMax = cargoResult?.data?.cargo_max || 100;
           const spaceLeft = cargoMax - cargoUsed;
-          const modulesWeCanLoad = Math.floor(spaceLeft / 10);
 
-          if (modulesWeCanLoad <= 0) {
+          // Determine how many modules fit based on their actual catalog sizes
+          const toLoad = [];
+          let usedSpace = 0;
+          for (const modId of remaining) {
+            const modSize = catalog.items?.[modId]?.size ?? 10;
+            if (usedSpace + modSize > spaceLeft) break;
+            toLoad.push(modId);
+            usedSpace += modSize;
+          }
+
+          if (toLoad.length === 0) {
             logResponse(
               '<span class="resp-warn">Not enough cargo space. Waiting...</span>',
             );
@@ -17572,41 +17581,57 @@
             continue;
           }
 
-          const toLoad = remaining.splice(0, modulesWeCanLoad);
-
           // Load from station storage into cargo
+          const loaded = [];
           for (const modId of toLoad) {
             await new Promise((resolve) => {
               sendExec(
                 bot.username,
                 "withdraw_items",
                 { item_id: modId, quantity: 1 },
-                () => resolve(),
+                (result) => {
+                  if (result.ok) {
+                    loaded.push(modId);
+                  } else {
+                    logResponse(
+                      `<span class="resp-warn">Failed to load ${modId}: ${result.error || "unknown"}</span>`,
+                    );
+                  }
+                  resolve();
+                },
               );
             }); //fixed by human because claude broke it on the game server, so we have to go back to the old command!
             await new Promise((r) => setTimeout(r, 300));
           }
 
           logResponse(
-            `<span class="resp-cmd">Loaded ${toLoad.length} modules into cargo</span>`,
+            `<span class="resp-cmd">Loaded ${loaded.length} modules into cargo</span>`,
           );
 
           // Install from cargo
-          for (const modId of toLoad) {
+          for (const modId of loaded) {
             await new Promise((resolve) => {
               sendExec(
                 bot.username,
                 "install_mod",
                 { module_id: modId },
-                resolve,
+                (result) => {
+                  if (!result.ok) {
+                    logResponse(
+                      `<span class="resp-warn">Failed to install ${modId}: ${result.error || "unknown"}</span>`,
+                    );
+                  }
+                  resolve();
+                },
               );
             });
             await new Promise((r) => setTimeout(r, 600));
           }
 
           logResponse(
-            `<span class="resp-ok">Installed ${toLoad.length} modules</span>`,
+            `<span class="resp-ok">Installed ${loaded.length} modules</span>`,
           );
+          remaining.splice(0, toLoad.length);
           statusEl.textContent = `${remaining.length} modules remaining...`;
         }
 
@@ -39524,7 +39549,7 @@ ignoreBlacklist: document.getElementById(
           ...(preset.modules.weapons || []),
           ...(preset.modules.defense || []),
           ...(preset.modules.utility || []),
-        ];
+        ].reverse();
 
         // Pre-flight: check faction storage has enough for ALL bots
         bulkRefitLog("Checking faction storage for required modules...");
@@ -39785,32 +39810,44 @@ ignoreBlacklist: document.getElementById(
           const cargoUsed = cargoResult.data.cargo_used || 0;
           const cargoMax = cargoResult.data.cargo_max || 100;
           const spaceLeft = cargoMax - cargoUsed;
-          const modulesWeCanLoad = Math.floor(spaceLeft / 10);
 
-          if (modulesWeCanLoad <= 0) {
+          // Determine how many modules fit based on their actual catalog sizes
+          const toLoad = [];
+          let usedSpace = 0;
+          for (let i = index; i < needed.length; i++) {
+            const modId = needed[i];
+            const modSize = catalog.items?.[modId]?.size ?? 10;
+            if (usedSpace + modSize > spaceLeft) break;
+            toLoad.push(modId);
+            usedSpace += modSize;
+          }
+
+          if (toLoad.length === 0) {
             bulkRefitLog(`  Not enough cargo space, waiting...`);
             setTimeout(() => cargoInstallLoop(botName, index, resolve, reject), 2000);
             return;
           }
 
-          const batch = needed.slice(index, index + modulesWeCanLoad);
-          let batchIndex = 0;
+          const loaded = [];
+          let loadIndex = 0;
 
           function loadNext() {
-            if (batchIndex >= batch.length) {
-              installBatch(botName, batch, 0, index + batch.length, resolve, reject);
+            if (loadIndex >= toLoad.length) {
+              installBatch(botName, loaded, 0, index + loaded.length, resolve, reject);
               return;
             }
-            const batchModId = batch[batchIndex];
+            const batchModId = toLoad[loadIndex];
             sendExec(
               botName,
               "withdraw_items",
               { item_id: batchModId, quantity: 1 },
               (res) => {
-                if (!res.ok) {
+                if (res.ok) {
+                  loaded.push(batchModId);
+                } else {
                   bulkRefitLog(`  Failed to load ${batchModId}: ${res.error || "unknown"}`);
                 }
-                batchIndex++;
+                loadIndex++;
                 setTimeout(loadNext, 300);
               }
             );

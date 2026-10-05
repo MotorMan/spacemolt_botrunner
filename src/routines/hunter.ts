@@ -4313,6 +4313,23 @@ function pickFleetBattleEnemy(
 }
 
 /**
+ * Returns true if every fitted weapon module is a Null Cannon (typical AoE mode
+ * layout). Used by the fleet/arena Null Cannon brace-fire cycle.
+ */
+async function hasOnlyNullCannons(ctx: RoutineContext): Promise<boolean> {
+  const weapons = await getWeaponModules(ctx);
+  if (weapons.length === 0) return false;
+  return weapons.every(w => {
+    const name = (w.name || "").toLowerCase();
+    const moduleId = (w.moduleId || "").toLowerCase();
+    return (
+      (name.includes("null") && name.includes("cannon")) ||
+      (moduleId.includes("null") && moduleId.includes("cannon"))
+    );
+  });
+}
+
+/**
  * Wake up and fight the battle the fleet dragged us into.
  * Returns true if the battle ended in our favour (or simply ended).
  */
@@ -4371,6 +4388,11 @@ async function fleetModeFight(
     ctx.log("combat", "⚠️ No ammo loaded for this fleet battle — fighting anyway (fleet mode never abandons the fleet mid-battle)");
   }
 
+  const nullCannonOnly = await hasOnlyNullCannons(ctx);
+  if (nullCannonOnly) {
+    ctx.log("combat", "🔁 Null Cannon only detected — enabling brace-fire cycle (1 fire / 3 brace per 4-tick recycle)");
+  }
+
   return await fightJoinedBattle(
     ctx,
     enemy ? ({ id: enemy.id, name: enemy.name } as NearbyEntity) : null,
@@ -4382,6 +4404,12 @@ async function fleetModeFight(
     settings.shieldRechargePct ?? 80,   // percentage; fightJoinedBattle divides by 100
     settings.onlyNPCs && !settings.fleetFightPlayers,        // onlyNPCs — fleet leader picks targets, but still honour global onlyNPCs unless fleetFightPlayers is enabled
     settings.cloakOnStart,
+    false,                              // stayAtEngaged
+    settings.ammoThreshold,
+    settings.maxReloadAttempts,
+    settings.ammoReloadAbsoluteThreshold,
+    settings.ammoReloadPercentThreshold,
+    nullCannonOnly,                     // nullCannonBraceCycle
   );
 }
 

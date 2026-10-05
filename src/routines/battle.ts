@@ -1675,11 +1675,15 @@ export async function fightJoinedBattle(
   maxReloadAttempts: number = 3,
   ammoReloadAbsoluteThreshold: number = 1,
   ammoReloadPercentThreshold: number = 25,
+  nullCannonBraceCycle: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
 
   let currentTarget = target;
+
+  let lastNullCannonTick: number | undefined;
+  let nullCannonPhase = 0;
 
   // If the caller passed a stale or unrelated target (common after attack timeout
   // when a boss jumped us), pick a real participant from the actual battle.
@@ -2209,8 +2213,27 @@ export async function fightJoinedBattle(
         }
       }
 
-      if (currentTarget) await doEngage(currentTarget);
-      await ctx.sleep(10000);
+      if (nullCannonBraceCycle && status.tick !== undefined) {
+        if (status.tick !== lastNullCannonTick) {
+          lastNullCannonTick = status.tick;
+          nullCannonPhase = (nullCannonPhase + 1) % 4;
+
+          if (nullCannonPhase === 0) {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            if (currentTarget) {
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            }
+          } else {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
+            await bot.exec("battle", { action: "stance", stance: "brace" });
+          }
+        }
+        await ctx.sleep(10000);
+      } else {
+        if (currentTarget) await doEngage(currentTarget);
+        await ctx.sleep(10000);
+      }
       continue;
     }
 
@@ -2252,8 +2275,27 @@ export async function fightJoinedBattle(
       // trying to attack instead of silently sitting in the outer ring and dying.
       // Re-attacking an already-engaged target just returns "already in a battle",
       // which attackTarget treats as success, so this is harmless when fine.
-      if (currentTarget) await doEngage(currentTarget);
-      await ctx.sleep(10000);
+      if (nullCannonBraceCycle && status.tick !== undefined) {
+        if (status.tick !== lastNullCannonTick) {
+          lastNullCannonTick = status.tick;
+          nullCannonPhase = (nullCannonPhase + 1) % 4;
+
+          if (nullCannonPhase === 0) {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
+            await bot.exec("battle", { action: "stance", stance: "fire" });
+            if (currentTarget) {
+              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            }
+          } else {
+            ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
+            await bot.exec("battle", { action: "stance", stance: "brace" });
+          }
+        }
+        await ctx.sleep(10000);
+      } else {
+        if (currentTarget) await doEngage(currentTarget);
+        await ctx.sleep(10000);
+      }
     }
   }
 }

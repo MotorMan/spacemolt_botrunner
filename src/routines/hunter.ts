@@ -4843,9 +4843,9 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
        ammoToGet = Math.max(0, 20 - currentAmmoForType);
      }
 
-      if (desiredAmmoBoxes > 0) {
-        ammoToGet = Math.min(ammoToGet, desiredAmmoBoxes);
-      }
+     if (desiredAmmoBoxes > 0) {
+       ammoToGet = Math.max(0, Math.min(ammoToGet, desiredAmmoBoxes - currentAmmoForType));
+     }
 
     // Prefer currently loaded ammo if available
     let chosenAmmoId: string | null = null;

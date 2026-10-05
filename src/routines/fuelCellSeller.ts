@@ -1624,6 +1624,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const milDeficit = Math.max(0, milTarget - currentMilitaryCargo);
 
     const needSellItems = settings.sellItems.some(item => getSellItemCargo(bot, item.itemId) <= 0);
+    const anySellCargo = settings.sellItems.some(item => getSellItemCargo(bot, item.itemId) > 0);
     const needMilitary = milDeficit > 0;
 
     if ((needSellItems || needMilitary) && atHomeStationAfterMaintenance) {
@@ -1694,7 +1695,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await ctx.sleep(10000);
         continue;
       }
-    } else if (needSellItems && !atHomeStationAfterMaintenance) {
+    } else if (!hasCargo && !atHomeStationAfterMaintenance) {
       ctx.log("fc", "Lost cargo during maintenance — returning home to restock");
       continue;
     }

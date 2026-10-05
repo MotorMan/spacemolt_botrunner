@@ -26911,6 +26911,10 @@ When responding:
           const cost =
             upgradeData.cost ?? upgradeData.credits ?? upgradeData.price ?? 0;
 
+          const currentFac = (factionFacilitiesData || []).find(f => (f.facility_id || f.id) === facilityId);
+          const currentFacType = currentFac?.facility_type || currentFac?.type || "";
+          const needsWithdrawal = currentFacType === "faction_lockbox";
+
           const storageResult = await new Promise((resolve) => {
             sendExec(username, "view_faction_storage", {}, resolve);
           });
@@ -26948,27 +26952,8 @@ When responding:
             return;
           }
 
-          if (cost > 0) {
-            await new Promise((resolve) => {
-              sendExec(
-                username,
-                "storage",
-                {
-                  action: "deposit",
-                  target: "self",
-                  source: "faction",
-                  item_id: "credits",
-                  quantity: cost,
-                },
-                resolve,
-              );
-            });
-          }
-
-          if (Array.isArray(mats) && mats.length > 0) {
-            for (const m of mats) {
-              const mId = m.item_id || m.name || "?";
-              const mQty = m.quantity || m.count || 1;
+          if (needsWithdrawal) {
+            if (cost > 0) {
               await new Promise((resolve) => {
                 sendExec(
                   username,
@@ -26977,17 +26962,38 @@ When responding:
                     action: "deposit",
                     target: "self",
                     source: "faction",
-                    item_id: mId,
-                    quantity: mQty,
+                    item_id: "credits",
+                    quantity: cost,
                   },
                   resolve,
                 );
               });
             }
+
+            if (Array.isArray(mats) && mats.length > 0) {
+              for (const m of mats) {
+                const mId = m.item_id || m.name || "?";
+                const mQty = m.quantity || m.count || 1;
+                await new Promise((resolve) => {
+                  sendExec(
+                    username,
+                    "storage",
+                    {
+                      action: "deposit",
+                      target: "self",
+                      source: "faction",
+                      item_id: mId,
+                      quantity: mQty,
+                    },
+                    resolve,
+                  );
+                });
+              }
+            }
           }
 
           container.innerHTML =
-            '<div style="font-size:11px;padding:4px 0;color:var(--text-dim)">Withdrawn materials, upgrading...</div>';
+            '<div style="font-size:11px;padding:4px 0;color:var(--text-dim)">Upgrading facility...</div>';
 
           const upgradeResult = await new Promise((resolve) => {
             sendExec(
@@ -28689,11 +28695,9 @@ When responding:
         }
 
         const upgradeType = up.type_id || up.facility_type || up.type || "";
-        const storageFacilityTypes = [
-          "faction_lockbox",
-          "faction_storage",
-          "faction_stronghold",
-        ];
+        const currentFac = (factionFacilitiesData || []).find(f => (f.facility_id || f.id) === facilityId);
+        const currentFacType = currentFac?.facility_type || currentFac?.type || "";
+        const needsWithdrawal = currentFacType === "faction_lockbox";
 
         const detailHtml = `
     <div class="faction-card" style="padding:12px">
@@ -28710,7 +28714,7 @@ When responding:
         <button class="primary sm" style="width:100%" onclick="upgradeFactionFacility('${esc(username)}','${esc(facilityId)}','${esc(upgradeType)}')">Upgrade Facility</button>
       </div>
       <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
-        ${storageFacilityTypes.includes(upgradeType) ? "This will withdraw required materials from faction storage and upgrade the facility." : "This will upgrade the facility using materials in faction storage."}
+        ${needsWithdrawal ? "This will withdraw required materials from faction storage and upgrade the facility." : "This will upgrade the facility using materials in faction storage."}
       </div>
     </div>
   `;
@@ -28735,13 +28739,9 @@ When responding:
           up.materials || up.requirements || up.build_materials || [];
         const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
 
-        // Facility types that need materials withdrawn from faction storage to station storage
-        const storageFacilityTypes = [
-          "faction_lockbox",
-          "faction_storage",
-          "faction_stronghold",
-        ];
-        const needsWithdrawal = storageFacilityTypes.includes(upgradeType);
+        const currentFac = (factionFacilitiesData || []).find(f => (f.facility_id || f.id) === facilityId);
+        const currentFacType = currentFac?.facility_type || currentFac?.type || "";
+        const needsWithdrawal = currentFacType === "faction_lockbox";
 
         let progressHtml = `
     <div class="faction-card" style="padding:12px">

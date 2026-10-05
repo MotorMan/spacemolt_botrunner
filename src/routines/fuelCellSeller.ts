@@ -93,7 +93,8 @@ export type FCSkipReason =
   | "outpost"
   | "no_market"
   | "dock_denied"
-  | "unknown_station";
+  | "unknown_station"
+  | "no_storage";
 
 export interface SellItemConfig {
   itemId: string;
@@ -114,6 +115,7 @@ const SKIP_LABELS: Record<FCSkipReason, string> = {
   no_market: "no market",
   dock_denied: "docking denied",
   unknown_station: "unknown station",
+  no_storage: "no storage",
 };
 
 /** Skip reasons the bot can learn at runtime (the rest come from settings/map). */
@@ -121,6 +123,7 @@ const LEARNABLE_SKIPS: ReadonlySet<FCSkipReason> = new Set<FCSkipReason>([
   "no_market",
   "dock_denied",
   "unknown_station",
+  "no_storage",
 ]);
 
 export interface FCStationEntry {
@@ -332,18 +335,26 @@ export function evaluateStationSkip(
   const isHome = entry.systemId === data.homeSystem && entry.poiId === data.homeStation;
 
   if (entry.learnedSkip && LEARNABLE_SKIPS.has(entry.learnedSkip)) {
-    const window = entry.learnedSkip === "unknown_station"
-      ? UNKNOWN_STATION_RELEARN_MS
-      : settings.relearnMs;
-    const age = ageMs(entry.learnedSkipAt, now);
-    if (age === null || age < window) {
-      entry.skipReason = entry.learnedSkip;
-      return entry.learnedSkip;
+    // no_storage is only meaningful in preStage mode; clear it otherwise so
+    // normal-mode runs can still visit stations that simply lack storage.
+    if (entry.learnedSkip === "no_storage" && settings.preStageMode !== "preStage") {
+      entry.learnedSkip = null;
+      entry.learnedSkipAt = null;
+      entry.learnedSkipDetail = null;
+    } else {
+      const window = entry.learnedSkip === "unknown_station"
+        ? UNKNOWN_STATION_RELEARN_MS
+        : settings.relearnMs;
+      const age = ageMs(entry.learnedSkipAt, now);
+      if (age === null || age < window) {
+        entry.skipReason = entry.learnedSkip;
+        return entry.learnedSkip;
+      }
+      // Window elapsed — give the station one more chance.
+      entry.learnedSkip = null;
+      entry.learnedSkipAt = null;
+      entry.learnedSkipDetail = null;
     }
-    // Window elapsed — give the station one more chance.
-    entry.learnedSkip = null;
-    entry.learnedSkipAt = null;
-    entry.learnedSkipDetail = null;
   }
 
   if (!isHome) {
@@ -438,6 +449,13 @@ export function classifyStationError(message: string | undefined | null): FCSkip
     msg.includes("invalid station")
   ) {
     return "unknown_station";
+  }
+  if (
+    msg.includes("does not have a storage facility") ||
+    msg.includes("no storage facility") ||
+    msg.includes("does not offer storage")
+  ) {
+    return "no_storage";
   }
   return null;
 }
@@ -582,16 +600,22 @@ async function checkStationStorageRemote(
 ): Promise<boolean> {
   const updates: Record<string, number> = {};
   const storageFlags: Record<string, { hasFaction: boolean; hasStation: boolean }> = {};
+  let hasNoStorage = false;
 
   for (const itemConfig of settings.sellItems) {
     const result = await getRemoteStorageQty(ctx.bot, stationEntry.poiId, itemConfig.itemId);
     updates[itemConfig.itemId] = result.qty;
     storageFlags[itemConfig.itemId] = { hasFaction: result.hasFactionStorage, hasStation: result.hasStationStorage };
+    if (result.noStorageFacility) hasNoStorage = true;
   }
 
   const hasAnyStorage = Object.values(storageFlags).some(f => f.hasFaction || f.hasStation);
   stationEntry.deposits = hasAnyStorage ? { ...(stationEntry.deposits ?? {}), ...updates } : {};
   stationEntry.lastVisit = new Date().toISOString();
+
+  if (hasNoStorage && settings.preStageMode === "preStage") {
+    markStationLearnedSkip(ctx, stationEntry, "no_storage", "Station has no faction or station storage");
+  }
 
   ctx.log(
     "fc",
@@ -628,15 +652,21 @@ async function refreshAllStationStorage(
     const station = eligible[i].entry;
     const updates: Record<string, number> = {};
     let hasAnyStorage = false;
+    let hasNoStorage = false;
 
     for (const itemConfig of settings.sellItems) {
       const result = await getRemoteStorageQty(bot, station.poiId, itemConfig.itemId);
       updates[itemConfig.itemId] = result.qty;
       if (result.hasFactionStorage || result.hasStationStorage) hasAnyStorage = true;
+      if (result.noStorageFacility) hasNoStorage = true;
     }
 
     station.deposits = hasAnyStorage ? { ...(station.deposits ?? {}), ...updates } : {};
     station.lastVisit = new Date().toISOString();
+
+    if (hasNoStorage && settings.preStageMode === "preStage") {
+      markStationLearnedSkip(ctx, station, "no_storage", "Station has no faction or station storage");
+    }
 
     if (i < count - 1) {
       await ctx.sleep(settings.remoteCheckDelayMs);
@@ -1064,11 +1094,14 @@ interface StorageCheckResult {
   qty: number;
   hasFactionStorage: boolean;
   hasStationStorage: boolean;
+  noStorageFacility: boolean;
 }
 
 async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<StorageCheckResult> {
   let hasFactionStorage = false;
   let hasStationStorage = false;
+  let noFactionStorage = false;
+  let noStationStorage = false;
 
   // Try faction storage first
   try {
@@ -1078,7 +1111,12 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const result = factionResp.result as Record<string, unknown>;
       const items = Array.isArray(result.items) ? result.items : [];
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
-      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: true, hasStationStorage: false };
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: true, hasStationStorage: false, noStorageFacility: false };
+    } else if (factionResp.error) {
+      const errMsg = (factionResp.error.message || "").toLowerCase();
+      if (errMsg.includes("does not have a storage facility") || errMsg.includes("no storage facility")) {
+        noFactionStorage = true;
+      }
     }
   } catch {
     // ignore faction storage errors
@@ -1092,13 +1130,18 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const result = stationResp.result as Record<string, unknown>;
       const items = Array.isArray(result.items) ? result.items : [];
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
-      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: false, hasStationStorage: true };
+      if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: false, hasStationStorage: true, noStorageFacility: false };
+    } else if (stationResp.error) {
+      const errMsg = (stationResp.error.message || "").toLowerCase();
+      if (errMsg.includes("does not offer storage")) {
+        noStationStorage = true;
+      }
     }
   } catch {
     // ignore station storage errors
   }
 
-  return { qty: 0, hasFactionStorage, hasStationStorage };
+  return { qty: 0, hasFactionStorage, hasStationStorage, noStorageFacility: noFactionStorage && noStationStorage };
 }
 
 /**
@@ -1107,6 +1150,9 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
  * so the priority list reflects actual station stock, not stale ledger entries.
  * Stations are sorted by priority: most depleted (highest total need) first,
  * then by fuel cost (cheapest first), then by oldest last visit.
+ *
+ * When a focus item is provided, stations with 0 stock of that item are treated
+ * as emergency priority.
  */
 async function buildPreStagePlan(
   ctx: RoutineContext,
@@ -1114,9 +1160,17 @@ async function buildPreStagePlan(
   data: FCStationsData,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
   filters: { systems: Set<string>; stations: Set<string> },
+  focusItemId: string | null,
 ): Promise<Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }>> {
   const { eligible } = partitionStations(data, settings, filters);
-  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number>; totalNeed: number }> = [];
+  const plan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number>; totalNeed: number; hasZeroFocus: boolean }> = [];
+
+  const focusItem = settings.sellItems.find(i => i.itemId === focusItemId) || settings.sellItems[0];
+  const focusBlocked = new Set(
+    focusItem.blockedStations.map(
+      b => b.toLowerCase()
+    )
+  );
 
   for (const { entry, idx } of eligible) {
     const needByItem: Record<string, number> = {};
@@ -1144,11 +1198,20 @@ async function buildPreStagePlan(
     }
 
     if (totalNeed > 0) {
-      plan.push({ idx, entry, needByItem, totalNeed });
+      const focusKey = entry.poiId.toLowerCase();
+      const focusSysKey = `${entry.systemId}|${entry.poiId}`.toLowerCase();
+      const isFocusBlocked = focusBlocked.has(focusKey) || focusBlocked.has(focusSysKey);
+      const knownFocusQty = entry.deposits?.[focusItem.itemId] || 0;
+      const hasZeroFocus = !isFocusBlocked && knownFocusQty === 0 && knownFocusQty < focusItem.maxPerStation;
+      const needsFocus = needByItem[focusItem.itemId] !== undefined;
+      if (focusItemId && !needsFocus) continue;
+      plan.push({ idx, entry, needByItem, totalNeed, hasZeroFocus });
     }
   }
 
   plan.sort((a, b) => {
+    // Emergency first: stations with 0 stock of focus item
+    if (a.hasZeroFocus !== b.hasZeroFocus) return a.hasZeroFocus ? -1 : 1;
     if (a.totalNeed !== b.totalNeed) return b.totalNeed - a.totalNeed;
     const costA = estimateFuelCost(data.homeSystem, a.entry.systemId, settings.fuelCostPerJump).cost;
     const costB = estimateFuelCost(data.homeSystem, b.entry.systemId, settings.fuelCostPerJump).cost;
@@ -1228,15 +1291,99 @@ async function updateStationPrices(
   return cancelled;
 }
 
+function stationNeedsItem(
+  entry: FCStationEntry,
+  itemConfig: SellItemConfig,
+  preStage: boolean,
+): boolean {
+  if (preStage) {
+    const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
+    return knownQty < itemConfig.maxPerStation;
+  }
+  const unsoldForItem = entry.activeOrders
+    .filter(o => o.itemId === itemConfig.itemId)
+    .reduce((sum, o) => sum + o.remaining, 0);
+  return unsoldForItem < itemConfig.maxPerStation;
+}
+
+function stationHasZeroStock(
+  entry: FCStationEntry,
+  itemConfig: SellItemConfig,
+  preStage: boolean,
+): boolean {
+  if (preStage) {
+    return (entry.deposits?.[itemConfig.itemId] || 0) === 0;
+  }
+  return !entry.activeOrders.some(o => o.itemId === itemConfig.itemId);
+}
+
+export function computeItemNeeds(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): Map<string, number> {
+  const { eligible } = partitionStations(data, settings, filters);
+  const needs = new Map<string, number>();
+  const preStage = settings.preStageMode === "preStage";
+
+  for (const item of settings.sellItems) {
+    needs.set(item.itemId, 0);
+  }
+
+  for (const { entry } of eligible) {
+    for (const item of settings.sellItems) {
+      if (stationNeedsItem(entry, item, preStage)) {
+        needs.set(item.itemId, (needs.get(item.itemId) || 0) + 1);
+      }
+    }
+  }
+
+  return needs;
+}
+
+export function selectFocusItem(
+  itemNeeds: Map<string, number>,
+  currentFocusItemId: string | null,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+): string {
+  if (settings.sellItems.length <= 1) {
+    return settings.sellItems[0]?.itemId || "";
+  }
+
+  let bestItem = settings.sellItems[0]?.itemId || "";
+  let bestCount = -1;
+
+  for (const [itemId, count] of itemNeeds) {
+    if (count > bestCount) {
+      bestCount = count;
+      bestItem = itemId;
+    }
+  }
+
+  // If current focus is still viable (within 20% of best), keep it to avoid thrashing
+  if (currentFocusItemId && bestItem !== currentFocusItemId && bestCount > 0) {
+    const currentCount = itemNeeds.get(currentFocusItemId) || 0;
+    if (currentCount > 0 && currentCount / bestCount >= 0.8) {
+      return currentFocusItemId;
+    }
+  }
+
+  return bestItem;
+}
+
 /**
  * Pick the next station to sell at. Only stations that passed the eligibility
  * screen are considered, so blacklisted stations, faction outposts and stations
  * proven to have no market are never travelled to.
+ *
+ * When a focus item is provided, stations with 0 stock of that item are treated
+ * as emergency priority, followed by stations that still need the focus item.
  */
 function getNextStation(
   data: FCStationsData,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
   filters: { systems: Set<string>; stations: Set<string> },
+  focusItemId: string | null,
 ): number {
   const { eligible } = partitionStations(data, settings, filters);
   if (eligible.length === 0) return -1;
@@ -1249,18 +1396,25 @@ function getNextStation(
     return home.idx;
   }
 
-  // Prioritize stations with lowest total unsold (highest demand), then closest, then oldest visit
+  const preStage = settings.preStageMode === "preStage";
+  const focusItem = settings.sellItems.find(i => i.itemId === focusItemId) || settings.sellItems[0];
+
   const stationPriority = eligible.map(({ entry: station, idx }) => {
     const cost = estimateFuelCost(data.homeSystem, station.systemId, settings.fuelCostPerJump).cost;
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
     const isNearCap = settings.sellItems.every(item => station.ordersUnsold >= item.maxPerStation);
+    const hasZeroFocus = !isNearCap && stationHasZeroStock(station, focusItem, preStage);
+    const needsFocus = stationNeedsItem(station, focusItem, preStage);
+
     return {
       idx,
       ordersUnsold: station.ordersUnsold,
       cost,
       lastVisit,
       isNearCap,
-      priorityScore: isNearCap ? 999999 : station.ordersUnsold,
+      hasZeroFocus,
+      needsFocus,
+      priorityScore: isNearCap ? 999999 : hasZeroFocus ? 1 : needsFocus ? 2 : 3,
       tieBreaker: cost,
       lastTie: lastVisit,
     };
@@ -1323,6 +1477,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     lastFleeTime: undefined,
   };
 
+  let currentFocusItemId: string | null = null;
+
   while (bot.state === "running") {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
@@ -1359,6 +1515,15 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       lastRemoteUpdate = now;
       // Reload data after update to ensure we have latest
       fcData = loadFCStationsData();
+    }
+
+    // Refresh focus item based on freshest station need counts
+    if (settings.sellItems.length > 1) {
+      const itemNeeds = computeItemNeeds(fcData, settings, getBlacklistFilters());
+      currentFocusItemId = selectFocusItem(itemNeeds, currentFocusItemId, settings);
+      const focusItem = settings.sellItems.find(i => i.itemId === currentFocusItemId);
+      const counts = settings.sellItems.map(i => `${itemNeeds.get(i.itemId) || 0} need ${i.itemName}`).join(", ");
+      ctx.log("fc", `Focus item: ${focusItem?.itemName || currentFocusItemId} (${counts})`);
     }
 
     // Capacity is judged over sellable stations only — a blacklisted station or
@@ -1468,31 +1633,21 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const cargoUsed = bot.cargo || 0;
       const freeSpace = Math.max(0, cargoMax - cargoUsed);
 
-      // Load military reserve first (3 cargo each) so sell items can fill remaining space
-      const milToWithdraw = Math.min(milDeficit, Math.floor(freeSpace / 3));
+      // Load sell items first (focus item first), then military reserve with remaining space
+      const sortedSellItems = currentFocusItemId
+        ? [
+            ...settings.sellItems.filter(i => i.itemId === currentFocusItemId),
+            ...settings.sellItems.filter(i => i.itemId !== currentFocusItemId),
+          ]
+        : settings.sellItems;
 
-      if (milToWithdraw > 0) {
-        const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
-        if (milWithdrawResp.error) {
-          ctx.log("error", `Military fuel cell withdraw failed: ${milWithdrawResp.error.message}`);
-        } else {
-          ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
-        }
-      }
-
-      await ctx.sleep(2000);
-      await bot.refreshCargo();
-      const cargoAfterMil = bot.cargo || 0;
-      const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterMil);
-
-      // Load sell items in priority order until cargo is full
-      for (const itemConfig of settings.sellItems) {
+      for (const itemConfig of sortedSellItems) {
         const currentQty = getSellItemCargo(bot, itemConfig.itemId);
         const needQty = Math.max(0, itemConfig.maxPerStation - currentQty);
         if (needQty <= 0) continue;
 
         const itemSize = getItemSize(itemConfig.itemId);
-        const canFit = Math.min(needQty, Math.floor(remainingFreeSpace / itemSize));
+        const canFit = Math.min(needQty, Math.floor(freeSpace / itemSize));
         if (canFit <= 0) break;
 
         const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: itemConfig.itemId, quantity: canFit });
@@ -1505,6 +1660,22 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await bot.refreshCargo();
         const newUsed = bot.cargo || 0;
         if (newUsed >= cargoMax) break;
+      }
+
+      await ctx.sleep(2000);
+      await bot.refreshCargo();
+      const cargoAfterSell = bot.cargo || 0;
+      const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterSell);
+
+      const milToWithdraw = Math.min(milDeficit, Math.floor(remainingFreeSpace / 3));
+
+      if (milToWithdraw > 0) {
+        const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
+        if (milWithdrawResp.error) {
+          ctx.log("error", `Military fuel cell withdraw failed: ${milWithdrawResp.error.message}`);
+        } else {
+          ctx.log("fc", `Withdrew ${milToWithdraw}x military fuel cells from faction storage`);
+        }
       }
 
       await bot.refreshCargo();
@@ -1528,11 +1699,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       continue;
     }
 
-    let targetIdx = getNextStation(fcData, settings, cycleFilters);
+    let targetIdx = getNextStation(fcData, settings, cycleFilters, currentFocusItemId);
     let preStagePlan: Array<{ idx: number; entry: FCStationEntry; needByItem: Record<string, number> }> = [];
 
     if (settings.preStageMode === "preStage") {
-      preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters);
+      preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters, currentFocusItemId);
       if (preStagePlan.length === 0) {
         ctx.log("fc", "All stations already stocked — returning home");
         yield "return_home";
@@ -1578,7 +1749,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
         saveFCStationsData(fcData);
 
-        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true));
+        targetIdx = getNextStation(fcData, settings, getBlacklistFilters(true), currentFocusItemId);
         if (targetIdx < 0) {
           ctx.log("fc", "Every mapped station is excluded (blacklist / outpost / no market) — waiting");
           await ctx.sleep(60000);
@@ -1774,6 +1945,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const needByItem = planEntry?.needByItem ?? {};
 
       for (const itemConfig of settings.sellItems) {
+        if (currentFocusItemId && itemConfig.itemId !== currentFocusItemId) continue;
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
 
@@ -1834,6 +2006,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     } else {
       // Normal mode: calculate prices and create sell orders
       for (const itemConfig of settings.sellItems) {
+        if (currentFocusItemId && itemConfig.itemId !== currentFocusItemId) continue;
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
         if (inCargo <= 0) continue;
 

@@ -27010,8 +27010,7 @@ When responding:
 
           if (upgradeResult.ok) {
             const hint = upgradeResult.data?.hint || "Facility upgraded!";
-            appendLine("system", `${username}: ${hint}`);
-            fetchFactionFacilities(username);
+            container.innerHTML = `<div style="font-size:11px;padding:4px 0;color:var(--green)">${esc(hint)}</div>`;
           } else {
             container.innerHTML = `<div style="font-size:11px;color:var(--red);padding:4px 0">Failed: ${upgradeResult.error || "unknown"}</div>`;
           }
@@ -28748,7 +28747,7 @@ When responding:
       <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Upgrading: ${esc(uName)}</div>
       <div id="fup-step-1">Getting upgrade details...</div>
       <div id="fup-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
-      ${needsWithdrawal ? '<div id="fup-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>' : ""}
+      <div id="fup-step-3" style="color:var(--text-dim)">${needsWithdrawal ? "Withdrawing materials..." : "Materials ready in faction storage"}</div>
       <div id="fup-step-4" style="color:var(--text-dim)">Upgrading facility...</div>
       <div id="fup-status" style="margin-top:12px;font-size:11px"></div>
       <div id="fup-actions" style="margin-top:12px"></div>
@@ -28839,7 +28838,7 @@ When responding:
 
           if (missing.length > 0) {
             setStatus("Missing: " + missing.join(", "), "var(--orange)");
-            document.getElementById("up-actions").innerHTML =
+            document.getElementById("fup-actions").innerHTML =
               '<button class="sm" onclick="fetchFactionFacilities(\'' +
               esc(username) +
               "')\">Back to List</button>";
@@ -28910,6 +28909,8 @@ When responding:
             }
 
             updateStep(3, "Materials withdrawn", "var(--green)");
+          } else {
+            updateStep(3, "Materials ready in faction storage", "var(--green)");
           }
 
           updateStep(4, "Upgrading facility...", "var(--text)");

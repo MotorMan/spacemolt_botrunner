@@ -1112,6 +1112,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   width: 100%;
   flex-shrink: 0;
 }
+.manual-section.collapsed {
+  border-top: none;
+  padding-top: 0;
+  margin-top: 0;
+}
 .manual-section-header {
   display: flex;
   align-items: center;

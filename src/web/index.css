@@ -1150,6 +1150,33 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   gap: 8px;
 }
 
+.manual-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.manual-toolbar-btn {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s;
+}
+.manual-toolbar-btn:hover {
+  background: rgba(255,255,255,0.06);
+  color: var(--text-bright);
+}
+.manual-toolbar-btn.active {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
 .craft-details-group {
   padding: 8px 10px;
   flex-basis: 100%;

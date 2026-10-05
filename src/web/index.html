@@ -7283,6 +7283,14 @@
   `;
 
         document.getElementById("manualControls").innerHTML = `
+    <div class="manual-toolbar">
+      <button class="manual-toolbar-btn ${!manualCollapseState.wreck ? 'active' : ''}" onclick="toggleManualSection('wreck')">🔍 Wreck</button>
+      <button class="manual-toolbar-btn ${!manualCollapseState.shipLoadout ? 'active' : ''}" onclick="toggleManualSection('shipLoadout')">⚙️ Ship Build</button>
+      <button class="manual-toolbar-btn ${!manualCollapseState.modulePreset ? 'active' : ''}" onclick="toggleManualSection('modulePreset')">🔧 Module Preset</button>
+      <button class="manual-toolbar-btn ${!manualCollapseState.gifting ? 'active' : ''}" onclick="toggleManualSection('gifting')">🎁 Gifting</button>
+      <button class="manual-toolbar-btn ${!manualCollapseState.crafting ? 'active' : ''}" onclick="toggleManualSection('crafting')">🔨 Crafting</button>
+      <button class="manual-toolbar-btn ${!manualCollapseState.fleetActions ? 'active' : ''}" onclick="toggleManualSection('fleetActions')">⚔️ Fleet</button>
+    </div>
     <div class="cmd-group">
       <label>Travel</label>
       <select id="mc-travel-poi">${poiOpts}</select>
@@ -7356,10 +7364,6 @@
     ${weaponReloadSection}
 
     <div class="manual-section ${manualCollapseState.wreck ? 'collapsed' : ''}" data-section="wreck">
-      <div class="manual-section-header" onclick="toggleManualSection('wreck')">
-        <span class="manual-section-title">Wreck Salvage</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         ${wreckSection}
       </div>
@@ -7447,10 +7451,6 @@
     </div>
 
     <div class="manual-section ${manualCollapseState.shipLoadout ? 'collapsed' : ''}" data-section="shipLoadout">
-      <div class="manual-section-header" onclick="toggleManualSection('shipLoadout')">
-        <span class="manual-section-title">Ship Build Materials Withdrawal</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         <div class="cmd-group">
           <label>Loadout</label>
@@ -7471,10 +7471,6 @@
     </div>
 
     <div class="manual-section ${manualCollapseState.modulePreset ? 'collapsed' : ''}" data-section="modulePreset">
-      <div class="manual-section-header" onclick="toggleManualSection('modulePreset')">
-        <span class="manual-section-title">Module Loadout Preset</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         <div class="cmd-group">
           <label>Preset</label>
@@ -7489,10 +7485,6 @@
     </div>
 
     <div class="manual-section ${manualCollapseState.gifting ? 'collapsed' : ''}" data-section="gifting">
-      <div class="manual-section-header" onclick="toggleManualSection('gifting')">
-        <span class="manual-section-title">Gifting</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         <div class="cmd-group">
           <label>Gift Item</label>
@@ -7573,10 +7565,6 @@
     </div>
 
     <div class="manual-section ${manualCollapseState.crafting ? 'collapsed' : ''}" data-section="crafting">
-      <div class="manual-section-header" onclick="toggleManualSection('crafting')">
-        <span class="manual-section-title">Crafting</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         <div class="cmd-group">
            <button class="danger sm" onclick="mcCancelAllCraftJobs()" style="width:100%" title="Fetch the craft queue and bulk cancel all jobs in one request">🛑 Cancel All Craft Jobs</button>
@@ -7626,10 +7614,6 @@
     </div>
 
     <div class="manual-section ${manualCollapseState.fleetActions ? 'collapsed' : ''}" data-section="fleetActions">
-      <div class="manual-section-header" onclick="toggleManualSection('fleetActions')">
-        <span class="manual-section-title">Fleet Actions</span>
-        <span class="manual-section-chevron">▼</span>
-      </div>
       <div class="manual-section-body">
         <div class="cmd-group">
           <label>Board Ship</label>

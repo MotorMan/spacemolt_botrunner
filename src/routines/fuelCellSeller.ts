@@ -1332,7 +1332,12 @@ export function computeItemNeeds(
 
   for (const { entry } of eligible) {
     for (const item of settings.sellItems) {
-      if (stationNeedsItem(entry, item, preStage)) {
+      if (!stationNeedsItem(entry, item, preStage)) continue;
+
+      if (preStage) {
+        const knownQty = entry.deposits?.[item.itemId] || 0;
+        needs.set(item.itemId, (needs.get(item.itemId) || 0) + Math.max(0, item.maxPerStation - knownQty));
+      } else {
         needs.set(item.itemId, (needs.get(item.itemId) || 0) + 1);
       }
     }

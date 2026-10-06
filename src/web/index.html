@@ -38519,6 +38519,17 @@ ignoreBlacklist: document.getElementById(
     <div class="faction-section-title">Available from Storage</div>
     <div id="sy-storage-mods"><div class="faction-no-data">Loading storage...</div></div>
   </div>`;
+        html += `<div class="faction-section">
+    <div class="faction-section-title">Faction Storage</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+      <select id="sy-faction-mod-select" style="font-size:12px;padding:4px 8px;flex:1;min-width:0">
+        <option value="">-- loading faction storage --</option>
+      </select>
+      <button class="primary sm" onclick="shipFactionWithdrawAndInstall('${esc(username)}')">Withdraw & Install</button>
+      <button class="sm" onclick="fetchFactionStorageMods('${esc(username)}')" title="Refresh faction storage list">Refresh</button>
+    </div>
+    <div id="sy-faction-mods-status" style="font-size:11px;color:var(--text-dim)"></div>
+  </div>`;
 
         // Debug: raw module data
         html += `<details style="margin-top:12px">
@@ -38530,6 +38541,7 @@ ignoreBlacklist: document.getElementById(
         setTimeout(() => {
           fetchCargoMods(username);
           fetchStorageMods(username);
+          fetchFactionStorageMods(username);
         }, 0);
 
         return html;
@@ -38591,6 +38603,54 @@ ignoreBlacklist: document.getElementById(
         });
       }
 
+      function fetchFactionStorageMods(username) {
+        const select = document.getElementById("sy-faction-mod-select");
+        const status = document.getElementById("sy-faction-mods-status");
+        if (!select) return;
+        if (
+          shipyardSelectedBot !== username ||
+          shipyardActivePanel !== "modules"
+        )
+          return;
+        select.innerHTML =
+          '<option value="">-- loading faction storage --</option>';
+        if (status) status.textContent = "Loading faction storage...";
+        sendExec(username, "view_faction_storage", undefined, (result) => {
+          if (
+            shipyardSelectedBot !== username ||
+            shipyardActivePanel !== "modules"
+          )
+            return;
+          if (!result.ok || !result.data) {
+            select.innerHTML =
+              '<option value="">Not in faction or no access</option>';
+            if (status) status.textContent = result.error || "Failed to load";
+            return;
+          }
+          const d = result.data;
+          const items = Array.isArray(d)
+            ? d
+            : d.items || d.storage || d.inventory || [];
+          if (items.length === 0) {
+            select.innerHTML =
+              '<option value="">Faction storage is empty</option>';
+            if (status) status.textContent = "0 items";
+            return;
+          }
+          let opts =
+            '<option value="">-- select module to install --</option>';
+          for (const item of items) {
+            const id = item.item_id || item.id || "";
+            const name = item.name || item.item_name || id || "?";
+            const qty = item.quantity ?? item.count ?? 1;
+            if (!id) continue;
+            opts += `<option value="${esc(id)}">${esc(name)}${qty > 1 ? ` (x${qty})` : ""}</option>`;
+          }
+          select.innerHTML = opts;
+          if (status) status.textContent = `${items.length} item(s) available`;
+        });
+      }
+
       function renderModItemsList(items, username, source) {
         let html = '<div class="faction-card">';
         for (const item of items) {
@@ -38614,11 +38674,16 @@ ignoreBlacklist: document.getElementById(
             source === "storage"
               ? `shipWithdrawAndInstall('${esc(username)}','${esc(id)}','${escJs(name)}')`
               : `shipInstallMod('${esc(username)}','${esc(id)}')`;
+          const depAction =
+            source === "storage"
+              ? `shipDepositToFaction('${esc(username)}','${esc(id)}','${escJs(name)}','storage')`
+              : `shipDepositToFaction('${esc(username)}','${esc(id)}','${escJs(name)}','cargo')`;
           html += `<div class="shipyard-mod-row">
       <div style="flex:1;min-width:0">
         <div class="shipyard-mod-name">${esc(name)} ${qty > 1 ? `<span style="color:var(--text-dim)">x${qty}</span>` : ""}</div>
         ${detail ? `<div class="shipyard-mod-detail">${esc(detail)}</div>` : ""}
       </div>
+      <button class="sm" style="flex-shrink:0" onclick="${depAction}" title="Deposit to faction storage">Deposit → Faction</button>
       <button class="primary sm" style="flex-shrink:0" onclick="${action}">${source === "storage" ? "Withdraw & Install" : "Install"}</button>
     </div>`;
         }
@@ -40289,6 +40354,123 @@ ignoreBlacklist: document.getElementById(
                 }
               },
             );
+          },
+        );
+      }
+
+      function shipFactionWithdrawAndInstall(username) {
+        const select = document.getElementById("sy-faction-mod-select");
+        if (!select) return;
+        const itemId = select.value;
+        if (!itemId) {
+          appendLine("system", "Select a module from faction storage first");
+          return;
+        }
+        const itemName = select.options[select.selectedIndex]?.text || itemId;
+        const statusEl = document.getElementById("sy-faction-mods-status");
+        if (statusEl) statusEl.textContent = "Withdrawing from faction storage...";
+        appendLine(
+          "system",
+          `Withdrawing ${itemName} from faction storage...`,
+        );
+        sendExec(
+          username,
+          "storage",
+          {
+            action: "deposit",
+            target: "self",
+            source: "faction",
+            item_id: itemId,
+            quantity: 1,
+          },
+          (step1Result) => {
+            if (!step1Result.ok) {
+              appendLine(
+                "system",
+                `Faction withdraw failed: ${step1Result.error || "unknown"}`,
+              );
+              if (statusEl) statusEl.textContent = "Faction withdraw failed";
+              return;
+            }
+            appendLine(
+              "system",
+              `Moved ${itemName} from faction storage to personal storage`,
+            );
+            sendExec(
+              username,
+              "withdraw_items",
+              { item_id: itemId, quantity: 1 },
+              (step2Result) => {
+                if (!step2Result.ok) {
+                  appendLine(
+                    "system",
+                    `Withdraw to cargo failed: ${step2Result.error || "unknown"} — item is in personal storage`,
+                  );
+                  if (statusEl) statusEl.textContent = "In personal storage";
+                  return;
+                }
+                appendLine(
+                  "system",
+                  `Moved ${itemName} to cargo`,
+                );
+                sendExec(
+                  username,
+                  "install_mod",
+                  { module_id: itemId },
+                  (installResult) => {
+                if (installResult.ok) {
+                  appendLine(
+                    "system",
+                    `${username} installed ${itemName} from faction storage`,
+                  );
+                  fetchShipDetails(username);
+                } else {
+                  appendLine(
+                    "system",
+                    `Install failed: ${installResult.error || "unknown"} — item is in cargo`,
+                  );
+                  fetchShipDetails(username);
+                }
+                  },
+                );
+              },
+            );
+          },
+        );
+      }
+
+      function shipDepositToFaction(username, itemId, itemName, source) {
+        if (!itemId) return;
+        const sourceLabel = source === "cargo" ? "cargo" : "station storage";
+        appendLine(
+          "system",
+          `Depositing ${itemName || itemId} from ${sourceLabel} to faction storage...`,
+        );
+        sendExec(
+          username,
+          "storage",
+          {
+            action: "deposit",
+            target: "faction",
+            source: source,
+            item_id: itemId,
+            quantity: 1,
+          },
+          (result) => {
+            if (result.ok) {
+              appendLine(
+                "system",
+                `${username} deposited ${itemName || itemId} to faction storage`,
+              );
+              fetchCargoMods(username);
+              fetchStorageMods(username);
+              fetchFactionStorageMods(username);
+            } else {
+              appendLine(
+                "system",
+                `Faction deposit failed: ${result.error || "unknown"}`,
+              );
+            }
           },
         );
       }

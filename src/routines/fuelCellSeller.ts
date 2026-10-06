@@ -154,6 +154,7 @@ export interface FCStationsData {
   stations: FCStationEntry[];
   currentStationIndex: number;
   lastStarted: string;
+  lastRemoteUpdate: number;
 }
 
 function emptyFCStationsData(): FCStationsData {
@@ -164,6 +165,7 @@ function emptyFCStationsData(): FCStationsData {
     stations: [],
     currentStationIndex: 0,
     lastStarted: new Date().toISOString(),
+    lastRemoteUpdate: 0,
   };
 }
 
@@ -192,6 +194,7 @@ function loadFCStationsData(): FCStationsData {
       skipReason: station.skipReason ?? null,
     }));
     data.version = 2;
+    data.lastRemoteUpdate = data.lastRemoteUpdate ?? 0;
     return data;
   } catch {
     return emptyFCStationsData();
@@ -213,11 +216,17 @@ let filterCache: { at: number; systems: Set<string>; stations: Set<string> } | n
 function getBlacklistFilters(force = false): { systems: Set<string>; stations: Set<string> } {
   const now = Date.now();
   if (!force && filterCache && now - filterCache.at < FILTER_CACHE_MS) return filterCache;
+  const settings = getFuelCellSellerSettings();
   filterCache = {
     at: now,
     systems: new Set(getSystemBlacklist().map(s => s.toLowerCase())),
     stations: buildDeniedStationSet(),
   };
+  for (const item of settings.sellItems) {
+    for (const station of (item.blockedStations || [])) {
+      filterCache.stations.add(station.toLowerCase());
+    }
+  }
   return filterCache;
 }
 
@@ -607,6 +616,14 @@ async function checkStationStorageRemote(
     updates[itemConfig.itemId] = result.qty;
     storageFlags[itemConfig.itemId] = { hasFaction: result.hasFactionStorage, hasStation: result.hasStationStorage };
     if (result.noStorageFacility) hasNoStorage = true;
+
+    const errorMsg = result.factionError || result.stationError || "";
+    if (errorMsg) {
+      const skipReason = classifyStationError(errorMsg);
+      if (skipReason) {
+        markStationLearnedSkip(ctx, stationEntry, skipReason, errorMsg);
+      }
+    }
   }
 
   const hasAnyStorage = Object.values(storageFlags).some(f => f.hasFaction || f.hasStation);
@@ -659,6 +676,14 @@ async function refreshAllStationStorage(
       updates[itemConfig.itemId] = result.qty;
       if (result.hasFactionStorage || result.hasStationStorage) hasAnyStorage = true;
       if (result.noStorageFacility) hasNoStorage = true;
+
+      const errorMsg = result.factionError || result.stationError || "";
+      if (errorMsg) {
+        const skipReason = classifyStationError(errorMsg);
+        if (skipReason) {
+          markStationLearnedSkip(ctx, station, skipReason, errorMsg);
+        }
+      }
     }
 
     station.deposits = hasAnyStorage ? { ...(station.deposits ?? {}), ...updates } : {};
@@ -1095,6 +1120,8 @@ interface StorageCheckResult {
   hasFactionStorage: boolean;
   hasStationStorage: boolean;
   noStorageFacility: boolean;
+  factionError?: string;
+  stationError?: string;
 }
 
 async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string): Promise<StorageCheckResult> {
@@ -1102,6 +1129,8 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
   let hasStationStorage = false;
   let noFactionStorage = false;
   let noStationStorage = false;
+  let factionError: string | undefined;
+  let stationError: string | undefined;
 
   // Try faction storage first
   try {
@@ -1113,7 +1142,8 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
       if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: true, hasStationStorage: false, noStorageFacility: false };
     } else if (factionResp.error) {
-      const errMsg = (factionResp.error.message || "").toLowerCase();
+      factionError = factionResp.error.message || "";
+      const errMsg = factionError.toLowerCase();
       if (errMsg.includes("does not have a storage facility") || errMsg.includes("no storage facility")) {
         noFactionStorage = true;
       }
@@ -1132,7 +1162,8 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const found = items.find((i: any) => i.item_id === itemId || i.itemId === itemId);
       if (found) return { qty: found.quantity ?? found.qty ?? 0, hasFactionStorage: false, hasStationStorage: true, noStorageFacility: false };
     } else if (stationResp.error) {
-      const errMsg = (stationResp.error.message || "").toLowerCase();
+      stationError = stationResp.error.message || "";
+      const errMsg = stationError.toLowerCase();
       if (errMsg.includes("does not offer storage")) {
         noStationStorage = true;
       }
@@ -1141,7 +1172,7 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
     // ignore station storage errors
   }
 
-  return { qty: 0, hasFactionStorage, hasStationStorage, noStorageFacility: noFactionStorage && noStationStorage };
+  return { qty: 0, hasFactionStorage, hasStationStorage, noStorageFacility: noFactionStorage && noStationStorage, factionError, stationError };
 }
 
 /**
@@ -1470,7 +1501,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
   }
 
   // Track last remote update time for periodic checks
-  let lastRemoteUpdate: number = 0;
+  let lastRemoteUpdate: number = fcData.lastRemoteUpdate || 0;
 
   // Persistent battle state across cycles
   const battleState: BattleState = {
@@ -1518,7 +1549,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       ctx.log("fc", "Time for periodic remote update of station orders...");
       await updateAllStationsFromRemote(ctx, fcData, settings);
       lastRemoteUpdate = now;
-      // Reload data after update to ensure we have latest
+      fcData.lastRemoteUpdate = now;
+      saveFCStationsData(fcData);
       fcData = loadFCStationsData();
     }
 
@@ -1636,8 +1668,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
 
       const cargoMax = bot.cargoMax || 825;
-      const cargoUsed = bot.cargo || 0;
-      const freeSpace = Math.max(0, cargoMax - cargoUsed);
+      let cargoUsed = bot.cargo || 0;
+      let freeSpace = Math.max(0, cargoMax - cargoUsed);
 
       // Load sell items first (focus item first), then military reserve with remaining space
       const sortedSellItems = currentFocusItemId
@@ -1664,8 +1696,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         ctx.log("fc", `Withdrew ${canFit}x ${itemConfig.itemName} from faction storage`);
         await ctx.sleep(1000);
         await bot.refreshCargo();
-        const newUsed = bot.cargo || 0;
-        if (newUsed >= cargoMax) break;
+        cargoUsed = bot.cargo || 0;
+        freeSpace = Math.max(0, cargoMax - cargoUsed);
+        if (freeSpace <= 0) break;
       }
 
       await ctx.sleep(2000);
@@ -1968,6 +2001,13 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const remoteResult = await getRemoteStorageQty(bot, target.poiId, itemConfig.itemId);
         if (!remoteResult.hasFactionStorage && !remoteResult.hasStationStorage) {
           ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: no faction storage or station storage available`);
+          const errorMsg = remoteResult.factionError || remoteResult.stationError || "";
+          if (errorMsg) {
+            const skipReason = classifyStationError(errorMsg);
+            if (skipReason) {
+              markStationLearnedSkip(ctx, target, skipReason, errorMsg);
+            }
+          }
           continue;
         }
         const knownQty = remoteResult.qty;

@@ -38637,9 +38637,14 @@ ignoreBlacklist: document.getElementById(
             if (status) status.textContent = "0 items";
             return;
           }
+          const sorted = [...items].sort((a, b) => {
+            const nameA = (a.name || a.item_name || a.item_id || a.id || "").toLowerCase();
+            const nameB = (b.name || b.item_name || b.item_id || b.id || "").toLowerCase();
+            return nameA.localeCompare(nameB);
+          });
           let opts =
             '<option value="">-- select module to install --</option>';
-          for (const item of items) {
+          for (const item of sorted) {
             const id = item.item_id || item.id || "";
             const name = item.name || item.item_name || id || "?";
             const qty = item.quantity ?? item.count ?? 1;

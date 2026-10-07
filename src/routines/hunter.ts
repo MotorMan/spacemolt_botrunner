@@ -10,6 +10,9 @@
  *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
  *   - creature_farm: Farm creatures across a Hunter Patrol Profile's systems
  *   - creature_farm_random: Farm creatures across randomly selected systems
+ *   - hunt_big_creatures: Hunt known large creatures (Cloudwhale, Molt Leviathan,
+ *     Rainbow Leviathan) using explorer wildlife data. Targets the closest known
+ *     big creature, falls back to random creature farm when none are known.
  *   - fleet_arena: Stay in the current POI and do nothing until the fleet enters battle
  *   - pvp: Camp a single system POI (never move) and send an attack command every
  *          tick at a configured target player (hunter.targetPlayer / per-bot override)
@@ -79,6 +82,7 @@ import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common
 import { combatDebugLog } from "../debug.js";
 import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
 import { creatureKillStore } from "../creaturekillstore.js";
+import { wildlifeStore, type WildlifeDetail } from "../wildlivestore.js";
 import {
   findStation,
   isStationPoi,
@@ -512,7 +516,7 @@ async function handleFuelCheckFailure(
 
 export type HunterCoordinationMode = "off" | "assist" | "avoid";
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "fleet_arena" | "fleet" | "pvp" | "boarding";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius" | "station_protection" | "creature_farm" | "creature_farm_random" | "hunt_big_creatures" | "fleet_arena" | "fleet" | "pvp" | "boarding";
 
 /**
  * A Creature Farm "route" is just a Hunter Patrol Profile (hunter.hunterPatrols).
@@ -1867,6 +1871,11 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       return;
     }
 
+    if (initialSettings.mode === "hunt_big_creatures") {
+      yield* huntBigCreaturesRoutine(ctx);
+      return;
+    }
+
     if (isFleetArenaMode(initialSettings.mode)) {
       yield* fleetArenaModeRoutine(ctx);
       return;
@@ -2386,6 +2395,408 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 }
+
+// ── Hunt Big Creatures Routine ──────────────────────────────────
+//
+// Targets known large creatures (Cloudwhale, Molt Leviathan, Rainbow Leviathan)
+// using the explorer wildlife data. Selects the closest known big creature,
+// navigates there, and farms it. Falls back to random creature farm when no
+// big creatures are currently known.
+
+const BIG_CREATURE_KEYWORDS = ["cloudwhale", "leviathan"];
+
+function isKnownBigCreature(creature: WildlifeDetail): boolean {
+  const name = (creature.name || "").toLowerCase();
+  const species = (creature.species || "").toLowerCase();
+  return BIG_CREATURE_KEYWORDS.some(kw => name.includes(kw) || species.includes(kw));
+}
+
+function findKnownBigCreatures(): Array<{ system: string; poi: string; name: string; count: number }> {
+  const all = wildlifeStore.getAll();
+  return all
+    .filter(c => isKnownBigCreature(c) && c.count > 0)
+    .map(c => ({
+      system: c.system,
+      poi: c.poi,
+      name: c.name,
+      count: c.count,
+    }));
+}
+
+function pickClosestBigCreatureTarget(
+  fromSystem: string,
+  targets: Array<{ system: string; poi: string; name: string; count: number }>,
+): { target: { system: string; poi: string; name: string; count: number }; distance: number } | null {
+  let best: { target: { system: string; poi: string; name: string; count: number }; distance: number } | null = null;
+  const seen = new Set<string>();
+  for (const t of targets) {
+    const key = `${t.system}|${t.poi}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const route = mapStore.findRoute(fromSystem, t.system);
+    const jumps = route ? Math.max(0, route.length - 1) : Infinity;
+    if (jumps === Infinity) continue;
+    if (!best || jumps < best.distance) {
+      best = { target: t, distance: jumps };
+    }
+  }
+  return best;
+}
+
+async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await ensureHunterCoordListener(bot.username);
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+
+    // ── Death recovery ──
+    const death = await handleDeath(ctx, settings);
+    if (death === "stop") return;
+    if (death === "wait") continue;
+
+    // ── Refresh known big creature locations ──
+    const knownTargets = findKnownBigCreatures();
+
+    if (knownTargets.length === 0) {
+      ctx.log("info", "No known big creatures — doing a random creature farm cycle before rechecking");
+      // Fallback: one creature_farm_random style cycle
+      yield "fallback_random_farm";
+      await creatureFarmRandomFallbackCycle(ctx, settings);
+      continue;
+    }
+
+    const currentSystem = bot.system;
+    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets);
+
+    if (!best) {
+      ctx.log("warn", "No reachable big creature targets — falling back to random farm");
+      yield "fallback_random_farm";
+      await creatureFarmRandomFallbackCycle(ctx, settings);
+      continue;
+    }
+
+    const target = best.target;
+    ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
+
+    // ── Standard pre-hunt checks ──
+    yield "get_status";
+    await bot.refreshLocation();
+    logStatus(ctx);
+
+    const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
+    if (fueled !== "fueled") {
+      await handleFuelCheckFailure(ctx, settings, fueled);
+      continue;
+    }
+
+    await bot.refreshShip();
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct <= settings.repairThreshold) {
+      ctx.log("system", `Hull at ${hullPct}% — returning home to repair`);
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    await bot.refreshCargo();
+    const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+    if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home`);
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    const cargoPct = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (cargoPct >= (settings.creatureFarmCargoFullPct || 0.95)) {
+      ctx.log("system", `Cargo ${Math.round(cargoPct * 100)}% — returning home`);
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!hasAmmo && !settings.meatShield) {
+      ctx.log("combat", "Out of ammo — returning home to restock");
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      ctx.log("combat", "Low on repair kits — returning home to resupply");
+      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+      continue;
+    }
+
+    // ── Navigate to target system ──
+    if (bot.system !== target.system) {
+      ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+        autoCloak: settings.autoCloak,
+        skipBlacklist: true,
+        isCombatBot: true,
+        joinBattles: true,
+      };
+      const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${target.system} — rechecking targets next cycle`);
+        }
+        continue;
+      }
+      await resubscribeObservationAfterMove(bot);
+    }
+
+    // ── Farm the target system for the big creature ──
+    yield "farm_big_creature";
+    const farmKills = await farmSystemForBigCreature(ctx, settings, target);
+    if (farmKills > 0) {
+      ctx.log("combat", `Big creature hunt: ${farmKills} kill(s) in ${target.system}`);
+    }
+
+    // Brief pause before rechecking known locations
+    await ctx.sleep(5000);
+  }
+}
+
+async function farmSystemForBigCreature(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+  target: { system: string; poi: string; name: string; count: number },
+): Promise<number> {
+  const { bot } = ctx;
+  const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
+  let totalKills = 0;
+
+  // Focus on the target POI first, then sweep other non-station POIs
+  const { pois } = await getSystemInfo(ctx);
+  let patrolPois = pois.filter(p => !isStationPoi(p));
+  // Sort target POI to the front
+  patrolPois.sort((a, b) => {
+    const aIsTarget = a.id === target.poi || a.name === target.poi ? -1 : 1;
+    const bIsTarget = b.id === target.poi || b.name === target.poi ? -1 : 1;
+    return aIsTarget - bIsTarget;
+  });
+
+  for (const poi of patrolPois) {
+    if (bot.state !== "running") break;
+
+    await bot.refreshShip();
+    const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (midHull <= settings.repairThreshold) break;
+
+    await bot.refreshCargo();
+    const midCargo = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (midCargo >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+
+    const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+    if (!ammo && !settings.meatShield) break;
+
+    ctx.log("travel", `Big creature hunt: scanning ${poi.name}...`);
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+      continue;
+    }
+    bot.poi = poi.id;
+    bot.clearObservationState();
+    await ctx.sleep(1000);
+
+    if (await checkAndHandleExistingBattle(ctx, settings)) {
+      // Battle handled, re-scan after
+    }
+
+    let passes = 0;
+    while (bot.state === "running" && passes < maxPasses) {
+      passes++;
+      const obsResult = await getObservationOrNearby(bot);
+      const nearbyData = obsResult.result;
+      if (!nearbyData) break;
+
+      bot.trackNearbyPlayers(nearbyData);
+      bot.trackWildlife(nearbyData);
+
+      const afterBattleResp = await getObservationOrNearby(bot);
+      const afterBattleData = afterBattleResp.result;
+      if (!afterBattleData) break;
+      bot.trackNearbyPlayers(afterBattleData);
+      bot.trackWildlife(afterBattleData);
+
+      const entities = parseNearby(afterBattleData);
+      const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+      const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      let targets = [...creatures, ...pirates];
+      targets = pickUnclaimedBoardingTarget(targets, bot.username);
+      const targetsToEngage = sortTargetsByPriority(targets);
+
+      if (targetsToEngage.length === 0) break;
+
+      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+
+      for (const t of targetsToEngage) {
+        if (bot.state !== "running") break;
+
+        await bot.refreshShip();
+        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (preHull <= settings.repairThreshold) break;
+
+        await useRepairKits(ctx);
+        const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+        if (!ammo && !settings.meatShield) break;
+
+        const freshScanResp = await bot.exec("get_nearby");
+        let freshEntities: NearbyEntity[] = [];
+        if (!freshScanResp.error && freshScanResp.result) {
+          bot.trackNearbyPlayers(freshScanResp.result);
+          bot.trackWildlife(freshScanResp.result);
+          freshEntities = parseNearby(freshScanResp.result);
+        }
+        const stillPresent = freshEntities.find(e => e.id === t.id || e.name === t.name);
+        if (!stillPresent) {
+          ctx.log("combat", `⚠️ ${t.name} no longer at ${poi.name} — skipping`);
+          continue;
+        }
+
+        const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+        if (won) {
+          totalKills++;
+          recordCreatureKill(bot, t);
+          ctx.log("combat", `Kill #${totalKills} (${t.name}) — looting...`);
+          if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+          const cset = getHunterSettings(bot.username);
+          await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+          if (cp >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+        }
+      }
+      if (totalKills > 0 && totalKills % 3 === 0) {
+        await bot.refreshCargo();
+        const cp2 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+        if (cp2 >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+      }
+      await ctx.sleep(1500);
+    }
+  }
+
+  return totalKills;
+}
+
+async function creatureFarmRandomFallbackCycle(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+  const basePool = settings.creatureFarmSystems || [];
+  if (basePool.length === 0) {
+    ctx.log("info", "No creatureFarmSystems configured for fallback — waiting 30s");
+    await ctx.sleep(30000);
+    return;
+  }
+
+  const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
+  let targetSystem = baseSystem;
+  if (settings.creatureFarmRoamJumps > 0) {
+    const resolvedBase = resolveSystemId(baseSystem);
+    if (resolvedBase) {
+      const expanded = findSystemsWithinRadius(resolvedBase, settings.creatureFarmRoamJumps);
+      if (expanded.length > 0) {
+        targetSystem = expanded[Math.floor(Math.random() * expanded.length)];
+      }
+    }
+  }
+
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+    autoCloak: settings.autoCloak,
+    skipBlacklist: true,
+    isCombatBot: true,
+    joinBattles: true,
+  };
+
+  if (bot.system !== targetSystem) {
+    ctx.log("travel", `Fallback farm: heading to ${targetSystem}...`);
+    const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Could not reach ${targetSystem} for fallback farm`);
+      return;
+    }
+    await resubscribeObservationAfterMove(bot);
+  }
+
+  const loopsPerSystem = settings.creatureFarmLoopsPerSystem || 3;
+  const cargoFullPct = settings.creatureFarmCargoFullPct || 0.95;
+  const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
+  let sweeps = 0;
+  while (bot.state === "running" && sweeps < loopsPerSystem) {
+    sweeps++;
+    const { pois } = await getSystemInfo(ctx);
+    const patrolPois = pois.filter(p => !isStationPoi(p));
+    if (patrolPois.length === 0) break;
+
+    ctx.log("info", `Fallback farm sweep ${sweeps}/${loopsPerSystem} — ${patrolPois.length} POI(s)`);
+    for (const poi of patrolPois) {
+      if (bot.state !== "running") break;
+      await bot.refreshShip();
+      const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (midHull <= settings.repairThreshold) break;
+      await bot.refreshCargo();
+      if ((bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0) >= cargoFullPct) break;
+
+      const travelResp = await bot.exec("travel", { target_poi: poi.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) continue;
+      bot.poi = poi.id;
+      bot.clearObservationState();
+      await ctx.sleep(1000);
+
+      let passes = 0;
+      while (bot.state === "running" && passes < maxPasses) {
+        passes++;
+        const obsResult = await getObservationOrNearby(bot);
+        const nearbyData = obsResult.result;
+        if (!nearbyData) break;
+        bot.trackNearbyPlayers(nearbyData);
+        bot.trackWildlife(nearbyData);
+
+        const afterBattleResp = await getObservationOrNearby(bot);
+        const afterBattleData = afterBattleResp.result;
+        if (!afterBattleData) break;
+        bot.trackNearbyPlayers(afterBattleData);
+        bot.trackWildlife(afterBattleData);
+
+        const entities = parseNearby(afterBattleData);
+        const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+        if (creatures.length === 0) break;
+
+        for (const t of creatures) {
+          if (bot.state !== "running") break;
+          await useRepairKits(ctx);
+          const ammo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+          if (!ammo && !settings.meatShield) break;
+
+          const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+          if (won) {
+            recordCreatureKill(bot, t);
+            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+            const cset = getHunterSettings(bot.username);
+            await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if ((bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0) >= cargoFullPct) break;
+          }
+        }
+        await ctx.sleep(1500);
+      }
+    }
+  }
+}
+
 // ── Roam Systems Routine (original behavior) ────────────────────
 
 async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {

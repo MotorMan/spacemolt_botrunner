@@ -9,6 +9,7 @@
  */
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { catalogStore } from "../catalogstore.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { resolveStationId, getMobileCapitolSystem } from "./common.js";
 import {
@@ -21,6 +22,7 @@ import {
   detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
+  writeSettings,
   logFactionActivity,
   isPirateSystem,
   getSystemInfo,
@@ -47,11 +49,17 @@ function getCleanupSettings(username?: string): {
   depositAllStorage: boolean;
   enableCloak: boolean;
   cloakIgnoreBlacklist: boolean;
+  cleanupRemoteFactionStorage: boolean;
+  factionStorageLeaveItems: string[];
 } {
   const all = readSettings();
   const general = all.general || {};
   const t = all.cleanup || {};
   const botOverrides = username ? (all[username] || {}) : {};
+
+  const rawLeaveItems = (t.factionStorageLeaveItems as string[]) || [];
+  const leaveItems = rawLeaveItems.filter((id): id is string => typeof id === "string" && id.length > 0);
+
   return {
     homeSystem: (botOverrides.homeSystem as string)
       || (t.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
@@ -63,6 +71,8 @@ function getCleanupSettings(username?: string): {
     depositAllStorage: (t.depositAllStorage as boolean) || true,
     enableCloak: (t.enableCloak as boolean) ?? false,
     cloakIgnoreBlacklist: (t.cloakIgnoreBlacklist as boolean) ?? false,
+    cleanupRemoteFactionStorage: (t.cleanupRemoteFactionStorage as boolean) ?? false,
+    factionStorageLeaveItems: leaveItems,
   };
 }
 
@@ -386,6 +396,165 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
   return stations;
 }
 
+const BULK_MAX_ITEMS = 100;
+const BULK_SETTLE_MS = 2000;
+
+function chunkBulkItems<T extends { itemId: string }>(items: T[]): T[][] {
+  if (items.length <= BULK_MAX_ITEMS) return [items];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += BULK_MAX_ITEMS) {
+    chunks.push(items.slice(i, i + BULK_MAX_ITEMS));
+  }
+  return chunks;
+}
+
+async function bulkStationToFaction(
+  ctx: RoutineContext,
+  items: Array<{ itemId: string; quantity: number }>,
+): Promise<number> {
+  const { bot } = ctx;
+  const valid = items.filter((r) => r.itemId && r.quantity > 0);
+  if (valid.length === 0) return 0;
+
+  const before = new Map(bot.storage.map((i) => [i.itemId, i.quantity]));
+  const chunks = chunkBulkItems(valid);
+  let movedTypes = 0;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "withdraw",
+      source: "storage",
+      target: "faction",
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (!resp.error) movedTypes += chunk.length;
+    else ctx.log("warn", `Bulk station→faction failed: ${resp.error.message}`);
+  }
+  await sleep(BULK_SETTLE_MS);
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+
+  let stranded = 0;
+  for (const [itemId, qtyBefore] of before) {
+    const qtyAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+    if (qtyAfter > 0) {
+      stranded++;
+      ctx.log("error", `⚠️ Could NOT return ${qtyAfter}x ${itemId} to faction storage (returned ${qtyBefore - qtyAfter}/${qtyBefore}).`);
+    }
+  }
+  if (stranded > 0) {
+    ctx.log("error", `⚠️ ${stranded} item type(s) stranded in station storage — manual deposit required.`);
+  }
+  return before.size - stranded;
+}
+
+async function bulkWithdrawFromStation(
+  ctx: RoutineContext,
+  items: Array<{ itemId: string; quantity: number }>,
+): Promise<Map<string, number>> {
+  const { bot } = ctx;
+  const valid = items.filter((r) => r.itemId && r.quantity > 0);
+  const moved = new Map<string, number>();
+  if (valid.length === 0) return moved;
+
+  const before = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
+  const chunks = chunkBulkItems(valid);
+  for (const chunk of chunks) {
+    const resp = await bot.exec("withdraw_items", {
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (resp.error) {
+      ctx.log("warn", `Bulk station→cargo failed: ${resp.error.message}`);
+    }
+  }
+  await sleep(BULK_SETTLE_MS);
+  await bot.refreshCargo();
+  await bot.refreshStorage();
+
+  const after = new Map(bot.inventory.map((i) => [i.itemId, i.quantity]));
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const delta = (after.get(id) || 0) - (before.get(id) || 0);
+    if (delta > 0) moved.set(id, delta);
+  }
+  return moved;
+}
+
+async function bulkFactionToStation(
+  ctx: RoutineContext,
+  items: Array<{ itemId: string; quantity: number }>,
+): Promise<number> {
+  const { bot } = ctx;
+  const valid = items.filter((r) => r.itemId && r.quantity > 0);
+  if (valid.length === 0) return 0;
+
+  const before = new Map(bot.factionStorage.map((i) => [i.itemId, i.quantity]));
+  const chunks = chunkBulkItems(valid);
+  let movedTypes = 0;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "deposit",
+      target: "self",
+      source: "faction",
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (!resp.error) movedTypes += chunk.length;
+    else ctx.log("warn", `Bulk faction→station failed: ${resp.error.message}`);
+  }
+  await sleep(BULK_SETTLE_MS);
+  await bot.refreshFactionStorage(false, undefined, true);
+  await bot.refreshStorage();
+
+  let stranded = 0;
+  for (const [itemId, qtyBefore] of before) {
+    const qtyAfter = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
+    if (qtyAfter > 0) {
+      stranded++;
+      ctx.log("error", `⚠️ Could NOT move ${qtyAfter}x ${itemId} from faction to station (moved ${qtyBefore - qtyAfter}/${qtyBefore}).`);
+    }
+  }
+  if (stranded > 0) {
+    ctx.log("error", `⚠️ ${stranded} item type(s) stranded in faction storage — manual transfer required.`);
+  }
+  return before.size - stranded;
+}
+
+async function bulkDepositToFaction(
+  ctx: RoutineContext,
+  items: Array<{ itemId: string; quantity: number }>,
+): Promise<Map<string, number>> {
+  const { bot } = ctx;
+  const valid = items.filter((r) => r.itemId && r.quantity > 0);
+  const deposited = new Map<string, number>();
+  if (valid.length === 0) return deposited;
+
+  const before = new Map(bot.factionStorage.map((i) => [i.itemId, i.quantity]));
+  const chunks = chunkBulkItems(valid);
+  let lastErr: string | undefined;
+  for (const chunk of chunks) {
+    const resp = await bot.exec("storage", {
+      action: "deposit",
+      target: "faction",
+      items: chunk.map((r) => ({ item_id: r.itemId, quantity: r.quantity })),
+    });
+    if (resp.error) lastErr = resp.error.message;
+  }
+  await sleep(BULK_SETTLE_MS);
+  await bot.refreshLocation();
+  await bot.refreshFactionStorage(false, undefined, true);
+
+  if (lastErr) ctx.log("warn", `Bulk deposit to faction had errors: ${lastErr}`);
+
+  const after = new Map(bot.factionStorage.map((i) => [i.itemId, i.quantity]));
+  for (const id of new Set([...before.keys(), ...after.keys()])) {
+    const delta = (after.get(id) || 0) - (before.get(id) || 0);
+    if (delta > 0) deposited.set(id, delta);
+  }
+  return deposited;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /** Navigate to home station and deposit all non-fuel cargo/storage to faction storage. */
 async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
   const { bot } = ctx;
@@ -510,65 +679,33 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   });
 
   if (storageItemsToDeposit.length > 0 && isAtHomeStation) {
-    ctx.log("trade", `At home station — depositing station storage to faction...`);
+    ctx.log("trade", `At home station — bulk depositing station storage to faction...`);
+    const moved = await bulkStationToFaction(ctx, storageItemsToDeposit.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
     for (const item of storageItemsToDeposit) {
-      if (bot.state !== "running") {
-        ctx.log("system", "Stop requested — aborting deposit");
-        return;
-      }
-      const fResp = await bot.exec("storage", {
-        action: "deposit",
-        target: "faction",
-        item_id: item.itemId,
-        quantity: item.quantity,
-        source: "storage"
-      });
-
-      if (!fResp.error) {
-        deposited.push(`${item.quantity}x ${item.name} (storage)`);
-        logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup storage)`);
-        const idx = bot.storage.findIndex(s => s.itemId === item.itemId);
-        if (idx >= 0) bot.storage.splice(idx, 1);
-      } else if (fResp.error?.message?.includes("storage_cap_exceeded") || fResp.error?.message?.includes("cap reached")) {
-        skipped.push(`${item.quantity}x ${item.name} (faction full)`);
-        ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
-      } else {
-        ctx.log("error", `Faction deposit failed: ${fResp.error.message}`);
-      }
+      deposited.push(`${item.quantity}x ${item.name} (storage)`);
+      logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup storage)`);
+    }
+    if (moved < storageItemsToDeposit.length) {
+      ctx.log("warn", `Only ${moved}/${storageItemsToDeposit.length} item types fully returned to faction`);
     }
   }
 
   if (bot.inventory.some(i => i.quantity > 0)) {
-    for (const item of [...bot.inventory]) {
-      if (bot.state !== "running") {
-        ctx.log("system", "Stop requested — aborting deposit");
-        return;
-      }
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-
-      if (!settings.depositAllStorage && !item.itemId.startsWith("package:")) continue;
-
-      if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
-
-      const fResp = await bot.exec("storage", {
-        action: "deposit",
-        target: "faction",
-        item_id: item.itemId,
-        quantity: item.quantity,
-        source: "cargo"
-      });
-      if (!fResp.error) {
-        deposited.push(`${item.quantity}x ${item.name}`);
-        logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup)`);
-      } else if (fResp.error?.message?.includes("storage_cap_exceeded") || fResp.error?.message?.includes("cap reached")) {
-        skipped.push(`${item.quantity}x ${item.name} (faction full)`);
-        ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
-      } else {
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        deposited.push(`${item.quantity}x ${item.name} (station)`);
-      }
+    ctx.log("trade", `Bulk depositing cargo to faction...`);
+    const cargoItems = [...bot.inventory]
+      .filter(item => {
+        if (item.quantity <= 0) return false;
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+        if (!settings.depositAllStorage && !item.itemId.startsWith("package:")) return false;
+        return true;
+      })
+      .map((i) => ({ itemId: i.itemId, quantity: i.quantity }));
+    const depositedCargo = await bulkDepositToFaction(ctx, cargoItems);
+    for (const [itemId, qty] of depositedCargo) {
+      const name = bot.inventory.find(i => i.itemId === itemId)?.name || itemId;
+      deposited.push(`${qty}x ${name}`);
+      logFactionActivity(ctx, "deposit", `Deposited ${qty}x ${name} (cleanup cargo)`);
     }
   }
 
@@ -656,58 +793,33 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
   });
 
   if (storageItemsToDeposit.length > 0) {
-    ctx.log("trade", `Depositing home station storage to faction...`);
+    ctx.log("trade", `Bulk depositing home station storage to faction...`);
+    const moved = await bulkStationToFaction(ctx, storageItemsToDeposit.map((i) => ({ itemId: i.itemId, quantity: i.quantity })));
     for (const item of storageItemsToDeposit) {
-      if (bot.state !== "running") {
-        ctx.log("system", "Stop requested — aborting deposit");
-        return;
-      }
-      const fResp = await bot.exec("storage", {
-        action: "deposit",
-        target: "faction",
-        item_id: item.itemId,
-        quantity: item.quantity,
-        source: "storage"
-      });
-
-      if (!fResp.error) {
-        depositedCount++;
-        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station storage`);
-        const idx = bot.storage.findIndex(s => s.itemId === item.itemId);
-        if (idx >= 0) bot.storage.splice(idx, 1);
-      } else {
-        ctx.log("error", `Failed to deposit ${item.name}: ${fResp.error.message}`);
-      }
+      depositedCount++;
+      ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station storage`);
+    }
+    if (moved < storageItemsToDeposit.length) {
+      ctx.log("warn", `Only ${moved}/${storageItemsToDeposit.length} item types fully returned to faction`);
     }
   }
 
   // Deposit cargo to faction
   if (bot.inventory.some(i => i.quantity > 0)) {
-    ctx.log("trade", `Depositing cargo to faction...`);
-    for (const item of [...bot.inventory]) {
-      if (bot.state !== "running") {
-        ctx.log("system", "Stop requested — aborting deposit");
-        return;
-      }
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-
-      const fResp = await bot.exec("storage", {
-        action: "deposit",
-        target: "faction",
-        item_id: item.itemId,
-        quantity: item.quantity,
-        source: "cargo"
-      });
-
-      if (!fResp.error) {
-        depositedCount++;
-        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station cargo`);
-      } else {
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to station`);
-      }
+    ctx.log("trade", `Bulk depositing cargo to faction...`);
+    const cargoItems = [...bot.inventory]
+      .filter(item => {
+        if (item.quantity <= 0) return false;
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+        return true;
+      })
+      .map((i) => ({ itemId: i.itemId, quantity: i.quantity }));
+    const depositedCargo = await bulkDepositToFaction(ctx, cargoItems);
+    for (const [itemId, qty] of depositedCargo) {
+      const name = bot.inventory.find(i => i.itemId === itemId)?.name || itemId;
+      depositedCount++;
+      ctx.log("trade", `Deposited ${qty}x ${name} from home station cargo`);
     }
   }
   
@@ -802,12 +914,27 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const settings = getCleanupSettings(bot.username);
+
+    // Initialize factionStorageLeaveItems from catalog if empty
+    if (settings.factionStorageLeaveItems.length === 0 && catalogStore.getAll()?.items && Object.keys(catalogStore.getAll().items).length > 0) {
+      const allItemIds = Object.keys(catalogStore.getAll().items);
+      allItemIds.sort((a, b) => a.localeCompare(b));
+      const all = readSettings();
+      writeSettings({
+        ...all,
+        cleanup: {
+          ...(all.cleanup || {}),
+          factionStorageLeaveItems: allItemIds,
+        },
+      });
+    }
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
     };
-    ctx.log("info", `Cleanup settings: home=${settings.homeStation} (${settings.homeSystem}), focus=${settings.focusStationId || 'none'}, depositAllStorage=${settings.depositAllStorage}`);
+    ctx.log("info", `Cleanup settings: home=${settings.homeStation} (${settings.homeSystem}), focus=${settings.focusStationId || 'none'}, depositAllStorage=${settings.depositAllStorage}, cleanupRemoteFactionStorage=${settings.cleanupRemoteFactionStorage}, leaveItems=${settings.factionStorageLeaveItems.length}`);
 
     // ── Cloak: enable at startup/cycle start if configured ──
     await enableCloakAtDock(ctx, settings);
@@ -1258,20 +1385,63 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      // Withdraw items (capped by free space)
+      // Bulk withdraw items from station storage (capped by free space)
       if (hasItems) {
-        for (const item of bot.storage) {
-          if (item.quantity <= 0) continue;
-          await bot.refreshStatus();
-          const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
-          if (freeSpace <= 0) break;
+        await bot.refreshStatus();
+        const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
+        if (freeSpace > 0) {
+          const toWithdraw = bot.storage
+            .filter(item => item.quantity > 0)
+            .map((i) => ({ itemId: i.itemId, quantity: Math.min(i.quantity, maxItemsForCargo(freeSpace, i.itemId)) }))
+            .filter((i) => i.quantity > 0);
+          if (toWithdraw.length > 0) {
+            const moved = await bulkWithdrawFromStation(ctx, toWithdraw);
+            for (const [itemId, qty] of moved) {
+              totalItems += qty;
+              const name = bot.storage.find(s => s.itemId === itemId)?.name || bot.inventory.find(c => c.itemId === itemId)?.name || itemId;
+              ctx.log("trade", `Withdrew ${qty}x ${name} from ${station.poiName}`);
+            }
+          }
+        }
+      }
 
-          const qty = Math.min(item.quantity, maxItemsForCargo(freeSpace, item.itemId));
-          if (qty <= 0) continue;
-          const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
-          if (!wResp.error) {
-            totalItems += qty;
-            ctx.log("trade", `Withdrew ${qty}x ${item.name} from ${station.poiName}`);
+      // Also clean remote faction storage if enabled
+      if (settings.cleanupRemoteFactionStorage) {
+        await bot.refreshFactionStorage(false, station.baseId || station.stationId, true);
+        const leaveSet = new Set(settings.factionStorageLeaveItems);
+        const factionItemsToWithdraw = bot.factionStorage.filter((i) => {
+          if (i.quantity <= 0) return false;
+          if (leaveSet.has(i.itemId)) return false;
+          const lower = i.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+          return true;
+        });
+
+        if (factionItemsToWithdraw.length > 0) {
+          ctx.log("trade", `Cleaning remote faction storage at ${station.poiName}...`);
+          await bot.refreshStatus();
+          const factionFreeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
+          if (factionFreeSpace > 0) {
+            const factionToWithdraw = factionItemsToWithdraw
+              .map((i) => ({ itemId: i.itemId, quantity: Math.min(i.quantity, maxItemsForCargo(factionFreeSpace, i.itemId)) }))
+              .filter((i) => i.quantity > 0);
+            if (factionToWithdraw.length > 0) {
+              const factionMovedToStation = await bulkFactionToStation(ctx, factionToWithdraw);
+              if (factionMovedToStation > 0) {
+                const toCargo = factionItemsToWithdraw
+                  .filter((i) => bot.storage.some(s => s.itemId === i.itemId && s.quantity > 0))
+                  .map((i) => ({ itemId: i.itemId, quantity: bot.storage.find(s => s.itemId === i.itemId)?.quantity || 0 }))
+                  .filter((i) => i.quantity > 0);
+                if (toCargo.length > 0) {
+                  const cargoMoved = await bulkWithdrawFromStation(ctx, toCargo);
+                  for (const [itemId, qty] of cargoMoved) {
+                    totalItems += qty;
+                    const name = bot.factionStorage.find(f => f.itemId === itemId)?.name || bot.inventory.find(c => c.itemId === itemId)?.name || itemId;
+                    ctx.log("trade", `Withdrew ${qty}x ${name} from remote faction storage (${station.poiName})`);
+                  }
+                }
+              }
+            }
           }
         }
       }

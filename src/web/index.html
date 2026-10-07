@@ -35577,13 +35577,29 @@ ignoreBlacklist: document.getElementById(
         }
         const grandTotalTypes = Object.keys(grandTotalByItem).length;
 
+        const localBotOpts =
+          bots.length > 0
+            ? bots
+                .sort((a, b) =>
+                  (a.username || "").localeCompare(b.username || ""),
+                )
+                .map(
+                  (b) =>
+                    `<option value="${esc(b.username)}">${esc(b.username)}</option>`,
+                )
+                .join("")
+            : "";
+
         const stationsList =
           stations.length > 0
             ? stations
                 .map((s, idx) => {
-                  const parts = s.includes("|")
-                    ? s.split("|")
-                    : [generalSystem, s];
+                  const raw = typeof s === "string" ? s : s.station;
+                  const mode = typeof s === "string" ? "faction" : s.deliveryMode || "faction";
+                  const giftBot = typeof s === "string" ? "" : s.giftBot || "";
+                  const parts = raw.includes("|")
+                    ? raw.split("|")
+                    : [generalSystem, raw];
                   const sysId = parts[0];
                   const poiId = parts[1];
                   const sysData = mapData[sysId];
@@ -35593,10 +35609,36 @@ ignoreBlacklist: document.getElementById(
                       (sysData.pois || []).find((p) => p.id === poiId)?.name ||
                       poiId
                     : poiId;
-                  return `<div class="blacklist-item">
-          <span class="blacklist-name">${esc(sysData?.name || sysId)} / ${esc(poiName)} <span class="blacklist-id">(${esc(s)})</span></span>
-          <button class="sm danger" onclick="removeFuelTransportStation(${idx})">Remove</button>
-        </div>`;
+                  const compactLabel = `${esc(sysData?.name || sysId)} / ${esc(poiName)}`;
+                  const modeOptions = [
+                    { value: "faction", label: "Faction Storage" },
+                    { value: "personal", label: "Station Storage" },
+                    { value: "gift", label: "Gift to Bot" },
+                  ]
+                    .map(
+                      (o) =>
+                        `<option value="${o.value}"${mode === o.value ? " selected" : ""}>${o.label}</option>`,
+                    )
+                    .join("");
+                  const allBotOpts = localBotOpts + getRemoteBotOptions("", giftBot);
+                  const giftBotOptions =
+                    allBotOpts.length > 0
+                      ? `<option value="">(select bot)</option>${allBotOpts}`
+                      : `<option value="">No bots available</option>`;
+                  const giftBotSelect = `<select id="ft-gift-bot-${idx}" onchange="updateFuelTransportStationGiftBot(${idx}, this.value)" style="font-size:11px;padding:2px 6px;max-width:160px">${giftBotOptions}</select>`;
+                  const giftBotStyle =
+                    mode === "gift"
+                      ? "display:inline-flex;align-items:center;gap:4px"
+                      : "display:none";
+                  return `<div class="blacklist-item" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+            <span class="blacklist-name" style="flex:1;min-width:160px">${compactLabel}</span>
+            <select onchange="updateFuelTransportStationMode(${idx}, this.value)" style="font-size:11px;padding:2px 6px">${modeOptions}</select>
+            <span id="ft-gift-bot-wrap-${idx}" style="${giftBotStyle}">
+              <span style="font-size:11px;color:var(--dim)">To:</span>
+              ${giftBotSelect}
+            </span>
+            <button class="sm danger" onclick="removeFuelTransportStation(${idx})">Remove</button>
+          </div>`;
                 })
                 .join("")
             : '<div class="blacklist-empty">No remote stations added. Add stations below using the dropdown.</div>';
@@ -35779,8 +35821,8 @@ ignoreBlacklist: document.getElementById(
         if (!settings.fuel_transport) settings.fuel_transport = {};
         if (!settings.fuel_transport.stations)
           settings.fuel_transport.stations = [];
-        if (!settings.fuel_transport.stations.includes(val)) {
-          settings.fuel_transport.stations.push(val);
+        if (!settings.fuel_transport.stations.some((s) => (typeof s === "string" ? s : s.station) === val)) {
+          settings.fuel_transport.stations.push({ station: val, deliveryMode: "faction", giftBot: "" });
         }
         rerenderCurrentSettings();
       }
@@ -35788,6 +35830,28 @@ ignoreBlacklist: document.getElementById(
       function removeFuelTransportStation(idx) {
         if (!settings.fuel_transport?.stations) return;
         settings.fuel_transport.stations.splice(idx, 1);
+        rerenderCurrentSettings();
+      }
+
+      function updateFuelTransportStationMode(idx, mode) {
+        if (!settings.fuel_transport?.stations?.[idx]) return;
+        const entry = settings.fuel_transport.stations[idx];
+        if (typeof entry === "string") {
+          settings.fuel_transport.stations[idx] = { station: entry, deliveryMode: mode, giftBot: "" };
+        } else {
+          entry.deliveryMode = mode;
+        }
+        rerenderCurrentSettings();
+      }
+
+      function updateFuelTransportStationGiftBot(idx, botName) {
+        if (!settings.fuel_transport?.stations?.[idx]) return;
+        const entry = settings.fuel_transport.stations[idx];
+        if (typeof entry === "string") {
+          settings.fuel_transport.stations[idx] = { station: entry, deliveryMode: "gift", giftBot: botName };
+        } else {
+          entry.giftBot = botName;
+        }
         rerenderCurrentSettings();
       }
 
@@ -35900,8 +35964,12 @@ ignoreBlacklist: document.getElementById(
       }
 
       function saveFuelTransportSettings() {
+        const rawStations = settings.fuel_transport?.stations || [];
+        const stations = rawStations.map((s) =>
+          typeof s === "string" ? { station: s, deliveryMode: "faction", giftBot: "" } : s,
+        );
         const s = {
-          stations: settings.fuel_transport?.stations || [],
+          stations,
           items: settings.fuel_transport?.items || [],
           refuelThreshold:
             parseInt(

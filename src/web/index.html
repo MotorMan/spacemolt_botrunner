@@ -1531,6 +1531,14 @@
       let statsDaily = {};
       let profileReturnHomeIgnoreBlacklist = false;
       let lastUsedRoutines = {};
+      let profileStationStorageSort = "alpha"; // 'alpha' | 'reverseAlpha' | 'quantity' | 'reverseQuantity'
+      function cycleProfileStationStorageSort() {
+        if (profileStationStorageSort === "alpha") profileStationStorageSort = "reverseAlpha";
+        else if (profileStationStorageSort === "reverseAlpha") profileStationStorageSort = "quantity";
+        else if (profileStationStorageSort === "quantity") profileStationStorageSort = "reverseQuantity";
+        else profileStationStorageSort = "alpha";
+        renderProfileSidebar();
+      }
 
       // Fresh storage data that persists across status updates
       // These are NOT auto-cleared to prevent stale data from overwriting fresh data
@@ -6453,15 +6461,30 @@
                 .join("")
             : '<div class="inv-empty">Empty</div>';
 
-        const storItems =
-          freshStorage.length > 0
-            ? freshStorage
+        const storItems = (() => {
+          let sorted = freshStorage;
+          if (profileStationStorageSort === "alpha") {
+            sorted = freshStorage.slice().sort((a, b) =>
+              (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()),
+            );
+          } else if (profileStationStorageSort === "reverseAlpha") {
+            sorted = freshStorage.slice().sort((a, b) =>
+              (b.name || "").toLowerCase().localeCompare((a.name || "").toLowerCase()),
+            );
+          } else if (profileStationStorageSort === "quantity") {
+            sorted = freshStorage.slice().sort((a, b) => (b.quantity || 0) - (a.quantity || 0));
+          } else if (profileStationStorageSort === "reverseQuantity") {
+            sorted = freshStorage.slice().sort((a, b) => (a.quantity || 0) - (b.quantity || 0));
+          }
+          return sorted.length > 0
+            ? sorted
                 .map(
                   (i) =>
                     `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`,
                 )
                 .join("")
             : '<div class="inv-empty">Empty</div>';
+        })();
 
         document.getElementById("profileSidebar").innerHTML = `
     <div class="profile-card">
@@ -6488,7 +6511,15 @@
     </div>
 
     <div class="profile-card">
-      <div class="profile-card-header">Station Storage</div>
+      <div class="profile-card-header" style="cursor:pointer;user-select:none" onclick="cycleProfileStationStorageSort()" title="Click to cycle sort: Name A-Z → Z-A → Qty High-Low → Low-High">
+        Station Storage <span id="profileStationStorageSortIndicator">${(() => {
+          if (profileStationStorageSort === "alpha") return "▲";
+          if (profileStationStorageSort === "reverseAlpha") return "▼";
+          if (profileStationStorageSort === "quantity") return "▼";
+          if (profileStationStorageSort === "reverseQuantity") return "▲";
+          return "";
+        })()}</span>
+      </div>
       <div class="profile-card-body">
         <div class="inv-list">${storItems}</div>
       </div>
@@ -6542,6 +6573,14 @@
             values[6].textContent = loc; // Location
             values[7].textContent = bot.docked ? "Yes" : "No"; // Docked
           }
+          const ssIndicator = document.getElementById("profileStationStorageSortIndicator");
+          if (ssIndicator) {
+            if (profileStationStorageSort === "alpha") ssIndicator.textContent = "▲";
+            else if (profileStationStorageSort === "reverseAlpha") ssIndicator.textContent = "▼";
+            else if (profileStationStorageSort === "quantity") ssIndicator.textContent = "▼";
+            else if (profileStationStorageSort === "reverseQuantity") ssIndicator.textContent = "▲";
+            else ssIndicator.textContent = "";
+          }
         }
 
         // Only update cargo/storage/skills cards if sidebar doesn't have focus
@@ -6566,15 +6605,30 @@
           if (cargoCard) cargoCard.innerHTML = invItems;
 
           // Update station storage
-          const storItems =
-            freshStorage.length > 0
-              ? freshStorage
+          const storItems = (() => {
+            let sorted = freshStorage;
+            if (profileStationStorageSort === "alpha") {
+              sorted = freshStorage.slice().sort((a, b) =>
+                (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()),
+              );
+            } else if (profileStationStorageSort === "reverseAlpha") {
+              sorted = freshStorage.slice().sort((a, b) =>
+                (b.name || "").toLowerCase().localeCompare((a.name || "").toLowerCase()),
+              );
+            } else if (profileStationStorageSort === "quantity") {
+              sorted = freshStorage.slice().sort((a, b) => (b.quantity || 0) - (a.quantity || 0));
+            } else if (profileStationStorageSort === "reverseQuantity") {
+              sorted = freshStorage.slice().sort((a, b) => (a.quantity || 0) - (b.quantity || 0));
+            }
+            return sorted.length > 0
+              ? sorted
                   .map(
                     (i) =>
                       `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`,
                   )
                   .join("")
               : '<div class="inv-empty">Empty</div>';
+          })();
           const storageCard = sidebar.querySelector(
             ".profile-card:nth-child(3) .inv-list",
           );

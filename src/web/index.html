@@ -29811,6 +29811,7 @@ async function fetchPersonalFacilityTypes(username) {
         const ignoreBlacklistWhenCloaked = explorer.ignoreBlacklistWhenCloaked ?? true;
         const ignorePirateFleeWhenCloaked = explorer.ignorePirateFleeWhenCloaked ?? true;
         const coordinateExplorers = explorer.coordinateExplorers ?? true;
+        const explorerSystemTimeout = explorer.explorerSystemTimeout ?? 60;
 
         // Per-bot focus area overrides for trade_update mode
         const explorerBots = bots.filter((b) => {
@@ -29951,6 +29952,14 @@ async function fetchPersonalFacilityTypes(username) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">System Exploration Timeout (minutes)</div>
+        <div class="setting-hint">After a bot visits a system, other bots will avoid it for this many minutes. Spreads exploration effort across the fleet. Set to 1 for maximum parallelism, or higher to reduce redundant visits. Default: 60.</div>
+      </div>
+      <input type="number" id="set-explorer-systemTimeout" min="1" max="1440" value="${explorerSystemTimeout}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Scavenge Wrecks</div>
         <div class="setting-hint" style="color:var(--red)">⚠ WARNING: Scavenging takes extra ticks and is unsafe near pirates (they attack on tick 3). Disabled by default.</div>
       </div>
@@ -30051,6 +30060,9 @@ async function fetchPersonalFacilityTypes(username) {
           coordinateExplorers:
             document.getElementById("set-explorer-coordinateExplorers").value ===
             "true",
+          explorerSystemTimeout:
+            parseInt(document.getElementById("set-explorer-systemTimeout").value) ||
+            60,
           scavengeEnabled:
             document.getElementById("set-explorer-scavengeEnabled").value ===
             "true",

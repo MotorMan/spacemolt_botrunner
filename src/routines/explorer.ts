@@ -40,6 +40,7 @@ import {
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
+import { explorerHistoryStore } from "../explorerhistorystore.js";
 import {
   updateShipListings,
 } from "../shipsforsale.js";
@@ -213,6 +214,7 @@ function getExplorerSettings(username?: string): {
   ignoreBlacklistWhenCloaked: boolean;
   ignorePirateFleeWhenCloaked: boolean;
   coordinateExplorers: boolean;
+  explorerSystemTimeout: number;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -306,6 +308,9 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.coordinateExplorers)
       : true;
 
+  // System exploration timeout (minutes): global explorer only, default 60
+  const explorerSystemTimeout = Number(e.explorerSystemTimeout) || 60;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : "explore") as ExplorerMode,
     acceptMissions,
@@ -323,6 +328,7 @@ function getExplorerSettings(username?: string): {
     ignoreBlacklistWhenCloaked,
     ignorePirateFleeWhenCloaked,
     coordinateExplorers,
+    explorerSystemTimeout,
   };
 }
 
@@ -719,6 +725,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     visitedSystems.add(systemId);
     visitedSystemTimes.set(systemId, Date.now());
     mapStore.markSystemVisited(systemId);
+    explorerHistoryStore.recordVisit(bot.username, systemId);
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -1315,7 +1322,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
     // ── Coordination: avoid systems other active explorers are targeting ──
     const claimedTargets = currentSettings.coordinateExplorers ? getClaimedTargets() : null;
 
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked, claimedTargets);
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked, claimedTargets, currentSettings.explorerSystemTimeout);
 
     // ── Coordination: Announce our target to other explorers ──
     if (currentSettings.coordinateExplorers && sendBotChat && getAllBotNames && nextSystem) {
@@ -1337,7 +1344,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked, currentSettings.explorerSystemTimeout);
         if (!random) {
           ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
           if (path.length >= 2) {
@@ -4487,10 +4494,11 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * Skips pirate systems, blacklisted systems, and systems we've fled from.
  * When cloaked and ignoreBlacklistWhenCloaked is enabled, skips blacklist/flee filtering.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, claimedTargets: Set<string> | null = null, explorerSystemTimeoutMins: number = 60): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
+  const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;
 
   // DEBUG: Log blacklist contents and filtering
   if (blacklist.length > 0) {
@@ -4557,6 +4565,20 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
     }
   }
 
+  // Avoid systems recently visited by any bot (coordination via persistent history)
+  if (timeoutMs > 0) {
+    const recentSystems = explorerHistoryStore.getRecentSystemIds(timeoutMs);
+    if (recentSystems.length > 0) {
+      const notRecent = candidates.filter(c => !recentSystems.includes(c.id.toLowerCase()));
+      if (notRecent.length > 0) {
+        ctx.log("exploration", `History: skipping ${candidates.length - notRecent.length} system(s) visited within last ${explorerSystemTimeoutMins}m`);
+        candidates = notRecent;
+      } else {
+        ctx.log("exploration", `History: all candidate systems were recently visited — proceeding anyway`);
+      }
+    }
+  }
+
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
 
@@ -4615,10 +4637,11 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false): Connection | null {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false, explorerSystemTimeoutMins: number = 60): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
+  const timeoutMs = explorerSystemTimeoutMins * 60 * 1000;
 
   // DEBUG: Log blacklist contents and filtering
   if (blacklist.length > 0) {
@@ -4709,6 +4732,14 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Significant penalty for systems visited in the last hour (avoid loops)
     if (visitedRecently) {
       score -= 500;
+    }
+
+    // Penalty for systems recently visited by any bot (coordination via persistent history)
+    if (timeoutMs > 0) {
+      const lastAnyVisit = conn.id ? explorerHistoryStore.getLastVisitTime(conn.id) : null;
+      if (lastAnyVisit && (now - lastAnyVisit) < timeoutMs) {
+        score -= 500;
+      }
     }
 
     return { conn, score };

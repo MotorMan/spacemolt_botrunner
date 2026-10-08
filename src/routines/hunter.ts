@@ -2644,6 +2644,7 @@ async function farmSystemForBigCreature(
   const { bot } = ctx;
   const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
   let totalKills = 0;
+  let targetKilled = false;
 
   // Focus on the target POI first, then sweep other non-station POIs
   const { pois } = await getSystemInfo(ctx);
@@ -2657,6 +2658,7 @@ async function farmSystemForBigCreature(
 
   for (const poi of patrolPois) {
     if (bot.state !== "running") break;
+    if (targetKilled) break;
 
     await bot.refreshShip();
     const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
@@ -2679,17 +2681,17 @@ async function farmSystemForBigCreature(
     bot.clearObservationState();
     await ctx.sleep(1000);
 
-    if (await checkAndHandleExistingBattle(ctx, settings)) {
-      ctx.log("combat", "Big creature hunt: battle interrupted — pausing POI scan and rechecking next cycle");
-      break;
+    if (bot.isInBattle()) {
+      ctx.log("combat", "Big creature hunt: already in battle — skipping POI scan");
+      continue;
     }
 
     let passes = 0;
-    while (bot.state === "running" && passes < maxPasses) {
+    while (bot.state === "running" && passes < maxPasses && !targetKilled) {
       passes++;
 
       if (bot.isInBattle()) {
-        ctx.log("combat", "Big creature hunt: already in battle — breaking pass loop to re-evaluate next cycle");
+        ctx.log("combat", "Big creature hunt: already in battle — breaking pass loop");
         break;
       }
 
@@ -2724,6 +2726,7 @@ async function farmSystemForBigCreature(
 
       for (const t of prioritizedTargets) {
         if (bot.state !== "running") break;
+        if (targetKilled) break;
 
         if (bot.isInBattle()) {
           ctx.log("combat", "Big creature hunt: already in battle — stopping target queue");
@@ -2756,19 +2759,38 @@ async function farmSystemForBigCreature(
           totalKills++;
           recordCreatureKill(bot, t);
           ctx.log("combat", `Kill #${totalKills} (${t.name}) — looting...`);
-          if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+          if (!settings.disableWreckSalvaging) {
+            if (bot.isInBattle()) {
+              ctx.log("combat", "Clearing stale battle state after big creature kill — looting immediately");
+              bot.currentBattle.inBattle = false;
+              bot.currentBattle.battleId = null;
+              bot.currentBattle.participants = [];
+            }
+            await scavengeWrecks(ctx);
+          }
           const cset = getHunterSettings(bot.username);
           await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
           await useRepairKits(ctx);
           await bot.refreshCargo();
           const cp = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
-          if (cp >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+          if (cp >= (settings.creatureFarmCargoFullPct || 0.95)) {
+            targetKilled = true;
+            break;
+          }
+          if (isBigCreature(t.name)) {
+            ctx.log("info", `Big creature hunt: killed target ${t.name} — done with this POI`);
+            targetKilled = true;
+            break;
+          }
         }
       }
       if (totalKills > 0 && totalKills % 3 === 0) {
         await bot.refreshCargo();
         const cp2 = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
-        if (cp2 >= (settings.creatureFarmCargoFullPct || 0.95)) break;
+        if (cp2 >= (settings.creatureFarmCargoFullPct || 0.95)) {
+          targetKilled = true;
+          break;
+        }
       }
       await ctx.sleep(1500);
     }

@@ -429,7 +429,7 @@ export async function ensureAmmoLoaded(
     const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, effectiveAmmoType);
     if (matchingAmmo.length === 0) {
       ctx.log("combat", `⚠️ No ${effectiveAmmoType} ammo in cargo for "${weapon.name}" — need to resupply`);
-      continue;
+      return false;
     }
 
     const ammoItem = matchingAmmo[0];

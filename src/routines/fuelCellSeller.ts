@@ -75,6 +75,9 @@ const DEFAULT_RELEARN_HOURS = 168; // 7 days
 const UNKNOWN_STATION_RELEARN_MS = 24 * 60 * 60 * 1000;
 /** Blacklist lookups read settings from disk, so cache them for a sweep. */
 const FILTER_CACHE_MS = 10_000;
+/** Stations whose stock of an item is below this fraction of maxPerStation are
+ *  treated as critical/low-priority emergencies during focus-item selection. */
+const CRITICAL_FILL_THRESHOLD = 0.5;
 
 interface FCOrder {
   itemId: string;
@@ -156,6 +159,14 @@ export interface FCStationsData {
   currentStationIndex: number;
   lastStarted: string;
   lastRemoteUpdate: number;
+}
+
+interface ItemUrgency {
+  itemId: string;
+  totalNeed: number;
+  criticalStationCount: number;
+  zeroStationCount: number;
+  criticalDeficit: number;
 }
 
 function emptyFCStationsData(): FCStationsData {
@@ -1378,8 +1389,52 @@ export function computeItemNeeds(
   return needs;
 }
 
+function computeItemUrgency(
+  data: FCStationsData,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
+  filters: { systems: Set<string>; stations: Set<string> },
+): ItemUrgency[] {
+  const { eligible } = partitionStations(data, settings, filters);
+  const preStage = settings.preStageMode === "preStage";
+  const urgencies: ItemUrgency[] = [];
+
+  for (const item of settings.sellItems) {
+    let totalNeed = 0;
+    let criticalStationCount = 0;
+    let zeroStationCount = 0;
+    let criticalDeficit = 0;
+
+    for (const { entry } of eligible) {
+      if (!stationNeedsItem(entry, item, preStage)) continue;
+
+      const knownQty = preStage ? (entry.deposits?.[item.itemId] || 0) : 0;
+      const need = Math.max(0, item.maxPerStation - knownQty);
+      totalNeed += need;
+
+      if (knownQty === 0) {
+        zeroStationCount++;
+        criticalStationCount++;
+        criticalDeficit += need;
+      } else if (knownQty <= item.maxPerStation * CRITICAL_FILL_THRESHOLD) {
+        criticalStationCount++;
+        criticalDeficit += need;
+      }
+    }
+
+    urgencies.push({
+      itemId: item.itemId,
+      totalNeed,
+      criticalStationCount,
+      zeroStationCount,
+      criticalDeficit,
+    });
+  }
+
+  return urgencies;
+}
+
 export function selectFocusItem(
-  itemNeeds: Map<string, number>,
+  itemUrgencies: ItemUrgency[],
   currentFocusItemId: string | null,
   settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): string {
@@ -1387,20 +1442,19 @@ export function selectFocusItem(
     return settings.sellItems[0]?.itemId || "";
   }
 
-  let bestItem = settings.sellItems[0]?.itemId || "";
-  let bestCount = -1;
+  const sorted = [...itemUrgencies].sort((a, b) => {
+    if (b.criticalStationCount !== a.criticalStationCount) return b.criticalStationCount - a.criticalStationCount;
+    if (b.zeroStationCount !== a.zeroStationCount) return b.zeroStationCount - a.zeroStationCount;
+    if (b.criticalDeficit !== a.criticalDeficit) return b.criticalDeficit - a.criticalDeficit;
+    return b.totalNeed - a.totalNeed;
+  });
 
-  for (const [itemId, count] of itemNeeds) {
-    if (count > bestCount) {
-      bestCount = count;
-      bestItem = itemId;
-    }
-  }
+  const bestItem = sorted[0]?.itemId || settings.sellItems[0]?.itemId || "";
 
-  // If current focus is still viable (within 20% of best), keep it to avoid thrashing
-  if (currentFocusItemId && bestItem !== currentFocusItemId && bestCount > 0) {
-    const currentCount = itemNeeds.get(currentFocusItemId) || 0;
-    if (currentCount > 0 && currentCount / bestCount >= 0.8) {
+  if (currentFocusItemId && bestItem !== currentFocusItemId) {
+    const current = itemUrgencies.find(u => u.itemId === currentFocusItemId);
+    const best = sorted[0];
+    if (current && best && current.criticalStationCount > 0 && current.criticalStationCount >= best.criticalStationCount * 0.8) {
       return currentFocusItemId;
     }
   }
@@ -1557,10 +1611,13 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     // Refresh focus item based on freshest station need counts
     if (settings.sellItems.length > 1) {
-      const itemNeeds = computeItemNeeds(fcData, settings, getBlacklistFilters());
-      currentFocusItemId = selectFocusItem(itemNeeds, currentFocusItemId, settings);
+      const itemUrgencies = computeItemUrgency(fcData, settings, getBlacklistFilters());
+      currentFocusItemId = selectFocusItem(itemUrgencies, currentFocusItemId, settings);
       const focusItem = settings.sellItems.find(i => i.itemId === currentFocusItemId);
-      const counts = settings.sellItems.map(i => `${itemNeeds.get(i.itemId) || 0} need ${i.itemName}`).join(", ");
+      const counts = settings.sellItems.map(i => {
+        const u = itemUrgencies.find(ur => ur.itemId === i.itemId);
+        return `${u?.totalNeed || 0} need ${i.itemName} (${u?.criticalStationCount || 0} low)`;
+      }).join(", ");
       ctx.log("fc", `Focus item: ${focusItem?.itemName || currentFocusItemId} (${counts})`);
     }
 

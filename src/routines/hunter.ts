@@ -179,6 +179,14 @@ function prioritizeLeviathans(creatures: NearbyEntity[]): NearbyEntity[] {
   return [...prioritized, ...rest];
 }
 
+function prioritizeBigCreatures(creatures: NearbyEntity[]): NearbyEntity[] {
+  if (!creatures.length) return creatures;
+  const big = creatures.filter(e => isBigCreature(e.name));
+  const leviathans = creatures.filter(e => !isBigCreature(e.name) && isLeviathanCreature(e.name, e.species));
+  const rest = creatures.filter(e => !isBigCreature(e.name) && !isLeviathanCreature(e.name, e.species));
+  return [...big, ...leviathans, ...rest];
+}
+
 /**
  * Returns true if a creature is a leviathan (worth a coordinated multi-hunter
  * assist). Everything else dies to a single hunter shot, so pulling in extra
@@ -1294,6 +1302,56 @@ function releaseExpiredCreatureClaims(): void {
   }
 }
 
+// ── Big creature hunt coordination (non-API bot chat channel) ────
+//
+// Multiple big-creature hunters can pick the same known target without
+// coordination. We avoid that by broadcasting our chosen target system/POI
+// and ignoring recently announced targets from other hunters when choosing
+// ours.
+
+const BIG_CREATURE_HUNT_TTL_MS = 10 * 60 * 1000;
+const bigCreatureHuntAnnouncements = new Map<string, { claimer: string; expires: number }>();
+
+function releaseExpiredBigCreatureHunts(): void {
+  const now = Date.now();
+  for (const [key, claim] of bigCreatureHuntAnnouncements) {
+    if (claim.expires <= now) bigCreatureHuntAnnouncements.delete(key);
+  }
+}
+
+function announceBigCreatureHunt(bot: Bot, system: string, poi: string, targetName: string): void {
+  if (!system || !poi) return;
+  const settings = getHunterSettings(bot.username);
+  if (settings.coordinationMode === "off") return;
+  const key = `${system}|${poi}`;
+  const existing = bigCreatureHuntAnnouncements.get(key);
+  if (existing && existing.claimer === bot.username) return;
+  bigCreatureHuntAnnouncements.set(key, { claimer: bot.username, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+  botChatChannel.send({
+    sender: bot.username,
+    recipients: [],
+    channel: "coordination",
+    content: `[BIG CREATURE HUNT] ${bot.username} heading to ${targetName} at ${system}/${poi}`,
+    metadata: {
+      type: "big_creature_hunt",
+      system,
+      poi,
+      targetName,
+    },
+  });
+}
+
+function isBigCreatureHuntClaimedByOther(system: string, poi: string, username: string): boolean {
+  const key = `${system}|${poi}`;
+  const claim = bigCreatureHuntAnnouncements.get(key);
+  if (!claim) return false;
+  if (claim.expires <= Date.now()) {
+    bigCreatureHuntAnnouncements.delete(key);
+    return false;
+  }
+  return claim.claimer !== username;
+}
+
 /** Broadcast a claim lock for a non-leviathan creature we're about to engage. */
 function claimCreature(ctx: RoutineContext, target: { id: string; name: string }): void {
   const { bot } = ctx;
@@ -1460,6 +1518,16 @@ function ensureHunterCoordListener(username: string): void {
       if (targetId) {
         boardingClaims.set(targetId, { claimer: msg.sender, expires: Date.now() + BOARDING_CLAIM_TTL_MS });
       }
+    } else if (meta.type === "big_creature_hunt") {
+      const system = (meta.system as string) || "";
+      const poi = (meta.poi as string) || "";
+      if (!system || !poi) return;
+      const key = `${system}|${poi}`;
+      const incomingClaimer = (msg.sender || "").trim();
+      if (!incomingClaimer) return;
+      const existing = bigCreatureHuntAnnouncements.get(key);
+      if (existing && existing.claimer === incomingClaimer) return;
+      bigCreatureHuntAnnouncements.set(key, { claimer: incomingClaimer, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
     }
   });
 }
@@ -2412,6 +2480,7 @@ function isKnownBigCreature(creature: WildlifeDetail): boolean {
 }
 
 function findKnownBigCreatures(): Array<{ system: string; poi: string; name: string; count: number }> {
+  releaseExpiredBigCreatureHunts();
   const all = wildlifeStore.getAll();
   return all
     .filter(c => isKnownBigCreature(c) && c.count > 0)
@@ -2427,12 +2496,14 @@ function pickClosestBigCreatureTarget(
   fromSystem: string,
   targets: Array<{ system: string; poi: string; name: string; count: number }>,
 ): { target: { system: string; poi: string; name: string; count: number }; distance: number } | null {
+  releaseExpiredBigCreatureHunts();
   let best: { target: { system: string; poi: string; name: string; count: number }; distance: number } | null = null;
   const seen = new Set<string>();
   for (const t of targets) {
     const key = `${t.system}|${t.poi}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    if (isBigCreatureHuntClaimedByOther(t.system, t.poi, "")) continue;
     const route = mapStore.findRoute(fromSystem, t.system);
     const jumps = route ? Math.max(0, route.length - 1) : Infinity;
     if (jumps === Infinity) continue;
@@ -2450,6 +2521,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
+    releaseExpiredBigCreatureHunts();
 
     // ── Death recovery ──
     const death = await handleDeath(ctx, settings);
@@ -2479,6 +2551,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     const target = best.target;
     ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
+    announceBigCreatureHunt(bot, target.system, target.poi, target.name);
 
     // ── Standard pre-hunt checks ──
     yield "get_status";
@@ -2607,12 +2680,19 @@ async function farmSystemForBigCreature(
     await ctx.sleep(1000);
 
     if (await checkAndHandleExistingBattle(ctx, settings)) {
-      // Battle handled, re-scan after
+      ctx.log("combat", "Big creature hunt: battle interrupted — pausing POI scan and rechecking next cycle");
+      break;
     }
 
     let passes = 0;
     while (bot.state === "running" && passes < maxPasses) {
       passes++;
+
+      if (bot.isInBattle()) {
+        ctx.log("combat", "Big creature hunt: already in battle — breaking pass loop to re-evaluate next cycle");
+        break;
+      }
+
       const obsResult = await getObservationOrNearby(bot);
       const nearbyData = obsResult.result;
       if (!nearbyData) break;
@@ -2627,18 +2707,28 @@ async function farmSystemForBigCreature(
       bot.trackWildlife(afterBattleData);
 
       const entities = parseNearby(afterBattleData);
-      const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
+      const allCreatures = entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name));
+      const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
+      const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
+      const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);
       const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       let targets = [...creatures, ...pirates];
       targets = pickUnclaimedBoardingTarget(targets, bot.username);
       const targetsToEngage = sortTargetsByPriority(targets);
+      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier)));
 
-      if (targetsToEngage.length === 0) break;
+      if (prioritizedTargets.length === 0) break;
 
-      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+      const bigCount = prioritizedTargets.filter(t => isBigCreature(t.name)).length;
+      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))`);
 
-      for (const t of targetsToEngage) {
+      for (const t of prioritizedTargets) {
         if (bot.state !== "running") break;
+
+        if (bot.isInBattle()) {
+          ctx.log("combat", "Big creature hunt: already in battle — stopping target queue");
+          break;
+        }
 
         await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;

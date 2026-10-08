@@ -1673,7 +1673,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             }
           } else if (command === "jump" || command === "travel") {
             const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string);
-            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string);
+            const poiId = (r.poi_id as string) || (r.poi as string) || (location.poi_id as string);
             if (sysId) this.system = sysId;
             if (poiId) this.poi = poiId;
             if (r.auto_docked || location.docked_at) this.docked = true;

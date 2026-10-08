@@ -2495,6 +2495,7 @@ function findKnownBigCreatures(): Array<{ system: string; poi: string; name: str
 function pickClosestBigCreatureTarget(
   fromSystem: string,
   targets: Array<{ system: string; poi: string; name: string; count: number }>,
+  claimerUsername: string,
 ): { target: { system: string; poi: string; name: string; count: number }; distance: number } | null {
   releaseExpiredBigCreatureHunts();
   let best: { target: { system: string; poi: string; name: string; count: number }; distance: number } | null = null;
@@ -2503,7 +2504,7 @@ function pickClosestBigCreatureTarget(
     const key = `${t.system}|${t.poi}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (isBigCreatureHuntClaimedByOther(t.system, t.poi, "")) continue;
+    if (isBigCreatureHuntClaimedByOther(t.system, t.poi, claimerUsername)) continue;
     const route = mapStore.findRoute(fromSystem, t.system);
     const jumps = route ? Math.max(0, route.length - 1) : Infinity;
     if (jumps === Infinity) continue;
@@ -2540,7 +2541,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     }
 
     const currentSystem = bot.system;
-    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets);
+    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, bot.username);
 
     if (!best) {
       ctx.log("warn", "No reachable big creature targets — falling back to random farm");
@@ -2550,8 +2551,10 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     }
 
     const target = best.target;
-    ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
+    const targetKey = `${target.system}|${target.poi}`;
+    bigCreatureHuntAnnouncements.set(targetKey, { claimer: bot.username, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
     announceBigCreatureHunt(bot, target.system, target.poi, target.name);
+    ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
 
     // ── Standard pre-hunt checks ──
     yield "get_status";
@@ -2602,6 +2605,10 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     // ── Navigate to target system ──
     if (bot.system !== target.system) {
+      if (isBigCreatureHuntClaimedByOther(target.system, target.poi, bot.username)) {
+        ctx.log("warn", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} was claimed by another hunter while we were preparing — rechecking targets`);
+        continue;
+      }
       ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,

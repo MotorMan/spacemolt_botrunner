@@ -29,6 +29,7 @@ import {
   resetInTransitData as resetFtInTransitData,
   flushAllCoordinationData as flushAllFtCoordinationData,
 } from "../routines/fuelTransferCoordination.js";
+import { clearAllGifted, getGiftedSummary, getAllGiftedItems, clearGiftedForStation } from "../routines/fuelTransferGiftTracking.js";
 import { setEnabled as setPerfEnabled } from "../perf.js";
 import { refreshDiskSpaceState, getCurrentState, setAlertCallback as setDiskSpaceAlertCallback, setEmergencyCallback as setDiskSpaceEmergencyCallback, formatBytes, isWriteSafe, safeWriteFileSync, startMonitoring as startDiskSpaceMonitoring, stopMonitoring as stopDiskSpaceMonitoring, setThreshold as setDiskSpaceThreshold, getThreshold as getDiskSpaceThreshold, getPendingWrites, type DiskSpaceState } from "../diskSpaceGuard.js";
 
@@ -3000,7 +3001,28 @@ if (!this.settings.fuel_service) {
             const coordination = resetFtCoordinationTracking();
             const inTransit = resetFtInTransitData();
             flushAllFtCoordinationData();
-            return Response.json({ ok: true, coordination, inTransit });
+            const giftedCount = getGiftedSummary().entryCount;
+            clearAllGifted();
+            return Response.json({ ok: true, coordination, inTransit, gifted: { clear: true, entryCount: giftedCount } });
+          }
+
+          // POST /api/fuel_transport/reset-gifted - Clear all fuel transport gift
+          // tracking. Needed when gifted delivery counts drift (e.g. items were
+          // re-gifted or the recipient already collected them) and bots skip work
+          // thinking stations are already at target.
+          if (url.pathname === "/api/fuel_transport/reset-gifted" && req.method === "POST") {
+            const gifted = getGiftedSummary();
+            clearAllGifted();
+            return Response.json({ ok: true, gifted: { clear: true, ...gifted } });
+          }
+
+          // POST /api/fuel_transport/reset-gifted/:stationId - Clear gifted
+          // tracking for a single station only.
+          if (url.pathname.startsWith("/api/fuel_transport/reset-gifted/") && req.method === "POST") {
+            const stationId = decodeURIComponent(url.pathname.slice("/api/fuel_transport/reset-gifted/".length));
+            const entries = getAllGiftedItems(stationId);
+            clearGiftedForStation(stationId);
+            return Response.json({ ok: true, stationId, entryCount: Object.keys(entries).length });
           }
 
           // ── Ship Pricing Calc ──────────────────────────────────

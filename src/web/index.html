@@ -35853,6 +35853,10 @@ ignoreBlacklist: document.getElementById(
         <button class="sm" onclick="resetFuelTransportCoop()">🔓 Reset Co-op Locks</button>
         <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clears all fuel transport delivery locks and in-transit claims if bots think another bot is handling a delivery.</span>
       </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="sm" onclick="resetFuelTransportGifted()">🎁 Reset Gifted Tracking</button>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clears the fleet-wide count of items already gifted to remote stations. Use when bots skip gifted deliveries because they think targets are already met.</span>
+      </div>
     </div>
 
     <div class="setting-row" style="margin-top:16px">
@@ -37087,8 +37091,38 @@ ignoreBlacklist: document.getElementById(
             const data = await response.json();
             const locks = data?.coordination?.clearedLocks ?? 0;
             const entries = data?.inTransit?.clearedEntries ?? 0;
+            const giftedEntries = data?.gifted?.entryCount ?? 0;
             alert(
-              `Cleared ${locks} delivery lock(s) and ${entries} in-transit claim(s)`,
+              `Cleared ${locks} delivery lock(s), ${entries} in-transit claim(s), and ${giftedEntries} gifted tracking entr(y/ies)`,
+            );
+          } else {
+            const error = await response.json();
+            alert(`Failed to reset: ${error.error || "Unknown error"}`);
+          }
+        } catch (e) {
+          alert(`Failed to reset: ${e.message}`);
+        }
+      }
+
+      async function resetFuelTransportGifted() {
+        const summary = await fetch("/api/fuel_transport/coop-status").then(r => r.ok ? r.json() : null).catch(() => null);
+        if (
+          !confirm(
+            "Clear all fuel transport gifted delivery tracking?\n\nUse this when bots skip gifted deliveries because they think items are already delivered. This resets the fleet-wide count of items gifted to each remote station.",
+          )
+        )
+          return;
+
+        try {
+          const response = await fetch("/api/fuel_transport/reset-gifted", {
+            method: "POST",
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const entries = data?.gifted?.entryCount ?? 0;
+            const stations = data?.gifted?.stationCount ?? 0;
+            alert(
+              `Cleared ${entries} gifted tracking entr(y/ies) across ${stations} station(s)`,
             );
           } else {
             const error = await response.json();

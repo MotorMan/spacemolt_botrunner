@@ -66,6 +66,23 @@ export function getAllGiftedItems(stationId: string): Record<string, GiftedItemE
   return data[stationId] ?? {};
 }
 
+/** Count of stations that currently have at least one gifted item entry, plus
+ *  the total number of item entries across all stations. Used by the web UI to
+ *  report how much gifted tracking state exists before a reset. */
+export function getGiftedSummary(): { stationCount: number; entryCount: number } {
+  const data = loadGiftedData();
+  let stationCount = 0;
+  let entryCount = 0;
+  for (const entries of Object.values(data)) {
+    const keys = Object.keys(entries);
+    if (keys.length > 0) {
+      stationCount++;
+      entryCount += keys.length;
+    }
+  }
+  return { stationCount, entryCount };
+}
+
 /** Record `qty` more units of `itemId` as gifted to `stationId`. */
 export function addGiftedQuantity(stationId: string, itemId: string, qty: number): number {
   if (qty <= 0) return getGiftedQuantity(stationId, itemId);

@@ -898,6 +898,7 @@ export async function fightFreshBattle(
   const MAX_BATTLE_TICKS = 60;
   let tickCount = 0;
   let lastHull = bot.hull;
+  let lastBattleTick: number | undefined;
   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
   const originalTarget = target;
   const fightAtEngaged = (): boolean =>
@@ -1047,6 +1048,17 @@ export async function fightFreshBattle(
       await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
+
+    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
+      bot.currentBattle.inBattle = false;
+      bot.currentBattle.battleId = null;
+      bot.currentBattle.participants = [];
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
+    lastBattleTick = status.tick;
 
     let targetParticipant = status.participants.find(
       p => p.player_id === target.id || p.username === target.name
@@ -1864,6 +1876,7 @@ export async function fightJoinedBattle(
 
   let lastKnownEnemyZone = "outer";
   let tickCount = 0;
+  let lastBattleTick: number | undefined;
 
   while (true) {
     if (bot.state !== "running") return false;
@@ -1883,6 +1896,17 @@ export async function fightJoinedBattle(
       await recloakAfterBattle(ctx, cloakOnStart);
       return true;
     }
+
+    if (lastBattleTick !== undefined && status.tick === lastBattleTick) {
+      ctx.log("combat", `⚡ Battle tick frozen at ${status.tick} for 2 consecutive polls — treating as victory`);
+      bot.currentBattle.inBattle = false;
+      bot.currentBattle.battleId = null;
+      bot.currentBattle.participants = [];
+      await checkAndPraiseMorgThar(ctx, true);
+      await recloakAfterBattle(ctx, cloakOnStart);
+      return true;
+    }
+    lastBattleTick = status.tick;
 
     // Immediate hull/shield check at the start of every combat tick — do not
     // wait for target-switching logic to decide whether we're in danger.

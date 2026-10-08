@@ -2864,6 +2864,13 @@ async function farmSystemForBigCreature(
               bot.currentBattle.battleId = null;
               bot.currentBattle.participants = [];
             }
+            const battleStatusBeforeLoot = await getBattleStatus(ctx);
+            if (!battleStatusBeforeLoot && bot.isInBattle()) {
+              ctx.log("combat", "API confirms no battle — clearing stale WebSocket state before looting");
+              bot.currentBattle.inBattle = false;
+              bot.currentBattle.battleId = null;
+              bot.currentBattle.participants = [];
+            }
             await scavengeWrecks(ctx);
           }
           const cset = getHunterSettings(bot.username);

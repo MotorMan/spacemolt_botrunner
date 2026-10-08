@@ -4766,16 +4766,19 @@ if (this.craftQueueTracker && jobId && recipeId) {
        });
      }
 
-     const result = wildlifeStore.reconcile(this.system, this.poi, observed);
+      const nearbyData = nearbyResult as Record<string, unknown>;
+      const poi = (nearbyData.poi_id as string) || this.poi;
 
-     if (result.newTypes > 0) {
-       this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
-     }
-     if (result.prunedIds > 0 || result.prunedTypes > 0) {
-       debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
-         `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${this.poi}`);
-     }
-   }
+      const result = wildlifeStore.reconcile(this.system, poi, observed);
+
+      if (result.newTypes > 0) {
+        this.log("wildlife", `Discovered ${result.newTypes} new wildlife creature(s) from nearby scan`);
+      }
+      if (result.prunedIds > 0 || result.prunedTypes > 0) {
+        debugLogForBot(this.username, "wildlife:prune", `${this.username}`,
+          `Pruned ${result.prunedIds} gone creature(s) / ${result.prunedTypes} type(s) at ${this.system}/${poi}`);
+      }
+    }
 
   /** Register a captured prize ship from a ship_captured WebSocket notification.
    *  Stores the mapping so we can find the prize_id in get_nearby by matching ship_id.

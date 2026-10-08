@@ -2575,6 +2575,7 @@ function pickClosestBigCreatureTarget(
   fromSystem: string,
   targets: Array<{ system: string; poi: string; name: string; count: number }>,
   claimerUsername: string,
+  claimTarget: boolean = false,
 ): { target: { system: string; poi: string; name: string; count: number }; distance: number } | null {
   releaseExpiredBigCreatureHunts();
   let best: { target: { system: string; poi: string; name: string; count: number }; distance: number } | null = null;
@@ -2591,7 +2592,30 @@ function pickClosestBigCreatureTarget(
       best = { target: t, distance: jumps };
     }
   }
+
+  if (claimTarget && best) {
+    const targetKey = `${best.target.system}|${best.target.poi}`;
+    bigCreatureHuntAnnouncements.set(targetKey, { claimer: claimerUsername, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+    bigCreatureHuntInFlight.set(targetKey, claimerUsername);
+    syncBigCreatureClaimsToFile();
+  }
+
   return best;
+}
+
+async function shouldAbortForBigCreatureHunt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>, username: string): Promise<boolean> {
+  if (settings.mode !== "hunt_big_creatures") return false;
+  const knownTargets = findKnownBigCreatures();
+  if (knownTargets.length === 0) return false;
+
+  const currentSystem = ctx.bot.system;
+  const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, username, false);
+  if (!best) return false;
+
+  if (isBigCreatureHuntClaimedByOther(best.target.system, best.target.poi, username)) return false;
+
+  ctx.log("info", `Big creature available: ${best.target.name} at ${best.target.system}/${best.target.poi} (${best.distance} jumps) — diverting from fallback`);
+  return true;
 }
 
 async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -2600,9 +2624,16 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
   await ensureHunterCoordListener(bot.username);
   loadPersistedBigCreatureClaims();
 
+  let huntLoopCount = 0;
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
     releaseExpiredBigCreatureHunts();
+
+    // Periodically reload persisted claims from other processes so we don't
+    // race against a claim that was written while we were in a long fallback.
+    if (++huntLoopCount % 5 === 0) {
+      loadPersistedBigCreatureClaims();
+    }
 
     // ── Death recovery ──
     const death = await handleDeath(ctx, settings);
@@ -2613,6 +2644,11 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     const knownTargets = findKnownBigCreatures();
 
     if (knownTargets.length === 0) {
+      // Double-check right before committing to a fallback — a creature may
+      // have been discovered during the previous loop iteration.
+      if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+        continue;
+      }
       ctx.log("info", "No known big creatures — doing a random creature farm cycle before rechecking");
       // Fallback: one creature_farm_random style cycle
       yield "fallback_random_farm";
@@ -2621,7 +2657,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     }
 
     const currentSystem = bot.system;
-    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, bot.username);
+    const best = pickClosestBigCreatureTarget(currentSystem, knownTargets, bot.username, true);
 
     if (!best) {
       ctx.log("warn", "No reachable big creature targets — falling back to random farm");
@@ -2632,8 +2668,6 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     const target = best.target;
     const targetKey = `${target.system}|${target.poi}`;
-    bigCreatureHuntAnnouncements.set(targetKey, { claimer: bot.username, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
-    bigCreatureHuntInFlight.set(targetKey, bot.username);
     announceBigCreatureHunt(bot, target.system, target.poi, target.name);
     ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
 
@@ -2916,6 +2950,12 @@ async function creatureFarmRandomFallbackCycle(
     return;
   }
 
+  // If a big creature has appeared since we last checked, abort the fallback
+  // so the hunt loop can redirect immediately.
+  if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+    return;
+  }
+
   const baseSystem = basePool[Math.floor(Math.random() * basePool.length)];
   let targetSystem = baseSystem;
   if (settings.creatureFarmRoamJumps > 0) {
@@ -2953,6 +2993,13 @@ async function creatureFarmRandomFallbackCycle(
   let sweeps = 0;
   while (bot.state === "running" && sweeps < loopsPerSystem) {
     sweeps++;
+
+    // Check between sweeps: a big creature may have been noticed while we
+    // were farming the previous POI.
+    if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+      return;
+    }
+
     const { pois } = await getSystemInfo(ctx);
     const patrolPois = pois.filter(p => !isStationPoi(p));
     if (patrolPois.length === 0) break;
@@ -3006,6 +3053,12 @@ async function creatureFarmRandomFallbackCycle(
             await useRepairKits(ctx);
             await bot.refreshCargo();
             if ((bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0) >= cargoFullPct) break;
+          }
+
+          // Between fights: if a big creature has appeared, abort the fallback
+          // and let the hunt loop redirect to it.
+          if (await shouldAbortForBigCreatureHunt(ctx, settings, bot.username)) {
+            return;
           }
         }
         await ctx.sleep(1500);

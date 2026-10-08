@@ -4618,8 +4618,16 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   }
 
   // All connected systems have been visited this session or recently
-  // If no valid candidates, fall back to any non-blacklisted connection
-  if (candidates.length === 0 && nonBlacklistedConns.length > 0) {
+  // If no valid candidates, fall back to least-recently-visited non-blacklisted connection
+  if (nonBlacklistedConns.length > 0) {
+    nonBlacklistedConns.sort((a, b) => {
+      const aLast = a.id ? explorerHistoryStore.getLastVisitTime(a.id) : null;
+      const bLast = b.id ? explorerHistoryStore.getLastVisitTime(b.id) : null;
+      if (aLast === null && bLast === null) return 0;
+      if (aLast === null) return -1;
+      if (bLast === null) return 1;
+      return aLast - bLast;
+    });
     return nonBlacklistedConns[0];
   }
   
@@ -4748,10 +4756,21 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
   // Sort by score (highest first)
   scored.sort((a, b) => b.score - a.score);
 
-  // Pick from top scored (add some randomness among top candidates)
+  // Pick from top scored — break ties by least-recently-visited first
+  // so we cycle through the full cluster instead of looping on the same system.
   const topScore = scored[0].score;
   const topCandidates = scored.filter(s => s.score === topScore);
-  const chosen = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+  if (topCandidates.length > 1) {
+    topCandidates.sort((a, b) => {
+      const aLast = a.conn.id ? explorerHistoryStore.getLastVisitTime(a.conn.id) : null;
+      const bLast = b.conn.id ? explorerHistoryStore.getLastVisitTime(b.conn.id) : null;
+      if (aLast === null && bLast === null) return 0;
+      if (aLast === null) return -1;
+      if (bLast === null) return 1;
+      return aLast - bLast;
+    });
+  }
+  const chosen = topCandidates[0];
 
   const connInfo = scored.map(s => `${s.conn.name || s.conn.id}: ${s.score}`).join(", ");
   ctx.log("info", `Connection scores: ${connInfo} — picking ${chosen.conn.name || chosen.conn.id}`);

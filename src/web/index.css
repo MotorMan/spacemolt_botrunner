@@ -193,10 +193,6 @@ main {
 #page-commandall.active {
   display: flex;
 }
-#page-achievements {
-  padding: 0;
-  gap: 0;
-}
 #page-marketbrowser {
   padding: 0;
   gap: 0;

@@ -2682,9 +2682,246 @@ if (!this.settings.fuel_service) {
             delete loadouts[name];
             saveModuleLoadouts(loadouts);
             return Response.json({ ok: true, name });
-          }
+           }
 
-          // GET /api/facility-transfer-loadouts - Load all facility transfer loadouts
+           // POST /api/ship/bulk-move - Bulk cargo move with capacity check and verification
+           if (url.pathname === "/api/ship/bulk-move" && req.method === "POST") {
+             const body = await req.json() as {
+               botName: string;
+               mode: string;
+               items: Array<{ itemId: string; quantity: number }>;
+             };
+
+             const bot = getBot(body.botName);
+             if (!bot) return Response.json({ error: "Bot not found" }, { status: 404 });
+             if (!bot.isConnected()) return Response.json({ error: "Bot not connected" }, { status: 400 });
+
+             const validItems = (body.items || []).filter((it) => it.itemId && it.quantity > 0);
+             if (validItems.length === 0) return Response.json({ error: "No items to move" }, { status: 400 });
+
+             // Pre-flight cargo snapshot
+             await bot.refreshCargo();
+             const cargoBefore = bot.inventory.map((i) => ({ itemId: i.itemId, quantity: i.quantity }));
+             const cargoUsedBefore = bot.cargo;
+             const cargoMaxBefore = bot.cargoMax;
+
+             let lastError: string | undefined;
+             const moved: Array<{ itemId: string; quantity: number }> = [];
+             const failed: Array<{ itemId: string; quantity: number; error: string }> = [];
+
+             if (body.mode === "faction_to_cargo") {
+               const step1 = await bot.exec("storage", {
+                 action: "deposit",
+                 target: "self",
+                 source: "faction",
+                 items: validItems.map((it) => ({ item_id: it.itemId, quantity: it.quantity })),
+               });
+               if (step1.error) lastError = step1.error.message;
+               await bot.refreshStorage();
+
+               const step2 = await bot.exec("withdraw_items", {
+                 items: validItems.map((it) => ({ item_id: it.itemId, quantity: it.quantity })),
+               });
+               if (step2.error) lastError = lastError ?? step2.error.message;
+             } else if (body.mode === "station_to_cargo") {
+               const resp = await bot.exec("withdraw_items", {
+                 items: validItems.map((it) => ({ item_id: it.itemId, quantity: it.quantity })),
+               });
+               if (resp.error) lastError = resp.error.message;
+             } else {
+               let action = "deposit";
+               let target = body.mode === "cargo_to_faction" || body.mode === "station_to_faction" ? "faction" : "self";
+               let source: string | undefined;
+               if (body.mode === "station_to_faction") source = "storage";
+               else if (body.mode === "faction_to_station") source = "faction";
+
+               const resp = await bot.exec("storage", {
+                 action,
+                 target,
+                 ...(source ? { source } : {}),
+                 items: validItems.map((it) => ({ item_id: it.itemId, quantity: it.quantity })),
+               });
+               if (resp.error) lastError = resp.error.message;
+             }
+
+             // Post-flight: refresh and diff
+             await bot.refreshCargo();
+             if (body.mode === "station_to_cargo" || body.mode === "faction_to_cargo" || body.mode === "faction_to_station") {
+               await bot.refreshStorage();
+             }
+             if (body.mode === "cargo_to_faction" || body.mode === "station_to_faction" || body.mode === "faction_to_cargo") {
+               await bot.refreshFactionStorage(true, undefined, true);
+             }
+
+             const cargoAfter = bot.inventory.map((i) => ({ itemId: i.itemId, quantity: i.quantity }));
+             const beforeMap = new Map(cargoBefore.map((i) => [i.itemId, i.quantity]));
+             const afterMap = new Map(cargoAfter.map((i) => [i.itemId, i.quantity]));
+
+             for (const item of validItems) {
+               const before = beforeMap.get(item.itemId) || 0;
+               const after = afterMap.get(item.itemId) || 0;
+               const delta = after - before;
+               if (body.mode === "cargo_to_station" || body.mode === "cargo_to_faction" || body.mode === "station_to_faction") {
+                 if (delta < 0) {
+                   moved.push({ itemId: item.itemId, quantity: Math.abs(delta) });
+                 } else {
+                   failed.push({ itemId: item.itemId, quantity: item.quantity, error: lastError || "No change detected" });
+                 }
+               } else {
+                 if (delta > 0) {
+                   moved.push({ itemId: item.itemId, quantity: delta });
+                 } else {
+                   failed.push({ itemId: item.itemId, quantity: item.quantity, error: lastError || "No change detected" });
+                 }
+               }
+             }
+
+             return Response.json({
+               ok: failed.length === 0,
+               error: lastError,
+               moved,
+               failed,
+               partial: moved.length > 0 && failed.length > 0,
+               cargoBefore,
+               cargoAfter,
+               cargoUsedBefore,
+               cargoMaxBefore,
+               cargoUsedAfter: bot.cargo,
+               cargoMaxAfter: bot.cargoMax,
+             });
+           }
+
+           // POST /api/ship/apply-preset - Apply module preset with cargo-aware planning and verification
+           if (url.pathname === "/api/ship/apply-preset" && req.method === "POST") {
+             const body = await req.json() as {
+               botName: string;
+               preset: { modules: { weapons?: string[]; defense?: string[]; utility?: string[] } };
+             };
+
+             const bot = getBot(body.botName);
+             if (!bot) return Response.json({ error: "Bot not found" }, { status: 404 });
+             if (!bot.isConnected()) return Response.json({ error: "Bot not connected" }, { status: 400 });
+
+             const targetModules = [
+               ...(body.preset.modules.weapons || []),
+               ...(body.preset.modules.defense || []),
+               ...(body.preset.modules.utility || []),
+             ];
+
+             // Get current modules
+             const statusResp = await bot.exec("get_status");
+             const statusResult = statusResp.result as any;
+             const currentModules = statusResult?.modules || statusResult?.ship?.modules || [];
+
+             const needed = [...targetModules];
+             const toRemove: Array<{ catalogId: string; instanceId: string }> = [];
+
+             for (const mod of currentModules) {
+               const catalogId = mod.type_id || mod.item_id || mod.definition_id;
+               const instanceId = mod.id || mod.module_id || mod.instance_id;
+               if (!catalogId || !instanceId) continue;
+               const idx = needed.indexOf(catalogId);
+               if (idx !== -1) {
+                 needed.splice(idx, 1);
+               } else {
+                 toRemove.push({ catalogId, instanceId });
+               }
+             }
+
+             const removed: string[] = [];
+             const installed: string[] = [];
+             const failed: string[] = [];
+
+             // Phase 1: Uninstall extras
+             for (const mod of toRemove) {
+               const res = await bot.exec("uninstall_mod", { module_id: mod.instanceId });
+               if (!res.error) {
+                 removed.push(mod.catalogId);
+               } else {
+                 failed.push(`uninstall:${mod.catalogId}`);
+               }
+             }
+
+             // Phase 2: Deposit removed modules
+             for (const modId of removed) {
+               const all = catalogStore.getAll() as any;
+               const quest = all?.items?.[modId]?.quest_item === true;
+               const target = quest ? "self" : "faction";
+               await bot.exec("storage", { action: "deposit", target, item_id: modId, quantity: 1 });
+             }
+
+             // Phase 3: Withdraw needed modules
+             for (const modId of [...needed]) {
+               const all = catalogStore.getAll() as any;
+               if (all?.items?.[modId]?.quest_item === true) continue;
+               const res = await bot.exec("storage", {
+                 action: "deposit",
+                 target: "self",
+                 item_id: modId,
+                 quantity: 1,
+                 source: "faction",
+               });
+               if (res.error) {
+                 failed.push(`withdraw:${modId}`);
+                 const idx = needed.indexOf(modId);
+                 if (idx !== -1) needed.splice(idx, 1);
+               }
+             }
+
+             // Phase 4: Install in cargo-aware batches
+             while (needed.length > 0) {
+               await bot.refreshCargo();
+               const cargoUsed = bot.cargo;
+               const cargoMax = bot.cargoMax;
+               const spaceLeft = cargoMax - cargoUsed;
+
+               const toLoad: string[] = [];
+               let usedSpace = 0;
+               for (const modId of needed) {
+                 const all = catalogStore.getAll() as any;
+                 const modSize = all?.items?.[modId]?.size && typeof all.items[modId].size === "number" && all.items[modId].size > 0
+                   ? all.items[modId].size
+                   : 10;
+                 if (usedSpace + modSize > spaceLeft) break;
+                 toLoad.push(modId);
+                 usedSpace += modSize;
+               }
+
+               if (toLoad.length === 0) break;
+
+               for (const modId of toLoad) {
+                 const wRes = await bot.exec("withdraw_items", { item_id: modId, quantity: 1 });
+                 if (wRes.error) {
+                   failed.push(`load:${modId}`);
+                   const idx = needed.indexOf(modId);
+                   if (idx !== -1) needed.splice(idx, 1);
+                   continue;
+                 }
+
+                 const iRes = await bot.exec("install_mod", { module_id: modId });
+                 if (iRes.error) {
+                   failed.push(`install:${modId}`);
+                   await bot.exec("deposit_items", { item_id: modId, quantity: 1 });
+                 } else {
+                   installed.push(modId);
+                 }
+
+                 const idx = needed.indexOf(modId);
+                 if (idx !== -1) needed.splice(idx, 1);
+               }
+             }
+
+             return Response.json({
+               ok: failed.length === 0 && needed.length === 0,
+               removed,
+               installed,
+               failed,
+               remaining: needed,
+               partial: installed.length > 0 && (failed.length > 0 || needed.length > 0),
+             });
+           }
+
+           // GET /api/facility-transfer-loadouts - Load all facility transfer loadouts
           if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "GET") {
             const loadouts = getFacilityTransferLoadouts();
             return Response.json({ loadouts });

@@ -9707,65 +9707,104 @@
        *  cargo/storage and moves up to 100 items per tick via the `storage`
        *  bulk command. */
       let fleetBulkMove = null; // { mode, bots: string[], index }
-      function mcDepositAllAllBots() {
-        if (fleetBulkMove) {
-          logResponse('<span class="resp-err">Fleet bulk move already running</span>');
-          return;
-        }
-        const mode = val("mc-depall-source");
-        const others = bots
-          .map((b) => b.username)
-          .filter((u) => u && bots.find((b) => b.username === u));
-        if (others.length === 0) {
-          logResponse('<span class="resp-err">No bots available</span>');
-          return;
-        }
-        fleetBulkMove = { mode, bots: others, index: 0 };
-        logResponse(
-          `<span class="resp-cmd">Starting fleet Bulk Move: ${mode} across ${others.length} bot(s)</span>`,
-        );
-        mcProcessFleetBulkMove();
-      }
+       function mcDepositAllAllBots() {
+         if (fleetBulkMove) {
+           logResponse('<span class="resp-err">Fleet bulk move already running</span>');
+           return;
+         }
+         const mode = val("mc-depall-source");
+         const others = bots
+           .map((b) => b.username)
+           .filter((u) => u && bots.find((b) => b.username === u));
+         if (others.length === 0) {
+           logResponse('<span class="resp-err">No bots available</span>');
+           return;
+         }
+         fleetBulkMove = { mode, bots: others, index: 0 };
+         logResponse(
+           `<span class="resp-cmd">Starting fleet Bulk Move: ${mode} across ${others.length} bot(s) (cargo-aware backend)</span>`,
+         );
+         mcProcessFleetBulkMove();
+       }
 
-      function mcProcessFleetBulkMove() {
-        if (!fleetBulkMove) return;
-        if (fleetBulkMove.index >= fleetBulkMove.bots.length) {
-          logResponse(
-            `<span class="resp-ok">Fleet Bulk Move complete! All ${fleetBulkMove.bots.length} bot(s) processed.</span>`,
-          );
-          fleetBulkMove = null;
-          const st = document.getElementById("mc-depall-fleet-status");
-          if (st) {
-            st.textContent = "Idle";
-            st.style.color = "var(--text-dim)";
-          }
-          return;
-        }
+       async function mcProcessFleetBulkMove() {
+         if (!fleetBulkMove) return;
+         if (fleetBulkMove.index >= fleetBulkMove.bots.length) {
+           logResponse(
+             `<span class="resp-ok">Fleet Bulk Move complete! All ${fleetBulkMove.bots.length} bot(s) processed.</span>`,
+           );
+           fleetBulkMove = null;
+           const st = document.getElementById("mc-depall-fleet-status");
+           if (st) {
+             st.textContent = "Idle";
+             st.style.color = "var(--text-dim)";
+           }
+           return;
+         }
 
-        const botName = fleetBulkMove.bots[fleetBulkMove.index];
-        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
-        logResponse(
-          `<span class="resp-cmd">${ts} > [${fleetBulkMove.index + 1}/${fleetBulkMove.bots.length}] ${botName}: refreshing storage...</span>`,
-        );
+         const botName = fleetBulkMove.bots[fleetBulkMove.index];
+         const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+         logResponse(
+           `<span class="resp-cmd">${ts} > [${fleetBulkMove.index + 1}/${fleetBulkMove.bots.length}] ${botName}: refreshing...</span>`,
+         );
 
-        // Refresh the bot's cargo + both storages so the queue reflects reality,
-        // then run its bulk move using the bot's own data (no global swapping).
-        sendExec(botName, "get_cargo", {}, () => {
-          sendExec(botName, "view_storage", {}, () => {
-            sendExec(botName, "view_storage", { target: "faction" }, () => {
-              mcRunFleetBulkMoveForBot(botName, fleetBulkMove.mode, () => {
-                fleetBulkMove.index++;
-                const st = document.getElementById("mc-depall-fleet-status");
-                if (st) {
-                  st.textContent = `Processing: ${fleetBulkMove.index}/${fleetBulkMove.bots.length}`;
-                  st.style.color = "var(--green)";
-                }
-                setTimeout(mcProcessFleetBulkMove, TICK_COOLDOWN_MS + 500);
-              });
-            });
-          });
-        });
-      }
+         try {
+           await sendExecAsync(botName, "get_cargo", {});
+           await sendExecAsync(botName, "view_storage", {});
+           await sendExecAsync(botName, "view_storage", { target: "faction" });
+         } catch (e) {
+           logResponse(
+             `<span class="resp-warn">${botName}: refresh failed: ${esc(e.message || e)}</span>`,
+           );
+         }
+
+         const bot = bots.find((b) => b.username === botName);
+         if (!bot) {
+           fleetBulkMove.index++;
+           setTimeout(mcProcessFleetBulkMove, TICK_COOLDOWN_MS + 500);
+           return;
+         }
+
+         let items = [];
+         const mode = fleetBulkMove.mode;
+         if (mode === "cargo_to_station" || mode === "cargo_to_faction") {
+           items = (bot.inventory || []).map((i) => ({ itemId: i.itemId || i.item_id, quantity: i.quantity || 1 }));
+         } else if (mode === "station_to_faction" || mode === "station_to_cargo") {
+           items = (bot.storage || []).map((i) => ({ itemId: i.itemId || i.item_id, quantity: i.quantity || 1 }));
+         } else if (mode === "faction_to_station" || mode === "faction_to_cargo") {
+           items = (bot.factionStorage || []).map((i) => ({ itemId: i.itemId || i.item_id, quantity: i.quantity || 1 }));
+         }
+
+         try {
+           const result = await apiShipBulkMove(botName, mode, items);
+           if (result.ok) {
+             logResponse(
+               `<span class="resp-ok">${botName}: moved ${result.moved?.length || 0} item type(s)</span>`,
+             );
+           } else {
+             logResponse(
+               `<span class="resp-err">${botName}: failed: ${esc(result.error || "unknown")}</span>`,
+             );
+           }
+           if (result.partial) {
+             logResponse(
+               `<span class="resp-warn">${botName}: partial move (${result.moved?.length || 0} ok, ${result.failed?.length || 0} failed)</span>`,
+             );
+           }
+         } catch (e) {
+           logResponse(
+             `<span class="resp-err">${botName}: error: ${esc(e.message || e)}</span>`,
+           );
+         }
+
+         fleetBulkMove.index++;
+         const st = document.getElementById("mc-depall-fleet-status");
+         if (st) {
+           st.textContent = `Processing: ${fleetBulkMove.index}/${fleetBulkMove.bots.length}`;
+           st.style.color = "var(--green)";
+         }
+         setTimeout(mcProcessFleetBulkMove, TICK_COOLDOWN_MS + 500);
+       }
 
       /** Build + run the bulk move queue for a single fleet bot, then call done. */
       function mcRunFleetBulkMoveForBot(botName, mode, done) {
@@ -11668,20 +11707,56 @@
         }
       }
 
-      function sendExecAsync(botName, command, params) {
-        return new Promise((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            reject(new Error(`Timeout: ${command} did not respond`));
-          }, 120000);
-          sendExec(botName, command, params, (result) => {
-            clearTimeout(timeout);
-            if (result.ok) resolve(result);
-            else reject(new Error(result.error || "unknown"));
-          });
-        });
-      }
+       function sendExecAsync(botName, command, params) {
+         return new Promise((resolve, reject) => {
+           const timeout = setTimeout(() => {
+             reject(new Error(`Timeout: ${command} did not respond`));
+           }, 120000);
+           sendExec(botName, command, params, (result) => {
+             clearTimeout(timeout);
+             if (result.ok) resolve(result);
+             else reject(new Error(result.error || "unknown"));
+           });
+         });
+       }
 
-      function handleExecResult(msg) {
+       async function apiShipBulkMove(botName, mode, items) {
+         try {
+           const resp = await fetch("/api/ship/bulk-move", {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+             body: JSON.stringify({ botName, mode, items }),
+           });
+           if (!resp.ok) {
+             const err = await resp.json().catch(() => ({}));
+             throw new Error(err.error || `HTTP ${resp.status}`);
+           }
+           return await resp.json();
+         } catch (e) {
+           console.error("apiShipBulkMove error", e);
+           throw e;
+         }
+       }
+
+       async function apiShipApplyPreset(botName, preset) {
+         try {
+           const resp = await fetch("/api/ship/apply-preset", {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+             body: JSON.stringify({ botName, preset }),
+           });
+           if (!resp.ok) {
+             const err = await resp.json().catch(() => ({}));
+             throw new Error(err.error || `HTTP ${resp.status}`);
+           }
+           return await resp.json();
+         } catch (e) {
+           console.error("apiShipApplyPreset error", e);
+           throw e;
+         }
+       }
+
+       function handleExecResult(msg) {
         // Try to match callback
         if (msg._seq && execCallbacks[msg._seq]) {
           clearTimeout(execTimers[msg._seq]);
@@ -17320,137 +17395,89 @@
       }
 
       // Phase 2: Change to selected module loadout (smart uninstall only)
-      async function changeToModulePreset() {
-        const bot = getProfileBot();
-        const statusEl = document.getElementById("mc-module-preset-status");
-        if (!bot) {
-          if (statusEl) statusEl.textContent = "No bot selected";
-          return;
-        }
+       async function changeToModulePreset() {
+         const bot = getProfileBot();
+         const statusEl = document.getElementById("mc-module-preset-status");
+         if (!bot) {
+           if (statusEl) statusEl.textContent = "No bot selected";
+           return;
+         }
 
-        const presetName = window._selectedModulePreset?.[bot.username];
-        if (!presetName) {
-          if (statusEl) statusEl.textContent = "Load a preset first";
-          return;
-        }
+         const presetName = window._selectedModulePreset?.[bot.username];
+         if (!presetName) {
+           if (statusEl) statusEl.textContent = "Load a preset first";
+           return;
+         }
 
-        // Fetch preset details
-        const presets = await loadModulePresetsForManual();
-        const preset = presets[presetName];
-        if (!preset || !preset.modules) {
-          if (statusEl) statusEl.textContent = "Preset not found";
-          return;
-        }
+         const presets = await loadModulePresetsForManual();
+         const preset = presets[presetName];
+         if (!preset || !preset.modules) {
+           if (statusEl) statusEl.textContent = "Preset not found";
+           return;
+         }
 
-        // Build target module list (preserves duplicates like multiple cargo expanders)
-        const targetModules = [
-          ...(preset.modules.weapons || []),
-          ...(preset.modules.defense || []),
-          ...(preset.modules.utility || []),
-        ];
+         if (statusEl) {
+           statusEl.textContent = "Applying preset via backend...";
+           statusEl.style.color = "var(--yellow)";
+         }
 
-        if (statusEl) {
-          statusEl.textContent = "Checking current modules...";
-          statusEl.style.color = "var(--yellow)";
-        }
+         logResponse(
+           `<span class="resp-cmd">Applying module preset "${presetName}" to ${bot.username}...</span>`,
+         );
 
-        // Get current ship modules via get_status
-        sendExec(bot.username, "get_status", {}, (result) => {
-          if (!result.ok || !result.data) {
-            if (statusEl) statusEl.textContent = "Failed to get ship status";
-            return;
-          }
+         try {
+           const result = await apiShipApplyPreset(bot.username, preset);
 
-          // Modules are usually in result.data.modules or result.data.ship.modules
-          const currentModules =
-            result.data.modules || result.data.ship?.modules || [];
-          const removedModules = []; // { catalogId, instanceId }
+           if (result.removed?.length > 0) {
+             logResponse(
+               `<span class="resp-cmd">Removed ${result.removed.length} modules</span>`,
+             );
+           }
+           if (result.installed?.length > 0) {
+             logResponse(
+               `<span class="resp-ok">Installed ${result.installed.length} modules</span>`,
+             );
+           }
+           if (result.failed?.length > 0) {
+             logResponse(
+               `<span class="resp-err">Failed: ${result.failed.join(", ")}</span>`,
+             );
+           }
+           if (result.remaining?.length > 0) {
+             logResponse(
+               `<span class="resp-warn">Could not install ${result.remaining.length} modules (cargo full): ${result.remaining.map((m) => catalog.items?.[m]?.name || m).join(", ")}</span>`,
+             );
+           }
 
-          // Build a map of what we still need to install (handles duplicates)
-          const needed = [...targetModules];
+           if (result.ok) {
+             statusEl.textContent = "Module loadout complete!";
+             statusEl.style.color = "var(--green)";
+             logResponse(
+               `<span class="resp-ok">Successfully changed to module loadout "${presetName}"</span>`,
+             );
+           } else if (result.partial) {
+             statusEl.textContent = "Partially applied";
+             statusEl.style.color = "var(--orange)";
+             logResponse(
+               `<span class="resp-warn">Partially applied module loadout "${presetName}"</span>`,
+             );
+           } else {
+             statusEl.textContent = "Failed!";
+             statusEl.style.color = "var(--red)";
+             logResponse(
+               `<span class="resp-err">Failed to apply module loadout "${presetName}"</span>`,
+             );
+           }
+         } catch (e) {
+           statusEl.textContent = "Error!";
+           statusEl.style.color = "var(--red)";
+           logResponse(
+             `<span class="resp-err">Error applying preset: ${esc(e.message || e)}</span>`,
+           );
+         }
+       }
 
-          for (const mod of currentModules) {
-            const catalogId = mod.type_id || mod.item_id || mod.definition_id;
-            const instanceId = mod.id || mod.module_id || mod.instance_id;
-
-            if (catalogId && instanceId) {
-              const idx = needed.indexOf(catalogId);
-              if (idx !== -1) {
-                needed.splice(idx, 1); // already have this one, keep it
-              } else {
-                // We don't want this module
-                removedModules.push({ catalogId, instanceId });
-              }
-            }
-          }
-
-          if (needed.length === 0 && removedModules.length === 0) {
-            if (statusEl) {
-              statusEl.textContent = "Already matches preset";
-              statusEl.style.color = "var(--green)";
-            }
-            logResponse(
-              `<span class="resp-ok">Ship already has the correct modules for "${presetName}"</span>`,
-            );
-            return;
-          }
-
-          if (statusEl)
-            statusEl.textContent = `Removing ${removedModules.length} module(s)...`;
-
-          logResponse(
-            `<span class="resp-cmd">Removing ${removedModules.length} modules not in preset "${presetName}"</span>`,
-          );
-
-          // Uninstall extras one by one
-          let index = 0;
-          function uninstallNext() {
-            if (index >= removedModules.length) {
-              if (statusEl) {
-                statusEl.textContent = "Uninstall complete";
-                statusEl.style.color = "var(--green)";
-              }
-              logResponse(
-                `<span class="resp-ok">Finished removing extra modules for "${presetName}"</span>`,
-              );
-
-              // Continue to Phase 3 (deposit/withdraw/cargo loop)
-              finishModuleLoadoutChange(
-                bot,
-                presetName,
-                needed,
-                removedModules,
-              );
-              return;
-            }
-
-            const modInfo = removedModules[index];
-            sendExec(
-              bot.username,
-              "uninstall_mod",
-              { module_id: modInfo.instanceId },
-              (res) => {
-                if (res.ok) {
-                  logResponse(
-                    `<span class="resp-ok">Uninstalled ${modInfo.catalogId}</span>`,
-                  );
-                } else {
-                  logResponse(
-                    `<span class="resp-err">Failed to uninstall ${modInfo.catalogId}: ${res.error || "unknown"}</span>`,
-                  );
-                }
-                index++;
-                // Small delay between uninstalls
-                setTimeout(uninstallNext, 800);
-              },
-            );
-          }
-
-          uninstallNext();
-        });
-      }
-
-      // ── Phase 3: Full module loadout change (deposit → withdraw → cargo/install loop) ──
+       // ── Phase 3: Full module loadout change (deposit → withdraw → cargo/install loop) ──
       async function finishModuleLoadoutChange(
         bot,
         presetName,

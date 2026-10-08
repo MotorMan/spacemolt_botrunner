@@ -1302,21 +1302,80 @@ function releaseExpiredCreatureClaims(): void {
   }
 }
 
-// ── Big creature hunt coordination (non-API bot chat channel) ────
+import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
+import { join } from "path";
+
+const DATA_DIR = join(process.cwd(), "data");
+const BIG_CREATURE_CLAIMS_FILE = join(DATA_DIR, "big_creature_claims.json");
+
+function ensureDataDir(): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function loadBigCreatureClaimsFromFile(): Record<string, { claimer: string; expires: number }> {
+  try {
+    if (!existsSync(BIG_CREATURE_CLAIMS_FILE)) return {};
+    const parsed = JSON.parse(readFileSync(BIG_CREATURE_CLAIMS_FILE, "utf-8")) as Record<string, { claimer: string; expires: number }>;
+    return parsed || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveBigCreatureClaimsToFile(claims: Record<string, { claimer: string; expires: number }>): void {
+  try {
+    ensureDataDir();
+    writeFileSync(BIG_CREATURE_CLAIMS_FILE, JSON.stringify(claims, null, 2), "utf-8");
+  } catch {
+    // best-effort persistence
+  }
+}
+
+function syncBigCreatureClaimsToFile(): void {
+  const now = Date.now();
+  const claims: Record<string, { claimer: string; expires: number }> = {};
+  for (const [key, claim] of bigCreatureHuntAnnouncements) {
+    if (claim.expires > now) {
+      claims[key] = claim;
+    }
+  }
+  saveBigCreatureClaimsToFile(claims);
+}
+
+function loadPersistedBigCreatureClaims(): void {
+  const claims = loadBigCreatureClaimsFromFile();
+  const now = Date.now();
+  for (const [key, claim] of Object.entries(claims)) {
+    if (claim.expires > now) {
+      bigCreatureHuntAnnouncements.set(key, claim);
+    }
+  }
+}
+
+// ── Big creature hunt coordination (non-API bot chat channel + file) ─
 //
 // Multiple big-creature hunters can pick the same known target without
 // coordination. We avoid that by broadcasting our chosen target system/POI
 // and ignoring recently announced targets from other hunters when choosing
-// ours.
+// ours. Claims are persisted to disk so newly started bots honour existing
+// claims even if they missed the in-memory broadcast.
 
 const BIG_CREATURE_HUNT_TTL_MS = 10 * 60 * 1000;
 const bigCreatureHuntAnnouncements = new Map<string, { claimer: string; expires: number }>();
+const bigCreatureHuntInFlight = new Map<string, string>();
 
 function releaseExpiredBigCreatureHunts(): void {
   const now = Date.now();
   for (const [key, claim] of bigCreatureHuntAnnouncements) {
     if (claim.expires <= now) bigCreatureHuntAnnouncements.delete(key);
   }
+  for (const [key, claimer] of bigCreatureHuntInFlight) {
+    const persisted = bigCreatureHuntAnnouncements.get(key);
+    if (!persisted || persisted.claimer !== claimer) bigCreatureHuntInFlight.delete(key);
+  }
+  syncBigCreatureClaimsToFile();
 }
 
 function announceBigCreatureHunt(bot: Bot, system: string, poi: string, targetName: string): void {
@@ -1339,6 +1398,17 @@ function announceBigCreatureHunt(bot: Bot, system: string, poi: string, targetNa
       targetName,
     },
   });
+  const syncLight = (globalThis as any).syncLight as { queueBigCreatureClaim?: (claim: any) => void } | undefined;
+  if (syncLight?.queueBigCreatureClaim) {
+    syncLight.queueBigCreatureClaim({
+      claimer: bot.username,
+      system,
+      poi,
+      targetName,
+      expiresAt: Date.now() + BIG_CREATURE_HUNT_TTL_MS,
+    });
+  }
+  syncBigCreatureClaimsToFile();
 }
 
 function isBigCreatureHuntClaimedByOther(system: string, poi: string, username: string): boolean {
@@ -1347,9 +1417,18 @@ function isBigCreatureHuntClaimedByOther(system: string, poi: string, username: 
   if (!claim) return false;
   if (claim.expires <= Date.now()) {
     bigCreatureHuntAnnouncements.delete(key);
+    syncBigCreatureClaimsToFile();
     return false;
   }
   return claim.claimer !== username;
+}
+
+function isBigCreatureHuntInFlightOrClaimedByOther(system: string, poi: string, username: string): boolean {
+  const key = `${system}|${poi}`;
+  if (isBigCreatureHuntClaimedByOther(system, poi, username)) return true;
+  const inFlight = bigCreatureHuntInFlight.get(key);
+  if (inFlight && inFlight !== username) return true;
+  return false;
 }
 
 /** Broadcast a claim lock for a non-leviathan creature we're about to engage. */
@@ -2504,7 +2583,7 @@ function pickClosestBigCreatureTarget(
     const key = `${t.system}|${t.poi}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (isBigCreatureHuntClaimedByOther(t.system, t.poi, claimerUsername)) continue;
+    if (isBigCreatureHuntInFlightOrClaimedByOther(t.system, t.poi, claimerUsername)) continue;
     const route = mapStore.findRoute(fromSystem, t.system);
     const jumps = route ? Math.max(0, route.length - 1) : Infinity;
     if (jumps === Infinity) continue;
@@ -2519,6 +2598,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
   const { bot } = ctx;
 
   await ensureHunterCoordListener(bot.username);
+  loadPersistedBigCreatureClaims();
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -2553,6 +2633,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     const target = best.target;
     const targetKey = `${target.system}|${target.poi}`;
     bigCreatureHuntAnnouncements.set(targetKey, { claimer: bot.username, expires: Date.now() + BIG_CREATURE_HUNT_TTL_MS });
+    bigCreatureHuntInFlight.set(targetKey, bot.username);
     announceBigCreatureHunt(bot, target.system, target.poi, target.name);
     ctx.log("info", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} (${best.distance} jumps away)`);
 
@@ -2563,6 +2644,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, homeStation: settings.homeStation, skipBlacklist: true, skipFleeCheck: true });
     if (fueled !== "fueled") {
+      bigCreatureHuntInFlight.delete(targetKey);
       await handleFuelCheckFailure(ctx, settings, fueled);
       continue;
     }
@@ -2570,6 +2652,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
+      bigCreatureHuntInFlight.delete(targetKey);
       ctx.log("system", `Hull at ${hullPct}% — returning home to repair`);
       await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
       continue;
@@ -2578,6 +2661,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      bigCreatureHuntInFlight.delete(targetKey);
       ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining — returning home`);
       await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
       continue;
@@ -2585,6 +2669,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     const cargoPct = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     if (cargoPct >= (settings.creatureFarmCargoFullPct || 0.95)) {
+      bigCreatureHuntInFlight.delete(targetKey);
       ctx.log("system", `Cargo ${Math.round(cargoPct * 100)}% — returning home`);
       await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
       continue;
@@ -2592,12 +2677,14 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
     if (!hasAmmo && !settings.meatShield) {
+      bigCreatureHuntInFlight.delete(targetKey);
       ctx.log("combat", "Out of ammo — returning home to restock");
       await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
       continue;
     }
 
     if (isLowOnFieldConsumables(bot.inventory, 1, 0)) {
+      bigCreatureHuntInFlight.delete(targetKey);
       ctx.log("combat", "Low on repair kits — returning home to resupply");
       await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
       continue;
@@ -2605,8 +2692,9 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     // ── Navigate to target system ──
     if (bot.system !== target.system) {
-      if (isBigCreatureHuntClaimedByOther(target.system, target.poi, bot.username)) {
+      if (isBigCreatureHuntInFlightOrClaimedByOther(target.system, target.poi, bot.username)) {
         ctx.log("warn", `Big creature hunt: ${target.name} at ${target.system}/${target.poi} was claimed by another hunter while we were preparing — rechecking targets`);
+        bigCreatureHuntInFlight.delete(targetKey);
         continue;
       }
       ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
@@ -2620,6 +2708,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
       };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
+        bigCreatureHuntInFlight.delete(targetKey);
         const battleAfterNav = await getBattleStatus(ctx);
         if (battleAfterNav) {
           await handleNavigationBattleInterrupt(ctx, settings);
@@ -2630,6 +2719,8 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
       }
       await resubscribeObservationAfterMove(bot);
     }
+
+    bigCreatureHuntInFlight.delete(targetKey);
 
     // ── Farm the target system for the big creature ──
     yield "farm_big_creature";

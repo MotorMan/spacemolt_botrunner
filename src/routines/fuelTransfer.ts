@@ -51,6 +51,11 @@ import {
   type FtNeededItem,
   type FtLoadPlanItem,
 } from "./fuelTransferPlanning.js";
+import {
+  getGiftedQuantity,
+  getAllGiftedItems,
+  addGiftedQuantity,
+} from "./fuelTransferGiftTracking.js";
 
 
 const FACTION_STORAGE_API_RATE_LIMIT_MS = 1000;
@@ -426,6 +431,7 @@ async function depositToRemoteStation(
 
       if (!sResp.error && actuallySent > 0) {
         ctx.log("cargo", `Gifted ${actuallySent}x ${itemName} to ${giftBot}`);
+        addGiftedQuantity(remoteStationId, itemId, actuallySent);
         return { success: true, depositedQty: actuallySent, mode: "gift" };
       }
 
@@ -792,12 +798,15 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
 
           loadoutItemIds = collectLoadoutItemIds(pendingLoadouts);
-          const loadoutNeeds = buildLoadoutNeeds(remoteStationId, pendingLoadouts, stationQtyCache, getItemSize);
+          const baseQtyCache = config.deliveryMode === "gift"
+            ? addGiftedToStationCache(stationQtyCache, remoteStationId, config.deliveryMode)
+            : stationQtyCache;
+          const loadoutNeeds = buildLoadoutNeeds(remoteStationId, pendingLoadouts, baseQtyCache, getItemSize);
 
           // Nothing outstanding? Then the loadout is done — record it now
           // rather than only after a delivery, so a satisfied loadout stops
           // being re-planned every cycle.
-          evaluateLoadoutCompletion(ctx, remoteStationId, pendingLoadouts, stationQtyCache, false);
+          evaluateLoadoutCompletion(ctx, remoteStationId, pendingLoadouts, baseQtyCache, false);
 
           if (loadoutNeeds.length > 0) {
             allAtTarget = false;
@@ -810,7 +819,10 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
               lastTransferFailure.delete(remoteStationId);
               const freshQtyCache = await getRemoteFactionAllItemsRateLimited(bot, remoteStationId);
               if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-              evaluateLoadoutCompletion(ctx, remoteStationId, pendingLoadouts, freshQtyCache, true);
+              const freshBaseQtyCache = config.deliveryMode === "gift"
+                ? addGiftedToStationCache(freshQtyCache, remoteStationId, config.deliveryMode)
+                : freshQtyCache;
+              evaluateLoadoutCompletion(ctx, remoteStationId, pendingLoadouts, freshBaseQtyCache, true);
             } else {
               lastTransferFailure.set(remoteStationId, Date.now());
               ctx.log("fuel", `${remoteStationId}: Nothing delivered this trip — pausing this station for ${Math.round(TRANSFER_FAILURE_COOLDOWN_MS / 1000)}s`);
@@ -825,16 +837,19 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           
           const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
           if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
-          if (currentQty >= item.targetQuantity) {
-            ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
+          const effectiveQty = config.deliveryMode === "gift"
+            ? currentQty + getGiftedQuantity(remoteStationId, item.itemId)
+            : currentQty;
+          if (effectiveQty >= item.targetQuantity) {
+            ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${effectiveQty}/${item.targetQuantity} — ✓`);
             continue;
           }
 
-          const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
-          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
+          const strategy = determineTransferStrategy(effectiveQty, item.targetQuantity);
+          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${effectiveQty}/${item.targetQuantity} — ${strategy.reason}`);
           if (strategy.skip) continue;
 
-          const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, item.targetQuantity - currentQty, bot.username);
+          const coOpAvailable = getAvailableDeliveryQuantity(item.itemId, remoteStationId, item.targetQuantity - effectiveQty, bot.username);
           if (coOpAvailable <= 0) {
             ctx.log("fuel", `Co-op: ${item.itemName} fully claimed by other bots — skipping`);
             continue;
@@ -843,7 +858,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           neededItems.push({
             itemId: item.itemId,
             itemName: item.itemName,
-            needed: item.targetQuantity - currentQty,
+            needed: item.targetQuantity - effectiveQty,
             itemSize: getItemSize(item.itemId),
             stationTarget: item.targetQuantity,
             forceQty: 0,
@@ -1186,18 +1201,22 @@ async function deliverBatchToStation(
       continue;
     }
 
-    const currentStationQty = await getRemoteFactionQty(bot, remoteStationId, plan.itemId);
-    // Force-full demand must be deposited even when the station is already
-    // stocked, so it is added on top of any remaining top-up need.
-    const { total: remainingNeed, stationNeed, forceNeed } = remainingDepositNeed(plan, currentStationQty);
-    
-    if (remainingNeed <= 0) {
-      ctx.log("fuel", `${remoteStationId}: ${plan.itemName} already at target (${currentStationQty}/${plan.stationTarget}) — skipping deposit, releasing lock`);
-      releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "already_at_target");
-      removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
-      results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
-      continue;
-    }
+     const currentStationQty = await getRemoteFactionQty(bot, remoteStationId, plan.itemId);
+     const giftedQty = stationConfig.deliveryMode === "gift"
+       ? getGiftedQuantity(remoteStationId, plan.itemId)
+       : 0;
+     const effectiveStationQty = currentStationQty + giftedQty;
+     // Force-full demand must be deposited even when the station is already
+     // stocked, so it is added on top of any remaining top-up need.
+     const { total: remainingNeed, stationNeed, forceNeed } = remainingDepositNeed(plan, effectiveStationQty);
+     
+     if (remainingNeed <= 0) {
+       ctx.log("fuel", `${remoteStationId}: ${plan.itemName} already at target (${effectiveStationQty}/${plan.stationTarget}) — skipping deposit, releasing lock`);
+       releaseDeliveryLock(botUsername, plan.itemId, remoteStationId, "already_at_target");
+       removeFtInTransitItems(botUsername, remoteStationId, [{ itemId: plan.itemId, quantity: plan.qty }]);
+       results.push({ deposited: false, itemId: plan.itemId, qty: 0 });
+       continue;
+     }
     
     const toDeposit = Math.min(cargoQty, plan.qty, remainingNeed);
     const needLabel = forceNeed > 0
@@ -1281,4 +1300,28 @@ async function getItemStatus(
   ctx.log("fuel", `Remote faction storage for ${remoteStationId}: ${itemId} = ${currentQty}`);
 
   return { cachedQty, currentQty, hasCache };
+}
+
+function getEffectiveStationQty(
+  stationId: string,
+  itemId: string,
+  deliveryMode: "faction" | "personal" | "gift"
+): number {
+  const base = getFactionStorageQuantity(stationId, itemId);
+  if (deliveryMode !== "gift") return base;
+  return base + getGiftedQuantity(stationId, itemId);
+}
+
+function addGiftedToStationCache(
+  cache: Record<string, number>,
+  stationId: string,
+  deliveryMode: "faction" | "personal" | "gift"
+): Record<string, number> {
+  if (deliveryMode !== "gift") return cache;
+  const gifted = getAllGiftedItems(stationId);
+  const merged = { ...cache };
+  for (const [itemId, entry] of Object.entries(gifted)) {
+    merged[itemId] = (merged[itemId] || 0) + entry.quantity;
+  }
+  return merged;
 }

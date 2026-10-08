@@ -1653,9 +1653,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
 
-    await ensureDocked(ctx);
-    await tryRefuel(ctx);
-    await repairShip(ctx);
+    if (atHomeStation) {
+      await ensureDocked(ctx);
+      await tryRefuel(ctx);
+      await repairShip(ctx);
+    }
 
     await bot.refreshCargo();
     const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;

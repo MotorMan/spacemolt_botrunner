@@ -2552,23 +2552,77 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
 const BIG_CREATURE_KEYWORDS = ["cloudwhale", "leviathan"];
 
+/**
+ * Pirate stronghold systems that the big creature hunter must never travel to.
+ *
+ * Big creatures spawn inside pirate stronghold POIs. We fight pirates, so
+ * travelling to one of those POIs means shooting the stronghold's own station
+ * and its defenders. Any big creature sighted in one of these systems is
+ * ignored and the next-closest target is picked instead.
+ *
+ * This ban is consulted ONLY by the hunt_big_creatures mode (via
+ * findKnownBigCreatures / shouldAbortForBigCreatureHunt). No other hunter mode
+ * or routine reads it, and the global system blacklist is deliberately left
+ * untouched.
+ */
+const BIG_CREATURE_BANNED_SYSTEMS: ReadonlySet<string> = new Set<string>([
+  "barnard_44",
+  "gsc_0008",
+  "gliese_581",
+  "algol",
+  "xamidimura",
+  "alhena",
+  "sheratan",
+  "zaniah",
+  "bellatrix",
+]);
+
+/** True when the system is a pirate stronghold the big creature hunt must skip. */
+function isBigCreatureBannedSystem(system: string | undefined): boolean {
+  if (!system) return false;
+  return BIG_CREATURE_BANNED_SYSTEMS.has(system.trim().toLowerCase());
+}
+
+/** Human-readable id of the last banned sighting set we logged (dedupes the loop log). */
+let lastLoggedBannedBigCreatures = "";
+
 function isKnownBigCreature(creature: WildlifeDetail): boolean {
   const name = (creature.name || "").toLowerCase();
   const species = (creature.species || "").toLowerCase();
   return BIG_CREATURE_KEYWORDS.some(kw => name.includes(kw) || species.includes(kw));
 }
 
+/** Big creature sightings we are deliberately ignoring because they sit in a banned system. */
+function findBannedBigCreatureSightings(): Array<{ system: string; poi: string; name: string; count: number }> {
+  return wildlifeStore.getAll()
+    .filter(c => isKnownBigCreature(c) && c.count > 0 && isBigCreatureBannedSystem(c.system))
+    .map(c => ({ system: c.system, poi: c.poi, name: c.name, count: c.count }));
+}
+
 function findKnownBigCreatures(): Array<{ system: string; poi: string; name: string; count: number }> {
   releaseExpiredBigCreatureHunts();
   const all = wildlifeStore.getAll();
   return all
-    .filter(c => isKnownBigCreature(c) && c.count > 0)
+    .filter(c => isKnownBigCreature(c) && c.count > 0 && !isBigCreatureBannedSystem(c.system))
     .map(c => ({
       system: c.system,
       poi: c.poi,
       name: c.name,
       count: c.count,
     }));
+}
+
+/** Log (once per change) the banned big creature sightings we are skipping. */
+function logBannedBigCreatureSightings(ctx: RoutineContext): void {
+  const banned = findBannedBigCreatureSightings();
+  const summary = banned
+    .map(t => `${t.name} @ ${t.system}/${t.poi}`)
+    .sort()
+    .join(", ");
+  if (summary === lastLoggedBannedBigCreatures) return;
+  lastLoggedBannedBigCreatures = summary;
+  if (!summary) return;
+  ctx.log("info", `Big creature hunt: ignoring ${banned.length} sighting(s) in banned pirate stronghold system(s): ${summary}`);
 }
 
 function pickClosestBigCreatureTarget(
@@ -2642,6 +2696,7 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     // ── Refresh known big creature locations ──
     const knownTargets = findKnownBigCreatures();
+    logBannedBigCreatureSightings(ctx);
 
     if (knownTargets.length === 0) {
       // Double-check right before committing to a fallback — a creature may

@@ -33,6 +33,7 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   maxItemsForCargo,
+  cargoUsedFromInventory,
   readSettings,
   isPirateSystem,
   checkAndFleeFromBattle,
@@ -1623,8 +1624,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     // Restart recovery: empty cargo not at home → return home; full cargo → proceed to station
     if (!atHomeStation && !hasCargo) {
       ctx.log("fc", `Restart recovery: empty cargo not at home (${bot.system}/${bot.poi}) — returning home`);
+      if (bot.state !== "running") continue;
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") continue;
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
@@ -1635,6 +1638,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
       if (bot.poi !== settings.homeStation) {
+        if (bot.state !== "running") continue;
         await ensureUndocked(ctx);
         const travelResp = await bot.exec("travel", { target_poi: settings.homeStation });
         if (travelResp.error) {
@@ -1665,10 +1669,15 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const needMilitary = milDeficit > 0;
 
     if ((needSellItems || needMilitary) && atHomeStationAfterMaintenance) {
+      if (bot.state !== "running") continue;
+
       ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
 
+      await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
+      if (bot.state !== "running") continue;
+
       const cargoMax = bot.cargoMax || 825;
-      let cargoUsed = bot.cargo || 0;
+      const cargoUsed = cargoUsedFromInventory(bot);
       let freeSpace = Math.max(0, cargoMax - cargoUsed);
 
       // Load sell items first (focus item first), then military reserve with remaining space
@@ -1680,6 +1689,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         : settings.sellItems;
 
       for (const itemConfig of sortedSellItems) {
+        if (bot.state !== "running") break;
+
         const currentQty = getSellItemCargo(bot, itemConfig.itemId);
         const needQty = Math.max(0, itemConfig.maxPerStation - currentQty);
         if (needQty <= 0) continue;
@@ -1691,24 +1702,25 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: itemConfig.itemId, quantity: canFit });
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw ${itemConfig.itemName} failed: ${withdrawResp.error.message}`);
+          if (withdrawResp.error.message.toLowerCase().includes("cargo_full")) break;
           continue;
         }
         ctx.log("fc", `Withdrew ${canFit}x ${itemConfig.itemName} from faction storage`);
         await ctx.sleep(1000);
         await bot.refreshCargo();
-        cargoUsed = bot.cargo || 0;
-        freeSpace = Math.max(0, cargoMax - cargoUsed);
+        const newCargoUsed = cargoUsedFromInventory(bot);
+        freeSpace = Math.max(0, cargoMax - newCargoUsed);
         if (freeSpace <= 0) break;
       }
 
       await ctx.sleep(2000);
       await bot.refreshCargo();
-      const cargoAfterSell = bot.cargo || 0;
+      const cargoAfterSell = cargoUsedFromInventory(bot);
       const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterSell);
 
       const milToWithdraw = Math.min(milDeficit, Math.floor(remainingFreeSpace / 3));
 
-      if (milToWithdraw > 0) {
+      if (milToWithdraw > 0 && bot.state === "running") {
         const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });
         if (milWithdrawResp.error) {
           ctx.log("error", `Military fuel cell withdraw failed: ${milWithdrawResp.error.message}`);
@@ -1724,8 +1736,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }).join(", ");
       const finalMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
       ctx.log("fc", `Loaded: ${sellItemsSummary}, ${finalMil}x military fuel cells`);
-
-      await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
 
       const anySellCargo = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
       if (!anySellCargo && finalMil <= 0) {
@@ -1745,8 +1755,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       preStagePlan = await buildPreStagePlan(ctx, bot, fcData, settings, cycleFilters, currentFocusItemId);
       if (preStagePlan.length === 0) {
         ctx.log("fc", "All stations already stocked — returning home");
+        if (bot.state !== "running") break;
         yield "return_home";
         if (bot.system !== settings.homeSystem) {
+          if (bot.state !== "running") break;
           await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
         }
         continue;
@@ -1821,8 +1833,10 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const hasSellCargo = hasAnySellCargo(bot, settings);
     if (!hasSellCargo) {
       ctx.log("fc", "No sell cargo before travel — returning home to restock");
+      if (bot.state !== "running") break;
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") break;
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
@@ -1833,6 +1847,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       }
       if (bot.poi !== settings.homeStation) {
+        if (bot.state !== "running") break;
         await ensureUndocked(ctx);
         await bot.exec("travel", { target_poi: settings.homeStation });
         bot.poi = settings.homeStation;
@@ -1840,9 +1855,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       continue;
     }
 
+    if (bot.state !== "running") break;
     await ensureUndocked(ctx);
 
     if (bot.system !== target.systemId) {
+      if (bot.state !== "running") break;
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting");
@@ -1860,6 +1877,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
 
     if (bot.poi !== target.poiId) {
+      if (bot.state !== "running") break;
       ctx.log("travel", `Traveling to ${target.poiName}...`);
       const travelResult = await travelToStationWithHint(ctx, target.poiId, target.poiName, target.systemId, {
         fuelThresholdPct: safetyOpts.fuelThresholdPct,
@@ -1882,6 +1900,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       bot.poi = target.poiId;
     }
 
+    if (bot.state !== "running") break;
     yield "dock";
     const dockResp = await bot.exec("dock");
 
@@ -2194,10 +2213,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted;
 
     if (shouldReturnHome) {
+      if (bot.state !== "running") break;
       yield "return_home";
       ctx.log("travel", `Returning to ${settings.homeSystem}...`);
 
       if (bot.system !== settings.homeSystem) {
+        if (bot.state !== "running") break;
         await ensureUndocked(ctx);
 
         const returnThreshold = Math.max(60, settings.refuelThreshold + 20);
@@ -2214,6 +2235,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       // Deposit any remaining sell items and military cells
       for (const itemConfig of settings.sellItems) {
+        if (bot.state !== "running") break;
         const remaining = getSellItemCargo(bot, itemConfig.itemId);
         if (remaining > 0) {
           ctx.log("fc", `Depositing ${remaining}x remaining ${itemConfig.itemName}`);
@@ -2222,7 +2244,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         }
       }
       const remainingMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
-      if (remainingMil > 0) {
+      if (remainingMil > 0 && bot.state === "running") {
         ctx.log("fc", `Depositing ${remainingMil}x remaining military fuel cells`);
         await ensureDocked(ctx);
         await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: remainingMil });
@@ -2232,6 +2254,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       ctx.log("fc", "Pre-stage run complete — returned home");
     } else {
       // Pre-stage mode: undock and continue to next station
+      if (bot.state !== "running") break;
       await ensureUndocked(ctx);
       ctx.log("fc", `Pre-stage: continuing to next station (${totalSellCargoQty(bot, settings)} items remaining in cargo)`);
     }

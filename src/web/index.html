@@ -20485,6 +20485,9 @@
         const preStageMode = fc.preStageMode || "none";
         const enablePriceUpdates = fc.enablePriceUpdates !== false;
         const priceUpdateThreshold = fc.priceUpdateThreshold || 10;
+        const storageRefreshIntervalMinutes = fc.storageRefreshIntervalMinutes || 15;
+        const blockedWaitMinutes = fc.blockedWaitMinutes || 5;
+        const preStagePartialLock = fc.preStagePartialLock !== false;
         let sellItemsJson = "";
         try {
           sellItemsJson = JSON.stringify(fc.sellItems || []);
@@ -20641,6 +20644,14 @@
       <input type="number" id="set-fc-remoteUpdateIntervalMinutes" min="5" max="1440" value="${remoteUpdateIntervalMinutes}">
     </div>
 
+     <div class="setting-row">
+      <div>
+        <div class="setting-label">Storage Refresh Interval (minutes)</div>
+        <div class="setting-hint">How often faction storage counts are re-queried when the bot is at home. Lower values keep the priority list fresher but hammer the server more. Must be at least 5.</div>
+      </div>
+      <input type="number" id="set-fc-storageRefreshIntervalMinutes" min="5" max="1440" value="${storageRefreshIntervalMinutes}">
+    </div>
+
     <div class="setting-row">
       <div>
         <div class="setting-label">Skip Faction Outposts</div>
@@ -20660,6 +20671,25 @@
       <select id="set-fc-preStageMode">
         <option value="none" ${preStageMode === "none" ? "selected" : ""}>Disabled (list at each station)</option>
         <option value="preStage" ${preStageMode === "preStage" ? "selected" : ""}>Pre-Stage (deposit to station storage)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Blocked Wait (minutes)</div>
+        <div class="setting-hint">When all pre-stage stations are reserved by other bots, how long to wait before retrying. Longer waits reduce redundant server polling.</div>
+      </div>
+      <input type="number" id="set-fc-blockedWaitMinutes" min="1" max="120" value="${blockedWaitMinutes}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Partial Station Lock</div>
+        <div class="setting-hint">When enabled, a reserved station only locks the cargo amount the bot is actually carrying (not the entire station capacity). This lets multiple bots deposit at the same station simultaneously, since no single bot has enough cargo to fill a station in one trip. When disabled, a station is fully locked for all other bots once reserved.</div>
+      </div>
+      <select id="set-fc-preStagePartialLock">
+        <option value="true" ${preStagePartialLock ? "selected" : ""}>Enabled</option>
+        <option value="false" ${!preStagePartialLock ? "selected" : ""}>Disabled</option>
       </select>
     </div>
 
@@ -21161,6 +21191,14 @@
               document.getElementById("set-fc-remoteUpdateIntervalMinutes")
                 ?.value,
             ) || 60,
+          storageRefreshIntervalMinutes:
+            Math.max(
+              5,
+              parseInt(
+                document.getElementById("set-fc-storageRefreshIntervalMinutes")
+                  ?.value,
+              ) || 15,
+            ),
           skipOutposts:
             document.getElementById("set-fc-skipOutposts")?.value !== "false",
           relearnHours:
@@ -21168,6 +21206,15 @@
             168,
           preStageMode:
             document.getElementById("set-fc-preStageMode")?.value || "none",
+          blockedWaitMinutes:
+            Math.max(
+              1,
+              parseInt(
+                document.getElementById("set-fc-blockedWaitMinutes")?.value,
+              ) || 5,
+            ),
+          preStagePartialLock:
+            document.getElementById("set-fc-preStagePartialLock")?.value !== "false",
           enablePriceUpdates:
             document.getElementById("set-fc-enablePriceUpdates")?.value === "true",
           priceUpdateThreshold:

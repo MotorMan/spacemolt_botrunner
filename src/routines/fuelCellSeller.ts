@@ -57,6 +57,16 @@ const FC_PRESTAGE_LEDGER_FILE = "data/fcPreStageLedger.json";
 const FC_PRESTAGE_LOCK_FILE = "data/fcPreStage.lock";
 const FC_PRESTAGE_RESERVATIONS_FILE = "data/fcPreStageReservations.json";
 const RESERVATION_TIMEOUT_MS = 15 * 60 * 1000;
+/** Minimum time between at-home storage refresh sweeps. The bot hammers the
+ *  server with ~2 exec calls per station × N items, so we throttle this to
+ *  once per interval instead of every cycle. */
+const DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES = 15;
+const MIN_STORAGE_REFRESH_INTERVAL_MINUTES = 5;
+/** How long to wait when the entire pre-stage plan is reserved by other bots.
+ *  A short sleep just re-runs the cycle (and refreshes storage) again, so the
+ *  default is long enough to let other bots finish their deposits. */
+const DEFAULT_BLOCKED_WAIT_MINUTES = 5;
+const MIN_BLOCKED_WAIT_MINUTES = 1;
 /** Curated list of NPC stations. Used only as an exemption list: an NPC station
  *  named "... Outpost" (Void Gate Outpost, Deep Range Outpost) is a real, dockable
  *  station with a market and must never be mistaken as a faction outpost. */
@@ -672,6 +682,7 @@ async function refreshAllStationStorage(
 
   ctx.log("fc", `Refreshing faction storage for ${count} stations...`);
 
+  let errorCount = 0;
   for (let i = 0; i < count; i++) {
     if (bot.state !== "running") {
       ctx.log("fc", "Bot stopped, aborting storage refresh");
@@ -691,9 +702,12 @@ async function refreshAllStationStorage(
 
       const errorMsg = result.factionError || result.stationError || "";
       if (errorMsg) {
+        errorCount++;
         const skipReason = classifyStationError(errorMsg);
         if (skipReason) {
           markStationLearnedSkip(ctx, station, skipReason, errorMsg);
+        } else {
+          ctx.log("fc", `Unexpected storage error at ${station.poiName} (${itemConfig.itemName}): ${errorMsg.split("\n")[0]}`);
         }
       }
     }
@@ -711,7 +725,7 @@ async function refreshAllStationStorage(
   }
 
   saveFCStationsData(data);
-  ctx.log("fc", `Storage refresh complete for ${count} stations`);
+  ctx.log("fc", `Storage refresh complete for ${count} stations` + (errorCount > 0 ? ` (${errorCount} storage errors, see details above)` : ""));
 }
 
 function defaultSellItems(settings: {
@@ -756,6 +770,9 @@ export function getFuelCellSellerSettings(username?: string): {
   skipOutposts: boolean;
   relearnMs: number;
   militaryFuelCellsCount: number;
+  storageRefreshIntervalMs: number;
+  blockedWaitMs: number;
+  preStagePartialLock: boolean;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -795,6 +812,9 @@ export function getFuelCellSellerSettings(username?: string): {
   const enablePriceUpdates = (fc.enablePriceUpdates as boolean) ?? false;
   const priceUpdateThreshold = (fc.priceUpdateThreshold as number) || 10;
 
+  const rawStorageRefreshMin = Number(fc.storageRefreshIntervalMinutes ?? DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES);
+  const rawBlockedWaitMin = Number(fc.blockedWaitMinutes ?? DEFAULT_BLOCKED_WAIT_MINUTES);
+
   return {
     homeSystem: (fc.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
     homeStation: (fc.homeStation as string) || (general.factionStorageStation as string) || "sol_central",
@@ -822,6 +842,13 @@ export function getFuelCellSellerSettings(username?: string): {
       ? Math.round(rawRelearn * 60 * 60 * 1000)
       : DEFAULT_RELEARN_HOURS * 60 * 60 * 1000,
     militaryFuelCellsCount: (fc.militaryFuelCellsCount as number) || 10,
+    storageRefreshIntervalMs: Number.isFinite(rawStorageRefreshMin) && rawStorageRefreshMin > 0
+      ? Math.max(MIN_STORAGE_REFRESH_INTERVAL_MINUTES, Math.round(rawStorageRefreshMin)) * 60 * 1000
+      : DEFAULT_STORAGE_REFRESH_INTERVAL_MINUTES * 60 * 1000,
+    blockedWaitMs: Number.isFinite(rawBlockedWaitMin) && rawBlockedWaitMin > 0
+      ? Math.max(MIN_BLOCKED_WAIT_MINUTES, Math.round(rawBlockedWaitMin)) * 60 * 1000
+      : DEFAULT_BLOCKED_WAIT_MINUTES * 60 * 1000,
+    preStagePartialLock: (fc.preStagePartialLock as boolean) ?? true,
   };
 }
 
@@ -1071,60 +1098,137 @@ async function withPreStageLock(bot: Bot, fn: () => Promise<void>): Promise<void
   await fn();
 }
 
-function loadReservations(): Record<string, { botName: string; reservedAt: string }> {
+interface StationReservationEntry {
+  botName: string;
+  reservedAt: string;
+  reservedQty: number;
+}
+
+type Reservations = Record<string, StationReservationEntry[]>;
+
+/** Backwards-compatible: the old format stored a single { botName, reservedAt }
+ *  per station. The new format stores an array of entries. If the file on disk
+ *  has the legacy shape, it is upgraded transparently on load. */
+function normalizeReservation(raw: unknown): StationReservationEntry[] | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    return raw.filter(
+      (r): r is StationReservationEntry =>
+        typeof r === "object" && r !== null &&
+        typeof r.botName === "string" &&
+        typeof r.reservedAt === "string",
+    ).map(r => ({ botName: r.botName, reservedAt: r.reservedAt, reservedQty: r.reservedQty ?? 0 }));
+  }
+  if (typeof raw === "object" && raw !== null) {
+    const obj = raw as { botName?: string; reservedAt?: string; reservedQty?: number };
+    if (typeof obj.botName === "string" && typeof obj.reservedAt === "string") {
+      return [{ botName: obj.botName, reservedAt: obj.reservedAt, reservedQty: obj.reservedQty ?? 0 }];
+    }
+  }
+  return null;
+}
+
+function loadReservations(): Reservations {
   try {
     if (!existsSync(FC_PRESTAGE_RESERVATIONS_FILE)) return {};
     const raw = readFileSync(FC_PRESTAGE_RESERVATIONS_FILE, "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    const result: Reservations = {};
+    for (const [stationId, val] of Object.entries(parsed || {})) {
+      const arr = normalizeReservation(val);
+      if (arr && arr.length > 0) {
+        result[stationId] = arr;
+      }
+    }
+    return result;
   } catch {
     return {};
   }
 }
 
-function saveReservations(reservations: Record<string, { botName: string; reservedAt: string }>): void {
+function saveReservations(reservations: Reservations): void {
   const payload = JSON.stringify(reservations, null, 2);
   safeWriteFileSync(FC_PRESTAGE_RESERVATIONS_FILE, payload, Buffer.byteLength(payload, "utf-8"));
 }
 
-function cleanExpiredReservations(reservations: Record<string, { botName: string; reservedAt: string }>): void {
+export function cleanExpiredReservations(reservations: Reservations): void {
   const now = Date.now();
-  for (const [stationId, res] of Object.entries(reservations)) {
-    const reservedAt = new Date(res.reservedAt).getTime();
-    if (now - reservedAt > RESERVATION_TIMEOUT_MS) {
+  for (const [stationId, entries] of Object.entries(reservations)) {
+    const live = entries.filter(e => {
+      const reservedAt = new Date(e.reservedAt).getTime();
+      return now - reservedAt < RESERVATION_TIMEOUT_MS;
+    });
+    if (live.length === 0) {
       delete reservations[stationId];
+    } else {
+      reservations[stationId] = live;
     }
   }
 }
 
-function reserveStation(
-  reservations: Record<string, { botName: string; reservedAt: string }>,
-  stationId: string,
-  botName: string,
-): void {
-  reservations[stationId] = { botName, reservedAt: new Date().toISOString() };
+/** Total quantity reserved by *other* bots at this station (expired entries
+ *  already pruned by cleanExpiredReservations). */
+export function reservedQtyByOthers(reservations: Reservations, stationId: string, botName: string): number {
+  const entries = reservations[stationId];
+  if (!entries) return 0;
+  return entries
+    .filter(e => e.botName !== botName)
+    .reduce((sum, e) => sum + e.reservedQty, 0);
 }
 
-function clearStationReservation(
-  reservations: Record<string, { botName: string; reservedAt: string }>,
+export function reserveStation(
+  reservations: Reservations,
+  stationId: string,
+  botName: string,
+  reservedQty: number,
+): void {
+  if (!reservations[stationId]) reservations[stationId] = [];
+  reservations[stationId] = reservations[stationId].filter(e => e.botName !== botName);
+  reservations[stationId].push({ botName, reservedAt: new Date().toISOString(), reservedQty: Math.max(0, reservedQty) });
+}
+
+export function clearStationReservation(
+  reservations: Reservations,
   stationId: string,
   botName: string,
 ): void {
-  const res = reservations[stationId];
-  if (res && res.botName === botName) {
+  const entries = reservations[stationId];
+  if (!entries) return;
+  reservations[stationId] = entries.filter(e => e.botName !== botName);
+  if (reservations[stationId].length === 0) {
     delete reservations[stationId];
   }
 }
 
-function isStationReserved(
-  reservations: Record<string, { botName: string; reservedAt: string }>,
+/**
+ * When preStagePartialLock is enabled: returns true only when the sum of
+ * quantities already reserved by *other* bots plus this bot's planned deposit
+ * would exceed the station's per-item capacity (maxQty). This lets multiple
+ * bots share a station — each only locks the cargo it is actually carrying.
+ *
+ * When preStagePartialLock is disabled: falls back to the original behaviour —
+ * the station is fully locked for any other bot regardless of quantity.
+ */
+export function isStationReserved(
+  reservations: Reservations,
   stationId: string,
   botName: string,
+  plannedQty: number,
+  maxQty: number,
+  partialLock: boolean,
 ): boolean {
-  const res = reservations[stationId];
-  if (!res) return false;
-  const reservedAt = new Date(res.reservedAt).getTime();
-  if (Date.now() - reservedAt > RESERVATION_TIMEOUT_MS) return false;
-  return res.botName !== botName;
+  const entries = reservations[stationId];
+  if (!entries || entries.length === 0) return false;
+
+  const otherEntries = entries.filter(e => e.botName !== botName);
+  if (otherEntries.length === 0) return false;
+
+  if (!partialLock) {
+    return true;
+  }
+
+  const totalFromOthers = otherEntries.reduce((sum, e) => sum + e.reservedQty, 0);
+  return totalFromOthers + plannedQty > maxQty;
 }
 
 interface StorageCheckResult {
@@ -1144,7 +1248,7 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
   let factionError: string | undefined;
   let stationError: string | undefined;
 
-  // Try faction storage first
+   // Try faction storage first
   try {
     const factionResp = await bot.exec("view_faction_storage", { station_id: stationId });
     if (!factionResp.error && factionResp.result) {
@@ -1158,10 +1262,14 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const errMsg = factionError.toLowerCase();
       if (errMsg.includes("does not have a storage facility") || errMsg.includes("no storage facility")) {
         noFactionStorage = true;
+      } else {
+        bot.log("fc", `view_faction_storage error for ${stationId} / ${itemId}: ${factionError.split("\n")[0]}`);
       }
     }
-  } catch {
-    // ignore faction storage errors
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    factionError = msg;
+    bot.log("fc", `view_faction_storage threw for ${stationId} / ${itemId}: ${msg.split("\n")[0]}`);
   }
 
   // Fallback to station storage
@@ -1178,10 +1286,14 @@ async function getRemoteStorageQty(bot: Bot, stationId: string, itemId: string):
       const errMsg = stationError.toLowerCase();
       if (errMsg.includes("does not offer storage")) {
         noStationStorage = true;
+      } else {
+        bot.log("fc", `view_storage error for ${stationId} / ${itemId}: ${stationError.split("\n")[0]}`);
       }
     }
-  } catch {
-    // ignore station storage errors
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    stationError = msg;
+    bot.log("fc", `view_storage threw for ${stationId} / ${itemId}: ${msg.split("\n")[0]}`);
   }
 
   return { qty: 0, hasFactionStorage, hasStationStorage, noStorageFacility: noFactionStorage && noStationStorage, factionError, stationError };
@@ -1569,6 +1681,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
   };
 
   let currentFocusItemId: string | null = null;
+  let lastStorageRefresh: number = 0;
 
   while (bot.state === "running") {
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -1732,7 +1845,16 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
 
-      await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
+      const nowStorage = Date.now();
+      if (nowStorage - lastStorageRefresh >= settings.storageRefreshIntervalMs) {
+        const { eligible: storageEligible } = partitionStations(fcData, settings, cycleFilters);
+        ctx.log("fc", `Refreshing faction storage for ${storageEligible.length} stations...`);
+        await refreshAllStationStorage(ctx, bot, fcData, settings, cycleFilters);
+        lastStorageRefresh = nowStorage;
+        saveFCStationsData(fcData);
+      } else {
+        ctx.log("debug", `Skipping storage refresh — last refreshed ${Math.round((nowStorage - lastStorageRefresh) / 1000 / 60)}min ago (interval: ${Math.round(settings.storageRefreshIntervalMs / 60000)}min)`);
+      }
       if (bot.state !== "running") continue;
 
       const cargoMax = bot.cargoMax || 825;
@@ -1833,6 +1955,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
 
       let selectedPlanIdx = -1;
+      const focusItemConfig = settings.sellItems.find(i => i.itemId === currentFocusItemId) || settings.sellItems[0];
+      const cargoForFocus = focusItemConfig ? getSellItemCargo(bot, focusItemConfig.itemId) : 0;
       await withPreStageLock(bot, async () => {
         const reservations = loadReservations();
         cleanExpiredReservations(reservations);
@@ -1842,10 +1966,13 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         for (let i = 0; i < preStagePlan.length; i++) {
           const candidatePlanIdx = (planOffset + i) % preStagePlan.length;
           const candidate = preStagePlan[candidatePlanIdx];
-          if (!isStationReserved(reservations, candidate.entry.poiId, bot.username)) {
+          const needQty = candidate.needByItem[focusItemConfig.itemId] || 0;
+          const plannedQty = Math.min(cargoForFocus, needQty);
+          const maxQty = focusItemConfig.maxPerStation;
+          if (!isStationReserved(reservations, candidate.entry.poiId, bot.username, plannedQty, maxQty, settings.preStagePartialLock)) {
             selectedPlanIdx = candidatePlanIdx;
             targetIdx = candidate.idx;
-            reserveStation(reservations, candidate.entry.poiId, bot.username);
+            reserveStation(reservations, candidate.entry.poiId, bot.username, plannedQty);
             saveReservations(reservations);
             break;
           }
@@ -1853,8 +1980,22 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       });
 
       if (selectedPlanIdx < 0) {
-        ctx.log("fc", "All stations in pre-stage plan are reserved by other bots — waiting");
-        await ctx.sleep(30000);
+        const reservedStations = loadReservations();
+        const reservedCount = preStagePlan.filter(p => {
+          const entries = reservedStations[p.entry.poiId];
+          if (!entries || entries.length === 0) return false;
+          return entries.some(e => e.botName !== bot.username);
+        }).length;
+        const totalPlanQty = preStagePlan.reduce((sum, p) => sum + Object.values(p.needByItem).reduce((a, b) => a + b, 0), 0);
+        ctx.log(
+          "fc",
+          `All ${reservedCount} stations in pre-stage plan (${preStagePlan.length} total, ${totalPlanQty} units needed) ` +
+          `are reserved by other bots — waiting ${Math.round(settings.blockedWaitMs / 60000)}min` +
+          (settings.preStagePartialLock
+            ? " (partial reservation: stations may become available as other bots finish)"
+            : " (full reservation: stations will not free until the holding bot moves on)"),
+        );
+        await ctx.sleep(settings.blockedWaitMs);
         continue;
       }
     } else {
@@ -2104,7 +2245,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
           continue;
         }
 
-        // Try faction storage first
+  // Try faction storage first
         const factionResp = await bot.exec("storage", {
           action: 'deposit',
           source: 'cargo',

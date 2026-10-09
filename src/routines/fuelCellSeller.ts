@@ -1737,9 +1737,18 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       const cargoMax = bot.cargoMax || 825;
       const cargoUsed = cargoUsedFromInventory(bot);
-      let freeSpace = Math.max(0, cargoMax - cargoUsed);
+      const milItemSize = getItemSize(MILITARY_FUEL_CELL_ITEM_ID);
+      // Reserve cargo space for military fuel cells before loading sell items.
+      // Without this reservation, sell items fill the entire cargo and the
+      // military reserve (needed for emergency in-transit refueling) is never
+      // withdrawn — especially in pre-stage mode where the bot carries a full
+      // load of sell items across many jumps.
+      const milReservedSpace = milDeficit * milItemSize;
+      let freeSpace = Math.max(0, cargoMax - cargoUsed - milReservedSpace);
 
-      // Load sell items first (focus item first), then military reserve with remaining space
+      // Load sell items first (focus item first), then military reserve with
+      // remaining space. The reserved military space is excluded so sell items
+      // never crowd out the emergency fuel reserve.
       const sortedSellItems = currentFocusItemId
         ? [
             ...settings.sellItems.filter(i => i.itemId === currentFocusItemId),
@@ -1768,7 +1777,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         await ctx.sleep(1000);
         await bot.refreshCargo();
         const newCargoUsed = cargoUsedFromInventory(bot);
-        freeSpace = Math.max(0, cargoMax - newCargoUsed);
+        freeSpace = Math.max(0, cargoMax - newCargoUsed - milReservedSpace);
         if (freeSpace <= 0) break;
       }
 
@@ -1777,7 +1786,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const cargoAfterSell = cargoUsedFromInventory(bot);
       const remainingFreeSpace = Math.max(0, cargoMax - cargoAfterSell);
 
-      const milToWithdraw = Math.min(milDeficit, Math.floor(remainingFreeSpace / 3));
+      const milToWithdraw = Math.min(milDeficit, Math.floor(remainingFreeSpace / milItemSize));
 
       if (milToWithdraw > 0 && bot.state === "running") {
         const milWithdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: milToWithdraw });

@@ -1892,16 +1892,29 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       return false;
     }
     let currentCredits = member.credits;
+    let freshStatusFailed = false;
     if (ctx.getBotFreshStatus) {
       const freshStatus = await ctx.getBotFreshStatus(member.username);
       if (freshStatus) {
         currentCredits = freshStatus.credits;
+      } else {
+        // Can't get fresh status — bot may be disconnected or not in local map.
+        // Do NOT fall back to stale member.credits (which may be 0); skip this bot.
+        freshStatusFailed = true;
       }
     }
 
     // Check again after async operation
     if (!shouldContinueCreditTopOff()) {
       return false;
+    }
+
+    // If we couldn't get fresh status, skip this bot rather than risk over-topping
+    // based on stale cached data (which often reads 0 for idle bots).
+    if (freshStatusFailed) {
+      ctx.log("rescue", `💰 ${member.username}: fresh status unavailable, skipping (avoid stale 0-credit top-off)`);
+      consecutiveZeroCredits.delete(member.username);
+      continue;
     }
 
     // Track consecutive 0 credit readings
@@ -1974,7 +1987,9 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     }
 
     if (actualCredits === null) {
-      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, but has ${consecutiveCount} consecutive 0 readings - proceeding with top-off as fallback`);
+      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log after ${consecutiveCount} consecutive 0 readings — skipping top-off to avoid over-topping`);
+      consecutiveZeroCredits.delete(member.username);
+      continue;
     } else if (actualCredits >= minThreshold) {
       ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr (>= ${minThreshold}), false 0 reading. Resetting count.`);
       consecutiveZeroCredits.delete(member.username);

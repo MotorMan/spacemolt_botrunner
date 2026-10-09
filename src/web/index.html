@@ -9556,7 +9556,11 @@
         // Block status updates from clobbering our fresh data.
         window._refreshingStorage = true;
         window._lastStorageRefresh = Date.now();
-
+        // Safety: clear the flag after 5s even if the storage callback never fires.
+        setTimeout(() => { window._refreshingStorage = false; }, 5000);
+         // Safety: clear the flag after 5s even if the storage callback never fires,
+         // so the dashboard doesn't get permanently frozen with stale status data.
+         setTimeout(() => { window._refreshingStorage = false; }, 5000);
         let pending = 0;
         const done = () => {
           renderProfileSidebar();

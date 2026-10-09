@@ -1899,12 +1899,16 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
         if (!resp.error && resp.result && typeof resp.result === "object") {
           this._lastStatusResult = resp.result as Record<string, unknown>;
           this.applyStatusResult(this._lastStatusResult);
+          this.notifyStateChanged();
           return { result: this._lastStatusResult, error: undefined, notifications: [] };
         }
         // The fetch failed but we have a previous good result — keep using it
         // instead of falling back to the possibly-stale account.state.
         if (this._lastStatusResult == null) {
           this._lastStatusResult = this.account.state as unknown as Record<string, unknown>;
+          this.applyStatusResult(this._lastStatusResult);
+          this.notifyStateChanged();
+          return { result: this._lastStatusResult, error: undefined, notifications: [] };
         }
         this.applyStatusResult(this._lastStatusResult);
         return { result: this._lastStatusResult, error: undefined, notifications: [] };

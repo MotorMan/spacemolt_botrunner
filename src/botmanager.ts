@@ -3177,6 +3177,7 @@ async function main(): Promise<void> {
         debugLogForBot("SYSTEM", "periodic:keepalive", `Session keep-alive for ${keepAliveCount} idle bot(s)`);
       }
       await Promise.allSettled(keepAlivePromises);
+      refreshStatusTable();
     } catch (err) {
       console.error('Error in periodic session keep-alive:', err);
     }

@@ -13,6 +13,57 @@ import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
 import { loadSettings } from "../web/server.js";
 import { readSellOutcome } from "./sellOutcome.js";
 
+function readCreditDepositSettings(settings: Record<string, unknown>): {
+  creditDepositThreshold: number;
+  creditDepositIntervalSec: number;
+} {
+  const mr = (settings.market_routine as Record<string, unknown> | undefined) || {};
+  const threshold = typeof mr.creditDepositThreshold === "number" && mr.creditDepositThreshold > 0
+    ? mr.creditDepositThreshold
+    : 100000;
+  const interval = typeof mr.creditDepositIntervalSec === "number" && mr.creditDepositIntervalSec > 0
+    ? mr.creditDepositIntervalSec
+    : 300;
+  return { creditDepositThreshold: threshold, creditDepositIntervalSec: interval };
+}
+
+async function tryDepositExcessCredits(
+  bot: Bot,
+  ctx: RoutineContext,
+  lastCreditDepositAt: number,
+): Promise<number> {
+  try {
+    const settings = loadSettings();
+    const { creditDepositThreshold, creditDepositIntervalSec } = readCreditDepositSettings(settings);
+
+    if (Date.now() - lastCreditDepositAt < creditDepositIntervalSec * 1000) return lastCreditDepositAt;
+
+    await bot.refreshStatus();
+    if (!bot.docked || bot.credits <= creditDepositThreshold) return lastCreditDepositAt;
+    if (!bot.faction) return lastCreditDepositAt;
+
+    const excess = bot.credits - creditDepositThreshold;
+    if (excess <= 0) return lastCreditDepositAt;
+
+    const depositResp = await bot.exec("storage", {
+      action: "deposit",
+      target: "faction",
+      item_id: "credits",
+      quantity: excess,
+    });
+    if (!depositResp.error) {
+      ctx.log("trade", `Market routine: deposited ${excess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
+      return Date.now();
+    } else {
+      ctx.log("warn", `Market routine: credit deposit to faction failed: ${depositResp.error.message}`);
+    }
+    return Date.now();
+  } catch (e) {
+    ctx.log("warn", `Market routine: credit deposit exception: ${e instanceof Error ? e.message : String(e)}`);
+    return Date.now();
+  }
+}
+
 function saveItemsToMarketDetails(
   systemId: string,
   stationKey: string,
@@ -255,6 +306,7 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let currentBaseId: string | null = null;
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
   let lastShipBrowseAt = 0;
+  let lastCreditDepositAt = 0;
   const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
   let wasConnected = bot.isConnected();
   const placedOrders = new Map<string, { price: number; quantity: number }>();
@@ -524,6 +576,9 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       lastShipBrowseAt = Date.now();
     }
+
+    // Periodically deposit excess credits to faction storage.
+    lastCreditDepositAt = await tryDepositExcessCredits(bot, ctx, lastCreditDepositAt);
 
     await ctx.sleep(10000);
   }

@@ -729,6 +729,19 @@ if (!this.settings.fuel_service) {
       (this.settings.general as Record<string, unknown>).periodicRefreshSec = 30;
       saveSettings(this.settings);
     }
+    // Initialize market_routine defaults
+    if (!this.settings.market_routine) {
+      this.settings.market_routine = {};
+    }
+    const mr = this.settings.market_routine as Record<string, unknown>;
+    if (mr.creditDepositThreshold === undefined) {
+      mr.creditDepositThreshold = 100000;
+      saveSettings(this.settings);
+    }
+    if (mr.creditDepositIntervalSec === undefined) {
+      mr.creditDepositIntervalSec = 300;
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
@@ -1309,6 +1322,8 @@ if (!this.settings.fuel_service) {
             const settings = this.settings;
             const globalItems = (((settings.market_routine as Record<string, unknown>) || {}).globalItems as Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>) || [];
             const sellToStationOrdersOnly = !!((settings.market_routine as Record<string, unknown>) || {}).sellToStationOrdersOnly;
+            const creditDepositThreshold = ((settings.market_routine as Record<string, unknown>) || {}).creditDepositThreshold ?? 100000;
+            const creditDepositIntervalSec = ((settings.market_routine as Record<string, unknown>) || {}).creditDepositIntervalSec ?? 300;
             const perBot: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>> = {};
             for (const [key, value] of Object.entries(settings)) {
               if (key === "market_routine" || key === "general" || key === "clerk" || key === "flock" || key === "botAssignments") continue;
@@ -1318,17 +1333,23 @@ if (!this.settings.fuel_service) {
                 perBot[key] = items;
               }
             }
-            return Response.json({ global: globalItems, perBot, sellToStationOrdersOnly });
+            return Response.json({ global: globalItems, perBot, sellToStationOrdersOnly, creditDepositThreshold, creditDepositIntervalSec });
           }
           if (req.method === "POST") {
-            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>>; sellToStationOrdersOnly?: boolean };
-            console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [], sellToStationOrdersOnly: body.sellToStationOrdersOnly });
+            const body = await req.json() as { global?: Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>; perBot?: Record<string, Array<{itemId: string; itemName: string; minSellPrice: number; preloadToStation: number}>>; sellToStationOrdersOnly?: boolean; creditDepositThreshold?: number; creditDepositIntervalSec?: number };
+            console.log("[market-routine-settings] POST received:", { globalCount: body.global?.length ?? 0, perBotKeys: body.perBot ? Object.keys(body.perBot) : [], sellToStationOrdersOnly: body.sellToStationOrdersOnly, creditDepositThreshold: body.creditDepositThreshold, creditDepositIntervalSec: body.creditDepositIntervalSec });
             if (!this.settings.market_routine) this.settings.market_routine = {};
             if (body.global) {
               this.settings.market_routine.globalItems = body.global;
             }
             if (body.sellToStationOrdersOnly !== undefined) {
               this.settings.market_routine.sellToStationOrdersOnly = body.sellToStationOrdersOnly;
+            }
+            if (body.creditDepositThreshold !== undefined) {
+              this.settings.market_routine.creditDepositThreshold = body.creditDepositThreshold;
+            }
+            if (body.creditDepositIntervalSec !== undefined) {
+              this.settings.market_routine.creditDepositIntervalSec = body.creditDepositIntervalSec;
             }
             if (body.perBot) {
               for (const [botName, items] of Object.entries(body.perBot)) {

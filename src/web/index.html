@@ -707,6 +707,9 @@
             >
               Module Seller
             </div>
+            <div class="sidebar-item" onclick="switchSettingsTab('market')">
+              Market
+            </div>
             <div
               class="sidebar-item"
               onclick="switchSettingsTab('client_sync')"
@@ -13937,6 +13940,7 @@
           module_seller: renderModuleSellerSettings,
           client_sync: renderClientSyncSettings,
           fuel_service: renderFuelServiceSettings,
+          market: renderMarketSettings,
         };
         const fn = dispatch[activeSettingsTab];
         if (!fn) return;
@@ -42004,6 +42008,70 @@ ignoreBlacklist: document.getElementById(
         // Refresh the remote bot list now that settings may have changed.
         fetchRemoteBots();
       }
+
+       function renderMarketSettings(panel) {
+         const mr = settings.market_routine || {};
+         const creditDepositThreshold = mr.creditDepositThreshold ?? 100000;
+         const creditDepositIntervalSec = mr.creditDepositIntervalSec ?? 300;
+
+         panel.innerHTML = `
+     <h3>Market Routine Settings</h3>
+     <div class="settings-desc">Global settings for the market routine: credit deposit to faction storage, sell-item monitoring, and ship browsing.</div>
+
+     <div style="padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg);margin-bottom:16px">
+       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏦 Credit Deposit to Faction Storage</div>
+       <div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">
+         When the bot is docked and in a faction, any credits above the threshold are automatically deposited to faction storage on the configured interval. This helps keep faction funds consolidated.
+       </div>
+
+       <div class="setting-row">
+         <div>
+           <div class="setting-label">Credit Deposit Threshold (cr)</div>
+           <div class="setting-hint">Keep this many credits on the bot; deposit any excess above this to faction storage.</div>
+         </div>
+         <input type="number" id="set-market-creditDepositThreshold" min="0" value="${creditDepositThreshold}" style="width:120px">
+       </div>
+
+       <div class="setting-row">
+         <div>
+           <div class="setting-label">Credit Deposit Interval (seconds)</div>
+           <div class="setting-hint">How often to check and deposit excess credits to faction storage.</div>
+         </div>
+         <input type="number" id="set-market-creditDepositIntervalSec" min="1" value="${creditDepositIntervalSec}" style="width:120px">
+       </div>
+     </div>
+
+     <div class="settings-save-bar">
+       <button class="primary" onclick="saveMarketSettings()">Save Settings</button>
+     </div>
+   `;
+       }
+
+       async function saveMarketSettings() {
+         const threshold = parseInt(document.getElementById("set-market-creditDepositThreshold")?.value, 10) || 100000;
+         const interval = parseInt(document.getElementById("set-market-creditDepositIntervalSec")?.value, 10) || 300;
+         try {
+           const res = await fetch("/api/market-routine-settings", {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+             body: JSON.stringify({ creditDepositThreshold: threshold, creditDepositIntervalSec: interval }),
+           });
+           if (!res.ok) {
+             const txt = await res.text().catch(() => "");
+             throw new Error(`HTTP ${res.status}${txt ? ": " + txt : ""}`);
+           }
+           settings.market_routine = {
+             ...(settings.market_routine || {}),
+             creditDepositThreshold: threshold,
+             creditDepositIntervalSec: interval,
+           };
+           captureSettingsPanelSnapshot();
+           alert("Market settings saved.");
+         } catch (e) {
+           console.error("Failed to save market settings:", e);
+           alert("Failed to save market settings: " + (e instanceof Error ? e.message : String(e)));
+         }
+       }
 
       function renderFuelServiceSettings(panel) {
         const fs = settings.fuel_service || {};

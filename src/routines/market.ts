@@ -53,10 +53,24 @@ async function tryDepositExcessCredits(
       ctx.log("info", `Credit deposit: credits ${bot.credits} <= threshold ${creditDepositThreshold}, nothing to deposit`);
       return Date.now();
     }
-    if (!bot.faction) {
-      ctx.log("info", `Credit deposit: bot has no faction (credits=${bot.credits}, threshold=${creditDepositThreshold})`);
+
+    // Confirm faction membership by probing storage — bot.faction from
+    // get_status isn't always populated; the storage probe is authoritative
+    // (matches the pattern in faction_trader.ts:1457).
+    const factionResp = await bot.exec("storage", { action: "view", target: "faction" });
+    if (factionResp.error) {
+      const msg = factionResp.error.message || "";
+      if (/not_in_faction|must be in a faction/i.test(msg)) {
+        ctx.log("info", `Credit deposit: bot is not in a faction (credits=${bot.credits}, threshold=${creditDepositThreshold})`);
+      } else {
+        ctx.log("warn", `Credit deposit: faction probe failed: ${factionResp.error.code} ${msg}`);
+      }
       return Date.now();
     }
+
+    const factionResult = (factionResp.result ?? {}) as Record<string, unknown>;
+    const factionId = (factionResult.faction_id as string) || (factionResult.faction_name as string) || null;
+    if (factionId && !bot.faction) bot.faction = factionId;
 
     const excess = bot.credits - creditDepositThreshold;
     if (excess <= 0) {

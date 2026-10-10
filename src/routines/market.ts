@@ -90,6 +90,42 @@ async function tryDepositExcessCredits(
     if (!depositResp.error) {
       ctx.log("trade", `Market routine: deposited ${excess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
       return Date.now();
+    }
+
+    // Handle stale credits: if the deposit failed because the bot doesn't actually
+    // have enough credits (bot.credits was stale from the throttled get_status),
+    // fetch a fresh get_status directly (bypassing the refreshStatus throttle) and
+    // retry with the correct amount.
+    if (/insufficient_credits/i.test(depositResp.error.message || "")) {
+      ctx.log("info", `Credit deposit: stale balance (reported ${excess}cr excess), fetching fresh status and retrying`);
+      const freshStatusResp = await bot.exec("get_status");
+      if (freshStatusResp.error) {
+        ctx.log("warn", `Credit deposit: fresh get_status failed: ${freshStatusResp.error.code} ${freshStatusResp.error.message}`);
+        return Date.now();
+      }
+      const freshResult = (freshStatusResp.result ?? {}) as Record<string, unknown>;
+      const location = freshResult.location as Record<string, unknown> | undefined;
+      const player = freshResult.player as Record<string, unknown> | undefined;
+      const p = location || player || freshResult;
+      const actualCredits = (player?.credits as number) ?? (freshResult.credits as number) ?? (p.credits as number) ?? bot.credits;
+      if (actualCredits !== bot.credits) bot.credits = actualCredits;
+      const actualExcess = actualCredits - creditDepositThreshold;
+      if (actualExcess <= 0) {
+        ctx.log("info", `Credit deposit: after fresh fetch, credits ${actualCredits} <= threshold ${creditDepositThreshold}, nothing to deposit`);
+        return Date.now();
+      }
+      ctx.log("info", `Credit deposit: retrying with ${actualExcess}cr (fresh balance=${actualCredits})`);
+      const retryResp = await bot.exec("storage", {
+        action: "deposit" as const,
+        target: "faction",
+        item_id: "credits",
+        quantity: actualExcess,
+      });
+      if (!retryResp.error) {
+        ctx.log("trade", `Market routine: deposited ${actualExcess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
+        return Date.now();
+      }
+      ctx.log("warn", `Market routine: credit deposit retry failed: ${retryResp.error.code} ${retryResp.error.message}`);
     } else {
       ctx.log("warn", `Market routine: credit deposit to faction failed: ${depositResp.error.code} ${depositResp.error.message}`);
     }

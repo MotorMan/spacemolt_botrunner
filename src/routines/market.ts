@@ -35,27 +35,49 @@ async function tryDepositExcessCredits(
   try {
     const settings = loadSettings();
     const { creditDepositThreshold, creditDepositIntervalSec } = readCreditDepositSettings(settings);
+    const now = Date.now();
+    const timeSinceLast = now - lastCreditDepositAt;
+    const intervalMs = creditDepositIntervalSec * 1000;
 
-    if (Date.now() - lastCreditDepositAt < creditDepositIntervalSec * 1000) return lastCreditDepositAt;
+    if (timeSinceLast < intervalMs) {
+      return lastCreditDepositAt;
+    }
 
     await bot.refreshStatus();
-    if (!bot.docked || bot.credits <= creditDepositThreshold) return lastCreditDepositAt;
-    if (!bot.faction) return lastCreditDepositAt;
+
+    if (!bot.docked) {
+      ctx.log("info", `Credit deposit: bot not docked (docked=${bot.docked}, credits=${bot.credits}, faction=${bot.faction ?? "none"})`);
+      return Date.now();
+    }
+    if (bot.credits <= creditDepositThreshold) {
+      ctx.log("info", `Credit deposit: credits ${bot.credits} <= threshold ${creditDepositThreshold}, nothing to deposit`);
+      return Date.now();
+    }
+    if (!bot.faction) {
+      ctx.log("info", `Credit deposit: bot has no faction (credits=${bot.credits}, threshold=${creditDepositThreshold})`);
+      return Date.now();
+    }
 
     const excess = bot.credits - creditDepositThreshold;
-    if (excess <= 0) return lastCreditDepositAt;
+    if (excess <= 0) {
+      ctx.log("info", `Credit deposit: excess ${excess} <= 0, skipping`);
+      return Date.now();
+    }
 
-    const depositResp = await bot.exec("storage", {
-      action: "deposit",
+    const depositPayload = {
+      action: "deposit" as const,
       target: "faction",
       item_id: "credits",
       quantity: excess,
-    });
+    };
+    ctx.log("info", `Credit deposit: dispatching storage.deposit for ${excess}cr to faction (threshold=${creditDepositThreshold}, interval=${creditDepositIntervalSec}s)`);
+    const depositResp = await bot.exec("storage", depositPayload);
+
     if (!depositResp.error) {
       ctx.log("trade", `Market routine: deposited ${excess}cr to faction storage (retained ${creditDepositThreshold}cr)`);
       return Date.now();
     } else {
-      ctx.log("warn", `Market routine: credit deposit to faction failed: ${depositResp.error.message}`);
+      ctx.log("warn", `Market routine: credit deposit to faction failed: ${depositResp.error.code} ${depositResp.error.message}`);
     }
     return Date.now();
   } catch (e) {

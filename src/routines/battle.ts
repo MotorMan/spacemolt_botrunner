@@ -175,6 +175,8 @@ let rawEntities: Array<Record<string, unknown>> = [];
       rawEntities = r.players as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.nearby)) {
       rawEntities = r.nearby as Array<Record<string, unknown>>;
+    } else if (Array.isArray(r.objects)) {
+      rawEntities = r.objects as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.pirates)) {
       rawEntities = r.pirates as Array<Record<string, unknown>>;
     } else if (Array.isArray(r.creatures)) {
@@ -280,7 +282,7 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
 
 export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
   if (!huntCreatures) return false;
-  return !!(entity.isCreature || entity.type === "creature");
+  return !!(entity.isCreature || entity.type === "creature" || (entity.id && entity.id.startsWith("crt_")) || isCreatureName(entity.name));
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────

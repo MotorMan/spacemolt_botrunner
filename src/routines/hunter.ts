@@ -254,7 +254,7 @@ function shouldFleeFromBigCreature(
 
 /**
  * Returns true if a creature has been branded by another faction/ranch.
- * Branded creatures must NEVER be attacked â€” the branding marker lives in the
+ * Branded creatures must NEVER be attacked — the branding marker lives in the
  * creature's display name (not the hex id), so we check the name before picking
  * the id to attack. Future game updates may impose penalties for killing branded
  * livestock, so we skip them everywhere today.
@@ -262,6 +262,19 @@ function shouldFleeFromBigCreature(
 function isBrandedCreature(name: string | undefined): boolean {
   if (!name) return false;
   return name.toLowerCase().includes("branded");
+}
+
+/**
+ * Returns true if a creature is protected and must NEVER be attacked.
+ *
+ * Currently only "Cloudwhale Calf" is protected: killing the calf prevents the
+ * adult Cloudwhale from ever spawning, and calves drop poor loot. This is
+ * checked at target-selection time (pickCreatureTargets / big creature hunt)
+ * so the hunter simply skips over them and engages other targets instead.
+ */
+function isProtectedCreature(name: string | undefined): boolean {
+  if (!name) return false;
+  return name.toLowerCase().includes("cloudwhale calf");
 }
 
 /**
@@ -1449,7 +1462,7 @@ function claimCreature(ctx: RoutineContext, target: { id: string; name: string }
   const settings = getHunterSettings(bot.username);
   if (settings.coordinationMode === "off") return;
   const isCreature = !!(target as any).isCreature || isCreatureTarget(target as any, true);
-  if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name)) return;
+  if (!isCreature || isLeviathanCreature(target.name) || isBrandedCreature(target.name) || isProtectedCreature(target.name)) return;
   if (isBigCreature(target.name) && !canAttackBigCreatures(bot)) return;
   const existing = creatureClaims.get(target.id);
   if (existing && existing.claimer === bot.username) return;
@@ -1499,7 +1512,7 @@ function isCreatureClaimedByOther(creatureId: string, username: string): boolean
  */
 function pickCreatureTargets(entities: NearbyEntity[], bot: Bot, huntCreatures: boolean, max: number, coordinationMode: HunterCoordinationMode): NearbyEntity[] {
   releaseExpiredCreatureClaims();
-  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name));
+  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name));
   const unclaimed = creatures.filter(e =>
     isLeviathanCreature(e.name) || coordinationMode !== "avoid" || !isCreatureClaimedByOther(e.id, bot.username),
   );
@@ -1630,6 +1643,9 @@ function broadcastHunterAssist(ctx: RoutineContext, target: { id: string; name: 
   if (settings.coordinationMode === "off") return;
   // Branded creatures are NEVER broadcast â€” they belong to another faction.
   if (creature && isBrandedCreature(target.name)) return;
+  // Protected creatures (e.g. Cloudwhale Calf) are NEVER broadcast — they must
+  // not be attacked or drawn into combat via assist requests.
+  if (creature && isProtectedCreature(target.name)) return;
   if (creature && settings.coordinationMode === "avoid" && !isLeviathanCreature(target.name)) return;
   if (creature && isBigCreature(target.name) && !canAttackBigCreatures(ctx.bot)) return;
   botChatChannel.send({
@@ -1743,9 +1759,12 @@ continue;
     }
 
     const valid = req.creature
-      ? isCreatureTarget(match, true) && !isBrandedCreature(match.name)
+      ? isCreatureTarget(match, true) && !isBrandedCreature(match.name) && !isProtectedCreature(match.name)
       : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
     if (!valid) {
+      if (req.creature && isProtectedCreature(req.targetName)) {
+        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (Cloudwhale Calf)`);
+      }
       handled.add(key);
       continue;
     }
@@ -2907,7 +2926,7 @@ async function farmSystemForBigCreature(
       bot.trackWildlife(afterBattleData);
 
       const entities = parseNearby(afterBattleData);
-      const allCreatures = entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name));
+      const allCreatures = entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name));
       const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
       const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
       const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);
@@ -3042,6 +3061,38 @@ async function creatureFarmRandomFallbackCycle(
     isCombatBot: true,
     joinBattles: true,
   };
+
+  // â”€â”€ Pre-navigation survival checks â”€â”€
+  // This fallback is reached from hunt_big_creatures when no known big
+  // creatures exist. A bot started out in the wild with 0 fuel cells cannot
+  // refuel in the field, so check the cell stash BEFORE committing to a jump â€”
+  // otherwise it strands itself on a random system hop (the reported bug).
+  // These mirror the pre-engagement checks in creatureFarmRoutine /
+  // huntBigCreaturesRoutine, adapted to return out of this one-shot cycle.
+  const homeSystem = settings.homeSystem || "";
+  const homeStation = settings.homeStation || "";
+
+  await bot.refreshCargo();
+  const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+  if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+    ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
+    await returnToHomeAndResupply(ctx, settings);
+    return;
+  }
+
+  const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
+  if (fueled !== "fueled") {
+    await handleFuelCheckFailure(ctx, settings, fueled);
+    return;
+  }
+
+  await bot.refreshShip();
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  if (hullPct <= settings.repairThreshold) {
+    ctx.log("system", `Hull at ${hullPct}% â€” returning home to repair`);
+    await returnToHomeAndResupply(ctx, settings);
+    return;
+  }
 
   if (bot.system !== targetSystem) {
     ctx.log("travel", `Fallback farm: heading to ${targetSystem}...`);

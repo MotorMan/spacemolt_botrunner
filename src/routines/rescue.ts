@@ -8205,6 +8205,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         ctx.log("rescue", `🛢️ Starting chain rescue — looking for more stranded bots from ${bot.system}...`);
         let chainCount = 0;
         const MAX_CHAIN_RESCUES = 20;
+        const failedChainTargets = new Set<string>();
 
         while (chainCount < MAX_CHAIN_RESCUES) {
           // Re-scan fleet for stranded bots
@@ -8215,7 +8216,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const chainNow = Date.now();
           chainStranded = chainStranded.filter(t => {
             const expiry = rescueCompletionCooldown.get(t.username);
-            return !expiry || expiry <= chainNow;
+            return (!expiry || expiry <= chainNow) && !failedChainTargets.has(t.username);
           });
 
           if (chainStranded.length === 0) {
@@ -8298,6 +8299,33 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           await bot.refreshLocation();
 
+          // Travel to the target's POI within the system
+          if (closest.poi) {
+            const { pois } = await getSystemInfo(ctx);
+            const chainTargetPoiLower = closest.poi.toLowerCase();
+            const chainMatchedPoi = pois.find(p => {
+              const pName = (p.name || "").toLowerCase();
+              const pId = (p.id || "").toLowerCase();
+              return pName === chainTargetPoiLower || pId === chainTargetPoiLower;
+            });
+            if (chainMatchedPoi) {
+              ctx.log("rescue", `🛢️ Chain: traveling to ${closest.username}'s location (${chainMatchedPoi.name || chainMatchedPoi.id})...`);
+              const poiTravelResp = await bot.exec("travel", { target_poi: chainMatchedPoi.id });
+              if (poiTravelResp.error) {
+                const poiErrMsg = poiTravelResp.error.message.toLowerCase();
+                if (poiTravelResp.error.code === "battle_interrupt" || poiErrMsg.includes("interrupted by battle") || poiErrMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Chain travel interrupted by battle! fleeing!`);
+                  const { fleeFromBattle } = await import("./common.js");
+                  await fleeFromBattle(ctx);
+                  await ctx.sleep(5000);
+                  continue;
+                }
+              }
+            } else {
+              ctx.log("rescue", `⚠️ Chain: could not resolve POI "${closest.poi}" in ${bot.system} — will try refuel anyway`);
+            }
+          }
+
           // Deliver fuel via pump
           const chainPlayerId = await findPlayerId(ctx, closest.username);
           if (!chainPlayerId) {
@@ -8317,10 +8345,105 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           if (chainRefuelResp.error) {
             const errLower = chainRefuelResp.error.message.toLowerCase();
+
             if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
               ctx.log("rescue", `ℹ️ Chain: ${closest.username} tank already full — skipping`);
-            } else {
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              continue;
+            }
+
+            // Target may have moved — parse new location from error message
+            const movedLocation = parseDifferentLocationError(chainRefuelResp.error.message);
+            if (!movedLocation) {
               ctx.log("warn", `Chain rescue: refuel failed for ${closest.username}: ${chainRefuelResp.error.message}`);
+              failedChainTargets.add(closest.username);
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              await ctx.sleep(3000);
+              continue;
+            }
+
+            const resolved = resolveSystemForLocationName(movedLocation);
+            if (!resolved) {
+              ctx.log("warn", `Chain: ${closest.username} moved to "${movedLocation}" but system unknown — skipping`);
+              failedChainTargets.add(closest.username);
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              await ctx.sleep(3000);
+              continue;
+            }
+
+            ctx.log("rescue", `🔄 Chain: ${closest.username} moved to ${resolved.poiName} (${resolved.systemId}) — retargeting...`);
+
+            // Navigate to the new system if different
+            if (normalizeSystemName(bot.system || "") !== normalizeSystemName(resolved.systemId)) {
+              await ensureUndocked(ctx);
+              const chainRetargetOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+              const chainRetargetArrived = await navigateToSystem(ctx, resolved.systemId, chainRetargetOpts);
+              if (!chainRetargetArrived) {
+                ctx.log("warn", `Chain: failed to reach ${resolved.systemId} for retarget — skipping`);
+                failedChainTargets.add(closest.username);
+                if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+                await ctx.sleep(3000);
+                continue;
+              }
+              await bot.refreshLocation();
+            }
+
+            // Travel to the target's POI
+            if (resolved.poiId) {
+              const retargetTravelResp = await bot.exec("travel", { target_poi: resolved.poiId });
+              if (retargetTravelResp.error) {
+                const rtErr = retargetTravelResp.error.message.toLowerCase();
+                if (retargetTravelResp.error.code === "battle_interrupt" || rtErr.includes("interrupted by battle") || rtErr.includes("interrupted by combat")) {
+                  ctx.log("combat", `Chain: retarget travel interrupted by battle! fleeing!`);
+                  const { fleeFromBattle } = await import("./common.js");
+                  await fleeFromBattle(ctx);
+                  await ctx.sleep(5000);
+                  if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+                  continue;
+                }
+              }
+            }
+
+            // Retry the refuel at the new location
+            const chainRecheckId = await findPlayerId(ctx, closest.username);
+            if (!chainRecheckId) {
+              ctx.log("warn", `Chain: could not find ${closest.username} at new location — skipping`);
+              failedChainTargets.add(closest.username);
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              await ctx.sleep(3000);
+              continue;
+            }
+
+            const chainRetryMax = Math.min(Math.floor(bot.fuel / 3), settings.maxFuelDelivery);
+            if (chainRetryMax <= 0) {
+              ctx.log("rescue", `⛽ Chain: not enough fuel for retarget retry — ending chain`);
+              failedChainTargets.add(closest.username);
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              break;
+            }
+
+            const chainRetryResp = await bot.exec("refuel", { target: chainRecheckId, quantity: chainRetryMax });
+            if (chainRetryResp.error) {
+              const retryErrLower = chainRetryResp.error.message.toLowerCase();
+              if (retryErrLower.includes("target_tank_full") || retryErrLower.includes("fuel tank is already full")) {
+                ctx.log("rescue", `ℹ️ Chain: ${closest.username} tank already full after retarget — skipping`);
+              } else {
+                ctx.log("warn", `Chain: retarget retry failed for ${closest.username}: ${chainRetryResp.error.message}`);
+                failedChainTargets.add(closest.username);
+                await ctx.sleep(3000);
+              }
+              if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+              continue;
+            } else {
+              const chainRetryResult = chainRetryResp.result as Record<string, unknown> | undefined;
+              if (chainRetryResult) {
+                const chainRetryDelta = Math.abs(chainRetryResult.fuel as number || chainRetryResult.quantity as number || 0);
+                ctx.log("rescue", `✓ Chain rescue #${chainCount + 1}: transferred ${chainRetryDelta} fuel to ${closest.username} (retargeted to ${resolved.poiName})`);
+              } else {
+                ctx.log("rescue", `✓ Chain rescue #${chainCount + 1}: refueled ${closest.username} (retargeted to ${resolved.poiName})`);
+              }
+              rescueCompletionCooldown.set(closest.username, Date.now() + rescueCompletionCooldownMs);
+              chainCount++;
             }
           } else {
             const chainResult = chainRefuelResp.result as Record<string, unknown> | undefined;

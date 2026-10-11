@@ -1,9 +1,12 @@
 import type { Routine, RoutineContext } from "../bot.js";
-import { enableCloakingIfPossible, ensureDocked, ensureUndocked, sleep, readSettings } from "./common.js";
+import { enableCloakingIfPossible, ensureDocked, ensureUndocked, readSettings } from "./common.js";
 
 interface LbCRefSettings {
   refuelTarget: string;
   refuelQuantity: number;
+  dockedMode?: boolean;
+  dockedPoi?: string;
+  scanIntervalMs?: number;
 }
 
 function getLbCRefSettings(botUsername?: string): LbCRefSettings {
@@ -15,6 +18,9 @@ function getLbCRefSettings(botUsername?: string): LbCRefSettings {
   return {
     refuelTarget: typeof raw.refuelTarget === "string" ? raw.refuelTarget : "",
     refuelQuantity: typeof raw.refuelQuantity === "number" ? raw.refuelQuantity : 1,
+    dockedMode: typeof raw.dockedMode === "boolean" ? raw.dockedMode : false,
+    dockedPoi: typeof raw.dockedPoi === "string" ? raw.dockedPoi : undefined,
+    scanIntervalMs: typeof raw.scanIntervalMs === "number" ? raw.scanIntervalMs : 2000,
   };
 }
 
@@ -31,7 +37,92 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
     return;
   }
 
-  ctx.log("system", `LB-C-ReF online — target=${settings.refuelTarget} qty=${settings.refuelQuantity}`);
+  ctx.log("system", `LB-C-ReF online — target=${settings.refuelTarget} qty=${settings.refuelQuantity} dockedMode=${settings.dockedMode}`);
+
+  if (settings.dockedMode) {
+    while (bot.state === "running") {
+      const docked = await ensureDocked(ctx, true);
+      if (!docked) {
+        ctx.log("warn", "LB-C-ReF (docked): Could not dock — retrying in 5s");
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      try {
+        const obsResp = await bot.subscribeToObservation(false);
+        if (obsResp.error) {
+          ctx.log("warn", `LB-C-ReF (docked): subscribe_observation failed: ${obsResp.error.message}`);
+        }
+      } catch (err) {
+        ctx.log("warn", `LB-C-ReF (docked): subscribe_observation error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      const recentlyRefueled = new Map<string, number>();
+      const cooldownMs = 30000;
+
+      let obsUnsub: (() => void) | null = null;
+      try {
+        const acct: any = (bot as any).account;
+        if (acct && typeof acct.on === "function") {
+          obsUnsub = acct.on("observation_update", () => {});
+        }
+      } catch {}
+
+      ctx.log("system", "LB-C-ReF (docked): Monitoring for players to refuel...");
+
+      while (bot.state === "running") {
+        await bot.refreshShip();
+        try {
+          bot.trackNearbyPlayers(bot.getObservationResult());
+        } catch {}
+
+        const obs = bot.getObservationResult();
+        const players = (obs.players || []) as any[];
+
+        for (const player of players) {
+          const username = (player.username as string) || (player.name as string) || (player.player_id as string);
+          if (!username) continue;
+          const now = Date.now();
+          const last = recentlyRefueled.get(username);
+          if (last && now - last < cooldownMs) continue;
+
+          try {
+            yield `refuel_player_${username}`;
+            const resp = await bot.exec("refuel", { target: username, quantity: settings.refuelQuantity });
+            if (!resp.error) {
+              recentlyRefueled.set(username, now);
+              ctx.log("system", `LB-C-ReF (docked): Refueled ${username} (+${settings.refuelQuantity})`);
+              const cutoff = now - cooldownMs * 2;
+              for (const [k, t] of recentlyRefueled.entries()) {
+                if (t < cutoff) recentlyRefueled.delete(k);
+              }
+            } else {
+              const errMsg = String(resp.error.message || "").toLowerCase();
+              if (errMsg.includes("not nearby") || errMsg.includes("too far") || errMsg.includes("must be closer")) {
+                // ignore
+              } else if (/rate limit|too many requests|temporarily blocked/.test(errMsg)) {
+                ctx.log("warn", "LB-C-ReF (docked) rate limited");
+                await ctx.sleep(10000);
+                break;
+              } else {
+                ctx.log("warn", `LB-C-ReF (docked): Failed to refuel ${username}: ${resp.error.message}`);
+              }
+            }
+          } catch (err) {
+            ctx.log("warn", `LB-C-ReF (docked): Error refueling ${username}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        await ctx.sleep(settings.scanIntervalMs || 2000);
+      }
+
+      if (obsUnsub) {
+        try { obsUnsub(); } catch {}
+        obsUnsub = null;
+      }
+    }
+    return;
+  }
 
   while (bot.state === "running") {
     yield "init_cloak";
@@ -48,23 +139,16 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
     while (bot.state === "running") {
       await bot.refreshShip();
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-
       if (fuelPct <= 0) {
         ctx.log("system", `LB-C-ReF: Fuel depleted (${fuelPct}%) — breaking to dock`);
         break;
       }
-
       if (!bot.isCloaked) {
         ctx.log("system", "LB-C-ReF: Cloak dropped — breaking to re-cloak");
         break;
       }
-
       yield `refuel_${refuelCount}`;
-      const resp = await bot.exec("refuel", {
-        target: settings.refuelTarget,
-        quantity: settings.refuelQuantity,
-      });
-
+      const resp = await bot.exec("refuel", { target: settings.refuelTarget, quantity: settings.refuelQuantity });
       if (!resp.error) {
         refuelCount++;
         failCount = 0;
@@ -73,7 +157,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
         failCount++;
         const msg = String(resp.error.message || "").toLowerCase();
         if (/rate limit|too many requests|temporarily blocked/.test(msg)) {
-          ctx.log("warn", `LB-C-ReF rate limited — backing off 10s`);
+          ctx.log("warn", "LB-C-ReF rate limited — backing off 10s");
           await ctx.sleep(10000);
           continue;
         }
@@ -83,11 +167,10 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
       }
-
       const notifications = (resp as any).notifications || [];
       for (const n of notifications) {
         const notification = (n || {}) as Record<string, unknown>;
-        const notifMsg = ((notification.data as Record<string, unknown>) || {}).message as string || notification.message as string || "";
+        const notifMsg = ((notification.data as Record<string, unknown>) || {}).message as string || (notification.message as string) || "";
         if (notifMsg) {
           ctx.log("rescue", `LB-C-ReF notification: ${notifMsg}`);
         }

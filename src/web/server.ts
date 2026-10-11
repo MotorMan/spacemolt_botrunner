@@ -2890,8 +2890,11 @@ if (!this.settings.fuel_service) {
                }
              }
 
-             // Phase 4: Install in cargo-aware batches
-             while (needed.length > 0) {
+              // Phase 4: Install in cargo-aware batches.
+              // Reverse so utility modules (CPU, PWR, reactor, etc.) install first —
+              // they provide the resources the weapons/defense modules need.
+              needed.reverse();
+              while (needed.length > 0) {
                await bot.refreshCargo();
                const cargoUsed = bot.cargo;
                const cargoMax = bot.cargoMax;

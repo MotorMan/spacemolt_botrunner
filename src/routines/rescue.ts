@@ -8203,26 +8203,29 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       if (!isAtHome) {
         ctx.log("rescue", `🛢️ Starting chain rescue — looking for more stranded bots from ${bot.system}...`);
-        let chainCount = 0;
-        const MAX_CHAIN_RESCUES = 20;
-        const failedChainTargets = new Set<string>();
+         let chainCount = 0;
+         const MAX_CHAIN_RESCUES = 25;
+         const failedChainTargets = new Set<string>();
 
-        while (chainCount < MAX_CHAIN_RESCUES) {
-          // Re-scan fleet for stranded bots
-          const chainFleet = await getTrackingFleet(ctx);
-          let chainStranded = findStrandedBots(chainFleet, bot.username, settings.fuelThreshold);
+         while (chainCount < MAX_CHAIN_RESCUES) {
+           await ctx.sleep(1000);
 
-          // Filter out recently rescued targets (cooldown prevents re-rescue)
-          const chainNow = Date.now();
-          chainStranded = chainStranded.filter(t => {
-            const expiry = rescueCompletionCooldown.get(t.username);
-            return (!expiry || expiry <= chainNow) && !failedChainTargets.has(t.username);
-          });
+           // Re-scan fleet for stranded bots
+           const chainFleet = await getTrackingFleet(ctx);
+           let chainStranded = findStrandedBots(chainFleet, bot.username, settings.fuelThreshold);
 
-          if (chainStranded.length === 0) {
-            ctx.log("rescue", `🏁 No more stranded bots — ending chain rescue after ${chainCount} additional rescue(s)`);
-            break;
-          }
+           // Filter out recently rescued targets (cooldown prevents re-rescue)
+           const chainNow = Date.now();
+           chainStranded = chainStranded.filter(t => {
+             const expiry = rescueCompletionCooldown.get(t.username);
+             return (!expiry || expiry <= chainNow) && !failedChainTargets.has(t.username);
+           });
+
+           if (chainStranded.length === 0) {
+             ctx.log("rescue", `🏁 No more stranded bots — ending chain rescue after ${chainCount} additional rescue(s)`);
+             break;
+           }
+
 
           // Pick the closest stranded bot using jumpsBetweenSystems (synchronous)
           let closest: RescueTarget | null = null;
@@ -8252,6 +8255,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           if (chainQueuedRescue && !claimRescue(chainQueuedRescue.id, bot.username)) {
             ctx.log("rescue", `🤝 ${chainQueuedRescue.targetUsername} already claimed by ${chainQueuedRescue.claimedBy} — skipping in chain`);
+            failedChainTargets.add(closest.username);
+            await ctx.sleep(3000);
             continue;
           }
 
@@ -8278,7 +8283,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const decision = shouldProceedOrYield(chainClaim, partnerClaim);
               if (decision === "yield") {
                 ctx.log("coop", `🤝 Chain: yielding ${closest.username} to ${partnerClaim.botName} (closer: ${partnerClaim.jumps} vs ${closestJumps} jumps)`);
+                failedChainTargets.add(closest.username);
                 if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+                await ctx.sleep(3000);
                 continue;
               }
             }

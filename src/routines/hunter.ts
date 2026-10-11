@@ -407,24 +407,35 @@ async function handleUnexpectedBattle(
   const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
 
   if (boardingEnabled && fakeTarget) {
-    const canBoard = await checkBoardingCapability(ctx);
-    if (canBoard) {
-      const fitMarines = await getFitMarineCount(ctx);
-      const marineRequirement = boardingMarines > 0 ? boardingMarines : 1;
-      if (fitMarines < marineRequirement) {
-        ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
-      } else {
-        const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
-        ctx.log("combat", `ðŸ›¸ Boarding: engaging unexpected battle with ${boardingTarget.name} (shields â‰¤ ${boardingShieldThreshold}% â†’ board)`);
-        broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
-        broadcastBoardingClaim(ctx, boardingTarget);
-        const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
-        if (result === "failed") {
-          ctx.log("combat", `Boarding failed for ${boardingTarget.name} â€” switching to fire stance to finish`);
-          // âš ï¸ CRITICAL: Pass cloakOnStart through â€” re-cloak must happen immediately after battle
-          await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, isCreatureName(boardingTarget.name));
+    // NEVER attempt boarding on creatures - they are not capturable ships
+    const boardingTargetName = fakeTarget.name || "";
+    if (isCreatureName(boardingTargetName)) {
+      ctx.log("combat", `âš ï¸ ${boardingTargetName} is a creature - cannot board, engaging with fire stance`);
+    } else {
+      const canBoard = await checkBoardingCapability(ctx);
+      if (canBoard) {
+        const fitMarines = await getFitMarineCount(ctx);
+        const marineRequirement = boardingMarines > 0 ? boardingMarines : 1;
+        if (fitMarines < marineRequirement) {
+          ctx.log("combat", `Boarding: insufficient fit marines (${fitMarines} aboard, need ${marineRequirement}) â€” cannot board`);
+        } else {
+          const boardingTarget = pickLowestShieldsEnemy(battleStatus, analysis.sideId) || fakeTarget;
+          // Double-check the actual target isn't a creature
+          if (isCreatureName(boardingTarget.name)) {
+            ctx.log("combat", `âš ï¸ ${boardingTarget.name} is a creature - cannot board, engaging with fire stance`);
+          } else {
+            ctx.log("combat", `ðŸ›¸ Boarding: engaging unexpected battle with ${boardingTarget.name} (shields â‰¤ ${boardingShieldThreshold}% â†’ board)`);
+            broadcastHunterAssist(ctx, boardingTarget, isCreatureName(boardingTarget.name));
+            broadcastBoardingClaim(ctx, boardingTarget);
+            const result = await boardingSubroutine(ctx, boardingTarget, boardingShieldThreshold, boardingMarines, fleeThreshold, effectiveShieldRechargePct, cloakOnStart);
+            if (result === "failed") {
+              ctx.log("combat", `Boarding failed for ${boardingTarget.name} â€” switching to fire stance to finish`);
+              // âš ï¸ CRITICAL: Pass cloakOnStart through â€” re-cloak must happen immediately after battle
+              await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, isCreatureName(boardingTarget.name));
+            }
+            return;
+          }
         }
-        return;
       }
     }
   }
@@ -8261,7 +8272,8 @@ async function* engageBoardingTargetsAtCurrentPoi(
 
       const canBoard = settings.boardingEnabled
         && settings.boardingShieldThreshold > 0
-        && await checkBoardingCapability(ctx);
+        && await checkBoardingCapability(ctx)
+        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
 
       if (canBoard) {
         const fitMarines = await getFitMarineCount(ctx);
@@ -8586,7 +8598,8 @@ async function* boardingSystemPass(
       // Determine if we should attempt boarding this target
       const canBoard = settings.boardingEnabled
         && settings.boardingShieldThreshold > 0
-        && await checkBoardingCapability(ctx);
+        && await checkBoardingCapability(ctx)
+        && !isCreatureTarget(target as any, true); // NEVER board creatures - they are not capturable
 
       if (canBoard) {
         const fitMarines = await getFitMarineCount(ctx);

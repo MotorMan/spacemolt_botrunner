@@ -3076,6 +3076,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           let pickedFleetTarget: RescueTarget | null = null;
 
           for (const candidate of shuffled) {
+            // Calculate real distance before broadcasting so partner bots
+            // receive an accurate jump count (not a hardcoded 0).
+            const myJumps = await calculateJumpsToTarget(bot, candidate.system, settings.ignoreBlacklist);
             // Broadcast claim for candidate so other rescue bots back out
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
@@ -3083,7 +3086,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               system: candidate.system,
               poi: candidate.poi,
               timestamp: new Date().toISOString(),
-              jumps: 0,
+              jumps: myJumps,
               botName: bot.username,
             };
 
@@ -3106,8 +3109,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             );
 
             if (otherClaims.length > 0) {
-              const myDistance = await calculateJumpsToTarget(bot, candidate.system, settings.ignoreBlacklist);
-
+              const myDistance = myJumps;
               const othersCloser = otherClaims.some((c) => {
                 if (c.jumps >= 0 && myDistance >= 0 && c.jumps < myDistance) return true;
                 if (c.jumps < 0 && myDistance >= 0) return true;
@@ -5982,8 +5984,8 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
         if (member.username !== bot.username && !isOwnBot(member.username)) {
           markAsOwnBot(member.username);
           ctx.log("rescue", `🤝 Marked ${member.username} as our bot (will not blacklist or ghost)`);
+          }
         }
-      }
 
         // Check if we're the primary FLEET rescue bot. A non-primary bot only
         // helps when there are 2+ stranded fleet members (a surge the single
@@ -5993,6 +5995,14 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
         const strandedBots = fleetRescueEnabled
           ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
           : [];
+
+        // Add each stranded bot to the rescue queue so the file-based atomic
+        // claim (claimRescue) can prevent two rescue bots from targeting the
+        // same stranded bot at the same time.
+        for (const sb of strandedBots) {
+          addToRescueQueue(sb.username, sb.system, sb.poi || "", sb.fuelPct, sb.docked);
+        }
+
         if (!fleetRescueEnabled) {
           ctx.log("rescue", `📴 FLEET rescue DISABLED in settings - skipping fleet targets`);
         } else if (!isFleetRescuePrimary) {
@@ -6569,9 +6579,90 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       // ── Rescue the most critical bot ──
-      target = maydayTarget || targets[0];
+      if (maydayTarget) {
+        target = maydayTarget;
+        isMaydayTarget = true;
+      } else if (targets.length > 0) {
+        // Fleet rescue: coordinate with partner bot to avoid two bots chasing
+        // the same stranded target. Shuffle targets so both bots don't always
+        // pick the same most-critical first bot.
+        const shuffled = [...targets].sort(() => Math.random() - 0.5);
+        let pickedFleetTarget: RescueTarget | null = null;
+
+        for (const candidate of shuffled) {
+          // Try the file-based atomic claim first — works cross-process when
+          // both bots share a filesystem.
+          const queue = getRescueQueue();
+          const queuedRescue = queue.pending.find(
+            r => r.targetUsername === candidate.username &&
+                 r.system === candidate.system &&
+                 !r.completed
+          );
+
+          if (queuedRescue && !claimRescue(queuedRescue.id, bot.username)) {
+            // Already claimed by another bot — try next candidate
+            ctx.log("rescue", `🤝 ${queuedRescue.targetUsername} already claimed by ${queuedRescue.claimedBy} — trying next target`);
+            continue;
+          }
+
+          // Atomically claimed (or no queue entry for cross-client stranding)
+          pickedFleetTarget = candidate;
+
+          // If cooperation is enabled, broadcast our claim and check for
+          // partner claims so bots on separate clients can still deconflict.
+          if (isCooperationEnabled()) {
+            const myJumps = await calculateJumpsToTarget(bot, candidate.system, settings.ignoreBlacklist);
+            const myClaim: RescueClaim = {
+              type: "RESCUE_CLAIM",
+              player: candidate.username,
+              system: candidate.system,
+              poi: candidate.poi,
+              timestamp: new Date().toISOString(),
+              jumps: myJumps,
+              botName: bot.username,
+            };
+
+            const sendResult = await broadcastRescueClaim(bot, myClaim);
+            if (sendResult.ok) {
+              ctx.log("coop", `📧 Broadcast fleet claim: ${candidate.username} at ${candidate.system} (${myJumps} jumps)`);
+            } else {
+              ctx.log("coop", `⚠️ Failed to broadcast fleet claim: ${sendResult.error}`);
+            }
+
+            // Wait briefly for partner claims to arrive via the Bot Chat relay
+            await ctx.sleep(3000);
+
+            const partnerClaim = isRescueClaimedByPartner(
+              candidate.username,
+              candidate.system,
+              candidate.poi,
+              bot.username
+            );
+
+            if (partnerClaim) {
+              const decision = shouldProceedOrYield(myClaim, partnerClaim);
+              if (decision === "yield") {
+                ctx.log("coop", `🤝 Yielding fleet rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${myJumps} jumps)`);
+                // Release our atomic claim since we're yielding
+                if (queuedRescue) {
+                  releaseRescueClaim(queuedRescue.id, bot.username);
+                }
+                continue; // Try next candidate
+              }
+            }
+          }
+
+          break; // Found our target
+        }
+
+        target = pickedFleetTarget;
+      }
+
       isMaydayTarget = !!maydayTarget;
       logCategory = isMaydayTarget ? "mayday" : "rescue";
+      if (target) {
+        ctx.log("rescue", `🎯 Fleet rescue selected: ${target.username} at ${target.system} (${target.fuelPct}% fuel, ${targets.length} candidates)`);
+      }
     }
 
     if (!target) {
@@ -7836,9 +7927,65 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
         }
       }
-    }
+     }
 
-    // ── Handle a FAILED / unnecessary rescue ──
+     // ── Multi-bot refuel: refuel all additional stranded bots in the same
+     // system before returning home, so we don't make a 10-jump round trip
+     // just to rescue one bot at a time. ──
+     if (rescueDelivered && hasPump && !skipToReturnHome) {
+       const currentFleet = await getTrackingFleet(ctx);
+       const fleetStranded = findStrandedBots(currentFleet, bot.username, settings.fuelThreshold);
+       const sameSystemExtras = fleetStranded.filter(t =>
+         t.username !== target.username &&
+         normalizeSystemName(t.system || "") === normalizeSystemName(target.system || "")
+       );
+
+       if (sameSystemExtras.length > 0) {
+         ctx.log("rescue", `🛢️ ${sameSystemExtras.length} additional stranded bot(s) in ${target.system} — refueling before returning home`);
+         for (const extra of sameSystemExtras) {
+           if (bot.state !== "running") break;
+           if (bot.fuel <= 0) {
+             ctx.log("rescue", `⚠️ Out of fuel — skipping remaining nearby rescues`);
+             break;
+           }
+
+           ctx.log("rescue", `🔄 Nearby rescue: ${extra.username} at ${extra.fuelPct}% fuel`);
+
+           const extraPlayerId = await findPlayerId(ctx, extra.username);
+           if (!extraPlayerId) {
+             ctx.log("warn", `Could not find player ID for ${extra.username} — skipping nearby rescue`);
+             continue;
+           }
+
+           const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), settings.maxFuelDelivery);
+           if (maxDeliverable <= 0) {
+             ctx.log("rescue", `⚠️ Not enough fuel to help ${extra.username}`);
+             continue;
+           }
+
+           const extraRefuelResp = await bot.exec("refuel", { target: extraPlayerId, quantity: maxDeliverable });
+           if (extraRefuelResp.error) {
+             const errLower = extraRefuelResp.error.message.toLowerCase();
+             if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
+               ctx.log("rescue", `ℹ️ ${extra.username}'s tank already full — skipping`);
+               continue;
+             }
+             ctx.log("warn", `Failed to refuel ${extra.username}: ${extraRefuelResp.error.message}`);
+             continue;
+           }
+
+           const extraResult = extraRefuelResp.result as Record<string, unknown> | undefined;
+           if (extraResult) {
+             const extraFuelDelta = Math.abs(extraResult.fuel as number || extraResult.quantity as number || 0);
+             ctx.log("rescue", `✓ Transferred ${extraFuelDelta} fuel to ${extra.username}`);
+           } else {
+             ctx.log("rescue", `✓ Refueled ${extra.username}`);
+           }
+         }
+       }
+     }
+
+     // ── Handle a FAILED / unnecessary rescue ──
     // If we never actually delivered fuel/help this cycle, we must NOT bill the
     // player or announce a successful rescue. This covers: target not found,
     // moved out of reach, tank already full because another rescuer got there
@@ -8041,6 +8188,160 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }, cooldownSec * 1000);
         } else {
           ctx.log("rescue", `🔇 Faction announcement disabled for this rescue`);
+        }
+      }
+    }
+
+    // ── Chain rescue: after completing a rescue, look for more stranded bots
+    // in the fleet and rescue them before returning home. This prevents the
+    // bot from making a 10-jump round trip to home between each rescue when
+    // multiple bots need help across the galaxy. ──
+    if (rescueDelivered && !isMaydayTarget && !skipToReturnHome && hasPump) {
+      const isAtHome = homeSystem
+        ? normalizeSystemName(bot.system) === normalizeSystemName(homeSystem)
+        : false;
+
+      if (!isAtHome) {
+        ctx.log("rescue", `🛢️ Starting chain rescue — looking for more stranded bots from ${bot.system}...`);
+        let chainCount = 0;
+        const MAX_CHAIN_RESCUES = 20;
+
+        while (chainCount < MAX_CHAIN_RESCUES) {
+          // Re-scan fleet for stranded bots
+          const chainFleet = await getTrackingFleet(ctx);
+          let chainStranded = findStrandedBots(chainFleet, bot.username, settings.fuelThreshold);
+
+          // Filter out recently rescued targets (cooldown prevents re-rescue)
+          const chainNow = Date.now();
+          chainStranded = chainStranded.filter(t => {
+            const expiry = rescueCompletionCooldown.get(t.username);
+            return !expiry || expiry <= chainNow;
+          });
+
+          if (chainStranded.length === 0) {
+            ctx.log("rescue", `🏁 No more stranded bots — ending chain rescue after ${chainCount} additional rescue(s)`);
+            break;
+          }
+
+          // Pick the closest stranded bot using jumpsBetweenSystems (synchronous)
+          let closest: RescueTarget | null = null;
+          let closestJumps: number | null = null;
+          for (const candidate of chainStranded) {
+            const jumps = jumpsBetweenSystems(bot.system || "", candidate.system);
+            if (jumps !== null) {
+              if (closestJumps === null || jumps < closestJumps) {
+                closest = candidate;
+                closestJumps = jumps;
+              }
+            }
+          }
+
+          if (!closest || closestJumps === null) {
+            ctx.log("rescue", `🏁 Could not route to any stranded bot — ending chain rescue`);
+            break;
+          }
+
+          // File-based atomic claim (cross-process safe)
+          const chainQueue = getRescueQueue();
+          const chainQueuedRescue = chainQueue.pending.find(
+            r => r.targetUsername === closest.username &&
+                 r.system === closest.system &&
+                 !r.completed
+          );
+
+          if (chainQueuedRescue && !claimRescue(chainQueuedRescue.id, bot.username)) {
+            ctx.log("rescue", `🤝 ${chainQueuedRescue.targetUsername} already claimed by ${chainQueuedRescue.claimedBy} — skipping in chain`);
+            continue;
+          }
+
+          // Cooperation: broadcast claim and check for partner claims
+          if (isCooperationEnabled()) {
+            const chainClaim: RescueClaim = {
+              type: "RESCUE_CLAIM",
+              player: closest.username,
+              system: closest.system,
+              poi: closest.poi,
+              timestamp: new Date().toISOString(),
+              jumps: closestJumps,
+              botName: bot.username,
+            };
+
+            await broadcastRescueClaim(bot, chainClaim);
+            await ctx.sleep(3000);
+
+            const partnerClaim = isRescueClaimedByPartner(
+              closest.username, closest.system, closest.poi, bot.username
+            );
+
+            if (partnerClaim) {
+              const decision = shouldProceedOrYield(chainClaim, partnerClaim);
+              if (decision === "yield") {
+                ctx.log("coop", `🤝 Chain: yielding ${closest.username} to ${partnerClaim.botName} (closer: ${partnerClaim.jumps} vs ${closestJumps} jumps)`);
+                if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+                continue;
+              }
+            }
+          }
+
+          // Navigate to the target system
+          ctx.log("rescue", `🛢️ Chain #${chainCount + 1}: navigating to ${closest.username} at ${closest.system} (${closestJumps} jumps, ${closest.fuelPct}% fuel)...`);
+          yield "chain_rescue";
+          await ensureUndocked(ctx);
+          const chainSafetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+          const chainArrived = await navigateToSystem(ctx, closest.system, chainSafetyOpts);
+
+          if (!chainArrived) {
+            ctx.log("warn", `Chain rescue: failed to reach ${closest.system} — ending chain`);
+            if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+            break;
+          }
+
+          await bot.refreshLocation();
+
+          // Deliver fuel via pump
+          const chainPlayerId = await findPlayerId(ctx, closest.username);
+          if (!chainPlayerId) {
+            ctx.log("warn", `Chain rescue: could not find player ID for ${closest.username}`);
+            if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+            continue;
+          }
+
+          const chainMaxDeliverable = Math.min(Math.floor(bot.fuel / 3), settings.maxFuelDelivery);
+          if (chainMaxDeliverable <= 0) {
+            ctx.log("rescue", `⛽ Chain rescue: not enough fuel — ending chain`);
+            if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+            break;
+          }
+
+          const chainRefuelResp = await bot.exec("refuel", { target: chainPlayerId, quantity: chainMaxDeliverable });
+
+          if (chainRefuelResp.error) {
+            const errLower = chainRefuelResp.error.message.toLowerCase();
+            if (errLower.includes("target_tank_full") || errLower.includes("fuel tank is already full")) {
+              ctx.log("rescue", `ℹ️ Chain: ${closest.username} tank already full — skipping`);
+            } else {
+              ctx.log("warn", `Chain rescue: refuel failed for ${closest.username}: ${chainRefuelResp.error.message}`);
+            }
+          } else {
+            const chainResult = chainRefuelResp.result as Record<string, unknown> | undefined;
+            if (chainResult) {
+              const chainFuelDelta = Math.abs(chainResult.fuel as number || chainResult.quantity as number || 0);
+              ctx.log("rescue", `✓ Chain rescue #${chainCount + 1}: transferred ${chainFuelDelta} fuel to ${closest.username}`);
+            } else {
+              ctx.log("rescue", `✓ Chain rescue #${chainCount + 1}: refueled ${closest.username}`);
+            }
+            rescueCompletionCooldown.set(closest.username, Date.now() + rescueCompletionCooldownMs);
+            chainCount++;
+          }
+
+          if (chainQueuedRescue) releaseRescueClaim(chainQueuedRescue.id, bot.username);
+
+          // Check if we need to refuel self before continuing
+          const chainFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (chainFuelPct < settings.refuelThreshold) {
+            ctx.log("rescue", `⛽ Chain rescue: fuel low at ${chainFuelPct}% — ending chain to refuel`);
+            break;
+          }
         }
       }
     }

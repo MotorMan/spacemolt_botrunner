@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
@@ -6278,6 +6278,11 @@
           <input type="text" id="pbs-lbcref-target" value="${esc((lbCRef.refuelTarget || ""))}" placeholder="bot username" style="font-size:11px;padding:2px 4px;width:120px">
           <span class="sl">Qty</span>
           <input type="number" id="pbs-lbcref-qty" value="${(lbCRef.refuelQuantity || 1)}" min="1" max="100" style="font-size:11px;padding:2px 4px;width:70px">
+        
+          <span class="sl">Docked Mode</span>
+          <label style="display:flex;align-items:center;gap:4px;font-size:11px"><input type="checkbox" id="pbs-lbcref-docked" > Stay docked & refuel nearby</label>
+          <span class="sl">Scan Interval (ms)</span>
+          <input type="number" id="pbs-lbcref-scan" value="" min="500" max="10000" step="500" style="font-size:11px;padding:2px 4px;width:70px">
         </div>
         <button class="primary sm" onclick="savePerBotLbCRefSettings()" style="margin-top:8px">Save LB-C-ReF</button>
       </div>
@@ -6395,11 +6400,15 @@
         if (!bot) return;
         const target = document.getElementById("pbs-lbcref-target")?.value || "";
         const qty = parseInt(document.getElementById("pbs-lbcref-qty")?.value || "1", 10);
+        const docked = document.getElementById("pbs-lbcref-docked")?.checked || false;
+        const scan = parseInt(document.getElementById("pbs-lbcref-scan")?.value || "2000", 10);
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, {
           lb_c_ref: {
             refuelTarget: target,
             refuelQuantity: Number.isFinite(qty) ? qty : 1,
+            dockedMode: docked,
+            scanIntervalMs: Number.isFinite(scan) ? scan : 2000,
           },
         });
         send({
@@ -44005,3 +44014,5 @@ function saveFuelServiceSettings() {
     </script>
   </body>
 </html>
+
+

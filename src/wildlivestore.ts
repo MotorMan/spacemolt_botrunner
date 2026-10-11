@@ -155,6 +155,7 @@ export class WildlifeStore {
 
   constructor() {
     this.migrateIfNeeded();
+    this.cleanupDisplayNames();
     this.startTimers();
   }
 
@@ -804,6 +805,107 @@ export class WildlifeStore {
       evicted++;
     }
     return evicted;
+  }
+
+  /**
+   * One-time cleanup: remove POI entries and fix system names that were
+   * persisted as display names instead of canonical ids.
+   *
+   * A bug stored the game's human-readable poi display name (e.g.
+   * "Shaula Gas Plume") as the POI key instead of the canonical id.  Once the
+   * game started returning canonical ids those display-name keys became
+   * orphans: reconcile() never visits them again, so they persist forever
+   * on disk.  Any POI key or `system` field containing a space is treated
+   * as a display name and removed (the system field is sanitized rather
+   * than dropped).
+   */
+  cleanupDisplayNames(): void {
+    let removedPois = 0;
+    const touchedSystems = new Set<string>();
+
+    // Clean on-disk files for systems not currently in the hot cache.
+    for (const key of this.listSystemKeys()) {
+      if (this.cache.has(key)) continue;
+      const path = this.systemFilePath(key);
+      if (!existsSync(path)) continue;
+
+      let sys: SystemWildlife;
+      try {
+        sys = JSON.parse(readFileSync(path, "utf-8")) as SystemWildlife;
+        if (!sys.pois) sys.pois = {};
+      } catch {
+        continue;
+      }
+
+      const removed = this.stripDisplayNames(sys);
+      if (removed === 0) continue;
+
+      removedPois += removed;
+      touchedSystems.add(key);
+      const empty = Object.keys(sys.pois).length === 0 && !sys.survey;
+      if (empty) {
+        try { unlinkSync(path); } catch { /* already gone */ }
+      } else {
+        const payload = JSON.stringify(sys) + "\n";
+        safeWriteFileSync(path, payload, Buffer.byteLength(payload, "utf-8"));
+      }
+    }
+
+    // Clean hot-cache entries that haven't been flushed to disk yet.
+    const cacheToDelete: string[] = [];
+    for (const [key, entry] of this.cache) {
+      const removed = this.stripDisplayNames(entry.sys);
+      if (removed > 0) {
+        removedPois += removed;
+        entry.dirty = true;
+        entry.sys.lastUpdated = new Date().toISOString();
+        const empty = Object.keys(entry.sys.pois).length === 0 && !entry.sys.survey;
+        if (empty) {
+          cacheToDelete.push(key);
+          const path = this.systemFilePath(key);
+          try { unlinkSync(path); } catch { /* fine */ }
+        } else {
+          touchedSystems.add(key);
+        }
+      }
+    }
+    for (const key of cacheToDelete) {
+      this.cache.delete(key);
+    }
+
+    if (removedPois > 0 || touchedSystems.size > 0) {
+      console.log(
+        `[WildlifeStore] Cleaned up ${removedPois} display-name POI entr` +
+        (removedPois === 1 ? "y" : "ies") +
+        ` from ${touchedSystems.size} system(s)`,
+      );
+    }
+  }
+
+  /**
+   * Strip display-name (space-containing) keys from a single SystemWildlife.
+   * Sanitizes the `system` field if it is a display name; removes POI keys
+   * that contain spaces.  Returns the number of removed POI entries.
+   */
+  private stripDisplayNames(sys: SystemWildlife): number {
+    let removed = 0;
+
+    // Fix the system field if it is a display name (contains spaces).
+    if (typeof sys.system === "string" && sys.system.includes(" ")) {
+      sys.system = sanitizeSystemName(sys.system);
+    }
+
+    // Remove POI keys that are display names (contain spaces).
+    if (sys.pois) {
+      for (const poiKey of Object.keys(sys.pois)) {
+        if (poiKey.includes(" ")) {
+          delete sys.pois[poiKey];
+          removed++;
+        }
+      }
+    }
+
+    return removed;
   }
 
   /**

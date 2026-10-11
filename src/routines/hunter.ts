@@ -278,6 +278,33 @@ function isProtectedCreature(name: string | undefined): boolean {
 }
 
 /**
+ * Returns true if a creature is an adult Cloud Whale (not a calf, not a leviathan).
+ * Cloud Whales hunt in packs and should only be engaged when enough are present
+ * to leave breeding pairs behind.
+ */
+function isCloudWhale(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return lower.includes("cloudwhale") && !lower.includes("cloudwhale calf");
+}
+
+/**
+ * Apply the Cloud Whale pack rule to a list of creature entities.
+ *
+ * Cloud Whales attack in packs. We only engage them when at least 3 are present,
+ * and when we do, we kill only 1 and leave the remaining 2+ to breed. With 2 or
+ * fewer, we remove all of them so they can breed undisturbed.
+ */
+function applyCloudWhalePackRule(entities: NearbyEntity[]): NearbyEntity[] {
+  const cloudWhales = entities.filter(e => isCloudWhale(e.name));
+  const others = entities.filter(e => !isCloudWhale(e.name));
+  if (cloudWhales.length < 3) {
+    return others;
+  }
+  return [...others, cloudWhales[0]];
+}
+
+/**
  * Record a creature kill to the historical data store for later system scoring.
  * Only records when creatureFarmRecordKills is enabled and the target is actually
  * a creature (not a pirate).
@@ -1512,7 +1539,7 @@ function isCreatureClaimedByOther(creatureId: string, username: string): boolean
  */
 function pickCreatureTargets(entities: NearbyEntity[], bot: Bot, huntCreatures: boolean, max: number, coordinationMode: HunterCoordinationMode): NearbyEntity[] {
   releaseExpiredCreatureClaims();
-  const creatures = entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name));
+  const creatures = applyCloudWhalePackRule(entities.filter(e => isCreatureTarget(e, huntCreatures) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name)));
   const unclaimed = creatures.filter(e =>
     isLeviathanCreature(e.name) || coordinationMode !== "avoid" || !isCreatureClaimedByOther(e.id, bot.username),
   );
@@ -2634,6 +2661,7 @@ function findKnownBigCreatures(): Array<{ system: string; poi: string; name: str
   const all = wildlifeStore.getAll();
   return all
     .filter(c => isKnownBigCreature(c) && c.count > 0 && !isBigCreatureBannedSystem(c.system))
+    .filter(c => !isCloudWhale(c.name) || c.count >= 3)
     .map(c => ({
       system: c.system,
       poi: c.poi,
@@ -2926,7 +2954,7 @@ async function farmSystemForBigCreature(
       bot.trackWildlife(afterBattleData);
 
       const entities = parseNearby(afterBattleData);
-      const allCreatures = entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name));
+      const allCreatures = applyCloudWhalePackRule(entities.filter(e => isCreatureTarget(e, true) && !isStationEntity(e) && !isBrandedCreature(e.name) && !isProtectedCreature(e.name)));
       const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
       const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
       const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);

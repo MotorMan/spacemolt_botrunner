@@ -267,25 +267,26 @@ function isBrandedCreature(name: string | undefined): boolean {
 /**
  * Returns true if a creature is protected and must NEVER be attacked.
  *
- * Currently only "Cloudwhale Calf" is protected: killing the calf prevents the
- * adult Cloudwhale from ever spawning, and calves drop poor loot. This is
+ * Cloudwhale Calves and Hatchlings are protected: killing them prevents the
+ * adult Cloudwhale from ever spawning, and they drop poor loot. This is
  * checked at target-selection time (pickCreatureTargets / big creature hunt)
  * so the hunter simply skips over them and engages other targets instead.
  */
 function isProtectedCreature(name: string | undefined): boolean {
   if (!name) return false;
-  return name.toLowerCase().includes("cloudwhale calf");
+  const lower = name.toLowerCase();
+  return lower.includes("cloudwhale calf") || lower.includes("cloudwhale hatchling");
 }
 
 /**
- * Returns true if a creature is an adult Cloud Whale (not a calf, not a leviathan).
- * Cloud Whales hunt in packs and should only be engaged when enough are present
- * to leave breeding pairs behind.
+ * Returns true if a creature is an adult Cloud Whale (not a calf or hatchling,
+ * not a leviathan). Cloud Whales hunt in packs and should only be engaged when
+ * enough are present to leave breeding pairs behind.
  */
 function isCloudWhale(name: string | undefined): boolean {
   if (!name) return false;
   const lower = name.toLowerCase();
-  return lower.includes("cloudwhale") && !lower.includes("cloudwhale calf");
+  return lower.includes("cloudwhale") && !lower.includes("cloudwhale calf") && !lower.includes("cloudwhale hatchling");
 }
 
 /**
@@ -1790,7 +1791,7 @@ continue;
       : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
     if (!valid) {
       if (req.creature && isProtectedCreature(req.targetName)) {
-        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (Cloudwhale Calf)`);
+        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (Cloudwhale Calf/Hatchling)`);
       }
       handled.add(key);
       continue;

@@ -341,11 +341,16 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       const r = routeResp.result as any;
       const est = r.estimated_fuel ?? 0;
       const avail = r.fuel_available ?? bot.fuel;
-      if (avail >= est) {
+      // 0 fuel means no movement is possible at all — every jump and POI
+      // travel costs at least 1 fuel. Even when the route estimate is 0
+      // (e.g. same-system destination), the bot still needs ≥1 fuel to travel
+      // to the station POI. Require max(est, 1) so 0 fuel always triggers refuel.
+      const minFuel = Math.max(est, 1);
+      if (avail >= minFuel) {
         needsRefuel = false;
-        ctx.log("system", `Route fuel check: ${avail} available >= ${est} needed — no refuel required`);
+        ctx.log("system", `Route fuel check: ${avail} available >= ${minFuel} needed — no refuel required`);
       } else {
-        ctx.log("system", `Route needs ${est - avail} more fuel — will refuel`);
+        ctx.log("system", `Route needs ${minFuel - avail} more fuel — will refuel`);
       }
     }
   } catch {}

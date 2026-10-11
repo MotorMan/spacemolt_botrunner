@@ -2117,7 +2117,9 @@ export async function checkRouteFuel(
     const hasWormhole = routeHasWormhole(raw.route);
     let affordable: boolean | undefined;
     if (raw.fuel_available !== undefined && raw.estimated_fuel !== undefined && !hasWormhole) {
-      affordable = raw.fuel_available >= raw.estimated_fuel;
+      // 0 fuel means no movement is possible — a jump and any POI travel
+      // each cost at least 1 fuel, so 0/0 is NOT affordable (can't move at all).
+      affordable = raw.fuel_available >= Math.max(raw.estimated_fuel, 1);
     }
     return {
       found: true,
@@ -2540,7 +2542,7 @@ async function ensureFueledCore(
         const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
         const hasWormhole = routeHasWormhole(routeData?.route);
         if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined && !hasWormhole) {
-          const canMakeItHome = routeData.fuel_available >= routeData.estimated_fuel;
+          const canMakeItHome = routeData.fuel_available >= Math.max(routeData.estimated_fuel, 1);
           ctx.log("system", `Route to home: ${routeData.total_jumps} jumps, need ${routeData.estimated_fuel} fuel, have ${routeData.fuel_available}`);
           if (canMakeItHome) {
             ctx.log("system", `Can reach home (${routeData.fuel_available} fuel >= ${routeData.estimated_fuel} needed) — navigating home to refuel`);

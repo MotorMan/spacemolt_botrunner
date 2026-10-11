@@ -2992,7 +2992,7 @@ if (state && state.status !== "idle") {
         state.status = "in_transit";
         if (state.currentRouteIndex > 0) {
           // Quick refuel/repair at intermediate stops if needed
-          await tryRefuel(ctx);
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem });
           await repairShip(ctx);
         }
       }
@@ -3063,9 +3063,9 @@ if (state && state.status !== "idle") {
       saveTransportState(state);
     }
 
-    // Safety / upkeep
-    await tryRefuel(ctx);
-    await repairShip(ctx);
+     // Safety / upkeep
+     await tryRefuel(ctx, { homeSystem: settings.homeSystem });
+     await repairShip(ctx);
     ctx.log("transport", `Loop iteration complete, sleeping 5s`);
     await ctx.sleep(5000);
   }

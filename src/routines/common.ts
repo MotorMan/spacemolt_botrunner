@@ -1575,11 +1575,102 @@ async function tryBuyOneFuelCell(ctx: RoutineContext): Promise<boolean> {
   return false;
 }
 
+// ── Faction / ally station cache ─────────────────────────────────────
+// `faction_info` returns our faction ID + the full allies list. This rarely
+// changes during a session, so we cache it for a few minutes to avoid
+// hammering the API on every refuel attempt.
+let factionInfoCache: { timestamp: number; factionId: string; allyIds: Set<string> } | null = null;
+const FACTION_INFO_CACHE_MS = 300_000;
+
+/** Our own faction ID and the set of allied faction IDs (cached). */
+async function getBotFactionInfo(bot: Bot): Promise<{ factionId: string; allyIds: Set<string> }> {
+  const now = Date.now();
+  if (factionInfoCache && now - factionInfoCache.timestamp < FACTION_INFO_CACHE_MS) {
+    return { factionId: factionInfoCache.factionId, allyIds: factionInfoCache.allyIds };
+  }
+  try {
+    const resp = await bot.exec("faction_info", {});
+    if (!resp.error && resp.result) {
+      const data = resp.result as Record<string, unknown>;
+      const sc = (data.structuredContent as Record<string, unknown>) || data;
+      const factionId = (sc.id as string) || bot.faction || "";
+      const allies = (sc.allies as Array<{ id: string }>) || [];
+      const allyIds = new Set<string>(allies.map((a) => a.id).filter(Boolean));
+      factionInfoCache = { timestamp: now, factionId, allyIds };
+      return { factionId, allyIds };
+    }
+  } catch {
+    // fall through to fallback
+  }
+  return { factionId: bot.faction || "", allyIds: new Set() };
+}
+
+/**
+ * Check if the station the bot is currently docked at belongs to our faction
+ * or one of our allies. Uses `get_base` (which requires being docked) to read
+ * the base's `faction_id` / `empire`, then compares against `bot.faction` and
+ * the cached ally list from `faction_info`.
+ *
+ * Returns `true` when the station is free refuel (our faction / ally).
+ * Returns `false` when it is a neutral / hostile station that WILL charge
+ * credits for `refuel`, or when the check itself failed.
+ */
+async function isStationFactionOrAlly(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.docked || !bot.poi) return false;
+  if (!bot.faction) return false;
+
+  try {
+    const resp = await bot.exec("get_base", {});
+    if (resp.error || !resp.result) return false;
+    const data = resp.result as Record<string, unknown>;
+    const sc = (data.structuredContent as Record<string, unknown>) || data;
+    const baseObj = (sc.base as Record<string, unknown>) || sc;
+    const baseFactionId = (baseObj.faction_id as string) || "";
+    const baseEmpire = (baseObj.empire as string) || "";
+
+    if (baseFactionId && baseFactionId === bot.faction) return true;
+    if (baseEmpire && baseEmpire === bot.faction) return true;
+
+    const { allyIds } = await getBotFactionInfo(bot);
+    if (baseFactionId && allyIds.has(baseFactionId)) return true;
+    if (baseEmpire && allyIds.has(baseEmpire)) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Determine whether the bot's current cargo of fuel cells carries enough fuel
+ * to reach the given home system. Uses `find_route` to ask the server for the
+ * real fuel estimate (this ship's burn rate is unknown to the client).
+ *
+ * Returns `true` when cargo cells alone can get us home. Returns `false` when
+ * they cannot (or when the route can't be resolved — the safe, conservative
+ * assumption is that we need station fuel).
+ */
+async function cargoCellsCanReachHome(ctx: RoutineContext, cargoCells: CargoFuelCells, homeSystem: string): Promise<boolean> {
+  if (cargoCells.fuel <= 0) return false;
+  if (!homeSystem) return false;
+  try {
+    const estimate = await estimateRouteFuel(ctx, homeSystem);
+    if (!estimate) return false;
+    return cargoCells.fuel >= estimate.estimatedFuel;
+  } catch {
+    return false;
+  }
+}
+
 /** Attempt to refuel to full. Calls refuel repeatedly until tank is full.
  *  If broke, sells cargo. If still can't refuel, waits at station and retries.
  *  Assumes docked.
- *  @param opts.skipApprovedCheck If true, bypass the approved fuel station check (for hunters). */
-export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?: boolean }): Promise<void> {
+ *  @param opts.skipApprovedCheck If true, bypass the approved fuel station check (for hunters).
+ *  @param opts.homeSystem When set, gates paid station refuel at non-faction/non-ally stations:
+ *         if cargo fuel cells carry enough fuel to reach this system, the bot will undock and
+ *         use cargo cells instead of paying credits. Paid station refuel only happens as a
+ *         last resort when cargo cells are insufficient (or absent). */
+export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?: boolean; homeSystem?: string }): Promise<void> {
   const { bot } = ctx;
   await bot.refreshShip();
   await bot.refreshCargo();
@@ -1618,8 +1709,41 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
           ctx.log("error", `Dock at ${refuelStation.name} failed: ${dResp.error.message}`);
           return;
         }
+  }
+  }
+
+  // ── PAID REFUEL GUARD ─────────────────────────────────────────────
+  // At a non-faction / non-ally station, `refuel` charges credits from the
+  // station's fuel reserve. Avoid this whenever cargo fuel cells can get us
+  // home: undock and refuel from cargo cells instead (free). Paid station
+  // refuel only happens as a true last resort — when cargo cells are absent
+  // or insufficient to reach the home system.
+  if (currentStation && bot.docked) {
+    const isFactionOrAlly = await isStationFactionOrAlly(ctx);
+    if (!isFactionOrAlly) {
+      const cargoCells = getCargoFuelCells(bot);
+      const hasCells = cargoCells.fuel > 0;
+      const homeSystem = opts?.homeSystem;
+
+      if (hasCells && homeSystem) {
+        const canReachHome = await cargoCellsCanReachHome(ctx, cargoCells, homeSystem);
+        if (canReachHome) {
+          ctx.log("system",
+            `Station ${currentStation.name} is not our faction/ally — undocking to use ` +
+            `${cargoCells.fuel} fuel from cargo cells (${cargoCells.summary}) instead of paying for station fuel`);
+          await ensureUndocked(ctx);
+          await bot.refreshShip();
+          const postPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (postPct >= 95) {
+            ctx.log("system", `Cargo cells topped off fuel to ${postPct}% — paid refuel not needed`);
+            return;
+          }
+          // Fall through to the refuel loop below — it will consume remaining
+          // cargo cells while undocked (free), no station credits charged.
+        }
       }
     }
+  }
 
   // Call refuel repeatedly until full or until it fails
   let consecutiveErrors = 0;
@@ -1667,22 +1791,26 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
     return;
   }
 
-  // Fuel still low — wait at station and retry periodically
+  // Fuel still low — wait at station and retry periodically (only makes sense when docked)
   const isSolCentral = currentStation?.id === "sol_station" || currentStation?.id === "sol_central";
-  for (let attempt = 1; attempt <= REFUEL_WAIT_RETRIES && bot.state === "running"; attempt++) {
-    ctx.log("system", `Fuel still at ${fuelPct}% — waiting at station (attempt ${attempt}/${REFUEL_WAIT_RETRIES})...`);
-    await sleep(REFUEL_WAIT_INTERVAL);
+  if (bot.docked) {
+    for (let attempt = 1; attempt <= REFUEL_WAIT_RETRIES && bot.state === "running"; attempt++) {
+      ctx.log("system", `Fuel still at ${fuelPct}% — waiting at station (attempt ${attempt}/${REFUEL_WAIT_RETRIES})...`);
+      await sleep(REFUEL_WAIT_INTERVAL);
 
-    await bot.refreshShip();
-    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (fuelPct >= 50) {
-      ctx.log("system", `Fuel recovered to ${fuelPct}% — continuing`);
-      return;
+      await bot.refreshShip();
+      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct >= 50) {
+        ctx.log("system", `Fuel recovered to ${fuelPct}% — continuing`);
+        return;
+      }
     }
   }
 
   await bot.refreshShip();
-  ctx.log("error", `Could not refuel after ${REFUEL_WAIT_RETRIES} waits — fuel: ${bot.fuel}/${bot.maxFuel}`);
+  if (bot.docked) {
+    ctx.log("error", `Could not refuel after ${REFUEL_WAIT_RETRIES} waits — fuel: ${bot.fuel}/${bot.maxFuel}`);
+  }
 }
 
 // ── Repair ───────────────────────────────────────────────────
@@ -2396,7 +2524,7 @@ async function ensureFueledCore(
   // If docked at a station with fuel service, refuel there first (don't undock)
   if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
     ctx.log("system", `Already docked at ${dockingStation.name} with fuel service — refueling in place...`);
-    await tryRefuel(ctx, { skipApprovedCheck: true });
+    await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: opts?.homeSystem });
     await bot.refreshShip();
     const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (newFuelPct >= thresholdPct) {
@@ -2466,7 +2594,7 @@ async function ensureFueledCore(
     }
     if (recovered) {
       // Fuel improved but still under threshold — re-run tryRefuel for any residual station reserve.
-      await tryRefuel(ctx, { skipApprovedCheck: true });
+      await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: opts?.homeSystem });
       await bot.refreshShip();
       fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (fuelPct >= thresholdPct) return true;
@@ -2501,7 +2629,7 @@ async function ensureFueledCore(
         } else {
           await ensureDocked(ctx);
         }
-        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem: opts?.homeSystem });
         await bot.refreshShip();
         const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (newFuel >= thresholdPct) {

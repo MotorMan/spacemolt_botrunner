@@ -80,6 +80,16 @@ export interface CreatureClaimPayload {
   expiresAt: number;
 }
 
+/**
+ * A single-system wildlife update pushed by a light client (or the master's own
+ * `drainPushes` hook) to the master. Carries exactly one `SystemWildlife` so the
+ * master merges only what changed — not the full galaxy — keeping bandwidth low.
+ */
+export interface WildlifeDeltaPayload {
+  system: string;
+  data: unknown;
+}
+
 export interface PlayerNamePayload {
   name: string;
   faction?: string;
@@ -232,4 +242,24 @@ export interface MarketQueryResult {
    *  no reachable remote market client), `remote` = another connected client
    *  via the sync master. Purely diagnostic — the payload is identical. */
   source?: "local" | "remote";
+}
+
+/**
+ * Incremental wildlife delta a light client polls from the master after its
+ * one-time full sync. Only the systems that changed since `since` are included,
+ * so normal operation stays low-bandwidth (a few KB instead of the full
+ * multi-MB galaxy dump).
+ */
+export interface WildlifeDeltasResponse {
+  ok: boolean;
+  /** The master's current wildlife version. The client stores this and sends it
+   *  back as `since` on the next poll so the master knows where to continue from. */
+  version: number;
+  /** Systems that changed since `since`, keyed by system id. Empty when there
+   *  are no new discoveries — the common case, keeping each poll response tiny. */
+  systems: Record<string, unknown>;
+  /** `true` when the client has fallen too far behind (master restarted or
+   *  changelog was trimmed): the client should re-pull the full wildlife data
+   *  via GET /api/client-sync/wildlife instead of merging these deltas. */
+  needsFull: boolean;
 }

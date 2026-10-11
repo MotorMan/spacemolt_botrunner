@@ -21,7 +21,7 @@ export function configureSync(_ctx: SyncHookContext): void {
   if (_ctx.pushToMaster) _push = _ctx.pushToMaster;
 }
 
-export function setPushFn(fn: PushFn): void {
+export function setPushFn(fn: PushFn | null): void {
   _push = fn;
 }
 

@@ -1,5 +1,7 @@
-import { type SyncSettings, type MarketQueryRequest, type MarketQueryResult, type CreatureClaimPayload } from "./client_sync_types.js";
+import { type SyncSettings, type MarketQueryRequest, type MarketQueryResult, type CreatureClaimPayload, type WildlifeDeltasResponse } from "./client_sync_types.js";
 import { botChatChannel } from "./bot_chat_channel.js";
+import { wildlifeStore, type SystemWildlife, type WildlifeFullData } from "./wildlivestore.js";
+import { setPushFn } from "./client_sync_hooks.js";
 
 /**
  * Lightweight client connect.
@@ -53,11 +55,27 @@ export class ClientSyncLightSlave {
   private hasMarketData = false;
   private pendingCreatureClaims: CreatureClaimPayload[] = [];
 
+  // ── Lightweight wildlife / creature sync ──────────────────────────────
+  // On first connect the light client pulls the master's full creature list
+  // once. From then on it only exchanges individual system updates: its bots'
+  // discoveries are pushed to the master as single-system deltas (via the shared
+  // `setPushFn` hook wired to wildlivestore.drainPushes), and on each poll cycle
+  // the light client GETs only the systems that changed on the master since its
+  // last-known version. This keeps steady-state bandwidth at a few KB instead of
+  // the multi-MB full-galaxy push the heavy slave does every 15 s.
+  /** Has the one-time full wildlife pull completed since the last (re)register? */
+  private wildlifeSynced = false;
+  /** Master's wildlife version we last observed. Sent back as `since` on the
+   *  next delta poll so the master knows what we already have. */
+  private wildlifeVersion = 0;
+  /** True once we've installed our push fn via setPushFn (avoids double-install). */
+  private pushFnInstalled = false;
+
   constructor(settings: SyncSettings) {
     this.settings = settings;
   }
 
-  public start(): void {
+   public start(): void {
     if (this.running) return;
     this.running = true;
     console.log(`[ClientSync-Light] Starting lightweight client connect`);
@@ -66,11 +84,15 @@ export class ClientSyncLightSlave {
     // prunes silent clients at 10min, so this is well within that window and
     // lets a client self-heal long before the master forgets us.
     this.staleMs = Math.max(30000, intervalMs * 4);
+    // Wire up the wildlife push hook so local creature discoveries
+    // (wildlivestore.drainPushes → onWildlifeUpdate) are forwarded to the
+    // master as single-system deltas instead of sitting in memory.
+    this.installPushFn();
     this.timer = setInterval(() => this.pollCycle(), intervalMs);
     this.pollCycle();
   }
 
-  public stop(): void {
+   public stop(): void {
     this.running = false;
     if (this.timer) {
       clearInterval(this.timer);
@@ -78,11 +100,19 @@ export class ClientSyncLightSlave {
     }
     this.clientId = null;
     this.connectionState = 'disconnected';
+    // Tear down our push fn so the wildlife store stops trying to relay
+    // deltas to a master we're no longer connected to.
+    if (this.pushFnInstalled) {
+      setPushFn(null);
+      this.pushFnInstalled = false;
+    }
+    this.wildlifeSynced = false;
+    this.wildlifeVersion = 0;
   }
 
-  public getState(): { connected: boolean; lastSync: number; lastError: string | null; connectionState: string; lastConnectAttempt: number } {
-    return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError, connectionState: this.connectionState, lastConnectAttempt: this.lastConnectAttempt };
-  }
+   public getState(): { connected: boolean; lastSync: number; lastError: string | null; connectionState: string; lastConnectAttempt: number; wildlifeSynced: boolean; wildlifeVersion: number } {
+     return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError, connectionState: this.connectionState, lastConnectAttempt: this.lastConnectAttempt, wildlifeSynced: this.wildlifeSynced, wildlifeVersion: this.wildlifeVersion };
+   }
 
   /** Push any pending local bot-chat messages to the master immediately, outside the normal poll cycle. */
   public async pushChatNow(): Promise<void> {
@@ -96,6 +126,93 @@ export class ClientSyncLightSlave {
 
   public queueCreatureClaim(claim: CreatureClaimPayload): void {
     this.pendingCreatureClaims.push(claim);
+  }
+
+  /**
+   * Install the global wildlife push hook so the local wildlifeStore's
+   * `drainPushes` timer forwards individual system discoveries to the master
+   * as single-system deltas — exactly the "live updates to individual creatures"
+   * the light client exchanges instead of re-uploading the full galaxy.
+   *
+   * `setPushFn` is process-global, so we guard with `pushFnInstalled` to avoid
+   * double-installs across start/stop cycles. The master node sets its own
+   * push fn (for its own bot discoveries); this method is only called on a
+   * light-slave node where no other push fn is active.
+   */
+  private installPushFn(): void {
+    if (this.pushFnInstalled) return;
+    setPushFn(async (type, payload) => {
+      if (type !== "wildlife") return;
+      const wrapper = payload.data as { system?: string; data?: SystemWildlife } | undefined;
+      const sysData = wrapper?.data;
+      const sysId = wrapper?.system || (sysData as SystemWildlife | undefined)?.system;
+      if (!sysData || !sysId) return;
+      if (!this.clientId) return;
+      try {
+        await this.request<{ ok: boolean }>("/api/client-sync/wildlife-update", { method: "POST" }, {
+          system: sysId,
+          data: sysData,
+        });
+      } catch {
+        // best-effort; the next poll-cycle delta pull will reconcile any missed
+        // sighting that was also picked up by the master from another client.
+      }
+    });
+    this.pushFnInstalled = true;
+  }
+
+  /**
+   * One-time full wildlife sync: pull the master's authoritative creature list
+   * and merge it into the local wildlifeStore. Only runs once per (re)connect —
+   * after this, the light client only exchanges individual system deltas.
+   */
+  private async syncWildlife(): Promise<void> {
+    if (!this.settings.syncWildlife) return;
+    try {
+      const data = await this.request<WildlifeFullData>("/api/client-sync/wildlife");
+      if (data && typeof data === "object" && data.systems) {
+        wildlifeStore.mergeFrom(data);
+        this.wildlifeSynced = true;
+        this.log(`Full wildlife sync: merged ${Object.keys(data.systems).length} system(s) from master`);
+      }
+    } catch (err) {
+      this.logError(`Wildlife full sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Poll the master for incremental wildlife updates — only the systems that
+   * changed since our last-known version. If the master signals `needsFull`
+   * (we fell too far behind, e.g. master restarted) we re-do the full sync.
+   * Never throws.
+   */
+  private async pullWildlifeDeltas(): Promise<void> {
+    if (!this.settings.syncWildlife) return;
+    if (!this.clientId || !this.wildlifeSynced) return;
+    try {
+      const data = await this.request<WildlifeDeltasResponse>(
+        `/api/client-sync/wildlife-deltas?since=${this.wildlifeVersion}`,
+      );
+      if (!data || typeof data !== "object") return;
+      if (data.needsFull) {
+        this.log(`Wildlife delta gap too large — re-pulling full sync`);
+        this.wildlifeSynced = false;
+        await this.syncWildlife();
+        return;
+      }
+      this.wildlifeVersion = data.version;
+      const systemCount = Object.keys(data.systems || {}).length;
+      if (systemCount > 0) {
+        wildlifeStore.mergeFrom({
+          systems: data.systems as Record<string, SystemWildlife>,
+          lastUpdated: new Date().toISOString(),
+          counts: wildlifeStore.getCounts(),
+        });
+        this.log(`Wildlife deltas: merged ${systemCount} system(s) since v${this.wildlifeVersion - 1}`);
+      }
+    } catch (err) {
+      this.logError(`Wildlife delta pull failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async pushCreatureClaims(): Promise<void> {
@@ -202,7 +319,7 @@ export class ClientSyncLightSlave {
     }
   }
 
-  private async register(): Promise<{ ok: boolean; error?: string }> {
+   private async register(): Promise<{ ok: boolean; error?: string; wildlifeVersion?: number }> {
     const url = new URL("/api/client-sync/register", this.settings.masterUrl).toString();
     this.connectionState = 'connecting';
     this.lastConnectAttempt = Date.now();
@@ -219,7 +336,7 @@ export class ClientSyncLightSlave {
           light: true,
         }),
       });
-      let payload: { ok: boolean; clientId?: string; error?: string };
+      let payload: { ok: boolean; clientId?: string; error?: string; wildlifeVersion?: number };
       try {
         payload = await res.json();
       } catch {
@@ -229,6 +346,12 @@ export class ClientSyncLightSlave {
         this.clientId = payload.clientId;
         this.connectionState = 'connected';
         this.lastError = null;
+        // Capture the master's wildlife version at registration time. On a
+        // fresh connect (or after a master restart that reset its version) we
+        // will do a one-time full creature sync; the version here seeds the
+        // subsequent delta polling.
+        this.wildlifeVersion = payload.wildlifeVersion ?? 0;
+        this.wildlifeSynced = false;
         this.log(`Connected to master as ${this.settings.label || "light"} (${payload.clientId})`);
       } else {
         this.connectionState = 'disconnected';
@@ -500,6 +623,15 @@ export class ClientSyncLightSlave {
       await this.pullChat();
       await this.pushCreatureClaims();
       await this.pullCreatureClaims();
+      // Lightweight creature sync: one-time full pull on (re)connect, then
+      // incremental per-system deltas on every cycle so steady-state bandwidth
+      // stays tiny. The master's own discoveries and every other light client's
+      // sightings arrive via the deltas — no full-galaxy re-download needed.
+      if (!this.wildlifeSynced) {
+        await this.syncWildlife();
+      } else {
+        await this.pullWildlifeDeltas();
+      }
       // Fleet-wide catalog convergence: the master elects ONE client to fetch
       // catalog.json from the gameserver and relays that single copy to the
       // rest of us — so we don't all hammer the (rate-limited) endpoint and end

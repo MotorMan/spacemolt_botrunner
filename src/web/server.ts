@@ -11,10 +11,10 @@ import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, setLoadoutForceFullDelivery, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 import { playerNameStore } from "../playernamestore.js";
-import { wildlifeStore, type WildlifeFullData } from "../wildlivestore.js";
+import { wildlifeStore, type WildlifeFullData, type SystemWildlife } from "../wildlivestore.js";
 import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse, type MarketQueryRequest, type MarketQueryResult } from "../client_sync_master.js";
 import { listSyncedFiles, readSyncedFile, mergeIntoFile, seedIntoFile, isPathSynced, type FileEntry } from "../client_sync_files.js";
-import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, resolveMarketSource } from "../client_sync_hooks.js";
+import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate, setMarketQueryFn, setPushFn, resolveMarketSource } from "../client_sync_hooks.js";
 import { queryLocalMarket, getLocalMarketStatus } from "../market_local_source.js";
 import { marketDetailsStore } from "../marketdetailsstore.js";
 import { priceOverridesStore } from "../priceoverrides.js";
@@ -720,6 +720,7 @@ if (!this.settings.fuel_service) {
         this.syncMaster.saveSettings();
       }
       this.syncMaster.startFileSync((this.settings.clientSync.pollIntervalSec as number) || 15);
+      this.setupMasterWildlifePush();
     }
     // Initialize periodic refresh setting in general
     if (!this.settings.general || typeof this.settings.general !== "object") {
@@ -779,11 +780,39 @@ if (!this.settings.fuel_service) {
     return json;
   }
 
-  private evictWildlifeJson(): void {
+   private evictWildlifeJson(): void {
     if (!this.wildlifeJsonCache) return;
     if (Date.now() - this.wildlifeJsonCache.lastUsed > WILDLIFE_JSON_IDLE_MS) {
       this.wildlifeJsonCache = null;
     }
+  }
+
+  /** Force-invalidate the wildlife JSON cache so a merge-triggered re-stringify
+   *  happens on the next GET /api/client-sync/wildlife (or /api/wildlife). */
+  private invalidateWildlifeJson(): void {
+    this.wildlifeJsonCache = null;
+  }
+
+  /**
+   * Wire up the wildlife push hook so that when the master node's OWN bots
+   * discover creatures (wildlivestore.drainPushes → onWildlifeUpdate), the
+   * change is recorded on the master's wildlife version + changelog. This makes
+   * local discoveries propagate to connected light clients as deltas — exactly
+   * "as if a bot on the master saw it." Light/slave nodes set their own push fn
+   * (forwarding to this master over HTTP) in botmanager.ts; that path is
+   * mutually exclusive with this one.
+   */
+  private setupMasterWildlifePush(): void {
+    if (this.syncMaster?.getMode() !== "master") return;
+    setPushFn(async (type, payload) => {
+      if (type !== "wildlife") return;
+      const wrapper = payload.data as { system?: string; data?: SystemWildlife } | undefined;
+      const sysData = wrapper?.data;
+      const sysId = wrapper?.system || (sysData as SystemWildlife | undefined)?.system;
+      if (!sysData || !sysId) return;
+      this.syncMaster?.recordWildlifeUpdate("local", { system: sysId, data: sysData });
+      this.invalidateWildlifeJson();
+    });
   }
 
   /** Account for an outbound WS payload. Callers pass the already-serialized
@@ -1932,6 +1961,7 @@ if (!this.settings.fuel_service) {
             saveSettings(this.settings);
             if (this.syncMaster.getMode() === "master") {
               this.syncMaster.startFileSync((csSettings.pollIntervalSec as number) || 15);
+              this.setupMasterWildlifePush();
             }
           }
           const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
@@ -2050,14 +2080,51 @@ if (!this.settings.fuel_service) {
             return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/wildlife" && req.method === "GET") {
+            // Light clients use this endpoint for their one-time full sync on
+            // connect (or when the deltas endpoint signals needsFull). It returns
+            // the master's authoritative wildlife snapshot, memoized for 10 s.
             return new Response(this.getWildlifeJson(), {
               headers: { ...cors, "Content-Type": "application/json" },
             });
           }
+          // Incremental wildlife deltas for light clients. Returns only the
+          // systems that changed since the client's last-known version, so a
+          // quiet galaxy costs just a few bytes per poll. If the client fell too
+          // far behind (master restart, changelog trimmed), needsFull is set and
+          // the client should re-GET /api/client-sync/wildlife instead.
+          if (url.pathname === "/api/client-sync/wildlife-deltas" && req.method === "GET") {
+            const since = parseInt(url.searchParams.get("since") || "0", 10) || 0;
+            const cid = req.headers.get("x-client-id") || "";
+            const result = this.syncMaster?.getWildlifeDeltas(since, cid) ?? { version: 0, systems: {}, needsFull: true };
+            return Response.json({
+              ok: true,
+              version: result.version,
+              systems: result.systems,
+              needsFull: result.needsFull,
+            }, { headers: cors });
+          }
+          // Current master wildlife version. Light clients can use this for a
+          // sub-KB pre-check before deciding whether to fetch deltas.
+          if (url.pathname === "/api/client-sync/wildlife-version" && req.method === "GET") {
+            return Response.json({ version: this.syncMaster?.getWildlifeVersion() ?? 0 }, { headers: cors });
+          }
           if (url.pathname === "/api/client-sync/wildlife-update" && req.method === "POST") {
+            const clientId = req.headers.get("x-client-id") || "anonymous";
             try {
-              const body = await req.json() as WildlifeFullData;
-              wildlifeStore.mergeFrom(body);
+              const body = await req.json();
+              if (this.syncMaster) {
+                // Accept both single-system pushes ({ system, data } from light
+                // clients' per-discovery hook) and full-dataset pushes (full
+                // slave's pushWildlife every cycle). The master diffs + versions
+                // internally so light clients only get notified about real changes.
+                const result = this.syncMaster.recordWildlifeUpdate(clientId, body as import("../client_sync_types.js").WildlifeDeltaPayload | WildlifeFullData);
+                this.invalidateWildlifeJson();
+                return Response.json({ ok: result.ok, version: result.version, changed: result.changed }, { headers: cors });
+              }
+              // Fallback: non-master or no syncMaster instance — still merge for
+              // backward-compat with any direct callers.
+              wildlifeStore.mergeFrom(body as WildlifeFullData);
+              this.invalidateWildlifeJson();
               return Response.json({ ok: true }, { headers: cors });
             } catch {
               return Response.json({ ok: false, error: "invalid json" }, { status: 500, headers: cors });
@@ -2078,6 +2145,7 @@ if (!this.settings.fuel_service) {
               if (body.url) {
                 this.syncMaster.pullFromSlave(cid).catch(() => {});
               }
+              return Response.json({ ...result, wildlifeVersion: this.syncMaster.getWildlifeVersion() }, { headers: cors });
             }
             return Response.json(result, { headers: cors });
           }

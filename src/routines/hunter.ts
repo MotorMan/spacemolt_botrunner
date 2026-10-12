@@ -2207,6 +2207,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
   // lifetime of the generator (the routine run).
   let sysIndex = 0;
   let creatureFarmExpandedSystems: string[] = [];
+  let stayPoiAnchor: { system: string; poi: string | null } | null = null;
 
   while (bot.state === "running") {
     const settings = getHunterSettings(bot.username);
@@ -2289,8 +2290,21 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     const homeSystem = settings.homeSystem || "";
     const homeStation = settings.homeStation || "";
-    const targetSystem = effectiveSystems[sysIndex];
+    let targetSystem = effectiveSystems[sysIndex];
     const targetPois = profile?.targetPois || [];
+
+    // Stay-in-POI mode: lock the bot to its current system (and eventually its
+    // current POI) so it re-scans one location for respawns instead of roaming
+    // between POIs and systems. The anchor is captured once on first entry and
+    // then re-applied every outer-loop iteration to pin `targetSystem`.
+    if (settings.stayInPoi) {
+      if (!stayPoiAnchor) {
+        stayPoiAnchor = { system: bot.system, poi: bot.poi || null };
+        ctx.log("system", `Stay-in-POI mode: anchored at ${stayPoiAnchor.system}` +
+          (stayPoiAnchor.poi ? ` / ${stayPoiAnchor.poi}` : " â€” will lock to the first POI encountered"));
+      }
+      targetSystem = stayPoiAnchor.system;
+    }
     // `loopsPerSystem` is the number of full POI sweeps to perform in this system
     // before advancing to the next profile system. This is the "loops" setting
     // the user configures (creatureFarmLoopsPerSystem); it drives the inner
@@ -2425,6 +2439,23 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
       if (targetPois && targetPois.length > 0) {
         patrolPois = patrolPois.filter(p => targetPois.includes(p.id) || targetPois.includes(p.name));
       }
+
+      // Stay-in-POI mode: once anchored to a specific POI, only ever farm that
+      // one POI each sweep so the bot re-scans it for respawns instead of
+      // roaming between POIs. The anchor's poi is null until the first sweep
+      // lands on a non-station POI (e.g. when starting from a station).
+      const anchor = stayPoiAnchor;
+      if (settings.stayInPoi && anchor) {
+        if (!anchor.poi && patrolPois.length > 0) {
+          anchor.poi = patrolPois[0].id;
+          ctx.log("system", `Stay-in-POI mode: locked to POI ${anchor.poi} in ${anchor.system}`);
+        }
+        if (anchor.poi) {
+          const anchoredPoi = patrolPois.find(p => p.id === anchor.poi || p.name === anchor.poi);
+          patrolPois = anchoredPoi ? [anchoredPoi] : [];
+        }
+      }
+
       if (patrolPois.length === 0) {
         ctx.log("info", "No non-station POIs in target system â€” waiting 30s");
         await ctx.sleep(30000);

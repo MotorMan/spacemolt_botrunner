@@ -5473,7 +5473,7 @@
       </label>`;
           }
 
-          if (hunterMode === "boarding") {
+          if (hunterMode === "boarding" || hunterMode === "creature_farm" || hunterMode === "creature_farm_random") {
             const stayInPoi = botSettings.stayInPoi ?? false;
             actions += `
       <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px" title="Stay at the current POI and re-scan every cycle instead of navigating between POIs/systems">
@@ -33179,8 +33179,8 @@ ignoreBlacklist: document.getElementById(
 
        <div class="setting-row">
          <div>
-           <div class="setting-label">Stay in POI (boarding mode)</div>
-           <div class="setting-hint">When enabled in boarding mode, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs and systems. Recommended with a fixed patrol profile or single system.</div>
+            <div class="setting-label">Stay in POI</div>
+            <div class="setting-hint">When enabled, the hunter stays at its current POI and re-scans every cycle instead of navigating between POIs/systems. Applies to boarding and creature farm modes. Recommended with a fixed patrol profile or single system.</div>
          </div>
          <select id="set-hunter-stayInPoi">
            <option value="false"${!stayInPoi ? " selected" : ""}>Disabled (patrol between POIs)</option>

@@ -29,8 +29,13 @@ export function isCreatureName(name: string | undefined): boolean {
   return wildlifeStore.hasCreatureName(name);
 }
 
+function isCreatureNameOrSpecies(entity: NearbyEntity | null | undefined): boolean {
+  if (!entity) return false;
+  return isCreatureName(entity.name) || isCreatureName(entity.species);
+}
+
 function isCreatureFightTarget(target: NearbyEntity | null | undefined): boolean {
-  return !!target?.isCreature || target?.type === "creature" || target?.id?.startsWith("crt_") || isCreatureName(target?.name);
+  return !!target?.isCreature || target?.type === "creature" || target?.id?.startsWith("crt_") || isCreatureNameOrSpecies(target);
 }
 
 // ── Types ─────────────────────────────────────────────
@@ -143,6 +148,9 @@ export interface NearbyEntity {
   shield?: number;
   maxShield?: number;
   status?: string;
+  branded?: boolean;
+  brand_faction?: string;
+  brand_ranch?: string;
 }
 
 export interface WeaponModule {
@@ -245,12 +253,13 @@ let rawEntities: Array<Record<string, unknown>> = [];
       const creatureId = (c.creature_id as string) || "";
       if (!creatureId) continue;
 
+      const branded = !!(c.branded as boolean) || /branded/i.test((c.name as string) || "");
       entities.push({
         id: creatureId,
         name: (c.name as string) || "",
         type: "creature",
         species: (c.species as string) || "",
-        faction: "",
+        faction: (c.brand_faction as string) || "",
         isNPC: true,
         isPirate: false,
         isCreature: true,
@@ -258,6 +267,9 @@ let rawEntities: Array<Record<string, unknown>> = [];
         hull: c.hull as number,
         maxHull: c.max_hull as number,
         inCombat: c.in_combat as boolean,
+        branded,
+        brand_faction: (c.brand_faction as string) || "",
+        brand_ranch: (c.brand_ranch as string) || "",
       });
     }
   }
@@ -282,7 +294,7 @@ export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttac
 
 export function isCreatureTarget(entity: NearbyEntity, huntCreatures: boolean): boolean {
   if (!huntCreatures) return false;
-  return !!(entity.isCreature || entity.type === "creature" || (entity.id && entity.id.startsWith("crt_")) || isCreatureName(entity.name));
+  return !!(entity.isCreature || entity.type === "creature" || (entity.id && entity.id.startsWith("crt_")) || isCreatureName(entity.name) || isCreatureName(entity.species));
 }
 
 // ── Weapon & Ammo Management ─────────────────────────────────

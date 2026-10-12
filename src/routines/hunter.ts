@@ -85,7 +85,7 @@ import { writeSettings, isCombatDebugEnabled, getGlobalHomeBase } from "./common
 import { combatDebugLog } from "../debug.js";
 import { boardingClaims, BOARDING_CLAIM_TTL_MS, pickUnclaimedBoardingTarget } from "../boardingCooperation.js";
 import { creatureKillStore } from "../creaturekillstore.js";
-import { wildlifeStore, type WildlifeDetail } from "../wildlivestore.js";
+import { wildlifeStore, type WildlifeDetail, normalizeCreatureName } from "../wildlivestore.js";
 import {
   findStation,
   isStationPoi,
@@ -261,10 +261,27 @@ function shouldFleeFromBigCreature(
  * creature's display name (not the hex id), so we check the name before picking
  * the id to attack. Future game updates may impose penalties for killing branded
  * livestock, so we skip them everywhere today.
+ *
+ * Detection covers two name formats:
+ *   1. The word "BRANDED" in the name — e.g. "[RNC] BRANDED Belt-Grazer"
+ *   2. A faction-tag prefix like "[RNC] " where the stripped name is a known
+ *      creature species — e.g. "[RNC] Belt-Grazer" (only true when the
+ *      de-tagged name is a known creature, so player ships with faction tags
+ *      like "[POLICE]" are not false-positives).
  */
 function isBrandedCreature(name: string | undefined): boolean {
   if (!name) return false;
-  return name.toLowerCase().includes("branded");
+  const lower = name.toLowerCase();
+  // Format 1: "BRANDED" keyword in the name
+  if (lower.includes("branded")) return true;
+  // Format 2: faction-tag prefix "[TAG] SpeciesName" — only branded if the
+  // stripped name is a known creature (avoids false positives on players).
+  const tagMatch = name.match(/^\[[^\]]+\]\s*(.*)/);
+  if (tagMatch) {
+    const stripped = tagMatch[1].trim();
+    if (stripped && isCreatureName(stripped)) return true;
+  }
+  return false;
 }
 
 /**
@@ -317,9 +334,9 @@ function recordCreatureKill(bot: Bot, target: NearbyEntity): void {
   const settings = getHunterSettings(bot.username);
   if (!settings.creatureFarmRecordKills) return;
   if (!bot.system || !bot.poi) return;
-  const isCreature = !!(target as any).isCreature || (target as any).type === "creature" || isCreatureName(target.name);
+  const isCreature = !!(target as any).isCreature || (target as any).type === "creature" || isCreatureName(target.name) || isCreatureName((target as any).species);
   if (!isCreature) return;
-  const species = (target as any).species || target.name || "unknown";
+  const species = (target as any).species || normalizeCreatureName(target.name) || "unknown";
   creatureKillStore.recordKill(bot.system, bot.poi, species);
 }
 

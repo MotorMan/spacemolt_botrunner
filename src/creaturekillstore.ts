@@ -1,6 +1,7 @@
 import { writeFileSync, existsSync, readFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { safeWriteFileSync } from "./diskSpaceGuard.js";
+import { normalizeCreatureName } from "./wildlivestore.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const CREATURE_KILLS_FILE = join(DATA_DIR, "creature_kills.json");
@@ -25,7 +26,7 @@ function blankData(): CreatureKillData {
 }
 
 function sanitizeKey(name: string): string {
-  const cleaned = (name || "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "_");
+  const cleaned = normalizeCreatureName(name).replace(/[^a-z0-9_-]+/g, "_");
   return cleaned || "unknown";
 }
 

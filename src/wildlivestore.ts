@@ -6,6 +6,28 @@ import { onWildlifeUpdate, isSyncPushEnabled } from "./client_sync_hooks.js";
 import { safeWriteFileSync } from "./diskSpaceGuard.js";
 import { perf } from "./perf.js";
 
+/**
+ * Strip the faction-tag prefix and "BRANDED" keyword that the recent game
+ * patch prepends to branded ranch livestock display names
+ * (e.g. "[RNC] BRANDED Belt-Grazer" → "Belt-Grazer", "[RNC] Belt-Grazer" → "Belt-Grazer"),
+ * then trim, collapse spaces, and lowercase.
+ *
+ * Exported so callers in battle.ts, hunter.ts, and elsewhere can normalise a
+ * creature display name before exact-match lookups, ensuring branded and
+ * non-branded variants of the same species are treated as one.
+ */
+export function normalizeCreatureName(name: string | undefined): string {
+  if (!name) return "";
+  let cleaned = name.trim();
+  // Strip leading faction-tag prefix, e.g. "[RNC] ", "[POLICE] "
+  cleaned = cleaned.replace(/^\[[^\]]+\]\s*/g, "").trim();
+  // Strip the BRANDED keyword (case-insensitive, word-boundary)
+  cleaned = cleaned.replace(/\bBRANDED\b/gi, "").trim();
+  // Collapse any leftover double spaces
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  return cleaned.toLowerCase();
+}
+
 const CREATURES_DIR = join(process.cwd(), "data", "creatures");
 const LEGACY_WILDLIFE_FILE = join(process.cwd(), "data", "wildlifeInfo.json");
 
@@ -298,8 +320,17 @@ export class WildlifeStore {
     this._botName = name;
   }
 
+  /**
+   * Strip the faction-tag prefix and "BRANDED" keyword that the recent game
+   * patch prepends to branded ranch livestock names (e.g. "[RNC] BRANDED
+   * Belt-Grazer" → "belt-grazer"), then normalise to lowercase.
+   *
+   * This keeps branded and non-branded variants of the same species in the
+   * same store entry so that exact-name lookups (hasCreatureName / isCreatureName)
+   * still match a creature whose display name now carries a faction tag.
+   */
   private normalize(name: string): string {
-    return name.trim().toLowerCase();
+    return normalizeCreatureName(name);
   }
 
   // ── Name index ──────────────────────────────────────────────────────────

@@ -1800,10 +1800,14 @@ async function travelToHomeStationOrDockAnywhere(
  * and the rescue routine would keep topping the SAME bot off every 30s —
  * dumping the whole faction treasury into one ship. A real get_status updates
  * the cached credits so the next cycle sees the real balance and skips the bot.
+ *
+ * A short delay before the refresh gives the game server time to process the
+ * credit deposit so the get_status response reflects the updated balance.
  */
 async function refreshBotCreditsAfterTopOff(ctx: RoutineContext, username: string): Promise<void> {
   if (!ctx.getBotFreshStatus) return;
   try {
+    await ctx.sleep(3000);
     await ctx.getBotFreshStatus(username);
     ctx.log("rescue", `💰 Forced status refresh for ${username} after credit top-off`);
   } catch (e) {
@@ -1870,6 +1874,16 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       continue;
     }
 
+    // Skip bots that were topped off recently — the game server may not have
+    // processed the deposit yet, so get_status would still show the pre-top-off
+    // balance and we'd waste a cycle re-topping the same bot.
+    const now = Date.now();
+    const cooldownExpiry = recentlyToppedOff.get(member.username);
+    if (cooldownExpiry && now < cooldownExpiry) {
+      ctx.log("rescue", `💰 ${member.username} recently topped off, skipping (cooldown)`);
+      continue;
+    }
+
     // Normal top-off for bots with credits below the min threshold.
     if (currentCredits > 0) {
       if (currentCredits >= minThreshold || currentCredits >= targetAmount) continue;
@@ -1900,6 +1914,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
         await refreshBotCreditsAfterTopOff(ctx, member.username);
+        recentlyToppedOff.set(member.username, Date.now() + TOP_OFF_COOLDOWN_MS);
         return true;
       }
     }
@@ -1982,6 +1997,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
         await refreshBotCreditsAfterTopOff(ctx, member.username);
+        recentlyToppedOff.set(member.username, Date.now() + TOP_OFF_COOLDOWN_MS);
         return true;
       }
     } else {
@@ -1998,6 +2014,13 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
   }
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
   // bot.credits is already fresh from the background loop's refreshStatus() call
+
+  // Skip self if recently topped off
+  const selfCooldownExpiry = recentlyToppedOff.get(bot.username);
+  if (selfCooldownExpiry && Date.now() < selfCooldownExpiry) {
+    ctx.log("rescue", `💰 Self recently topped off, skipping (cooldown)`);
+    return false;
+  }
 
   if (bot.credits >= minThreshold || bot.credits >= targetAmount) {
     ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${minThreshold}cr min threshold), no action needed`);
@@ -2020,6 +2043,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     }
 
     ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${bot.credits + needed}cr)`);
+    recentlyToppedOff.set(bot.username, Date.now() + TOP_OFF_COOLDOWN_MS);
     return true;
   }
 
@@ -2059,6 +2083,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     }
 
     ctx.log("rescue", `💰 Withdrew ${1 + needed}cr total from faction treasury for self (now at ${targetAmount}cr)`);
+    recentlyToppedOff.set(bot.username, Date.now() + TOP_OFF_COOLDOWN_MS);
     return true;
   } else {
     // Self still shows 0 after withdraw — unusual for self, will retry next cycle
@@ -2070,7 +2095,9 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
 let creditTopOffRoutineActive = false;
-const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
+const TOP_OFF_COOLDOWN_MS = 90_000;
+const recentlyToppedOff = new Map<string, number>();
+const ownBotRescueCooldown = new Map<string, number>();
 // How long a freshly-rescued bot is skipped by the fleet scan after a successful
 // rescue. This is essential for cross-client rescue: the remote client only
 // pushes its updated (refueled) status every `pollIntervalSec` (often 120s),

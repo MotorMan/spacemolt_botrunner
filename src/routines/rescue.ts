@@ -1845,6 +1845,16 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     if (member.username === bot.username) continue;
     if (member.state !== "running" && member.state !== "idle") continue;
 
+    // Check cooldown BEFORE the expensive getBotFreshStatus call — this avoids
+    // unnecessary get_status API calls for bots we'll skip anyway, and it
+    // closes the race window where a concurrent loop could pass the check
+    // before the first loop sets the cooldown after its deposit.
+    const now = Date.now();
+    const cooldownExpiry = recentlyToppedOff.get(member.username);
+    if (cooldownExpiry && now < cooldownExpiry) {
+      continue;
+    }
+
     // Fetch fresh credits for this bot using getBotFreshStatus (forces a real get_status)
     if (!shouldContinueCreditTopOff()) {
       return false;
@@ -1867,20 +1877,17 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       return false;
     }
 
+    // Re-check cooldown after the async getBotFreshStatus call — a concurrent
+    // iteration could have set the cooldown while we were waiting for the API.
+    const recheckExpiry = recentlyToppedOff.get(member.username);
+    if (recheckExpiry && Date.now() < recheckExpiry) {
+      continue;
+    }
+
     // If we couldn't get fresh status, skip this bot rather than risk over-topping
     // based on stale cached data (which often reads 0 for idle bots).
     if (freshStatusFailed) {
       ctx.log("rescue", `💰 ${member.username}: fresh status unavailable, skipping (may be disconnected)`);
-      continue;
-    }
-
-    // Skip bots that were topped off recently — the game server may not have
-    // processed the deposit yet, so get_status would still show the pre-top-off
-    // balance and we'd waste a cycle re-topping the same bot.
-    const now = Date.now();
-    const cooldownExpiry = recentlyToppedOff.get(member.username);
-    if (cooldownExpiry && now < cooldownExpiry) {
-      ctx.log("rescue", `💰 ${member.username} recently topped off, skipping (cooldown)`);
       continue;
     }
 
@@ -1913,8 +1920,12 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
         return false;
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
-        await refreshBotCreditsAfterTopOff(ctx, member.username);
+        // Set cooldown immediately after the deposit succeeds — before the slow
+        // refreshBotCreditsAfterTopOff call (which sleeps 3s + does another
+        // get_status). This minimizes the window where a concurrent loop
+        // iteration could pass the cooldown check and double-top this bot.
         recentlyToppedOff.set(member.username, Date.now() + TOP_OFF_COOLDOWN_MS);
+        await refreshBotCreditsAfterTopOff(ctx, member.username);
         return true;
       }
     }
@@ -1996,8 +2007,8 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
         return false;
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
-        await refreshBotCreditsAfterTopOff(ctx, member.username);
         recentlyToppedOff.set(member.username, Date.now() + TOP_OFF_COOLDOWN_MS);
+        await refreshBotCreditsAfterTopOff(ctx, member.username);
         return true;
       }
     } else {
@@ -2095,6 +2106,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
 let creditTopOffRoutineActive = false;
+let creditTopOffLoopRunning = false;
 const TOP_OFF_COOLDOWN_MS = 90_000;
 const recentlyToppedOff = new Map<string, number>();
 const ownBotRescueCooldown = new Map<string, number>();
@@ -2116,8 +2128,8 @@ function shouldContinueCreditTopOff(): boolean {
 }
 
 /**
- * Background credit top-off loop — runs independently every 60 seconds,
- * only when docked at sol_central. Non-blocking to the main rescue loop.
+ * Background credit top-off loop — runs independently every 30 seconds,
+ * only when docked at the home system. Non-blocking to the main rescue loop.
  */
 function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number): void {
   if (targetAmount <= 0) {
@@ -2132,11 +2144,19 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
   }
 
   creditTopOffRoutineActive = true;
-  ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
-
-  const intervalMs = 30 * 1000; // .1 minute
+  const intervalMs = 30 * 1000; // 30 seconds
+  ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: ${intervalMs / 1000}s)`);
 
   const loop = async () => {
+    // Re-entrancy guard: setInterval fires every 30s regardless of whether the
+    // previous async iteration finished. On a laggy client with 181 fleet members
+    // (each requiring a getBotFreshStatus API call), one iteration easily exceeds
+    // 30s, so concurrent iterations race past the cooldown check and dump credits
+    // into bots that were already topped off. This guard makes overlap impossible.
+    if (creditTopOffLoopRunning) {
+      return;
+    }
+    creditTopOffLoopRunning = true;
     try {
       const { bot } = ctx;
 
@@ -2197,10 +2217,13 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
       if (creditTopOffRoutineActive) {
         ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
       }
+    } finally {
+      // Always release the re-entrancy guard, even on error
+      creditTopOffLoopRunning = false;
     }
   };
 
-  // Run immediately on start, then every minute
+  // Run immediately on start, then every 30 seconds
   loop();
   creditTopOffIntervalId = setInterval(loop, intervalMs);
 }
@@ -2211,6 +2234,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
  */
 function stopCreditTopOffBackground(): void {
   creditTopOffRoutineActive = false; // Set flag FIRST to prevent new loop iterations
+  creditTopOffLoopRunning = false; // Release re-entrancy guard so interval can fire again
   if (creditTopOffIntervalId !== null) {
     clearInterval(creditTopOffIntervalId);
     creditTopOffIntervalId = null;

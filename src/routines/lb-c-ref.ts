@@ -1,4 +1,4 @@
-import type { Routine, RoutineContext } from "../bot.js";
+﻿import type { Routine, RoutineContext } from "../bot.js";
 import { enableCloakingIfPossible, ensureDocked, ensureUndocked, readSettings } from "./common.js";
 
 interface LbCRefSettings {
@@ -7,6 +7,8 @@ interface LbCRefSettings {
   dockedMode?: boolean;
   dockedPoi?: string;
   scanIntervalMs?: number;
+  onlyNewArrivals?: boolean;
+  refuelLowFuelPct?: number;
 }
 
 function getLbCRefSettings(botUsername?: string): LbCRefSettings {
@@ -21,9 +23,10 @@ function getLbCRefSettings(botUsername?: string): LbCRefSettings {
     dockedMode: typeof raw.dockedMode === "boolean" ? raw.dockedMode : false,
     dockedPoi: typeof raw.dockedPoi === "string" ? raw.dockedPoi : undefined,
     scanIntervalMs: typeof raw.scanIntervalMs === "number" ? raw.scanIntervalMs : 2000,
+    onlyNewArrivals: typeof raw.onlyNewArrivals === "boolean" ? raw.onlyNewArrivals : true,
+    refuelLowFuelPct: typeof raw.refuelLowFuelPct === "number" ? raw.refuelLowFuelPct : 0,
   };
 }
-
 export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
@@ -37,13 +40,13 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
     return;
   }
 
-  ctx.log("system", `LB-C-ReF online — target=${settings.refuelTarget} qty=${settings.refuelQuantity} dockedMode=${settings.dockedMode}`);
+  ctx.log("system", `LB-C-ReF online â€” target=${settings.refuelTarget} qty=${settings.refuelQuantity} dockedMode=${settings.dockedMode}`);
 
   if (settings.dockedMode) {
     while (bot.state === "running") {
       const docked = await ensureDocked(ctx, true);
       if (!docked) {
-        ctx.log("warn", "LB-C-ReF (docked): Could not dock — retrying in 5s");
+        ctx.log("warn", "LB-C-ReF (docked): Could not dock â€” retrying in 5s");
         await ctx.sleep(5000);
         continue;
       }
@@ -58,6 +61,9 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       const recentlyRefueled = new Map<string, number>();
+      const seen = new Set<string>();
+      const lowFuelThreshold = settings.refuelLowFuelPct || 0;
+      const onlyNew = settings.onlyNewArrivals !== false;
       const cooldownMs = 30000;
 
       let obsUnsub: (() => void) | null = null;
@@ -82,6 +88,18 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
         for (const player of players) {
           const username = (player.username as string) || (player.name as string) || (player.player_id as string);
           if (!username) continue;
+          const key = username.toLowerCase();
+          if (onlyNew && seen.has(key)) {
+            if (lowFuelThreshold > 0) {
+              const fuel = (player.fuel as number) || (player.current_fuel as number) || 0;
+              const maxFuel = (player.max_fuel as number) || (player.fuel_capacity as number) || 0;
+              if (maxFuel <= 0 || ((fuel / maxFuel) * 100) >= lowFuelThreshold) {
+                continue;
+              }
+            } else {
+              continue;
+            }
+          }
           const now = Date.now();
           const last = recentlyRefueled.get(username);
           if (last && now - last < cooldownMs) continue;
@@ -128,7 +146,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "init_cloak";
     const cloaked = await enableCloakingIfPossible(ctx);
     if (!cloaked) {
-      ctx.log("warn", "LB-C-ReF: Could not enable cloaking — retrying next cycle");
+      ctx.log("warn", "LB-C-ReF: Could not enable cloaking â€” retrying next cycle");
       await ctx.sleep(5000);
       continue;
     }
@@ -140,11 +158,11 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
       await bot.refreshShip();
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (fuelPct <= 0) {
-        ctx.log("system", `LB-C-ReF: Fuel depleted (${fuelPct}%) — breaking to dock`);
+        ctx.log("system", `LB-C-ReF: Fuel depleted (${fuelPct}%) â€” breaking to dock`);
         break;
       }
       if (!bot.isCloaked) {
-        ctx.log("system", "LB-C-ReF: Cloak dropped — breaking to re-cloak");
+        ctx.log("system", "LB-C-ReF: Cloak dropped â€” breaking to re-cloak");
         break;
       }
       yield `refuel_${refuelCount}`;
@@ -157,13 +175,13 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
         failCount++;
         const msg = String(resp.error.message || "").toLowerCase();
         if (/rate limit|too many requests|temporarily blocked/.test(msg)) {
-          ctx.log("warn", "LB-C-ReF rate limited — backing off 10s");
+          ctx.log("warn", "LB-C-ReF rate limited â€” backing off 10s");
           await ctx.sleep(10000);
           continue;
         }
         ctx.log("warn", `LB-C-ReF refuel FAILED: ${resp.error.message}`);
         if (failCount >= 5) {
-          ctx.log("error", `LB-C-ReF: ${failCount} consecutive refuel failures — breaking to dock`);
+          ctx.log("error", `LB-C-ReF: ${failCount} consecutive refuel failures â€” breaking to dock`);
           break;
         }
       }
@@ -180,7 +198,7 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "dock_and_refuel";
     const docked = await ensureDocked(ctx, true);
     if (!docked) {
-      ctx.log("error", "LB-C-ReF: Could not dock — retrying cloak loop");
+      ctx.log("error", "LB-C-ReF: Could not dock â€” retrying cloak loop");
       await ctx.sleep(5000);
       continue;
     }

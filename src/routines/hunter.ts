@@ -48,6 +48,9 @@
   *   desiredFuelCells     â€” how many fuel cells the bot tries to keep stocked (-1 = fill cargo, default: -1)
   *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
  *   onlyNPCs        â€” only attack NPC pirates, never players (default: true)
+ *   ignorePirates    â€” never attack pirates (creatures only); intended for
+ *                     creature-farm hunter bots that operate in pirate strongholds
+ *                     and must avoid station reputation penalties (default: false)
  *   ammoReloadAbsoluteThreshold â€” ammo count to reload when weapon has â‰¤50 total ammo (default: 1)
  *   ammoReloadPercentThreshold â€” % of max ammo to reload when weapon has >50 total ammo (default: 25)
  *   pirateBaseSystem â€” system ID for patrol_radius mode (default: "" - currently configured base)
@@ -647,8 +650,9 @@ export function getHunterSettings(username?: string): {
   repairThreshold: number;
   fleeThreshold: number;
   shieldRechargePct: number;
-  onlyNPCs: boolean;
-  huntCreatures: boolean;
+   onlyNPCs: boolean;
+   ignorePirates: boolean;
+   huntCreatures: boolean;
   coordinateHunts: boolean;
   coordinationMode: HunterCoordinationMode;
   autoCloak: boolean;
@@ -734,7 +738,8 @@ export function getHunterSettings(username?: string): {
     returnHomeOnFuelCellsRemaining: (h.returnHomeOnFuelCellsRemaining as number) || 2,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     shieldRechargePct: (h.shieldRechargePct as number) || 80,
-    onlyNPCs: h.onlyNPCs !== false && h.onlyNPCs !== "false",
+     onlyNPCs: h.onlyNPCs !== false && h.onlyNPCs !== "false",
+    ignorePirates: (botOverrides.ignorePirates as boolean) ?? (h.ignorePirates as boolean) ?? false,
     huntCreatures: (botOverrides.huntCreatures ?? h.huntCreatures) !== false,
     coordinateHunts: (h.coordinateHunts as boolean) !== false,
     coordinationMode: resolveCoordinationMode(h.coordinationMode, (h.coordinateHunts as boolean) !== false),
@@ -2492,7 +2497,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
           const entities = parseNearby(afterBattleData);
           const creatures = pickCreatureTargets(entities, bot, true, settings.maxCreaturesPerScan, settings.coordinationMode);
-          const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+          const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
           let targets = [...creatures, ...pirates];
           targets = pickUnclaimedBoardingTarget(targets, bot.username);
 
@@ -2503,7 +2508,7 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
             break;
           }
 
-          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})`);
+          ctx.log("combat", `Found ${pirates.length} pirate(s), ${creatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses})${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
 
           for (const target of targetsToEngage) {
             if (bot.state !== "running") break;
@@ -2959,16 +2964,16 @@ async function farmSystemForBigCreature(
       const bigCreatures = allCreatures.filter(e => isBigCreature(e.name));
       const otherCreatures = allCreatures.filter(e => !isBigCreature(e.name));
       const creatures = [...prioritizeBigCreatures(bigCreatures), ...prioritizeLeviathans(otherCreatures)].slice(0, settings.maxCreaturesPerScan);
-      const pirates = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+      const pirates = settings.ignorePirates ? [] : entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
       let targets = [...creatures, ...pirates];
       targets = pickUnclaimedBoardingTarget(targets, bot.username);
       const targetsToEngage = sortTargetsByPriority(targets);
-      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier)));
+      const prioritizedTargets = prioritizeBigCreatures(targetsToEngage.filter(t => isCreatureTarget(t, true) || (!settings.ignorePirates && isPirateTarget(t, settings.onlyNPCs, settings.maxAttackTier))));
 
       if (prioritizedTargets.length === 0) break;
 
       const bigCount = prioritizedTargets.filter(t => isBigCreature(t.name)).length;
-      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))`);
+      ctx.log("combat", `Big creature hunt: ${pirates.length} pirate(s), ${allCreatures.length} creature(s) at ${poi.name} (pass ${passes}/${maxPasses}, ${bigCount} big target(s))${settings.ignorePirates ? " â€” ignoring pirates" : ""}`);
 
       for (const t of prioritizedTargets) {
         if (bot.state !== "running") break;

@@ -5457,6 +5457,22 @@
         Single Loop
       </label>`;
 
+          // Per-bot "Ignore Pirates" checkbox (creature farm modes only): lets
+          // big-ship creature hunters operate inside pirate strongholds without
+          // firing on pirates (which would trigger station reputation penalties).
+          const isCreatureMode =
+            hunterMode === "creature_farm" ||
+            hunterMode === "creature_farm_random" ||
+            hunterMode === "hunt_big_creatures";
+          if (isCreatureMode) {
+            const ignorePirates = botSettings.ignorePirates ?? false;
+            actions += `
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px" title="Never attack pirates â€” only creatures. Lets big-ship bots creature-hunt in pirate strongholds without triggering station reputation penalties for attacking pirates.">
+        <input type="checkbox" id="profile-hunter-ignorePirates" onchange="saveProfileHunterIgnorePirates()"${ignorePirates ? " checked" : ""}>
+        Ignore Pirates
+      </label>`;
+          }
+
           if (hunterMode === "boarding") {
             const stayInPoi = botSettings.stayInPoi ?? false;
             actions += `
@@ -5898,6 +5914,23 @@
 
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { singleLoop });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileHunterIgnorePirates() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const checkbox = document.getElementById("profile-hunter-ignorePirates");
+        if (!checkbox) return;
+        const ignorePirates = checkbox.checked;
+
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { ignorePirates });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -32422,6 +32455,7 @@ ignoreBlacklist: document.getElementById(
         const disableResupply = h.disableResupply ?? false;
         const onlyNPCs = h.onlyNPCs !== false;
         const huntCreatures = h.huntCreatures !== false;
+        const ignorePirates = h.ignorePirates ?? false;
         const coordinateHunts = h.coordinateHunts !== false;
         const coordinationMode = h.coordinationMode || (coordinateHunts ? "avoid" : "off");
         const responseRange = h.responseRange ?? 3;
@@ -32966,6 +33000,17 @@ ignoreBlacklist: document.getElementById(
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Ignore Pirates (creature farm only)</div>
+          <div class="setting-hint">ON: The hunter never attacks pirates â€” only creatures. Lets big-ship creature-farm bots operate inside pirate strongholds without triggering station reputation penalties for attacking pirates. OFF (recommended for pirate hunting): the hunter attacks both pirates and creatures as normal.</div>
+        </div>
+        <select id="set-hunter-ignorePirates">
+          <option value="false"${!ignorePirates ? " selected" : ""}>Off â€” hunt creatures and pirates</option>
+          <option value="true"${ignorePirates ? " selected" : ""}>On â€” ignore pirates, creatures only</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Loot Wrecks After Kills</div>
           <div class="setting-hint">ON (recommended): The hunter loots wreck cargo after every kill so loot is not left behind for others to steal. OFF: The hunter skips looting and keeps hunting — use this in wreck-heavy areas where looting would slow it down.</div>
         </div>
@@ -33244,6 +33289,8 @@ ignoreBlacklist: document.getElementById(
           disableScanCommandForPirates:
             document.getElementById("set-hunter-disableScanCommandForPirates")
               .value === "true",
+          ignorePirates:
+            document.getElementById("set-hunter-ignorePirates")?.value === "true",
           disableWreckSalvaging:
             document.getElementById("set-hunter-disableWreckSalvaging")
               .value === "true",

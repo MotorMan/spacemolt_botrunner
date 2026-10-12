@@ -1820,6 +1820,27 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
       await bot.refreshCargo();
     } else if (!atHomeStation && hasCargo) {
+      // In pre-stage mode, the deposit loop only processes the focus item.
+      // If the focus item is depleted from cargo, we can't deposit anything
+      // useful at any station — return home to restock instead of looping.
+      if (settings.preStageMode === "preStage" && currentFocusItemId) {
+        const focusCargo = getSellItemCargo(bot, currentFocusItemId);
+        if (focusCargo <= 0) {
+          const focusItemName = settings.sellItems.find(i => i.itemId === currentFocusItemId)?.itemName || currentFocusItemId;
+          ctx.log("fc", `Restart recovery: ${focusItemName} depleted from cargo — returning home to restock`);
+          yield "return_home";
+          if (bot.state !== "running") continue;
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for return journey");
+            await ctx.sleep(60000);
+            continue;
+          }
+          await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+          continue;
+        }
+      }
       ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
 
@@ -2419,7 +2440,14 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshCargo();
 
     const allSellItemsDepleted = !settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
-    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted;
+    const focusItemDepleted = settings.preStageMode === "preStage" && currentFocusItemId
+      ? getSellItemCargo(bot, currentFocusItemId) <= 0
+      : false;
+    if (focusItemDepleted) {
+      const focusItemName = settings.sellItems.find(i => i.itemId === currentFocusItemId)?.itemName || currentFocusItemId;
+      ctx.log("fc", `${focusItemName} depleted from cargo — returning home to restock`);
+    }
+    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted || focusItemDepleted;
 
     if (shouldReturnHome) {
       if (bot.state !== "running") break;

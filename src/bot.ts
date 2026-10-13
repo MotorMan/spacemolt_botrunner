@@ -421,7 +421,7 @@ docked = false;
   /** Track captured prize ships by ship_id → prize_id mapping.
    *  Populated by ship_captured WebSocket notifications so we can find
    *  the correct prize_id in get_nearby even if we didn't see it immediately. */
-  capturedPrizeTracker: Map<string, { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number }> = new Map();
+  capturedPrizeTracker: Map<string, { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean }> = new Map();
 
   /** Set of queued crafting job IDs to prevent duplicate submissions. */
   private queuedCraftingJobs: Set<string> = new Set();
@@ -4854,17 +4854,25 @@ if (this.craftQueueTracker && jobId && recipeId) {
       ship_class: shipClass,
       battle_id: battleId,
       timestamp: Date.now(),
+      claim_verified: existing?.claim_verified ?? false,
     });
     this.log("combat", `📦 Registered captured prize: ship_id=${shipId} class=${shipClass} battle=${battleId}${prizeId ? ` prize_id=${prizeId}` : " (prize_id pending)"}`);
   }
 
+  markPrizeClaimVerified(shipId: string): void {
+    const entry = this.capturedPrizeTracker.get(shipId);
+    if (entry) {
+      entry.claim_verified = true;
+    }
+  }
+
   /** Look up a captured prize by ship_id. Returns the tracker entry or undefined. */
-  getCapturedPrizeByShipId(shipId: string): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number } | undefined {
+  getCapturedPrizeByShipId(shipId: string): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean } | undefined {
     return this.capturedPrizeTracker.get(shipId);
   }
 
   /** Find a captured prize entry matching a nearby prize by ship_id. */
-  findCapturedPrizeMatch(prize: { ship_id?: string; prize_id?: string; status?: string }): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number } | undefined {
+  findCapturedPrizeMatch(prize: { ship_id?: string; prize_id?: string; status?: string }): { prize_id: string; ship_id: string; ship_class: string; battle_id: string; timestamp: number; claim_verified: boolean } | undefined {
     if (!prize.ship_id) return undefined;
     const entry = this.capturedPrizeTracker.get(prize.ship_id);
     if (entry) return entry;

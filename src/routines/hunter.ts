@@ -7137,11 +7137,20 @@ export async function boardingSubroutine(
  * This fixes mismatches where the initial ship_captured registration used the
  * pre-capture ship_id instead of the prize's actual ship_id.
  */
-function syncCapturedPrizeTracker(bot: Bot, prize: { ship_id?: string; prize_id?: string; ship_class?: string }): void {
+function syncCapturedPrizeTracker(bot: Bot, prize: { ship_id?: string; prize_id?: string; ship_class?: string; status?: string }): void {
   if (!prize.ship_id) return;
   const existing = bot.getCapturedPrizeByShipId(prize.ship_id);
-  if (existing && existing.prize_id) return;
+  if (!existing && !prize.prize_id) return;
+  if (existing && existing.prize_id) {
+    if (prize.status === "claimed" || prize.status === "in_transit") {
+      bot.markPrizeClaimVerified(prize.ship_id);
+    }
+    return;
+  }
   bot.registerCapturedPrize(prize.ship_id, prize.ship_class || "", "", prize.prize_id);
+  if (prize.status === "claimed" || prize.status === "in_transit") {
+    bot.markPrizeClaimVerified(prize.ship_id);
+  }
 }
 
 /**
@@ -7857,6 +7866,10 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
           }
 
           if (trackedMatch || knownShipId) {
+            if (prize.status === "claimed") {
+              const verifyEntry = trackedMatch || (knownShipId ? bot.getCapturedPrizeByShipId(knownShipId) : undefined);
+              if (verifyEntry) bot.markPrizeClaimVerified(verifyEntry.ship_id);
+            }
             ctx.log("combat", `ðŸ›¸ RecoverPrize: attempting claim for ${prize.ship_name || prize.prize_id} (status=${prize.status})`);
             const claimed = await claimPrizeAtCurrentPoi(ctx, settings, true, prize);
             if (claimed) {
@@ -7911,6 +7924,12 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
         return match && p.status === "claimed" && p.wait_reason;
       });
       if (stalled) {
+        // The prize was found at the POI with status=claimed â€” it is ours.
+        // Mark it verified so that if it disappears from get_nearby later,
+        // we know it left the POI (success) rather than "still spawning".
+        const stalledMatch = bot.findCapturedPrizeMatch(stalled);
+        if (stalledMatch) bot.markPrizeClaimVerified(stalledMatch.ship_id);
+
         if (stalled.wait_reason === "no_fuel") {
           ctx.log("combat", `RecoverPrize: prize stalled (no_fuel) â€” attempting refuel`);
           await servicePrize(ctx, stalled, "refuel");
@@ -7926,7 +7945,7 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
     }
 
     const trackedEntries = Array.from(bot.capturedPrizeTracker.values());
-    let targetEntry = trackedEntries.find((e: { ship_id?: string; prize_id?: string }) => {
+    let targetEntry = trackedEntries.find((e: { ship_id?: string; prize_id?: string; claim_verified?: boolean }) => {
       if (knownShipId && e.ship_id === knownShipId) return true;
       return e.ship_id && recoveries.some(r => r.ship_id === e.ship_id || r.prize_id === e.prize_id);
     });
@@ -7958,6 +7977,14 @@ async function recoverPrize(ctx: RoutineContext, settings: ReturnType<typeof get
           p.ship_id === targetEntry.ship_id || p.prize_id === targetEntry.prize_id,
         );
         if (!targetPrize) {
+          // If we previously verified this prize at the POI (saw it with
+          // status=claimed after servicing), its absence from get_nearby means
+          // it left the POI â€” recovery is complete. Do NOT keep waiting.
+          if (targetEntry.claim_verified) {
+            ctx.log("combat", `âœ… RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} no longer visible â€” left POI after being claimed (verified earlier)`);
+            bot.capturedPrizeTracker.delete(targetEntry.ship_id);
+            return true;
+          }
           // Prize not visible yet â€” it may still be spawning. Do NOT delete the
           // tracker entry; wait and retry instead.
           ctx.log("combat", `RecoverPrize: tracked prize ${targetEntry.ship_id.slice(0,8)} not yet visible â€” waiting for spawn (tick ${waitTick}/${maxWaitTicks})`);

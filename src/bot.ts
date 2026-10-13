@@ -3600,11 +3600,9 @@ getSkillLevel(skillId: string): number {
    * Anchors a watch at the current POI/system and returns the initial snapshot.
    * Subsequent updates arrive via observation_update push events.
    */
-async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
-     console.error(`[${this.username}] >>> subscribeToObservation called activeScan=${activeScan}`);
-     const libObs = this.libObservationState();
+  async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> {
+    const libObs = this.libObservationState();
     if (libObs.subscribed && !activeScan) {
-      console.error(`[${this.username}] >>> subscribeToObservation(library already active=true, porting cache)`);
       this.observationSession = { id: "active", poi_id: libObs.poiId, system_id: libObs.systemId };
       this.observationTick = libObs.tick;
       this.observationUnknownSignature = libObs.unknownSignature;
@@ -3612,10 +3610,10 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
       this.observationNearby = libObs.nearby;
       this.observationSystemAgents = libObs.systemAgents;
       this.log("observation", `Library observation already active (poi=${libObs.poiId} nearby=${libObs.nearby.length}) — ported cache`);
+      this.feedObservationIntoStore();
       return { result: { poi_id: libObs.poiId, system_id: libObs.systemId, nearby: libObs.nearby, system_agents: libObs.systemAgents, active_scan: libObs.activeScan, unknown_signature: libObs.unknownSignature }, error: undefined, notifications: [] };
     }
     if (libObs.subscribed && activeScan) {
-      console.error(`[${this.username}] >>> subscribeToObservation(library active=true, switching to activeScan)`);
       await this.libExec("subscribe_observation", { active_scan: true });
       const updated = this.libObservationState();
       this.observationSession = { id: "active", poi_id: updated.poiId, system_id: updated.systemId };
@@ -3625,23 +3623,21 @@ async subscribeToObservation(activeScan: boolean = false): Promise<ApiResponse> 
       this.observationNearby = updated.nearby;
       this.observationSystemAgents = updated.systemAgents;
       this.log("observation", `Observation active scan enabled (poi=${updated.poiId} nearby=${updated.nearby.length})`);
+      this.feedObservationIntoStore();
       return { result: { poi_id: updated.poiId, system_id: updated.systemId, nearby: updated.nearby, system_agents: updated.systemAgents, active_scan: true, unknown_signature: updated.unknownSignature }, error: undefined, notifications: [] };
     }
-this.log("observation", `[${this.username}] >>> subscribeToObservation(activeScan=${activeScan}) calling libExec`);
     const resp = await this.libExec("subscribe_observation", { active_scan: activeScan });
-    this.log("observation", `[${this.username}] >>> subscribe_observation response: error=${resp.error ? resp.error.message : "none"}, result_type=${resp.result ? typeof resp.result : "undefined"}`);
     if (resp.error) {
       this.log("error", `subscribe_observation failed: ${resp.error.message}`);
       return resp;
     }
 
-const sc = resp.result as Record<string, unknown>;
-    this.log("observation", `[${this.username}] >>> subscribe_observation full response: ${JSON.stringify(sc)}`);
+    const sc = resp.result as Record<string, unknown>;
     const fresh = this.libObservationState();
 
-    // Determine nearby and systemAgents from response; if missing, use empty arrays
-    let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : [];
-    let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : [];
+    // Determine nearby and systemAgents from response; if missing, use the library cache
+    let nearby: Array<Record<string, unknown>> = Array.isArray(sc.nearby) ? sc.nearby as Array<Record<string, unknown>> : (fresh.nearby.length ? fresh.nearby : []);
+    let systemAgents: Array<Record<string, unknown>> = Array.isArray(sc.system_agents) ? sc.system_agents as Array<Record<string, unknown>> : (fresh.systemAgents.length ? fresh.systemAgents : []);
 
     // Update observation state
     this.observationSession = {
@@ -3658,7 +3654,10 @@ const sc = resp.result as Record<string, unknown>;
     this.log("debug", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length} agents=${this.observationSystemAgents.length})`);
     this.log("observation", `Subscribed to observation (poi=${this.observationSession.poi_id} system=${this.observationSession.system_id} nearby=${this.observationNearby.length})`);
 
-    // Return the original response
+    // Feed the baseline snapshot into the player tracker so arrival/departure
+    // lookups in fullPlayerInfo.json work from the very first update.
+    this.feedObservationIntoStore();
+
     return resp;
   }
 
@@ -3685,10 +3684,19 @@ const sc = resp.result as Record<string, unknown>;
   }
 
   /**
-   * Return a synthetic get_nearby-shaped result built from the live
-   * observation cache, so existing parseNearby() logic keeps working.
+   * Feed the current observation cache into the persistent player/name
+   * stores so that arrival/departure lookups work reliably. Called after
+   * subscribeToObservation baseline and after each observation_update.
    */
-getObservationResult(): Record<string, unknown> {
+  private feedObservationIntoStore(): void {
+    try { this.trackNearbyPlayers(this.getObservationResult()); } catch { /* ignore tracking errors */ }
+  }
+
+  /**
+    * Return a synthetic get_nearby-shaped result built from the live
+    * observation cache, so existing parseNearby() logic keeps working.
+    */
+  getObservationResult(): Record<string, unknown> {
 const allNearby = [...this.observationNearby, ...this.observationSystemAgents];
     const pirates: Record<string, unknown>[] = [];
     const creatures: Record<string, unknown>[] = [];
@@ -3745,11 +3753,13 @@ return {
 
   /**
    * Process an observation_update push event from the server and update
-   * the cached nearby / system_agent lists.
+   * the cached nearby / system_agent lists. Logs player arrivals and
+   * departures with resolved display names (falling back to player_id →
+   * fullPlayerInfo.json lookup).
    */
   private handleObservationUpdate(data: Record<string, unknown>): void {
     debugLogForBot(this.username, "bot:observation", `${this.username} >>> handleObservationUpdate received`);
-    
+
     const poiId = (data.poi_id as string) || this.observationSession?.poi_id || "";
     const systemId = (data.system_id as string) || this.observationSession?.system_id || "";
     const tick = (data.tick as number) || 0;
@@ -3766,60 +3776,99 @@ return {
     this.observationTick = tick;
     this.observationUnknownSignature = unknownSig;
 
-const nearbyPlayerMap = new Map<string, Record<string, unknown>>();
-     const systemNpcMap = new Map<string, Record<string, unknown>>();
-     for (const e of this.observationNearby) {
-       const key = (e.username as string) || (e.player_id as string) || "";
-       if (key) nearbyPlayerMap.set(key, e);
-     }
-     for (const e of this.observationSystemAgents) {
-       const key = (e.username as string) || (e.player_id as string) || "";
-       if (key) systemNpcMap.set(key, e);
-     }
+    // Build a map keyed by player_id (primary) with username as fallback so
+    // that departure entries (which arrive as bare player_id strings) match
+    // the same entity that was previously inserted via nearby_changed.
+    const nearbyMap = new Map<string, Record<string, unknown>>();
+    for (const e of this.observationNearby) {
+      const key = (e.player_id as string) || (e.username as string) || "";
+      if (key) nearbyMap.set(key, e);
+    }
 
-     const departures: string[] = [];
-     if (Array.isArray(data.nearby_departed)) {
-       for (const pid of data.nearby_departed as string[]) {
-         nearbyPlayerMap.delete(pid);
-         departures.push(pid);
-       }
-     }
-     if (Array.isArray(data.system_departed)) {
-       for (const pid of data.system_departed as string[]) {
-         systemNpcMap.delete(pid);
-         departures.push(pid);
-       }
-     }
-     if (departures.length > 0) {
-       debugLogForBot(this.username, "bot:observation", `${this.username} observation departed: ${departures.join(", ")}`);
-       this.log("observation", `Departed: ${departures.join(", ")}`);
-     }
+    const arrivals = new Map<string, Record<string, unknown>>();
+    const departures: string[] = [];
 
-     if (Array.isArray(data.nearby_changed)) {
-       for (const e of data.nearby_changed as Array<Record<string, unknown>>) {
-         const key = (e.username as string) || (e.player_id as string) || "";
-         if (key) nearbyPlayerMap.set(key, e);
-       }
-     }
-     if (Array.isArray(data.system_changed)) {
-       for (const e of data.system_changed as Array<Record<string, unknown>>) {
-         const key = (e.username as string) || (e.player_id as string) || "";
-         if (key) systemNpcMap.set(key, e);
-       }
-     }
+    // Process departures (bare id strings)
+    const departureFields = ["nearby_departed", "pirates_departed", "empire_npcs_departed", "creatures_departed", "system_departed"] as const;
+    for (const field of departureFields) {
+      if (Array.isArray(data[field as string])) {
+        for (const id of data[field as string] as string[]) {
+          if (nearbyMap.delete(id)) {
+            departures.push(id);
+          } else {
+            // Key may be stored under a username; try removing by that too
+            nearbyMap.forEach((v, k) => {
+              if ((v.username as string) === id || (v.name as string) === id) {
+                nearbyMap.delete(k);
+                departures.push(id);
+              }
+            });
+          }
+        }
+      }
+    }
+    if (departures.length > 0) {
+      const names = departures.map((pid) => this.resolveEntityName(pid));
+      this.log("observation", `${span("Departed:", "ansi-yellow")} ${names.join(", ")}`);
+    }
 
-     this.observationNearby = Array.from(nearbyPlayerMap.values());
-     this.observationSystemAgents = Array.from(systemNpcMap.values());
+    // Process arrivals / state changes (full objects)
+    const changeFields = ["nearby_changed", "pirates_changed", "empire_npcs_changed", "creatures_changed", "system_changed"] as const;
+    for (const field of changeFields) {
+      if (Array.isArray(data[field as string])) {
+        for (const e of data[field as string] as Array<Record<string, unknown>>) {
+          const key = (e.player_id as string) || (e.username as string) || (e.id as string) || "";
+          if (!key) continue;
+          if (!nearbyMap.has(key)) {
+            arrivals.set(key, e);
+          }
+          nearbyMap.set(key, e);
+        }
+      }
+    }
+    if (arrivals.size > 0) {
+      const parts = Array.from(arrivals.values()).map((e) => {
+        const name = this.resolveEntityName((e.player_id as string) || (e.username as string) || (e.id as string) || "");
+        const ship = (e.ship_name as string) || (e.ship as string) || (e.ship_class as string) || "";
+        const faction = (e.faction_tag as string) || "";
+        const inCombat = (e.in_combat as boolean) ?? false;
+        let detail = span(name, "ansi-bright ansi-green");
+        if (ship) detail += ` [${ship}]`;
+        if (faction) detail += ` {${faction}}`;
+        if (inCombat) detail += ` ${span("⚔", "ansi-red")}`;
+        return detail;
+      });
+      this.log("observation", `${span("Arrived:", "ansi-green")} ${parts.join(", ")}`);
+    }
+
+    this.observationNearby = Array.from(nearbyMap.values());
 
     const cloakedResolved = Array.isArray(data.cloaked_resolved) ? (data.cloaked_resolved as Array<Record<string, unknown>>).length : 0;
     const cloakedLost = Array.isArray(data.cloaked_lost) ? (data.cloaked_lost as string[]).length : 0;
     if (cloakedResolved > 0 || cloakedLost > 0) {
       debugLogForBot(this.username, "bot:observation", `${this.username} observation cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
-      this.log("observation", `Cloaked: +${cloakedResolved} resolved, -${cloakedLost} lost`);
+      this.log("observation", `${span("Cloaked:", "ansi-cyan")} +${cloakedResolved} resolved, -${cloakedLost} lost`);
     }
 
+    // Feed the updated presence into the persistent player/name store so
+    // that future departure lookups (nearby_departed player_ids) can be
+    // resolved to display names via fullPlayerInfo.json.
+    this.feedObservationIntoStore();
+
     debugLogForBot(this.username, "bot:observation", `${this.username} observation snapshot: nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
-    this.log("observation", `[tick ${tick}] nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
+    this.log("observation", `${span("[tick " + tick + "]", "ansi-white")} nearby=${this.observationNearby.length} system_agents=${this.observationSystemAgents.length} unknown=${this.observationUnknownSignature}`);
+  }
+
+  /**
+   * Resolve a player_id (or fallback username/name) to a human-readable
+   * display name. Looks up the entity in the persistent player store
+   * (data/fullPlayerInfo.json) by id first, then by normalized name.
+   * Returns the raw key when no match is found.
+   */
+  private resolveEntityName(idOrName: string): string {
+    if (!idOrName) return "unknown";
+    const detail = playerNameStore.getEntityDetailById(idOrName) || playerNameStore.getEntityDetail(idOrName);
+    return detail?.name || idOrName;
   }
 
   /**
@@ -5176,10 +5225,15 @@ const CATEGORY_COLORS: Record<string, string> = {
   scavenge: "\x1b[33m",
   rescue: "\x1b[96m",
   alert: "\x1b[91m",
+  observation: "\x1b[36m",
 };
 
 function getCategoryColor(category: string): string {
   return CATEGORY_COLORS[category] || CATEGORY_COLORS.info;
+}
+
+function span(value: string, cls: string): string {
+  return `<span class="${cls}">${value}</span>`;
 }
 
 function sleep(ms: number): Promise<void> {

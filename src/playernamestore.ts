@@ -637,9 +637,26 @@ export class PlayerNameStore {
   }
 
   /**
-   * Get detailed information for any entity (player, pirate, or empire NPC).
-   * Returns EntityDetail or null if not found.
-   */
+    * Get detailed information for an entity by its ID (player_id / pirate_id / npc id).
+    * Searches players, pirates, and empire_npcs. Returns EntityDetail or null.
+    */
+  getEntityDetailById(id: string): EntityDetail | null {
+    this.ensureLoaded();
+    if (!id) return null;
+    for (const category of ["players", "pirates", "empire_npcs"] as const) {
+      for (const entity of Object.values(this.fullPlayerInfo[category])) {
+        if (entity.id === id) {
+          return entity;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+    * Get detailed information for an entity (player, pirate, or empire NPC).
+    * Returns EntityDetail or null if not found.
+    */
   getEntityDetail(name: string): EntityDetail | null {
     this.ensureLoaded();
     const normalized = this.normalize(name);

@@ -384,11 +384,11 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   const placedOrders = new Map<string, { price: number; quantity: number }>();
 
   // Observation subscription: collect the player/pirate/empire-NPC data this bot
-  // sees at every station (same intent as the get_nearby feed, but via the live
-  // observation change-feed so we don't have to poll). The feed is pushed into
-  // the shared player tracker (playerNameStore) via trackNearbyPlayers, exactly
-  // like the get_nearby result handled in botmanager.ts.
-  let observationUnsub: (() => void) | null = null;
+  // sees at every station via the live observation feed. The feed is pushed into
+  // the shared player tracker (playerNameStore) by bot.ts's
+  // handleObservationUpdate / feedObservationIntoStore, exactly like the
+  // get_nearby result handled in botmanager.ts. Arrival/departure logging with
+  // resolved display names is also handled centrally there.
 
   // Advertise that THIS client produces its own market data. Traders running in
   // this same client then read data/marketDetails.json directly instead of
@@ -443,42 +443,23 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
     marketStreamStore.subscribe(baseId, cb);
   }
 
-  // Remove our observation_update listener (the server watch itself ends
-  // automatically on travel/jump, so we only tear down our local hook here).
+  // Clear the local observation cache (the server watch itself ends
+  // automatically on travel/jump, so we only tear down our local state here).
+  // Arrival/departure logging and player-name tracking are handled centrally
+  // by bot.ts on every observation_update push.
   function unsubscribeObservation() {
-    if (observationUnsub) {
-      try {
-        observationUnsub();
-      } catch {
-        /* ignore */
-      }
-      observationUnsub = null;
-    }
+    bot.clearObservationState();
   }
 
-  // Subscribe to the live observation feed for the station we are docked at and
-  // push every update (plus the initial baseline snapshot) into the shared
-  // player tracker, the same way get_nearby results are handled downstream.
+  // Subscribe to the live observation feed for the station we are docked at.
+  // bot.subscribeToObservation() feeds the baseline snapshot into the player
+  // tracker and enables observation_update pushes, which bot.ts routes through
+  // handleObservationUpdate for arrival/departure logging with resolved names.
   async function subscribeObservation() {
     unsubscribeObservation();
     if (!bot.account) {
       ctx.log("warn", "Observation subscription skipped: no account handle (player tracking disabled)");
       return;
-    }
-
-    // Register the listener first so we catch the initial update.
-    try {
-      // @ts-ignore: account.on exists on the spacemolt lib
-      const off = bot.account.on("observation_update", () => {
-        try {
-          bot.trackNearbyPlayers(bot.getObservationResult());
-        } catch {
-          /* ignore player-tracking errors from observation updates */
-        }
-      });
-      observationUnsub = off;
-    } catch (err) {
-      ctx.log("warn", `observation_update listener failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     try {
@@ -487,13 +468,8 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", `subscribe_observation failed: ${obsResp.error.message}`);
         return;
       }
-      // Feed the baseline snapshot into the player tracker (get_nearby-shaped).
-      try {
-        bot.trackNearbyPlayers(bot.getObservationResult());
-        ctx.log("info", `Observation baseline player data tracked at ${bot.system}/${bot.poi}`);
-      } catch {
-        /* ignore player-tracking errors from the baseline */
-      }
+      // subscribeToObservation already feeds the baseline into the player tracker.
+      ctx.log("info", `Observation subscribed at ${bot.system}/${bot.poi}`);
     } catch (err) {
       ctx.log("error", `subscribe_observation failed: ${err instanceof Error ? err.message : String(err)}`);
     }

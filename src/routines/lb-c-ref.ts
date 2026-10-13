@@ -100,9 +100,27 @@ export const lbCRefRoutine: Routine = async function* (ctx: RoutineContext) {
               continue;
             }
           }
+          if (onlyNew) seen.add(key);
           const now = Date.now();
           const last = recentlyRefueled.get(username);
           if (last && now - last < cooldownMs) continue;
+
+          const playerFuel = (player.fuel as number) || (player.current_fuel as number) || 0;
+          const playerMaxFuel = (player.max_fuel as number) || (player.fuel_capacity as number) || 0;
+          if (playerMaxFuel > 0 && playerFuel >= playerMaxFuel) continue;
+
+          const botFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          const selfFuelThreshold = settings.refuelLowFuelPct || 15;
+          if (botFuelPct < selfFuelThreshold) {
+            ctx.log("system", `LB-C-ReF (docked): Self-fuel low (${botFuelPct}%) — self-refueling before assisting ${username}`);
+            const selfResp = await bot.exec("refuel");
+            if (selfResp.error) {
+              ctx.log("warn", `LB-C-ReF (docked): Self-refuel failed: ${selfResp.error.message}`);
+            } else {
+              await bot.refreshShip();
+              ctx.log("system", `LB-C-ReF (docked): Self-refueled to ${bot.fuel}/${bot.maxFuel}`);
+            }
+          }
 
           try {
             yield `refuel_player_${username}`;

@@ -1714,7 +1714,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
             if (qty) this.cargo += qty;
           } else if (command === "refuel") {
             const fuelAdded = (r.fuel_added as number) || (r.quantity as number) || 0;
-            if (fuelAdded) this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+            if (fuelAdded) {
+              if (payload?.target) {
+                this.fuel = Math.max(0, this.fuel - fuelAdded);
+              } else {
+                this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+              }
+            }
             if (typeof ship.fuel === "number") this.fuel = ship.fuel;
           } else if (command === "repair") {
             const hullRepaired = (r.hull_repaired as number) || (r.hull as number) || 0;

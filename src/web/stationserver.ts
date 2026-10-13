@@ -834,17 +834,19 @@ export class StationWebServer {
           // Gun ammo + facility maintenance stock (faction storage only).
           // Only read live supplies when the drone is actually at the monitored
           // station; otherwise we would ingest the wrong station's faction
-          // storage and red-flag a healthy station.
+          // storage and red-flag a healthy station. Use baseId (confirmed POI)
+          // so the cache key matches the station we actually read.
           const supplies = atMonitoredStation
             ? await this.readSupplies(
                 row,
                 botInstance,
                 true,
                 prev?.supplies ?? lastGood?.supplies ?? null,
+                baseId,
               )
             : (prev?.supplies ?? lastGood?.supplies ?? null);
           const factionStockRaw = atMonitoredStation
-            ? await this.readFactionStock(botInstance, row, true, Math.max(1, this.config.supplyRefreshMin) * 60_000)
+            ? await this.readFactionStock(botInstance, row, true, Math.max(1, this.config.supplyRefreshMin) * 60_000, baseId)
             : null;
           const factionStock = factionStockRaw?.stock
             ? Object.fromEntries(factionStockRaw.stock)
@@ -1175,20 +1177,19 @@ export class StationWebServer {
   }
 
   /**
-   * Stock held in THIS station's faction storage. The docked-drone read is
-   * already keyed "system|poi", which is the same key the rest of the botrunner
-   * uses for the station the bot is physically at. Only that key is consulted
-   * here so we cannot accidentally pick up a fresher cache entry that belongs
-   * to a different station.
+   * Stock held in THIS station's faction storage. Uses the confirmed station POI
+   * from the get_base response (passed as stationPoiId) so we never pick up a
+   * cache entry for a different station, even if the bot's internal poi lags.
    */
   private async readFactionStock(
     botInstance: Bot,
     row: StationRow,
     docked: boolean,
     ttlMs: number,
+    stationPoiId: string,
   ): Promise<SupplyStock> {
     const faction = botInstance.faction || "unknown";
-    const dockedKey = `${botInstance.system}|${botInstance.poi}`;
+    const dockedKey = `${botInstance.system}|${stationPoiId}`;
 
     const toStock = (
       entries: { itemId: string; quantity: number; name?: string }[],
@@ -1212,14 +1213,12 @@ export class StationWebServer {
 
     const fresh = !!best && Date.now() - best.at <= ttlMs;
     if (!fresh && docked) {
-      // Read the faction storage of the station we're docked at and refill the
-      // shared cache for every other consumer. `updateFactionStorageCache` only
-      // runs on success, so a bumped `lastUpdated` is our success signal — that
-      // way a genuinely empty storage still reads as empty rather than falling
-      // back to stale numbers.
+      // Read the faction storage of the confirmed station and refill the
+      // shared cache. Pass the station POI explicitly so the bot reads the
+      // correct station even if its internal poi lags.
       const startedAt = Date.now();
       try {
-        await botInstance.refreshFactionStorage(true, undefined, true);
+        await botInstance.refreshFactionStorage(true, stationPoiId, false);
         const after = getFactionStorageCache(faction, dockedKey);
         if (after && (after.lastUpdated || 0) >= startedAt) {
           return { ...toStock(after.entries || []), at: after.lastUpdated, source: "live" };
@@ -1239,12 +1238,13 @@ export class StationWebServer {
     botInstance: Bot,
     docked: boolean,
     prev: SupplyStatus | null,
+    stationPoiId: string,
   ): Promise<SupplyStatus | null> {
     try {
       const ttlMs = Math.max(1, this.config.supplyRefreshMin) * 60_000;
-      const stationKey = `${botInstance.system}|${botInstance.poi}`;
+      const stationKey = `${botInstance.system}|${stationPoiId}`;
       const facs = await this.readStationFacilities(botInstance, stationKey, ttlMs);
-      const stock = await this.readFactionStock(botInstance, row, docked, ttlMs);
+      const stock = await this.readFactionStock(botInstance, row, docked, ttlMs, stationPoiId);
       return this.evaluateSupplies(facs.facilities, facs.at, stock);
     } catch (err) {
       // A supply hiccup must never blank an otherwise good card.

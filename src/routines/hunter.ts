@@ -287,15 +287,17 @@ function isBrandedCreature(name: string | undefined): boolean {
 /**
  * Returns true if a creature is protected and must NEVER be attacked.
  *
- * Cloudwhale Calves and Hatchlings are protected: killing them prevents the
- * adult Cloudwhale from ever spawning, and they drop poor loot. This is
- * checked at target-selection time (pickCreatureTargets / big creature hunt)
+ * Any creature whose name contains "hatchling" or "calf" is protected — this
+ * blanket rule covers Cloudwhale Calves, Molt/Rainbow/Hoarfrost Leviathan
+ * Hatchlings, and any future young-of-species variants. Killing hatchlings and
+ * calves prevents the adult from ever spawning, and they drop poor loot. This
+ * is checked at target-selection time (pickCreatureTargets / big creature hunt)
  * so the hunter simply skips over them and engages other targets instead.
  */
 function isProtectedCreature(name: string | undefined): boolean {
   if (!name) return false;
   const lower = name.toLowerCase();
-  return lower.includes("cloudwhale calf") || lower.includes("cloudwhale hatchling");
+  return lower.includes("hatchling") || lower.includes("calf");
 }
 
 /**
@@ -306,7 +308,7 @@ function isProtectedCreature(name: string | undefined): boolean {
 function isCloudWhale(name: string | undefined): boolean {
   if (!name) return false;
   const lower = name.toLowerCase();
-  return lower.includes("cloudwhale") && !lower.includes("cloudwhale calf") && !lower.includes("cloudwhale hatchling");
+  return lower.includes("cloudwhale") && !lower.includes("calf") && !lower.includes("hatchling");
 }
 
 /**
@@ -1813,7 +1815,7 @@ continue;
       : isPirateTarget(match, settings.onlyNPCs, settings.maxAttackTier);
     if (!valid) {
       if (req.creature && isProtectedCreature(req.targetName)) {
-        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (Cloudwhale Calf/Hatchling)`);
+        ctx.log("combat", `Skipping assist: ${req.targetName} is a protected creature (hatchling/calf)`);
       }
       handled.add(key);
       continue;

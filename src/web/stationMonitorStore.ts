@@ -73,37 +73,60 @@ export interface FuelCraftStatus {
  */
 export type SupplyLevel = "ok" | "low" | "out" | "unknown";
 
-/** One tracked consumable: either a facility maintenance input or gun ammo. */
+/** One tracked consumable: a facility maintenance input, gun ammo, or civilian food. */
 export interface SupplyItem {
   itemId: string;
   name: string;
-  kind: "maintenance" | "ammo";
   /**
-   * maintenance: units drawn from faction storage per 1000-tick cycle.
-   * ammo: number of active guns feeding from this ammo item (guns burn ammo per
-   * shot, so there is no per-cycle rate to project a depletion time from).
-   */
+    * "maintenance" — facility upkeep inputs withdrawn once per 1000-tick cycle.
+    * "ammo" — gun ammunition, judged on rounds remaining (no per-cycle burn rate).
+    * "food" — civilian consumables; NOT on a tick cycle, so no depletion estimate
+    *   is projected and running out is a minor (yellow) warning, not a red alert.
+    */
+  kind: "maintenance" | "ammo" | "food";
+  /**
+    * maintenance: units drawn from faction storage per 1000-tick cycle.
+    * ammo: number of active guns feeding from this ammo item (guns burn ammo per
+    * shot, so there is no per-cycle rate to project a depletion time from).
+    * food: 1 (the per-cycle figure is meaningless for civilian consumption, so we
+    * just count the facility that lists it).
+    */
   need: number;
   /** Units held in THIS station's faction storage — the only place station facilities draw from. */
   have: number;
-  /** maintenance: estimated days of stock left at the per-cycle burn. null for ammo. */
+  /**
+    * maintenance: estimated days of stock left at the per-cycle burn.
+    * ammo: null (no per-shot rate to project from).
+    * food: null (consumed by civilians, not on a tick cycle — no projection).
+    */
   daysLeft: number | null;
   level: SupplyLevel;
+  /** Catalog food_type for food items (e.g. "dish", "alcohol", "drink"); null for non-food. */
+  foodType: string | null;
   /** Names of the active facilities that consume this item. */
   facilities: string[];
 }
 
 /**
- * Ammo + maintenance supply state for a station, derived from the station's
- * facility list and its faction storage. Guns stop firing when their ammo box
- * is empty and facilities stop running when their maintenance inputs run out,
- * so both are surfaced on the monitor card as yellow (low) / red (out).
+ * Ammo + maintenance + food supply state for a station, derived from the
+ * station's facility list and its faction storage. Guns stop firing when their
+ * ammo box is empty and facilities stop running when their maintenance inputs
+ * run out, so both are surfaced on the monitor card as yellow (low) / red (out).
+ *
+ * Food is different: it is consumed by civilians (not on a tick cycle) and the
+ * station is paid for it, so running out is only a minor (yellow) warning — it
+ * does not harm the station's thriving/satisfaction status and never goes red.
  */
 export interface SupplyStatus {
-  /** Worst level across facility maintenance inputs. */
+  /** Worst level across facility maintenance inputs (non-food). */
   maintenance: SupplyLevel;
   /** Worst level across gun ammo. "ok" when the station has no armed guns. */
   ammo: SupplyLevel;
+  /**
+    * Worst level across civilian food items. Food is never "out" (empty food is
+    * "low"), so this only ever yellows a card, never red-flags it.
+    */
+  food: SupplyLevel;
   /** Number of active guns that need ammo. */
   guns: number;
   items: SupplyItem[];
@@ -184,12 +207,16 @@ export const SECS_PER_MAINT_CYCLE = 1000 * 10;
 const SECS_PER_DAY = 86_400;
 
 /**
- * Grade a station's ammo and maintenance stock against the configured
+ * Grade a station's ammo, maintenance, and food stock against the configured
  * thresholds. Pure: no I/O, so this is the single place the yellow/red decision
  * is made for both the monitor cards and the station detail table.
  *
  * Anything we could not read grades as `unknown`, never as a problem — a cache
  * miss or a failed call must not red-flag a healthy station.
+ *
+ * Food (items with a catalog `food_type`) is consumed by civilians, not on a
+ * tick cycle, so no depletion time is projected and running out is only a minor
+ * (yellow) warning — it never goes "out" and does not red-flag the card.
  */
 export function evaluateSupplies(
   facilities: SupplyFacility[],
@@ -197,6 +224,7 @@ export function evaluateSupplies(
   stock: SupplyStock,
   thresholds: SupplyThresholds,
   itemNames: Record<string, string> = {},
+  foodTypes: Record<string, string> = {},
 ): SupplyStatus {
   const checkedAt = Date.now();
   const nameOf = (id: string): string => stock.names.get(id) || itemNames[id] || id;
@@ -231,16 +259,25 @@ export function evaluateSupplies(
 
   for (const [itemId, e] of maintNeed) {
     const have = stock.stock.get(itemId) ?? 0;
-    const daysLeft = e.need > 0 ? ((have / e.need) * SECS_PER_MAINT_CYCLE) / SECS_PER_DAY : null;
+    const ft = foodTypes[itemId];
+    const isFood = !!ft;
+    // Food is consumed by civilians (not on a tick cycle), so there is no
+    // per-cycle burn rate to project a depletion time from.
+    const daysLeft = isFood ? null : (e.need > 0 ? ((have / e.need) * SECS_PER_MAINT_CYCLE) / SECS_PER_DAY : null);
     let level: SupplyLevel;
     if (stockUnknown) level = "unknown";
-    else if (have <= 0) level = "out";
+    else if (isFood) {
+      // Food running out is a minor warning, not a red alert — it does not
+      // prevent facilities from running or harm the station's thriving status.
+      level = have <= 0 ? "low" : "ok";
+    } else if (have <= 0) level = "out";
     else if (lowDays > 0 && daysLeft !== null && daysLeft <= lowDays) level = "low";
     else level = "ok";
     items.push({
       itemId,
       name: nameOf(itemId),
-      kind: "maintenance",
+      kind: isFood ? "food" : "maintenance",
+      foodType: ft || null,
       need: e.need,
       have,
       daysLeft: daysLeft === null ? null : Math.round(daysLeft * 100) / 100,
@@ -261,6 +298,7 @@ export function evaluateSupplies(
       itemId,
       name: nameOf(itemId),
       kind: "ammo",
+      foodType: null,
       need: e.guns,
       have,
       daysLeft: null,
@@ -269,9 +307,11 @@ export function evaluateSupplies(
     });
   }
 
-  // Ammo first (a silent gun is the more urgent problem), then by item id.
+  // Ammo first (a silent gun is the more urgent problem), then maintenance,
+  // then food (a minor worry — civilians complain before the station suffers).
+  const kindOrder: Record<SupplyItem["kind"], number> = { ammo: 0, maintenance: 1, food: 2 };
   items.sort((a, b) =>
-    a.kind === b.kind ? a.itemId.localeCompare(b.itemId) : a.kind === "ammo" ? -1 : 1,
+    a.kind === b.kind ? a.itemId.localeCompare(b.itemId) : kindOrder[a.kind] - kindOrder[b.kind],
   );
 
   // No line items for a category means nothing at this station consumes it,
@@ -287,7 +327,7 @@ export function evaluateSupplies(
 
   let note: string | null = null;
   if (facsUnknown) {
-    note = "Facility list unavailable — ammo/consumable state unknown.";
+    note = "Facility list unavailable — ammo/consumable/food state unknown.";
   } else if (stockUnknown) {
     note = "No faction storage reading for this station yet — stock unknown.";
   }
@@ -295,6 +335,7 @@ export function evaluateSupplies(
   return {
     maintenance: worst("maintenance"),
     ammo: worst("ammo"),
+    food: worst("food"),
     guns,
     items,
     source: stock.source,

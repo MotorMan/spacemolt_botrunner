@@ -507,16 +507,20 @@ export class StationWebServer {
     facilities: SlimFacility[];
     byId: Record<string, SlimFacility>;
     itemNames: Record<string, string>;
+    /** itemId -> food_type (e.g. "dish", "alcohol", "drink") for civilian food items. */
+    itemFoodTypes: Record<string, string>;
   } | null = null;
 
   private loadCatalog(): {
     facilities: SlimFacility[];
     byId: Record<string, SlimFacility>;
     itemNames: Record<string, string>;
+    itemFoodTypes: Record<string, string>;
   } {
     if (this.catalogCache) return this.catalogCache;
     let facilities: SlimFacility[] = [];
     const itemNames: Record<string, string> = {};
+    const itemFoodTypes: Record<string, string> = {};
     try {
       const path = join(process.cwd(), "data", "catalog.json");
       if (existsSync(path)) {
@@ -526,9 +530,11 @@ export class StationWebServer {
         };
         const facs = raw.facilities || {};
         for (const [id, it] of Object.entries(raw.items || {})) {
-          const nm = it && typeof it === "object" ? (it.name as string) : "";
-          if (nm) itemNames[id] = nm;
-        }
+           const nm = it && typeof it === "object" ? (it.name as string) : "";
+           if (nm) itemNames[id] = nm;
+           const ft = it && typeof it === "object" ? (it.food_type as string) : "";
+           if (ft) itemFoodTypes[id] = ft;
+         }
         facilities = Object.values(facs).map((f) => ({
           id: (f.id as string) || "",
           name: (f.name as string) || "",
@@ -566,7 +572,7 @@ export class StationWebServer {
     }
     const byId: Record<string, SlimFacility> = {};
     for (const f of facilities) if (f.id) byId[f.id] = f;
-    this.catalogCache = { facilities, byId, itemNames };
+    this.catalogCache = { facilities, byId, itemNames, itemFoodTypes };
     return this.catalogCache;
   }
 
@@ -1049,7 +1055,7 @@ export class StationWebServer {
     };
   }
 
-  // ── Ammo / consumable supply tracking ─────────────────────
+  // ── Ammo / maintenance / food supply tracking ───────────────
   //
   // Station guns feed from an ammo item and go silent the moment it hits zero;
   // service/infrastructure facilities withdraw their maintenance inputs once per
@@ -1057,6 +1063,12 @@ export class StationWebServer {
   // the STATION'S FACTION STORAGE — the docked drone's cargo and personal
   // station storage are never touched by station facilities — so that is the
   // only stock we count.
+  //
+  // Some facility maintenance inputs are actually civilian food (identified via
+  // the catalog's `food_type` key). Food is no longer on a tick cycle — it is
+  // consumed by civilians and the station is paid for it — so we cannot project
+  // a depletion time, and running out is only a minor (yellow) warning that
+  // never red-flags the card or harms thriving status.
   //
   // The numbers come from caches the rest of the botrunner already fills (the
   // shared faction-storage cache and the per-station facility list). The monitor
@@ -1268,6 +1280,7 @@ export class StationWebServer {
         consumableLowDays: this.config.consumableLowDays,
       },
       cat.itemNames,
+      cat.itemFoodTypes,
     );
   }
 

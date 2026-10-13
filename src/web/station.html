@@ -207,24 +207,32 @@
     return supplyInfo(v).level === "low";
   }
 
-  // ── ammo / consumable supply indicator ──
+  // ── ammo / maintenance / food supply indicator ──
   // The station's guns and facilities both draw from the station's FACTION
   // storage (never the drone's cargo or personal storage). The server evaluates
   // stock against the configured thresholds and hands us the levels.
+  // Food is consumed by civilians (not on a tick cycle) and running out is only
+  // a minor (yellow) warning — it never red-flags the card or harms thriving.
   function supplyInfo(v) {
     const s = v.supplies;
     if (!s) {
       return {
-        level: "unknown", ammo: "unknown", cons: "unknown", guns: 0, items: [],
+        level: "unknown", ammo: "unknown", cons: "unknown", food: "unknown", guns: 0, items: [],
         label: "SUPPLY ?", cls: "sup-unknown",
-        title: "Ammo/consumable stock not read yet for this station",
+        title: "Ammo/consumable/food stock not read yet for this station",
       };
     }
     const ammo = s.ammo || "unknown";
     const cons = s.maintenance || "unknown";
-    // Worst of the two categories drives the card colour.
+    const food = s.food || "unknown";
+    // Worst of ammo and maintenance drives the alert (red) level. Food is only
+    // a minor warning — it can yellow a card but never red-flag it.
     const rank = { out: 3, low: 2, unknown: 1, ok: 0 };
     const level = rank[ammo] >= rank[cons] ? ammo : cons;
+    // Food at "low" yellows the card if nothing more urgent is already flagged.
+    // Food is never "out" (empty food is "low"), and food "unknown" never warns.
+    let effectiveLevel = level;
+    if (level !== "out" && food === "low") effectiveLevel = "low";
     const guns = num(s.guns);
     const items = Array.isArray(s.items) ? s.items : [];
 
@@ -233,7 +241,9 @@
     for (const i of bad) {
       const qty = i.kind === "ammo"
         ? num(i.have) + " rnd"
-        : num(i.have) + " (" + (i.daysLeft == null ? "?" : fmtDays(i.daysLeft)) + ")";
+        : i.kind === "food"
+          ? num(i.have) + " units"
+          : num(i.have) + " (" + (i.daysLeft == null ? "?" : fmtDays(i.daysLeft)) + ")";
       parts.push((i.level === "out" ? "OUT " : "LOW ") + (i.name || i.itemId) + ": " + qty);
     }
     if (s.note) parts.push(s.note);
@@ -245,16 +255,18 @@
     const age = s.storageAt ? " · stock read " + ageText(s.storageAt) : "";
 
     // Ammo is called out by name on the chip, because a silent gun is the
-    // failure people care about most.
+    // failure people care about most. Food gets its own warning, but only a
+    // minor (yellow) one — never the red a depleted maintenance input earns.
     let label, cls;
     if (ammo === "out") { label = "NO AMMO"; cls = "sup-bad"; }
     else if (ammo === "low") { label = "AMMO LOW"; cls = "sup-warn"; }
     else if (cons === "out") { label = "NO SUPPLY"; cls = "sup-bad"; }
     else if (cons === "low") { label = "SUPPLY LOW"; cls = "sup-warn"; }
+    else if (food === "low") { label = "FOOD LOW"; cls = "sup-warn"; }
     else if (level === "unknown") { label = "SUPPLY ?"; cls = "sup-unknown"; }
     else { label = guns > 0 ? "ARMED x" + guns : "SUPPLIED"; cls = "sup-ok"; }
 
-    return { level, ammo, cons, guns, items, label, cls, title: parts.join("\n") + age };
+    return { level: effectiveLevel, ammo, cons, food, guns, items, label, cls, title: parts.join("\n") + age };
   }
 
   function fmtDays(d) {
@@ -1487,9 +1499,9 @@
       el.innerHTML = '<div class="detail-note">Ammo/consumable stock has not been read for this station yet. It is evaluated on the monitor\'s poll sweep — press REFRESH on the monitor page if you need it now.</div>';
       return;
     }
-    const items = Array.isArray(s.items) ? s.items : [];
+     const items = Array.isArray(s.items) ? s.items : [];
     if (!items.length) {
-      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance or ammo requirements.</div>';
+      el.innerHTML = '<div class="detail-note">No active station facilities with maintenance, ammo, or food requirements.</div>';
       return;
     }
 
@@ -1504,9 +1516,11 @@
     const rowFor = (i) => {
       const color = LEVEL_COLOR[i.level] || LEVEL_COLOR.unknown;
       const isAmmo = i.kind === "ammo";
+      const isFood = i.kind === "food";
       // Ammo has no per-cycle burn, so there is nothing to project a run-out
-      // time from — only the round count matters.
-      const depletion = isAmmo
+      // time from — only the round count matters. Food is consumed by civilians
+      // (not on a tick cycle), so there is also no depletion estimate.
+      const depletion = isAmmo || isFood
         ? "—"
         : i.level === "unknown"
           ? "?"
@@ -1515,10 +1529,16 @@
             : i.daysLeft == null
               ? "—"
               : "≈ " + fmtDays(i.daysLeft);
-      const tag = isAmmo ? ' <span class="cons-tag">AMMO</span>' : "";
+      const tag = isAmmo
+        ? ' <span class="cons-tag">AMMO</span>'
+        : isFood
+          ? ' <span class="cons-tag">FOOD</span>'
+          : "";
       const need = isAmmo
         ? num(i.need) + (num(i.need) === 1 ? " gun" : " guns")
-        : num(i.need) + "/cycle";
+        : isFood
+          ? "—"
+          : num(i.need) + "/cycle";
       return `<tr title="${esc((i.facilities || []).join(", "))}">
         <td class="cons-item">${esc(i.name || i.itemId)}${tag}</td>
         <td class="cons-id">${esc(i.itemId)}</td>
@@ -1547,9 +1567,10 @@
 
     const maintFacs = [];
     const ammoFacs = [];
+    const foodFacs = [];
     for (const i of items) {
       for (const f of i.facilities || []) {
-        const bucket = i.kind === "ammo" ? ammoFacs : maintFacs;
+        const bucket = i.kind === "ammo" ? ammoFacs : i.kind === "food" ? foodFacs : maintFacs;
         if (!bucket.includes(f)) bucket.push(f);
       }
     }
@@ -1559,9 +1580,12 @@
     const ammoHtml = ammoFacs.length
       ? `<div class="cons-contrib">Ammo for: ${ammoFacs.map((c) => esc(c)).join(", ")}</div>`
       : "";
+    const foodHtml = foodFacs.length
+      ? `<div class="cons-contrib">Food for: ${foodFacs.map((c) => esc(c)).join(", ")}</div>`
+      : "";
 
     const thresholds =
-      `LOW at ≤${num(config.ammoLowThreshold, 100)} rounds (ammo) and ≤${num(config.consumableLowDays, 2)}d left (maintenance).`;
+      `LOW at ≤${num(config.ammoLowThreshold, 100)} rounds (ammo) and ≤${num(config.consumableLowDays, 2)}d left (maintenance). Food has no depletion estimate (civilian consumption, not a tick cycle).`;
     const read = s.storageAt
       ? `Faction storage read ${ageText(s.storageAt)}${s.source === "cache" ? " (shared cache)" : ""}.`
       : "Faction storage not read yet.";
@@ -1582,11 +1606,12 @@
         </thead>
         <tbody>${rows}</tbody>
       </table>
-      <div class="cons-foot">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Maintenance is withdrawn once per 1000-tick (10000s ≈ 2.78h) cycle, so the depletion estimate does not account for unknown cycle start timing. Ammo has no per-shot rate to project from, so it is judged on rounds remaining. ${esc(thresholds)} ${esc(read)}</div>
-      ${noteHtml}
-      ${contribHtml}
-      ${ammoHtml}
-    `;
+       <div class="cons-foot">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Maintenance is withdrawn once per 1000-tick (10000s ≈ 2.78h) cycle, so the depletion estimate does not account for unknown cycle start timing. Ammo has no per-shot rate to project from, so it is judged on rounds remaining. Food is consumed by civilians (not on a tick cycle) — it has no depletion estimate, and running out is a minor warning only (it does not prevent facilities from running or harm thriving status). ${esc(thresholds)} ${esc(read)}</div>
+       ${noteHtml}
+       ${contribHtml}
+       ${ammoHtml}
+       ${foodHtml}
+     `;
   }
 
   // ── Frame-rate cap (GPU) ──────────────────────────────────

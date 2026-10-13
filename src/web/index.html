@@ -26011,6 +26011,10 @@ When responding:
       // FACTION storage only — station facilities and guns never draw from the
       // drone's cargo or its personal station storage. Red = out, yellow = low
       // (shared thresholds from the station monitor's settings).
+      // Food items (flagged via the catalog's food_type key) are tracked
+      // separately: they are consumed by civilians, not on a tick cycle, so
+      // there is no depletion projection and running out is only a yellow
+      // warning — it does not red-flag the station or harm thriving status.
       async function fetchStationMaintenance(username) {
         const container = document.getElementById("stationMaintenanceSummary");
         if (!container) return;
@@ -26027,8 +26031,14 @@ When responding:
         const thresholds = await getStationThresholds();
 
         // 3) Sum maintenance inputs across built & active facilities.
+        // Some maintenance inputs are actually civilian food (flagged via the
+        // catalog's food_type key) — those are consumed by civilians, not on a
+        // tick cycle, so they are tracked separately and only warn (yellow),
+        // never red-flag the card.
         const totals = {};
+        const foodTotals = {};
         const contributing = [];
+        const foodContributing = [];
         (stationFacilitiesData || []).forEach((fac) => {
           const active = fac.status === "active" || fac.active === true;
           if (!active) return;
@@ -26036,17 +26046,25 @@ When responding:
           const cat = resolveStationCatalog(fac);
           const maint = (cat && cat.maintenance_inputs) || [];
           if (!maint.length) return;
-          contributing.push({
-            name: fac.name || id || "?",
-            items: maint.map((m) => ({
-              item_id: m.item_id,
-              quantity: m.quantity || 1,
-            })),
-          });
+          const facName = fac.name || id || "?";
+          const regularItems = [];
+          const foodItems = [];
           maint.forEach((m) => {
             const key = m.item_id;
-            totals[key] = (totals[key] || 0) + (m.quantity || 1);
+            if (catalog.items?.[key]?.food_type) {
+              foodTotals[key] = (foodTotals[key] || 0) + (m.quantity || 1);
+              foodItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
+            } else {
+              totals[key] = (totals[key] || 0) + (m.quantity || 1);
+              regularItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
+            }
           });
+          if (regularItems.length) {
+            contributing.push({ name: facName, items: regularItems });
+          }
+          if (foodItems.length) {
+            foodContributing.push(facName);
+          }
         });
 
         // 3b) Sum weapon-ammo requirements from active defense facilities. A
@@ -26066,9 +26084,9 @@ When responding:
         });
 
         const ammoKeys = Object.keys(ammo);
-        if (Object.keys(totals).length === 0 && ammoKeys.length === 0) {
+        if (Object.keys(totals).length === 0 && ammoKeys.length === 0 && Object.keys(foodTotals).length === 0) {
           container.innerHTML =
-            '<div class="faction-no-data">No active station facilities with maintenance or ammo requirements.</div>';
+            '<div class="faction-no-data">No active station facilities with maintenance, ammo, or food requirements.</div>';
           return;
         }
 
@@ -26092,23 +26110,31 @@ When responding:
           if (m > 0) return `${m}m ${s}s`;
           return `${s}s`;
         };
-        const rowFor = (itemId, need, isAmmo) => {
+        const rowFor = (itemId, need, isAmmo, isFood = false) => {
           // FACTION storage only — station facilities/guns draw from nothing else.
           const have = inv.factionStorage[itemId] || 0;
-          const cyclesLeft = need > 0 ? have / need : Infinity;
-          const secsLeft = cyclesLeft * SECS_PER_CYCLE;
-          const daysLeft = secsLeft / SECS_PER_DAY;
-          // Out = the facility stops / the gun cannot fire. Low = still running,
-          // but close enough to warrant a restock. Same rules as the monitor.
           let level;
-          if (have <= 0) level = "out";
-          else if (isAmmo)
-            level = thresholds.ammoLowThreshold > 0 && have <= thresholds.ammoLowThreshold ? "low" : "ok";
-          else
-            level =
-              thresholds.consumableLowDays > 0 && daysLeft <= thresholds.consumableLowDays
-                ? "low"
-                : "ok";
+          let secsLeft;
+          let cyclesLeft;
+          if (isFood) {
+            // Food is consumed by civilians (not on a tick cycle) — no depletion
+            // projection. Running out is a minor warning, not a red alert.
+            level = have <= 0 ? "low" : "ok";
+          } else {
+            cyclesLeft = need > 0 ? have / need : Infinity;
+            secsLeft = cyclesLeft * SECS_PER_CYCLE;
+            const daysLeft = secsLeft / SECS_PER_DAY;
+            // Out = the facility stops / the gun cannot fire. Low = still running,
+            // but close enough to warrant a restock. Same rules as the monitor.
+            if (have <= 0) level = "out";
+            else if (isAmmo)
+              level = thresholds.ammoLowThreshold > 0 && have <= thresholds.ammoLowThreshold ? "low" : "ok";
+            else
+              level =
+                thresholds.consumableLowDays > 0 && daysLeft <= thresholds.consumableLowDays
+                  ? "low"
+                  : "ok";
+          }
           if (level === "out") allGood = false;
           if (level === "low") anyLow = true;
           const haveStr = num(have);
@@ -26120,10 +26146,13 @@ When responding:
               : level === "low"
                 ? isAmmo
                   ? "▲ Low"
-                  : "▲ Low (" + fmtDuration(secsLeft) + ")"
+                  : isFood
+                    ? "▲ Low"
+                    : "▲ Low (" + fmtDuration(secsLeft) + ")"
                 : "✗ Out";
-          // Ammo burns per shot, so there is no cycle rate to project from.
-          const depletion = isAmmo
+          // Ammo burns per shot and food is civilian-consumed — neither has a
+          // per-cycle burn rate to project a depletion time from.
+          const depletion = isAmmo || isFood
             ? "—"
             : (have <= 0
               ? "depleted"
@@ -26132,10 +26161,14 @@ When responding:
                 : `≈ ${fmtDuration(secsLeft)} (${num(Math.floor(cyclesLeft))} cycles)`);
           const tag = isAmmo
             ? ' <span style="font-size:9px;color:var(--text-dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;margin-left:4px">AMMO</span>'
-            : "";
+            : isFood
+              ? ' <span style="font-size:9px;color:var(--text-dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;margin-left:4px">FOOD</span>'
+              : "";
           const needStr = isAmmo
             ? num(need) + (num(need) === 1 ? " gun" : " guns")
-            : num(need) + "/cycle";
+            : isFood
+              ? "—"
+              : num(need) + "/cycle";
           return `<tr>
           <td style="padding:4px 8px">${esc(catalogName(itemId))}${tag}</td>
           <td style="padding:4px 8px;font-family:monospace;color:var(--text-dim)">${esc(itemId)}</td>
@@ -26148,12 +26181,17 @@ When responding:
 
         const rows = Object.entries(totals)
           .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([itemId, need]) => rowFor(itemId, need, false))
+          .map(([itemId, need]) => rowFor(itemId, need, false, false))
+          .join("");
+
+        const foodRows = Object.entries(foodTotals)
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(([itemId, need]) => rowFor(itemId, need, false, true))
           .join("");
 
         const ammoRows = ammoKeys
           .sort((a, b) => a.localeCompare(b))
-          .map((itemId) => rowFor(itemId, ammo[itemId], true))
+          .map((itemId) => rowFor(itemId, ammo[itemId], true, false))
           .join("");
 
         const summary = !allGood
@@ -26172,6 +26210,11 @@ When responding:
               .map((c) => esc(c))
               .join(", ")}</div>`
           : "";
+        const foodHtml = foodContributing.length
+          ? `<div style="margin-top:6px;font-size:11px;color:var(--text-dim)">Food for: ${foodContributing
+              .map((c) => esc(c))
+              .join(", ")}</div>`
+          : "";
 
         container.innerHTML = `
       ${summary}
@@ -26186,11 +26229,12 @@ When responding:
             <th style="padding:4px 8px;text-align:right">Est. until depletion</th>
           </tr>
         </thead>
-        <tbody>${rows}${ammoRows}</tbody>
+        <tbody>${rows}${ammoRows}${foodRows}</tbody>
       </table>
-       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it does not account for unknown cycle start timing. Ammo burns per shot, so it is judged on rounds remaining rather than a projected time. LOW at ≤${num(thresholds.ammoLowThreshold)} rounds (ammo) and ≤${num(thresholds.consumableLowDays)}d left (maintenance) — configurable in the station monitor's settings. Refresh after delivering items.</div>
+       <div style="margin-top:8px;font-size:10px;color:var(--text-dim)">Stock is this station's FACTION storage only — station facilities and guns never draw from the drone's cargo or its personal station storage. Depletion estimate assumes consumables are drawn once per 1000-tick (10000s) cycle; it does not account for unknown cycle start timing. Ammo burns per shot, so it is judged on rounds remaining rather than a projected time. Food is consumed by civilians (not on a tick cycle) — it has no depletion estimate, and running out is a minor warning only (it does not stop facilities or harm thriving status). LOW at ≤${num(thresholds.ammoLowThreshold)} rounds (ammo) and ≤${num(thresholds.consumableLowDays)}d left (maintenance) — configurable in the station monitor's settings. Refresh after delivering items.</div>
       ${contribHtml}
       ${ammoHtml}
+      ${foodHtml}
     `;
       }
 

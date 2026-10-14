@@ -1403,7 +1403,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
 
     // Pick the nearest system needing exploration
     const target = systemsNeedingExploration[0];
-    const priorityLabel = target.priority === "unvisited" ? "unvisited" : "stale";
+    const priorityLabel = target.priority === "unvisited" ? "unvisited" : "revisit";
     ctx.log("exploration", `Systematic explore: Found ${systemsNeedingExploration.length} system(s) needing exploration, targeting nearest ${priorityLabel}: ${target.name} (${target.distance} jumps away)`);
 
     // Announce our target to other explorers via bot chat
@@ -3656,13 +3656,17 @@ async function findAllUnvisitedSystems(
 }
 
 /**
- * Find all systems that need systematic exploration (unvisited or stale POIs).
+ * Find all systems that need systematic exploration.
  * This is the core function for the new "explore" mode that works like achievement mode.
  * 
  * Returns systems sorted by jump distance (nearest first).
  * Respects blacklist/flee unless cloaked.
  * Filters out systems recently explored by other bots (5 min cooldown).
  * Uses server's find_route API for accurate pathfinding to ALL systems.
+ * 
+ * Priority:
+ *   1. Unvisited systems (never visited by this bot)
+ *   2. All other systems (for continuous re-exploration like achievement mode)
  */
 async function findSystemsNeedingExploration(
   ctx: RoutineContext,
@@ -3675,7 +3679,7 @@ async function findSystemsNeedingExploration(
   id: string;
   name: string;
   distance: number;
-  priority: "unvisited" | "stale";
+  priority: "unvisited" | "revisit";
   route: string[];
 }>> {
   const currentSystem = ctx.bot.system;
@@ -3701,10 +3705,8 @@ async function findSystemsNeedingExploration(
   const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
   const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
 
-  const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
-
   // Find candidate systems needing exploration
-  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "stale" }> = [];
+  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "revisit" }> = [];
 
   for (const sys of allSystems) {
     // Skip current system
@@ -3722,31 +3724,13 @@ async function findSystemsNeedingExploration(
       if (recentSet.has(sys.id.toLowerCase())) continue;
     }
 
-    // Determine priority
+    // Determine priority: unvisited first, then all others for revisit
     if (sys.visited === false) {
       // Never visited by this bot
       candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
-    } else if (sys.visited === true) {
-      // Visited by this bot - check if POIs are stale
-      const poiCount = sys.pois?.length ?? 0;
-      if (poiCount === 0) {
-        candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
-      } else {
-        let allStale = true;
-        for (const poi of sys.pois) {
-          const updateTime = poi.last_updated ? new Date(poi.last_updated).getTime() : 0;
-          if (updateTime > staleThreshold) {
-            allStale = false;
-            break;
-          }
-        }
-        if (allStale) {
-          candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "stale" });
-        }
-      }
     } else {
-      // System in mapStore but visited status unknown - treat as unvisited
-      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
+      // All other systems (visited=true or unknown) - include for continuous re-exploration
+      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "revisit" });
     }
   }
 
@@ -3755,7 +3739,7 @@ async function findSystemsNeedingExploration(
     return [];
   }
 
-  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration, querying routes...`);
+  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit), querying routes...`);
 
   // Use find_route for each candidate to get actual distance and route
   // Process in batches to avoid too many API calls
@@ -3763,7 +3747,7 @@ async function findSystemsNeedingExploration(
     id: string;
     name: string;
     distance: number;
-    priority: "unvisited" | "stale";
+    priority: "unvisited" | "revisit";
     route: string[];
   }> = [];
 
@@ -3806,12 +3790,12 @@ async function findSystemsNeedingExploration(
       id: u.id,
       name: u.name,
       distance: u.distance,
-      priority: u.priority === "unknown" ? "unvisited" : "stale",
+      priority: u.priority === "unknown" ? "unvisited" : "revisit",
       route: u.route,
     }));
   }
 
-  // Sort: unvisited priority first, then stale; within each tier, nearest first
+  // Sort: unvisited priority first, then revisit; within each tier, nearest first
   results.sort((a, b) => {
     if (a.priority !== b.priority) {
       return a.priority === "unvisited" ? -1 : 1;

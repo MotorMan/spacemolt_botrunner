@@ -523,37 +523,94 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       .filter(a => a.botName !== bot.username)
       .map(a => a.startingSystem);
     
-    const startSystem = findDistantStartingSystem(
-      bot.system || "",
-      otherAssignments,
-      blacklist,
-      fledFromSystems,
-      startupSettings.ignoreBlacklistWhenCloaked,
-      bot.isCloaked
-    );
+    // Get all candidate distant systems (top 10 farthest from other explorers)
+    const allSystems = mapStore.getSystems();
+    const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
+    const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
+    const otherStartsSet = new Set(otherAssignments.map(s => s.toLowerCase()));
     
-    if (startSystem) {
-      const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, startSystem.id, startSystem.name);
-      if (assigned) {
-        ctx.log("exploration", `Assigned starting system: ${startSystem.name} (${startSystem.id}) - spreading from other explorers`);
-        // Navigate to assigned starting system if not already there
-        if (startSystem.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
-          ctx.log("travel", `Navigating to assigned starting system ${startSystem.name}...`);
+    // Pre-calculate distances from each other explorer's starting system
+    const otherStartDistances = new Map<string, Map<string, number>>();
+    for (const otherStart of otherAssignments) {
+      const distances = calculateLocalDistances(otherStart, blacklist, fledFromSystems, startupSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
+      const distMap = new Map<string, number>();
+      for (const [sysId, info] of distances.entries()) {
+        distMap.set(sysId, info.distance);
+      }
+      otherStartDistances.set(otherStart.toLowerCase(), distMap);
+    }
+    
+    const candidates: Array<{ id: string; name: string; minDistToOthers: number }> = [];
+    for (const sys of allSystems) {
+      const sysLower = sys.id.toLowerCase();
+      if (!bot.isCloaked || !startupSettings.ignoreBlacklistWhenCloaked) {
+        if (blacklistSet.has(sysLower)) continue;
+      }
+      if (isTemporarilyBlacklisted(sys.id)) continue;
+      if (fledSet.has(sysLower)) continue;
+      if (otherStartsSet.has(sysLower)) continue;
+      if (sysLower === (bot.system || "").toLowerCase()) continue;
+      
+      let minDistToOthers = Infinity;
+      if (otherAssignments.length > 0) {
+        for (const otherStart of otherAssignments) {
+          const distMap = otherStartDistances.get(otherStart.toLowerCase());
+          if (distMap) {
+            const dist = distMap.get(sys.id);
+            if (dist !== undefined && dist < minDistToOthers) {
+              minDistToOthers = dist;
+            }
+          }
+        }
+      }
+      
+      if (minDistToOthers !== Infinity) {
+        candidates.push({ id: sys.id, name: sys.name || sys.id, minDistToOthers });
+      }
+    }
+    
+    if (candidates.length === 0) {
+      ctx.log("exploration", "Could not find distant starting system, using current location");
+    } else {
+      // Sort by distance from others (farthest first)
+      candidates.sort((a, b) => b.minDistToOthers - a.minDistToOthers);
+      
+      // Try top candidates until one works
+      let assignedSystem = null;
+      for (let i = 0; i < Math.min(5, candidates.length); i++) {
+        const candidate = candidates[i];
+        const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, candidate.id, candidate.name);
+        if (!assigned) continue; // Another bot got it
+        
+        ctx.log("exploration", `Assigned starting system: ${candidate.name} (${candidate.id}) - distance from others: ${candidate.minDistToOthers}`);
+        
+        if (candidate.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
+          ctx.log("travel", `Navigating to assigned starting system ${candidate.name}...`);
           await ensureUndocked(ctx);
-          const arrived = await navigateToSystem(ctx, startSystem.id, { 
+          const arrived = await navigateToSystem(ctx, candidate.id, { 
             fuelThresholdPct: startupSettings.refuelThreshold, 
             hullThresholdPct: 30, 
             skipBlacklist: startupSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
           });
           if (!arrived) {
-            ctx.log("warn", `Could not reach assigned starting system ${startSystem.name}, will explore from current location`);
+            ctx.log("warn", `Could not reach ${candidate.name}, trying next distant system...`);
+            // Clear assignment and try next
+            explorerAssignmentStore.clearAssignment(bot.username);
+            continue;
           } else {
-            ctx.log("travel", `Arrived at assigned starting system ${startSystem.name}`);
+            ctx.log("travel", `Arrived at assigned starting system ${candidate.name}`);
+            assignedSystem = candidate;
+            break;
           }
+        } else {
+          assignedSystem = candidate;
+          break;
         }
       }
-    } else {
-      ctx.log("exploration", "Could not find distant starting system, using current location");
+      
+      if (!assignedSystem) {
+        ctx.log("exploration", "All distant starting systems unreachable, using current location");
+      }
     }
   } else {
     ctx.log("exploration", `Resuming from assigned starting system: ${existingAssignment.startingSystemName} (${existingAssignment.startingSystem})`);
@@ -3701,84 +3758,7 @@ function calculateLocalDistances(
   return distances;
 }
 
-/**
- * Find the best starting system for a new explorer - one that's farthest from 
- * other explorers' assigned starting systems.
- * Uses local BFS on mapStore graph - no API calls.
- */
-function findDistantStartingSystem(
-  currentSystem: string,
-  otherStartingSystems: string[],
-  blacklist: string[],
-  fledFromSystems: Set<string>,
-  ignoreBlacklistWhenCloaked: boolean,
-  isCloaked: boolean
-): { id: string; name: string } | null {
-  const allSystems = mapStore.getSystems();
-  
-  // Filter valid candidate systems
-  const candidates: Array<{ id: string; name: string; minDistToOthers: number }> = [];
-  const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
-  const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
-  const otherStartsSet = new Set(otherStartingSystems.map(s => s.toLowerCase()));
-
-  for (const sys of allSystems) {
-    const sysLower = sys.id.toLowerCase();
-    // Skip blacklisted, fled, and other explorers' starting systems
-    // Respect ignoreBlacklistWhenCloaked for cloaked bots
-    if (!isCloaked || !ignoreBlacklistWhenCloaked) {
-      if (blacklistSet.has(sysLower)) continue;
-    }
-    if (isTemporarilyBlacklisted(sys.id)) continue;
-    if (fledSet.has(sysLower)) continue;
-    if (otherStartsSet.has(sysLower)) continue;
-    // Skip current system
-    if (sysLower === currentSystem.toLowerCase()) continue;
-
-    // Calculate minimum distance to any other explorer's starting system
-    let minDistToOthers = Infinity;
-    if (otherStartingSystems.length > 0) {
-      // Use position-based distance as approximation for speed
-      const currentPos = mapStore.getSystem(currentSystem)?.position;
-      const sysPos = sys.position;
-      if (currentPos && sysPos && typeof sysPos.x === "number" && typeof sysPos.y === "number") {
-        const dx = sysPos.x - currentPos.x;
-        const dy = sysPos.y - currentPos.y;
-        minDistToOthers = Math.sqrt(dx * dx + dy * dy);
-      } else {
-        // Fallback: use local BFS from current to estimate
-        const distances = calculateLocalDistances(currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
-        const dist = distances.get(sys.id);
-        if (dist) minDistToOthers = dist.distance;
-      }
-    } else {
-      // No other explorers - prefer distant systems from current
-      const currentPos = mapStore.getSystem(currentSystem)?.position;
-      const sysPos = sys.position;
-      if (currentPos && sysPos && typeof sysPos.x === "number" && typeof sysPos.y === "number") {
-        const dx = sysPos.x - currentPos.x;
-        const dy = sysPos.y - currentPos.y;
-        minDistToOthers = Math.sqrt(dx * dx + dy * dy);
-      }
-    }
-
-    if (minDistToOthers !== Infinity) {
-      candidates.push({ id: sys.id, name: sys.name || sys.id, minDistToOthers });
-    }
-  }
-
-  if (candidates.length === 0) return null;
-
-  // Sort by distance from others (farthest first) for maximum spread
-  candidates.sort((a, b) => b.minDistToOthers - a.minDistToOthers);
-
-  // Pick from top 5 farthest (add randomness)
-  const topCount = Math.min(5, candidates.length);
-  const idx = Math.floor(Math.random() * topCount);
-  return { id: candidates[idx].id, name: candidates[idx].name };
-}
-
-/**
+  /**
  * Find systems needing exploration using LOCAL BFS - no API calls.
  * Returns systems sorted by jump distance (nearest first).
  * 

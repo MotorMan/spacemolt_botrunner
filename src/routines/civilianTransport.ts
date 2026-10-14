@@ -954,6 +954,11 @@ export async function unloadPassengersToLounge(
     if (!ok) {
       return { ok: false, error: `Failed to navigate to home system ${homeSystem}` };
     }
+    // Verify we actually arrived at the home system
+    await bot.refreshLocation();
+    if (homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+      return { ok: false, error: `Navigation reported success but bot is still in ${bot.system}, not ${homeSystem}` };
+    }
   }
 
   if (homeStation && bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
@@ -1093,6 +1098,12 @@ async function returnHomeForFuelCells(ctx: RoutineContext, settings: CivilianTra
     });
     if (!ok) {
       ctx.log("transport", "Could not navigate home to restock fuel cells — will retry next cycle");
+      return;
+    }
+    // Verify we actually arrived at the home system
+    await bot.refreshLocation();
+    if (settings.homeSystem.toLowerCase() !== (bot.system || "").toLowerCase()) {
+      ctx.log("error", `Navigation reported success but bot is still in ${bot.system}, not ${settings.homeSystem}`);
       return;
     }
   }

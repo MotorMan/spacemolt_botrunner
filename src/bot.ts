@@ -189,6 +189,17 @@ export class Bot {
   private _lastAction = "";
   private _error: string | null = null;
   private _abortController: AbortController | null = null;
+  /** In-flight routine runner-loop promise (null when no routine is running). */
+  private _runLoop: Promise<void> | null = null;
+  /** Incremented on every routine start; the runner loop captures its value and
+   *  exits if it goes stale, so a loop left over from an earlier run can never
+   *  resume stepping its generator just because a newer run set the state back
+   *  to "running". */
+  private _runGeneration = 0;
+  /** Serializes routine starts so two callers racing (e.g. the emergency
+   *  return-home timer vs. a manual Start) can't both fall through the
+   *  "already running" check before either has set the state. */
+  private _startGate: Promise<void> = Promise.resolve();
   private pendingCommands = new Map<string, AbortController>();
   private lastSystem = "unknown";
   private lastPoi = "";
@@ -959,16 +970,33 @@ docked = false;
       this._abortController?.abort();
     }
 
+    this.scheduleEmergencyReturnHome();
+  }
+
+  /**
+   * Launch the return_home routine a few seconds after the emergency warp
+   * stabilizer fired. The delay gives the interrupted routine a moment to
+   * wind down; `bot.start()` itself additionally waits for the previous
+   * runner loop to fully settle (see awaitRunLoopSettled), so the old routine
+   * can never resume farming/fighting just because the state flips back to
+   * "running" — which is what used to keep a hunter hunting after the
+   * stabilizer fired instead of sending it home.
+   */
+  private scheduleEmergencyReturnHome(delayMs = 4000): void {
     const botName = this.username;
     setTimeout(() => {
       void (async () => {
-        const { handleStart, getBot } = await import("./botmanager.js");
-        const bot = getBot(botName);
-        if (!bot) return;
-        if (bot.state === "running") return;
-        await handleStart({ type: "start", bot: botName, routine: "return_home" });
-      })().catch(() => {});
-    }, 4000);
+        try {
+          const { handleStart, getBot } = await import("./botmanager.js");
+          const bot = getBot(botName);
+          if (!bot) return;
+          if (bot.state === "running") return; // a routine (re)started meanwhile
+          await handleStart({ type: "start", bot: botName, routine: "return_home" });
+        } catch {
+          // never let the emergency return path throw into the timer
+        }
+      })();
+    }, delayMs);
   }
 
   log(category: string, message: string): void {
@@ -2017,23 +2045,13 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
         // disappearance (ewsGone) OR unexpected position change at low hull.
         // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
          if (ewsGone || (positionChanged && hullPct <= 20)) {
-             this._ewsFallbackTriggered = true;
-             this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
-             saveStoppedState(this.username, "emergency");
-             saveLastUsedRoutine(this.username, "return_home");
+              this._ewsFallbackTriggered = true;
+              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+              saveStoppedState(this.username, "emergency");
+              saveLastUsedRoutine(this.username, "return_home");
 
-             this.stop();
-
-             const botName = this.username;
-             setTimeout(() => {
-               void (async () => {
-                 const { handleStart, getBot } = await import("./botmanager.js");
-                 const bot = getBot(botName);
-                 if (!bot) return;
-                 if (bot.state === "running") return;
-                 await handleStart({ type: "start", bot: botName, routine: "return_home" });
-                })().catch(() => {});
-              }, 4000);
+              this.stop();
+              this.scheduleEmergencyReturnHome();
             }
           }
         }
@@ -2171,24 +2189,14 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           // disappearance (ewsGone) OR unexpected position change at low hull.
           // The old prevHullPct > 20 gate missed fires when hull was already <= 20%.
            if (ewsGone || (positionChanged && hullPct <= 20)) {
-             this._ewsFallbackTriggered = true;
-             this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
-             saveStoppedState(this.username, "emergency");
-             saveLastUsedRoutine(this.username, "return_home");
+              this._ewsFallbackTriggered = true;
+              this.log("emergency", "⚠️ Emergency Warp Stabilizer activation detected (hull critical fallback)!");
+              saveStoppedState(this.username, "emergency");
+              saveLastUsedRoutine(this.username, "return_home");
 
-             this.stop();
-
-             const botName = this.username;
-             setTimeout(() => {
-               void (async () => {
-                 const { handleStart, getBot } = await import("./botmanager.js");
-                 const bot = getBot(botName);
-                 if (!bot) return;
-                 if (bot.state === "running") return;
-                 await handleStart({ type: "start", bot: botName, routine: "return_home" });
-               })().catch(() => {});
-             }, 4000);
-           }
+              this.stop();
+              this.scheduleEmergencyReturnHome();
+            }
          }
 
          if (modulesArray.length > 0 || modulesResolved) {
@@ -2793,6 +2801,42 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     } catch { /* ignore dashboard mirror errors */ }
   }
 
+  /**
+   * Wait for a previous routine's runner loop to fully settle before a new
+   * routine may start.
+   *
+   * A stop request only takes effect BETWEEN generator steps, so a routine
+   * that is mid-step (finishing a battle, a jump chain, a transit) keeps
+   * running for a while after stop(). Starting a new routine during that
+   * window used to reset `_state` back to "running" and hand the old loop a
+   * fresh AbortController — the old routine's own `bot.state === "running"`
+   * guards then passed again and it kept farming/fighting, interleaved with
+   * the new routine on the same ship. That is exactly how a hunter whose
+   * emergency warp stabilizer fired kept hunting for ~13 minutes afterwards
+   * instead of going home.
+   *
+   * Bounded by a timeout so a wedged step can never block starts forever;
+   * the run-generation guard in the runner loop then discards the stale loop.
+   */
+  private async awaitRunLoopSettled(): Promise<void> {
+    const RUN_SETTLE_TIMEOUT_MS = 90_000;
+    const loop = this._runLoop;
+    if (!loop) return;
+    this.log("system", "Waiting for the previous routine to finish stopping before starting...");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, RUN_SETTLE_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([loop.catch(() => {}), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (this._runLoop === loop) {
+      this.log("warn", "Previous routine did not settle in time — starting anyway (its loop will be discarded)");
+    }
+  }
+
   /** Start running a routine. */
   async start(
     routineName: string,
@@ -2810,10 +2854,39 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       return;
     }
 
+    // Serialize starters: chain onto the start gate so only one caller can be
+    // inside the critical section (settle-wait + state flip) at a time.
+    let releaseStartGate!: () => void;
+    const startGate = new Promise<void>((r) => { releaseStartGate = r; });
+    const previousGate = this._startGate;
+    this._startGate = startGate;
+    await previousGate;
+
+    try {
+      // A routine may still be winding down after a stop request ("stopping").
+      // NEVER let this start override that: the old runner loop only checks for
+      // "stopping" BETWEEN generator steps, so flipping the state back to
+      // "running" here would let the old generator keep farming/fighting (two
+      // routines interleaved on one ship). Wait for the old loop to settle.
+      await this.awaitRunLoopSettled();
+      // The state may have flipped while we waited (another start could have
+      // grabbed the bot), so re-check rather than trusting the earlier guard.
+      if ((this._state as BotState) === "running") {
+        this.log("error", "Bot is already running");
+        return;
+      }
+    } finally {
+      releaseStartGate();
+    }
+
     this._state = "running";
     this._routine = routineName;
     this._error = null;
     this._abortController = new AbortController();
+    // Each routine run gets a generation token. The runner loop below exits if
+    // the token goes stale, so a lingering loop from an earlier run can never
+    // mistake a newer run's "running" state for permission to keep stepping.
+    const generation = ++this._runGeneration;
 
     // (Re)subscribe to the realtime market push stream if this routine deals
     // with trade (explorer/trader); otherwise ensure it's dropped to save
@@ -2860,52 +2933,81 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     await ensureInsured(ctx);
 
     const generator = routine(ctx);
-    try {
-      while (true) {
-        let stateName!: string | void;
-        let done!: boolean | undefined;
-        if (perf.isEnabled()) {
-          const cpuStart = process.cpuUsage();
-          const wallStart = performance.now();
-          ({ value: stateName, done } = await generator.next());
-          const wallMs = performance.now() - wallStart;
-          const cpuDelta = process.cpuUsage(cpuStart);
-          perf.markRoutineTick(this.username, routineName, (cpuDelta.user + cpuDelta.system) / 1000, wallMs);
+    // The runner loop runs as a tracked promise so a subsequent start() can
+    // wait for it to settle (see awaitRunLoopSettled) instead of racing it.
+    const runLoop = (async () => {
+      try {
+        while (true) {
+          // A stop request (or a force-reset by an emergency path) may have
+          // landed while the previous action was in flight, or this loop may
+          // have been superseded by a newer routine run. Never step the
+          // generator again in that case.
+          if (generation !== this._runGeneration || (this._state as BotState) !== "running") {
+            this.log("system", "Routine stopping — bot is no longer running (stopped or superseded)");
+            break;
+          }
+          let stateName!: string | void;
+          let done!: boolean | undefined;
+          if (perf.isEnabled()) {
+            const cpuStart = process.cpuUsage();
+            const wallStart = performance.now();
+            ({ value: stateName, done } = await generator.next());
+            const wallMs = performance.now() - wallStart;
+            const cpuDelta = process.cpuUsage(cpuStart);
+            perf.markRoutineTick(this.username, routineName, (cpuDelta.user + cpuDelta.system) / 1000, wallMs);
+          } else {
+            ({ value: stateName, done } = await generator.next());
+          }
+          if (done) break;
+          if ((this._state as BotState) === "stopping") {
+            this.log("system", `Stopped during state: ${stateName}`);
+            break;
+          }
+          // Small gap between actions - use interruptible sleep
+          await ctx.sleep(2000);
+        }
+      } catch (err) {
+        if (generation !== this._runGeneration) {
+          // Superseded by a newer run (settle timeout elapsed) — this loop's
+          // outcome must not touch the state of the run that replaced it.
+          this.log("system", "Superseded routine loop ended — discarding without touching bot state");
+          return;
+        }
+        if (err instanceof Error && err.name === "AbortError") {
+          this.log("system", "Routine stopped by abort signal");
         } else {
-          ({ value: stateName, done } = await generator.next());
+          const msg = err instanceof Error ? err.message : String(err);
+          this._error = msg;
+          this.log("error", `Routine error: ${msg}`);
+          this._state = "error";
+          throw err;
         }
-        if (done) break;
-        if ((this._state as BotState) === "stopping") {
-          this.log("system", `Stopped during state: ${stateName}`);
-          break;
-        }
-        // Small gap between actions - use interruptible sleep
-        await ctx.sleep(2000);
+      } finally {
+        await generator.return(undefined);
       }
-    } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
-        this.log("system", "Routine stopped by abort signal");
-      } else {
-        const msg = err instanceof Error ? err.message : String(err);
-        this._error = msg;
-        this.log("error", `Routine error: ${msg}`);
-        this._state = "error";
-        throw err;
-      }
-    } finally {
-      await generator.return(undefined);
-    }
 
-    this._state = "idle";
-    this._routine = null;
-    // Routine ended — the abort controller was for this routine's lifetime only.
-    // Clear it so ad-hoc commands (get_status, get_nearby, etc.) issued while the
-    // bot is idle don't trip the "Bot stopped" guard in libExec().
-    this._abortController = null;
-    // Routine ended — drop the market push stream (it was only for trade
-    // routines) so an idle bot generates no market bandwidth.
-    this.syncMarketSubscription();
-    this.log("system", "Routine finished");
+      // Same guard as above: a loop that was superseded while it was wedged
+      // must leave the newer run's state (and abort controller) untouched.
+      if (generation !== this._runGeneration) return;
+
+      this._state = "idle";
+      this._routine = null;
+      // Routine ended — the abort controller was for this routine's lifetime only.
+      // Clear it so ad-hoc commands (get_status, get_nearby, etc.) issued while the
+      // bot is idle don't trip the "Bot stopped" guard in libExec().
+      this._abortController = null;
+      // Routine ended — drop the market push stream (it was only for trade
+      // routines) so an idle bot generates no market bandwidth.
+      this.syncMarketSubscription();
+      this.log("system", "Routine finished");
+    })();
+
+    this._runLoop = runLoop;
+    try {
+      await runLoop;
+    } finally {
+      if (this._runLoop === runLoop) this._runLoop = null;
+    }
   }
 
   /** Fetch ship modules and cache installed mod type ids. */

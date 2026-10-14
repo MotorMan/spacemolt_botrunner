@@ -287,18 +287,18 @@ function isBrandedCreature(name: string | undefined): boolean {
 /**
  * Returns true if a creature is protected and must NEVER be attacked.
  *
- * Any creature whose name contains "hatchling", "calf", or "young" is protected — this
- * blanket rule covers Cloudwhale Calves, Molt/Rainbow/Hoarfrost Leviathan
- * Hatchlings, young variants of any species, and any future young-of-species
- * names. Killing young prevents the adult from ever spawning, and they drop
- * poor loot. This is checked at target-selection time (pickCreatureTargets /
- * big creature hunt) so the hunter simply skips over them and engages other
- * targets instead.
+ * Any creature whose name contains "hatchling", "calf", "young", or "juvenile"
+ * is protected — this blanket rule covers Cloudwhale Calves,
+ * Molt/Rainbow/Hoarfrost Leviathan Hatchlings, young and juvenile variants of
+ * any species, and any future young-of-species names. Killing young/juvenile
+ * creatures prevents the adult from ever spawning, and they drop poor loot.
+ * This is checked at target-selection time (pickCreatureTargets / big creature
+ * hunt) so the hunter simply skips over them and engages other targets instead.
  */
 function isProtectedCreature(name: string | undefined): boolean {
   if (!name) return false;
   const lower = name.toLowerCase();
-  return lower.includes("hatchling") || lower.includes("calf") || lower.includes("young");
+  return lower.includes("hatchling") || lower.includes("calf") || lower.includes("young") || lower.includes("juvenile");
 }
 
 /**
@@ -309,7 +309,7 @@ function isProtectedCreature(name: string | undefined): boolean {
 function isCloudWhale(name: string | undefined): boolean {
   if (!name) return false;
   const lower = name.toLowerCase();
-  return lower.includes("cloudwhale") && !lower.includes("calf") && !lower.includes("hatchling") && !lower.includes("young");
+  return lower.includes("cloudwhale") && !lower.includes("calf") && !lower.includes("hatchling") && !lower.includes("young") && !lower.includes("juvenile");
 }
 
 /**

@@ -23,6 +23,7 @@ import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled 
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
 import { isConnectionError } from "./connection.js";
+import { isRateLimitError, parseServerDelayMs, reportCleanSend, reportRateLimitHit, shouldLogGateClosed, waitForGate } from "./ratelimitgate.js";
 
 /** A login() promise older than this (ms) is treated as wedged and reset, so a
  *  dead socket can never permanently park the routine on an unresolved promise. */
@@ -332,11 +333,6 @@ docked = false;
    */
   private _recovery: Promise<boolean> | null = null;
 
-  /** Progressive backoff (ms) applied after a rate-limit/IP-block error, so we
-   *  stop hammering the server and let the temporary block window elapse. Grows
-   *  by 30s per hit (capped at 5min) and resets after a clean command. */
-  private _rateLimitBackoff = 30_000;
-
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
@@ -630,7 +626,23 @@ docked = false;
     action: string,
     payload: Record<string, unknown> | undefined,
   ): Promise<unknown> {
+    // In-place retries for rate-limit rejections. The server rejects a blocked
+    // command WITHOUT executing it, so resending once the block window the
+    // server specified has elapsed is safe (the library's own rate-limit
+    // retry assumes the same). The bound keeps a command that keeps getting
+    // rejected from parking forever inside send; after that we surface the
+    // error so the routine can end cleanly.
+    let rateLimitHits = 0;
     for (;;) {
+      // Global IP-block gate (see ratelimitgate.ts): the server blocks the
+      // whole IP, so when any bot trips a block EVERY outbound command from
+      // EVERY bot parks here until the window the server specified elapses.
+      // This is what actually stops the hammering — the old per-call sleep in
+      // libExec let concurrent commands and the routine loop's next iteration
+      // keep firing straight into the block (each "backing off 300s" while
+      // logging identical failures every second).
+      await waitForGate();
+
       // If the socket is ALREADY observably closed (not just "not yet
       // authenticated"), there is zero point firing the send: it can ONLY throw
       // "cannot send on a closed socket" and spam the log with the very error
@@ -657,9 +669,37 @@ docked = false;
       const rawSend = this.liveRawSend();
       if (!rawSend) throw new Error("no account");
       try {
-        return await measureSend(() => rawSend(tool, action, payload));
+        const result = await measureSend(() => rawSend(tool, action, payload));
+        // Clean command: the block (if any) is over — ease the gate's
+        // escalation back to its base so normal operation resumes promptly.
+        reportCleanSend();
+        return result;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
+        if (isRateLimitError(err)) {
+          // Open the gate for exactly as long as the server asked
+          // ("Try again in N seconds") — or our escalating floor when it states
+          // no delay — then wait on it and retry. Logging only the first
+          // reporter per window keeps a concurrent burst from spamming the same
+          // warning six times a second (the old log).
+          const penalty = reportRateLimitHit(message);
+          if (shouldLogGateClosed()) {
+            const serverDelayMs = parseServerDelayMs(message);
+            const serverNote = serverDelayMs !== null
+              ? ` (server said retry in ${Math.round(serverDelayMs / 1000)}s)`
+              : "";
+            this.log(
+              "warn",
+              `⏳ Rate limit hit — pausing ALL commands for ${Math.round(penalty / 1000)}s${serverNote} to let the IP block lapse`,
+            );
+          }
+          if (++rateLimitHits > 2) throw err;
+          await waitForGate();
+          // Stagger the resume so the fleet's parked commands don't hit the
+          // server as one synchronized burst the instant the gate opens.
+          await new Promise((r) => setTimeout(r, Math.random() * 500));
+          continue;
+        }
         if (!isConnectionError(message)) throw err;
         if (this.state === "stopping" || this._abortController?.signal.aborted) {
           throw err;
@@ -1075,9 +1115,12 @@ docked = false;
     try {
       const res = await acct.send(tool, action, body);
       const result = extractLibResult(res);
-      // A clean command means we're no longer rate-limited; ease the backoff
-      // back to its base so normal operation resumes promptly.
-      this._rateLimitBackoff = 30_000;
+      // Rate-limit handling (waiting for the server's "try again in N
+      // seconds", gating every further command) lives in `sendResilient` at the
+      // single account.send chokepoint — see ratelimitgate.ts. Errors only
+      // surface here once the gate's bounded in-place retries are exhausted,
+      // and the gate stays closed for the rest of the block window, so the
+      // routine's next command parks on it instead of hammering.
       return { result, error: undefined, notifications: [] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1111,17 +1154,11 @@ docked = false;
         return { error: { code: "in_battle", message }, result: undefined, notifications: [] };
       }
       this.log("error", `libExec ${command} failed: ${message}`);
-      // Rate-limit / IP-block protection: the server temporarily bans an IP for
-      // excessive command rate. If we blindly return the error, routines retry
-      // immediately and the storm keeps the IP blocked (or escalates the ban).
-      // Instead, pause here so the block window elapses before we issue more
-      // commands. We sleep in increasing steps so repeated hits back off harder.
-      if (/excessive rate limit|temporarily blocked|rate limit|too many requests/i.test(message)) {
-        const penalty = this._rateLimitBackoff;
-        this._rateLimitBackoff = Math.min(this._rateLimitBackoff + 30_000, 300_000);
-        this.log("warn", `⏳ Rate limit hit — backing off ${Math.round(penalty / 1000)}s before next command to avoid an IP ban`);
-        await sleep(penalty);
-      }
+      // Rate-limit / IP-block protection is enforced at the send chokepoint
+      // (`sendResilient` → ratelimitgate.ts): the gate is already closed for
+      // the server's stated window, so every subsequent command — from every
+      // bot — parks before sending instead of re-tripping the block. Surfacing
+      // the error here is all that's left to do.
       return { error: { code: "lib_error", message }, result: undefined, notifications: [] };
     }
   }

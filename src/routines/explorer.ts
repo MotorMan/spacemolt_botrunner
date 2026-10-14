@@ -3725,7 +3725,10 @@ function findDistantStartingSystem(
   for (const sys of allSystems) {
     const sysLower = sys.id.toLowerCase();
     // Skip blacklisted, fled, and other explorers' starting systems
-    if (blacklistSet.has(sysLower)) continue;
+    // Respect ignoreBlacklistWhenCloaked for cloaked bots
+    if (!isCloaked || !ignoreBlacklistWhenCloaked) {
+      if (blacklistSet.has(sysLower)) continue;
+    }
     if (isTemporarilyBlacklisted(sys.id)) continue;
     if (fledSet.has(sysLower)) continue;
     if (otherStartsSet.has(sysLower)) continue;

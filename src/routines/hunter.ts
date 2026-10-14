@@ -2700,10 +2700,20 @@ function isBigCreatureBannedSystem(system: string | undefined): boolean {
 /** Human-readable id of the last banned sighting set we logged (dedupes the loop log). */
 let lastLoggedBannedBigCreatures = "";
 
+/**
+ * True when a wildlife store entry is an ADULT big creature worth travelling
+ * to. The keyword match is the same one the combat path uses, but young
+ * variants of a big species (Molt/Rainbow Leviathan Hatchling, Cloudwhale
+ * Calf, ...) carry the same species keyword ("molt_leviathan") and would
+ * otherwise be selected as hunt targets — they are protected, drop poor loot,
+ * and killing one prevents the adult from ever spawning. Without this check
+ * the hunt loop burns fuel and jumps on a system that only holds hatchlings.
+ */
 function isKnownBigCreature(creature: WildlifeDetail): boolean {
   const name = (creature.name || "").toLowerCase();
   const species = (creature.species || "").toLowerCase();
-  return BIG_CREATURE_KEYWORDS.some(kw => name.includes(kw) || species.includes(kw));
+  if (!BIG_CREATURE_KEYWORDS.some(kw => name.includes(kw) || species.includes(kw))) return false;
+  return !isProtectedCreature(creature.name);
 }
 
 /** Big creature sightings we are deliberately ignoring because they sit in a banned system. */

@@ -516,6 +516,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const blacklist = getSystemBlacklist();
   const startupSettings = getExplorerSettings(bot.username);
   const existingAssignment = explorerAssignmentStore.getAssignment(bot.username);
+  let assignedStartSystem: { id: string; name: string } | null = null;
   
   if (!existingAssignment) {
     // No assignment yet - pick a system far from other explorers using local BFS
@@ -569,52 +570,31 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
     
-    if (candidates.length === 0) {
-      ctx.log("exploration", "Could not find distant starting system, using current location");
-    } else {
+    if (candidates.length > 0) {
       // Sort by distance from others (farthest first)
       candidates.sort((a, b) => b.minDistToOthers - a.minDistToOthers);
       
-      // Try top candidates until one works
-      let assignedSystem = null;
+      // Pick the first available candidate (don't navigate yet - will do after startup prep)
       for (let i = 0; i < Math.min(5, candidates.length); i++) {
         const candidate = candidates[i];
         const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, candidate.id, candidate.name);
         if (!assigned) continue; // Another bot got it
         
         ctx.log("exploration", `Assigned starting system: ${candidate.name} (${candidate.id}) - distance from others: ${candidate.minDistToOthers}`);
-        
-        if (candidate.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
-          ctx.log("travel", `Navigating to assigned starting system ${candidate.name}...`);
-          await ensureUndocked(ctx);
-          const arrived = await navigateToSystem(ctx, candidate.id, { 
-            fuelThresholdPct: startupSettings.refuelThreshold, 
-            hullThresholdPct: 30, 
-            skipBlacklist: startupSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
-          });
-          if (!arrived) {
-            ctx.log("warn", `Could not reach ${candidate.name}, trying next distant system...`);
-            // Clear assignment and try next
-            explorerAssignmentStore.clearAssignment(bot.username);
-            continue;
-          } else {
-            ctx.log("travel", `Arrived at assigned starting system ${candidate.name}`);
-            assignedSystem = candidate;
-            break;
-          }
-        } else {
-          assignedSystem = candidate;
-          break;
-        }
+        assignedStartSystem = candidate;
+        break;
       }
       
-      if (!assignedSystem) {
-        ctx.log("exploration", "All distant starting systems unreachable, using current location");
+      if (!assignedStartSystem) {
+        ctx.log("exploration", "All distant starting systems taken by other bots, using current location");
       }
+    } else {
+      ctx.log("exploration", "Could not find distant starting system, using current location");
     }
   } else {
     ctx.log("exploration", `Resuming from assigned starting system: ${existingAssignment.startingSystemName} (${existingAssignment.startingSystem})`);
     ctx.log("exploration", `Completed ${existingAssignment.completedSystems.length} systems so far`);
+    assignedStartSystem = { id: existingAssignment.startingSystem, name: existingAssignment.startingSystemName };
     // Add previously completed systems to visited set
     for (const sysId of existingAssignment.completedSystems) {
       visitedSystems.add(sysId);
@@ -622,6 +602,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Startup: dock at local station to clear cargo & refuel ──
+  // This MUST happen BEFORE navigating to assigned starting system
   yield "startup_prep";
   await bot.refreshStatus();
   const { pois: startPois } = await getSystemInfo(ctx);
@@ -689,7 +670,6 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Load fuel cells to max cargo (explorer long-range mode)
-      const startupSettings = getExplorerSettings(bot.username);
       if (startupSettings.loadFuelCellsAtHome) {
         yield "startup_load_fuel_cells";
         await loadFuelCellsToMax(ctx);
@@ -704,6 +684,23 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   } else {
     ctx.log("system", "No station in current system — skipping startup prep");
+  }
+
+  // ── Navigate to assigned starting system (AFTER startup prep for full fuel) ──
+  if (assignedStartSystem && assignedStartSystem.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
+    ctx.log("travel", `Navigating to assigned starting system ${assignedStartSystem.name}...`);
+    await ensureUndocked(ctx);
+    const arrived = await navigateToSystem(ctx, assignedStartSystem.id, { 
+      fuelThresholdPct: startupSettings.refuelThreshold, 
+      hullThresholdPct: 30, 
+      skipBlacklist: startupSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
+    });
+    if (!arrived) {
+      ctx.log("warn", `Could not reach assigned starting system ${assignedStartSystem.name}, will explore from current location`);
+      explorerAssignmentStore.clearAssignment(bot.username);
+    } else {
+      ctx.log("travel", `Arrived at assigned starting system ${assignedStartSystem.name}`);
+    }
   }
 
   // Persistent battle state across cycles

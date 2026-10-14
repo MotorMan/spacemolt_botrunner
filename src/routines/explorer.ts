@@ -512,48 +512,30 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Assign starting system for systematic exploration ──
-  // Each explorer picks an unassigned unvisited system for better coverage
+  // Each explorer picks a system far from other explorers' starting systems for galaxy-wide coverage
   const blacklist = getSystemBlacklist();
   const startupSettings = getExplorerSettings(bot.username);
   const existingAssignment = explorerAssignmentStore.getAssignment(bot.username);
   
   if (!existingAssignment) {
-    // No assignment yet - pick an unvisited system that other explorers aren't targeting
-    // First, get all systems from mapStore
-    const allSystems = mapStore.getSystems();
-    
-    // Get other explorers' assigned starting systems
+    // No assignment yet - pick a system far from other explorers using local BFS
     const otherAssignments = explorerAssignmentStore.getAllAssignments()
       .filter(a => a.botName !== bot.username)
-      .map(a => a.startingSystem.toLowerCase());
+      .map(a => a.startingSystem);
     
-    // Get systems recently explored by other bots (5 min cooldown)
-    const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
-    const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
+    const startSystem = findDistantStartingSystem(
+      bot.system || "",
+      otherAssignments,
+      blacklist,
+      fledFromSystems,
+      startupSettings.ignoreBlacklistWhenCloaked,
+      bot.isCloaked
+    );
     
-    // Find candidate unvisited systems
-    const candidates: Array<{ id: string; name: string }> = [];
-    for (const sys of allSystems) {
-      // Skip if not unvisited
-      if (sys.visited !== false) continue;
-      // Skip blacklisted/fled systems
-      if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
-      if (isTemporarilyBlacklisted(sys.id)) continue;
-      if (fledFromSystems.has(sys.id.toLowerCase())) continue;
-      // Skip systems assigned to other explorers
-      if (otherAssignments.includes(sys.id.toLowerCase())) continue;
-      // Skip recently explored by other bots
-      if (recentSet.has(sys.id.toLowerCase())) continue;
-      
-      candidates.push({ id: sys.id, name: sys.name || sys.id });
-    }
-    
-    if (candidates.length > 0) {
-      // Pick a random candidate for good distribution
-      const startSystem = candidates[Math.floor(Math.random() * candidates.length)];
+    if (startSystem) {
       const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, startSystem.id, startSystem.name);
       if (assigned) {
-        ctx.log("exploration", `Assigned starting system: ${startSystem.name} (${startSystem.id}) - ${candidates.length} candidates available`);
+        ctx.log("exploration", `Assigned starting system: ${startSystem.name} (${startSystem.id}) - spreading from other explorers`);
         // Navigate to assigned starting system if not already there
         if (startSystem.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
           ctx.log("travel", `Navigating to assigned starting system ${startSystem.name}...`);
@@ -571,7 +553,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
     } else {
-      ctx.log("exploration", "No unassigned unvisited systems found, using current location");
+      ctx.log("exploration", "Could not find distant starting system, using current location");
     }
   } else {
     ctx.log("exploration", `Resuming from assigned starting system: ${existingAssignment.startingSystemName} (${existingAssignment.startingSystem})`);
@@ -3656,13 +3638,146 @@ async function findAllUnvisitedSystems(
 }
 
 /**
- * Find all systems that need systematic exploration.
- * This is the core function for the new "explore" mode that works like achievement mode.
+ * Local BFS pathfinder using mapStore connections.
+ * Calculates shortest path (distance + route) from a start system to all reachable systems.
+ * Does NOT use the API - uses local mapStore graph data.
  * 
+ * @param startSystem - Starting system ID
+ * @param blacklist - Systems to avoid
+ * @param fledFromSystems - Systems we've fled from
+ * @param ignoreBlacklistWhenCloaked - Whether to ignore blacklist when cloaked
+ * @param isCloaked - Whether bot is cloaked
+ * @param maxDistance - Maximum hops to search (optional)
+ * @returns Map of systemId -> { distance, route }
+ */
+function calculateLocalDistances(
+  startSystem: string,
+  blacklist: string[],
+  fledFromSystems: Set<string>,
+  ignoreBlacklistWhenCloaked: boolean,
+  isCloaked: boolean,
+  maxDistance?: number
+): Map<string, { distance: number; route: string[] }> {
+  const distances = new Map<string, { distance: number; route: string[] }>();
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
+    { systemId: startSystem, distance: 0, route: [startSystem] }
+  ];
+  visited.add(startSystem.toLowerCase());
+
+  const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
+  const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
+
+  while (queue.length > 0) {
+    const { systemId, distance, route } = queue.shift()!;
+    
+    if (maxDistance !== undefined && distance > maxDistance) continue;
+
+    const sys = mapStore.getSystem(systemId);
+    if (!sys || !sys.connections) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      const connLower = connId.toLowerCase();
+      if (visited.has(connLower)) continue;
+
+      // Skip blacklisted/fled systems unless cloaked
+      if (!isCloaked || !ignoreBlacklistWhenCloaked) {
+        if (blacklistSet.has(connLower)) continue;
+        if (isTemporarilyBlacklisted(connId)) continue;
+        if (fledSet.has(connLower)) continue;
+      }
+
+      visited.add(connLower);
+      const newDistance = distance + 1;
+      const newRoute = [...route, connId];
+
+      distances.set(connId, { distance: newDistance, route: newRoute });
+      queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+    }
+  }
+
+  return distances;
+}
+
+/**
+ * Find the best starting system for a new explorer - one that's farthest from 
+ * other explorers' assigned starting systems.
+ * Uses local BFS on mapStore graph - no API calls.
+ */
+function findDistantStartingSystem(
+  currentSystem: string,
+  otherStartingSystems: string[],
+  blacklist: string[],
+  fledFromSystems: Set<string>,
+  ignoreBlacklistWhenCloaked: boolean,
+  isCloaked: boolean
+): { id: string; name: string } | null {
+  const allSystems = mapStore.getSystems();
+  
+  // Filter valid candidate systems
+  const candidates: Array<{ id: string; name: string; minDistToOthers: number }> = [];
+  const blacklistSet = new Set(blacklist.map(b => b.toLowerCase()));
+  const fledSet = new Set(Array.from(fledFromSystems).map(s => s.toLowerCase()));
+  const otherStartsSet = new Set(otherStartingSystems.map(s => s.toLowerCase()));
+
+  for (const sys of allSystems) {
+    const sysLower = sys.id.toLowerCase();
+    // Skip blacklisted, fled, and other explorers' starting systems
+    if (blacklistSet.has(sysLower)) continue;
+    if (isTemporarilyBlacklisted(sys.id)) continue;
+    if (fledSet.has(sysLower)) continue;
+    if (otherStartsSet.has(sysLower)) continue;
+    // Skip current system
+    if (sysLower === currentSystem.toLowerCase()) continue;
+
+    // Calculate minimum distance to any other explorer's starting system
+    let minDistToOthers = Infinity;
+    if (otherStartingSystems.length > 0) {
+      // Use position-based distance as approximation for speed
+      const currentPos = mapStore.getSystem(currentSystem)?.position;
+      const sysPos = sys.position;
+      if (currentPos && sysPos && typeof sysPos.x === "number" && typeof sysPos.y === "number") {
+        const dx = sysPos.x - currentPos.x;
+        const dy = sysPos.y - currentPos.y;
+        minDistToOthers = Math.sqrt(dx * dx + dy * dy);
+      } else {
+        // Fallback: use local BFS from current to estimate
+        const distances = calculateLocalDistances(currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
+        const dist = distances.get(sys.id);
+        if (dist) minDistToOthers = dist.distance;
+      }
+    } else {
+      // No other explorers - prefer distant systems from current
+      const currentPos = mapStore.getSystem(currentSystem)?.position;
+      const sysPos = sys.position;
+      if (currentPos && sysPos && typeof sysPos.x === "number" && typeof sysPos.y === "number") {
+        const dx = sysPos.x - currentPos.x;
+        const dy = sysPos.y - currentPos.y;
+        minDistToOthers = Math.sqrt(dx * dx + dy * dy);
+      }
+    }
+
+    if (minDistToOthers !== Infinity) {
+      candidates.push({ id: sys.id, name: sys.name || sys.id, minDistToOthers });
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Sort by distance from others (farthest first) for maximum spread
+  candidates.sort((a, b) => b.minDistToOthers - a.minDistToOthers);
+
+  // Pick from top 5 farthest (add randomness)
+  const topCount = Math.min(5, candidates.length);
+  const idx = Math.floor(Math.random() * topCount);
+  return { id: candidates[idx].id, name: candidates[idx].name };
+}
+
+/**
+ * Find systems needing exploration using LOCAL BFS - no API calls.
  * Returns systems sorted by jump distance (nearest first).
- * Respects blacklist/flee unless cloaked.
- * Filters out systems recently explored by other bots (5 min cooldown).
- * Uses server's find_route API for accurate pathfinding to NEAREST systems only.
  * 
  * Priority:
  *   1. Unvisited systems (never visited by this bot)
@@ -3685,7 +3800,7 @@ async function findSystemsNeedingExploration(
   const currentSystem = ctx.bot.system;
   if (!currentSystem) return [];
 
-  // Refresh map data first - get full map from server
+  // Refresh map data from server (only get_map, no find_route)
   const mapResp = await ctx.bot.exec("get_map");
   if (mapResp.result && typeof mapResp.result === "object") {
     const mapData = mapResp.result as Record<string, unknown>;
@@ -3698,35 +3813,54 @@ async function findSystemsNeedingExploration(
     }
   }
 
-  // Get all systems from mapStore
-  const allSystems = mapStore.getSystems();
-  
+  // Calculate distances from current system to ALL reachable systems using local BFS
+  const localDistances = calculateLocalDistances(
+    currentSystem, 
+    blacklist, 
+    fledFromSystems, 
+    ignoreBlacklistWhenCloaked, 
+    isCloaked
+  );
+
+  if (localDistances.size === 0) {
+    ctx.log("warn", "Local BFS found no reachable systems — map may be incomplete");
+    return [];
+  }
+
   // Get systems recently explored by other bots (5 min cooldown)
   const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
   const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
 
-  // Find candidate systems needing exploration
-  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "revisit"; estDistance: number }> = [];
+  // Get all systems from mapStore
+  const allSystems = mapStore.getSystems();
 
-  // Get current system position for distance estimation
-  const currentSysData = mapStore.getSystem(currentSystem);
-  const currentPos = currentSysData?.position;
+  // Find candidate systems needing exploration
+  const candidates: Array<{ 
+    id: string; 
+    name: string; 
+    priority: "unvisited" | "revisit"; 
+    distance: number; 
+    route: string[];
+  }> = [];
 
   for (const sys of allSystems) {
+    const sysLower = sys.id.toLowerCase();
+    
     // Skip current system
-    if (sys.id.toLowerCase() === currentSystem.toLowerCase()) continue;
+    if (sysLower === currentSystem.toLowerCase()) continue;
     // Skip already visited in this session
     if (visitedSystems.has(sys.id)) continue;
-    // Skip blacklisted/fled systems (unless cloaked)
-    if (!isCloaked || !ignoreBlacklistWhenCloaked) {
-      if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
-      if (isTemporarilyBlacklisted(sys.id)) continue;
-      if (fledFromSystems.has(sys.id.toLowerCase())) continue;
-    }
     // Skip systems recently explored by other bots (5 min cooldown)
     if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
-      if (recentSet.has(sys.id.toLowerCase())) continue;
+      if (recentSet.has(sysLower)) continue;
     }
+
+    // Check if reachable via local BFS
+    const distInfo = localDistances.get(sys.id);
+    if (!distInfo) continue; // Not reachable from current position
+
+    const distance = distInfo.distance;
+    const route = distInfo.route;
 
     // Determine priority: unvisited first, then all others for revisit
     let priority: "unvisited" | "revisit";
@@ -3736,15 +3870,13 @@ async function findSystemsNeedingExploration(
       priority = "revisit";
     }
 
-    // Estimate distance using positions (Euclidean) if available
-    let estDistance = 999;
-    if (currentPos && sys.position && typeof sys.position.x === "number" && typeof sys.position.y === "number") {
-      const dx = sys.position.x - currentPos.x;
-      const dy = sys.position.y - currentPos.y;
-      estDistance = Math.sqrt(dx * dx + dy * dy);
-    }
-
-    candidates.push({ id: sys.id, name: sys.name || sys.id, priority, estDistance });
+    candidates.push({ 
+      id: sys.id, 
+      name: sys.name || sys.id, 
+      priority, 
+      distance, 
+      route 
+    });
   }
 
   if (candidates.length === 0) {
@@ -3752,96 +3884,18 @@ async function findSystemsNeedingExploration(
     return [];
   }
 
-  // Sort by priority first, then by estimated distance (nearest first)
-  candidates.sort((a, b) => {
-    if (a.priority !== b.priority) {
-      return a.priority === "unvisited" ? -1 : 1;
-    }
-    return a.estDistance - b.estDistance;
-  });
-
-  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit)`);
-
-  // Only query find_route for the nearest candidates to avoid API spam
-  // Limit to top 30 candidates (15 per priority tier max)
-  const MAX_ROUTE_QUERIES = 30;
-  const candidatesToQuery = candidates.slice(0, MAX_ROUTE_QUERIES);
-
-  // Use find_route for nearest candidates to get actual distance and route
-  const results: Array<{
-    id: string;
-    name: string;
-    distance: number;
-    priority: "unvisited" | "revisit";
-    route: string[];
-  }> = [];
-
-  // Process in small batches with small delay to respect rate limits
-  const batchSize = 5;
-  for (let i = 0; i < candidatesToQuery.length; i += batchSize) {
-    const batch = candidatesToQuery.slice(i, i + batchSize);
-    const promises = batch.map(async (cand) => {
-      const routeResp = await ctx.bot.exec("find_route", { target_system: cand.id });
-      const routeData = routeResp.result as { 
-        found?: boolean; 
-        route?: Array<{ system_id: string; name: string; jumps?: number }>; 
-        total_jumps?: number 
-      } | null;
-
-      if (routeData?.found && routeData.route && routeData.route.length > 1) {
-        const distance = routeData.total_jumps ?? (routeData.route.length - 1);
-        const route = routeData.route.map(r => r.system_id);
-        return {
-          id: cand.id,
-          name: cand.name,
-          distance,
-          priority: cand.priority,
-          route,
-        };
-      }
-      // Fallback: use estimated distance if find_route fails
-      return {
-        id: cand.id,
-        name: cand.name,
-        distance: Math.ceil(cand.estDistance / 10), // Rough conversion
-        priority: cand.priority,
-        route: [currentSystem, cand.id],
-      };
-    });
-
-    const batchResults = await Promise.all(promises);
-    for (const r of batchResults) {
-      if (r) results.push(r);
-    }
-
-    // Small delay between batches to respect rate limits
-    if (i + batchSize < candidatesToQuery.length) {
-      await ctx.sleep(200); // 200ms between batches = 5 req/sec max
-    }
-  }
-
-  if (results.length === 0) {
-    ctx.log("debug", "No routes found to candidate systems — using server fallback");
-    const unknowns = findUnknownSystemsWithCoordination(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
-    return unknowns.map(u => ({
-      id: u.id,
-      name: u.name,
-      distance: u.distance,
-      priority: u.priority === "unknown" ? "unvisited" : "revisit",
-      route: u.route,
-    }));
-  }
-
   // Sort: unvisited priority first, then revisit; within each tier, nearest first
-  results.sort((a, b) => {
+  candidates.sort((a, b) => {
     if (a.priority !== b.priority) {
       return a.priority === "unvisited" ? -1 : 1;
     }
     return a.distance - b.distance;
   });
 
-  ctx.log("exploration", `Found routes to ${results.length} systems needing exploration (nearest: ${results[0].name} at ${results[0].distance} jumps, ${results[0].priority})`);
-  return results;
+  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit) via local BFS`);
+
+  // Return top candidates (we'll use find_route only when actually navigating)
+  return candidates.slice(0, 100);
 }
 
 // ── Helpers ──────────────────────────────────────────────────

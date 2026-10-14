@@ -3662,7 +3662,7 @@ async function findAllUnvisitedSystems(
  * Returns systems sorted by jump distance (nearest first).
  * Respects blacklist/flee unless cloaked.
  * Filters out systems recently explored by other bots (5 min cooldown).
- * Uses server's find_route API for accurate pathfinding to ALL systems.
+ * Uses server's find_route API for accurate pathfinding to NEAREST systems only.
  * 
  * Priority:
  *   1. Unvisited systems (never visited by this bot)
@@ -3706,7 +3706,11 @@ async function findSystemsNeedingExploration(
   const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
 
   // Find candidate systems needing exploration
-  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "revisit" }> = [];
+  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "revisit"; estDistance: number }> = [];
+
+  // Get current system position for distance estimation
+  const currentSysData = mapStore.getSystem(currentSystem);
+  const currentPos = currentSysData?.position;
 
   for (const sys of allSystems) {
     // Skip current system
@@ -3725,13 +3729,22 @@ async function findSystemsNeedingExploration(
     }
 
     // Determine priority: unvisited first, then all others for revisit
+    let priority: "unvisited" | "revisit";
     if (sys.visited === false) {
-      // Never visited by this bot
-      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
+      priority = "unvisited";
     } else {
-      // All other systems (visited=true or unknown) - include for continuous re-exploration
-      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "revisit" });
+      priority = "revisit";
     }
+
+    // Estimate distance using positions (Euclidean) if available
+    let estDistance = 999;
+    if (currentPos && sys.position && typeof sys.position.x === "number" && typeof sys.position.y === "number") {
+      const dx = sys.position.x - currentPos.x;
+      const dy = sys.position.y - currentPos.y;
+      estDistance = Math.sqrt(dx * dx + dy * dy);
+    }
+
+    candidates.push({ id: sys.id, name: sys.name || sys.id, priority, estDistance });
   }
 
   if (candidates.length === 0) {
@@ -3739,10 +3752,22 @@ async function findSystemsNeedingExploration(
     return [];
   }
 
-  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit), querying routes...`);
+  // Sort by priority first, then by estimated distance (nearest first)
+  candidates.sort((a, b) => {
+    if (a.priority !== b.priority) {
+      return a.priority === "unvisited" ? -1 : 1;
+    }
+    return a.estDistance - b.estDistance;
+  });
 
-  // Use find_route for each candidate to get actual distance and route
-  // Process in batches to avoid too many API calls
+  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration (${candidates.filter(c => c.priority === "unvisited").length} unvisited, ${candidates.filter(c => c.priority === "revisit").length} revisit)`);
+
+  // Only query find_route for the nearest candidates to avoid API spam
+  // Limit to top 30 candidates (15 per priority tier max)
+  const MAX_ROUTE_QUERIES = 30;
+  const candidatesToQuery = candidates.slice(0, MAX_ROUTE_QUERIES);
+
+  // Use find_route for nearest candidates to get actual distance and route
   const results: Array<{
     id: string;
     name: string;
@@ -3751,10 +3776,10 @@ async function findSystemsNeedingExploration(
     route: string[];
   }> = [];
 
-  // Process candidates in batches of 10
-  const batchSize = 10;
-  for (let i = 0; i < candidates.length; i += batchSize) {
-    const batch = candidates.slice(i, i + batchSize);
+  // Process in small batches with small delay to respect rate limits
+  const batchSize = 5;
+  for (let i = 0; i < candidatesToQuery.length; i += batchSize) {
+    const batch = candidatesToQuery.slice(i, i + batchSize);
     const promises = batch.map(async (cand) => {
       const routeResp = await ctx.bot.exec("find_route", { target_system: cand.id });
       const routeData = routeResp.result as { 
@@ -3774,12 +3799,24 @@ async function findSystemsNeedingExploration(
           route,
         };
       }
-      return null;
+      // Fallback: use estimated distance if find_route fails
+      return {
+        id: cand.id,
+        name: cand.name,
+        distance: Math.ceil(cand.estDistance / 10), // Rough conversion
+        priority: cand.priority,
+        route: [currentSystem, cand.id],
+      };
     });
 
     const batchResults = await Promise.all(promises);
     for (const r of batchResults) {
       if (r) results.push(r);
+    }
+
+    // Small delay between batches to respect rate limits
+    if (i + batchSize < candidatesToQuery.length) {
+      await ctx.sleep(200); // 200ms between batches = 5 req/sec max
     }
   }
 

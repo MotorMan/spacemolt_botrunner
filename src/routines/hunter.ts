@@ -2716,6 +2716,55 @@ function isKnownBigCreature(creature: WildlifeDetail): boolean {
   return !isProtectedCreature(creature.name);
 }
 
+/**
+ * Minimum number of adult Cloudwhales that must be known alive in a system
+ * before the big creature hunter will travel there. Cloud Whales hunt in
+ * packs, so the count is aggregated across the whole system — a pack split
+ * between a belt and a cloud still counts as one pack. The live engagement
+ * rule in applyCloudWhalePackRule then guarantees at least two always survive.
+ */
+const CLOUDWHALE_MIN_PACK_SIZE = 3;
+
+/**
+ * How long a system whose Cloudwhale pack could not be engaged is skipped
+ * before the hunt loop re-checks it. A pack that is split across POIs (no
+ * single POI holding CLOUDWHALE_MIN_PACK_SIZE together) can never be legally
+ * engaged, so without this cooldown the hunter would sweep the same system
+ * every loop iteration forever. Instead it leaves and does a random creature
+ * farm cycle elsewhere, then re-checks in case the pack drifted back together.
+ */
+const CLOUDWHALE_UNENGAGEABLE_TTL_MS = 15 * 60 * 1000;
+const unengageableCloudwhaleSystems = new Map<string, number>();
+
+/** True when a wildlife store entry is an ADULT Cloudwhale (name or species match). */
+function isCloudWhaleEntry(c: WildlifeDetail): boolean {
+  if (isProtectedCreature(c.name)) return false;
+  const name = (c.name || "").toLowerCase();
+  const species = (c.species || "").toLowerCase();
+  return name.includes("cloudwhale") || species.includes("cloudwhale");
+}
+
+/** Unique adult Cloudwhale ids sighted anywhere in a system (pack may be split across POIs). */
+function countSystemCloudwhales(system: string): number {
+  const ids = new Set<string>();
+  for (const c of wildlifeStore.getAll()) {
+    if (c.system !== system || c.count <= 0 || !isCloudWhaleEntry(c)) continue;
+    for (const id of c.ids) ids.add(id);
+  }
+  return ids.size;
+}
+
+/** True while a system is on cooldown because its Cloudwhale pack could not be engaged. */
+function isCloudwhaleSystemUnengageable(system: string): boolean {
+  const expires = unengageableCloudwhaleSystems.get(system);
+  if (expires === undefined) return false;
+  if (expires <= Date.now()) {
+    unengageableCloudwhaleSystems.delete(system);
+    return false;
+  }
+  return true;
+}
+
 /** Big creature sightings we are deliberately ignoring because they sit in a banned system. */
 function findBannedBigCreatureSightings(): Array<{ system: string; poi: string; name: string; count: number }> {
   return wildlifeStore.getAll()
@@ -2726,9 +2775,27 @@ function findBannedBigCreatureSightings(): Array<{ system: string; poi: string; 
 function findKnownBigCreatures(): Array<{ system: string; poi: string; name: string; count: number }> {
   releaseExpiredBigCreatureHunts();
   const all = wildlifeStore.getAll();
+  // Cloudwhale packs are gated on the SYSTEM population, not the per-POI
+  // sighting: a pack split across POIs still counts as one pack, and the
+  // hunter never travels for a system that cannot spare a single whale.
+  // Leviathans have no pack rule and are unaffected.
+  const cloudwhaleIdsBySystem = new Map<string, Set<string>>();
+  for (const c of all) {
+    if (c.count <= 0 || isBigCreatureBannedSystem(c.system) || !isCloudWhaleEntry(c)) continue;
+    let ids = cloudwhaleIdsBySystem.get(c.system);
+    if (!ids) {
+      ids = new Set<string>();
+      cloudwhaleIdsBySystem.set(c.system, ids);
+    }
+    for (const id of c.ids) ids.add(id);
+  }
   return all
     .filter(c => isKnownBigCreature(c) && c.count > 0 && !isBigCreatureBannedSystem(c.system))
-    .filter(c => !isCloudWhale(c.name) || c.count >= 3)
+    .filter(c => {
+      if (!isCloudWhaleEntry(c)) return true;
+      if (isCloudwhaleSystemUnengageable(c.system)) return false;
+      return (cloudwhaleIdsBySystem.get(c.system)?.size ?? 0) >= CLOUDWHALE_MIN_PACK_SIZE;
+    })
     .map(c => ({
       system: c.system,
       poi: c.poi,
@@ -2938,9 +3005,25 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
 
     // â”€â”€ Farm the target system for the big creature â”€â”€
     yield "farm_big_creature";
-    const farmKills = await farmSystemForBigCreature(ctx, settings, target);
-    if (farmKills > 0) {
-      ctx.log("combat", `Big creature hunt: ${farmKills} kill(s) in ${target.system}`);
+    const farmResult = await farmSystemForBigCreature(ctx, settings, target);
+    if (farmResult.kills > 0) {
+      ctx.log("combat", `Big creature hunt: ${farmResult.kills} kill(s) in ${target.system}`);
+    }
+
+    // Cloudwhale pack rule: if the system holds an engageable-by-the-numbers
+    // pack (>= CLOUDWHALE_MIN_PACK_SIZE adults alive system-wide) but not a
+    // single whale died, the pack cannot be engaged right now - it is split
+    // across POIs so no single POI holds 3+ together, or this ship is too
+    // small to fight them. Leave the system and go do a random creature farm
+    // cycle elsewhere instead of re-sweeping it every loop; the system stays
+    // skipped until the cooldown expires, then gets re-checked in case the
+    // pack drifted back together.
+    if (farmResult.cloudwhaleKills === 0) {
+      const packSize = countSystemCloudwhales(target.system);
+      if (packSize >= CLOUDWHALE_MIN_PACK_SIZE) {
+        unengageableCloudwhaleSystems.set(target.system, Date.now() + CLOUDWHALE_UNENGAGEABLE_TTL_MS);
+        ctx.log("info", `Cloudwhale pack in ${target.system} (${packSize} adults) could not be engaged - leaving for a random farm elsewhere (needs ${CLOUDWHALE_MIN_PACK_SIZE} together in one POI; re-checking in ${Math.round(CLOUDWHALE_UNENGAGEABLE_TTL_MS / 60000)}m)`);
+      }
     }
 
     // Brief pause before rechecking known locations
@@ -2952,10 +3035,11 @@ async function farmSystemForBigCreature(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
   target: { system: string; poi: string; name: string; count: number },
-): Promise<number> {
+): Promise<{ kills: number; cloudwhaleKills: number }> {
   const { bot } = ctx;
   const maxPasses = settings.creatureFarmMaxPassesPerPoi || 6;
   let totalKills = 0;
+  let cloudwhaleKills = 0;
   let targetKilled = false;
 
   // Focus on the target POI first, then sweep other non-station POIs
@@ -3069,6 +3153,7 @@ async function farmSystemForBigCreature(
         const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
         if (won) {
           totalKills++;
+          if (isCloudWhale(t.name)) cloudwhaleKills++;
           recordCreatureKill(bot, t);
           ctx.log("combat", `Kill #${totalKills} (${t.name}) â€” looting...`);
           if (!settings.disableWreckSalvaging) {
@@ -3115,7 +3200,7 @@ async function farmSystemForBigCreature(
     }
   }
 
-  return totalKills;
+  return { kills: totalKills, cloudwhaleKills };
 }
 
 async function creatureFarmRandomFallbackCycle(

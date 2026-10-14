@@ -186,93 +186,24 @@ class ExplorerAssignmentStore {
     return !!data.bots[botName];
   }
 
-  /**
-   * Find the best starting system for a new bot - one that's farthest from other bots' starting systems.
-   * Returns null if no good starting system can be determined.
-   */
-  findDistantStartingSystem(
-    ctx: { bot: { system: string } },
-    mapStore: { getSystems: () => Array<{ id: string; name: string; connections: Array<{ system_id: string }> }> },
-    blacklist: string[],
-    fledFromSystems: Set<string>
-  ): { id: string; name: string } | null {
-    const currentSystem = ctx.bot.system;
-    if (!currentSystem) return null;
-
-    const otherStartingSystems = this.getAllStartingSystems();
-    
-    // If no other bots have starting systems, just use current system
-    if (otherStartingSystems.length === 0) {
-      const current = mapStore.getSystems().find(s => s.id.toLowerCase() === currentSystem.toLowerCase());
-      if (current) return { id: current.id, name: current.name || current.id };
-      return null;
-    }
-
-    // BFS from current system to find all reachable systems with distances
-    const visited = new Set<string>();
-    const queue: Array<{ systemId: string; distance: number }> = [
-      { systemId: currentSystem, distance: 0 }
-    ];
-    visited.add(currentSystem.toLowerCase());
-
-    const reachable: Array<{ id: string; name: string; distance: number }> = [];
-
-    while (queue.length > 0) {
-      const { systemId, distance } = queue.shift()!;
-      const sys = mapStore.getSystems().find(s => s.id.toLowerCase() === systemId.toLowerCase());
-      if (!sys) continue;
-
-      // Check if this system is a good candidate (not blacklisted, not fled from)
-      const isBlacklisted = blacklist.some(b => b.toLowerCase() === systemId.toLowerCase());
-      const hasFledFrom = fledFromSystems.has(systemId.toLowerCase());
-      
-      if (!isBlacklisted && !hasFledFrom) {
-        reachable.push({
-          id: sys.id,
-          name: sys.name || sys.id,
-          distance,
-        });
-      }
-
-      for (const conn of sys.connections) {
-        const connId = conn.system_id;
-        if (!connId) continue;
-        const connLower = connId.toLowerCase();
-        if (visited.has(connLower)) continue;
-        visited.add(connLower);
-        queue.push({ systemId: connId, distance: distance + 1 });
-      }
-    }
-
-    if (reachable.length === 0) return null;
-
-    // Sort by distance from current (farther = better for spreading out)
-    reachable.sort((a, b) => b.distance - a.distance);
-
-    // Pick one of the top 3 farthest systems (add some randomness)
-    const topCount = Math.min(3, reachable.length);
-    const idx = Math.floor(Math.random() * topCount);
-    return { id: reachable[idx].id, name: reachable[idx].name };
+/**
+ * Clear a bot's assignment (e.g., when mode changes).
+ */
+clearAssignment(botName: string): void {
+  const data = this.ensureLoaded();
+  if (data.bots[botName]) {
+    delete data.bots[botName];
+    this.dirty = true;
   }
+}
 
-  /**
-   * Clear a bot's assignment (e.g., when mode changes).
-   */
-  clearAssignment(botName: string): void {
-    const data = this.ensureLoaded();
-    if (data.bots[botName]) {
-      delete data.bots[botName];
-      this.dirty = true;
-    }
-  }
+private serialize(): string {
+  const data = this.ensureLoaded();
+  data.lastSaved = nowIso();
+  return JSON.stringify(data, null, 2) + "\n";
+}
 
-  private serialize(): string {
-    const data = this.ensureLoaded();
-    data.lastSaved = nowIso();
-    return JSON.stringify(data, null, 2) + "\n";
-  }
-
-  async flush(): Promise<boolean> {
+async flush(): Promise<boolean> {
     if (!this.dirty || this.writing) return false;
     this.writing = true;
     this.dirty = false;

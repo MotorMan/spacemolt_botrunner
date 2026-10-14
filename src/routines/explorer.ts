@@ -512,42 +512,66 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Assign starting system for systematic exploration ──
-  // Each explorer picks a distant starting point from others for better coverage
+  // Each explorer picks an unassigned unvisited system for better coverage
   const blacklist = getSystemBlacklist();
   const startupSettings = getExplorerSettings(bot.username);
   const existingAssignment = explorerAssignmentStore.getAssignment(bot.username);
   
   if (!existingAssignment) {
-    // No assignment yet - find a distant starting system
-    const distantStart = explorerAssignmentStore.findDistantStartingSystem(
-      { bot: { system: bot.system || "" } },
-      mapStore,
-      blacklist,
-      fledFromSystems
-    );
+    // No assignment yet - pick an unvisited system that other explorers aren't targeting
+    // First, get all systems from mapStore
+    const allSystems = mapStore.getSystems();
     
-    if (distantStart) {
-      const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, distantStart.id, distantStart.name);
+    // Get other explorers' assigned starting systems
+    const otherAssignments = explorerAssignmentStore.getAllAssignments()
+      .filter(a => a.botName !== bot.username)
+      .map(a => a.startingSystem.toLowerCase());
+    
+    // Get systems recently explored by other bots (5 min cooldown)
+    const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
+    const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
+    
+    // Find candidate unvisited systems
+    const candidates: Array<{ id: string; name: string }> = [];
+    for (const sys of allSystems) {
+      // Skip if not unvisited
+      if (sys.visited !== false) continue;
+      // Skip blacklisted/fled systems
+      if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(sys.id)) continue;
+      if (fledFromSystems.has(sys.id.toLowerCase())) continue;
+      // Skip systems assigned to other explorers
+      if (otherAssignments.includes(sys.id.toLowerCase())) continue;
+      // Skip recently explored by other bots
+      if (recentSet.has(sys.id.toLowerCase())) continue;
+      
+      candidates.push({ id: sys.id, name: sys.name || sys.id });
+    }
+    
+    if (candidates.length > 0) {
+      // Pick a random candidate for good distribution
+      const startSystem = candidates[Math.floor(Math.random() * candidates.length)];
+      const assigned = explorerAssignmentStore.assignStartingSystem(bot.username, startSystem.id, startSystem.name);
       if (assigned) {
-        ctx.log("exploration", `Assigned starting system: ${distantStart.name} (${distantStart.id})`);
-        // If the starting system is not our current system, navigate there first
-        if (distantStart.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
-          ctx.log("travel", `Navigating to assigned starting system ${distantStart.name}...`);
+        ctx.log("exploration", `Assigned starting system: ${startSystem.name} (${startSystem.id}) - ${candidates.length} candidates available`);
+        // Navigate to assigned starting system if not already there
+        if (startSystem.id.toLowerCase() !== (bot.system || "").toLowerCase()) {
+          ctx.log("travel", `Navigating to assigned starting system ${startSystem.name}...`);
           await ensureUndocked(ctx);
-          const arrived = await navigateToSystem(ctx, distantStart.id, { 
+          const arrived = await navigateToSystem(ctx, startSystem.id, { 
             fuelThresholdPct: startupSettings.refuelThreshold, 
             hullThresholdPct: 30, 
             skipBlacklist: startupSettings.ignoreBlacklistWhenCloaked && bot.isCloaked 
           });
           if (!arrived) {
-            ctx.log("warn", `Could not reach assigned starting system ${distantStart.name}, will explore from current location`);
+            ctx.log("warn", `Could not reach assigned starting system ${startSystem.name}, will explore from current location`);
           } else {
-            ctx.log("travel", `Arrived at assigned starting system ${distantStart.name}`);
+            ctx.log("travel", `Arrived at assigned starting system ${startSystem.name}`);
           }
         }
       }
     } else {
-      ctx.log("exploration", "Could not find distant starting system, using current location");
+      ctx.log("exploration", "No unassigned unvisited systems found, using current location");
     }
   } else {
     ctx.log("exploration", `Resuming from assigned starting system: ${existingAssignment.startingSystemName} (${existingAssignment.startingSystem})`);
@@ -1368,8 +1392,7 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
       fledFromSystems,
       visitedSystems,
       currentSettings.ignoreBlacklistWhenCloaked,
-      bot.isCloaked,
-      currentSettings.explorerSystemTimeout
+      bot.isCloaked
     );
 
     if (systemsNeedingExploration.length === 0) {
@@ -3639,6 +3662,7 @@ async function findAllUnvisitedSystems(
  * Returns systems sorted by jump distance (nearest first).
  * Respects blacklist/flee unless cloaked.
  * Filters out systems recently explored by other bots (5 min cooldown).
+ * Uses server's find_route API for accurate pathfinding to ALL systems.
  */
 async function findSystemsNeedingExploration(
   ctx: RoutineContext,
@@ -3646,8 +3670,7 @@ async function findSystemsNeedingExploration(
   fledFromSystems: Set<string>,
   visitedSystems: Set<string>,
   ignoreBlacklistWhenCloaked: boolean,
-  isCloaked: boolean,
-  explorerSystemTimeoutMins: number
+  isCloaked: boolean
 ): Promise<Array<{
   id: string;
   name: string;
@@ -3658,7 +3681,7 @@ async function findSystemsNeedingExploration(
   const currentSystem = ctx.bot.system;
   if (!currentSystem) return [];
 
-  // Refresh map data first
+  // Refresh map data first - get full map from server
   const mapResp = await ctx.bot.exec("get_map");
   if (mapResp.result && typeof mapResp.result === "object") {
     const mapData = mapResp.result as Record<string, unknown>;
@@ -3671,11 +3694,113 @@ async function findSystemsNeedingExploration(
     }
   }
 
-  // Check if mapStore has connection data for current system
-  const currentSys = mapStore.getSystem(currentSystem);
-  if (!currentSys || !currentSys.connections || currentSys.connections.length === 0) {
-    ctx.log("debug", `MapStore has no connection data for ${currentSystem} — using server fallback`);
-    // Fall back to findUnknownSystemsWithCoordination
+  // Get all systems from mapStore
+  const allSystems = mapStore.getSystems();
+  
+  // Get systems recently explored by other bots (5 min cooldown)
+  const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
+  const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
+
+  const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
+
+  // Find candidate systems needing exploration
+  const candidates: Array<{ id: string; name: string; priority: "unvisited" | "stale" }> = [];
+
+  for (const sys of allSystems) {
+    // Skip current system
+    if (sys.id.toLowerCase() === currentSystem.toLowerCase()) continue;
+    // Skip already visited in this session
+    if (visitedSystems.has(sys.id)) continue;
+    // Skip blacklisted/fled systems (unless cloaked)
+    if (!isCloaked || !ignoreBlacklistWhenCloaked) {
+      if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(sys.id)) continue;
+      if (fledFromSystems.has(sys.id.toLowerCase())) continue;
+    }
+    // Skip systems recently explored by other bots (5 min cooldown)
+    if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
+      if (recentSet.has(sys.id.toLowerCase())) continue;
+    }
+
+    // Determine priority
+    if (sys.visited === false) {
+      // Never visited by this bot
+      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
+    } else if (sys.visited === true) {
+      // Visited by this bot - check if POIs are stale
+      const poiCount = sys.pois?.length ?? 0;
+      if (poiCount === 0) {
+        candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
+      } else {
+        let allStale = true;
+        for (const poi of sys.pois) {
+          const updateTime = poi.last_updated ? new Date(poi.last_updated).getTime() : 0;
+          if (updateTime > staleThreshold) {
+            allStale = false;
+            break;
+          }
+        }
+        if (allStale) {
+          candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "stale" });
+        }
+      }
+    } else {
+      // System in mapStore but visited status unknown - treat as unvisited
+      candidates.push({ id: sys.id, name: sys.name || sys.id, priority: "unvisited" });
+    }
+  }
+
+  if (candidates.length === 0) {
+    ctx.log("debug", "No candidate systems needing exploration found in mapStore");
+    return [];
+  }
+
+  ctx.log("exploration", `Found ${candidates.length} candidate systems needing exploration, querying routes...`);
+
+  // Use find_route for each candidate to get actual distance and route
+  // Process in batches to avoid too many API calls
+  const results: Array<{
+    id: string;
+    name: string;
+    distance: number;
+    priority: "unvisited" | "stale";
+    route: string[];
+  }> = [];
+
+  // Process candidates in batches of 10
+  const batchSize = 10;
+  for (let i = 0; i < candidates.length; i += batchSize) {
+    const batch = candidates.slice(i, i + batchSize);
+    const promises = batch.map(async (cand) => {
+      const routeResp = await ctx.bot.exec("find_route", { target_system: cand.id });
+      const routeData = routeResp.result as { 
+        found?: boolean; 
+        route?: Array<{ system_id: string; name: string; jumps?: number }>; 
+        total_jumps?: number 
+      } | null;
+
+      if (routeData?.found && routeData.route && routeData.route.length > 1) {
+        const distance = routeData.total_jumps ?? (routeData.route.length - 1);
+        const route = routeData.route.map(r => r.system_id);
+        return {
+          id: cand.id,
+          name: cand.name,
+          distance,
+          priority: cand.priority,
+          route,
+        };
+      }
+      return null;
+    });
+
+    const batchResults = await Promise.all(promises);
+    for (const r of batchResults) {
+      if (r) results.push(r);
+    }
+  }
+
+  if (results.length === 0) {
+    ctx.log("debug", "No routes found to candidate systems — using server fallback");
     const unknowns = findUnknownSystemsWithCoordination(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
     return unknowns.map(u => ({
       id: u.id,
@@ -3686,136 +3811,16 @@ async function findSystemsNeedingExploration(
     }));
   }
 
-  // Get systems recently explored by other bots (5 min cooldown)
-  const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
-  const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
-
-  // BFS to find reachable systems needing exploration
-  const needingExploration: Array<{ id: string; name: string; distance: number; priority: "unvisited" | "stale"; route: string[]; }> = [];
-  const visited = new Set<string>();
-  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
-    { systemId: currentSystem, distance: 0, route: [currentSystem] }
-  ];
-  visited.add(currentSystem);
-
-  const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
-
-  while (queue.length > 0) {
-    const { systemId, distance, route } = queue.shift()!;
-    const sys = mapStore.getSystem(systemId);
-    if (!sys) continue;
-
-    for (const conn of sys.connections) {
-      const connId = conn.system_id;
-      if (!connId) continue;
-      if (visited.has(connId)) continue;
-      // Skip systems we've already visited in this session
-      if (visitedSystems.has(connId)) continue;
-
-      // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
-      // Unless cloaked and ignoreBlacklistWhenCloaked is enabled
-      if (!isCloaked || !ignoreBlacklistWhenCloaked) {
-        if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
-        if (isTemporarilyBlacklisted(connId)) continue;
-        if (fledFromSystems.has(connId)) continue;
-      }
-
-      // Skip systems recently explored by other bots (5 min cooldown)
-      // But allow if we're cloaked and ignoreBlacklistWhenCloaked
-      if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
-        if (recentSet.has(connId.toLowerCase())) continue;
-      }
-
-      visited.add(connId);
-      const newRoute = [...route, connId];
-      const newDistance = distance + 1;
-
-      const targetSys = mapStore.getSystem(connId);
-      if (targetSys) {
-        // System is in map.json — check visited status from get_map
-        if (targetSys.visited === false) {
-          // Never visited by this bot
-          needingExploration.push({
-            id: connId,
-            name: conn.system_name || connId,
-            distance: newDistance,
-            priority: "unvisited",
-            route: newRoute,
-          });
-          // Continue BFS through this system
-          queue.push({ systemId: connId, distance: newDistance, route: newRoute });
-          continue;
-        }
-        
-        // System is visited by this bot — check if POIs need refreshing
-        const poiCount = targetSys.pois?.length ?? 0;
-
-        if (poiCount === 0) {
-          // No POIs yet — treat as unvisited
-          needingExploration.push({
-            id: connId,
-            name: conn.system_name || connId,
-            distance: newDistance,
-            priority: "unvisited",
-            route: newRoute,
-          });
-        } else {
-          // Has POIs — check if all are stale
-          let allStale = true;
-          for (const poi of targetSys.pois) {
-            const updateTime = poi.last_updated ? new Date(poi.last_updated).getTime() : 0;
-            if (updateTime > staleThreshold) {
-              allStale = false;
-              break;
-            }
-          }
-          if (allStale) {
-            needingExploration.push({
-              id: connId,
-              name: conn.system_name || connId,
-              distance: newDistance,
-              priority: "stale",
-              route: newRoute,
-            });
-          }
-        }
-
-        // Continue BFS through known systems (whether explored or not)
-        queue.push({ systemId: connId, distance: newDistance, route: newRoute });
-      } else {
-        // System not in map.json at all — treat as unvisited
-        needingExploration.push({
-          id: connId,
-          name: conn.system_name || connId,
-          distance: newDistance,
-          priority: "unvisited",
-          route: newRoute,
-        });
-      }
-    }
-  }
-
   // Sort: unvisited priority first, then stale; within each tier, nearest first
-  needingExploration.sort((a, b) => {
+  results.sort((a, b) => {
     if (a.priority !== b.priority) {
       return a.priority === "unvisited" ? -1 : 1;
     }
     return a.distance - b.distance;
   });
 
-  if (needingExploration.length === 0) {
-    ctx.log("debug", "BFS found no systems needing exploration — using server fallback");
-    const unknowns = findUnknownSystemsWithCoordination(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
-    return unknowns.map(u => ({
-      id: u.id,
-      name: u.name,
-      distance: u.distance,
-      priority: u.priority === "unknown" ? "unvisited" : "stale",
-      route: u.route,
-    }));
-  }
-
-  return needingExploration;
+  ctx.log("exploration", `Found routes to ${results.length} systems needing exploration (nearest: ${results[0].name} at ${results[0].distance} jumps, ${results[0].priority})`);
+  return results;
 }
 
 // ── Helpers ──────────────────────────────────────────────────

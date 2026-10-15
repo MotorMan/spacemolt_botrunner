@@ -1761,9 +1761,21 @@ async function findNextBulkSourceStation(
 ): Promise<{ stationRef: string; systemId: string; itemCount: number } | null> {
   const { bot } = ctx;
   const allSystems = mapStore.getAllSystems();
+  // Respect the global system blacklist — never query faction storage at
+  // blacklisted systems (they're blocked for a reason).
+  const blacklistedSystems = new Set(getSystemBlacklist().map((s) => s.toLowerCase()));
   const candidates: Array<{ stationRef: string; systemId: string; poiName: string; baseId: string; totalItems: number }> = [];
 
+  // Rate limit: 500ms between API calls to avoid IP bans
+  const RATE_LIMIT_MS = 500;
+  let lastCall = 0;
+
   for (const [sysId, sys] of Object.entries(allSystems)) {
+    // Skip blacklisted systems entirely
+    if (blacklistedSystems.has(sysId.toLowerCase())) {
+      ctx.log("cargo", `🔎 Skipping blacklisted system: ${sysId}`);
+      continue;
+    }
     for (const poi of sys.pois) {
       if (!poi.has_base || !poi.base_id) continue;
       // Skip the destination station itself
@@ -1772,13 +1784,36 @@ async function findNextBulkSourceStation(
       if (settings.sourceStation && mapStore.sameStation(poi.base_id, settings.sourceStation)) continue;
 
       const baseId = poi.base_id;
+      // Rate limit
+      const now = Date.now();
+      const wait = lastCall + RATE_LIMIT_MS - now;
+      if (wait > 0) await ctx.sleep(wait);
+      lastCall = Date.now();
+
       // Remote view faction storage
+      ctx.log("cargo", `🔎 Querying faction storage at ${poi.base_name || poi.name || poi.id} (${sysId})...`);
       const resp = await bot.exec("view_faction_storage", { station_id: baseId });
-      if (resp.error || !resp.result) continue;
+      if (resp.error) {
+        const errMsg = resp.error.message || "";
+        // Expected errors for stations without faction storage — log at info level
+        if (errMsg.toLowerCase().includes("does not have a storage facility") ||
+            errMsg.toLowerCase().includes("no storage facility") ||
+            errMsg.toLowerCase().includes("no faction storage")) {
+          ctx.log("cargo", `   No faction storage facility`);
+        } else {
+          ctx.log("warn", `   view_faction_storage error: ${errMsg}`);
+        }
+        continue;
+      }
+      if (!resp.result) {
+        ctx.log("cargo", `   Empty response`);
+        continue;
+      }
       const result = resp.result as Record<string, unknown>;
       const items = Array.isArray(result.items) ? result.items : [];
 
       let totalItems = 0;
+      let itemTypes = 0;
       for (const item of items) {
         const itemId = (item.item_id || item.itemId || "").toString().toLowerCase();
         const qty = (item.quantity ?? item.qty ?? 0) as number;
@@ -1790,6 +1825,7 @@ async function findNextBulkSourceStation(
         // Skip hazardous if no lead-lined hold
         if (isHazardousItem(itemId) && bot.hasLeadLinedCargoHold === false) continue;
         totalItems += qty;
+        itemTypes++;
       }
 
       if (totalItems > 0) {
@@ -1800,6 +1836,9 @@ async function findNextBulkSourceStation(
           baseId,
           totalItems,
         });
+        ctx.log("cargo", `   ✅ Found ${totalItems} items (${itemTypes} types) available for bulk move`);
+      } else {
+        ctx.log("cargo", `   No movable items (after filters)`);
       }
     }
   }
@@ -1810,7 +1849,7 @@ async function findNextBulkSourceStation(
   candidates.sort((a, b) => b.totalItems - a.totalItems);
 
   const best = candidates[0];
-  ctx.log("cargo", `🔎 Auto-selected source: ${best.poiName} (${best.systemId}) — ${best.totalItems} items available`);
+  ctx.log("cargo", `🔎 Auto-selected source: ${best.poiName} (${best.systemId}) — ${best.totalItems} items available (from ${candidates.length} station(s) with items)`);
   // Update settings so the rest of the phase uses this station
   settings.sourceStation = best.stationRef;
   return { stationRef: best.stationRef, systemId: best.systemId, itemCount: best.totalItems };

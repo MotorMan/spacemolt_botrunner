@@ -145,6 +145,9 @@ interface CargoMoverSettings {
   /** When true, bulk move will include fuel cells (premium, military, energy)
    *  as regular cargo instead of skipping them. */
   bulkMoveFuelCells: boolean;
+  /** Item ids the user explicitly excluded from bulk move — these are never
+   *  planned, loaded, or delivered by the bulk-move sub-routine. */
+  bulkExcludeItems: string[];
 }
 
 export function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -197,6 +200,9 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     bulkSeedMode: (t.bulkSeedMode as boolean) ?? false,
     bulkSeedAmount: (t.bulkSeedAmount as number) || 10,
     bulkMoveFuelCells: (t.bulkMoveFuelCells as boolean) ?? false,
+    bulkExcludeItems: Array.isArray(t.bulkExcludeItems)
+      ? (t.bulkExcludeItems as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
+      : [],
   };
 }
 
@@ -342,6 +348,17 @@ function isBulkSkipItem(itemId: string, settings?: CargoMoverSettings): boolean 
     lower.includes("energy_cell");
   if (settings?.bulkMoveFuelCells && isFuelCell) return false;
   return isFuelCell;
+}
+
+/** True when the user explicitly excluded `itemId` from bulk move via the
+ *  `bulkExcludeItems` setting (the exclusion list in the Bulk Move UI).
+ *  Excluded items are never planned, loaded, or delivered by the bulk-move
+ *  sub-routine. The comparison is case-insensitive so a hand-edited settings
+ *  file still matches the game's item ids. */
+function isBulkExcludedItem(itemId: string, settings?: CargoMoverSettings): boolean {
+  if (!settings || settings.bulkExcludeItems.length === 0) return false;
+  const lower = itemId.toLowerCase();
+  return settings.bulkExcludeItems.some((id) => id.toLowerCase() === lower);
 }
 
 function isHazardousItem(itemId: string): boolean {
@@ -1227,7 +1244,9 @@ async function bulkDepositToDestination(
 /** Deliver every deliverable item currently in the hold to the destination.
  *  Used by the graceful-shutdown path so cargo is never abandoned when the
  *  routine is asked to stop. Fuel cells are never deposited (see
- *  isNeverDepositFuelItem / fuelDepositQty). Returns the delivered items. */
+ *  isNeverDepositFuelItem / fuelDepositQty). In bulk mode, items on the user
+ *  exclusion list are left in the hold (returned to source storage on the next
+ *  startup) instead of being delivered. Returns the delivered items. */
 async function deliverCargoAboard(
   ctx: RoutineContext,
   settings: CargoMoverSettings,
@@ -1243,6 +1262,11 @@ async function deliverCargoAboard(
     // Premium/energy cells never leave the ship; military cells keep the
     // required reserve aboard and deposit only the excess.
     if (isNeverDepositFuelItem(item.itemId, settings)) continue;
+    // Bulk-mode exclusions must never reach the destination.
+    if (settings.enableBulkMove && isBulkExcludedItem(item.itemId, settings)) {
+      ctx.log("cargo", `⏭️ Keeping ${item.quantity}x ${item.name} aboard (excluded from bulk move — will be returned to source storage)`);
+      continue;
+    }
     const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
     if (depositQty <= 0) {
       ctx.log("cargo", `🔋 Keeping ${item.quantity}x ${item.itemId} aboard (reserve ${settings.militaryFuelCells} required) — not depositing`);
@@ -1664,10 +1688,11 @@ export async function reconcileDeliveredWithDestination(
 }
 
 /** Build the ordered, filtered list of items to bulk-move from the source
- *  faction storage. Excludes operational fuel/energy cells, and any item whose
- *  stored quantity exceeds `bulkIgnoreOver` (those can never fit at the
- *  destination and would just error out). `destHas` lets seed mode skip items
- *  that already have a presence at the destination. */
+ *  faction storage. Excludes operational fuel/energy cells, anything on the
+ *  user exclusion list (`bulkExcludeItems`), and any item whose stored
+ *  quantity exceeds `bulkIgnoreOver` (those can never fit at the destination
+ *  and would just error out). `destHas` lets seed mode skip items that already
+ *  have a presence at the destination. */
 function planBulkItems(
   ctx: RoutineContext,
   sourceItems: Array<{ itemId: string; name: string; quantity: number }>,
@@ -1678,6 +1703,11 @@ const { bot } = ctx;
    let candidates = sourceItems.filter((i) => {
       if (!i.itemId || i.quantity <= 0) return false;
       if (isBulkSkipItem(i.itemId, settings)) return false;
+      // User-configured exclusions: never bulk-move these items.
+      if (isBulkExcludedItem(i.itemId, settings)) {
+        ctx.log("cargo", `  ⏭️ Skipping ${i.name}: excluded from bulk move (user exclusion list)`);
+        return false;
+      }
       // Skip hazardous items unless the bot has lead-lined cargo hold modules.
       if (isHazardousItem(i.itemId) && bot.hasLeadLinedCargoHold === false) {
         ctx.log("cargo", `  ⏭️ Skipping ${i.name}: hazardous item (no lead-lined cargo module)`);
@@ -1736,8 +1766,11 @@ async function runBulkMovePhase(
 ): Promise<void> {
   const { bot } = ctx;
   const mode = settings.bulkSeedMode ? "SEED-BASE" : "FULL";
+  const excludeNote = settings.bulkExcludeItems.length > 0
+    ? `, excluded=${settings.bulkExcludeItems.length} item(s): ${settings.bulkExcludeItems.join(", ")}`
+    : "";
   ctx.log("cargo", `═══════════════════════════════════════════════════════`);
-  ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}`);
+  ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}${excludeNote}`);
   ctx.log("cargo", `   Source: ${settings.sourceStation}`);
   ctx.log("cargo", `   Destination: ${settings.destinationStation} (${settings.destinationStorageType})`);
 
@@ -1873,7 +1906,7 @@ async function runBulkMovePhase(
       // Seed pass found nothing new to bring in — that means every sourced item
       // already has a presence at the destination, so seeding is complete.
       const allPresent = bot.factionStorage
-        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings) && i.quantity <= settings.bulkIgnoreOver)
+        .filter((i) => i.quantity > 0 && !isBulkSkipItem(i.itemId, settings) && !isBulkExcludedItem(i.itemId, settings) && i.quantity <= settings.bulkIgnoreOver)
         .every((i) => destHas.has(i.itemId));
       if (allPresent) {
         ctx.log("cargo", `✅ Seed pass complete — every sourced item now has a presence at the destination. Disabling seed mode and switching to FULL moves.`);
@@ -1984,6 +2017,9 @@ async function runBulkMovePhase(
     .filter((item) => {
       if (item.quantity <= 0) return false;
       if (isBulkSkipItem(item.itemId, settings)) return false;
+      // Never deliver user-excluded items — leave them in the hold; the startup
+      // dump returns them to the source faction storage on the next pass.
+      if (isBulkExcludedItem(item.itemId, settings)) return false;
       return fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings) > 0;
     })
     .map((item) => ({
@@ -2011,6 +2047,7 @@ async function runBulkMovePhase(
     const remainingInCargo = bot.inventory.filter((item) => {
       if (item.quantity <= 0) return false;
       if (isBulkSkipItem(item.itemId, settings)) return false;
+      if (isBulkExcludedItem(item.itemId, settings)) return false;
       const depositQty = fuelDepositQty(item.itemId, item.quantity, settings.militaryFuelCells, settings);
       return depositQty > 0;
     });

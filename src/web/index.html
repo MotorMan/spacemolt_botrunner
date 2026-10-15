@@ -34698,6 +34698,9 @@ ignoreBlacklist: document.getElementById(
         const bulkSeedMode = cm.bulkSeedMode ?? false;
         const bulkSeedAmount = cm.bulkSeedAmount ?? 10;
         const bulkMoveFuelCells = cm.bulkMoveFuelCells ?? false;
+        const bulkExcludeItems = Array.isArray(cm.bulkExcludeItems)
+          ? cm.bulkExcludeItems.filter((i) => typeof i === "string" && i)
+          : [];
 
         // Build station options from mapData
         let sourceStationOpts = '<option value="">(not set)</option>';
@@ -34873,6 +34876,45 @@ ignoreBlacklist: document.getElementById(
                 )
                 .join("")
             : '<option value="">No items available</option>';
+
+        // Bulk-move exclusion list, sourced from the catalog's items key.
+        // The dropdown offers every catalog item that is not already excluded;
+        // each excluded item gets a row with a remove button.
+        const bulkExcludeUsedIds = new Set(bulkExcludeItems);
+        const catalogItemList = Object.entries(catalog.items || {})
+          .map(([key, i]) => ({ id: i.id || key, name: i.name || key }))
+          .filter((i) => i.id && !bulkExcludeUsedIds.has(i.id))
+          .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+        const bulkExcludeItemOpts =
+          Object.keys(catalog.items || {}).length === 0
+            ? '<option value="">Catalog not loaded yet — reopen this panel</option>'
+            : catalogItemList.length > 0
+              ? catalogItemList
+                  .map(
+                    (i) =>
+                      `<option value="${esc(i.id)}">${esc(i.name)}</option>`,
+                  )
+                  .join("")
+              : '<option value="">All catalog items already excluded</option>';
+
+        const bulkExcludeList =
+          bulkExcludeItems.length > 0
+            ? bulkExcludeItems
+                .map((id, idx) => {
+                  const itemName = catalog.items?.[id]?.name || id;
+                  return `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(itemName)}</div>
+            <div class="craft-limit-detail">${esc(id)} — never bulk-moved</div>
+          </div>
+          <div style="display:flex;gap:4px;align-items:center">
+            <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverBulkExclusion(${idx})" title="Remove from exclusion list">✕</button>
+          </div>
+        </div>`;
+                })
+                .join("")
+            : '<div style="color:var(--dim);padding:8px">No items excluded — bulk move moves everything (except operational fuel cells).</div>';
 
         const showBotName = destinationStorageType === "send_gift";
 
@@ -35096,6 +35138,19 @@ ignoreBlacklist: document.getElementById(
              <div class="setting-hint">Include premium, military, and energy cells as regular cargo in bulk moves (otherwise they are skipped)</div>
            </div>
            <label><input type="checkbox" id="set-cm-bulkMoveFuelCells" ${bulkMoveFuelCells ? "checked" : ""} onchange="saveCargoMoverSettings()"> Enabled</label>
+         </div>
+
+         <div class="setting-row">
+           <div>
+             <div class="setting-label">Excluded Items</div>
+             <div class="setting-hint">Items bulk move will never move — they stay in the source faction storage</div>
+           </div>
+         </div>
+         ${bulkExcludeList}
+
+         <div style="margin:4px 0 8px;display:flex;gap:8px;align-items:center">
+           <select id="cm-bulk-exclude-select" style="flex:1;min-width:0">${bulkExcludeItemOpts}</select>
+           <button class="primary sm" onclick="addCargoMoverBulkExclusion()">+ Exclude Item</button>
          </div>
        </div>
     </div>
@@ -35338,6 +35393,26 @@ ignoreBlacklist: document.getElementById(
         rerenderCurrentSettings();
       }
 
+      function addCargoMoverBulkExclusion() {
+        const sel = document.getElementById("cm-bulk-exclude-select");
+        const id = sel?.value;
+        if (!id) return;
+
+        if (!settings.cargo_mover) settings.cargo_mover = {};
+        if (!Array.isArray(settings.cargo_mover.bulkExcludeItems)) {
+          settings.cargo_mover.bulkExcludeItems = [];
+        }
+        if (settings.cargo_mover.bulkExcludeItems.includes(id)) return;
+        settings.cargo_mover.bulkExcludeItems.push(id);
+        rerenderCurrentSettings();
+      }
+
+      function removeCargoMoverBulkExclusion(idx) {
+        if (!settings.cargo_mover?.bulkExcludeItems) return;
+        settings.cargo_mover.bulkExcludeItems.splice(idx, 1);
+        rerenderCurrentSettings();
+      }
+
       function setCargoMoverDeliveryTarget(idx) {
         const item = settings.cargo_mover?.items?.[idx];
         if (!item) return;
@@ -35506,6 +35581,11 @@ ignoreBlacklist: document.getElementById(
             ) || 10,
           bulkMoveFuelCells:
             document.getElementById("set-cm-bulkMoveFuelCells")?.checked ?? false,
+          bulkExcludeItems: Array.isArray(settings.cargo_mover?.bulkExcludeItems)
+            ? settings.cargo_mover.bulkExcludeItems.filter(
+                (i) => typeof i === "string" && i,
+              )
+            : [],
         };
 
         send({ type: "saveSettings", routine: "cargo_mover", settings: s });

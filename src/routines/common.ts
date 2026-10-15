@@ -629,13 +629,19 @@ export async function ensureDocked(
   ctx: RoutineContext,
   skipStorageCollection: boolean = true,
   minBalance: number = 0,
-  opts?: { skipApprovedCheck?: boolean; targetStationId?: string },
+  opts?: { skipApprovedCheck?: boolean; targetStationId?: string; strictTarget?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) {
     await bot.refreshStatus();
     if (bot.docked) return true;
   }
+
+  // Strict mode (home-base returns): the caller has already verified it is in
+  // the home system. Docking at another station IN THIS SYSTEM is fine, but the
+  // bot must never jump to some other system to dock — a "return home" that
+  // dumps loot at a random station strands the cargo across the galaxy.
+  const strict = opts?.strictTarget === true;
 
   const { pois } = await getSystemInfo(ctx);
   const stationBlacklist = buildDeniedStationSet();
@@ -649,7 +655,9 @@ export async function ensureDocked(
   // station can never be docked at this session.
   if (opts?.targetStationId) {
     const target = pois.find(p => p.id === opts.targetStationId && isStationPoi(p));
-    if (target && !isStationDenied(target.id)) station = target;
+    if (target && !isStationDenied(target.id)) {
+      station = target;
+    }
   }
 
   if (!station) {
@@ -659,12 +667,18 @@ export async function ensureDocked(
       : pois.find(p => isStationPoi(p) && !isStationDenied(p.id) && !stationBlacklist.has(p.id.toLowerCase())) ?? null;
   }
 
+  if (!station && strict) {
+    ctx.log("error", `No usable station in ${bot.system} — refusing to dock elsewhere (strict home-base return)`);
+    return false;
+  }
+
   if (station) {
     if (bot.poi !== station.id) {
       ctx.log("travel", `Traveling to ${station.name}...`);
       const travelResp = await bot.exec("travel", { target_poi: station.id });
       if (travelResp.error && !travelResp.error.message.includes("already")) {
         ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
+        if (strict) return false; // never wander to another system to dock
         // Fall through to search for nearest station
       } else {
         bot.poi = station.id;
@@ -697,6 +711,8 @@ export async function ensureDocked(
         ctx.log("error", `Dock failed: ${dockResp.error.message}`);
         // Fall through to search for nearest station
       }
+      // Strict callers (home-base returns) never jump to another system to dock.
+      if (strict) return false;
     }
   }
 
@@ -3071,18 +3087,19 @@ export async function depositCargoAtHome(
     await ensureUndocked(ctx);
     const arrived = await navigateToSystem(ctx, homeSystem, opts);
     if (!arrived) {
-      ctx.log("error", `Could not reach ${homeSystem} — will try depositing at nearest station`);
-      // Fallback: dock at any local station
-      await ensureDocked(ctx);
-      if (!bot.docked) return false;
-      return await depositNonFuelCargo(ctx);
+      // NEVER dump cargo at a random station: if we cannot reach the home
+      // system, keep the loot aboard and let the caller retry later. Docking
+      // "wherever possible" strands the cargo halfway across the galaxy.
+      ctx.log("error", `Could not reach ${homeSystem} — keeping cargo aboard (${bot.cargo}/${bot.cargoMax}), NOT depositing at a random station`);
+      return false;
     }
   }
 
-  // Dock at the configured home station (or any station in the system as fallback)
-  const docked = await ensureDocked(ctx, true, 0, home.station ? { targetStationId: home.station } : undefined);
+  // Dock at the configured home station (or any station in the home system as
+  // fallback). Strict: never jump to another system to dock and dump there.
+  const docked = await ensureDocked(ctx, true, 0, home.station ? { targetStationId: home.station, strictTarget: true } : { strictTarget: true });
   if (!docked) {
-    ctx.log("error", `Could not dock at home base (${homeName})`);
+    ctx.log("error", `Could not dock at home base (${homeName}) — keeping cargo aboard`);
     return false;
   }
 

@@ -848,6 +848,119 @@ function countFuelCellsInInventory(inventory: any[] | undefined): number {
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 }
 
+/**
+ * Split a configured home station into its system and POI parts. The setting
+ * may be a bare POI id ("grand_exchange_station") or a "system|poi" pair
+ * ("diphda|2574b16e0e18d90b98354bcae963854e").
+ */
+function splitHomeStation(homeStation: string): { system: string; poi: string } {
+  if (!homeStation) return { system: "", poi: "" };
+  if (homeStation.includes("|")) {
+    const [sys, poi] = homeStation.split("|");
+    return { system: (sys || "").trim(), poi: (poi || "").trim() };
+  }
+  return { system: "", poi: homeStation.trim() };
+}
+
+/**
+ * Navigate to the configured home base and dock there. Returns true only when
+ * the bot is docked at a station in the home system (at the exact home station
+ * when one is configured).
+ *
+ * HARD RULE — loot is NEVER dumped at a random station. If the home system
+ * cannot be reached, no home base is configured, or the routine is stopping,
+ * this returns false and the caller keeps the cargo aboard and retries later.
+ * "Docking wherever possible" and depositing everything strands loot at a
+ * random station halfway across the galaxy — the bot claims it is going home
+ * and then dumps the hold in whatever system it happened to get stuck in.
+ *
+ * @param navOpts Passed through to navigateToSystem (fuel/cloak/blacklist opts).
+ */
+export async function navigateToHomeBaseAndDock(
+  ctx: RoutineContext,
+  homeSystem: string,
+  homeStation: string,
+  navOpts: { fuelThresholdPct: number; hullThresholdPct: number; autoCloak?: boolean; skipBlacklist?: boolean; isCombatBot?: boolean; joinBattles?: boolean },
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  const parts = splitHomeStation(homeStation);
+  // A "system|poi" home station names the system its station actually lives in
+  // — that is authoritative and overrides a stale/mismatched homeSystem.
+  const effHomeSystem = parts.system || homeSystem;
+  if (parts.system && homeSystem && homeSystem.toLowerCase() !== parts.system.toLowerCase()) {
+    ctx.log("warn", `Home station "${homeStation}" lives in ${parts.system} — overriding stale homeSystem "${homeSystem}"`);
+  }
+  const homeLabel = homeStation || effHomeSystem || "(unconfigured)";
+
+  // A stop request must never trigger a "helpful" dock-and-dump on the way out.
+  if (bot.state !== "running") {
+    ctx.log("warn", `Routine stopping — aborting return to home base ${homeLabel} (loot kept aboard)`);
+    return false;
+  }
+
+  if (!effHomeSystem && !parts.poi) {
+    ctx.log("error", `No home base configured — refusing to dock/dump loot at a random station (cargo kept aboard)`);
+    await ctx.sleep(30000);
+    return false;
+  }
+
+  // No home system configured: the configured station POI must exist in the
+  // system we are already in — otherwise docking "anywhere" here would dump the
+  // loot at a random station in a random system.
+  if (!effHomeSystem && parts.poi) {
+    const { pois } = await getSystemInfo(ctx);
+    const stationHere = pois.some(p => p.id === parts.poi && isStationPoi(p));
+    if (!stationHere) {
+      ctx.log("error", `Home station ${parts.poi} is not in ${bot.system} and no home system is configured — loot kept aboard (will retry next cycle)`);
+      await ctx.sleep(30000);
+      return false;
+    }
+  }
+
+  await bot.refreshLocation();
+
+  const inHomeSystem = !!effHomeSystem && (bot.system || "").toLowerCase() === effHomeSystem.toLowerCase();
+  const atHomeStation = !!parts.poi && bot.poi === parts.poi;
+
+  if (atHomeStation && bot.docked) return true;
+
+  // Docked anywhere that is not the intended destination — undock so we can travel.
+  if (bot.docked && (!inHomeSystem || (parts.poi && bot.poi !== parts.poi))) {
+    await ensureUndocked(ctx);
+  }
+
+  // Navigate to the home system when we are not already there.
+  if (effHomeSystem && !inHomeSystem) {
+    const arrived = await navigateToSystem(ctx, effHomeSystem, { ...navOpts, homeSystem: effHomeSystem, homeStation });
+    await bot.refreshLocation();
+    const nowInHome = (bot.system || "").toLowerCase() === effHomeSystem.toLowerCase();
+    if (!arrived || !nowInHome) {
+      ctx.log("error", `Could not reach home system ${effHomeSystem} — loot kept aboard (${bot.cargo}/${bot.cargoMax} cargo), will retry next cycle`);
+      await ctx.sleep(30000);
+      return false;
+    }
+  }
+
+  if (bot.state !== "running") {
+    ctx.log("warn", `Routine stopping — aborting return to home base ${homeLabel} (loot kept aboard)`);
+    return false;
+  }
+
+  // Strict dock: at the configured home station only, or (when none is
+  // configured) at a station in the verified home system. Never wander to
+  // another system to dock, never dump loot at a random station.
+  const docked = parts.poi
+    ? await ensureDocked(ctx, true, 0, { targetStationId: parts.poi, strictTarget: true })
+    : await ensureDocked(ctx, true, 0, { strictTarget: true });
+  if (!docked) {
+    ctx.log("error", `Could not dock at home base ${homeLabel} — loot kept aboard (${bot.cargo}/${bot.cargoMax} cargo), will retry next cycle`);
+    await ctx.sleep(30000);
+    return false;
+  }
+  return true;
+}
+
 async function returnToHomeAndResupply(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
@@ -865,33 +978,13 @@ async function returnToHomeAndResupply(
     skipBlacklist: true,
     isCombatBot: true,
     joinBattles: true,
-    homeSystem,
-    homeStation,
   };
 
-  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} â€” depositing loot + restocking...`);
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking...`);
   try {
-    if (homeSystem && bot.system !== homeSystem) {
-      await ensureUndocked(ctx);
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-      if (!arrived) {
-        ctx.log("warn", `Could not navigate to home system ${homeSystem} â€” docking wherever possible`);
-      }
-    }
-
-    let docked = false;
-    if (homeStation && homeStation.includes("|")) {
-      const parts = homeStation.split("|");
-      const poi = parts[1] || parts[0];
-      docked = await ensureDocked(ctx, true, 0, poi ? { targetStationId: poi } : undefined);
-    } else if (homeStation) {
-      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
-    } else {
-      docked = await ensureDocked(ctx);
-    }
-
+    const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
     if (!docked) {
-      ctx.log("error", "Could not dock at home base â€” loot not deposited");
+      ctx.log("error", "Could not dock at home base — loot not deposited");
       return;
     }
 
@@ -901,7 +994,7 @@ async function returnToHomeAndResupply(
     await ensureInsured(ctx);
     await bot.checkSkills();
     await ensureUndocked(ctx);
-    ctx.log("info", "Resupplied at home base â€” resuming patrol");
+    ctx.log("info", "Resupplied at home base — resuming patrol");
   } catch (e) {
     ctx.log("error", `Error returning to home base: ${e}`);
   }
@@ -2108,29 +2201,13 @@ async function returnToCreatureFarmHome(
     joinBattles: true,
   };
 
-  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} â€” depositing loot + restocking ammo...`);
+  ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} — depositing loot + restocking ammo...`);
   try {
-    if (homeSystem && bot.system !== homeSystem) {
-      await ensureUndocked(ctx);
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-      if (!arrived) {
-        ctx.log("warn", `Could not navigate to home system ${homeSystem} â€” docking wherever possible`);
-      }
-    }
-
-    let docked = false;
-    if (homeStation && homeStation.includes("|")) {
-      const parts = homeStation.split("|");
-      const poi = parts[1] || parts[0];
-      docked = await ensureDocked(ctx, true, 0, poi ? { targetStationId: poi } : undefined);
-    } else if (homeStation) {
-      docked = await ensureDocked(ctx, true, 0, { targetStationId: homeStation });
-    } else {
-      docked = await ensureDocked(ctx);
-    }
-
+    // Strict home-base navigation: never dock/dump loot at a random station
+    // when the home base cannot be reached — keep the cargo aboard instead.
+    const docked = await navigateToHomeBaseAndDock(ctx, homeSystem, homeStation, safetyOpts);
     if (!docked) {
-      ctx.log("error", "Could not dock at home base â€” loot not deposited");
+      ctx.log("error", "Could not dock at home base — loot not deposited");
       return;
     }
 
@@ -2142,7 +2219,7 @@ async function returnToCreatureFarmHome(
     await ensureInsured(ctx);
     await bot.checkSkills();
     await ensureUndocked(ctx);
-    ctx.log("info", "Resupplied at home base â€” heading back to creature farm");
+    ctx.log("info", "Resupplied at home base — heading back to creature farm");
   } catch (e) {
     ctx.log("error", `Error returning to home base: ${e}`);
   }

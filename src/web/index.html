@@ -34701,6 +34701,7 @@ ignoreBlacklist: document.getElementById(
         const bulkExcludeItems = Array.isArray(cm.bulkExcludeItems)
           ? cm.bulkExcludeItems.filter((i) => typeof i === "string" && i)
           : [];
+        const bulkSourceMode = cm.bulkSourceMode || "single";
 
         // Build station options from mapData
         let sourceStationOpts = '<option value="">(not set)</option>';
@@ -34929,12 +34930,12 @@ ignoreBlacklist: document.getElementById(
       <span id="cm-admin-status" style="font-size:11px;color:var(--text-dim);align-self:center"></span>
     </div>
 
-    <div class="setting-row">
+    <div class="setting-row" id="cm-source-station-row" style="display: ${enableBulkMove ? "none" : ""}">
       <div>
         <div class="setting-label">Source Station</div>
         <div class="setting-hint">Station where items will be picked up</div>
       </div>
-      <select id="set-cm-sourceStation" onchange="saveCargoMoverSettings()">
+      <select id="set-cm-sourceStation-single" onchange="saveCargoMoverSettings()">
         ${sourceStationOpts}
       </select>
     </div>
@@ -35142,6 +35143,29 @@ ignoreBlacklist: document.getElementById(
 
          <div class="setting-row">
            <div>
+             <div class="setting-label">Source Mode</div>
+             <div class="setting-hint">"single" uses the configured source station; "all" scans all faction stations and picks the next one with items</div>
+           </div>
+           <select id="set-cm-bulkSourceMode" onchange="saveCargoMoverSettings(); toggleBulkMoveSourceFields()">
+             <option value="single" ${bulkSourceMode === "single" ? "selected" : ""}>Single Station</option>
+             <option value="all" ${bulkSourceMode === "all" ? "selected" : ""}>All Stations (auto-cleanup)</option>
+           </select>
+         </div>
+
+         <div id="cm-bulk-single-source-field" style="display: ${bulkSourceMode === "single" ? "" : "none"}">
+           <div class="setting-row">
+             <div>
+               <div class="setting-label">Source Station</div>
+               <div class="setting-hint">Station where items will be picked up</div>
+             </div>
+             <select id="set-cm-sourceStation" onchange="saveCargoMoverSettings()">
+               ${sourceStationOpts}
+             </select>
+           </div>
+         </div>
+
+         <div class="setting-row">
+           <div>
              <div class="setting-label">Excluded Items</div>
              <div class="setting-hint">Items bulk move will never move — they stay in the source faction storage</div>
            </div>
@@ -35165,16 +35189,32 @@ ignoreBlacklist: document.getElementById(
           const en = document.getElementById("set-cm-enableBulkMove")?.checked;
           const f = document.getElementById("cm-bulk-fields");
           if (f) f.style.display = en ? "" : "none";
+          const srcRow = document.getElementById("cm-source-station-row");
+          if (srcRow) srcRow.style.display = en ? "none" : "";
           saveCargoMoverSettings();
+        }
+
+        function toggleBulkMoveSourceFields() {
+          const mode = document.getElementById("set-cm-bulkSourceMode")?.value || "single";
+          const singleField = document.getElementById("cm-bulk-single-source-field");
+          if (singleField) singleField.style.display = mode === "single" ? "" : "none";
         }
 
         // Populate ship loadout dropdown
         populateCargoMoverShipLoadouts();
 
+        // Initialize source mode field visibility
+        toggleBulkMoveSourceFields();
+
         // Restore selector values after render
         if (sourceStation) {
-          const srcSel = document.getElementById("set-cm-sourceStation");
-          if (srcSel) srcSel.value = sourceStation;
+          if (!enableBulkMove) {
+            const srcSel = document.getElementById("set-cm-sourceStation-single");
+            if (srcSel) srcSel.value = sourceStation;
+          } else if (bulkSourceMode === "single") {
+            const srcSel = document.getElementById("set-cm-sourceStation");
+            if (srcSel) srcSel.value = sourceStation;
+          }
         }
         if (destinationStation) {
           const dstSel = document.getElementById("set-cm-destinationStation");
@@ -35532,9 +35572,16 @@ ignoreBlacklist: document.getElementById(
       }
 
       function saveCargoMoverSettings() {
+        const enableBulkMove = document.getElementById("set-cm-enableBulkMove")?.checked ?? false;
+        const bulkSourceMode = document.getElementById("set-cm-bulkSourceMode")?.value || "single";
+        let sourceStation = "";
+        if (!enableBulkMove) {
+          sourceStation = document.getElementById("set-cm-sourceStation-single")?.value || "";
+        } else if (bulkSourceMode === "single") {
+          sourceStation = document.getElementById("set-cm-sourceStation")?.value || "";
+        }
         const s = {
-          sourceStation:
-            document.getElementById("set-cm-sourceStation")?.value || "",
+          sourceStation,
           destinationStation:
             document.getElementById("set-cm-destinationStation")?.value || "",
           destinationStorageType:
@@ -35565,8 +35612,8 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-cm-ignorePiratesWhenCloaked")?.checked ?? true,
           ignoreBlacklistWhenCloaked:
             document.getElementById("set-cm-ignoreBlacklistWhenCloaked")?.checked ?? true,
-          enableBulkMove:
-            document.getElementById("set-cm-enableBulkMove")?.checked ?? false,
+          enableBulkMove,
+          bulkSourceMode,
           bulkIgnoreOver:
             parseInt(
               document.getElementById("set-cm-bulkIgnoreOver")?.value,

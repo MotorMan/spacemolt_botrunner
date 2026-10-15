@@ -137,6 +137,9 @@ interface CargoMoverSettings {
   bulkIgnoreOver: number;
   /** Transfer ordering: alphabetical, reverse alphabetical, or random. */
   bulkOrder: "alphabetical" | "reverse_alphabetical" | "random";
+  /** Source mode: "single" uses the configured sourceStation; "all" scans all
+   *  faction-storage stations and picks the next one with items to clean. */
+  bulkSourceMode: "single" | "all";
   /** Seed-base mode: first move a small amount of every item so the destination
    *  has a presence of each, then switch to full moving once all items are present. */
   bulkSeedMode: boolean;
@@ -203,6 +206,7 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     bulkExcludeItems: Array.isArray(t.bulkExcludeItems)
       ? (t.bulkExcludeItems as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
       : [],
+    bulkSourceMode: (t.bulkSourceMode as "single" | "all") || "single",
   };
 }
 
@@ -1747,6 +1751,71 @@ const { bot } = ctx;
   return planned;
 }
 
+/** Scan all stations with faction storage and return the next one that has
+ *  items to move (respecting exclusions, bulkIgnoreOver, and fuel cell skip).
+ *  Returns null if no station has items. Updates the passed settings object's
+ *  sourceStation to the selected station so the rest of the phase uses it. */
+async function findNextBulkSourceStation(
+  ctx: RoutineContext,
+  settings: CargoMoverSettings,
+): Promise<{ stationRef: string; systemId: string; itemCount: number } | null> {
+  const { bot } = ctx;
+  const allSystems = mapStore.getAllSystems();
+  const candidates: Array<{ stationRef: string; systemId: string; poiName: string; baseId: string; totalItems: number }> = [];
+
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    for (const poi of sys.pois) {
+      if (!poi.has_base || !poi.base_id) continue;
+      // Skip the destination station itself
+      if (mapStore.sameStation(poi.base_id, settings.destinationStation)) continue;
+      // Skip the configured home/source if it's set (to avoid re-scanning it when in "all" mode)
+      if (settings.sourceStation && mapStore.sameStation(poi.base_id, settings.sourceStation)) continue;
+
+      const baseId = poi.base_id;
+      // Remote view faction storage
+      const resp = await bot.exec("view_faction_storage", { station_id: baseId });
+      if (resp.error || !resp.result) continue;
+      const result = resp.result as Record<string, unknown>;
+      const items = Array.isArray(result.items) ? result.items : [];
+
+      let totalItems = 0;
+      for (const item of items) {
+        const itemId = (item.item_id || item.itemId || "").toString().toLowerCase();
+        const qty = (item.quantity ?? item.qty ?? 0) as number;
+        if (!itemId || qty <= 0) continue;
+        // Apply same filters as planBulkItems
+        if (isBulkSkipItem(itemId, settings)) continue;
+        if (isBulkExcludedItem(itemId, settings)) continue;
+        if (qty > settings.bulkIgnoreOver) continue;
+        // Skip hazardous if no lead-lined hold
+        if (isHazardousItem(itemId) && bot.hasLeadLinedCargoHold === false) continue;
+        totalItems += qty;
+      }
+
+      if (totalItems > 0) {
+        candidates.push({
+          stationRef: sysId + "|" + poi.id,
+          systemId: sysId,
+          poiName: poi.base_name || poi.name || poi.id,
+          baseId,
+          totalItems,
+        });
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  // Sort by most items first (greedy: clean the fullest stations first)
+  candidates.sort((a, b) => b.totalItems - a.totalItems);
+
+  const best = candidates[0];
+  ctx.log("cargo", `🔎 Auto-selected source: ${best.poiName} (${best.systemId}) — ${best.totalItems} items available`);
+  // Update settings so the rest of the phase uses this station
+  settings.sourceStation = best.stationRef;
+  return { stationRef: best.stationRef, systemId: best.systemId, itemCount: best.totalItems };
+}
+
 /** Bulk-move sub-routine. Moves everything (respecting `bulkIgnoreOver`,
  *  `bulkOrder`, and `bulkSeedMode`) from the source faction storage to the
  *  destination. Runs a single round: load as much as fits, deliver, then return
@@ -1765,13 +1834,30 @@ async function runBulkMovePhase(
   warnedNoCloak: { warned: boolean },
 ): Promise<void> {
   const { bot } = ctx;
+
+  // ── AUTO-SOURCE: if bulkSourceMode is "all", scan all faction stations
+  //  and pick the next one with items to clean. This lets the mover act as a
+  //  multi-station cleanup routine without needing a fixed source.
+  if (settings.bulkSourceMode === "all") {
+    const nextSource = await findNextBulkSourceStation(ctx, settings);
+    if (!nextSource) {
+      ctx.log("cargo", `📦 Bulk Move (ALL): no stations with items found — waiting 60s`);
+      await ctx.sleep(60000);
+      return;
+    }
+    ctx.log("cargo", `📦 Bulk Move (ALL): selected ${nextSource.stationRef} (${nextSource.itemCount} items)`);
+  }
+
   const mode = settings.bulkSeedMode ? "SEED-BASE" : "FULL";
   const excludeNote = settings.bulkExcludeItems.length > 0
     ? `, excluded=${settings.bulkExcludeItems.length} item(s): ${settings.bulkExcludeItems.join(", ")}`
     : "";
   ctx.log("cargo", `═══════════════════════════════════════════════════════`);
   ctx.log("cargo", `📦 Bulk Move (${mode}) — order=${settings.bulkOrder}, ignoreOver=${settings.bulkIgnoreOver}${excludeNote}`);
-  ctx.log("cargo", `   Source: ${settings.sourceStation}`);
+  const sourceLabel = settings.bulkSourceMode === "all"
+    ? `auto-selected (${settings.sourceStation})`
+    : settings.sourceStation;
+  ctx.log("cargo", `   Source: ${sourceLabel}`);
   ctx.log("cargo", `   Destination: ${settings.destinationStation} (${settings.destinationStorageType})`);
 
   const sourceSystem = resolveStationSystem(settings.sourceStation);

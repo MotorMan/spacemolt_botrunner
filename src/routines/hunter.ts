@@ -119,6 +119,7 @@ import {
   useRepairKits,
   acquireFuelCellsAndRefuel,
   getFuelCellFuelValue,
+  parseWrecks,
 } from "./common.js";
 
 import type { Bot } from "../bot.js";
@@ -2976,6 +2977,49 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
   }
 }
 
+/**
+ * True if any wreck at the current POI still holds lootable items.
+ */
+async function poiHasLootableWrecks(ctx: RoutineContext): Promise<boolean> {
+  const resp = await ctx.bot.exec("get_wrecks");
+  if (resp.error || !resp.result) return false;
+  return parseWrecks(resp.result).some(w => w.items.length > 0);
+}
+
+/**
+ * Loot EVERY wreck at the current POI, not just the one belonging to the
+ * creature we killed. Big creature fights usually also destroy player ships
+ * (expensive modules!) and other creatures, and another hunter may land the
+ * killing blow on the big creature itself — all of that loot is worth taking.
+ *
+ * Wrecks can also appear a few seconds after the battle ends, so we re-check
+ * briefly instead of doing a single loot pass and moving on.
+ */
+async function sweepWrecksAtPoi(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (bot.state !== "running") return;
+    if (bot.docked) return;
+    if (bot.isInBattle()) return; // fight first — the caller sweeps again after combat
+    await bot.refreshCargo();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) return;
+
+    const looted = await scavengeWrecks(ctx);
+    if (looted > 0) {
+      // Grabbed something — a short pause, then confirm nothing else spawned.
+      if (attempt < 2) await ctx.sleep(1500);
+      continue;
+    }
+
+    // Nothing looted this pass: give late-spawning wrecks a moment, then bail
+    // out if the POI really is empty.
+    if (attempt >= 1) return;
+    await ctx.sleep(4000);
+    if (bot.state !== "running" || bot.docked || bot.isInBattle()) return;
+    if (!(await poiHasLootableWrecks(ctx))) return;
+  }
+}
+
 async function farmSystemForBigCreature(
   ctx: RoutineContext,
   settings: ReturnType<typeof getHunterSettings>,
@@ -2986,6 +3030,7 @@ async function farmSystemForBigCreature(
   let totalKills = 0;
   let cloudwhaleKills = 0;
   let targetKilled = false;
+  let engagedAtPoi = false;
 
   // Focus on the target POI first, then sweep other non-station POIs
   const { pois } = await getSystemInfo(ctx);
@@ -3000,6 +3045,7 @@ async function farmSystemForBigCreature(
   for (const poi of patrolPois) {
     if (bot.state !== "running") break;
     if (targetKilled) break;
+    engagedAtPoi = false;
 
     await bot.refreshShip();
     const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
@@ -3091,10 +3137,11 @@ async function farmSystemForBigCreature(
         }
         const stillPresent = freshEntities.find(e => e.id === t.id || e.name === t.name);
         if (!stillPresent) {
-          ctx.log("combat", `âš ï¸ ${t.name} no longer at ${poi.name} â€” skipping`);
+          ctx.log("combat", `⚠️ ${t.name} no longer at ${poi.name} — skipping`);
           continue;
         }
 
+        engagedAtPoi = true;
         const won = await hunterEngage(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
         if (won) {
           totalKills++;
@@ -3110,12 +3157,12 @@ async function farmSystemForBigCreature(
             }
             const battleStatusBeforeLoot = await getBattleStatus(ctx);
             if (!battleStatusBeforeLoot && bot.isInBattle()) {
-              ctx.log("combat", "API confirms no battle â€” clearing stale WebSocket state before looting");
+              ctx.log("combat", "API confirms no battle — clearing stale WebSocket state before looting");
               bot.currentBattle.inBattle = false;
               bot.currentBattle.battleId = null;
               bot.currentBattle.participants = [];
             }
-            await scavengeWrecks(ctx);
+            await sweepWrecksAtPoi(ctx);
           }
           const cset = getHunterSettings(bot.username);
           await topUpShields(ctx, (cset.shieldRechargePct ?? 80) / 100);
@@ -3143,6 +3190,16 @@ async function farmSystemForBigCreature(
       }
       await ctx.sleep(1500);
     }
+  }
+
+  // The POI loop exited for any reason (target killed, damage/cargo/ammo limits,
+  // passes exhausted). Never leave the POI we fought at without looting EVERY
+  // wreck: big creature fights usually also destroy player ships (expensive
+  // modules!), another hunter may have landed the killing blow on the big
+  // creature, and wrecks can spawn a few seconds after the battle ends.
+  if (engagedAtPoi && !settings.disableWreckSalvaging && bot.state === "running" && !bot.docked) {
+    ctx.log("combat", "Big creature hunt: looting all remaining wrecks before leaving the POI");
+    await sweepWrecksAtPoi(ctx);
   }
 
   return { kills: totalKills, cloudwhaleKills };

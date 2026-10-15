@@ -151,6 +151,10 @@ interface CargoMoverSettings {
   /** Item ids the user explicitly excluded from bulk move — these are never
    *  planned, loaded, or delivered by the bulk-move sub-routine. */
   bulkExcludeItems: string[];
+  /** Station references (system|poiId or base_id) the user explicitly excluded
+   *  from bulk move "all" mode — these stations will never be scanned or used
+   *  as a source. */
+  bulkExcludeStations: string[];
 }
 
 export function getCargoMoverSettings(username?: string): CargoMoverSettings {
@@ -205,6 +209,9 @@ export function getCargoMoverSettings(username?: string): CargoMoverSettings {
     bulkMoveFuelCells: (t.bulkMoveFuelCells as boolean) ?? false,
     bulkExcludeItems: Array.isArray(t.bulkExcludeItems)
       ? (t.bulkExcludeItems as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
+      : [],
+    bulkExcludeStations: Array.isArray(t.bulkExcludeStations)
+      ? (t.bulkExcludeStations as unknown[]).filter((v): v is string => typeof v === "string" && v.length > 0)
       : [],
     bulkSourceMode: (t.bulkSourceMode as "single" | "all") || "single",
   };
@@ -1764,6 +1771,8 @@ async function findNextBulkSourceStation(
   // Respect the global system blacklist — never query faction storage at
   // blacklisted systems (they're blocked for a reason).
   const blacklistedSystems = new Set(getSystemBlacklist().map((s) => s.toLowerCase()));
+  // User-configured excluded stations (by base_id or system|poiId)
+  const excludedStations = new Set(settings.bulkExcludeStations.map((s) => s.toLowerCase()));
   const candidates: Array<{ stationRef: string; systemId: string; poiName: string; baseId: string; totalItems: number }> = [];
 
   // Rate limit: 500ms between API calls to avoid IP bans
@@ -1771,17 +1780,20 @@ async function findNextBulkSourceStation(
   let lastCall = 0;
 
   for (const [sysId, sys] of Object.entries(allSystems)) {
-    // Skip blacklisted systems entirely
-    if (blacklistedSystems.has(sysId.toLowerCase())) {
-      ctx.log("cargo", `🔎 Skipping blacklisted system: ${sysId}`);
-      continue;
-    }
+    // Skip blacklisted systems entirely (silent — they have no usable station)
+    if (blacklistedSystems.has(sysId.toLowerCase())) continue;
     for (const poi of sys.pois) {
       if (!poi.has_base || !poi.base_id) continue;
       // Skip the destination station itself
       if (mapStore.sameStation(poi.base_id, settings.destinationStation)) continue;
       // Skip the configured home/source if it's set (to avoid re-scanning it when in "all" mode)
       if (settings.sourceStation && mapStore.sameStation(poi.base_id, settings.sourceStation)) continue;
+      // Skip user-excluded stations (match by base_id or system|poiId)
+      const stationRef = sysId + "|" + poi.id;
+      if (excludedStations.has(poi.base_id.toLowerCase()) || excludedStations.has(stationRef.toLowerCase())) {
+        ctx.log("cargo", `🔎 Skipping excluded station: ${poi.base_name || poi.name || poi.id} (${stationRef})`);
+        continue;
+      }
 
       const baseId = poi.base_id;
       // Rate limit

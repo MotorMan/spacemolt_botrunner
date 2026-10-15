@@ -34701,6 +34701,9 @@ ignoreBlacklist: document.getElementById(
         const bulkExcludeItems = Array.isArray(cm.bulkExcludeItems)
           ? cm.bulkExcludeItems.filter((i) => typeof i === "string" && i)
           : [];
+        const bulkExcludeStations = Array.isArray(cm.bulkExcludeStations)
+          ? cm.bulkExcludeStations.filter((i) => typeof i === "string" && i)
+          : [];
         const bulkSourceMode = cm.bulkSourceMode || "single";
 
         // Build station options from mapData
@@ -34916,6 +34919,62 @@ ignoreBlacklist: document.getElementById(
                 })
                 .join("")
             : '<div style="color:var(--dim);padding:8px">No items excluded — bulk move moves everything (except operational fuel cells).</div>';
+
+        // Build station exclusion list (only stations with faction storage)
+        const bulkExcludeStationUsedIds = new Set(bulkExcludeStations);
+        // Build a list of all stations with faction storage (has_base && base_id)
+        const allStationsWithFactionStorage = [];
+        for (const [sysId, sys] of Object.entries(mapData)) {
+          for (const poi of sys.pois || []) {
+            if (poi.has_base && poi.base_id) {
+              const val = sysId + "|" + poi.id;
+              const label = poi.base_name || poi.name || poi.id;
+              allStationsWithFactionStorage.push({ val, label, sysName: sys.name || sysId });
+            }
+          }
+        }
+        allStationsWithFactionStorage.sort((a, b) =>
+          (a.label + " " + a.sysName).localeCompare(b.label + " " + b.sysName),
+        );
+        const availableStations = allStationsWithFactionStorage.filter(
+          (s) => !bulkExcludeStationUsedIds.has(s.val.toLowerCase()) && !bulkExcludeStationUsedIds.has(s.label.toLowerCase()),
+        );
+        const bulkExcludeStationOpts =
+          availableStations.length > 0
+            ? availableStations
+                .map(
+                  (s) => `<option value="${esc(s.val)}">${esc(s.label)} (${esc(s.sysName)})</option>`,
+                )
+                .join("")
+            : '<option value="">All stations already excluded</option>';
+
+        const bulkExcludeStationList =
+          bulkExcludeStations.length > 0
+            ? bulkExcludeStations
+                .map((id, idx) => {
+                  // Find the station name from mapData
+                  let stationName = id;
+                  for (const [sysId, sys] of Object.entries(mapData)) {
+                    for (const poi of sys.pois || []) {
+                      if (poi.base_id === id || (sysId + "|" + poi.id) === id) {
+                        stationName = poi.base_name || poi.name || poi.id;
+                        break;
+                      }
+                    }
+                  }
+                  return `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(stationName)}</div>
+            <div class="craft-limit-detail">${esc(id)} — never used as bulk move source</div>
+          </div>
+          <div style="display:flex;gap:4px;align-items:center">
+            <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverBulkExcludeStation(${idx})" title="Remove from exclusion list">✕</button>
+          </div>
+        </div>`;
+                })
+                .join("")
+            : '<div style="color:var(--dim);padding:8px">No stations excluded — all faction-storage stations eligible.</div>';
 
         const showBotName = destinationStorageType === "send_gift";
 
@@ -35172,11 +35231,24 @@ ignoreBlacklist: document.getElementById(
          </div>
          ${bulkExcludeList}
 
-         <div style="margin:4px 0 8px;display:flex;gap:8px;align-items:center">
-           <select id="cm-bulk-exclude-select" style="flex:1;min-width:0">${bulkExcludeItemOpts}</select>
-           <button class="primary sm" onclick="addCargoMoverBulkExclusion()">+ Exclude Item</button>
-         </div>
-       </div>
+<div style="margin:4px 0 8px;display:flex;gap:8px;align-items:center">
+            <select id="cm-bulk-exclude-select" style="flex:1;min-width:0">${bulkExcludeItemOpts}</select>
+            <button class="primary sm" onclick="addCargoMoverBulkExclusion()">+ Exclude Item</button>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="setting-label">Excluded Stations</div>
+              <div class="setting-hint">Stations bulk move will never use as a source in "All Stations" mode</div>
+            </div>
+          </div>
+          ${bulkExcludeStationList}
+
+          <div style="margin:4px 0 8px;display:flex;gap:8px;align-items:center">
+            <select id="cm-bulk-exclude-station-select" style="flex:1;min-width:0">${bulkExcludeStationOpts}</select>
+            <button class="primary sm" onclick="addCargoMoverBulkExcludeStation()">+ Exclude Station</button>
+          </div>
+        </div>
     </div>
 
     <div class="settings-save-bar">
@@ -35453,6 +35525,26 @@ ignoreBlacklist: document.getElementById(
         rerenderCurrentSettings();
       }
 
+      function addCargoMoverBulkExcludeStation() {
+        const sel = document.getElementById("cm-bulk-exclude-station-select");
+        const id = sel?.value;
+        if (!id) return;
+
+        if (!settings.cargo_mover) settings.cargo_mover = {};
+        if (!Array.isArray(settings.cargo_mover.bulkExcludeStations)) {
+          settings.cargo_mover.bulkExcludeStations = [];
+        }
+        if (settings.cargo_mover.bulkExcludeStations.includes(id)) return;
+        settings.cargo_mover.bulkExcludeStations.push(id);
+        rerenderCurrentSettings();
+      }
+
+      function removeCargoMoverBulkExcludeStation(idx) {
+        if (!settings.cargo_mover?.bulkExcludeStations) return;
+        settings.cargo_mover.bulkExcludeStations.splice(idx, 1);
+        rerenderCurrentSettings();
+      }
+
       function setCargoMoverDeliveryTarget(idx) {
         const item = settings.cargo_mover?.items?.[idx];
         if (!item) return;
@@ -35630,6 +35722,11 @@ ignoreBlacklist: document.getElementById(
             document.getElementById("set-cm-bulkMoveFuelCells")?.checked ?? false,
           bulkExcludeItems: Array.isArray(settings.cargo_mover?.bulkExcludeItems)
             ? settings.cargo_mover.bulkExcludeItems.filter(
+                (i) => typeof i === "string" && i,
+              )
+            : [],
+          bulkExcludeStations: Array.isArray(settings.cargo_mover?.bulkExcludeStations)
+            ? settings.cargo_mover.bulkExcludeStations.filter(
                 (i) => typeof i === "string" && i,
               )
             : [],

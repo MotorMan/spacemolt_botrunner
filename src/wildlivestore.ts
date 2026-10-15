@@ -715,9 +715,6 @@ export class WildlifeStore {
           if (!entry || !entry.n) continue;
           const existing = tlist.find((e) => e.n === entry.n && e.h === entry.h);
           if (existing) {
-            for (const id of entry.ids || []) {
-              if (id && !existing.ids.includes(id)) existing.ids.push(id);
-            }
             if (entry.seen && entry.seen > existing.seen) {
               existing.seen = entry.seen;
               if (entry.s) existing.s = entry.s;
@@ -730,7 +727,7 @@ export class WildlifeStore {
               h: entry.h || 0,
               s: entry.s || "",
               r: entry.r || "",
-              ids: [...(entry.ids || [])],
+              ids: [],
               seen: entry.seen || new Date().toISOString(),
             });
             changed = true;

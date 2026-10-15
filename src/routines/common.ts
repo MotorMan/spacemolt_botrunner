@@ -2396,7 +2396,7 @@ export type FuelCheckOutcome = "fueled" | "in_battle" | "failed";
 export async function ensureFueledEx(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean; targetSystemId?: string },
 ): Promise<FuelCheckOutcome> {
   const { bot } = ctx;
 
@@ -2426,7 +2426,7 @@ export async function ensureFueledEx(
     }
   }
 
-  return (await ensureFueledCore(ctx, thresholdPct, opts)) ? "fueled" : "failed";
+  return (await ensureFueledCore(ctx, thresholdPct, { ...(opts || {}), targetSystemId: opts?.targetSystemId })) ? "fueled" : "failed";
 }
 
 /**
@@ -2454,7 +2454,7 @@ export async function ensureFueled(
 async function ensureFueledCore(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; skipApprovedCheck?: boolean; homeSystem?: string; homeStation?: string; skipFleeCheck?: boolean; targetSystemId?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
 
@@ -2602,7 +2602,10 @@ async function ensureFueledCore(
   }
 
   // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
-  if (opts?.skipBlacklist && opts?.homeSystem && bot.state === "running") {
+  // Skip if we're already navigating TO the home system (avoid infinite recursion)
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+  const isNavigatingToHome = opts?.targetSystemId && opts?.homeSystem && normalizeSystemName(opts.targetSystemId) === normalizeSystemName(opts.homeSystem);
+  if (opts?.skipBlacklist && opts?.homeSystem && bot.state === "running" && !isNavigatingToHome) {
     const homeSystem = opts.homeSystem;
     const globalHome = getGlobalHomeBase();
     // Resolve the home station POI id: prefer the explicitly passed one, fall back
@@ -2612,7 +2615,7 @@ async function ensureFueledCore(
       homeStationPoi = homeStationPoi.split("|")[1] || "";
     }
     ctx.log("system", `Hunter mode: navigating to home system ${homeSystem} for refueling...`);
-    const navResult = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
+    const navResult = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true, homeSystem: opts?.homeSystem, homeStation: opts?.homeStation });
     if (navResult) {
       await bot.refreshLocation();
       const { pois: homePois } = await getSystemInfo(ctx);
@@ -3180,7 +3183,7 @@ export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; skipApprovedCheck?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; onPreJump?: (nextSystem: string, jumpNumber: number) => void; skipBlacklist?: boolean; skipApprovedCheck?: boolean; isCombatBot?: boolean; joinBattles?: boolean; ignorePiratesWhenCloaked?: boolean; ignoreBlacklistWhenCloaked?: boolean; homeSystem?: string; homeStation?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -3314,11 +3317,7 @@ export async function navigateToSystem(
     }
 
 // Fuel check — MUST have adequate fuel before jumping
-// NOTE: intentionally omit homeSystem/homeStation here. navigateToSystem is
-// itself the navigation primitive; passing homeSystem into its internal fuel
-// check causes ensureFueledCore to recursively call navigateToSystem again,
-// creating an infinite loop whenever fuel is low.
-    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipApprovedCheck, skipFleeCheck: opts.isCombatBot });
+    const fueled = await ensureFueledEx(ctx, opts.fuelThresholdPct, { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist || (ignoreBlacklistWhenCloaked && bot.isCloaked), skipApprovedCheck: opts.skipApprovedCheck, skipFleeCheck: opts.isCombatBot, homeSystem: opts.homeSystem, homeStation: opts.homeStation, targetSystemId });
       if (fueled === "in_battle") {
         // Not a fuel problem — we're in a fight, and jumps are rejected while in
         // battle anyway. Abort navigation so the caller resolves combat first

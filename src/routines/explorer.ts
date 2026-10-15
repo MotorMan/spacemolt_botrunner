@@ -563,6 +563,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         }
+      } else {
+        // No other explorers assigned yet — every system is equally "distant",
+        // so treat them as candidates instead of filtering them all out.
+        // The first few get reserved in mapStore order, giving later starters
+        // something to spread away from.
+        minDistToOthers = FAR_FROM_OTHERS_DISTANCE;
       }
       
       if (minDistToOthers !== Infinity) {
@@ -713,6 +719,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     lastFleeTime: undefined,
   };
 
+  // Persistent counter for consecutive picks where every candidate was
+  // occupied by another explorer (shared with the coordination helper)
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
+
   // Track if we've already enabled cloak (mutation command - don't re-issue)
   let cloakEnabled = false;
 
@@ -799,21 +809,25 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode === "trade_update") {
       ctx.log("system", "Mode changed to trade_update — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* tradeUpdateRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "deep_core_scan") {
       ctx.log("system", "Mode changed to deep_core_scan — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* deepCoreScanRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "visit_all") {
       ctx.log("system", "Mode changed to visit_all — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* visitAllRoutine(ctx);
       return;
     }
     if (modeCheck.mode === "achievement") {
       ctx.log("system", "Mode changed to achievement — switching routines...");
+      clearExplorerPosition(bot.username);
       yield* achievementRoutine(ctx);
       return;
     }
@@ -835,6 +849,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     visitedSystemTimes.set(systemId, Date.now());
     mapStore.markSystemVisited(systemId);
     explorerHistoryStore.recordVisit(bot.username, systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -1111,6 +1126,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     let wormholeJumped = false;
     for (const { poi, reason } of toVisit) {
       if (bot.state !== "running") break;
+      // Keep the live-position heartbeat fresh during long POI tours so
+      // other explorers keep seeing us as "in this system".
+      updateExplorerPosition(bot.username, systemId, poi.id);
 
       const isMinable = isMinablePoi(poi.type);
       const isStation = isStationPoi(poi);
@@ -1437,8 +1455,33 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
       continue;
     }
 
-    // Pick the nearest system needing exploration
-    const target = systemsNeedingExploration[0];
+    // Pick the nearest system needing exploration — but never tailgate another
+    // explorer: skip systems they currently occupy, skip systems they have
+    // claimed, and re-roll to an isolated region if everything nearby is taken.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = currentSettings.coordinateExplorers ? getClaimedTargetMap() : null;
+    const pick = pickCoordinatedSystemTarget(systemsNeedingExploration, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: s => s.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const target = pick.target;
+    if (!target) {
+      ctx.log("warn", "No exploration target available — waiting before re-evaluating");
+      await ctx.sleep(30000);
+      continue;
+    }
     const priorityLabel = target.priority === "unvisited" ? "unvisited" : "revisit";
     ctx.log("exploration", `Systematic explore: Found ${systemsNeedingExploration.length} system(s) needing exploration, targeting nearest ${priorityLabel}: ${target.name} (${target.distance} jumps away)`);
 
@@ -1526,6 +1569,8 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
     // Continue to next iteration to explore this system's POIs
     continue;
   }
+
+  clearExplorerPosition(bot.username);
 };
 
 // ── POI visit sub-routines ───────────────────────────────────
@@ -2964,6 +3009,8 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
   const fledFromSystems = new Set<string>();
   const path: string[] = [];
   let lastSystem: string | null = null;
+  // Persistent counter shared with the coordination helper
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
   // Get initial system info
   yield "startup";
@@ -3074,6 +3121,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Mark this system as visited (both locally and via mapStore)
     visitedSystems.add(systemId);
     mapStore.markSystemVisited(systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
 
     // Get visit stats
     const stats = mapStore.getVisitStats();
@@ -3088,8 +3136,12 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Find unvisited systems reachable from current position
     const unvisited = findUnvisitedSystemsByServerFlag(ctx, systemId, blacklist, fledFromSystems);
 
-    // Coordination: avoid systems other active explorers are currently targeting
-    const visitAllClaimed = settings.coordinateExplorers ? getClaimedTargets() : null;
+    // Coordination inputs shared by both pick sites below: systems other
+    // explorers currently occupy, and systems they've claimed as targets.
+    // The pick policy itself lives in pickCoordinatedSystemTarget so every
+    // explorer routine behaves identically.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = settings.coordinateExplorers ? getClaimedTargetMap() : null;
 
     if (unvisited.length === 0) {
       ctx.log("info", "No unvisited systems in connected region — picking nearest unvisited from map...");
@@ -3120,11 +3172,23 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
         return aDist - bDist;
       });
 
-      const target = pickCoordinatedTarget(allUnvisited, visitAllClaimed, u => u.systemId);
-      if (!target) {
-        ctx.log("info", "All systems visited! Explore mode complete.");
-        return;
+      const pick = pickCoordinatedSystemTarget(allUnvisited, {
+        occupied: occupiedSystems,
+        claimed: claimedTargets,
+        blacklist,
+        excludeBot: bot.username,
+        keyOf: u => u.systemId,
+        waitState: occupiedWaitState,
+        maxWaitAttempts: 3,
+        log: msg => ctx.log("exploration", msg),
+      });
+
+      if (pick.shouldWait || !pick.target) {
+        await ctx.sleep(30000);
+        continue;
       }
+
+      const target = pick.target;
 
       // Announce our target to other explorers for coordination
       if (settings.coordinateExplorers && ctx.sendBotChat && ctx.getAllBotNames) {
@@ -3147,7 +3211,23 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     }
 
     // Jump to nearest unvisited system
-    const target = pickCoordinatedTarget(unvisited, visitAllClaimed, u => u.id);
+    const pick = pickCoordinatedSystemTarget(unvisited, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: u => u.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const target = pick.target;
     if (!target) {
       await ctx.sleep(5000);
       continue;
@@ -3209,6 +3289,8 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   const fledFromSystems = new Set<string>();
   const path: string[] = [];
   let lastSystem: string | null = null;
+  // Persistent counter shared with the coordination helper
+  const occupiedWaitState: ExplorerWaitState = { blockedCount: 0 };
 
   // Get initial system info
   yield "startup";
@@ -3373,7 +3455,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         const home = getGlobalHomeBase();
         const homeSystem = home.system || "sol";
         const homeName = home.name || "home base";
-        const homeArrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+        const homeArrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
         if (homeArrived) {
           ctx.log("system", `Returned to ${homeName} from pirate system - continuing achievement mode`);
           await ctx.sleep(5000);
@@ -3385,6 +3467,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // Mark this system as visited locally
     visitedSystems.add(systemId);
     mapStore.markSystemVisited(systemId);
+    updateExplorerPosition(bot.username, systemId, bot.poi);
 
     // Get visit stats from mapStore
     const stats = mapStore.getVisitStats();
@@ -3399,7 +3482,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const homeName = home.name || "home base";
       if (bot.system.toLowerCase() !== homeSystem) {
         ctx.log("system", `Returning to ${homeName} to complete achievement mode`);
-        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
       }
       setExplorerMode(bot.username, "explore");
       return;
@@ -3448,7 +3531,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           const home = getGlobalHomeBase();
           const homeSystem = home.system || "sol";
           const homeName = home.name || "home base";
-          await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true });
+          await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, autoCloak: true, homeSystem, homeStation: home.station });
           await ctx.sleep(5000);
         } else {
           await ctx.sleep(30000);
@@ -3460,7 +3543,32 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // Sort by distance from current position (nearest first)
     unvisitedSystems.sort((a, b) => a.distance - b.distance);
 
-    const target = unvisitedSystems[0];
+    // Coordination: never tailgate another explorer — skip systems they
+    // currently occupy, skip systems they've claimed, and re-roll to an
+    // isolated region if everything nearby is taken.
+    const occupiedSystems = getOccupiedExplorerSystems(bot.username);
+    const claimedTargets = settings.coordinateExplorers ? getClaimedTargetMap() : null;
+    const pick = pickCoordinatedSystemTarget(unvisitedSystems, {
+      occupied: occupiedSystems,
+      claimed: claimedTargets,
+      blacklist,
+      excludeBot: bot.username,
+      keyOf: s => s.id,
+      waitState: occupiedWaitState,
+      maxWaitAttempts: 3,
+      log: msg => ctx.log("exploration", msg),
+    });
+
+    if (pick.shouldWait) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    const target = pick.target;
+    if (!target) {
+      await ctx.sleep(30000);
+      continue;
+    }
     ctx.log("travel", `Navigating to ${target.name} (${target.id}) - ${target.distance} jumps away, ${unvisitedSystems.length} systems remaining`);
 
     // Ensure fueled
@@ -3882,6 +3990,14 @@ async function findSystemsNeedingExploration(
 
 /** Threshold in days for considering POI data stale. */
 const STALE_POI_DAYS = 7;
+
+/**
+ * Stand-in "distance to other explorers" used when no other explorer has an
+ * assignment yet. Large enough to beat any real BFS distance so the candidate
+ * sort keeps working, finite so the candidates list isn't empty on a cold
+ * start (which used to leave the first explorer with no assignment at all).
+ */
+const FAR_FROM_OTHERS_DISTANCE = 10_000;
 
 /**
  * Find systems that need exploration, sorted by priority then distance (nearest first).
@@ -4340,7 +4456,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
   // Navigate to the configured home system
   if (bot.system !== homeSystem) {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+    const arrived = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 30, skipBlacklist: true, homeSystem, homeStation: home.station });
     if (!arrived) {
       ctx.log("error", `Could not reach ${homeSystem} — aborting fuel cell reload`);
       return false;
@@ -4944,9 +5060,70 @@ interface ExplorationTarget {
   expiresAt: number;
 }
 
-/** In-memory store of other explorers' current targets (expires after 5 minutes). */
+/** In-memory store of other explorers' current targets. */
 const explorationTargets = new Map<string, ExplorationTarget>();
-const EXPLORATION_TARGET_TTL_MS = 5 * 60 * 1000;
+/** How long an announced target stays claimed. Long enough to cover a
+ *  multi-jump route; once the bot arrives, its live position takes over. */
+const EXPLORATION_TARGET_TTL_MS = 15 * 60 * 1000;
+
+/** Live position of an explorer, refreshed every loop iteration and POI visit. */
+interface ExplorerLivePosition {
+  botName: string;
+  systemId: string;
+  poiId: string | null;
+  timestamp: number;
+}
+
+/** In-memory registry of where every explorer currently is (same process). */
+const explorerLivePositions = new Map<string, ExplorerLivePosition>();
+
+/** How long a position heartbeat stays valid. Covers long system dwells
+ *  (POI tours, dock/refuel/repair) since heartbeats refresh continuously. */
+const EXPLORER_POSITION_TTL_MS = 20 * 60 * 1000;
+
+/** Record this explorer's live position (heartbeat). */
+export function updateExplorerPosition(botName: string, systemId: string, poiId?: string | null): void {
+  if (!botName || !systemId) return;
+  explorerLivePositions.set(botName.toLowerCase(), {
+    botName,
+    systemId,
+    poiId: poiId ?? null,
+    timestamp: Date.now(),
+  });
+}
+
+/** Forget this explorer's live position (routine ended). */
+export function clearExplorerPosition(botName: string): void {
+  explorerLivePositions.delete(botName.toLowerCase());
+}
+
+/** Live positions of OTHER explorers, dropping stale heartbeats. */
+export function getLiveExplorerPositions(excludeBot: string): Array<ExplorerLivePosition> {
+  const now = Date.now();
+  const self = excludeBot.toLowerCase();
+  const live: Array<ExplorerLivePosition> = [];
+  for (const [key, pos] of explorerLivePositions.entries()) {
+    if (key === self) continue;
+    if (now - pos.timestamp > EXPLORER_POSITION_TTL_MS) {
+      explorerLivePositions.delete(key);
+      continue;
+    }
+    live.push(pos);
+  }
+  return live;
+}
+
+/**
+ * Systems currently occupied by OTHER explorers — a hard block on targeting.
+ * If another explorer is sitting in a system, we go somewhere else.
+ */
+export function getOccupiedExplorerSystems(excludeBot: string): Set<string> {
+  const occupied = new Set<string>();
+  for (const pos of getLiveExplorerPositions(excludeBot)) {
+    occupied.add(pos.systemId.toLowerCase());
+  }
+  return occupied;
+}
 
 /**
  * Announce our current target system to other explorers via bot chat.
@@ -4975,7 +5152,7 @@ function announceExplorationTarget(ctx: RoutineContext, targetSystemId: string):
 /**
  * Process an incoming exploration target announcement from another bot.
  */
-function processExplorationTarget(message: BotChatMessage): void {
+export function processExplorationTarget(message: BotChatMessage): void {
   try {
     const data = JSON.parse(message.content);
     if (data.type !== "exploration_target") return;
@@ -4993,21 +5170,19 @@ function processExplorationTarget(message: BotChatMessage): void {
   }
 }
 
-/**
- * Get all currently claimed exploration targets (not expired).
- */
-function getClaimedTargets(): Set<string> {
+/** Claimed targets as systemId(lowercase) -> expiry timestamp (fresh only). */
+export function getClaimedTargetMap(): Map<string, number> {
   const now = Date.now();
-  const claimed = new Set<string>();
-  
+  const claimed = new Map<string, number>();
+
   for (const [botName, target] of explorationTargets.entries()) {
     if (now < target.expiresAt) {
-      claimed.add(target.targetSystemId.toLowerCase());
+      claimed.set(target.targetSystemId.toLowerCase(), target.expiresAt);
     } else {
       explorationTargets.delete(botName);
     }
   }
-  
+
   return claimed;
 }
 
@@ -5024,8 +5199,9 @@ function cleanupExplorationTargets(): void {
 }
 
 /**
- * Find unknown systems to explore, avoiding targets claimed by other explorers.
- * Returns systems sorted by priority then distance (nearest first).
+ * Find unknown systems to explore, avoiding systems occupied by other
+ * explorers and targets they have claimed. Returns systems sorted by
+ * priority then distance (nearest first).
  */
 function findUnknownSystemsWithCoordination(
   ctx: RoutineContext,
@@ -5042,37 +5218,143 @@ function findUnknownSystemsWithCoordination(
   priority: "unknown" | "stale";
   oldestPoiUpdate: string | null;
 }> {
-  const claimedTargets = getClaimedTargets();
   cleanupExplorationTargets();
-  
+
   const unknowns = findUnknownSystems(ctx, currentSystem, blacklist, fledFromSystems, ignoreBlacklistWhenCloaked, isCloaked);
-  
-  // Filter out systems that other explorers are targeting
-  const unclaimed = unknowns.filter(u => !claimedTargets.has(u.id.toLowerCase()));
-  
-  if (unclaimed.length === 0 && unknowns.length > 0) {
-    ctx.log("exploration", `All unknown systems are being targeted by other explorers - selecting nearest available`);
-    // Return the original list - we'll pick the nearest even if targeted
-    return unknowns;
-  }
-  
-  ctx.log("exploration", `Filtered out ${unknowns.length - unclaimed.length} systems being targeted by other explorers`);
-  return unclaimed;
+
+  const pick = pickCoordinatedSystemTarget(unknowns, {
+    occupied: getOccupiedExplorerSystems(ctx.bot.username),
+    claimed: getClaimedTargetMap(),
+    blacklist,
+    excludeBot: ctx.bot.username,
+    keyOf: u => u.id,
+    log: msg => ctx.log("exploration", msg),
+  });
+
+  return pick.target ? [pick.target] : [];
 }
 
 /**
- * From a list of candidate targets, return the first that isn't currently
- * claimed by another explorer. Falls back to the first candidate if every one
- * is claimed, so we never get stuck waiting for a free system.
+ * Pick the candidate farthest (in jumps) from every other live explorer.
+ * Used to re-roll away when every candidate is claimed: instead of
+ * tailgating the nearest claim, go start a new region somewhere else.
  */
-function pickCoordinatedTarget<T>(
+export function pickMostIsolatedCandidate<T>(
   candidates: T[],
-  claimed: Set<string> | null,
+  excludeBot: string,
+  blacklist: string[],
   keyOf: (c: T) => string,
-): T | undefined {
-  if (!claimed || claimed.size === 0 || candidates.length === 0) {
-    return candidates[0];
+): T {
+  const others = getLiveExplorerPositions(excludeBot);
+  if (others.length === 0 || candidates.length === 0) return candidates[0];
+
+  // One BFS per other explorer gives jump-distance from their position.
+  const distMaps = others.map(o =>
+    calculateLocalDistances(o.systemId, blacklist, new Set<string>(), false, false)
+  );
+
+  let best = candidates[0];
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    const id = keyOf(candidate);
+    let minDist = Infinity;
+    for (const distMap of distMaps) {
+      const info = distMap.get(id) ?? distMap.get(id.toLowerCase());
+      if (!info) continue; // unreachable from that explorer
+      if (info.distance < minDist) minDist = info.distance;
+    }
+    // Unreachable from every other explorer = perfectly isolated.
+    const score = minDist === Infinity ? Number.MAX_SAFE_INTEGER : minDist;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
   }
-  const unclaimed = candidates.filter(c => !claimed.has(keyOf(c).toLowerCase()));
-  return (unclaimed.length > 0 ? unclaimed : candidates)[0];
+  return best;
+}
+
+/** Mutable counter shared across loop iterations to track consecutive
+ *  fully-blocked picks (every candidate occupied by another explorer). */
+export interface ExplorerWaitState {
+  blockedCount: number;
+}
+
+/** Result of a coordinated target pick. */
+interface CoordinatedTargetPick<T> {
+  /** Picked target, or null when there is nothing to pick right now. */
+  target: T | null;
+  /** True when the caller should sleep and retry on the next loop iteration. */
+  shouldWait: boolean;
+}
+
+/**
+ * The single anti-lockstep target-selection policy, shared by every explorer
+ * routine so they can never drift apart:
+ *
+ *  1. Skip systems other explorers currently occupy (hard block).
+ *  2. Skip systems other explorers have claimed as targets (soft block).
+ *  3. When everything nearby is claimed, re-roll to the most isolated
+ *     candidate instead of tailgating the nearest claim.
+ *  4. When everything nearby is occupied, wait up to `maxWaitAttempts`
+ *     loop iterations, then re-roll anyway so we never deadlock.
+ *
+ * All decisions are logged through `log` in one consistent format.
+ */
+export function pickCoordinatedSystemTarget<T>(
+  candidates: T[],
+  opts: {
+    /** Lowercased system ids other explorers currently sit in. */
+    occupied: Set<string>;
+    /** Claimed targets as systemId(lowercase) -> expiry, or null when
+     *  coordination is disabled. */
+    claimed: Map<string, number> | null;
+    blacklist: string[];
+    excludeBot: string;
+    keyOf: (c: T) => string;
+    /** Persistent wait counter; omit for routines that never wait. */
+    waitState?: ExplorerWaitState;
+    /** How many fully-blocked picks to tolerate before forcing a re-roll. */
+    maxWaitAttempts?: number;
+    log?: (msg: string) => void;
+  },
+): CoordinatedTargetPick<T> {
+  const { occupied, claimed, blacklist, excludeBot, keyOf, waitState, log } = opts;
+  const maxWaitAttempts = opts.maxWaitAttempts ?? 3;
+
+  if (candidates.length === 0) return { target: null, shouldWait: false };
+
+  const free = candidates.filter(c => !occupied.has(keyOf(c).toLowerCase()));
+  const skippedOccupied = candidates.length - free.length;
+  const unclaimed = free.filter(c => !claimed || !claimed.has(keyOf(c).toLowerCase()));
+  const skippedClaimed = free.length - unclaimed.length;
+
+  if (skippedOccupied > 0 || skippedClaimed > 0) {
+    log?.(`Coordination: avoiding ${skippedOccupied} occupied and ${skippedClaimed} claimed system(s) — ${unclaimed.length} free candidate(s) remain`);
+  }
+
+  if (unclaimed.length > 0) {
+    if (waitState) waitState.blockedCount = 0;
+    return { target: unclaimed[0], shouldWait: false };
+  }
+
+  if (free.length > 0) {
+    // Everything nearby is claimed — pick a NEW target far from the other
+    // explorers instead of following them around.
+    if (waitState) waitState.blockedCount = 0;
+    log?.(`All ${free.length} candidate system(s) are claimed by other explorers — re-rolling to an isolated region`);
+    return { target: pickMostIsolatedCandidate(free, excludeBot, blacklist, keyOf), shouldWait: false };
+  }
+
+  // Every reachable candidate is currently occupied by another explorer.
+  if (waitState) {
+    waitState.blockedCount++;
+    if (waitState.blockedCount <= maxWaitAttempts) {
+      log?.(`All ${candidates.length} candidate system(s) are occupied by other explorers — waiting before re-evaluating`);
+      return { target: null, shouldWait: true };
+    }
+    log?.(`Still fully blocked after ${waitState.blockedCount} attempts — re-rolling to the most isolated system anyway`);
+  } else {
+    log?.(`All ${candidates.length} candidate system(s) are occupied by other explorers — re-rolling to an isolated region`);
+  }
+  return { target: pickMostIsolatedCandidate(candidates, excludeBot, blacklist, keyOf), shouldWait: false };
 }

@@ -900,13 +900,18 @@ async function returnToHomeAndResupply(
   const { bot } = ctx;
   const homeSystem = settings.homeSystem || "";
   const homeStation = settings.homeStation || "";
+  // Use a low fuel threshold (10%) when navigating home — we only need enough
+  // fuel for the next jump, not the entire trip. The ensureFueled logic will
+  // consume cargo fuel cells as needed during the journey.
   const safetyOpts = {
-    fuelThresholdPct: settings.refuelThreshold,
+    fuelThresholdPct: 10,
     hullThresholdPct: settings.repairThreshold,
     autoCloak: settings.autoCloak,
     skipBlacklist: true,
     isCombatBot: true,
     joinBattles: true,
+    homeSystem,
+    homeStation,
   };
 
   ctx.log("system", `Returning to home base ${homeStation || homeSystem || "(default)"} â€” depositing loot + restocking...`);
@@ -9043,11 +9048,11 @@ async function* boardingSystemPass(
       // When fuel is low and a home base is configured, go directly home so the
       // hunter returns to the correct faction storage / station instead of a
       // random bypass station.
-      if (needsFuel && settings.homeSystem) {
-        ctx.log("system", `Low fuel (${postFuel}%) â€” returning to home base (${settings.homeSystem})...`);
+if (needsFuel && settings.homeSystem) {
+        ctx.log("system", `Low fuel (${postFuel}%) — returning to home base (${settings.homeSystem})...`);
         yield "dock";
         await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
-        const homeOk = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
+        const homeOk = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true, homeSystem: settings.homeSystem, homeStation: settings.homeStation });
         if (!homeOk) {
           ctx.log("system", "Could not reach home base â€” falling back to nearest safe station");
           yield "dock";

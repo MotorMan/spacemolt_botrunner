@@ -5824,6 +5824,24 @@
         </label>`;
         }
 
+        // Per-bot mode for civilian_transport routine
+        const isCivilianTransport =
+          (bot.state === "running" && bot.routine === "civilian_transport") ||
+          (bot.state !== "running" &&
+            bot.state !== "stopping" &&
+            getProfileSelectedRoutine() === "civilian_transport");
+        if (isCivilianTransport) {
+          const botSettings = settings[bot.username] || {};
+          const globalMode = (settings.civilian_transport || {}).mode || "normal";
+          const botMode = botSettings.mode || globalMode;
+          actions += `
+        <span class="profile-ore-label" style="margin-left:8px">Mode:</span>
+        <select id="profile-civilianTransportMode" onchange="saveProfileCivilianTransportMode()">
+          <option value="normal"${botMode === "normal" ? " selected" : ""}>Normal (deliver to destinations)</option>
+          <option value="lounge_transport"${botMode === "lounge_transport" ? " selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+        </select>`;
+        }
+
         actions += `
       <span class="profile-ore-label" style="margin-left:8px">Flock:</span>
       <select id="profile-flockName" onclick="event.stopPropagation()" onchange="saveProfileFlock()">${flockOpts.join("")}</select>
@@ -6301,6 +6319,22 @@
         const useAllStations = checkbox.checked;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { useAllStationsInEmpire: useAllStations });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfileCivilianTransportMode() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-civilianTransportMode");
+        if (!sel) return;
+        const mode = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { mode });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -36956,6 +36990,17 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Transport Mode</div>
+        <div class="setting-hint">Normal: delivers passengers to their destinations. Lounge Transport: picks up passengers and drops them at the faction Transit Lounge at home base.</div>
+      </div>
+      <select id="set-civilian_transport-mode">
+        <option value="normal" ${ct.mode === "normal" || !ct.mode ? "selected" : ""}>Normal (deliver to destinations)</option>
+        <option value="lounge_transport" ${ct.mode === "lounge_transport" ? "selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Max passengers per run</div>
         <div class="setting-hint">Global passenger cap. Set to 0 for unlimited (only limited by berths).</div>
       </div>
@@ -37146,6 +37191,8 @@ ignoreBlacklist: document.getElementById(
           document.getElementById("set-civilian_transport-minFuelCellsToDepart")
             ?.value || 6,
         );
+        const mode =
+          document.getElementById("set-civilian_transport-mode")?.value || "normal";
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -37174,6 +37221,7 @@ ignoreBlacklist: document.getElementById(
         s.factionDepositThreshold = factionDepositThreshold;
         s.buyFuelCells = buyFuelCells;
         s.minFuelCellsToDepart = minFuelCellsToDepart;
+        s.mode = mode;
 
         send({
           type: "saveSettings",

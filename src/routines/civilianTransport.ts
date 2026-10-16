@@ -581,7 +581,7 @@ interface TransportPassenger {
 
 interface TransportState {
   botUsername: string;
-  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed";
+  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge";
   shipId: string;
   shipName: string;
   customName?: string;
@@ -660,6 +660,8 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
+type CivilianTransportMode = "normal" | "lounge_transport";
+
 interface CivilianTransportSettings {
   maxJumps: number;
   roundsBeforeMoving: number;
@@ -683,6 +685,7 @@ interface CivilianTransportSettings {
   factionDepositThreshold: number;
   buyFuelCells: boolean;
   minFuelCellsToDepart: number;
+  mode: CivilianTransportMode;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -716,6 +719,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
     buyFuelCells: (t.buyFuelCells as boolean) ?? false,
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
+    mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
   };
 }
 
@@ -830,7 +834,7 @@ function isValidTransportState(state: unknown): state is TransportState {
   if (typeof s.shipId !== "string" || s.shipId.length === 0) return false;
   const berths = s.berths as Record<string, number> | undefined;
   if (!berths || (berths.economy + berths.business + berths.first) <= 0) return false;
-  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship"]);
+  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge"]);
   if (typeof s.status !== "string" || !validStatuses.has(s.status)) return false;
   return true;
 }
@@ -2360,6 +2364,7 @@ if (state && state.status !== "idle") {
       }
 
       // Now load in route order, one destination per loop, berth tally.
+      // For lounge_transport mode, load ALL passengers regardless of destination
       const loadedNames = new Set<string>();
       let usedEconomy = 0;
       let usedBusiness = 0;
@@ -2370,7 +2375,74 @@ if (state && state.status !== "idle") {
         return free;
       };
 
-      for (const leg of plannedRoute) {
+      const priority = settings.passengerPriority;
+      const classOrder: Record<string, number> = { first: 0, business: 0, economy: 0 };
+      if (priority === "first") {
+        classOrder.first = 0;
+        classOrder.business = 1;
+        classOrder.economy = 2;
+      } else if (priority === "business") {
+        classOrder.business = 0;
+        classOrder.first = 1;
+        classOrder.economy = 2;
+      } else if (priority === "economy") {
+        classOrder.economy = 0;
+        classOrder.first = 1;
+        classOrder.business = 2;
+      }
+
+      if (settings.mode === "lounge_transport") {
+        ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
+        const allPassengers = [...waiting];
+        const sortedPassengers = allPassengers.sort((a, b) => {
+          if (priority === "off") return 0;
+          return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
+        });
+
+        let loadedThisLeg = 0;
+        for (const p of sortedPassengers) {
+          if (loadedNames.has(p.citizen_id)) continue;
+          const cls = p.class.toLowerCase() as "economy" | "business" | "first";
+          const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
+          const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
+          const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
+          
+          let canLoad = false;
+          if (cls === "first" && usedFirst < capFirst) {
+            canLoad = true;
+            usedFirst++;
+          } else if (cls === "business" && usedBusiness < capBusiness) {
+            canLoad = true;
+            usedBusiness++;
+          } else if (cls === "economy") {
+            if (usedEconomy < capEconomy) {
+              canLoad = true;
+              usedEconomy++;
+            } else if (usedBusiness < capBusiness) {
+              canLoad = true;
+              usedBusiness++;
+            } else if (usedFirst < capFirst) {
+              canLoad = true;
+              usedFirst++;
+            }
+          }
+          
+          if (!canLoad) continue;
+          
+          loadedNames.add(p.citizen_id);
+          loadedThisLeg++;
+        }
+        
+        if (loadedThisLeg > 0) {
+          const loadResp = await bot.exec("load_passenger", { id: "all" });
+          if (loadResp.error) {
+            ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
+          }
+          await ctx.sleep(11000);
+        }
+      } else {
+        // Normal mode: load by destination groups
+        for (const leg of plannedRoute) {
         const legPoiLower = leg.poi.toLowerCase();
         const legSysLower = leg.system.toLowerCase();
         const currentPoiLower = (bot.poi || "").toLowerCase();
@@ -2391,21 +2463,6 @@ if (state && state.status !== "idle") {
           break;
         }
 
-        const priority = settings.passengerPriority;
-        const classOrder: Record<string, number> = { first: 0, business: 0, economy: 0 };
-        if (priority === "first") {
-          classOrder.first = 0;
-          classOrder.business = 1;
-          classOrder.economy = 2;
-        } else if (priority === "business") {
-          classOrder.business = 0;
-          classOrder.first = 1;
-          classOrder.economy = 2;
-        } else if (priority === "economy") {
-          classOrder.economy = 0;
-          classOrder.first = 1;
-          classOrder.business = 2;
-        }
         const sortedPassengers = [...passengersFinal].sort((a, b) => {
           if (priority === "off") return 0;
           return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
@@ -2512,6 +2569,7 @@ if (state && state.status !== "idle") {
         bot.refreshStatus().catch(() => {});
         await checkAndRecloak(ctx, settings);
         await depositExcessCredits(ctx, settings);
+      }
       }
 
       const listResp = await bot.exec("list_passengers");
@@ -2786,10 +2844,117 @@ if (state && state.status !== "idle") {
         }
       }
 
+      // Handle lounge_transport mode: instead of delivering to destinations, return to home base
+      if (settings.mode === "lounge_transport") {
+        if (!settings.homeSystem || !settings.homeStation) {
+          ctx.log("error", "Lounge transport mode requires homeSystem and homeStation to be configured");
+          state.status = "idle";
+          state.onboardPassengers = [];
+          state.route = [];
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
+        }
+        ctx.log("transport", `Lounge transport mode: loaded ${onboard.length} passengers, returning to home base ${settings.homeStation} in ${settings.homeSystem}`);
+        state.route = [{
+          system: settings.homeSystem,
+          poi: settings.homeStation,
+          poiName: settings.homeStation,
+        }];
+        state.currentRouteIndex = 0;
+        state.currentDestination = settings.homeStation;
+        state.status = "returning_to_lounge";
+        saveTransportState(state);
+        await ensureUndocked(ctx);
+        continue;
+      }
+
       // Undock and continue to transit handling below
       await ensureUndocked(ctx);
       state.status = "in_transit";
       saveTransportState(state);
+    }
+
+    if (state.status === "returning_to_lounge") {
+      if (!settings.homeSystem || !settings.homeStation) {
+        ctx.log("error", "Lounge transport mode requires homeSystem and homeStation");
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        saveTransportState(state);
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      const homeSystem = settings.homeSystem;
+      const homeStation = settings.homeStation;
+
+      // Navigate to home system if not there
+      if (bot.system && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+        ctx.log("transport", `Lounge transport: navigating to home system ${homeSystem}`);
+        const ok = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+        if (!ok) {
+          ctx.log("transport", `Failed to navigate to home system ${homeSystem}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Travel to home station if not there
+      if (bot.poi && bot.poi.toLowerCase() !== homeStation.toLowerCase()) {
+        ctx.log("transport", `Lounge transport: traveling to home station ${homeStation}`);
+        const tr = await bot.exec("travel", { target_poi: homeStation });
+        if (tr.error) {
+          ctx.log("error", `Travel to home station failed: ${tr.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Dock at home station
+      if (!bot.docked) {
+        ctx.log("transport", `Lounge transport: docking at home station ${homeStation}`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        continue;
+      }
+
+      // Unload all passengers to lounge
+      ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
+      const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
+      if (unloadResp.error) {
+        ctx.log("error", `Unload to lounge failed: ${unloadResp.error.message}`);
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      ctx.log("transport", `Lounge transport: successfully unloaded all passengers to Transit Lounge`);
+      state.onboardPassengers = [];
+      state.route = [];
+      state.currentRouteIndex = 0;
+      state.currentDestination = null;
+      state.status = "idle";
+      state.roundsWithoutPassengers = 0;
+      saveTransportState(state);
+
+      // Collect fuel cells at home base
+      await collectFuelCells(ctx, settings);
+
+      await ctx.sleep(5000);
+      continue;
     }
 
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {

@@ -208,7 +208,7 @@
     trading: ['buy', 'sell'],
     combat: ['damage', 'kill', 'outcome'],
     mission: ['abandon', 'expire', 'complete'],
-    faction: ['production_cycle', 'rent_warning']
+    faction: ['deposit', 'transfer', 'withdraw', 'refuel', 'maintenance_paid', 'rent_paid', 'transit_lounge_departures', 'facility_rented', 'listing_fee_earned', 'station_revenue', 'rent_received', 'production_cycle', 'rent_warning']
   };
 
   // ── Helpers ─────────────────────────────────────────────
@@ -638,26 +638,35 @@
 
   // Pull credits from structured fields first; fall back to parsing the
   // summary text (e.g. "Sold 12x Power Cell @ 2671 each (32052 credits)").
+  // The summary text takes priority for direction: if it explicitly says
+  // "Earned"/"Received"/etc. we force positive even if data.credits is
+  // stored as a negative number (some faction events do this).
   function extractCredits(e, d, summary, eventType) {
-    if (typeof d.credits === 'number') return d.credits;
-    if (typeof d.total_cost === 'number') return -d.total_cost;
-    if (typeof d.cost === 'number') return -d.cost;
-
-    const ev = String(eventType || '').toLowerCase();
     const text = String(summary || '');
+    const ev = String(eventType || '').toLowerCase();
     const m = text.match(/\(([\d,]+)\s*credits?\)/i) || text.match(/([\d,]+)\s*credits?/i);
     if (m) {
       const amt = parseInt(m[1].replace(/,/g, ''), 10);
-      if (!isNaN(amt)) {
+      if (!isNaN(amt) && amt > 0) {
         let sign = 1;
         if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || ev === 'buy') {
           sign = -1;
         } else if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || ev === 'sell') {
           sign = 1;
         }
+        // If summary is ambiguous, use structured credit field as tiebreaker.
+        if (sign === 1 && typeof d.credits === 'number' && d.credits < 0) {
+          return d.credits;
+        }
+        if (sign === -1 && typeof d.credits === 'number' && d.credits > 0) {
+          return d.credits;
+        }
         return sign * amt;
       }
     }
+    if (typeof d.credits === 'number') return d.credits;
+    if (typeof d.total_cost === 'number') return -d.total_cost;
+    if (typeof d.cost === 'number') return -d.cost;
     return 0;
   }
 

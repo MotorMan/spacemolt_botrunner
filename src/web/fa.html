@@ -127,10 +127,19 @@
     <button id="faLoadPagesBtn" onclick="loadMultiplePages()">Load Pages</button>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faLoadAllBots" style="width:14px;height:14px;">Load all bots</label>
     <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faShowBotSummary" style="width:14px;height:14px;">Bot summary</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
-    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
+    <div id="faFiltersPersonal" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeGifts" style="width:14px;height:14px;">Exclude gifts</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdraw" style="width:14px;height:14px;">Exclude faction withdraw</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeExchangeFill" style="width:14px;height:14px;">Exclude exchange fills</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludePassengerFare" style="width:14px;height:14px;">Exclude passenger fares</label>
+    </div>
+    <div id="faFiltersFaction" style="display:none;gap:6px;flex-wrap:wrap;align-items:center;">
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionDeposit" style="width:14px;height:14px;">Exclude faction deposit</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionWithdrawal" style="width:14px;height:14px;">Exclude faction withdrawal</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionRent" style="width:14px;height:14px;">Exclude rent</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionMaintenance" style="width:14px;height:14px;">Exclude maintenance</label>
+      <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;"><input type="checkbox" id="faExcludeFactionRevenue" style="width:14px;height:14px;">Exclude station revenue</label>
+    </div>
     <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
     <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
     <button onclick="clearFaResults()" style="background:#21262d;border:1px solid var(--border);color:var(--text);">Clear Log</button>
@@ -636,11 +645,11 @@
     });
   }
 
-  // Pull credits from structured fields first; fall back to parsing the
-  // summary text (e.g. "Sold 12x Power Cell @ 2671 each (32052 credits)").
-  // The summary text takes priority for direction: if it explicitly says
-  // "Earned"/"Received"/etc. we force positive even if data.credits is
-  // stored as a negative number (some faction events do this).
+  // Pull credits from summary text first, since it explicitly states
+  // direction ("Earned 9753 credits" vs "Facility rent: 58 credits"). The
+  // structured d.credits field is unreliable for faction events (stored with
+  // the opposite sign from what the summary says), so only use it as a
+  // fallback when the summary gives no clear signal.
   function extractCredits(e, d, summary, eventType) {
     const text = String(summary || '');
     const ev = String(eventType || '').toLowerCase();
@@ -648,20 +657,14 @@
     if (m) {
       const amt = parseInt(m[1].replace(/,/g, ''), 10);
       if (!isNaN(amt) && amt > 0) {
-        let sign = 1;
-        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || ev === 'buy') {
-          sign = -1;
-        } else if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || ev === 'sell') {
-          sign = 1;
+        if (/(^|[^a-z])(buy|bought|purchase|purchased|spent|withdraw|paid|cost|fee)/i.test(text) || /(paid|withdraw|cost|fee|maintenance|refuel)$/i.test(ev)) {
+          return -amt;
         }
-        // If summary is ambiguous, use structured credit field as tiebreaker.
-        if (sign === 1 && typeof d.credits === 'number' && d.credits < 0) {
-          return d.credits;
+        if (/(^|[^a-z])(sell|sold|received|earned|reward|income|gain)/i.test(text) || /(revenue|deposit|listing_fee|rented)$/i.test(ev)) {
+          return amt;
         }
-        if (sign === -1 && typeof d.credits === 'number' && d.credits > 0) {
-          return d.credits;
-        }
-        return sign * amt;
+        // Summary has an amount but no clear direction word — fall through
+        // to structured fields as a last resort.
       }
     }
     if (typeof d.credits === 'number') return d.credits;
@@ -686,6 +689,11 @@
     const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
     const excludeExchangeFill = document.getElementById('faExcludeExchangeFill').checked;
     const excludePassengerFare = document.getElementById('faExcludePassengerFare').checked;
+    const excludeFactionDeposit = document.getElementById('faExcludeFactionDeposit').checked;
+    const excludeFactionWithdrawal = document.getElementById('faExcludeFactionWithdrawal').checked;
+    const excludeFactionRent = document.getElementById('faExcludeFactionRent').checked;
+    const excludeFactionMaintenance = document.getElementById('faExcludeFactionMaintenance').checked;
+    const excludeFactionRevenue = document.getElementById('faExcludeFactionRevenue').checked;
     filteredEntries = rawEntries.filter(e => {
       if (activeCat && e.category !== activeCat) return false;
       if (activeEventType && e.eventType !== activeEventType) return false;
@@ -693,6 +701,11 @@
       if (excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) return false;
       if (excludeExchangeFill && e.eventType.includes('exchange_fill')) return false;
       if (excludePassengerFare && e.eventType.includes('passenger_fare')) return false;
+      if (excludeFactionDeposit && e.category === 'faction' && e.eventType.includes('deposit')) return false;
+      if (excludeFactionWithdrawal && e.category === 'faction' && e.eventType.includes('withdrawal')) return false;
+      if (excludeFactionRent && e.category === 'faction' && (e.eventType.includes('rent_paid') || e.eventType.includes('rent_received'))) return false;
+      if (excludeFactionMaintenance && e.category === 'faction' && e.eventType.includes('maintenance_paid')) return false;
+      if (excludeFactionRevenue && e.category === 'faction' && (e.eventType.includes('station_revenue') || e.eventType.includes('listing_fee_earned'))) return false;
       return true;
     });
     creditsIn = 0;
@@ -808,12 +821,22 @@
       summaryEl.style.display = 'block';
       const excludeGifts = document.getElementById('faExcludeGifts').checked;
       const excludeFactionWithdraw = document.getElementById('faExcludeFactionWithdraw').checked;
+      const excludeFactionDeposit = document.getElementById('faExcludeFactionDeposit').checked;
+      const excludeFactionWithdrawal = document.getElementById('faExcludeFactionWithdrawal').checked;
+      const excludeFactionRent = document.getElementById('faExcludeFactionRent').checked;
+      const excludeFactionMaintenance = document.getElementById('faExcludeFactionMaintenance').checked;
+      const excludeFactionRevenue = document.getElementById('faExcludeFactionRevenue').checked;
       const botStats = {};
       for (const e of rawEntries) {
         const bot = e.bot || 'unknown';
         if (!botStats[bot]) botStats[bot] = { in: 0, out: 0 };
         const include = !(excludeGifts && e.category === 'trading' && (e.eventType.includes('gift_sent') || e.eventType.includes('gift_received'))) &&
-                        !(excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw'));
+                        !(excludeFactionWithdraw && e.category === 'faction' && e.eventType.includes('withdraw')) &&
+                        !(excludeFactionDeposit && e.category === 'faction' && e.eventType.includes('deposit')) &&
+                        !(excludeFactionWithdrawal && e.category === 'faction' && e.eventType.includes('withdrawal')) &&
+                        !(excludeFactionRent && e.category === 'faction' && (e.eventType.includes('rent_paid') || e.eventType.includes('rent_received'))) &&
+                        !(excludeFactionMaintenance && e.category === 'faction' && e.eventType.includes('maintenance_paid')) &&
+                        !(excludeFactionRevenue && e.category === 'faction' && (e.eventType.includes('station_revenue') || e.eventType.includes('listing_fee_earned')));
         if (include) {
           if (e.credits > 0) botStats[bot].in += e.credits;
           else if (e.credits < 0) botStats[bot].out += Math.abs(e.credits);
@@ -880,6 +903,17 @@
 
   document.getElementById('faUseFactionId').addEventListener('change', () => {
     useFactionId = document.getElementById('faUseFactionId').checked;
+    const personal = document.getElementById('faFiltersPersonal');
+    const faction = document.getElementById('faFiltersFaction');
+    if (useFactionId) {
+      personal.style.display = 'none';
+      faction.style.display = 'flex';
+    } else {
+      personal.style.display = 'flex';
+      faction.style.display = 'none';
+    }
+    applyFilter();
+    renderResults();
   });
 
   document.getElementById('faStartPageInput').addEventListener('input', () => {

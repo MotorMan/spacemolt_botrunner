@@ -1170,38 +1170,42 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
         yield `test_wormhole_${poi.id}`;
         const jumpResp = await bot.exec("jump", { target_poi: poi.id });
-        if (!jumpResp.error) {
-          const r = jumpResp.result as Record<string, unknown> | undefined;
-          if (r && r.action === "jumped") {
-            // from_system/system are display names ("Alzirr"); the map is keyed
-            // by ids ("alzirr"), so never feed a name in as a system id.
-            const fromSystemName = (r.from_system as string) || systemId;
-            const exitPoi = (r.poi as string) || poi.id;
-            const destSystemName = (r.system as string) || "";
-            // bot.system is already updated to the arrival system by the jump.
-            const destSystemId = (r.system_id as string)
-              || (bot.system && bot.system !== systemId ? bot.system : "");
-            ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
-            if (destSystemId) {
-              mapStore.registerWormhole(destSystemId, {
-                id: exitPoi,
-                name: exitPoi,
-                exit_system_id: destSystemId,
-                exit_system_name: destSystemName || destSystemId,
-                exit_poi_id: exitPoi,
-                exit_poi_name: exitPoi,
-                // The entrance is the system we just left, not wherever the
-                // bot happens to be standing now.
-                destination_system_id: systemId,
-                destination_system_name: fromSystemName,
-              });
-            } else {
-              ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
-            }
-            // Mark both entrance and exit POIs explored
-            mapStore.markExplored(systemId, poi.id);
-            if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
+        if (jumpResp.error) {
+          ctx.log("warn", `Wormhole ${poi.id} jump failed: ${jumpResp.error.message} — marking POI explored and moving on`);
+          mapStore.markExplored(systemId, poi.id);
+          await bot.refreshLocation();
+          continue;
+        }
+        const r = jumpResp.result as Record<string, unknown> | undefined;
+        if (r && r.action === "jumped") {
+          // from_system/system are display names ("Alzirr"); the map is keyed
+          // by ids ("alzirr"), so never feed a name in as a system id.
+          const fromSystemName = (r.from_system as string) || systemId;
+          const exitPoi = (r.poi as string) || poi.id;
+          const destSystemName = (r.system as string) || "";
+          // bot.system is already updated to the arrival system by the jump.
+          const destSystemId = (r.system_id as string)
+            || (bot.system && bot.system !== systemId ? bot.system : "");
+          ctx.log("info", `🌌 Wormhole jumped: ${fromSystemName} -> ${destSystemName || destSystemId} (${exitPoi})`);
+          if (destSystemId) {
+            mapStore.registerWormhole(destSystemId, {
+              id: exitPoi,
+              name: exitPoi,
+              exit_system_id: destSystemId,
+              exit_system_name: destSystemName || destSystemId,
+              exit_poi_id: exitPoi,
+              exit_poi_name: exitPoi,
+              // The entrance is the system we just left, not wherever the
+              // bot happens to be standing now.
+              destination_system_id: systemId,
+              destination_system_name: fromSystemName,
+            });
+          } else {
+            ctx.log("warn", `Wormhole ${poi.id} jumped but no destination system id was reported — not recording it`);
           }
+          // Mark both entrance and exit POIs explored
+          mapStore.markExplored(systemId, poi.id);
+          if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
         }
         // Refresh location after wormhole jump
         await bot.refreshLocation();
@@ -3936,8 +3940,6 @@ async function findSystemsNeedingExploration(
     
     // Skip current system
     if (sysLower === currentSystem.toLowerCase()) continue;
-    // Skip already visited in this session
-    if (visitedSystems.has(sys.id)) continue;
     // Skip systems recently explored by other bots (5 min cooldown)
     if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
       if (recentSet.has(sysLower)) continue;
@@ -3949,6 +3951,35 @@ async function findSystemsNeedingExploration(
 
     const distance = distInfo.distance;
     const route = distInfo.route;
+
+    // Check if any POI in this system needs exploring or refreshing
+    const targetSys = mapStore.getSystem(sys.id);
+    const sysPois = targetSys?.pois ?? [];
+    let needsExploration = false;
+    let oldestPoiMins = Infinity;
+
+    if (sysPois.length === 0) {
+      // System has no known POIs — needs exploration
+      needsExploration = true;
+    } else {
+      for (const poi of sysPois) {
+        const minsAgo = mapStore.minutesSinceExplored(sys.id, poi.id);
+        if (minsAgo === Infinity) {
+          needsExploration = true; // Never explored
+          oldestPoiMins = Infinity;
+          break;
+        }
+        const isStation = !!(poi.has_base || poi.base_id || (poi.type || "").toLowerCase() === "station");
+        const threshold = isStation ? STATION_REFRESH_MINS : RESOURCE_REFRESH_MINS;
+        if (minsAgo >= threshold) {
+          needsExploration = true;
+        }
+        if (minsAgo < oldestPoiMins) oldestPoiMins = minsAgo;
+      }
+    }
+
+    // Skip systems that are fully explored and fresh
+    if (!needsExploration && sys.visited !== false) continue;
 
     // Determine priority: unvisited first, then all others for revisit
     let priority: "unvisited" | "revisit";

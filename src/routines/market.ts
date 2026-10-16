@@ -9,6 +9,7 @@ import {
 } from "../market_local_source.js";
 import { marketDetailsStore, type MarketOrderDetail } from "../marketdetailsstore.js";
 import { updateShipListings } from "../shipsforsale.js";
+import { livePassengers } from "../livePassengers.js";
 import { record as recordMarketSnapshot } from "../marketSnapshotStore.js";
 import { loadSettings } from "../web/server.js";
 import { readSellOutcome } from "./sellOutcome.js";
@@ -372,6 +373,46 @@ async function tryProcessSellableItems(
   }
 }
 
+function parseMarketStationPassengers(result: unknown): {
+  station: string;
+  waiting: Array<{
+    citizen_id: string;
+    name: string;
+    class: string;
+    citizenship: string;
+    destination: string;
+    destination_name: string;
+    destination_system?: string;
+    bio?: string;
+    estimated_fare?: number;
+  }>;
+  count: number;
+} | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, unknown>;
+  let inner = r.structuredContent && typeof r.structuredContent === "object"
+    ? (r.structuredContent as Record<string, unknown>)
+    : r;
+  const waiting = Array.isArray(inner.waiting) ? (inner.waiting as Array<Record<string, unknown>>) : [];
+  return {
+    station: (inner.station as string) || "",
+    waiting: waiting.map(p => ({
+      citizen_id: (p.citizen_id as string) || "",
+      name: (p.name as string) || "",
+      class: (p.class as string) || "economy",
+      citizenship: (p.citizenship as string) || "",
+      destination: (p.destination as string) || "",
+      destination_name: (p.destination_name as string) || "",
+      destination_system: (p.destination_system as string) || undefined,
+      bio: (p.bio as string) || undefined,
+      estimated_fare: typeof (p as Record<string, unknown>).estimated_fare === "number"
+        ? (p as Record<string, unknown>).estimated_fare as number
+        : undefined,
+    })),
+    count: (inner.count as number) || waiting.length,
+  };
+}
+
 export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
   let lastBaseId: string | null = null;
@@ -379,7 +420,9 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let marketUpdateCb: ((entry: import("../marketstreamstore.js").MarketStreamEntry | null) => void) | null = null;
   let lastShipBrowseAt = 0;
   let lastCreditDepositAt = 0;
+  let lastPassengerCheckAt = 0;
   const SHIP_BROWSE_INTERVAL_MS = 10 * 60 * 1000;
+  const PASSENGER_CHECK_INTERVAL_MS = 60 * 1000;
   let wasConnected = bot.isConnected();
   const placedOrders = new Map<string, { price: number; quantity: number }>();
 
@@ -596,6 +639,49 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       lastBaseId = nextBaseId;
+    }
+
+    // Periodically record the passengers waiting at this station into the
+    // live passenger roster (data/livePassengers.json) so the civilian
+    // transport routine knows who is available, where, and by name.
+    if (bot.system && bot.poi && Date.now() - lastPassengerCheckAt >= PASSENGER_CHECK_INTERVAL_MS) {
+      try {
+        yield `list_station_passengers_${bot.poi}`;
+        const resp = await bot.exec("list_station_passengers");
+        if (!resp.error && resp.result) {
+          const parsed = parseMarketStationPassengers(resp.result);
+          if (parsed) {
+            const at = {
+              systemId: bot.system,
+              stationId: bot.poi,
+              stationName: parsed.station || bot.poi,
+            };
+            let newPassengers = 0;
+            for (const p of parsed.waiting) {
+              const prev = livePassengers.get(p.citizen_id);
+              livePassengers.registerSeen(
+                {
+                  citizenId: p.citizen_id,
+                  name: p.name,
+                  accommodationClass: p.class as "economy" | "business" | "first",
+                  citizenship: p.citizenship,
+                  destination: p.destination,
+                  destinationName: p.destination_name,
+                  destinationSystem: p.destination_system,
+                  fare: p.estimated_fare ?? 0,
+                  bio: p.bio,
+                },
+                at,
+              );
+              if (!prev) newPassengers++;
+            }
+            ctx.log("info", `Live passengers: ${parsed.count} waiting at ${bot.poi} (${newPassengers} new), ${livePassengers.getCount()} tracked overall`);
+          }
+        }
+      } catch (e) {
+        ctx.log("warn", `Live passenger check failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      lastPassengerCheckAt = Date.now();
     }
 
     if (Date.now() - lastShipBrowseAt >= SHIP_BROWSE_INTERVAL_MS) {

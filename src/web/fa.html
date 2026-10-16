@@ -265,7 +265,9 @@
     const box = document.getElementById('faFactionIdBox');
     const idEl = document.getElementById('faFactionId');
     const bot = getSelectedBot();
-    const faction = bot && bot.faction ? bot.faction : '';
+    // Prefer a faction ID already resolved via faction_info; fall back to
+    // bot.faction (from get_status) for the display.
+    const faction = selectedBotFaction || (bot && bot.faction ? bot.faction : '');
     selectedBotFaction = faction;
     if (faction) {
       box.style.display = 'flex';
@@ -437,19 +439,23 @@
     const params = {};
     if (useFactionId) {
       if (!selectedBotFaction) {
-        // Faction not yet known — fetch get_status to populate bot.faction, then retry.
+        // Resolve the bot's own faction ID via faction_info (bot.faction may
+        // not be populated from get_status on library-backed bots).
         pendingLoad = false;
         document.getElementById('faLoadBtn').disabled = false;
         document.getElementById('faCooldown').style.display = 'none';
-        setFaStatus('Fetching bot status to resolve faction ID...', false, true);
-        sendExecWithRetry(bot, 'get_status', {}, (result) => {
+        setFaStatus('Resolving bot faction ID...', false, true);
+        sendExecWithRetry(bot, 'faction_info', {}, (result) => {
           if (result.error) {
             setFaStatus('Error resolving faction: ' + esc(result.error), true);
             return;
           }
+          const data = result.data || {};
+          const factionId = data.id || data.faction_id;
+          selectedBotFaction = factionId;
           updateFactionIdDisplay();
           if (!selectedBotFaction) {
-            setFaStatus('Selected bot has no faction ID. Choose a bot in a faction.', true);
+            setFaStatus('Selected bot is not in a faction. Choose a bot in a faction.', true);
             return;
           }
           loadActionLog();
@@ -534,15 +540,18 @@
         pendingLoad = false;
         document.getElementById('faLoadPagesBtn').disabled = false;
         document.getElementById('faCooldown').style.display = 'none';
-        setFaStatus('Fetching bot status to resolve faction ID...', false, true);
-        sendExecWithRetry(singleBot, 'get_status', {}, (result) => {
+        setFaStatus('Resolving bot faction ID...', false, true);
+        sendExecWithRetry(singleBot, 'faction_info', {}, (result) => {
           if (result.error) {
             setFaStatus('Error resolving faction: ' + esc(result.error), true);
             return;
           }
+          const data = result.data || {};
+          const factionId = data.id || data.faction_id;
+          selectedBotFaction = factionId;
           updateFactionIdDisplay();
           if (!selectedBotFaction) {
-            setFaStatus('Selected bot has no faction ID. Choose a bot in a faction.', true);
+            setFaStatus('Selected bot is not in a faction. Choose a bot in a faction.', true);
             return;
           }
           loadMultiplePages();

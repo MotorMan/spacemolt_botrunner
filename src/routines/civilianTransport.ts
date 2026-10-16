@@ -30,6 +30,7 @@ import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
+import { passengersLounge, LoungePassenger, PassengersLoungeStore } from "../passengersLounge.js";
 
 // HTML markup for log lines rendered in the web UI.
 const HTML_RESET = "</span>";
@@ -581,7 +582,7 @@ interface TransportPassenger {
 
 interface TransportState {
   botUsername: string;
-  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge";
+  status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed" | "returning_to_lounge" | "delivering_lounge_passenger";
   shipId: string;
   shipName: string;
   customName?: string;
@@ -834,7 +835,7 @@ function isValidTransportState(state: unknown): state is TransportState {
   if (typeof s.shipId !== "string" || s.shipId.length === 0) return false;
   const berths = s.berths as Record<string, number> | undefined;
   if (!berths || (berths.economy + berths.business + berths.first) <= 0) return false;
-  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge"]);
+  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "returning_to_lounge", "delivering_lounge_passenger"]);
   if (typeof s.status !== "string" || !validStatuses.has(s.status)) return false;
   return true;
 }
@@ -2527,7 +2528,7 @@ if (state && state.status !== "idle") {
                   citizenId: p.citizen_id || p.name,
                   name: p.name,
                   accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
-                  citizenship: p.citizenship,
+          citizenship: p.citizenship || "",
                   destination: p.destination,
                   destinationName: p.destination_name,
                   destinationSystem: (p as any).destinationSystem || p.destination_system,
@@ -2941,7 +2942,38 @@ if (state && state.status !== "idle") {
         continue;
       }
 
-      ctx.log("transport", `Lounge transport: successfully unloaded all passengers to Transit Lounge`);
+      // Track each passenger in the lounge store for future delivery
+      for (const p of state.onboardPassengers) {
+        const loungeEntry = PassengersLoungeStore.createLoungePassenger({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem || "",
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+        });
+        passengersLounge.addOrUpdatePassenger(loungeEntry);
+        civilianStore.addOrUpdate({
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship || "",
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem,
+          fare: p.fare || 0,
+          bio: p.bio || "",
+          loadedAt: p.loadedAt,
+          status: "boarded",
+        });
+        ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
+      }
+
+      ctx.log("transport", `Lounge transport: successfully unloaded ${state.onboardPassengers.length} passengers to Transit Lounge`);
       state.onboardPassengers = [];
       state.route = [];
       state.currentRouteIndex = 0;
@@ -2954,6 +2986,154 @@ if (state && state.status !== "idle") {
       await collectFuelCells(ctx, settings);
 
       await ctx.sleep(5000);
+      continue;
+    }
+
+    // ── Lounge Delivery Mode ──
+    // Check for lounge passengers whose timer has expired and deliver them
+    const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
+    if (expiredLoungePassengers.length > 0 && settings.mode === "lounge_transport") {
+      ctx.log("transport", `Lounge delivery: ${expiredLoungePassengers.length} passenger(s) ready for delivery from Transit Lounge`);
+      // Pick up the first expired passenger and deliver to their destination
+      const p = expiredLoungePassengers[0];
+      const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+      if (resolved) {
+        state.status = "delivering_lounge_passenger";
+        state.onboardPassengers = [{
+          citizenId: p.citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: null,
+          loadedAt: p.checkedInAt,
+          status: "boarded",
+        }];
+        state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
+        state.currentRouteIndex = 0;
+        state.currentDestination = resolved.poiName;
+        state.pickupStation = settings.homeStation || null;
+        state.pickupSystem = settings.homeSystem || null;
+        saveTransportState(state);
+        ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
+        continue;
+      } else {
+        ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
+        passengersLounge.markDelivered(p.citizenId);
+      }
+    }
+
+    if (state.status === "delivering_lounge_passenger") {
+      if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
+        // Route complete, clean up
+        const p = state.onboardPassengers[0];
+        if (p) {
+          passengersLounge.markDelivered(p.citizenId);
+          civilianStore.addOrUpdate({
+            citizenId: p.citizenId,
+            name: p.name,
+            accommodationClass: p.accommodationClass,
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destinationName,
+            destinationSystem: p.destinationSystem,
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: p.loadedAt,
+            status: "delivered",
+          });
+          logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", state.currentDestination || "");
+          recordTransportedPassenger(bot.username, p.name);
+          ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${state.currentDestination}`);
+        }
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = null;
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
+
+      const waypoint = state.route[state.currentRouteIndex];
+      ctx.log("transport", `Lounge delivery: waypoint ${state.currentRouteIndex + 1}/${state.route.length}: ${waypoint.system} / ${waypoint.poiName}`);
+
+      if (waypoint.system !== bot.system) {
+        ctx.log("transport", `Lounge delivery: navigating to system ${waypoint.system}`);
+        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
+        if (!ok) {
+          ctx.log("transport", `Lounge delivery: FAILED to navigate to system ${waypoint.system}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      if (bot.poi !== waypoint.poi) {
+        ctx.log("transport", `Lounge delivery: traveling to poi ${waypoint.poi}`);
+        const tr = await bot.exec("travel", { target_poi: waypoint.poi });
+        if (tr.error) {
+          ctx.log("transport", `Lounge delivery: Travel to ${waypoint.poi} failed: ${tr.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        await checkAndRecloak(ctx, settings);
+        await depositExcessCredits(ctx, settings);
+        continue;
+      }
+
+      // Dock at destination
+      if (!bot.docked) {
+        ctx.log("transport", `Lounge delivery: docking at ${waypoint.poiName}`);
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+          ctx.log("error", `Lounge delivery: Dock failed: ${dockResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        await bot.refreshStatus();
+        continue;
+      }
+
+      // Unload the lounge passenger at their destination
+      const p = state.onboardPassengers[0];
+      if (p) {
+        ctx.log("transport", `Lounge delivery: unloading ${p.name} at ${waypoint.poiName}`);
+        const unloadResp = await bot.exec("unload_passenger", { id: p.citizenId || p.name });
+        if (unloadResp.error) {
+          ctx.log("error", `Lounge delivery: Unload failed: ${unloadResp.error.message}`);
+        } else {
+          passengersLounge.markDelivered(p.citizenId);
+          civilianStore.addOrUpdate({
+            citizenId: p.citizenId,
+            name: p.name,
+            accommodationClass: p.accommodationClass,
+            citizenship: p.citizenship || "",
+            destination: p.destination,
+            destinationName: p.destinationName,
+            destinationSystem: p.destinationSystem,
+            fare: p.fare || 0,
+            bio: p.bio || "",
+            loadedAt: p.loadedAt,
+            status: "delivered",
+          });
+          recordTransportedPassenger(bot.username, p.name);
+          logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", waypoint.poi);
+          ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${waypoint.poiName}`);
+        }
+      }
+
+      state.currentRouteIndex += 1;
+      saveTransportState(state);
       continue;
     }
 

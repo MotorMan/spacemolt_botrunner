@@ -1450,7 +1450,8 @@ if (nearbyResp.result && typeof nearbyResp.result === "object") {
       fledFromSystems,
       visitedSystems,
       currentSettings.ignoreBlacklistWhenCloaked,
-      bot.isCloaked
+      bot.isCloaked,
+      lastSystem
     );
 
     if (systemsNeedingExploration.length === 0) {
@@ -3881,13 +3882,15 @@ async function findSystemsNeedingExploration(
   fledFromSystems: Set<string>,
   visitedSystems: Set<string>,
   ignoreBlacklistWhenCloaked: boolean,
-  isCloaked: boolean
+  isCloaked: boolean,
+  lastSystem: string | null
 ): Promise<Array<{
   id: string;
   name: string;
   distance: number;
   priority: "unvisited" | "revisit";
   route: string[];
+  oldestPoiMins: number;
 }>> {
   const currentSystem = ctx.bot.system;
   if (!currentSystem) return [];
@@ -3923,6 +3926,9 @@ async function findSystemsNeedingExploration(
   const recentSystems = explorerHistoryStore.getRecentSystemIds(5 * 60 * 1000);
   const recentSet = new Set(recentSystems.map(s => s.toLowerCase()));
 
+  // Short cooldown so we don't instantly re-visit the system we just left
+  const RE_VISIT_COOLDOWN_MINS = 5;
+
   // Get all systems from mapStore
   const allSystems = mapStore.getSystems();
 
@@ -3933,6 +3939,7 @@ async function findSystemsNeedingExploration(
     priority: "unvisited" | "revisit"; 
     distance: number; 
     route: string[];
+    oldestPoiMins: number;
   }> = [];
 
   for (const sys of allSystems) {
@@ -3940,6 +3947,8 @@ async function findSystemsNeedingExploration(
     
     // Skip current system
     if (sysLower === currentSystem.toLowerCase()) continue;
+    // Skip the system we just came from (prevents ping-pong between two systems)
+    if (lastSystem && sysLower === lastSystem.toLowerCase()) continue;
     // Skip systems recently explored by other bots (5 min cooldown)
     if (!(isCloaked && ignoreBlacklistWhenCloaked)) {
       if (recentSet.has(sysLower)) continue;
@@ -3956,30 +3965,34 @@ async function findSystemsNeedingExploration(
     const targetSys = mapStore.getSystem(sys.id);
     const sysPois = targetSys?.pois ?? [];
     let needsExploration = false;
-    let oldestPoiMins = Infinity;
+    let maxPoiMins = 0; // Track the STALEST POI (max minutes ago)
 
     if (sysPois.length === 0) {
       // System has no known POIs — needs exploration
       needsExploration = true;
+      maxPoiMins = Infinity;
     } else {
       for (const poi of sysPois) {
         const minsAgo = mapStore.minutesSinceExplored(sys.id, poi.id);
         if (minsAgo === Infinity) {
           needsExploration = true; // Never explored
-          oldestPoiMins = Infinity;
+          maxPoiMins = Infinity;
           break;
         }
+        if (minsAgo > maxPoiMins) maxPoiMins = minsAgo;
         const isStation = !!(poi.has_base || poi.base_id || (poi.type || "").toLowerCase() === "station");
         const threshold = isStation ? STATION_REFRESH_MINS : RESOURCE_REFRESH_MINS;
         if (minsAgo >= threshold) {
           needsExploration = true;
         }
-        if (minsAgo < oldestPoiMins) oldestPoiMins = minsAgo;
       }
     }
 
-    // Skip systems that are fully explored and fresh
+    // Skip systems that are fully explored and fresh (and not server-unvisited)
     if (!needsExploration && sys.visited !== false) continue;
+
+    // Skip systems we visited very recently (cooldown to prevent ping-pong)
+    if (maxPoiMins > 0 && maxPoiMins < RE_VISIT_COOLDOWN_MINS && sys.visited !== false) continue;
 
     // Determine priority: unvisited first, then all others for revisit
     let priority: "unvisited" | "revisit";
@@ -3994,7 +4007,8 @@ async function findSystemsNeedingExploration(
       name: sys.name || sys.id, 
       priority, 
       distance, 
-      route 
+      route,
+      oldestPoiMins: maxPoiMins
     });
   }
 
@@ -4003,10 +4017,15 @@ async function findSystemsNeedingExploration(
     return [];
   }
 
-  // Sort: unvisited priority first, then revisit; within each tier, nearest first
+  // Sort: unvisited priority first, then revisit; 
+  // within each tier, most stale POI first (highest oldestPoiMins), then nearest
   candidates.sort((a, b) => {
     if (a.priority !== b.priority) {
       return a.priority === "unvisited" ? -1 : 1;
+    }
+    // Most stale first (Infinity sorts to top)
+    if (b.oldestPoiMins !== a.oldestPoiMins) {
+      return b.oldestPoiMins - a.oldestPoiMins;
     }
     return a.distance - b.distance;
   });

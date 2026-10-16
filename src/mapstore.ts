@@ -926,7 +926,17 @@ class MapStore {
 
   /** Get minutes since a POI was last explored. Returns Infinity if never explored. */
   minutesSinceExplored(systemId: string, poiId: string): number {
-    const sys = this.data.systems[systemId];
+    // Case-insensitive system lookup (keys may differ in case from the passed id)
+    let sys = this.data.systems[systemId];
+    if (!sys) {
+      const lower = systemId.toLowerCase();
+      for (const key of Object.keys(this.data.systems)) {
+        if (key.toLowerCase() === lower) {
+          sys = this.data.systems[key];
+          break;
+        }
+      }
+    }
     if (!sys) return Infinity;
 
     const poi = sys.pois.find((p) => p.id === poiId);

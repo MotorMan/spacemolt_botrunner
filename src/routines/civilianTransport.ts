@@ -600,7 +600,6 @@ interface TransportState {
   lastUpdated: string;
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
-  visitedEmpireStations: string[];
   needsTravel: boolean;
 }
 
@@ -722,68 +721,6 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     minFuelCellsToDepart: Number((t.minFuelCellsToDepart as number) ?? 6),
     mode: (botOverrides.mode as CivilianTransportMode) || (t.mode as CivilianTransportMode) || "normal",
   };
-}
-
-// ── Empire station mapping ───────────────────────────────────
-
-interface EmpireStation {
-  systemId: string;
-  poiId: string;
-  poiName: string;
-}
-
-const EMPIRE_STATIONS: Record<string, EmpireStation[]> = {
-  solarian: [
-    { systemId: "sol", poiId: "sol_central", poiName: "Confederacy Central Command" },
-    { systemId: "alpha_centauri", poiId: "alpha_centauri_colonial_station", poiName: "Alpha Centauri Colonial Station" },
-    { systemId: "sirius", poiId: "sirius_observatory_station", poiName: "Sirius Observatory Station" },
-    { systemId: "nova_terra", poiId: "nova_terra_central", poiName: "Nova Terra Central" },
-    { systemId: "procyon", poiId: "procyon_colonial_station", poiName: "Procyon Colonial Station" },
-  ],
-  voidborn: [
-    { systemId: "nexus_prime", poiId: "the_core", poiName: "Central Nexus" },
-    { systemId: "node_alpha", poiId: "node_alpha_processing_station", poiName: "Node Alpha Processing Station" },
-    { systemId: "node_beta", poiId: "node_beta_industrial_station", poiName: "Node Beta Industrial Station" },
-    { systemId: "synchrony", poiId: "synchrony_hub", poiName: "Synchrony Hub" },
-    { systemId: "the_experiment", poiId: "the_experiment_research_station", poiName: "The Experiment Research Station" },
-    { systemId: "node_gamma", poiId: "node_gamma_relay_station", poiName: "Node Gamma Relay Station" },
-  ],
-  nebula: [
-    { systemId: "gold_run", poiId: "gold_run_extraction_hub", poiName: "Gold Run Extraction Hub" },
-    { systemId: "haven", poiId: "grand_exchange", poiName: "Grand Exchange Station" },
-    { systemId: "cargo_lanes", poiId: "cargo_lanes_freight_depot", poiName: "Cargo Lanes Freight Depot" },
-    { systemId: "traders_rest", poiId: "traders_rest_resort_station", poiName: "Trader's Rest Resort Station" },
-    { systemId: "the_levy", poiId: "the_levy_customs_station", poiName: "The Levy Customs Station" },
-    { systemId: "market_prime", poiId: "market_prime_exchange", poiName: "Market Prime Exchange" },
-    { systemId: "treasure_cache", poiId: "treasure_cache_trading_post", poiName: "Treasure Cache Trading Post" },
-  ],
-  crimson: [
-    { systemId: "the_rampart", poiId: "the_rampart_checkpoint", poiName: "The Rampart Checkpoint" },
-    { systemId: "the_crucible", poiId: "the_crucible_garrison", poiName: "The Crucible Garrison" },
-    { systemId: "iron_reach", poiId: "iron_reach_mining_colony", poiName: "Iron Reach Mining Colony" },
-    { systemId: "krynn", poiId: "war_citadel", poiName: "Crimson War Citadel" },
-    { systemId: "blood_forge", poiId: "blood_forge_smelting_works", poiName: "Blood Forge Smelting Works" },
-    { systemId: "ironhearth", poiId: "ironhearth_station", poiName: "Ironhearth Station" },
-    { systemId: "the_anvil", poiId: "the_anvil_arsenal", poiName: "The Anvil Arsenal" },
-  ],
-  outerrim: [
-    { systemId: "last_light", poiId: "ramens_rest", poiName: "Ramen's Rest" },
-    { systemId: "unknown_edge", poiId: "unknown_edge_waystation", poiName: "Unknown Edge Waystation" },
-    { systemId: "starfall", poiId: "starfall_salvage_station", poiName: "Starfall Salvage Station" },
-    { systemId: "void_gate", poiId: "void_gate_outpost", poiName: "Void Gate Outpost" },
-    { systemId: "deep_range", poiId: "deep_range_outpost", poiName: "Deep Range Outpost" },
-  ],
-};
-
-function getStationsForEmpire(empire: string): EmpireStation[] {
-  const lowerEmpire = empire.toLowerCase();
-  return EMPIRE_STATIONS[lowerEmpire] || [];
-}
-
-function getRandomEmpireStation(empire: string): EmpireStation | null {
-  const stations = getStationsForEmpire(empire);
-  if (stations.length === 0) return null;
-  return stations[Math.floor(Math.random() * stations.length)];
 }
 
 // ── Persistent helpers ───────────────────────────────────────
@@ -1542,97 +1479,69 @@ async function selectNextPickupStation(
   settings: CivilianTransportSettings,
 ): Promise<{ system: string; poi: string; poiName: string } | null> {
   const { bot } = ctx;
-  
-  let empire = bot.getEmpire();
-  
-  if (!empire && bot.poi && bot.system) {
-    const stationRef = loadStationRef();
-    const stationInfo = stationRef.by_underline_name[bot.poi.toLowerCase()] || 
-                         stationRef.by_station_id[bot.poi.toLowerCase()];
-    if (stationInfo) {
-      const systemId = stationInfo.system_id.toLowerCase();
-      for (const [emp, stations] of Object.entries(EMPIRE_STATIONS)) {
-        if (stations.some(s => s.systemId.toLowerCase() === systemId || s.poiId.toLowerCase() === bot.poi.toLowerCase())) {
-          empire = emp;
-          ctx.log("transport", `Derived empire '${emp}' from current station ${bot.poi}`);
-          break;
-        }
-      }
-    }
-  }
-  
-  if (!empire) {
-    ctx.log("transport", "Cannot determine bot's empire, falling back to nearest station search");
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
-    if (!pickup) return null;
-    return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
-  }
-
-  const empireLower = empire.toLowerCase();
-  const empireStations = getStationsForEmpire(empireLower);
-  
-  if (empireStations.length === 0) {
-    ctx.log("transport", `No known stations for empire ${empire}, falling back to nearest station search`);
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
-    if (!pickup) return null;
-    return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
-  }
 
   const currentSystem = bot.system || "";
   const currentPoi = bot.poi || "";
-  
-  const visitedStations = state.visitedEmpireStations || [];
-  const currentStationKey = `${currentSystem}:${currentPoi}`.toLowerCase();
-  
-  if (!visitedStations.includes(currentStationKey)) {
-    state.visitedEmpireStations = [...visitedStations, currentStationKey];
-    saveTransportState(state);
-  }
-  
-  const unvisitedStations = empireStations.filter(
-    s => !state.visitedEmpireStations.includes(`${s.systemId}:${s.poiId}`.toLowerCase())
-  );
-  
-  if (unvisitedStations.length > 0) {
-    const stationsWithHops = unvisitedStations.map(s => {
-      const hops = hopsToStation(currentSystem, s.systemId);
-      return { ...s, hops };
-    }).filter(s => s.hops <= settings.maxJumps);
-    
-    ctx.log("transport", `Found ${stationsWithHops.length} reachable unvisited stations out of ${unvisitedStations.length} total`);
-    
-    if (stationsWithHops.length > 0) {
-      stationsWithHops.sort((a, b) => a.hops - b.hops);
-      const next = stationsWithHops[0];
-      ctx.log("transport", `Moving to unvisited station: ${next.poiName} (${next.hops} hops)`);
-      return { system: next.systemId, poi: next.poiId, poiName: next.poiName };
+
+  if (!currentSystem) return null;
+
+  // BFS over known systems from the current location, nearest first, capped at maxJumps.
+  // Any station that isn't blacklisted is a valid pickup candidate — empire
+  // membership no longer restricts where the bot will go.
+  const blacklist = getSystemBlacklist();
+  const knownSystems = mapStore.getAllSystems();
+
+  const candidates = new Map<string, { hops: number; systemId: string }>();
+  candidates.set(currentSystem.toLowerCase(), { hops: 0, systemId: currentSystem });
+  let frontier = [currentSystem];
+  for (let depth = 1; depth <= settings.maxJumps; depth++) {
+    const nextFrontier: string[] = [];
+    for (const sys of frontier) {
+      const systemConns = knownSystems[sys]?.connections || [];
+      for (const c of systemConns) {
+        const cid = c.system_id.toLowerCase();
+        if (!candidates.has(cid) && !blacklist.includes(c.system_id)) {
+          candidates.set(cid, { hops: depth, systemId: c.system_id });
+          nextFrontier.push(c.system_id);
+        }
+      }
     }
-    
-    const fallback = unvisitedStations[0];
-    ctx.log("transport", `No unvisited stations within ${settings.maxJumps} hops, using: ${fallback.poiName}`);
-    return { system: fallback.systemId, poi: fallback.poiId, poiName: fallback.poiName };
+    frontier = nextFrontier;
+    if (frontier.length === 0) break;
   }
-  
-  ctx.log("transport", `All ${empireStations.length} empire stations visited, resetting and finding nearest from ${empireStations.length} total`);
-  state.visitedEmpireStations = [];
-  saveTransportState(state);
-  
-  let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
-  for (const s of empireStations) {
-    if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-    const dist = hopsBetweenSync(currentSystem, s.systemId);
-    if (dist < nearest.dist) {
-      nearest = { ...s, dist };
+
+  // Nearest system first. Skip the station we're already at, plus any
+  // blacklisted or pirate station.
+  const sorted = Array.from(candidates.values()).sort((a, b) => a.hops - b.hops);
+  for (const info of sorted) {
+    if (info.hops > settings.maxJumps) continue;
+    if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
+
+    const sysData = knownSystems[info.systemId];
+    if (!sysData) continue;
+
+    for (const p of sysData.pois || []) {
+      const hasBase = p.has_base || p.base_id !== null;
+      if (!hasBase) continue;
+      const poiId = p.id;
+      if (!poiId) continue;
+      if (
+        info.systemId.toLowerCase() === currentSystem.toLowerCase() &&
+        poiId.toLowerCase() === currentPoi.toLowerCase()
+      ) {
+        continue;
+      }
+      if (settings.blockPirateStations && isPirateStation(poiId)) continue;
+      if (isBlockedStation(poiId)) continue;
+
+      const poiName = (p.name || poiId) as string;
+      ctx.log("transport", `Moving to nearest station: ${poiName} (${info.hops} hops)`);
+      return { system: info.systemId, poi: poiId, poiName };
     }
   }
-  if (nearest.dist === 9999) {
-    ctx.log("transport", `No other empire stations available`);
-    return null;
-  }
-  if (nearest.dist > settings.maxJumps) {
-    ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
-  }
-  return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
+
+  ctx.log("transport", "No reachable non-blacklisted station found within maxJumps");
+  return null;
 }
 
 // ── Route planning ───────────────────────────────────────────
@@ -1714,20 +1623,6 @@ async function planTourRoute(
   return planned;
 }
 
-function hopsBetweenSync(a: string, b: string): number {
-  if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b, getSystemBlacklist());
-  if (!route) return 9999;
-  return route.length - 1;
-}
-
-function hopsToStation(a: string, b: string): number {
-  if (a.toLowerCase() === b.toLowerCase()) return 0;
-  const route = mapStore.findRoute(a, b, getSystemBlacklist());
-  if (!route) return 9999;
-  return route.length - 1;
-}
-
 function makeNewState(bot: Bot, shipId: string, shipName: string, customName: string | undefined, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
   return {
     botUsername: bot.username,
@@ -1749,7 +1644,6 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     lastUpdated: new Date().toISOString(),
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
-    visitedEmpireStations: [],
     needsTravel: false,
   };
 }

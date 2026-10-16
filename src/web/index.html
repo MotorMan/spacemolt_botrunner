@@ -37074,6 +37074,11 @@ ignoreBlacklist: document.getElementById(
     </div>
 
     <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-useLivePassengers" ${ct.useLivePassengers !== false ? "checked" : ""}> Use live passenger data to find pickup stations</label>
+      <div class="setting-hint" style="margin-top:4px">Use data/livePassengers.json (populated by the Market routine) to go directly to stations that have waiting passengers, instead of scanning the nearest empty station.</div>
+    </div>
+
+    <div style="margin-top:12px">
       <label><input type="checkbox" id="set-civilian_transport-announceDestination" ${ct.announceDestination !== false ? "checked" : ""}> Announce destinations in transport messages</label>
     </div>
 
@@ -37179,6 +37184,9 @@ ignoreBlacklist: document.getElementById(
         const allowParkInLounge =
           document.getElementById("set-civilian_transport-allowParkInLounge")
             ?.checked ?? false;
+        const useLivePassengers =
+          document.getElementById("set-civilian_transport-useLivePassengers")
+            ?.checked ?? false;
         const announceDestination =
           document.getElementById("set-civilian_transport-announceDestination")
             ?.checked ?? true;
@@ -37224,6 +37232,7 @@ ignoreBlacklist: document.getElementById(
         s.allowBusinessClass = allowBusinessClass;
         s.allowEconomyClass = allowEconomyClass;
         s.allowParkInLounge = allowParkInLounge;
+        s.useLivePassengers = useLivePassengers;
         s.announceDestination = announceDestination;
         s.disableFactionMessage = disableFactionMessage;
         s.enableCloak = enableCloak;

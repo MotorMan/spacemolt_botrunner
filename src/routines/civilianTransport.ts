@@ -683,6 +683,7 @@ interface CivilianTransportSettings {
   allowEconomyClass: boolean;
   allowParkInLounge: boolean;
   announceDestination: boolean;
+  useLivePassengers: boolean;
   disableFactionMessage: boolean;
   enableCloak: boolean;
   factionDepositThreshold: number;
@@ -718,6 +719,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
     allowParkInLounge: (t.allowParkInLounge as boolean) ?? false,
     announceDestination: (t.announceDestination as boolean) !== false,
+    useLivePassengers: (t.useLivePassengers as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
     enableCloak: (t.enableCloak as boolean) ?? false,
     factionDepositThreshold: Number((t.factionDepositThreshold as number) ?? 1000000),
@@ -1551,8 +1553,6 @@ async function selectNextPickupStation(
   }
 
   // BFS over known systems from the current location, nearest first, capped at maxJumps.
-  // Any station that isn't blacklisted is a valid pickup candidate — empire
-  // membership no longer restricts where the bot will go.
   const blacklist = getSystemBlacklist();
   const knownSystems = mapStore.getAllSystems();
 
@@ -1575,9 +1575,55 @@ async function selectNextPickupStation(
     if (frontier.length === 0) break;
   }
 
-  // Nearest system first. Skip the station we're already at, recently-visited
-  // stations (so we don't ping-pong between two neighbors), plus any blacklisted
-  // or pirate station.
+  // ── Live-passenger-first selection ─────────────────────────────────
+  // If enabled, use livePassengers.json to find stations that actually have
+  // waiting passengers, rather than bouncing to the nearest empty station.
+  if (settings.useLivePassengers) {
+    const liveCandidates: Array<{ system: string; poi: string; poiName: string; count: number; hops: number }> = [];
+
+    for (const info of Array.from(candidates.values())) {
+      if (info.hops > settings.maxJumps) continue;
+      if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
+
+      const sysData = knownSystems[info.systemId];
+      if (!sysData) continue;
+
+      for (const p of sysData.pois || []) {
+        const hasBase = p.has_base || p.base_id !== null;
+        if (!hasBase) continue;
+        const poiId = p.id;
+        if (!poiId) continue;
+        const key = stationKey(info.systemId, poiId);
+        if (key === currentKey) continue;
+        if (recentSet.has(key)) continue;
+        if (settings.blockPirateStations && isPirateStation(poiId)) continue;
+        if (isBlockedStation(poiId)) continue;
+
+        const count = livePassengers.getStationCount(info.systemId, poiId);
+        if (count > 0) {
+          liveCandidates.push({
+            system: info.systemId,
+            poi: poiId,
+            poiName: (p.name || poiId) as string,
+            count,
+            hops: info.hops,
+          });
+        }
+      }
+    }
+
+    if (liveCandidates.length > 0) {
+      // Sort by passenger count (desc), then hops (asc) — same as selectPickupStation
+      liveCandidates.sort((a, b) => b.count - a.count || a.hops - b.hops);
+      const best = liveCandidates[0];
+      ctx.log("transport", `Live passengers: moving to ${best.poiName} (${best.count} waiting, ${best.hops} hops)`);
+      return { system: best.system, poi: best.poi, poiName: best.poiName };
+    }
+
+    ctx.log("transport", "No stations with live waiting passengers within maxJumps");
+  }
+
+  // ── Fallback: nearest station scan ─────────────────────────────────
   const sorted = Array.from(candidates.values()).sort((a, b) => a.hops - b.hops);
   let skippedDueToRecency = false;
   for (const info of sorted) {
@@ -2061,6 +2107,54 @@ if (state && state.status !== "idle") {
         }
       } else if (idleStartTime !== 0) {
         idleStartTime = 0;
+      }
+
+      // ── Lounge delivery check ──
+      // When docked at home in lounge_transport mode, deliver expired lounge
+      // passengers before picking up new ones. Runs every idle cycle so it
+      // doesn't only happen on routine restart.
+      if (settings.mode === "lounge_transport" && bot.docked && isAtHomeBase(ctx, settings)) {
+        const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
+        if (expiredLoungePassengers.length > 0) {
+          const p = expiredLoungePassengers[0];
+          if (isBlockedStation(p.destination, p.destinationName)) {
+            ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
+            passengersLounge.markDelivered(p.citizenId);
+            await ctx.sleep(5000);
+            continue;
+          }
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+          if (resolved) {
+            state.status = "delivering_lounge_passenger";
+            state.onboardPassengers = [{
+              citizenId: p.citizenId,
+              name: p.name,
+              accommodationClass: p.accommodationClass,
+              citizenship: p.citizenship,
+              destination: p.destination,
+              destinationName: p.destinationName,
+              destinationSystem: p.destinationSystem,
+              fare: p.fare,
+              bio: p.bio,
+              routeData: null,
+              loadedAt: p.checkedInAt,
+              status: "boarded",
+            }];
+            state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
+            state.currentRouteIndex = 0;
+            state.currentDestination = resolved.poiName;
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            saveTransportState(state);
+            ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
+            continue;
+          } else {
+            ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
+            passengersLounge.markDelivered(p.citizenId);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
       }
 
       // Need to find passengers and load up
@@ -2939,13 +3033,26 @@ if (state && state.status !== "idle") {
       if (!bot.docked) {
         ctx.log("transport", `Lounge transport: docking at home station ${homeStation}`);
         const dockResp = await bot.exec("dock");
-        if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-          ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-          await ctx.sleep(30000);
-          continue;
+        if (dockResp.error) {
+          const msg = dockResp.error.message || "";
+          if (msg.toLowerCase().includes("already")) {
+            // Game already considers us docked; sync the flag and proceed.
+            bot.docked = true;
+          } else {
+            ctx.log("error", `Dock failed: ${msg}`);
+            await ctx.sleep(30000);
+            continue;
+          }
         }
         await bot.refreshStatus();
-        continue;
+        if (!bot.docked) {
+          // Still not docked after the dock command — wait for state to settle
+          // before retrying, to avoid a tight dock loop.
+          ctx.log("transport", `Dock issued but not yet docked at ${homeStation}, waiting...`);
+          await ctx.sleep(5000);
+          continue;
+        }
+        // Fall through to unload now that we're confirmed docked.
       }
 
       // Unload all passengers to lounge

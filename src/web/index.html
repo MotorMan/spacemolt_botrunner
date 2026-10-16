@@ -37069,6 +37069,11 @@ ignoreBlacklist: document.getElementById(
     </div>
 
     <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-allowParkInLounge" ${ct.allowParkInLounge ? "checked" : ""}> Pick up passengers to blacklisted destinations for Transit Lounge parking</label>
+      <div class="setting-hint" style="margin-top:4px">In Lounge Transport mode, pick up passengers whose destination is blacklisted and park them in the home Transit Lounge instead of skipping them. They will NOT be delivered to blacklisted destinations.</div>
+    </div>
+
+    <div style="margin-top:12px">
       <label><input type="checkbox" id="set-civilian_transport-announceDestination" ${ct.announceDestination !== false ? "checked" : ""}> Announce destinations in transport messages</label>
     </div>
 
@@ -37171,6 +37176,9 @@ ignoreBlacklist: document.getElementById(
         const allowEconomyClass =
           document.getElementById("set-civilian_transport-allowEconomyClass")
             ?.checked ?? true;
+        const allowParkInLounge =
+          document.getElementById("set-civilian_transport-allowParkInLounge")
+            ?.checked ?? false;
         const announceDestination =
           document.getElementById("set-civilian_transport-announceDestination")
             ?.checked ?? true;
@@ -37215,6 +37223,7 @@ ignoreBlacklist: document.getElementById(
         s.allowFirstClass = allowFirstClass;
         s.allowBusinessClass = allowBusinessClass;
         s.allowEconomyClass = allowEconomyClass;
+        s.allowParkInLounge = allowParkInLounge;
         s.announceDestination = announceDestination;
         s.disableFactionMessage = disableFactionMessage;
         s.enableCloak = enableCloak;

@@ -681,6 +681,7 @@ interface CivilianTransportSettings {
   allowFirstClass: boolean;
   allowBusinessClass: boolean;
   allowEconomyClass: boolean;
+  allowParkInLounge: boolean;
   announceDestination: boolean;
   disableFactionMessage: boolean;
   enableCloak: boolean;
@@ -715,6 +716,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowFirstClass: (t.allowFirstClass as boolean) !== false,
     allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
+    allowParkInLounge: (t.allowParkInLounge as boolean) ?? false,
     announceDestination: (t.announceDestination as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
     enableCloak: (t.enableCloak as boolean) ?? false,
@@ -2257,9 +2259,16 @@ if (state && state.status !== "idle") {
           continue;
         }
         if (isBlockedStation(p.destination, p.destination_name)) {
-          ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
-          skipped.push({ name: p.name, reason: `blacklisted station ${p.destination_name}` });
-          continue;
+          // In lounge_transport mode with allowParkInLounge, pick up passengers
+          // bound for blacklisted destinations to park them in the Transit Lounge
+          // instead of skipping them entirely. Delivery to blacklisted destinations
+          // remains blocked by the delivery blacklist check below.
+          if (!(settings.mode === "lounge_transport" && settings.allowParkInLounge)) {
+            ctx.log("transport", `Skipping passenger to blacklisted station: ${p.name} -> ${p.destination_name}`);
+            skipped.push({ name: p.name, reason: `blacklisted station ${p.destination_name}` });
+            continue;
+          }
+          // Fall through: include this passenger for lounge parking
         }
         if (cls === "first" && !settings.allowFirstClass) {
           if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (first disabled): ${p.name}`);
@@ -3031,6 +3040,13 @@ if (state && state.status !== "idle") {
       ctx.log("transport", `Lounge delivery: ${expiredLoungePassengers.length} passenger(s) ready for delivery from Transit Lounge`);
       // Pick up the first expired passenger and deliver to their destination
       const p = expiredLoungePassengers[0];
+      // Never deliver a passenger to a blacklisted destination — they stay in
+      // the lounge (or are dropped from tracking) rather than being stranded.
+      if (isBlockedStation(p.destination, p.destinationName)) {
+        ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
+        passengersLounge.markDelivered(p.citizenId);
+        continue;
+      }
       const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
       if (resolved) {
         state.status = "delivering_lounge_passenger";

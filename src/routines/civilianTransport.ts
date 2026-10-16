@@ -31,6 +31,7 @@ import { catalogStore } from "../catalogstore.js";
 import { extractShipModules, moduleHaystack } from "../shipmodules.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 import { passengersLounge, LoungePassenger, PassengersLoungeStore } from "../passengersLounge.js";
+import { livePassengers } from "../livePassengers.js";
 
 // HTML markup for log lines rendered in the web UI.
 const HTML_RESET = "</span>";
@@ -1080,6 +1081,58 @@ function parseStationPassengers(result: unknown): StationPassengersResponse | nu
   };
 }
 
+/** Trust livePassengers data for this long before falling back to a live API query. */
+const LIVE_PASSENGER_TTL_MS = 10 * 60 * 1000;
+
+interface StationPassengerLookup {
+  station: string;
+  waiting: StationPassenger[];
+  count: number;
+}
+
+/**
+ * Resolve the passengers waiting at a station, preferring the livePassengers
+ * roster (populated by the market routine) so the CT routine avoids slow,
+ * rate-limited `list_station_passengers` calls. Falls back to the live API
+ * when no fresh roster data exists for the station.
+ */
+async function fetchStationPassengers(
+  ctx: RoutineContext,
+  systemId: string,
+  stationId: string,
+): Promise<StationPassengerLookup | null> {
+  const { bot } = ctx;
+  const snap = livePassengers.getStationSnapshot(systemId, stationId);
+  const now = Date.now();
+  const isFresh = snap && snap.updatedAt && now - new Date(snap.updatedAt).getTime() < LIVE_PASSENGER_TTL_MS;
+  if (isFresh && snap.count > 0) {
+    const live = livePassengers.getAtStation(systemId, stationId);
+    if (live.length > 0) {
+      ctx.log("transport", `Live passengers: ${live.length} waiting at ${stationId} (roster)`);
+      return {
+        station: snap.stationName || stationId,
+        waiting: live.map(p => ({
+          citizen_id: p.citizenId,
+          name: p.name,
+          class: p.accommodationClass,
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destination_name: p.destinationName,
+          destination_system: p.destinationSystem,
+          bio: p.bio,
+          estimated_fare: p.fare,
+        })),
+        count: live.length,
+      };
+    }
+  }
+  const resp = await bot.exec("list_station_passengers");
+  if (resp.error || !resp.result) return null;
+  const parsed = parseStationPassengers(resp.result);
+  if (!parsed) return null;
+  return { station: parsed.station || stationId, waiting: parsed.waiting, count: parsed.count };
+}
+
 function parseListPassengers(result: unknown): ListPassengersResponse | null {
   if (!result || typeof result !== "object") return null;
   const r = result as Record<string, unknown>;
@@ -1368,18 +1421,15 @@ async function selectPickupStation(
   // Check current station first if docked (unless excluded)
   if (!excludeCurrentStation && bot.docked && currentPoi && currentSystem) {
     if (!blockPirateStations || !isPirateStation(currentPoi)) {
-      const resp = await bot.exec("list_station_passengers");
-      if (!resp.error && resp.result) {
-        const data = parseStationPassengers(resp.result);
-        if (data && data.count > 0) {
-          stations.push({
-            system: currentSystem,
-            poi: currentPoi,
-            poiName: data.station,
-            count: data.count,
-            hops: 0,
-          });
-        }
+      const lookup = await fetchStationPassengers(ctx, currentSystem, currentPoi);
+      if (lookup && lookup.count > 0) {
+        stations.push({
+          system: currentSystem,
+          poi: currentPoi,
+          poiName: lookup.station,
+          count: lookup.count,
+          hops: 0,
+        });
       }
     }
   }
@@ -1443,18 +1493,16 @@ for (const p of pois) {
           const poiId = (p.id || p.poi_id || p.name || "") as string;
           if (!poiId) continue;
           if (blockPirateStations && isPirateStation(poiId)) continue;
-          const pResp = await bot.exec("list_station_passengers");
-         if (pResp.error || !pResp.result) continue;
-         const pData = parseStationPassengers(pResp.result);
-         if (pData && pData.count > 0) {
-           stations.push({
-             system: info.systemId,
-             poi: poiId,
-             poiName: pData.station,
-             count: pData.count,
-             hops: info.hops,
-           });
-         }
+          const lookup = await fetchStationPassengers(ctx, info.systemId, poiId);
+          if (lookup && lookup.count > 0) {
+            stations.push({
+              system: info.systemId,
+              poi: poiId,
+              poiName: lookup.station,
+              count: lookup.count,
+              hops: info.hops,
+            });
+          }
        }
      } catch {
        // skip system query errors
@@ -2021,16 +2069,18 @@ if (state && state.status !== "idle") {
         } else {
           // Collect fuel cells at any station when idle
           await collectFuelCells(ctx, settings);
-          const resp = await bot.exec("list_station_passengers");
-          if (!resp.error && resp.result) {
-            const data = parseStationPassengers(resp.result);
-            if (data && data.count > 0) {
-              state.pickupStation = bot.poi;
-              state.pickupSystem = bot.system;
-              ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
-            } else {
-              state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-              ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+          const lookup = await fetchStationPassengers(ctx, bot.system, bot.poi);
+          if (lookup && lookup.count > 0) {
+            state.pickupStation = bot.poi;
+            state.pickupSystem = bot.system;
+            ctx.log("transport", `Found ${lookup.count} passengers at ${bot.poi}`);
+          } else if (lookup === null) {
+            // API error / no data — back off before retrying
+            await ctx.sleep(60000);
+            continue;
+          } else {
+            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+            ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
               if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
                 ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
                 const nextPickup = await selectNextPickupStation(ctx, state, settings);
@@ -2065,11 +2115,7 @@ if (state && state.status !== "idle") {
                 continue;
               }
             }
-          } else {
-            await ctx.sleep(60000);
-            continue;
           }
-        }
       } else {
         const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
         if (!pickup) {
@@ -2894,6 +2940,35 @@ if (state && state.status !== "idle") {
       }
 
       // Unload all passengers to lounge
+      const verifyResp = await bot.exec("list_passengers");
+      const verified = verifyResp.error || !verifyResp.result ? null : parseListPassengers(verifyResp.result);
+      if (!verified || verified.passengers.length === 0) {
+        ctx.log("transport", "Lounge transport: no passengers actually aboard, clearing state and returning to idle");
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = null;
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
+      state.onboardPassengers = verified.passengers.map(p => ({
+        citizenId: p.citizen_id || p.name,
+        name: p.name,
+        accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+        citizenship: p.citizenship,
+        destination: p.destination,
+        destinationName: p.destination_name,
+        destinationSystem: (p as any).destinationSystem || p.destination_system,
+        fare: p.fare,
+        bio: p.bio,
+        routeData: p.route_data || null,
+        loadedAt: new Date().toISOString(),
+        status: "boarded",
+        ticksRemaining: p.ticks_remaining,
+      }));
+      saveTransportState(state);
       ctx.log("transport", `Lounge transport: unloading ${state.onboardPassengers.length} passengers to Transit Lounge at ${homeStation}`);
       const unloadResp = await bot.exec("unload_passenger", { id: "all", target: "lounge" });
       if (unloadResp.error) {

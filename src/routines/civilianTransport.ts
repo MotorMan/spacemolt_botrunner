@@ -601,6 +601,7 @@ interface TransportState {
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
   needsTravel: boolean;
+  recentlyVisitedStations: string[];
 }
 
 interface FleetShip {
@@ -1485,6 +1486,20 @@ async function selectNextPickupStation(
 
   if (!currentSystem) return null;
 
+  const stationKey = (system: string, poi: string): string =>
+    `${system.toLowerCase()}:${poi.toLowerCase()}`;
+  const currentKey = stationKey(currentSystem, currentPoi);
+
+  const recentSet = new Set<string>();
+  for (const key of state.recentlyVisitedStations || []) recentSet.add(key.toLowerCase());
+
+  // We're leaving the current station because it had nothing to load — remember it
+  // so we don't immediately ping-pong back to it on the next selection.
+  if (currentSystem && currentPoi) {
+    addRecentStation(state, currentSystem, currentPoi);
+    saveTransportState(state);
+  }
+
   // BFS over known systems from the current location, nearest first, capped at maxJumps.
   // Any station that isn't blacklisted is a valid pickup candidate — empire
   // membership no longer restricts where the bot will go.
@@ -1510,9 +1525,11 @@ async function selectNextPickupStation(
     if (frontier.length === 0) break;
   }
 
-  // Nearest system first. Skip the station we're already at, plus any
-  // blacklisted or pirate station.
+  // Nearest system first. Skip the station we're already at, recently-visited
+  // stations (so we don't ping-pong between two neighbors), plus any blacklisted
+  // or pirate station.
   const sorted = Array.from(candidates.values()).sort((a, b) => a.hops - b.hops);
+  let skippedDueToRecency = false;
   for (const info of sorted) {
     if (info.hops > settings.maxJumps) continue;
     if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
@@ -1525,10 +1542,10 @@ async function selectNextPickupStation(
       if (!hasBase) continue;
       const poiId = p.id;
       if (!poiId) continue;
-      if (
-        info.systemId.toLowerCase() === currentSystem.toLowerCase() &&
-        poiId.toLowerCase() === currentPoi.toLowerCase()
-      ) {
+      const key = stationKey(info.systemId, poiId);
+      if (key === currentKey) continue;
+      if (recentSet.has(key)) {
+        skippedDueToRecency = true;
         continue;
       }
       if (settings.blockPirateStations && isPirateStation(poiId)) continue;
@@ -1540,8 +1557,27 @@ async function selectNextPickupStation(
     }
   }
 
+  // Every reachable station was recently visited — clear the short-term memory
+  // and allow revisiting so the tour can continue instead of stalling.
+  if (skippedDueToRecency) {
+    ctx.log("transport", "All reachable stations recently visited, clearing recent history and retrying");
+    state.recentlyVisitedStations = [];
+    saveTransportState(state);
+    return selectNextPickupStation(ctx, state, settings);
+  }
+
   ctx.log("transport", "No reachable non-blacklisted station found within maxJumps");
   return null;
+}
+
+function addRecentStation(state: TransportState, system: string, poi: string): void {
+  const key = `${system.toLowerCase()}:${poi.toLowerCase()}`;
+  const recent = state.recentlyVisitedStations || [];
+  if (recent.includes(key)) return;
+  recent.push(key);
+  const RECENT_STATION_LIMIT = 12;
+  if (recent.length > RECENT_STATION_LIMIT) recent.splice(0, recent.length - RECENT_STATION_LIMIT);
+  state.recentlyVisitedStations = recent;
 }
 
 // ── Route planning ───────────────────────────────────────────
@@ -1645,6 +1681,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
     needsTravel: false,
+    recentlyVisitedStations: [],
   };
 }
 
@@ -2288,50 +2325,79 @@ if (state && state.status !== "idle") {
 
       if (settings.mode === "lounge_transport") {
         ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
-        const allPassengers = [...waiting];
-        const sortedPassengers = allPassengers.sort((a, b) => {
-          if (priority === "off") return 0;
-          return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
-        });
+
+        // load_passenger loads by destination station id, so group waiting
+        // passengers by destination and issue one load per destination.
+        interface LoungeDestGroup { id: string; passengers: StationPassenger[] }
+        const loungeByDest = new Map<string, LoungeDestGroup>();
+        for (const p of waiting) {
+          const cls = p.class.toLowerCase();
+          if (cls === "first" && !settings.allowFirstClass) continue;
+          if (cls === "business" && !settings.allowBusinessClass) continue;
+          if (cls === "economy" && !settings.allowEconomyClass) continue;
+          const key = p.destination.toLowerCase();
+          let group = loungeByDest.get(key);
+          if (!group) {
+            group = { id: p.destination, passengers: [] };
+            loungeByDest.set(key, group);
+          }
+          group.passengers.push(p);
+        }
 
         let loadedThisLeg = 0;
-        for (const p of sortedPassengers) {
-          if (loadedNames.has(p.citizen_id)) continue;
-          const cls = p.class.toLowerCase() as "economy" | "business" | "first";
-          const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
-          const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
-          const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
-          
-          let canLoad = false;
-          if (cls === "first" && usedFirst < capFirst) {
-            canLoad = true;
-            usedFirst++;
-          } else if (cls === "business" && usedBusiness < capBusiness) {
-            canLoad = true;
-            usedBusiness++;
-          } else if (cls === "economy") {
-            if (usedEconomy < capEconomy) {
-              canLoad = true;
-              usedEconomy++;
-            } else if (usedBusiness < capBusiness) {
-              canLoad = true;
-              usedBusiness++;
-            } else if (usedFirst < capFirst) {
+        for (const group of loungeByDest.values()) {
+          const totalLoaded = usedEconomy + usedBusiness + usedFirst;
+          if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) break;
+
+          const destId = group.id;
+          const ps = group.passengers;
+
+          const sortedPassengers = [...ps].sort((a, b) => {
+            if (priority === "off") return 0;
+            return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
+          });
+
+          let canLoadAny = false;
+          for (const p of sortedPassengers) {
+            if (loadedNames.has(p.citizen_id)) continue;
+            const cls = p.class.toLowerCase() as "economy" | "business" | "first";
+            const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
+            const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
+            const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
+
+            let canLoad = false;
+            if (cls === "first" && usedFirst < capFirst) {
               canLoad = true;
               usedFirst++;
+            } else if (cls === "business" && usedBusiness < capBusiness) {
+              canLoad = true;
+              usedBusiness++;
+            } else if (cls === "economy") {
+              if (usedEconomy < capEconomy) {
+                canLoad = true;
+                usedEconomy++;
+              } else if (usedBusiness < capBusiness) {
+                canLoad = true;
+                usedBusiness++;
+              } else if (usedFirst < capFirst) {
+                canLoad = true;
+                usedFirst++;
+              }
             }
+
+            if (!canLoad) continue;
+            loadedNames.add(p.citizen_id);
+            loadedThisLeg++;
+            canLoadAny = true;
           }
-          
-          if (!canLoad) continue;
-          
-          loadedNames.add(p.citizen_id);
-          loadedThisLeg++;
-        }
-        
-        if (loadedThisLeg > 0) {
-          const loadResp = await bot.exec("load_passenger", { id: "all" });
+
+          if (!canLoadAny) continue;
+
+          const loadResp = await bot.exec("load_passenger", { id: destId });
           if (loadResp.error) {
-            ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
+            ctx.log("error", `load_passenger failed for ${destId} (lounge mode): ${loadResp.error.message}`);
+          } else {
+            ctx.log("transport", `Loaded passengers for ${destId} (lounge mode)`);
           }
           await ctx.sleep(11000);
         }

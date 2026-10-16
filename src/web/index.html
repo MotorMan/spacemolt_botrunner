@@ -261,7 +261,7 @@
                 >
                   <!-- populated by JS -->
                 </select>
-                <button class="sm primary" onclick="bulkStartIdleBots()">
+                <button class="sm primary" id="bulkStartBtn" onclick="bulkStartIdleBots()">
                   ▶ Start All Idle
                 </button>
                 <button class="sm danger" onclick="bulkStopRunningBots()">
@@ -4013,6 +4013,46 @@
 
       // ── Bulk Start Idle Bots ────────────────────────────────────
       const BULK_START_DELAY_MS = 10; // small gap between bot starts to keep the UI responsive during bulk start/stop
+      const BULK_START_SLOW_DELAY_MS = 10000; // 10 second delay for slow start (5s hold)
+
+      let bulkStartHoldTimer = null;
+      let bulkStartHeld = false;
+
+      function initBulkStartHold() {
+        const btn = document.getElementById("bulkStartBtn");
+        if (!btn) return;
+
+        const startHold = () => {
+          bulkStartHeld = false;
+          bulkStartHoldTimer = setTimeout(() => {
+            bulkStartHeld = true;
+            btn.classList.add("held");
+            appendLine("system", "Slow start mode activated (10s delay between bots)");
+          }, 5000);
+        };
+
+        const endHold = () => {
+          if (bulkStartHoldTimer) {
+            clearTimeout(bulkStartHoldTimer);
+            bulkStartHoldTimer = null;
+          }
+          const wasHeld = bulkStartHeld;
+          bulkStartHeld = false;
+          btn.classList.remove("held");
+          if (wasHeld) {
+            bulkStartIdleBots(BULK_START_SLOW_DELAY_MS);
+          } else {
+            bulkStartIdleBots(BULK_START_DELAY_MS);
+          }
+        };
+
+        btn.addEventListener("mousedown", startHold);
+        btn.addEventListener("mouseup", endHold);
+        btn.addEventListener("mouseleave", endHold);
+        btn.addEventListener("touchstart", startHold, { passive: true });
+        btn.addEventListener("touchend", endHold);
+        btn.addEventListener("touchcancel", endHold);
+      }
 
       /** Populate the bulk start routine dropdown */
       function updateBulkStartDropdown() {
@@ -4028,7 +4068,7 @@
       }
 
       /** Start all idle bots with the selected routine */
-      function bulkStartIdleBots() {
+      function bulkStartIdleBots(delayMs = BULK_START_DELAY_MS) {
         const select = document.getElementById("bulkStartRoutine");
         if (!select) return;
 
@@ -4055,7 +4095,7 @@
 
           index++;
           if (index < idleBots.length) {
-            setTimeout(startNext, BULK_START_DELAY_MS);
+            setTimeout(startNext, delayMs);
           }
         }
 
@@ -44326,6 +44366,7 @@ function saveFuelServiceSettings() {
       setInterval(refreshHomeStationFuel, 10000);
       // Poll battle status every 2 seconds when in battle
       setInterval(pollBattleStatus, 2000);
+      initBulkStartHold();
     </script>
   </body>
 </html>

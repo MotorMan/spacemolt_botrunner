@@ -731,8 +731,17 @@ button.warning:hover { background: #b98cff; }
 button.warning-cargo { background: var(--cyan); border-color: var(--cyan); color: #fff; }
 button.warning-cargo:hover { background: #4de0d0; }
 button.sm { padding: 3px 10px; font-size: 11px; }
+button.primary.held {
+  background: #a371f7;
+  border-color: #bc8cff;
+  animation: pulse-held 1s ease-in-out infinite alternate;
+}
+@keyframes pulse-held {
+  0% { box-shadow: 0 0 0 0 rgba(188, 140, 255, 0.5); }
+  100% { box-shadow: 0 0 0 8px rgba(188, 140, 255, 0); }
+}
 
-/* ── Log panels ─────────────────────────────────── */
+  /* ── Log panels ─────────────────────────────────── */
 .log-area {
   height: 500px;
   flex-shrink: 0;

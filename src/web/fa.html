@@ -80,6 +80,8 @@
     .fa-status { font-size: 12px; color: var(--text-dim); padding: 4px 0; }
     .fa-status.err { color: #f85149; }
     .fa-status.loading { color: #58a6ff; }
+    .fa-faction-id { font-size: 12px; color: var(--text-dim); font-family: 'Consolas', 'Monaco', monospace; }
+    .fa-faction-id.has-id { color: #58a6ff; font-weight: 600; }
   </style>
 </head>
 <body>
@@ -91,6 +93,11 @@
 
   <div class="fa-controls">
     <select id="faBotSelect"><option value="">-- select bot --</option></select>
+    <div id="faFactionIdBox" style="display:none;align-items:center;gap:6px;font-size:12px;color:var(--text-dim);margin-left:8px;">
+      <span style="color:var(--text-dim);">Faction:</span>
+      <span id="faFactionId" class="fa-faction-id"></span>
+    </div>
+    <label style="font-size:12px;color:var(--text-dim);display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px;"><input type="checkbox" id="faUseFactionId" style="width:14px;height:14px;"> Use bot's faction ID (view faction log)</label>
     <div class="fa-cat-group" id="faCatGroup">
       <button class="fa-cat-btn" data-cat="" style="background:rgba(88,166,255,0.2);color:#58a6ff;border-color:#58a6ff;">all</button>
       <button class="fa-cat-btn" data-cat="trading" style="background:#1a1a2e;color:#555;border-color:#333;">trading</button>
@@ -186,6 +193,8 @@
   let pendingLoad = false;
   let activeCat = '';
   let activeEventType = '';
+  let useFactionId = false;
+  let selectedBotFaction = '';
   let seenIds = new Set();
   let lastLoadedPage = 1;
 
@@ -198,7 +207,8 @@
     session: ['login'],
     trading: ['buy', 'sell'],
     combat: ['damage', 'kill', 'outcome'],
-    mission: ['abandon', 'expire', 'complete']
+    mission: ['abandon', 'expire', 'complete'],
+    faction: ['production_cycle', 'rent_warning']
   };
 
   // ── Helpers ─────────────────────────────────────────────
@@ -241,8 +251,31 @@
     const sel = document.getElementById('faBotSelect');
     const cur = sel.value;
     sel.innerHTML = '<option value="">-- select bot --</option>' +
-      bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}${b.state === 'running' ? ' ●' : ''}</option>`).join('');
+      bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}${b.state === 'running' ? ' ●' : ''}${b.faction ? ' · ' + esc(b.faction) : ''}</option>`).join('');
     if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+    updateFactionIdDisplay();
+  }
+
+  function getSelectedBot() {
+    const name = document.getElementById('faBotSelect').value;
+    return bots.find(b => b.username === name) || null;
+  }
+
+  function updateFactionIdDisplay() {
+    const box = document.getElementById('faFactionIdBox');
+    const idEl = document.getElementById('faFactionId');
+    const bot = getSelectedBot();
+    const faction = bot && bot.faction ? bot.faction : '';
+    selectedBotFaction = faction;
+    if (faction) {
+      box.style.display = 'flex';
+      idEl.textContent = faction;
+      idEl.className = 'fa-faction-id has-id';
+    } else {
+      box.style.display = 'none';
+      idEl.textContent = '';
+      idEl.className = 'fa-faction-id';
+    }
   }
 
   // ── WebSocket ───────────────────────────────────────────
@@ -404,8 +437,9 @@
     const params = {};
     if (activeCat) params.category = activeCat;
     if (activeEventType) params.event_type = activeEventType;
+    if (useFactionId && selectedBotFaction) params.faction_id = selectedBotFaction;
     params.page = page;
-    const label = activeCat || 'all';
+    const label = (useFactionId ? 'faction ' + selectedBotFaction : activeCat || 'all');
     setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
 
     sendExecWithRetry(bot, 'get_action_log', params, (result) => {
@@ -466,7 +500,8 @@
     const params = {};
     if (activeCat) params.category = activeCat;
     if (activeEventType) params.event_type = activeEventType;
-    const label = activeCat || 'all';
+    if (useFactionId && selectedBotFaction) params.faction_id = selectedBotFaction;
+    const label = (useFactionId ? 'faction ' + selectedBotFaction : activeCat || 'all');
 
     const targetBots = loadAllBots ? bots.map(b => b.username) : [singleBot];
     const botTotal = targetBots.length;
@@ -765,6 +800,14 @@
     activeEventType = document.getElementById('faEventTypeSelect').value;
     applyFilter();
     renderResults();
+  });
+
+  document.getElementById('faBotSelect').addEventListener('change', () => {
+    updateFactionIdDisplay();
+  });
+
+  document.getElementById('faUseFactionId').addEventListener('change', () => {
+    useFactionId = document.getElementById('faUseFactionId').checked;
   });
 
   document.getElementById('faStartPageInput').addEventListener('input', () => {

@@ -5354,16 +5354,18 @@
           }
         }
 
-        // Per-bot pathfinder_test settings (visible when pathfinder_test is selected or running)
-        const isPathfinderTest =
-          (bot.state === "running" && bot.routine === "pathfinder_test") ||
+        // Per-bot pathfinder settings (visible when pathfinder is selected or running)
+        const isPathfinder =
+          (bot.state === "running" && bot.routine === "pathfinder") ||
           (bot.state !== "running" &&
             bot.state !== "stopping" &&
-            getProfileSelectedRoutine() === "pathfinder_test");
-        if (isPathfinderTest) {
+            getProfileSelectedRoutine() === "pathfinder");
+        if (isPathfinder) {
           const botSettings = settings[bot.username] || {};
           const originSystem = botSettings.originSystem || "sol";
-          const targetSystem = botSettings.targetSystem || "alpha";
+          const scanStartDegree = botSettings.scanStartDegree ?? 0;
+          const scanStepDegrees = botSettings.scanStepDegrees ?? 12;
+          const scanWaitMinutes = botSettings.scanWaitMinutes ?? 5;
           const refuelThreshold = botSettings.refuelThreshold ?? 50;
           const sysOpts = [
             `<option value=""${!originSystem ? " selected" : ""}>(current)</option>`,
@@ -5384,30 +5386,15 @@
               `<option value="${esc(originSystem)}" selected>${esc(originSystem)}</option>`,
             );
           }
-          const targetOpts = [
-            `<option value=""${!targetSystem ? " selected" : ""}>(none)</option>`,
-          ];
-          for (const sys of [...knownSystems].sort((a, b) =>
-            (a.name || a.id || "").localeCompare(b.name || b.id || ""),
-          )) {
-            const sel = sys.id === targetSystem ? " selected" : "";
-            targetOpts.push(
-              `<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`,
-            );
-          }
-          if (
-            targetSystem &&
-            !knownSystems.find((s) => s.id === targetSystem)
-          ) {
-            targetOpts.push(
-              `<option value="${esc(targetSystem)}" selected>${esc(targetSystem)}</option>`,
-            );
-          }
           actions += `
       <span class="profile-ore-label">Origin System:</span>
       <select id="profile-pathfinderOrigin" onchange="saveProfilePathfinderOrigin()" style="width:auto;padding:2px 6px;font-size:11px">${sysOpts.join("")}</select>
-      <span class="profile-ore-label" style="margin-left:8px">Target System:</span>
-      <select id="profile-pathfinderTarget" onchange="saveProfilePathfinderTarget()" style="width:auto;padding:2px 6px;font-size:11px">${targetOpts.join("")}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Start (°):</span>
+      <input type="number" id="profile-pathfinderScanStartDegree" value="${scanStartDegree}" min="0" max="359" style="width:55px" onchange="saveProfilePathfinderScanStartDegree()">
+      <span class="profile-ore-label" style="margin-left:8px">Step (°):</span>
+      <input type="number" id="profile-pathfinderScanStepDegrees" value="${scanStepDegrees}" min="1" max="180" style="width:55px" onchange="saveProfilePathfinderScanStepDegrees()">
+      <span class="profile-ore-label" style="margin-left:8px">Wait (min):</span>
+      <input type="number" id="profile-pathfinderScanWaitMinutes" value="${scanWaitMinutes}" min="0" max="120" style="width:55px" onchange="saveProfilePathfinderScanWaitMinutes()">
       <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
       <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
         }
@@ -6137,14 +6124,46 @@
         settings[bot.username] = updated;
       }
 
-      function saveProfilePathfinderTarget() {
+      function saveProfilePathfinderScanStartDegree() {
         const bot = getProfileBot();
         if (!bot) return;
-        const sel = document.getElementById("profile-pathfinderTarget");
-        if (!sel) return;
-        const targetSystem = sel.value;
+        const inp = document.getElementById("profile-pathfinderScanStartDegree");
+        if (!inp) return;
+        const scanStartDegree = parseInt(inp.value, 10) || 0;
         const existing = settings[bot.username] || {};
-        const updated = Object.assign({}, existing, { targetSystem });
+        const updated = Object.assign({}, existing, { scanStartDegree });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfilePathfinderScanStepDegrees() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const inp = document.getElementById("profile-pathfinderScanStepDegrees");
+        if (!inp) return;
+        const scanStepDegrees = parseInt(inp.value, 10) || 12;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { scanStepDegrees });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfilePathfinderScanWaitMinutes() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const inp = document.getElementById("profile-pathfinderScanWaitMinutes");
+        if (!inp) return;
+        const scanWaitMinutes = parseInt(inp.value, 10) || 5;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { scanWaitMinutes });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -14051,7 +14070,7 @@
           ai_chat: renderAiChatSettings,
           hunter: renderHunterSettings,
           escort: renderEscortSettings,
-          pathfinder_test: renderPathfinderTestSettings,
+          pathfinder: renderPathfinderSettings,
           fleet_hunter: renderFleetHunterSettings,
           cargo_mover: renderCargoMoverSettings,
           fuel_transport: renderFuelTransportSettings,
@@ -20611,6 +20630,7 @@
         const storageRefreshIntervalMinutes = fc.storageRefreshIntervalMinutes || 15;
         const blockedWaitMinutes = fc.blockedWaitMinutes || 5;
         const preStagePartialLock = fc.preStagePartialLock !== false;
+        const preStageTopOffThresholdPct = fc.preStageTopOffThresholdPct || 0;
         let sellItemsJson = "";
         try {
           sellItemsJson = JSON.stringify(fc.sellItems || []);
@@ -20814,6 +20834,14 @@
         <option value="true" ${preStagePartialLock ? "selected" : ""}>Enabled</option>
         <option value="false" ${!preStagePartialLock ? "selected" : ""}>Disabled</option>
       </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Pre-Stage Top-Off Threshold (%)</div>
+        <div class="setting-hint">In pre-stage mode, only top off a station's storage when it is this % down from full. Avoids wasting trips restocking just a unit or two. Set to 0 to always top off (existing behavior).</div>
+      </div>
+      <input type="number" id="set-fc-preStageTopOffThresholdPct" min="0" max="100" value="${preStageTopOffThresholdPct}">
     </div>
 
     <div class="setting-row">
@@ -21338,6 +21366,14 @@
             ),
           preStagePartialLock:
             document.getElementById("set-fc-preStagePartialLock")?.value !== "false",
+          preStageTopOffThresholdPct:
+            Math.max(
+              0,
+              Math.min(
+                100,
+                parseInt(document.getElementById("set-fc-preStageTopOffThresholdPct")?.value) || 0,
+              ),
+            ),
           enablePriceUpdates:
             document.getElementById("set-fc-enablePriceUpdates")?.value === "true",
           priceUpdateThreshold:
@@ -34057,11 +34093,13 @@ ignoreBlacklist: document.getElementById(
         settings.escort = s;
       }
 
-      // ── Pathfinder Test settings ─────────────────────────────────────
-      function renderPathfinderTestSettings(panel) {
-        const p = settings.pathfinder_test || {};
+      // ── Pathfinder settings ─────────────────────────────────────
+      function renderPathfinderSettings(panel) {
+        const p = settings.pathfinder || {};
         const originSystem = p.originSystem || "sol";
-        const targetSystem = p.targetSystem || "alpha";
+        const scanStartDegree = p.scanStartDegree ?? 0;
+        const scanStepDegrees = p.scanStepDegrees ?? 12;
+        const scanWaitMinutes = p.scanWaitMinutes ?? 5;
         const refuelThreshold = p.refuelThreshold ?? 50;
 
         const sysOpts = ['<option value="">(current system)</option>'];
@@ -34079,39 +34117,40 @@ ignoreBlacklist: document.getElementById(
           );
         }
 
-        const targetOpts = ['<option value="">(none)</option>'];
-        for (const sys of [...knownSystems].sort((a, b) =>
-          (a.name || a.id || "").localeCompare(b.name || b.id || ""),
-        )) {
-          const sel = sys.id === targetSystem ? " selected" : "";
-          targetOpts.push(
-            `<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`,
-          );
-        }
-        if (targetSystem && !knownSystems.find((s) => s.id === targetSystem)) {
-          targetOpts.push(
-            `<option value="${esc(targetSystem)}" selected>${esc(targetSystem)} (custom)</option>`,
-          );
-        }
-
         panel.innerHTML = `
-    <h3>Pathfinder Test Settings</h3>
-    <div class="settings-desc">Configure the pathfinder test routine: navigate to an origin system, then perform a single line-of-sight Pathfinder jump to a target.</div>
+    <h3>Pathfinder Settings</h3>
+    <div class="settings-desc">Configure the pathfinder blind-system-hunt routine: navigate to an origin system, then perform systematic angled Pathfinder jumps (full 360 scan) to discover hidden/unknown systems, returning to the origin via calculated bearing.</div>
 
     <div class="setting-row">
       <div>
         <div class="setting-label">Origin System</div>
-        <div class="setting-hint">System to navigate to before performing the Pathfinder jump. Leave as "(current system)" to skip the pre-jump travel phase.</div>
+        <div class="setting-hint">System to navigate to before starting the scan. Leave as "(current system)" to scan from the bot's current system.</div>
       </div>
-      <select id="set-pathfinder_test-originSystem">${sysOpts.join("")}</select>
+      <select id="set-pathfinder-originSystem">${sysOpts.join("")}</select>
     </div>
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Target System</div>
-        <div class="setting-hint">Target system for the Pathfinder jump. Must be within line-of-sight from the origin.</div>
+        <div class="setting-label">Start Angle (°)</div>
+        <div class="setting-hint">Degrees where the 360° scan begins. Set to your direction of travel so the scan ends on the same path; a jump at start+180 returns to origin.</div>
       </div>
-      <select id="set-pathfinder_test-targetSystem">${targetOpts.join("")}</select>
+      <input type="number" id="set-pathfinder-scanStartDegree" min="0" max="359" value="${scanStartDegree}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Scan Angle Step (°)</div>
+        <div class="setting-hint">Degrees between each angled jump. Default 12 = 30 jumps for a full 360° scan.</div>
+      </div>
+      <input type="number" id="set-pathfinder-scanStepDegrees" min="1" max="180" value="${scanStepDegrees}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Wait Between Jumps (min)</div>
+        <div class="setting-hint">Timer: minutes to wait after each jump lands before returning to origin.</div>
+      </div>
+      <input type="number" id="set-pathfinder-scanWaitMinutes" min="0" max="120" value="${scanWaitMinutes}">
     </div>
 
     <div class="setting-row">
@@ -34119,31 +34158,40 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-label">Refuel Threshold (%)</div>
         <div class="setting-hint">Minimum fuel percentage before attempting jumps.</div>
       </div>
-      <input type="number" id="set-pathfinder_test-refuelThreshold" min="10" max="90" value="${refuelThreshold}">
+      <input type="number" id="set-pathfinder-refuelThreshold" min="10" max="90" value="${refuelThreshold}">
     </div>
 
     <div class="settings-save-bar">
-      <button class="primary" onclick="savePathfinderTestSettings()">Save Settings</button>
+      <button class="primary" onclick="savePathfinderSettings()">Save Settings</button>
     </div>
   `;
       }
 
-      function savePathfinderTestSettings() {
+      function savePathfinderSettings() {
         const s = {
           originSystem:
-            document.getElementById("set-pathfinder_test-originSystem").value ||
+            document.getElementById("set-pathfinder-originSystem").value ||
             "sol",
-          targetSystem:
-            document.getElementById("set-pathfinder_test-targetSystem").value ||
-            "alpha",
+          scanStartDegree:
+            parseInt(
+              document.getElementById("set-pathfinder-scanStartDegree").value,
+            ) || 0,
+          scanStepDegrees:
+            parseInt(
+              document.getElementById("set-pathfinder-scanStepDegrees").value,
+            ) || 12,
+          scanWaitMinutes:
+            parseInt(
+              document.getElementById("set-pathfinder-scanWaitMinutes").value,
+            ) || 5,
           refuelThreshold:
             parseInt(
-              document.getElementById("set-pathfinder_test-refuelThreshold")
+              document.getElementById("set-pathfinder-refuelThreshold")
                 .value,
             ) || 50,
         };
-        send({ type: "saveSettings", routine: "pathfinder_test", settings: s });
-        settings.pathfinder_test = s;
+        send({ type: "saveSettings", routine: "pathfinder", settings: s });
+        settings.pathfinder = s;
       }
 
       // ── Fleet Hunter settings ─────────────────────────────────────

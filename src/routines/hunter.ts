@@ -450,7 +450,7 @@ async function handleUnexpectedBattle(
             if (result === "failed") {
               ctx.log("combat", `Boarding failed for ${boardingTarget.name} â€” switching to fire stance to finish`);
               // âš ï¸ CRITICAL: Pass cloakOnStart through â€” re-cloak must happen immediately after battle
-              await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs, cloakOnStart, isCreatureName(boardingTarget.name));
+              await fightJoinedBattle(ctx, boardingTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, effectiveShieldRechargePct, onlyNPCs,     cloakOnStart, true);
             }
             return;
           }
@@ -1065,8 +1065,7 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
 
 const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed && !isBrandedCreature(p.username || ""));
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-    const fakeTargetIsCreature = fakeTarget ? isCreatureName(fakeTarget.name) : false;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, fakeTargetIsCreature);
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, true);
   }
 }
 
@@ -1648,7 +1647,7 @@ async function hunterEngage(
     claimCreature(ctx, target);
   }
   const hsettings = getHunterSettings(ctx.bot.username);
-  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, isCreature);
+  return engageTarget(ctx, target as any, fleeThreshold, fleeFromTier, minPiratesToFlee, maxAttackTier, sideId, skipScan, repairThreshold, onlyNPCs, cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold,     hsettings.ammoReloadPercentThreshold, true);
 }
 
 // â”€â”€ Boarding claim lock (non-API bot chat channel) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5045,7 +5044,7 @@ async function stationProtectionFight(ctx: RoutineContext, settings: ReturnType<
   if (fakeTarget) {
     broadcastHunterAssist(ctx, fakeTarget, fakeTargetIsCreature);
   }
-  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs, settings.cloakOnStart, fakeTargetIsCreature);
+  await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs,     settings.cloakOnStart, true);
 }
 
 async function* stationProtectionRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
@@ -8703,8 +8702,7 @@ async function* engageBoardingTargetsAtCurrentPoi(
         claimCreature(ctx, target);
       }
         const hsettings = getHunterSettings(ctx.bot.username);
-        const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, true);
 
       if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
       if (won) {
@@ -9030,8 +9028,7 @@ async function* boardingSystemPass(
          claimCreature(ctx, target);
        }
        const hsettings = getHunterSettings(ctx.bot.username);
-        const targetIsCreature = !!target.isCreature || target.id.startsWith("crt_") || isCreatureName(target.name);
-         const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, targetIsCreature);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart, hsettings.shieldRechargePct ?? 80, hsettings.ammoThreshold, hsettings.maxReloadAttempts, hsettings.ammoReloadAbsoluteThreshold, hsettings.ammoReloadPercentThreshold, true);
 
        if (await shouldAbortPatrolAfterEngage(ctx, won, target.name)) break;
        if (won) {

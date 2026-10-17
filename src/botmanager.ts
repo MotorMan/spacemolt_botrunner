@@ -27,7 +27,7 @@ import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { lexSellerRoutine } from "./routines/lex_seller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { civilianTransportRoutine, unloadPassengersToLounge } from "./routines/civilianTransport.js";
-import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
+import { pathfinderRoutine } from "./routines/pathfinder.js";
 import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { fuelServiceRoutine } from "./routines/fuelService.js";
 import { stealthSkillGrindRoutine } from "./routines/stealthSkillGrind.js";
@@ -543,7 +543,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
   escort: { name: "Escort (Fleet)", fn: escortRoutine },
   escort_flock: { name: "Escort (Flock)", fn: escortFlockRoutine },
-  pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
+  pathfinder: { name: "Pathfinder", fn: pathfinderRoutine },
   civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
   fuel_service: { name: "FuelService", fn: fuelServiceRoutine },

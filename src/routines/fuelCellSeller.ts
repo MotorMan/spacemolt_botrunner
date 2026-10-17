@@ -773,6 +773,7 @@ export function getFuelCellSellerSettings(username?: string): {
   storageRefreshIntervalMs: number;
   blockedWaitMs: number;
   preStagePartialLock: boolean;
+  preStageTopOffThresholdPct: number;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -849,6 +850,9 @@ export function getFuelCellSellerSettings(username?: string): {
       ? Math.max(MIN_BLOCKED_WAIT_MINUTES, Math.round(rawBlockedWaitMin)) * 60 * 1000
       : DEFAULT_BLOCKED_WAIT_MINUTES * 60 * 1000,
     preStagePartialLock: (fc.preStagePartialLock as boolean) ?? true,
+    preStageTopOffThresholdPct: Number.isFinite(Number(fc.preStageTopOffThresholdPct))
+      ? Math.max(0, Math.min(100, Math.round(Number(fc.preStageTopOffThresholdPct))))
+      : 0,
   };
 }
 
@@ -1345,7 +1349,7 @@ async function buildPreStagePlan(
       }
 
       const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
-      const need = Math.max(0, itemConfig.maxPerStation - knownQty);
+      const need = preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct);
       if (need > 0) {
         needByItem[itemConfig.itemId] = need;
         totalNeed += need;
@@ -1446,14 +1450,31 @@ async function updateStationPrices(
   return cancelled;
 }
 
+/** Effective pre-stage deficit for an item at a station. Returns 0 when the
+ *  station is within the configured top-off threshold of full (so the bot
+ *  doesn't waste a trip restocking a unit or two), otherwise maxPerStation -
+ *  knownQty. A threshold of 0 disables the check (existing behavior). */
+function preStageNeed(
+  itemConfig: SellItemConfig,
+  knownQty: number,
+  thresholdPct: number,
+): number {
+  const need = Math.max(0, itemConfig.maxPerStation - knownQty);
+  if (need <= 0) return 0;
+  if (!thresholdPct || thresholdPct <= 0) return need;
+  const minNeed = Math.ceil(itemConfig.maxPerStation * thresholdPct / 100);
+  return need >= minNeed ? need : 0;
+}
+
 function stationNeedsItem(
   entry: FCStationEntry,
   itemConfig: SellItemConfig,
   preStage: boolean,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): boolean {
   if (preStage) {
     const knownQty = entry.deposits?.[itemConfig.itemId] || 0;
-    return knownQty < itemConfig.maxPerStation;
+    return preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct) > 0;
   }
   const unsoldForItem = entry.activeOrders
     .filter(o => o.itemId === itemConfig.itemId)
@@ -1487,11 +1508,11 @@ export function computeItemNeeds(
 
   for (const { entry } of eligible) {
     for (const item of settings.sellItems) {
-      if (!stationNeedsItem(entry, item, preStage)) continue;
+      if (!stationNeedsItem(entry, item, preStage, settings)) continue;
 
       if (preStage) {
         const knownQty = entry.deposits?.[item.itemId] || 0;
-        needs.set(item.itemId, (needs.get(item.itemId) || 0) + Math.max(0, item.maxPerStation - knownQty));
+        needs.set(item.itemId, (needs.get(item.itemId) || 0) + preStageNeed(item, knownQty, settings.preStageTopOffThresholdPct));
       } else {
         needs.set(item.itemId, (needs.get(item.itemId) || 0) + 1);
       }
@@ -1517,10 +1538,11 @@ function computeItemUrgency(
     let criticalDeficit = 0;
 
     for (const { entry } of eligible) {
-      if (!stationNeedsItem(entry, item, preStage)) continue;
+      if (!stationNeedsItem(entry, item, preStage, settings)) continue;
 
       const knownQty = preStage ? (entry.deposits?.[item.itemId] || 0) : 0;
-      const need = Math.max(0, item.maxPerStation - knownQty);
+      const need = preStage ? preStageNeed(item, knownQty, settings.preStageTopOffThresholdPct) : Math.max(0, item.maxPerStation - knownQty);
+      if (need <= 0) continue;
       totalNeed += need;
 
       if (knownQty === 0) {
@@ -1607,7 +1629,7 @@ function getNextStation(
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
     const isNearCap = settings.sellItems.every(item => station.ordersUnsold >= item.maxPerStation);
     const hasZeroFocus = !isNearCap && stationHasZeroStock(station, focusItem, preStage);
-    const needsFocus = stationNeedsItem(station, focusItem, preStage);
+    const needsFocus = stationNeedsItem(station, focusItem, preStage, settings);
 
     return {
       idx,
@@ -2260,9 +2282,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
           continue;
         }
         const knownQty = remoteResult.qty;
-        const toDeposit = Math.min(inCargo, Math.max(0, itemConfig.maxPerStation - knownQty));
+        const toDeposit = Math.min(inCargo, preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct));
         if (toDeposit <= 0) {
-          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: already at ${knownQty}/${itemConfig.maxPerStation}`);
+          ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: within top-off threshold (${knownQty}/${itemConfig.maxPerStation})`);
           continue;
         }
 

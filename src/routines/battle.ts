@@ -1396,25 +1396,11 @@ export async function fightFreshBattle(
             return pZoneNum > targetZoneNum;
           });
           if (closerEnemy) {
-            ctx.log("combat", `🎯 Creature: switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled)`);
+            ctx.log("combat", `🎯 Switching to ${closerEnemy.username || closerEnemy.player_id} (current target fled out of range)`);
             target = { id: closerEnemy.player_id || closerEnemy.username, name: closerEnemy.username || closerEnemy.player_id } as NearbyEntity;
             await bot.exec("battle", { action: "target", target_id: target.id });
             targetParticipant = closerEnemy;
             await ctx.sleep(300);
-          } else if (ourZoneNow === "engaged") {
-            ctx.log("combat", `↩️ Retreating from ${ourZoneNow} to chase fleeing ${target.name} at ${targetParticipant.zone}`);
-            const retResp = await bot.exec("battle", { action: "retreat" });
-            if (retResp.error) {
-              const errMsg = retResp.error.message.toLowerCase();
-              if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-                ctx.log("combat", "✅ Battle ended (retreat failed: not in battle) - victory!");
-                await checkAndPraiseMorgThar(ctx, true);
-                await recloakAfterBattle(ctx, cloakOnStart);
-                return true;
-              }
-              ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-            }
-            await ctx.sleep(10000);
           }
         }
       }

@@ -4200,7 +4200,7 @@ async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): 
       }
       await bot.refreshLocation();
       if (bot.system && bot.system !== systemId) {
-        ctx.log("info", `Arrived in ${bot.system} via wormhole — new system will be added on next cycle`);
+        ctx.log("info", `Wormhole dropped us in ${bot.system} (off route from ${systemId}) — returning to route target on next cycle`);
         return;
       }
       continue;

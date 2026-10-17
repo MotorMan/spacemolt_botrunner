@@ -5283,10 +5283,12 @@
 
         // Per-bot explorer mode selector (visible when explorer is selected or running)
         const isExplorer =
-          (bot.state === "running" && bot.routine === "explorer") ||
+          (bot.state === "running" &&
+            (bot.routine === "explorer" || bot.routine === "fixed_route")) ||
           (bot.state !== "running" &&
             bot.state !== "stopping" &&
-            getProfileSelectedRoutine() === "explorer");
+            (getProfileSelectedRoutine() === "explorer" ||
+              getProfileSelectedRoutine() === "fixed_route"));
         if (isExplorer) {
           const botSettings = settings[bot.username] || {};
           const explorerMode = botSettings.explorerMode || "explore";
@@ -5308,6 +5310,7 @@
         <option value="deep_core_scan"${explorerMode === "deep_core_scan" ? " selected" : ""}>Scan hidden POIs</option>
         <option value="visit_all"${explorerMode === "visit_all" ? " selected" : ""}>Visit all systems</option>
         <option value="achievement"${explorerMode === "achievement" ? " selected" : ""}>Achievement (visit all 505)</option>
+        <option value="fixed_route"${explorerMode === "fixed_route" ? " selected" : ""}>Fixed Route (pre-determined path)</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">

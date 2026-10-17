@@ -261,7 +261,7 @@
                 >
                   <!-- populated by JS -->
                 </select>
-                <button class="sm primary" id="bulkStartBtn" onclick="bulkStartIdleBots()">
+                <button class="sm primary" id="bulkStartBtn">
                   ▶ Start All Idle
                 </button>
                 <button class="sm danger" onclick="bulkStopRunningBots()">
@@ -4131,7 +4131,7 @@
           if (index < runningBots.length) {
             setTimeout(stopNext, BULK_START_DELAY_MS);
           } else {
-            stopNext();
+            appendLine("system", "All stop commands sent!");
           }
         }
 

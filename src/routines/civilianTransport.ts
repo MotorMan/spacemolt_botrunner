@@ -2472,7 +2472,11 @@ if (state && state.status !== "idle") {
         classOrder.business = 2;
       }
 
-      if (settings.mode === "lounge_transport") {
+      const loungeFull = settings.mode === "lounge_transport" && passengersLounge.getAvailableSlots() <= 0;
+      if (loungeFull) {
+        ctx.log("transport", `Transit Lounge is full (150/150) — doing normal passenger deliveries instead of lounge pickup`);
+      }
+      if (settings.mode === "lounge_transport" && !loungeFull) {
         ctx.log("transport", `Lounge transport mode: loading all ${waiting.length} passengers at ${bot.poi} for transport to Transit Lounge`);
 
         // load_passenger loads by destination station id, so group waiting

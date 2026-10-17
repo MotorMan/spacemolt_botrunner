@@ -2285,6 +2285,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const toDeposit = Math.min(inCargo, preStageNeed(itemConfig, knownQty, settings.preStageTopOffThresholdPct));
         if (toDeposit <= 0) {
           ctx.log("fc", `Skipping ${itemConfig.itemName} at ${target.poiName}: within top-off threshold (${knownQty}/${itemConfig.maxPerStation})`);
+          target.deposits = { ...(target.deposits ?? {}), [itemConfig.itemId]: knownQty };
           continue;
         }
 

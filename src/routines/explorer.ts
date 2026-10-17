@@ -43,6 +43,7 @@ import { join } from "path";
 import { marketDetailsStore, type MarketItemObservation } from "../marketdetailsstore.js";
 import { explorerHistoryStore } from "../explorerhistorystore.js";
 import { explorerAssignmentStore } from "../explorerassignmentstore.js";
+import { explorerFixedPathStore, type ExplorerFixedPath, type FixedPathRouteEntry } from "../explorerFixedPathStore.js";
 import {
   updateShipListings,
 } from "../shipsforsale.js";
@@ -197,7 +198,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement" | "fixed_route";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -314,7 +315,7 @@ function getExplorerSettings(username?: string): {
   const explorerSystemTimeout = Number(e.explorerSystemTimeout) || 60;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : mode === "fixed_route" ? "fixed_route" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -359,6 +360,13 @@ export function setExplorerVisitAll(username: string, enabled: boolean): void {
 export function setExplorerAchievement(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "achievement" : "explore" },
+  });
+}
+
+/** Persist fixed_route mode setting for a specific bot. */
+export function setExplorerFixedRoute(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "fixed_route" : "explore" },
   });
 }
 
@@ -466,6 +474,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "achievement") {
     yield* achievementRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "fixed_route") {
+    yield* fixedRouteRoutine(ctx);
     return;
   }
 
@@ -829,6 +841,12 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("system", "Mode changed to achievement — switching routines...");
       clearExplorerPosition(bot.username);
       yield* achievementRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "fixed_route") {
+      ctx.log("system", "Mode changed to fixed_route — switching routines...");
+      clearExplorerPosition(bot.username);
+      yield* fixedRouteRoutine(ctx);
       return;
     }
 
@@ -3866,6 +3884,535 @@ function calculateLocalDistances(
   }
 
   return distances;
+}
+
+// ── Fixed-route (fixed_route mode) TSP generator ───────────────────
+
+/** Cloak module type ids. Inspected at route build time only — the cloak
+ *  command itself is never issued here (that would undock the ship). */
+const CLOAK_MODULE_IDS = [
+  "cloaking_device_i",
+  "cloaking_device_ii",
+  "phase_cloaking_device",
+  "voidborn_phase_cloak",
+  "emergency_cloaking_system",
+];
+
+/** Static wormholes that are always usable as bidirectional routing edges. */
+const STATIC_WORMHOLES: Array<[string, string]> = [
+  ["alzirr", "praecipua"],
+  ["hadar", "gsc_0036"],
+];
+
+/** Route-overlap warning thresholds (non-blocking, log only). */
+const FIXED_ROUTE_OVERLAY_WARN_PCT = 0.25;
+const FIXED_ROUTE_OVERLAY_WARN_COUNT = 5;
+
+/** Inspect equipped modules for a cloak. Returns false if the ship can't be read. */
+async function hasCloakModule(ctx: RoutineContext): Promise<boolean> {
+  const shipResp = await ctx.bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const { modules } = extractShipModules(shipResp.result);
+  return modules.some((mod) =>
+    CLOAK_MODULE_IDS.some((id) => moduleHaystack(mod).includes(id)),
+  );
+}
+
+/** Build a local adjacency list (lower-cased system ids) from mapStore
+ *  connections plus the two static wormholes. Dynamic wormholes are
+ *  excluded. Does not mutate mapStore. */
+function buildFixedRouteGraph(cloakAvailable: boolean): Map<string, Set<string>> {
+  const graph = new Map<string, Set<string>>();
+  const addNode = (id: string): void => {
+    const key = id.toLowerCase();
+    if (!graph.has(key)) graph.set(key, new Set());
+  };
+  const addEdge = (a: string, b: string): void => {
+    addNode(a);
+    addNode(b);
+    graph.get(a.toLowerCase())!.add(b.toLowerCase());
+    graph.get(b.toLowerCase())!.add(a.toLowerCase());
+  };
+
+  const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+
+  for (const sys of mapStore.getSystems()) {
+    const sysId = sys.id.toLowerCase();
+    if (!cloakAvailable && blacklistSet.has(sysId)) continue;
+    addNode(sys.id);
+    for (const conn of sys.connections || []) {
+      if (!conn.system_id) continue;
+      if (!cloakAvailable && blacklistSet.has(conn.system_id.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(conn.system_id)) continue;
+      addEdge(sys.id, conn.system_id);
+    }
+  }
+
+  for (const [a, b] of STATIC_WORMHOLES) {
+    addEdge(a, b);
+  }
+
+  return graph;
+}
+
+/** BFS hop distances from `start` over the local fixed-route graph. */
+function graphDistances(graph: Map<string, Set<string>>, start: string): Map<string, number> {
+  const dist = new Map<string, number>();
+  const startLower = start.toLowerCase();
+  if (!graph.has(startLower)) return dist;
+  const visited = new Set<string>([startLower]);
+  const queue: string[] = [startLower];
+  dist.set(startLower, 0);
+  let head = 0;
+  while (head < queue.length) {
+    const cur = queue[head++];
+    const curDist = dist.get(cur)!;
+    for (const nb of graph.get(cur) || []) {
+      if (visited.has(nb)) continue;
+      visited.add(nb);
+      dist.set(nb, curDist + 1);
+      queue.push(nb);
+    }
+  }
+  return dist;
+}
+
+/** Greedy nearest-neighbor TSP over the local graph.
+ *  Random start + random tie-breaking among equidistant unvisited systems
+ *  so bots starting at the same system diverge. Open path (no return). */
+function generateFixedRoute(graph: Map<string, Set<string>>, homeSystem: string): FixedPathRouteEntry[] {
+  const nodes = [...graph.keys()];
+  if (nodes.length === 0) return [];
+
+  const pickRandom = <T>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
+
+  const homeLower = homeSystem.toLowerCase();
+  if (!graph.has(homeLower)) {
+    graph.set(homeLower, new Set());
+    nodes.push(homeLower);
+  }
+
+  const start = pickRandom(nodes).toLowerCase();
+  const unvisited = new Set(nodes.filter((n) => n !== start));
+  const route: FixedPathRouteEntry[] = [];
+  let current = start;
+  let order = 0;
+
+  const addEntry = (sysId: string): void => {
+    const sys = mapStore.getSystem(sysId);
+    route.push({
+      order: order++,
+      systemId: sysId,
+      systemName: sys ? sys.name : sysId,
+      lastExploredAt: null,
+      blockedCount: 0,
+    });
+  };
+
+  addEntry(current);
+
+  while (unvisited.size > 0) {
+    const dists = graphDistances(graph, current);
+    let bestDist = Infinity;
+    const candidates: string[] = [];
+    for (const target of unvisited) {
+      const d = dists.get(target);
+      if (d === undefined) continue;
+      if (d < bestDist) {
+        bestDist = d;
+        candidates.length = 0;
+        candidates.push(target);
+      } else if (d === bestDist) {
+        candidates.push(target);
+      }
+    }
+    if (candidates.length === 0) break;
+    const next = pickRandom(candidates);
+    unvisited.delete(next);
+    current = next;
+    addEntry(current);
+  }
+
+  return route;
+}
+
+/** Log intersection of this bot's route with every other bot's route (non-blocking). */
+function logFixedRouteOverlap(botName: string, route: FixedPathRouteEntry[], ctx: RoutineContext): void {
+  const thisIds = new Set(route.map((e) => e.systemId.toLowerCase()));
+  const others = explorerFixedPathStore.getAllFixedPaths().filter((e) => e.botName !== botName);
+  let maxOverlap = 0;
+  let maxOther = "";
+  for (const other of others) {
+    const otherIds = new Set(other.route.map((e) => e.systemId.toLowerCase()));
+    let inter = 0;
+    for (const id of thisIds) if (otherIds.has(id)) inter++;
+    if (inter > maxOverlap) {
+      maxOverlap = inter;
+      maxOther = other.botName;
+    }
+  }
+  const pct = route.length > 0 ? maxOverlap / route.length : 0;
+  if (others.length > 0) {
+    ctx.log("system", `Fixed route overlap vs ${others.length} other bot(s): max ${maxOverlap} systems (${(pct * 100).toFixed(0)}%) with ${maxOther || "none"}`);
+    if (maxOverlap > FIXED_ROUTE_OVERLAY_WARN_COUNT || pct > FIXED_ROUTE_OVERLAY_WARN_PCT) {
+      ctx.log("warn", `Fixed route HIGH OVERLAP with ${maxOther}: ${maxOverlap} systems (${(pct * 100).toFixed(0)}%)`);
+    }
+  }
+}
+
+/** Full system exploration for one fixed-route target, reusing existing POI
+ *  scanning logic and staleness thresholds (STATION_REFRESH_MINS / RESOURCE_REFRESH_MINS). */
+async function* exploreFixedRouteSystem(ctx: RoutineContext, systemId: string): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const explorerSettings = getExplorerSettings(bot.username);
+
+  await bot.refreshLocation();
+  await bot.refreshShip();
+  mapStore.markSystemVisited(systemId);
+  explorerHistoryStore.recordVisit(bot.username, systemId);
+  updateExplorerPosition(bot.username, systemId, null);
+  await fetchSecurityLevel(ctx, systemId);
+
+  let currentFaintSignatures: FaintSignature[] = [];
+  let pois: SystemPOI[] = [];
+
+  if (explorerSettings.scanPois) {
+    yield "survey_system";
+    const surveyResp = await bot.exec("survey_system");
+    if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+      ctx.log("combat", "Battle detected during survey - aborting system scan");
+      return;
+    }
+    if (!surveyResp.error) {
+      const surveyResult = surveyResp.result as Record<string, unknown> | undefined;
+      if (surveyResult && typeof surveyResult === "object") {
+        bot.trackSurveyWildlife(surveyResult);
+        currentFaintSignatures = extractFaintSignatures(surveyResult);
+      }
+      const refreshed = await getSystemInfo(ctx);
+      if (refreshed.pois.length > pois.length) {
+        ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s) in ${systemId}`);
+      }
+      pois = refreshed.pois;
+    } else {
+      const msg = surveyResp.error.message.toLowerCase();
+      if (!msg.includes("already") && !msg.includes("cooldown")) {
+        ctx.log("info", `Survey: ${surveyResp.error.message}`);
+      }
+    }
+  } else {
+    const info = await getSystemInfo(ctx);
+    pois = info.pois;
+  }
+
+  // ── Classify POIs and determine what needs visiting ──
+  const toVisit: Array<{ poi: SystemPOI; reason: string }> = [];
+  for (const poi of pois) {
+    const isStation = isStationPoi(poi);
+    const isMinable = isMinablePoi(poi.type);
+    const isScenic = isScenicPoi(poi.type);
+    const minutesAgo = mapStore.minutesSinceExplored(systemId, poi.id);
+
+    if (isStation) {
+      if (minutesAgo < STATION_REFRESH_MINS) continue;
+      toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+    } else if (isMinable) {
+      const storedPoi = mapStore.getSystem(systemId)?.pois.find((p) => p.id === poi.id);
+      const hasResourceData = (storedPoi?.resources?.length ?? 0) > 0;
+      if (explorerSettings.surveyMode === "quick" && hasResourceData) {
+        if (minutesAgo < RESOURCE_REFRESH_MINS) continue;
+      }
+      if (!hasResourceData) {
+        toVisit.push({ poi, reason: "needs-resource-scan" });
+      } else if (minutesAgo < RESOURCE_REFRESH_MINS) {
+        continue;
+      } else {
+        toVisit.push({ poi, reason: "refresh" });
+      }
+    } else if (isScenic) {
+      if (explorerSettings.surveyMode === "quick") continue;
+      if (minutesAgo < Infinity) continue;
+      toVisit.push({ poi, reason: "new" });
+    } else {
+      if (explorerSettings.surveyMode === "quick") continue;
+      if (minutesAgo < RESOURCE_REFRESH_MINS) continue;
+      toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
+    }
+  }
+
+  // Chase faint signatures (creature hints)
+  if (currentFaintSignatures.length > 0 && explorerSettings.mode !== "visit_all") {
+    const sigPois = findPoisFromFaintSignatures(currentFaintSignatures, pois);
+    for (const poi of sigPois) {
+      if (!toVisit.some((t) => t.poi.id === poi.id)) {
+        toVisit.push({ poi, reason: "faint-signature" });
+      }
+    }
+    if (sigPois.length > 0) {
+      ctx.log("wildlife", `Following ${sigPois.length} faint signature(s) in ${systemId}: ${sigPois.map((p) => p.name).join(", ")}`);
+    }
+  }
+
+  if (toVisit.length === 0) {
+    ctx.log("info", `${systemId}: all POIs up to date — moving on`);
+    return;
+  }
+  ctx.log("info", `${systemId}: ${toVisit.length} POI(s) to visit`);
+
+  // ── Visit each POI ──
+  for (const { poi } of toVisit) {
+    if (bot.state !== "running") break;
+    updateExplorerPosition(bot.username, systemId, poi.id);
+
+    const isMinable = isMinablePoi(poi.type);
+    const isStation = isStationPoi(poi);
+
+    const poiFueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
+    if (!poiFueled) {
+      ctx.log("error", `Could not refuel at ${systemId} — aborting POI tour`);
+      break;
+    }
+    await bot.refreshLocation();
+    if (bot.system !== systemId) break;
+    await ensureUndocked(ctx);
+
+    yield `visit_${poi.id}`;
+    const travelResp = await bot.exec("travel", { target_poi: poi.id });
+    if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) continue;
+    if (travelResp.error && !travelResp.error.message.includes("already")) continue;
+    bot.poi = poi.id;
+
+    // ── Wormhole test ──
+    const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+    if (isWormholePoi) {
+      ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+      const jumpResp = await bot.exec("jump", { target_poi: poi.id });
+      if (jumpResp.error) {
+        mapStore.markExplored(systemId, poi.id);
+        await bot.refreshLocation();
+        continue;
+      }
+      const r = jumpResp.result as Record<string, unknown> | undefined;
+      if (r && r.action === "jumped") {
+        const destSystemId = (r.system_id as string) || "";
+        mapStore.markExplored(systemId, poi.id);
+        if (destSystemId) mapStore.markExplored(destSystemId, (r.poi as string) || poi.id);
+      }
+      await bot.refreshLocation();
+      if (bot.system && bot.system !== systemId) {
+        ctx.log("info", `Arrived in ${bot.system} via wormhole — new system will be added on next cycle`);
+        return;
+      }
+      continue;
+    }
+
+    if (isMinable) {
+      yield* scanResourcePoi(ctx, systemId, poi);
+    } else if (isStation) {
+      yield* scanStation(ctx, systemId, poi);
+    } else {
+      yield* visitOtherPoi(ctx, systemId, poi, new Set<string>());
+    }
+
+    mapStore.markExplored(systemId, poi.id);
+  }
+}
+
+/** Fixed-route explorer: walks a pre-determined route through all known
+ *  systems, fully surveys each, loops home to restock, then restarts. */
+export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+  const FUEL_THRESHOLD_PCT = 30;
+  const BLOCKED_PAUSE_MS = 60_000;
+
+  let sendBotChat: ((content: string, channel: BotChatChannel, recipients?: string[], metadata?: Record<string, unknown>) => void) | undefined;
+  let getAllBotNames: (() => string[]) | undefined;
+  if (ctx.sendBotChat) sendBotChat = ctx.sendBotChat;
+  if (ctx.getAllBotNames) getAllBotNames = ctx.getAllBotNames;
+
+  let consecutiveFailures = 0;
+
+  while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await ctx.sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "fixed_route")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // ── Re-check mode (user may have changed it, or session restarted) ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "fixed_route") {
+      ctx.log("system", `Mode changed to ${modeCheck.mode} — leaving fixed_route...`);
+      explorerFixedPathStore.removeFixedPath(bot.username);
+      return;
+    }
+
+    // ── Load / ensure route ──
+    let fixed = explorerFixedPathStore.getFixedPath(bot.username);
+    if (!fixed) {
+      const cloakAvailable = await hasCloakModule(ctx);
+      const homeBase = getGlobalHomeBase();
+      const homeSystem = homeBase.system || bot.system || "sol";
+      const graph = buildFixedRouteGraph(cloakAvailable);
+      const route = generateFixedRoute(graph, homeSystem);
+      if (route.length === 0) {
+        ctx.log("error", "Fixed route: no reachable systems to route through — retrying in 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+      const entry: ExplorerFixedPath = {
+        botName: bot.username,
+        routeId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+        createdAt: now(),
+        updatedAt: now(),
+        status: "active",
+        cloakAvailable,
+        homeSystem,
+        currentIndex: 0,
+        route,
+      };
+      explorerFixedPathStore.upsertFixedPath(entry);
+      explorerFixedPathStore.flushSync();
+      fixed = entry;
+      ctx.log("system", `Fixed route built — ${route.length} systems, cloak=${cloakAvailable}, home=${homeSystem}, start=${route[0].systemId}`);
+      logFixedRouteOverlap(bot.username, route, ctx);
+    }
+
+    const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";
+
+    // ── New-system detection: regenerate if get_map reveals systems not in route ──
+    const mapResp = await bot.exec("get_map");
+    if (mapResp.result && typeof mapResp.result === "object") {
+      const mapData = mapResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      const routeIds = new Set(fixed.route.map((e) => e.systemId.toLowerCase()));
+      const newSystems: Array<Record<string, unknown>> = [];
+      for (const s of systems) {
+        const id = ((s.system_id as string) || (s.id as string) || "").toLowerCase();
+        if (id && !routeIds.has(id)) newSystems.push(s);
+      }
+      if (newSystems.length > 0) {
+        const names = newSystems.map((s) => (s.name as string) || (s.system_id as string) || (s.id as string)).join(", ");
+        ctx.log("system", `NEW SYSTEM DISCOVERED: ${names} — regenerating fixed route...`);
+        if (sendBotChat && getAllBotNames) {
+          const others = getAllBotNames().filter((n) => n.toLowerCase() !== bot.username.toLowerCase());
+          if (others.length) {
+            sendBotChat(`🗺️ ${bot.username} discovered new system(s): ${names} — regenerating fixed route`, "coordination", others);
+          }
+        }
+        const cloakAvailable = fixed.cloakAvailable ?? (await hasCloakModule(ctx));
+        const graph = buildFixedRouteGraph(cloakAvailable);
+        const route = generateFixedRoute(graph, homeSystem);
+        if (route.length > 0) {
+          const entry: ExplorerFixedPath = {
+            ...fixed,
+            route,
+            currentIndex: Math.min(fixed.currentIndex, Math.max(0, route.length - 1)),
+            updatedAt: now(),
+            status: "active",
+            cloakAvailable,
+          };
+          explorerFixedPathStore.upsertFixedPath(entry);
+          explorerFixedPathStore.flushSync();
+          fixed = entry;
+          ctx.log("system", `Fixed route regenerated — ${route.length} systems`);
+          logFixedRouteOverlap(bot.username, route, ctx);
+        }
+      }
+    }
+
+    // ── Route complete → navigate home, restock fuel cells, restart ──
+    if (fixed.currentIndex >= fixed.route.length) {
+      ctx.log("system", "Fixed route complete — returning home to restock fuel cells...");
+      const homeOk = await returnToHomeBaseForFuelCells(ctx);
+      if (!homeOk) {
+        ctx.log("error", "Fixed route: could not reach home base to restock — waiting 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+      explorerFixedPathStore.setCurrentIndex(bot.username, 0);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      fixed.currentIndex = 0;
+      consecutiveFailures = 0;
+      ctx.log("system", "Fixed route complete — restarting from start");
+      continue;
+    }
+
+    const target = fixed.route[fixed.currentIndex];
+
+    // ── Blocked skip: unreachable system ──
+    const blacklistSet = new Set(getSystemBlacklist().map((b) => b.toLowerCase()));
+    const targetBlocked =
+      (!fixed.cloakAvailable && blacklistSet.has(target.systemId.toLowerCase())) ||
+      isTemporarilyBlacklisted(target.systemId) ||
+      target.blockedCount >= 5;
+
+    if (targetBlocked) {
+      explorerFixedPathStore.incrementBlockedCount(bot.username, target.order);
+      explorerFixedPathStore.flushSync();
+      consecutiveFailures++;
+      ctx.log("warn", `Fixed route: skipping blocked system ${target.systemId} (blockedCount=${target.blockedCount + 1})`);
+      if (consecutiveFailures >= 5) {
+        ctx.log("warn", "Fixed route: 5 consecutive failures — pausing 60s");
+        await ctx.sleep(BLOCKED_PAUSE_MS);
+        consecutiveFailures = 0;
+      }
+      fixed.currentIndex++;
+      explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      continue;
+    }
+    consecutiveFailures = 0;
+
+    // ── Mid-route fuel check ──
+    const fueled = await ensureFueled(ctx, FUEL_THRESHOLD_PCT);
+    if (!fueled) {
+      ctx.log("system", `Fixed route: low fuel before ${target.systemId} — excursion to home base`);
+      explorerFixedPathStore.flushSync();
+      await returnToHomeBaseForFuelCells(ctx);
+      continue; // resume at same currentIndex
+    }
+
+    // ── Travel to target ──
+    ctx.log("travel", `Fixed route: jumping to ${target.systemId} (${fixed.currentIndex + 1}/${fixed.route.length})`);
+    const arrived = await navigateToSystem(ctx, target.systemId, {
+      fuelThresholdPct: FUEL_THRESHOLD_PCT,
+      hullThresholdPct: 30,
+      skipBlacklist: fixed.cloakAvailable,
+      ignoreBlacklistWhenCloaked: true,
+      ignorePiratesWhenCloaked: true,
+      homeSystem,
+    });
+    if (!arrived) {
+      ctx.log("warn", `Fixed route: could not reach ${target.systemId} — blocking and skipping`);
+      explorerFixedPathStore.incrementBlockedCount(bot.username, target.order);
+      explorerFixedPathStore.flushSync();
+      consecutiveFailures++;
+      fixed.currentIndex++;
+      explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+      explorerFixedPathStore.flushSync();
+      fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+      continue;
+    }
+
+    // ── Full system exploration ──
+    yield* exploreFixedRouteSystem(ctx, target.systemId);
+
+    // ── Advance index ──
+    explorerFixedPathStore.markEntryExplored(bot.username, target.order, now());
+    fixed.currentIndex++;
+    explorerFixedPathStore.setCurrentIndex(bot.username, fixed.currentIndex);
+    explorerFixedPathStore.flushSync();
+    fixed = explorerFixedPathStore.getFixedPath(bot.username)!;
+
+    await ctx.sleep(1000);
+  }
 }
 
   /**

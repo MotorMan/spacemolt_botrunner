@@ -144,6 +144,12 @@ async function pathfinderJumpAtBearing(
     }
   }
 
+  // Honor an immediate stop request — don't poll tick or continue processing.
+  if (bot.state !== "running") {
+    ctx.log("system", "Pathfinder jump aborted — bot stopped");
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
+
   // Final tick capture at landing.
   endTick = await bot.pollCurrentTick();
 
@@ -326,6 +332,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     const jumped = await pathfinderJumpAtBearing(ctx, angle, originPos);
     if (!jumped.success) {
       ctx.log("error", `Pathfinder jump at ${angle}° failed — skipping angle`);
+      if (bot.state !== "running") break;
       continue;
     }
 

@@ -478,11 +478,6 @@ export async function libExecute(
   if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
     return { result: { ok: true }, error: undefined, notifications: [] };
   }
-  // Notifications arrive via event subscriptions, not as a query result.
-  if (command === "get_notifications") {
-    return { result: { notifications: [] }, error: undefined, notifications: [] };
-  }
-
   const { tool, action, body } = buildLibDispatch(command, payload);
 
   let lastErr: Error | null = null;

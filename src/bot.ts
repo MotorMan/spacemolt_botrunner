@@ -1086,11 +1086,6 @@ docked = false;
     if (COMMAND_TOOL_MAP[command] === "spacemolt_auth") {
       return { result: { ok: true }, error: undefined, notifications: [] };
     }
-    // Notifications arrive via event subscriptions (P2) for library bots.
-    if (command === "get_notifications") {
-      return { result: { notifications: [] }, error: undefined, notifications: [] };
-    }
-
     const blockedCommands = new Set(["jump", "travel", "dock", "undock", "mine", "salvage", "buy", "sell"]);
     if (this.isCustomsHold() && blockedCommands.has(command)) {
       this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
@@ -1481,7 +1476,23 @@ docked = false;
       // loops, which the library handles internally) was removed; the business
       // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
-      resp = await this.libExec(command, payload);
+      if (command === "jump") {
+        // Jump commands wait for action_result from the server; if the
+        // notification never arrives (e.g. jump rejected silently), the
+        // library's internal wait can stretch to 10 minutes. Bound it so a
+        // failed jump fails fast instead of blocking the routine. Route through
+        // execWithTimeout so the abort signal (stop request) breaks the jump
+        // immediately and the user can take over.
+        const timeoutMs = this.calculateJumpTimeout();
+        const targetId = (payload as Record<string, unknown> | undefined)?.target_system;
+        const targetIdStr = typeof targetId === "string" ? targetId : "";
+        resp = await this.execWithTimeout(command, payload, timeoutMs, targetIdStr, this._abortController?.signal);
+        if (resp.error && resp.error.code === "aborted") {
+          this.log("system", "Jump aborted by stop request — returning control to user.");
+        }
+      } else {
+        resp = await this.libExec(command, payload);
+      }
 
       if (isCombatDebugEnabled() && (
         command === "battle" || command === "scan" || command === "attack" ||
@@ -3174,6 +3185,7 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
     if (resp.error || !resp.result) {
       if (this.lastKnownTick !== null) {
         this.log("warn", "get_notifications failed, using lastKnownTick for tick estimation");
+        return this.lastKnownTick ?? null;
       }
       return null;
     }
@@ -3186,8 +3198,15 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
       this.lastKnownTick = tick;
       return tick;
     }
+    // Library-backed bots receive tick via observation push events rather than
+    // get_notifications; fall back to the cached observation tick.
+    if (this.observationTick && this.observationTick > 0) {
+      this.lastKnownTick = this.observationTick;
+      return this.observationTick;
+    }
     if (this.lastKnownTick !== null) {
       this.log("debug", `current_tick not in response, using lastKnownTick=${this.lastKnownTick}`);
+      return this.lastKnownTick ?? null;
     }
     return null;
   }

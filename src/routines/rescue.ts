@@ -1,8 +1,6 @@
 import type { Routine, RoutineContext, BotStatus } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
-import { EMPIRE_STATIONS, getAllStationsForEmpires } from "./fuelService.js";
 import { getLastFleetRoster, getLastFleetPullError, getBotStatuses } from "../botmanager.js";
-import { updateFactionStorageCache, getFactionStorageCache } from "../factionStorageCache.js";
 import {
   findStation,
   getSystemInfo,
@@ -5696,61 +5694,6 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
       startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
     } else {
       ctx.log("rescue", `💰 Credit top-off ${settings.creditTopOffEnabled ? `not assigned to this bot (waiting for ${settings.creditTopOffBot || 'primary bot'})` : 'DISABLED in settings'} - not running credit distribution`);
-    }
-
-    // ── Start background remote faction-station fuel monitor (non-blocking) ──
-    // Uses the new `faction_info` endpoint which returns fuel_bunkers for ALL
-    // stations in a single call, replacing the old per-station view_faction_storage polling.
-    const allFactionStations: string[] = getAllStationsForEmpires(Object.keys(EMPIRE_STATIONS));
-
-    if (allFactionStations.length > 0) {
-      ctx.log("rescue", `📡 Starting remote faction-station fuel monitor for ${allFactionStations.length} stations (via faction_info)`);
-
-      (async () => {
-        while (bot.state === "running") {
-          try {
-            const infoResp = await bot.exec("faction_info", {});
-            if (!infoResp.error && infoResp.result) {
-              const data = infoResp.result as Record<string, unknown>;
-              const fuelBunkers = (data.fuel_bunkers as Array<Record<string, unknown>>) || [];
-              const factionName = bot.faction || "";
-
-              let updated = 0;
-              for (const bunker of fuelBunkers) {
-                const baseId = bunker.base_id as string;
-                const reserve = (bunker.fuel_reserve as number) || 0;
-                const capacity = (bunker.fuel_capacity as number) || 0;
-
-                for (const stationRef of allFactionStations) {
-                  if (mapStore.sameStation(baseId, stationRef)) {
-                    const stationId = mapStore.resolveStationTarget(stationRef);
-                    const existing = getFactionStorageCache(factionName, stationId);
-                    updateFactionStorageCache(
-                      factionName,
-                      existing?.entries || [],
-                      stationId,
-                      reserve,
-                      capacity,
-                    );
-                    ctx.log("rescue", `📡 Remote ${stationRef}: faction fuel facility = ${reserve}/${capacity}`);
-                    updated++;
-                    break;
-                  }
-                }
-              }
-              if (updated > 0) {
-                ctx.log("rescue", `📡 faction_info refresh: updated ${updated}/${allFactionStations.length} stations`);
-              }
-            } else if (infoResp.error) {
-              ctx.log("warn", `📡 faction_info failed: ${infoResp.error.message}`);
-            }
-          } catch (e) {
-            ctx.log("warn", `📡 Error in remote faction-station fuel monitor: ${e}`);
-          }
-
-          await new Promise((resolve) => setTimeout(resolve, 60000));
-        }
-      })();
     }
 
     // Log category - determined when target is selected

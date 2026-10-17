@@ -4864,7 +4864,7 @@
           actionsEl._focusTrackingSetup = true;
           actionsEl.addEventListener("focusin", (e) => {
             if (
-              e.target.tagName === "SELECT" &&
+              (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") &&
               e.target.id?.startsWith("profile-")
             ) {
               window._profileActionsOpen = true;
@@ -4880,7 +4880,7 @@
             const relatedTarget = e.relatedTarget;
             if (
               !relatedTarget ||
-              relatedTarget.tagName !== "SELECT" ||
+              (relatedTarget.tagName !== "SELECT" && relatedTarget.tagName !== "INPUT") ||
               !relatedTarget.id?.startsWith("profile-")
             ) {
               // Set a timeout to close, allowing time for option clicks
@@ -4897,7 +4897,7 @@
           });
           // Also track mousedown to prevent re-render during dropdown interaction
           actionsEl.addEventListener("mousedown", (e) => {
-            if (e.target.tagName === "SELECT" && e.target.id?.startsWith("profile-")) {
+            if ((e.target.tagName === "SELECT" || e.target.tagName === "INPUT") && e.target.id?.startsWith("profile-")) {
               window._profileActionsOpen = true;
               if (window._profileActionsCloseTimeout) {
                 clearTimeout(window._profileActionsCloseTimeout);

@@ -4231,6 +4231,7 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
   if (ctx.getAllBotNames) getAllBotNames = ctx.getAllBotNames;
 
   let consecutiveFailures = 0;
+  let startupPrepped = false;
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -4280,6 +4281,49 @@ export async function* fixedRouteRoutine(ctx: RoutineContext): AsyncGenerator<st
       fixed = entry;
       ctx.log("system", `Fixed route built — ${route.length} systems, cloak=${cloakAvailable}, home=${homeSystem}, start=${route[0].systemId}`);
       logFixedRouteOverlap(bot.username, route, ctx);
+    }
+
+    // ── Startup prep: dock, load fuel cells to max, refuel tank, repair hull ──
+    if (!startupPrepped) {
+      startupPrepped = true;
+      ctx.log("system", "Fixed route: startup prep — docking to load fuel cells, refuel tank, and repair hull...");
+      const { pois: startPois } = await getSystemInfo(ctx);
+      const startStation = findStation(startPois);
+      if (startStation) {
+        if (bot.poi !== startStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: startStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("warn", `Could not reach startup station ${startStation.name}: ${tResp.error.message}`);
+          }
+        }
+        if (!bot.docked) {
+          const dResp = await bot.exec("dock");
+          if (!dResp.error || dResp.error.message.includes("already")) {
+            bot.docked = true;
+          }
+        }
+      }
+      if (bot.docked) {
+        await collectFromStorage(ctx);
+        const settings = getExplorerSettings(bot.username);
+        if (settings.loadFuelCellsAtHome) {
+          await loadFuelCellsToMax(ctx);
+        }
+        await tryRefuel(ctx);
+        await bot.refreshShip();
+        const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        if (hullPct <= 40) {
+          ctx.log("system", `Hull critical (${hullPct}%) — repairing at startup station`);
+          await repairShip(ctx);
+        }
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        ctx.log("system", `Startup prep complete — Fuel: ${fuelPct}% | Cargo: ${bot.cargo}/${bot.cargoMax} | Hull: ${hullPct}%`);
+      } else {
+        ctx.log("warn", "Fixed route: no station in current system for startup prep — proceeding with current fuel/cargo");
+      }
+      await ensureUndocked(ctx);
     }
 
     const homeSystem = fixed.homeSystem || getGlobalHomeBase().system || "sol";

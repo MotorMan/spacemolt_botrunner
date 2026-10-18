@@ -5403,6 +5403,14 @@
       <select id="profile-pathfinderScanPattern" style="width:90px" onchange="saveProfilePathfinderScanPattern()">
         <option value="circle" ${scanPattern === "circle" ? "selected" : ""}>Circle</option>
         <option value="star" ${scanPattern === "star" ? "selected" : ""}>Star</option>
+        <option value="spiral" ${scanPattern === "spiral" ? "selected" : ""}>Spiral</option>
+        <option value="figure8" ${scanPattern === "figure8" ? "selected" : ""}>Figure-8</option>
+        <option value="zigzag" ${scanPattern === "zigzag" ? "selected" : ""}>Zigzag</option>
+        <option value="petal" ${scanPattern === "petal" ? "selected" : ""}>Petal</option>
+        <option value="square" ${scanPattern === "square" ? "selected" : ""}>Square</option>
+        <option value="cross" ${scanPattern === "cross" ? "selected" : ""}>Cross</option>
+        <option value="wedge" ${scanPattern === "wedge" ? "selected" : ""}>Wedge</option>
+        <option value="random" ${scanPattern === "random" ? "selected" : ""}>Random</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
       <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
@@ -34209,11 +34217,19 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row">
       <div>
         <div class="setting-label">Sweep Pattern</div>
-        <div class="setting-hint">Circle = full 360° sweep. Star = out-and-back spikes in a tight arc around the start degree.</div>
+        <div class="setting-hint">Circle = full 360° sweep. Star/Wedge/Zigzag/etc. = out-and-back spikes in a tight arc around the start degree.</div>
       </div>
       <select id="set-pathfinder-scanPattern">
         <option value="circle" ${scanPattern === "circle" ? "selected" : ""}>Circle</option>
         <option value="star" ${scanPattern === "star" ? "selected" : ""}>Star</option>
+        <option value="spiral" ${scanPattern === "spiral" ? "selected" : ""}>Spiral</option>
+        <option value="figure8" ${scanPattern === "figure8" ? "selected" : ""}>Figure-8</option>
+        <option value="zigzag" ${scanPattern === "zigzag" ? "selected" : ""}>Zigzag</option>
+        <option value="petal" ${scanPattern === "petal" ? "selected" : ""}>Petal</option>
+        <option value="square" ${scanPattern === "square" ? "selected" : ""}>Square</option>
+        <option value="cross" ${scanPattern === "cross" ? "selected" : ""}>Cross</option>
+        <option value="wedge" ${scanPattern === "wedge" ? "selected" : ""}>Wedge</option>
+        <option value="random" ${scanPattern === "random" ? "selected" : ""}>Random</option>
       </select>
     </div>
 

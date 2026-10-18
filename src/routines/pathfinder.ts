@@ -19,7 +19,7 @@ interface PathfinderSettings {
   scanWaitMinutes?: number;
   scanDelayTicks?: number;
   refuelThreshold?: number;
-  scanPattern?: "circle" | "star";
+  scanPattern?: "circle" | "star" | "spiral" | "figure8" | "zigzag" | "petal" | "square" | "cross" | "wedge" | "random";
 }
 
 interface GalacticPos {
@@ -52,7 +52,7 @@ export function getPathfinderSettings(username?: string): PathfinderSettings {
     scanWaitMinutes: asNumber(botOverrides.scanWaitMinutes, asNumber(global.scanWaitMinutes, 5)),
     scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 2)),
     refuelThreshold: asNumber(botOverrides.refuelThreshold, asNumber(global.refuelThreshold, 50)),
-    scanPattern: (asString(botOverrides.scanPattern, asString(global.scanPattern, "circle")) as "circle" | "star"),
+    scanPattern: (asString(botOverrides.scanPattern, asString(global.scanPattern, "circle")) as PathfinderSettings["scanPattern"]),
   };
 }
 
@@ -80,8 +80,95 @@ export function setPathfinderScanDelayTicks(username: string, ticks: number): vo
   writeSettings({ [username]: { scanDelayTicks: ticks } });
 }
 
-export function setPathfinderScanPattern(username: string, pattern: "circle" | "star"): void {
+export function setPathfinderScanPattern(username: string, pattern: PathfinderSettings["scanPattern"]): void {
   writeSettings({ [username]: { scanPattern: pattern } });
+}
+
+/** Generate a sequence of scan angles for a given sweep pattern.
+ *  All patterns except "circle" return to origin after each angle (out + back),
+  *  keeping outward distance low. "circle" chains jumps mid-drift. */
+function generateScanPattern(
+  pattern: PathfinderSettings["scanPattern"],
+  startDegree: number,
+  stepDegrees: number,
+  numAngles: number,
+): number[] {
+  const angles: number[] = [];
+  const start = ((startDegree % 360) + 360) % 360;
+  const step = Math.max(1, Math.min(180, stepDegrees));
+
+  switch (pattern) {
+    case "circle": {
+      for (let i = 0; i < numAngles; i++) {
+        angles.push((start + i * step) % 360);
+      }
+      break;
+    }
+    case "star": {
+      for (let i = 0; i < numAngles; i++) {
+        angles.push((start + i * step) % 360);
+      }
+      break;
+    }
+    case "spiral": {
+      for (let i = 0; i < numAngles; i++) {
+        const dir = i % 2 === 0 ? 1 : -1;
+        const offset = Math.floor(i / 2) * step;
+        angles.push(((start + dir * offset) % 360 + 360) % 360);
+      }
+      break;
+    }
+    case "figure8": {
+      for (let i = 0; i < numAngles; i++) {
+        const dir = i % 2 === 0 ? 1 : -1;
+        const offset = Math.floor(i / 2) * step;
+        angles.push(((start + dir * offset) % 360 + 360) % 360);
+      }
+      break;
+    }
+    case "zigzag": {
+      for (let i = 0; i < numAngles; i++) {
+        const dir = i % 2 === 0 ? 1 : -1;
+        const offset = Math.floor(i / 2) * step;
+        angles.push(((start + dir * offset) % 360 + 360) % 360);
+      }
+      break;
+    }
+    case "petal": {
+      for (let i = 0; i < numAngles; i++) {
+        const offset = Math.round(Math.sin(i * (step * Math.PI / 180)) * 90);
+        angles.push(((start + offset) % 360 + 360) % 360);
+      }
+      break;
+    }
+    case "square": {
+      for (let i = 0; i < 4; i++) {
+        angles.push((start + i * 90) % 360);
+      }
+      break;
+    }
+    case "cross": {
+      for (let i = 0; i < 8; i++) {
+        angles.push((start + i * 45) % 360);
+      }
+      break;
+    }
+    case "wedge": {
+      const halfWedge = Math.min(45, Math.floor(numAngles / 2) * step);
+      for (let i = 0; i < numAngles; i++) {
+        angles.push(((start - halfWedge + i * step) % 360 + 360) % 360);
+      }
+      break;
+    }
+    case "random": {
+      for (let i = 0; i < numAngles; i++) {
+        angles.push(Math.floor(Math.random() * 360));
+      }
+      break;
+    }
+  }
+
+  return angles;
 }
 
 /** Perform a raw pathfinder jump at a given bearing.
@@ -313,11 +400,13 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
   const startDegree = ((scanStartDegree % 360) + 360) % 360;
   const numAngles = Math.floor(360 / scanStepDegrees);
-  // Star pattern does an out + back jump per spike; circle does one jump per
-  // angle plus a final return. Use 2x for a conservative fuel estimate either way.
-  const totalJumps = numAngles * 2;
+  const scanAngles = generateScanPattern(scanPattern, startDegree, scanStepDegrees, numAngles);
+  // Circle chains jumps mid-drift; all other patterns return to origin between
+  // angles (out + back). Add 1 for the final return jump on circle only.
+  const jumpsPerAngle = scanPattern === "circle" ? 1 : 2;
+  const totalJumps = scanAngles.length * jumpsPerAngle + (scanPattern === "circle" ? 1 : 0);
 
-  ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${numAngles} angles), pattern: ${scanPattern}, wait: ${scanWaitMinutes} min`);
+  ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${scanAngles.length} angles), pattern: ${scanPattern}, wait: ${scanWaitMinutes} min`);
 
   yield "prep";
   await bot.refreshStatus();
@@ -357,9 +446,14 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const foundSystems: FoundSystem[] = [];
 
   /** Issue a pathfinder jump at a bearing, wait 1 tick, then read get_poi and
-   *  log/record the destination. Fire-and-forget — no transit completion wait. */
-  async function scanAngle(angle: number, label: string): Promise<void> {
-    const jumped = await pathfinderJumpAtBearing(ctx, angle, null, { waitForCompletion: false });
+   *  log/record the destination. Fire-and-forget — no transit completion wait.
+   *  `midTransitWaitMs` waits that many ms after transit starts (used for the
+   *  initial jump to get away from origin). */
+  async function scanAngle(angle: number, label: string, opts?: { midTransitWaitMs?: number }): Promise<void> {
+    const jumped = await pathfinderJumpAtBearing(ctx, angle, null, {
+      waitForCompletion: false,
+      midTransitWaitMs: opts?.midTransitWaitMs,
+    });
     if (!jumped.success) {
       ctx.log("error", `Pathfinder jump at ${label} ${angle}° failed`);
       return;
@@ -417,41 +511,39 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
-  for (let i = 0; i < numAngles && bot.state === "running"; i++) {
-    const outwardAngle = (startDegree + i * scanStepDegrees) % 360;
-    const returnAngle = (outwardAngle + 180) % 360;
+  for (let i = 0; i < scanAngles.length && bot.state === "running"; i++) {
+    const angle = scanAngles[i];
+    const label = scanPattern === "circle" ? "Angle" : "Out";
 
     yield "scanning";
-    ctx.log("hunt", `Scanning spike ${outwardAngle}° (${i + 1}/${numAngles})`);
+    ctx.log("hunt", `Scanning ${label} ${angle}° (${i + 1}/${scanAngles.length})`);
 
+    // Initial jump from origin at startDegree. Wait for transit to START,
+    // then wait scanWaitMinutes mid-transit to get away from origin.
     if (i === 0) {
-      // Initial jump from origin at startDegree. Wait for transit to START,
-      // then wait scanWaitMinutes mid-transit to get away from origin.
       if (bot.inTransit) {
-        ctx.log("system", `Already drifting at start of sweep — skipping redundant initial jump at ${outwardAngle}°, checking destination instead...`);
+        ctx.log("system", `Already drifting at start of sweep — skipping redundant initial jump at ${angle}°, checking destination instead...`);
       } else {
-        const started = await pathfinderJumpAtBearing(ctx, outwardAngle, originPos, {
-          waitForCompletion: false,
+        await scanAngle(angle, label, {
           midTransitWaitMs: scanWaitMinutes > 0 ? scanWaitMinutes * 60 * 1000 : 0,
         });
-        if (!started.success) {
-          ctx.log("error", `Initial pathfinder jump at ${outwardAngle}° failed — aborting sweep`);
-          return;
-        }
       }
-    } else if (scanPattern === "star") {
-      // Star pattern: mid-drift redirect to the next outward spike angle.
-      await scanAngle(outwardAngle, "Out");
     } else {
-      // Circle pattern: mid-drift redirect to the next angle around the circle.
-      await scanAngle(outwardAngle, "Angle");
+      await scanAngle(angle, label);
     }
 
     if (bot.state !== "running") break;
 
-    // Star pattern: jump back toward origin after each outward spike.
-    if (scanPattern === "star") {
-      await scanAngle(returnAngle, "Back");
+    // For non-circle patterns, jump back to origin after each outward angle
+    // to keep outward distance low. Circle chains jumps mid-drift.
+    if (scanPattern !== "circle" && bot.state === "running") {
+      const returnAngle = (angle + 180) % 360;
+      const returned = await pathfinderJumpAtBearing(ctx, returnAngle, null, { waitForCompletion: true });
+      if (!returned.success) {
+        ctx.log("error", `Return jump from ${angle}° failed — may be stranded in ${bot.system}`);
+        if (bot.state !== "running") break;
+        continue;
+      }
     }
 
     if (bot.state !== "running") break;
@@ -463,8 +555,9 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
-  // Final return to origin — 180 off the starting degree.
-  if (bot.state === "running") {
+  // Final return to origin (circle pattern only — non-circle patterns already
+  // return to origin after each angle).
+  if (bot.state === "running" && scanPattern === "circle") {
     const returnBearing = (startDegree + 180) % 360;
     ctx.log("travel", `Returning to origin ${originSystem} at bearing ${returnBearing}° (180 off start degree ${startDegree}°)`);
     const returned = await pathfinderJumpAtBearing(ctx, returnBearing, null, { waitForCompletion: true });

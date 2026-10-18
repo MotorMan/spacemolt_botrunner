@@ -5366,6 +5366,7 @@
           const scanStartDegree = botSettings.scanStartDegree ?? 0;
           const scanStepDegrees = botSettings.scanStepDegrees ?? 12;
           const scanWaitMinutes = botSettings.scanWaitMinutes ?? 5;
+          const scanDelayTicks = botSettings.scanDelayTicks ?? 2;
           const refuelThreshold = botSettings.refuelThreshold ?? 50;
           const sysOpts = [
             `<option value=""${!originSystem ? " selected" : ""}>(current)</option>`,
@@ -5395,6 +5396,8 @@
       <input type="number" id="profile-pathfinderScanStepDegrees" value="${scanStepDegrees}" min="1" max="180" style="width:55px" onchange="saveProfilePathfinderScanStepDegrees()">
       <span class="profile-ore-label" style="margin-left:8px">Wait (min):</span>
       <input type="number" id="profile-pathfinderScanWaitMinutes" value="${scanWaitMinutes}" min="0" max="120" style="width:55px" onchange="saveProfilePathfinderScanWaitMinutes()">
+      <span class="profile-ore-label" style="margin-left:8px">Delay (ticks):</span>
+      <input type="number" id="profile-pathfinderScanDelayTicks" value="${scanDelayTicks}" min="0" max="60" style="width:55px" onchange="saveProfilePathfinderScanDelayTicks()">
       <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
       <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
         }
@@ -6164,6 +6167,22 @@
         const scanWaitMinutes = parseInt(inp.value, 10) || 5;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { scanWaitMinutes });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfilePathfinderScanDelayTicks() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const inp = document.getElementById("profile-pathfinderScanDelayTicks");
+        if (!inp) return;
+        const scanDelayTicks = parseInt(inp.value, 10) || 2;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { scanDelayTicks });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -34100,6 +34119,7 @@ ignoreBlacklist: document.getElementById(
         const scanStartDegree = p.scanStartDegree ?? 0;
         const scanStepDegrees = p.scanStepDegrees ?? 12;
         const scanWaitMinutes = p.scanWaitMinutes ?? 5;
+        const scanDelayTicks = p.scanDelayTicks ?? 2;
         const refuelThreshold = p.refuelThreshold ?? 50;
 
         const sysOpts = ['<option value="">(current system)</option>'];
@@ -34155,6 +34175,14 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Delay Between Angles (ticks)</div>
+        <div class="setting-hint">Game ticks to wait between each scan angle for aesthetic spacing on the fleet tracking map. Default 2 ticks (~20s). Set to 0 to skip.</div>
+      </div>
+      <input type="number" id="set-pathfinder-scanDelayTicks" min="0" max="60" value="${scanDelayTicks}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Refuel Threshold (%)</div>
         <div class="setting-hint">Minimum fuel percentage before attempting jumps.</div>
       </div>
@@ -34184,6 +34212,10 @@ ignoreBlacklist: document.getElementById(
             parseInt(
               document.getElementById("set-pathfinder-scanWaitMinutes").value,
             ) || 5,
+          scanDelayTicks:
+            parseInt(
+              document.getElementById("set-pathfinder-scanDelayTicks").value,
+            ) || 2,
           refuelThreshold:
             parseInt(
               document.getElementById("set-pathfinder-refuelThreshold")

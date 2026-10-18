@@ -1860,6 +1860,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
             continue;
           }
           await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+          if (bot.poi !== settings.homeStation) {
+            if (bot.state !== "running") continue;
+            await ensureUndocked(ctx);
+            await bot.exec("travel", { target_poi: settings.homeStation });
+            bot.poi = settings.homeStation;
+          }
           continue;
         }
       }
@@ -2002,6 +2008,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         if (bot.system !== settings.homeSystem) {
           if (bot.state !== "running") break;
           await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        }
+        if (bot.poi !== settings.homeStation) {
+          if (bot.state !== "running") break;
+          await ensureUndocked(ctx);
+          await bot.exec("travel", { target_poi: settings.homeStation });
+          bot.poi = settings.homeStation;
         }
         continue;
       }

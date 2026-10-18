@@ -5842,16 +5842,15 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   // Treat injured crew/marines before doing anything else
   await treatPersonnel(ctx);
 
-  // Recruit fresh crew and marines up to ship capacity
+  // Recruit fresh crew and marines up to ship capacity every time we are
+  // docked/restocking. Passing full capacity (or the 1500/450 fallback when
+  // capacity is unknown) is safe: the server only recruits what the ship can
+  // actually hold, so this always tops crew and marines off completely.
   await bot.refreshShip();
-  const maxCrew = bot.crewCapacity || 20;
-  const maxMarines = bot.marineCapacity || 10;
-  const crewDeficit = Math.max(0, maxCrew - (bot.fitCrew ?? 0));
-  const marineDeficit = Math.max(0, maxMarines - (bot.fitMarines ?? 0));
-  if (crewDeficit > 0 || marineDeficit > 0) {
-    await recruitPersonnel(ctx, crewDeficit, marineDeficit);
-    await ctx.sleep(11_000);
-  }
+  const maxCrew = bot.crewCapacity || 1500;
+  const maxMarines = bot.marineCapacity || 450;
+  await recruitPersonnel(ctx, maxCrew, maxMarines);
+  await ctx.sleep(11_000);
 
   await bot.refreshLocation();
   await bot.refreshCargo();

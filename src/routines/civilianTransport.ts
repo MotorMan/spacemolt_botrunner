@@ -1623,6 +1623,7 @@ async function selectNextPickupStation(
     }
 
     ctx.log("transport", "No stations with live waiting passengers within maxJumps");
+    return null;
   }
 
   // ── Fallback: nearest station scan ─────────────────────────────────
@@ -1800,11 +1801,24 @@ async function tryDeliverExpiredLoungePassenger(
   botUsername: string | null,
 ): Promise<boolean> {
   const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
-  if (expiredLoungePassengers.length === 0) return false;
 
-  const candidates = botUsername === null
-    ? expiredLoungePassengers
-    : expiredLoungePassengers.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+  let candidates: LoungePassenger[];
+  if (botUsername === null) {
+    // lounge_transport mode: only expired passengers are delivered one at a time
+    candidates = expiredLoungePassengers;
+  } else {
+    // achievement mode: pick up ALL waiting lounge passengers not yet transported
+    // by this bot, not just expired ones. The Transit Lounge at home base is the
+    // primary source of civilians for achievement mode.
+    const waitingLoungePassengers = passengersLounge.getWaitingPassengers();
+    const allCandidates = [...expiredLoungePassengers];
+    for (const p of waitingLoungePassengers) {
+      if (!allCandidates.some(existing => existing.citizenId === p.citizenId)) {
+        allCandidates.push(p);
+      }
+    }
+    candidates = allCandidates.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+  }
 
   if (candidates.length === 0) return false;
 

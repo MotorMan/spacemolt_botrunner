@@ -662,7 +662,7 @@ interface ListPassengersResponse {
   berths_used: { economy: number; business: number; first: number };
 }
 
-type CivilianTransportMode = "normal" | "lounge_transport";
+type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
 
 interface CivilianTransportSettings {
   maxJumps: number;
@@ -1851,6 +1851,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   }
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
+  if (settings.mode === "achievement") {
+    ctx.log("transport", "★ ACHIEVEMENT MODE ★ Only picking up civilians no bot has delivered yet, to transport every civilian once.");
+  }
 
   // Enable cloaking if configured and module is available
   if (settings.enableCloak) {
@@ -2347,6 +2350,13 @@ if (state && state.status !== "idle") {
       const skipped: Array<{ name: string; reason: string }> = [];
       for (const p of waiting) {
         const cls = p.class.toLowerCase();
+        // Achievement mode: only pick up civilians no bot has successfully
+        // delivered yet, so we make progress toward transporting every single
+        // civilian. Anyone already transported by any bot is skipped here.
+        if (settings.mode === "achievement" && civilianStore.hasBeenTransportedByAnyone(p.citizen_id)) {
+          skipped.push({ name: p.name, reason: "already transported (achievement mode)" });
+          continue;
+        }
         if (settings.blockPirateStations && isPirateStation(p.destination)) {
           if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
           skipped.push({ name: p.name, reason: `pirate destination ${p.destination_name}` });
@@ -2845,7 +2855,7 @@ if (state && state.status !== "idle") {
           loadedAt: new Date().toISOString(),
           status: "boarded",
           ticksRemaining: p.ticks_remaining,
-        });
+        }, bot.username);
       }
 
       // Build onboard passenger records
@@ -3124,7 +3134,7 @@ if (state && state.status !== "idle") {
           bio: p.bio || "",
           loadedAt: p.loadedAt,
           status: "boarded",
-        });
+        }, bot.username);
         ctx.log("transport", `Lounge transport: checked ${p.name} into Transit Lounge (expires ${loungeEntry.expiresAt})`);
       }
 
@@ -3207,7 +3217,7 @@ if (state && state.status !== "idle") {
             bio: p.bio || "",
             loadedAt: p.loadedAt,
             status: "delivered",
-          });
+          }, bot.username);
           logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", state.currentDestination || "");
           recordTransportedPassenger(bot.username, p.name);
           ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${state.currentDestination}`);
@@ -3287,7 +3297,7 @@ if (state && state.status !== "idle") {
             bio: p.bio || "",
             loadedAt: p.loadedAt,
             status: "delivered",
-          });
+          }, bot.username);
           recordTransportedPassenger(bot.username, p.name);
           logTransportProfit(bot.username, p.name, p.fare || 0, state.pickupStation || "", waypoint.poi);
           ctx.log("transport", `Lounge delivery: delivered ${p.name} to ${waypoint.poiName}`);
@@ -3494,7 +3504,7 @@ if (state && state.status !== "idle") {
           bio: p.bio,
           loadedAt: p.loadedAt,
           status: "delivered",
-        });
+        }, bot.username);
         recordTransportedPassenger(bot.username, p.name);
         logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }

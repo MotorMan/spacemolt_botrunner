@@ -37135,11 +37135,12 @@ ignoreBlacklist: document.getElementById(
     <div class="setting-row">
       <div>
         <div class="setting-label">Transport Mode</div>
-        <div class="setting-hint">Normal: delivers passengers to their destinations. Lounge Transport: picks up passengers and drops them at the faction Transit Lounge at home base.</div>
+        <div class="setting-hint">Normal: delivers passengers to their destinations. Lounge Transport: picks up passengers and drops them at the faction Transit Lounge at home base. Achievement: only picks up civilians no bot has ever delivered, to transport every civilian once.</div>
       </div>
       <select id="set-civilian_transport-mode">
         <option value="normal" ${ct.mode === "normal" || !ct.mode ? "selected" : ""}>Normal (deliver to destinations)</option>
         <option value="lounge_transport" ${ct.mode === "lounge_transport" ? "selected" : ""}>Lounge Transport (drop at Transit Lounge)</option>
+        <option value="achievement" ${ct.mode === "achievement" ? "selected" : ""}>Achievement (transport every civilian once)</option>
       </select>
     </div>
 

@@ -1875,6 +1875,15 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     await bot.refreshCargo();
     const atHomeStationAfterMaintenance = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
+    // Soft-stop: already back home and about to start the next load — stop now
+    // instead of loading out for another cycle.
+    if (atHomeStationAfterMaintenance && bot.shouldStopAfterCycle()) {
+      bot.clearStopAfterCycle();
+      ctx.log("fc", "Stop after cycle requested — at home, stopping routine before next load");
+      bot.initiateStop();
+      return;
+    }
+
     const milTarget = settings.militaryFuelCellsCount || 0;
     const currentMilitaryCargo = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
     const milDeficit = Math.max(0, milTarget - currentMilitaryCargo);
@@ -2512,6 +2521,14 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       saveFCStationsData(fcData);
       ctx.log("fc", "Pre-stage run complete — returned home");
+
+      // Soft-stop: finished the cycle and back home — stop before starting the next load.
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        ctx.log("fc", "Stop after cycle requested — back home, stopping routine");
+        bot.initiateStop();
+        return;
+      }
     } else {
       // Pre-stage mode: undock and continue to next station
       if (bot.state !== "running") break;

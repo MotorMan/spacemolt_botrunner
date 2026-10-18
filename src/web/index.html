@@ -6164,7 +6164,8 @@
         if (!bot) return;
         const inp = document.getElementById("profile-pathfinderScanWaitMinutes");
         if (!inp) return;
-        const scanWaitMinutes = parseInt(inp.value, 10) || 5;
+        const rawWait = parseInt(inp.value, 10);
+        const scanWaitMinutes = Number.isNaN(rawWait) ? 5 : rawWait;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { scanWaitMinutes });
         send({
@@ -6180,7 +6181,8 @@
         if (!bot) return;
         const inp = document.getElementById("profile-pathfinderScanDelayTicks");
         if (!inp) return;
-        const scanDelayTicks = parseInt(inp.value, 10) || 2;
+        const rawDelay = parseInt(inp.value, 10);
+        const scanDelayTicks = Number.isNaN(rawDelay) ? 2 : rawDelay;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { scanDelayTicks });
         send({
@@ -34209,13 +34211,19 @@ ignoreBlacklist: document.getElementById(
               document.getElementById("set-pathfinder-scanStepDegrees").value,
             ) || 12,
           scanWaitMinutes:
-            parseInt(
-              document.getElementById("set-pathfinder-scanWaitMinutes").value,
-            ) || 5,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-pathfinder-scanWaitMinutes").value,
+              );
+              return Number.isNaN(v) ? 5 : v;
+            })(),
           scanDelayTicks:
-            parseInt(
-              document.getElementById("set-pathfinder-scanDelayTicks").value,
-            ) || 2,
+            (() => {
+              const v = parseInt(
+                document.getElementById("set-pathfinder-scanDelayTicks").value,
+              );
+              return Number.isNaN(v) ? 2 : v;
+            })(),
           refuelThreshold:
             parseInt(
               document.getElementById("set-pathfinder-refuelThreshold")

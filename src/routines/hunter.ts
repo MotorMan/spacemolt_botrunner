@@ -8627,7 +8627,15 @@ async function* engageBoardingTargetsAtCurrentPoi(
             settings.cloakOnStart,
           );
 
-             if (result === "captured") {
+          // If marines were wiped out during boarding (e.g. another hunter
+          // killed the target while we were latched), we can no longer board.
+          // End the sweep so the main loop sends us home to treat and recruit.
+          if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+            ctx.log("system", `Fit marines critically low after boarding attempt on ${target.name} â€” ending patrol to recruit`);
+            return [totalKills, totalBoardings];
+          }
+
+           if (result === "captured") {
                totalKills++;
                totalBoardings++;
                  ctx.log("combat", `ðŸŽ‰ ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
@@ -8952,77 +8960,85 @@ async function* boardingSystemPass(
             settings.cloakOnStart,
           );
 
-            if (result === "captured") {
-              totalKills++;
-              totalBoardings++;
-               ctx.log("combat", `ðŸŽ‰ ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
-               await maybeFleeStationAfterBoarding(ctx, settings);
-               await useRepairKits(ctx);
-              await bot.refreshCargo();
-              await bot.refreshStatus();
-              const recoveries = bot.prizeRecoveries;
-              if (recoveries.length > 0) {
-                const cap = recoveries[0];
-                ctx.log("combat", `ðŸ“¦ Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
-              }
-               const recovered = await recoverPrize(ctx, settings, target.id);
-              if (recovered) {
-                ctx.log("combat", `ðŸ† Prize from ${target.name} successfully recovered!`);
-              } else {
-                ctx.log("combat", `âš ï¸ Could not recover prize from ${target.name} â€” another pilot may have claimed it, or the prize is at a different POI in this system`);
-              }
+          // If marines were wiped out during boarding (e.g. another hunter
+          // killed the target while we were latched), we can no longer board.
+          // End the sweep so the main loop sends us home to treat and recruit.
+          if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+            ctx.log("system", `Fit marines critically low after boarding attempt on ${target.name} â€” ending patrol to recruit`);
+            return [totalKills, totalBoardings];
+          }
 
-              yield "safety_check";
-              const postCaptureResp = await bot.exec("get_nearby");
-              if (!postCaptureResp.error) {
-                bot.trackNearbyPlayers(postCaptureResp.result);
-                bot.trackWildlife(postCaptureResp.result);
-              }
-             continue;
-          } else if (result === "target_eliminated") {
+          if (result === "captured") {
             totalKills++;
-            ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” target eliminated`);
-            if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-            await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
-            await useRepairKits(ctx);
-            await bot.refreshCargo();
+            totalBoardings++;
+             ctx.log("combat", `ðŸŽ‰ ${target.name} CAPTURED via boarding! (hull: ${target.hull || target.maxHull || "?"}%)`);
             await maybeFleeStationAfterBoarding(ctx, settings);
+            await useRepairKits(ctx);
+          await bot.refreshCargo();
+          await bot.refreshStatus();
+          const recoveries = bot.prizeRecoveries;
+          if (recoveries.length > 0) {
+            const cap = recoveries[0];
+            ctx.log("combat", `ðŸ“¦ Prize tracked: prize_id=${cap.prize_id} ship_id=${cap.ship_id} status=${cap.status}`);
+          }
+           const recovered = await recoverPrize(ctx, settings, target.id);
+          if (recovered) {
+            ctx.log("combat", `ðŸ† Prize from ${target.name} successfully recovered!`);
+          } else {
+            ctx.log("combat", `âš ï¸ Could not recover prize from ${target.name} â€” another pilot may have claimed it, or the prize is at a different POI in this system`);
+          }
 
-            yield "safety_check";
-            const postKillResp = await bot.exec("get_nearby");
-            if (!postKillResp.error) {
-              bot.trackNearbyPlayers(postKillResp.result);
-              bot.trackWildlife(postKillResp.result);
-              const nearbyEntities = parseNearby(postKillResp.result);
-              const newThreats = nearbyEntities.filter(e =>
-                isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
-                !isStationEntity(e) &&
-                e.id !== target.id &&
-                e.name !== target.name
-              );
-              if (newThreats.length > 0) {
-                ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} â€” engaging!`);
-                for (const newThreat of newThreats) {
-                  if (bot.state !== "running") break;
-                  const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
-                  if (newWon) {
-                    totalKills++;
-                    ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
-                  }
+          yield "safety_check";
+          const postCaptureResp = await bot.exec("get_nearby");
+          if (!postCaptureResp.error) {
+            bot.trackNearbyPlayers(postCaptureResp.result);
+            bot.trackWildlife(postCaptureResp.result);
+          }
+         continue;
+        } else if (result === "target_eliminated") {
+          totalKills++;
+          ctx.log("combat", `Kill #${totalKills} (${target.name}) â€” target eliminated`);
+          if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          await maybeFleeStationAfterBoarding(ctx, settings);
+
+          yield "safety_check";
+          const postKillResp = await bot.exec("get_nearby");
+          if (!postKillResp.error) {
+            bot.trackNearbyPlayers(postKillResp.result);
+            bot.trackWildlife(postKillResp.result);
+            const nearbyEntities = parseNearby(postKillResp.result);
+            const newThreats = nearbyEntities.filter(e =>
+              isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
+              !isStationEntity(e) &&
+              e.id !== target.id &&
+              e.name !== target.name
+            );
+            if (newThreats.length > 0) {
+              ctx.log("combat", `ðŸš¨ ${newThreats.length} new pirate(s) detected after kill: ${newThreats.map(t => t.name).join(", ")} â€” engaging!`);
+              for (const newThreat of newThreats) {
+                if (bot.state !== "running") break;
+                const newWon = await hunterEngage(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold, settings.onlyNPCs, settings.cloakOnStart);
+                if (newWon) {
+                  totalKills++;
+                  ctx.log("combat", `Kill #${totalKills} (${newThreat.name}) â€” additional threat eliminated`);
                 }
               }
             }
-            continue;
-         } else if (result === "retreat") {
-            break;
           }
-          // "failed" â€” fall through to normal fire engagement
-          ctx.log("combat", `Boarding failed for ${target.name} â€” engaging normally`);
+          continue;
+       } else if (result === "retreat") {
+          break;
         }
+        // "failed" â€” fall through to normal fire engagement
+        ctx.log("combat", `Boarding failed for ${target.name} â€” engaging normally`);
       }
+    }
 
-       // Normal fire engagement (fallback or boarding disabled)
-       if (!coordResponding) {
+     // Normal fire engagement (fallback or boarding disabled)
+     if (!coordResponding) {
          broadcastHunterAssist(ctx, target, !!(target.isCreature) || isCreatureTarget(target as any, true));
          claimCreature(ctx, target);
        }

@@ -7,6 +7,8 @@ import {
   getSystemInfo,
   getFuelCellFuelValue,
   estimateRouteFuel,
+  ensureDocked,
+  tryRefuel,
 } from "./common.js";
 import { formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
 
@@ -385,6 +387,44 @@ async function preflightFuelCheck(
   return { ok, availableFuel, neededFuel, fuelPerJump, totalJumps, jumpsPossible, militaryCells };
 }
 
+/** Before each scan jump, ensure fuel is above the refuel threshold.
+ *  Waits for any in-progress transit to complete, then checks fuel %.
+ *  If below threshold, docks at the nearest station and refuels.
+ *  Returns false if refueling fails (caller should abort the scan). */
+async function checkAndRefuelMidScan(
+  ctx: RoutineContext,
+  thresholdPct: number,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Wait for any in-progress transit to complete before we can dock.
+  while (bot.inTransit && bot.state === "running") {
+    await ctx.sleep(5000);
+    await bot.refreshStatus();
+  }
+
+  if (bot.state !== "running") return false;
+
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelPct < thresholdPct) {
+    ctx.log("system", `Fuel ${fuelPct}% below refuel threshold ${thresholdPct}% — refueling before continuing scan...`);
+    const docked = await ensureDocked(ctx);
+    if (!docked) {
+      ctx.log("error", "Cannot dock to refuel — aborting pathfinder scan");
+      return false;
+    }
+    await tryRefuel(ctx);
+    await bot.refreshShip();
+    const newPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (newPct < thresholdPct) {
+      ctx.log("error", `Refuel failed — still at ${newPct}% — aborting pathfinder scan`);
+      return false;
+    }
+    ctx.log("system", `Refueled to ${newPct}% — resuming scan`);
+  }
+  return true;
+}
+
 export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
   const settings = getPathfinderSettings(bot.username);
@@ -401,9 +441,9 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const startDegree = ((scanStartDegree % 360) + 360) % 360;
   const numAngles = Math.floor(360 / scanStepDegrees);
   const scanAngles = generateScanPattern(scanPattern, startDegree, scanStepDegrees, numAngles);
-  // Circle chains jumps mid-drift; all other patterns return to origin between
-  // angles (out + back). Add 1 for the final return jump on circle only.
-  const jumpsPerAngle = scanPattern === "circle" ? 1 : 2;
+  // Every angle is a single pathfinder jump. Circle adds a final return jump;
+  // non-circle patterns chain scans mid-drift without returning between angles.
+  const jumpsPerAngle = 1;
   const totalJumps = scanAngles.length * jumpsPerAngle + (scanPattern === "circle" ? 1 : 0);
 
   ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${scanAngles.length} angles), pattern: ${scanPattern}, wait: ${scanWaitMinutes} min`);
@@ -427,7 +467,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   ctx.log("system", `=== Pathfinder fuel check ===`);
   ctx.log("system", `Tank fuel: ${bot.fuel}/${bot.maxFuel}  Military cells: ${fuel.militaryCells}x (${fuel.militaryCells * getFuelCellFuelValue("military_fuel_cell")} fuel)`);
   ctx.log("system", `Total available fuel: ${fuel.availableFuel}  Per-jump cost (this ship): ${fuel.fuelPerJump}`);
-  ctx.log("system", `Planned jumps: ${fuel.totalJumps} (${numAngles} out + ${numAngles} back)  Needed: ${fuel.neededFuel} fuel`);
+  ctx.log("system", `Planned jumps: ${fuel.totalJumps} (${numAngles} scan jumps${scanPattern !== "circle" ? "" : " + 1 return"})  Needed: ${fuel.neededFuel} fuel`);
   ctx.log("system", `Jumps possible with current fuel: ${fuel.jumpsPossible}`);
   if (!fuel.ok) {
     ctx.log("error", `INSUFFICIENT FUEL: need ${fuel.neededFuel} for the full scan but only have ${fuel.availableFuel} (${fuel.jumpsPossible} jumps possible). Refuel or reduce scan angles before starting.`);
@@ -518,6 +558,10 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     yield "scanning";
     ctx.log("hunt", `Scanning ${label} ${angle}° (${i + 1}/${scanAngles.length})`);
 
+    // Check fuel before each jump — refuel if below threshold.
+    const fueled = await checkAndRefuelMidScan(ctx, refuelThreshold);
+    if (!fueled) break;
+
     // Initial jump from origin at startDegree. Wait for transit to START,
     // then wait scanWaitMinutes mid-transit to get away from origin.
     if (i === 0) {
@@ -534,20 +578,6 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (bot.state !== "running") break;
 
-    // For non-circle patterns, jump back to origin after each outward angle
-    // to keep outward distance low. Circle chains jumps mid-drift.
-    if (scanPattern !== "circle" && bot.state === "running") {
-      const returnAngle = (angle + 180) % 360;
-      const returned = await pathfinderJumpAtBearing(ctx, returnAngle, null, { waitForCompletion: false });
-      if (!returned.success) {
-        ctx.log("error", `Return jump from ${angle}° failed — may be stranded in ${bot.system}`);
-        if (bot.state !== "running") break;
-        continue;
-      }
-    }
-
-    if (bot.state !== "running") break;
-
     // Delay between scan jumps / spikes (1 tick = 10 seconds).
     if (scanDelayTicks > 0 && bot.state === "running") {
       ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan jumps...`);
@@ -555,11 +585,13 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
-  // Final return to origin (circle pattern only — non-circle patterns already
-  // return to origin after each angle).
-  if (bot.state === "running" && scanPattern === "circle") {
+  // Final return to origin.
+  // Circle chains jumps mid-drift and needs one return jump to get back home.
+  // Non-circle patterns chain scans without returning between angles, so they
+  // also need a final return to get back to origin.
+  if (bot.state === "running") {
     const returnBearing = (startDegree + 180) % 360;
-    ctx.log("travel", `Returning to origin ${originSystem} at bearing ${returnBearing}° (180 off start degree ${startDegree}°)`);
+    ctx.log("travel", `Returning to origin ${originSystem} at bearing ${returnBearing}°`);
     const returned = await pathfinderJumpAtBearing(ctx, returnBearing, null, { waitForCompletion: true });
     if (!returned.success) {
       ctx.log("error", `Return jump failed — may be stranded in ${bot.system}`);

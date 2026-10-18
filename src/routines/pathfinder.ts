@@ -105,6 +105,8 @@ async function pathfinderJumpAtBearing(
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
+  ctx.log("debug", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° raw result=${JSON.stringify(jumpResp.result)}`);
+
   const jr = jumpResp.result as Record<string, unknown> | undefined;
   const arrivalSystemId = (jr?.arrival_system_id as string) || "";
   const arrivalSystemName = (jr?.arrival_system as string) || "";
@@ -128,6 +130,7 @@ async function pathfinderJumpAtBearing(
 
   while (bot.state === "running" && poll < maxPolls && inTransit) {
     await ctx.sleep(5000);
+    if (bot.state !== "running") break;
     poll++;
 
     const poiResp = await bot.exec("get_poi");

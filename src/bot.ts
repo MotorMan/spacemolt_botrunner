@@ -1477,18 +1477,32 @@ docked = false;
       // logic below runs on the normalized ApiResponse libExec returns.
       let resp: ApiResponse;
       if (command === "jump") {
-        // Jump commands wait for action_result from the server; if the
-        // notification never arrives (e.g. jump rejected silently), the
-        // library's internal wait can stretch to 10 minutes. Bound it so a
-        // failed jump fails fast instead of blocking the routine. Route through
-        // execWithTimeout so the abort signal (stop request) breaks the jump
-        // immediately and the user can take over.
-        const timeoutMs = this.calculateJumpTimeout();
-        const targetId = (payload as Record<string, unknown> | undefined)?.target_system;
-        const targetIdStr = typeof targetId === "string" ? targetId : "";
-        resp = await this.execWithTimeout(command, payload, timeoutMs, targetIdStr, this._abortController?.signal);
-        if (resp.error && resp.error.code === "aborted") {
-          this.log("system", "Jump aborted by stop request — returning control to user.");
+        const target = (payload as Record<string, unknown> | undefined)?.target_system;
+        // Pathfinder jumps (target_system = bearing number) return pathfinder_redirect
+        // immediately and NEVER produce action_result. libExec/account.send waits for
+        // action_result which never arrives — causing a 10-minute hang. Worse: when
+        // stop() aborts the routine, the pending libExec promise is still in flight
+        // and eventually resolves, firing the jump long after the routine stopped.
+        // Fire-and-forget: send the command and return immediately.
+        if (typeof target === "number") {
+          const { tool, action, body } = buildLibDispatch(command, payload);
+          debugLogForBot(this.username, "bot:exec", `${this.username} > pathfinder jump bearing=${target} payload=${JSON.stringify(body)}`);
+          const rawSend = this.liveRawSend();
+          if (!rawSend) {
+            return {
+              error: { code: "no_account", message: "Library account not connected" },
+              result: undefined,
+              notifications: [],
+            };
+          }
+          void rawSend(tool, action, body).catch(() => {});
+          resp = {
+            error: undefined,
+            result: { action: "pathfinder_redirect", pathfinder: true },
+            notifications: [],
+          };
+        } else {
+          resp = await this.libExec(command, payload);
         }
       } else {
         resp = await this.libExec(command, payload);
@@ -3181,41 +3195,29 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
   }
 
   async pollCurrentTick(): Promise<number | null> {
-    const resp = await this.exec("get_notifications");
-    if (resp.error || !resp.result) {
-      if (this.lastKnownTick !== null) {
-        this.log("warn", "get_notifications failed, using lastKnownTick for tick estimation");
-        return this.lastKnownTick ?? null;
-      }
-      return null;
-    }
-    const r = resp.result as Record<string, unknown>;
-    let tick = r.current_tick as number | undefined;
-    if (typeof tick !== "number") {
-      tick = r.tick as number | undefined;
-    }
-    if (typeof tick === "number") {
-      this.lastKnownTick = tick;
-      return tick;
-    }
-    // Library-backed bots receive tick via observation push events rather than
-    // get_notifications; fall back to the cached observation tick.
+    // get_notifications is not available over WebSocket — notifications are pushed
+    // automatically. Rely on observationTick (from observation_update push events)
+    // or lastKnownTick instead.
     if (this.observationTick && this.observationTick > 0) {
       this.lastKnownTick = this.observationTick;
       return this.observationTick;
     }
-    if (this.lastKnownTick !== null) {
-      this.log("debug", `current_tick not in response, using lastKnownTick=${this.lastKnownTick}`);
-      return this.lastKnownTick ?? null;
-    }
-    return null;
+    return this.lastKnownTick ?? null;
   }
 
   async awaitNextTick(pollIntervalMs = 5000): Promise<number> {
     const startTick = await this.pollCurrentTick();
     if (startTick === null) throw new Error("Could not determine current tick");
     while (this.state === "running") {
-      await new Promise(r => setTimeout(r, pollIntervalMs));
+      // Interruptible sleep so a stop request breaks out immediately
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, pollIntervalMs);
+        this._abortController?.signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          resolve();
+        }, { once: true });
+      });
+      if (this.state !== "running") throw new Error("Bot stopped while waiting for next tick");
       const nextTick = await this.pollCurrentTick();
       if (nextTick !== null && nextTick > startTick) return nextTick;
     }

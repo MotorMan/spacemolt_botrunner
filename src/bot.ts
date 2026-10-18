@@ -1495,7 +1495,22 @@ docked = false;
               notifications: [],
             };
           }
-          void rawSend(tool, action, body).catch(() => {});
+          // Pathfinder jumps return pathfinder_redirect immediately and NEVER
+          // produce action_result. libExec/account.send waits for action_result
+          // which never arrives — causing a 10-minute hang. We await the raw
+          // send here (it returns immediately) so send failures are surfaced
+          // instead of being silently swallowed by void + .catch(() => {}).
+          try {
+            await rawSend(tool, action, body);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            this.log("error", `Pathfinder jump at bearing ${target} failed to send: ${message}`);
+            return {
+              error: { code: "send_failed", message },
+              result: undefined,
+              notifications: [],
+            };
+          }
           resp = {
             error: undefined,
             result: { action: "pathfinder_redirect", pathfinder: true },

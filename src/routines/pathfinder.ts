@@ -6,6 +6,7 @@ import {
   writeSettings,
   getSystemInfo,
   getFuelCellFuelValue,
+  estimateRouteFuel,
 } from "./common.js";
 import { formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
 
@@ -254,7 +255,11 @@ interface FuelCheck {
 }
 
 /** Pre-flight stupidity check: can this ship actually complete the configured scan? */
-async function preflightFuelCheck(ctx: RoutineContext, totalJumps: number): Promise<FuelCheck> {
+async function preflightFuelCheck(
+  ctx: RoutineContext,
+  totalJumps: number,
+  originSystem?: string,
+): Promise<FuelCheck> {
   const { bot } = ctx;
 
   // Tank fuel currently aboard.
@@ -268,10 +273,17 @@ async function preflightFuelCheck(ctx: RoutineContext, totalJumps: number): Prom
   const cellFuel = getFuelCellFuelValue("military_fuel_cell"); // 100 per cell
   const availableFuel = tankFuel + militaryCells * cellFuel;
 
-  // Pathfinder jumps use the Pathfinder Drive module which has its own
-  // fuel burn rate — it does NOT match find_route's regular jump cost.
-  // This ship consumes 25 fuel per pathfinder jump.
-  const fuelPerJump = 25;
+  // Pathfinder jumps cost 5x the ship's normal jump fuel cost (per find_route).
+  // find_route is the only source that knows this ship's actual fuel burn.
+  let pathfinderFuelPerJump = 25; // fallback if find_route is unavailable
+  if (originSystem) {
+    const route = await estimateRouteFuel(ctx, originSystem);
+    if (route && route.fuelPerJump > 0) {
+      pathfinderFuelPerJump = route.fuelPerJump * 5;
+    }
+  }
+
+  const fuelPerJump = pathfinderFuelPerJump;
 
   const neededFuel = totalJumps * fuelPerJump;
   const jumpsPossible = fuelPerJump > 0 ? Math.floor(availableFuel / fuelPerJump) : 0;
@@ -312,7 +324,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   ctx.log("travel", `At origin system ${originSystem}`);
 
   // ── Pre-flight stupidity check ──
-  const fuel = await preflightFuelCheck(ctx, totalJumps);
+  const fuel = await preflightFuelCheck(ctx, totalJumps, originSystem);
   ctx.log("system", `=== Pathfinder fuel check ===`);
   ctx.log("system", `Tank fuel: ${bot.fuel}/${bot.maxFuel}  Military cells: ${fuel.militaryCells}x (${fuel.militaryCells * getFuelCellFuelValue("military_fuel_cell")} fuel)`);
   ctx.log("system", `Total available fuel: ${fuel.availableFuel}  Per-jump cost (this ship): ${fuel.fuelPerJump}`);
@@ -383,7 +395,13 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
       const p = poiResp.result as Record<string, unknown>;
       inTransit = (p.in_transit as boolean) ?? false;
       ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
-      destinationSystem = (p.system as string) || (p.arrival_system as string) || "?";
+      // While in transit, get_poi returns the destination under to_system,
+      // not system or arrival_system.
+      destinationSystem =
+        (p.to_system as string) ||
+        (p.system as string) ||
+        (p.arrival_system as string) ||
+        "?";
     }
 
     ctx.log("system", `Angle ${angle}°: in_transit=${inTransit} ticks_remaining=${ticksRemaining ?? "?"} destination=${destinationSystem}`);
@@ -392,25 +410,26 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshLocation();
     await bot.refreshStatus();
     const landedSystem = bot.system;
-    const wasKnown = mapStore.getSystem(landedSystem) !== null;
+    const destination = destinationSystem !== "?" ? destinationSystem : landedSystem;
+    const wasKnown = mapStore.getSystem(destination) !== null;
 
-    const atVoid = /void|empty|deep_space|interstellar|space/i.test(landedSystem);
+    const atVoid = /void|empty|deep_space|interstellar|space/i.test(destination);
 
     foundSystems.push({
       angle,
-      systemId: landedSystem,
-      systemName: landedSystem,
+      systemId: destination,
+      systemName: destination,
       known: wasKnown,
       atVoid,
     });
 
     // Tell what degree we tried and what the destination changed to.
     if (atVoid) {
-      ctx.log("hunt", `Angle ${angle}°: destination ${landedSystem} (void/empty space)`);
+      ctx.log("hunt", `Angle ${angle}°: destination ${destination} (void/empty space)`);
     } else if (wasKnown) {
-      ctx.log("hunt", `Angle ${angle}°: destination ${landedSystem} (known system)`);
+      ctx.log("hunt", `Angle ${angle}°: destination ${destination} (known system)`);
     } else {
-      ctx.log("hunt", `🎯 JACKPOT! Angle ${angle}°: destination ${landedSystem} (unknown/hidden system)`);
+      ctx.log("hunt", `🎯 JACKPOT! Angle ${angle}°: destination ${destination} (unknown/hidden system)`);
     }
 
     if (bot.state !== "running") break;

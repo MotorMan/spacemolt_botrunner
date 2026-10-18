@@ -1807,12 +1807,20 @@ async function tryDeliverExpiredLoungePassenger(
     // lounge_transport mode: only expired passengers are delivered one at a time
     candidates = expiredLoungePassengers;
   } else {
-    // achievement mode: pick up ALL waiting lounge passengers not yet transported
-    // by this bot, not just expired ones. The Transit Lounge at home base is the
-    // primary source of civilians for achievement mode.
+    // achievement mode: pick up ALL lounge passengers not yet transported by
+    // this bot. The Transit Lounge at home base is the primary source of
+    // civilians for achievement mode. Includes passengers that are still
+    // "waiting", passengers already marked "ready_for_delivery" (expired in a
+    // prior cycle but never picked up), and newly expired passengers.
     const waitingLoungePassengers = passengersLounge.getWaitingPassengers();
+    const readyLoungePassengers = passengersLounge.getReadyForDeliveryPassengers();
     const allCandidates = [...expiredLoungePassengers];
     for (const p of waitingLoungePassengers) {
+      if (!allCandidates.some(existing => existing.citizenId === p.citizenId)) {
+        allCandidates.push(p);
+      }
+    }
+    for (const p of readyLoungePassengers) {
       if (!allCandidates.some(existing => existing.citizenId === p.citizenId)) {
         allCandidates.push(p);
       }

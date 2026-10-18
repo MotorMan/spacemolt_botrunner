@@ -5,7 +5,6 @@ import {
   readSettings,
   writeSettings,
   getSystemInfo,
-  estimateRouteFuel,
   getFuelCellFuelValue,
 } from "./common.js";
 import { calculatePathfinderBearing, formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
@@ -170,6 +169,11 @@ async function pathfinderJumpAtBearing(
     }
   }
 
+  if (poll >= maxPolls && inTransit && bot.state === "running") {
+    ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit did not complete after ${Math.round(maxPolls * 5 / 1000)}s, aborting`);
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
+
   // Honor an immediate stop request — don't poll tick or continue processing.
   if (bot.state !== "running") {
     ctx.log("system", "Pathfinder jump aborted — bot stopped");
@@ -276,17 +280,10 @@ async function preflightFuelCheck(ctx: RoutineContext, totalJumps: number): Prom
   const cellFuel = getFuelCellFuelValue("military_fuel_cell"); // 100 per cell
   const availableFuel = tankFuel + militaryCells * cellFuel;
 
-  // Ask the server what a jump costs for THIS ship/module loadout. find_route is
-  // the only source that knows the real per-jump fuel burn. We route from the
-  // origin system to any known neighbor to learn fuel_per_jump.
-  let fuelPerJump = 0;
-  const originSys = mapStore.getSystem(bot.system);
-  const neighbor = originSys?.connections?.[0]?.system_id;
-  if (neighbor) {
-    const est = await estimateRouteFuel(ctx, neighbor);
-    if (est) fuelPerJump = est.fuelPerJump;
-  }
-  if (!fuelPerJump || fuelPerJump <= 0) fuelPerJump = 25; // conservative server default
+  // Pathfinder jumps use the Pathfinder Drive module which has its own
+  // fuel burn rate — it does NOT match find_route's regular jump cost.
+  // This ship consumes 25 fuel per pathfinder jump.
+  const fuelPerJump = 25;
 
   const neededFuel = totalJumps * fuelPerJump;
   const jumpsPossible = fuelPerJump > 0 ? Math.floor(availableFuel / fuelPerJump) : 0;

@@ -1311,12 +1311,21 @@ async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<
   const cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || 0) as number;
   
   let berths = { economy: 0, business: 0, first: 0 };
-  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, number>;
+  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, unknown>;
+  const berthCount = (val: unknown): number => {
+    if (typeof val === "number") return val;
+    if (val && typeof val === "object") {
+      const obj = val as Record<string, unknown>;
+      if (typeof obj.total === "number") return obj.total;
+      if (typeof obj.free === "number") return obj.free;
+    }
+    return 0;
+  };
   if (directBerths.economy || directBerths.business || directBerths.first) {
     berths = {
-      economy: directBerths.economy || 0,
-      business: directBerths.business || 0,
-      first: directBerths.first || 0,
+      economy: berthCount(directBerths.economy),
+      business: berthCount(directBerths.business),
+      first: berthCount(directBerths.first),
     };
   } else {
     const catalog = loadCatalog();

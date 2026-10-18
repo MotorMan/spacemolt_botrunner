@@ -17,6 +17,7 @@ interface PathfinderSettings {
   scanStartDegree?: number;
   scanStepDegrees?: number;
   scanWaitMinutes?: number;
+  scanDelayTicks?: number;
   refuelThreshold?: number;
 }
 
@@ -48,6 +49,7 @@ export function getPathfinderSettings(username?: string): PathfinderSettings {
     scanStartDegree: asNumber(botOverrides.scanStartDegree, asNumber(global.scanStartDegree, 0)),
     scanStepDegrees: asNumber(botOverrides.scanStepDegrees, asNumber(global.scanStepDegrees, 12)),
     scanWaitMinutes: asNumber(botOverrides.scanWaitMinutes, asNumber(global.scanWaitMinutes, 5)),
+    scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 2)),
     refuelThreshold: asNumber(botOverrides.refuelThreshold, asNumber(global.refuelThreshold, 50)),
   };
 }
@@ -70,6 +72,10 @@ export function setPathfinderScanWaitMinutes(username: string, minutes: number):
 
 export function setPathfinderRefuelThreshold(username: string, threshold: number): void {
   writeSettings({ [username]: { refuelThreshold: threshold } });
+}
+
+export function setPathfinderScanDelayTicks(username: string, ticks: number): void {
+  writeSettings({ [username]: { scanDelayTicks: ticks } });
 }
 
 /** Perform a raw pathfinder jump at a given bearing and wait for arrival.
@@ -115,19 +121,36 @@ async function pathfinderJumpAtBearing(
   }
 
   // Wait for transit to complete, capturing the tick we land on.
-  let inTransit = true;
+  // Pathfinder jumps are fire-and-forget — the server may not register
+  // transit immediately. Wait for in_transit to become TRUE first, then
+  // wait for it to become FALSE before capturing the end tick.
+  let inTransit = false;
   let ticksRemaining: number | null = null;
   let endTick: number | null = null;
   let poll = 0;
   const maxPolls = 720; // up to ~60 minutes at 5s polls
 
-  const firstPoi = await bot.exec("get_poi");
-  if (firstPoi.result && typeof firstPoi.result === "object") {
-    const p = firstPoi.result as Record<string, unknown>;
-    inTransit = (p.in_transit as boolean) ?? false;
-    ticksRemaining = (p.ticks_remaining as number) ?? null;
+  // Phase 1: wait for transit to START (server may need a tick to register it)
+  let startPolls = 0;
+  const maxStartPolls = 24; // up to ~2 minutes to detect transit start
+  while (bot.state === "running" && startPolls < maxStartPolls && !inTransit) {
+    await ctx.sleep(5000);
+    if (bot.state !== "running") break;
+    startPolls++;
+    const startPoi = await bot.exec("get_poi");
+    if (startPoi.result && typeof startPoi.result === "object") {
+      const p = startPoi.result as Record<string, unknown>;
+      inTransit = (p.in_transit as boolean) ?? false;
+      ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
+    }
   }
 
+  if (!inTransit && bot.state === "running") {
+    ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit never started`);
+    return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
+
+  // Phase 2: wait for transit to COMPLETE
   while (bot.state === "running" && poll < maxPolls && inTransit) {
     await ctx.sleep(5000);
     if (bot.state !== "running") break;
@@ -263,7 +286,7 @@ async function preflightFuelCheck(ctx: RoutineContext, totalJumps: number): Prom
     const est = await estimateRouteFuel(ctx, neighbor);
     if (est) fuelPerJump = est.fuelPerJump;
   }
-  if (!fuelPerJump || fuelPerJump <= 0) fuelPerJump = 50; // conservative server default
+  if (!fuelPerJump || fuelPerJump <= 0) fuelPerJump = 25; // conservative server default
 
   const neededFuel = totalJumps * fuelPerJump;
   const jumpsPossible = fuelPerJump > 0 ? Math.floor(availableFuel / fuelPerJump) : 0;
@@ -280,6 +303,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const scanStartDegree = settings.scanStartDegree ?? 0;
   const scanStepDegrees = Math.max(1, Math.min(180, settings.scanStepDegrees ?? 12));
   const scanWaitMinutes = settings.scanWaitMinutes ?? 5;
+  const scanDelayTicks = settings.scanDelayTicks ?? 2;
   const refuelThreshold = settings.refuelThreshold ?? 50;
 
   const startDegree = ((scanStartDegree % 360) + 360) % 360;
@@ -374,6 +398,20 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     // Return to origin using x/y math from our tracked position.
     await returnToSystem(ctx, originSystem, currentPos, originPos);
     if (bot.state !== "running") break;
+
+    // Delay between angles for aesthetic spacing on the fleet tracking map.
+    // Set to 0 to skip (default 2 ticks = ~20 seconds).
+    if (scanDelayTicks > 0 && bot.state === "running") {
+      const startTick = await bot.pollCurrentTick();
+      if (startTick !== null) {
+        ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan angles...`);
+        while (bot.state === "running") {
+          const now = await bot.pollCurrentTick();
+          if (now !== null && now - startTick >= scanDelayTicks) break;
+          await ctx.sleep(5000);
+        }
+      }
+    }
   }
 
   // Final formatted report

@@ -1781,6 +1781,73 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
   };
 }
 
+// ── Lounge delivery helper (achievement primary source) ────────────────────
+//
+// Attempts to pick up one expired Transit Lounge passenger and deliver them to
+// their destination. Returns true when it took action (delivered, skipped, or
+// could not resolve) so the caller can `continue` the loop. Returns false when
+// there was nothing actionable, letting the caller fall through to remote
+// station pickup. When `allowAlreadyTransported` is false (achievement mode),
+// passengers already delivered by any bot are skipped entirely, leaving them
+// for normal CT bots.
+async function tryDeliverExpiredLoungePassenger(
+  ctx: RoutineContext,
+  bot: Bot,
+  state: TransportState,
+  settings: CivilianTransportSettings,
+  allowAlreadyTransported: boolean,
+): Promise<boolean> {
+  const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
+  if (expiredLoungePassengers.length === 0) return false;
+
+  const candidates = allowAlreadyTransported
+    ? expiredLoungePassengers
+    : expiredLoungePassengers.filter((p) => !civilianStore.hasBeenTransportedByAnyone(p.citizenId));
+
+  if (candidates.length === 0) {
+    // All expired lounge passengers already transported by someone else — leave
+    // them for normal CT bots; achievement mode only counts new deliveries.
+    return false;
+  }
+
+  const p = candidates[0];
+  if (isBlockedStation(p.destination, p.destinationName)) {
+    ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
+    passengersLounge.markDelivered(p.citizenId);
+    return true;
+  }
+  const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+  if (resolved) {
+    state.status = "delivering_lounge_passenger";
+    state.onboardPassengers = [{
+      citizenId: p.citizenId,
+      name: p.name,
+      accommodationClass: p.accommodationClass,
+      citizenship: p.citizenship,
+      destination: p.destination,
+      destinationName: p.destinationName,
+      destinationSystem: p.destinationSystem,
+      fare: p.fare,
+      bio: p.bio,
+      routeData: null,
+      loadedAt: p.checkedInAt,
+      status: "boarded",
+    }];
+    state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
+    state.currentRouteIndex = 0;
+    state.currentDestination = resolved.poiName;
+    state.pickupStation = settings.homeStation || null;
+    state.pickupSystem = settings.homeSystem || null;
+    saveTransportState(state);
+    ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
+    return true;
+  } else {
+    ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
+    passengersLounge.markDelivered(p.citizenId);
+    return true;
+  }
+}
+
 // ── Main routine ─────────────────────────────────────────────
 
 export const civilianTransportRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -2085,6 +2152,15 @@ if (state && state.status !== "idle") {
         bot.initiateStop();
         await ctx.sleep(5000);
         return;
+      }
+
+      // ── Achievement mode: primary source is the home Transit Lounge ──
+      // Other CT bots park passengers here. Deliver any not-yet-transported
+      // expired lounge passenger first; only fall back to remote station
+      // pickup when the lounge has nothing new to deliver.
+      if (settings.mode === "achievement") {
+        const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, false);
+        if (loungeActed) continue;
       }
 
       // Check idle timeout - return home if stuck idle for too long
@@ -3155,48 +3231,12 @@ if (state && state.status !== "idle") {
     }
 
     // ── Lounge Delivery Mode ──
-    // Check for lounge passengers whose timer has expired and deliver them
-    const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
-    if (expiredLoungePassengers.length > 0 && settings.mode === "lounge_transport") {
-      ctx.log("transport", `Lounge delivery: ${expiredLoungePassengers.length} passenger(s) ready for delivery from Transit Lounge`);
-      // Pick up the first expired passenger and deliver to their destination
-      const p = expiredLoungePassengers[0];
-      // Never deliver a passenger to a blacklisted destination — they stay in
-      // the lounge (or are dropped from tracking) rather than being stranded.
-      if (isBlockedStation(p.destination, p.destinationName)) {
-        ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
-        passengersLounge.markDelivered(p.citizenId);
-        continue;
-      }
-      const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
-      if (resolved) {
-        state.status = "delivering_lounge_passenger";
-        state.onboardPassengers = [{
-          citizenId: p.citizenId,
-          name: p.name,
-          accommodationClass: p.accommodationClass,
-          citizenship: p.citizenship,
-          destination: p.destination,
-          destinationName: p.destinationName,
-          destinationSystem: p.destinationSystem,
-          fare: p.fare,
-          bio: p.bio,
-          routeData: null,
-          loadedAt: p.checkedInAt,
-          status: "boarded",
-        }];
-        state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
-        state.currentRouteIndex = 0;
-        state.currentDestination = resolved.poiName;
-        state.pickupStation = settings.homeStation || null;
-        state.pickupSystem = settings.homeSystem || null;
-        saveTransportState(state);
-        ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
-        continue;
-      } else {
-        ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
-        passengersLounge.markDelivered(p.citizenId);
-      }
+    // ── Lounge Delivery ──
+    // Deliver expired Transit Lounge passengers to their destinations.
+    // (In achievement mode this runs first as the primary source, above.)
+    if (settings.mode === "lounge_transport") {
+      const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, true);
+      if (loungeActed) continue;
     }
 
     if (state.status === "delivering_lounge_passenger") {

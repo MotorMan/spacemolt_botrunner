@@ -538,7 +538,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     // to keep outward distance low. Circle chains jumps mid-drift.
     if (scanPattern !== "circle" && bot.state === "running") {
       const returnAngle = (angle + 180) % 360;
-      const returned = await pathfinderJumpAtBearing(ctx, returnAngle, null, { waitForCompletion: true });
+      const returned = await pathfinderJumpAtBearing(ctx, returnAngle, null, { waitForCompletion: false });
       if (!returned.success) {
         ctx.log("error", `Return jump from ${angle}° failed — may be stranded in ${bot.system}`);
         if (bot.state !== "running") break;

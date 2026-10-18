@@ -357,16 +357,22 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
     // completion wait. We only want to confirm transit started, then keep
     // issuing course changes.
     if (i === 0) {
-      // Initial jump from origin at startDegree. Wait for transit to START,
-      // then wait scanWaitMinutes mid-transit to get away from origin before
-      // the sweep continues.
-      const started = await pathfinderJumpAtBearing(ctx, angle, originPos, {
-        waitForCompletion: false,
-        midTransitWaitMs: scanWaitMinutes > 0 ? scanWaitMinutes * 60 * 1000 : 0,
-      });
-      if (!started.success) {
-        ctx.log("error", `Initial pathfinder jump at ${angle}° failed — aborting sweep`);
-        return;
+      // If we're already in transit, skip the redundant jump command — the
+      // server burns 25 fuel on every jump deg even if it's the same bearing.
+      if (bot.inTransit) {
+        ctx.log("system", `Already drifting at start of sweep — skipping redundant initial jump at ${angle}°, checking destination instead...`);
+      } else {
+        // Initial jump from origin at startDegree. Wait for transit to START,
+        // then wait scanWaitMinutes mid-transit to get away from origin before
+        // the sweep continues.
+        const started = await pathfinderJumpAtBearing(ctx, angle, originPos, {
+          waitForCompletion: false,
+          midTransitWaitMs: scanWaitMinutes > 0 ? scanWaitMinutes * 60 * 1000 : 0,
+        });
+        if (!started.success) {
+          ctx.log("error", `Initial pathfinder jump at ${angle}° failed — aborting sweep`);
+          return;
+        }
       }
     } else {
       // Sweep jump: change course by scanStepDegrees from whatever bearing
@@ -395,13 +401,18 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
       const p = poiResp.result as Record<string, unknown>;
       inTransit = (p.in_transit as boolean) ?? false;
       ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
-      // While in transit, get_poi returns the destination under to_system,
-      // not system or arrival_system.
-      destinationSystem =
-        (p.to_system as string) ||
-        (p.system as string) ||
-        (p.arrival_system as string) ||
-        "?";
+      // While in transit, get_poi returns the destination under to_system.
+      // If to_system is empty/missing while in transit, we're drifting into
+      // infinite void — no destination system at all.
+      const toSystem = p.to_system as string | undefined;
+      if (toSystem && toSystem !== "") {
+        destinationSystem = toSystem;
+      } else if (!inTransit) {
+        // Landed — use system or arrival_system for where we actually are.
+        destinationSystem = (p.system as string) || (p.arrival_system as string) || "?";
+      } else {
+        destinationSystem = "VOID";
+      }
     }
 
     ctx.log("system", `Angle ${angle}°: in_transit=${inTransit} ticks_remaining=${ticksRemaining ?? "?"} destination=${destinationSystem}`);

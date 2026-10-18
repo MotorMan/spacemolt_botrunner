@@ -5368,6 +5368,7 @@
           const scanWaitMinutes = botSettings.scanWaitMinutes ?? 5;
           const scanDelayTicks = botSettings.scanDelayTicks ?? 2;
           const refuelThreshold = botSettings.refuelThreshold ?? 50;
+          const scanPattern = botSettings.scanPattern ?? "circle";
           const sysOpts = [
             `<option value=""${!originSystem ? " selected" : ""}>(current)</option>`,
           ];
@@ -5398,6 +5399,11 @@
       <input type="number" id="profile-pathfinderScanWaitMinutes" value="${scanWaitMinutes}" min="0" max="120" style="width:55px" onchange="saveProfilePathfinderScanWaitMinutes()">
       <span class="profile-ore-label" style="margin-left:8px">Delay (ticks):</span>
       <input type="number" id="profile-pathfinderScanDelayTicks" value="${scanDelayTicks}" min="0" max="60" style="width:55px" onchange="saveProfilePathfinderScanDelayTicks()">
+      <span class="profile-ore-label" style="margin-left:8px">Pattern:</span>
+      <select id="profile-pathfinderScanPattern" style="width:90px" onchange="saveProfilePathfinderScanPattern()">
+        <option value="circle" ${scanPattern === "circle" ? "selected" : ""}>Circle</option>
+        <option value="star" ${scanPattern === "star" ? "selected" : ""}>Star</option>
+      </select>
       <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
       <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
         }
@@ -6185,6 +6191,22 @@
         const scanDelayTicks = Number.isNaN(rawDelay) ? 2 : rawDelay;
         const existing = settings[bot.username] || {};
         const updated = Object.assign({}, existing, { scanDelayTicks });
+        send({
+          type: "saveSettings",
+          routine: bot.username,
+          settings: updated,
+        });
+        settings[bot.username] = updated;
+      }
+
+      function saveProfilePathfinderScanPattern() {
+        const bot = getProfileBot();
+        if (!bot) return;
+        const sel = document.getElementById("profile-pathfinderScanPattern");
+        if (!sel) return;
+        const scanPattern = sel.value;
+        const existing = settings[bot.username] || {};
+        const updated = Object.assign({}, existing, { scanPattern });
         send({
           type: "saveSettings",
           routine: bot.username,
@@ -34122,6 +34144,7 @@ ignoreBlacklist: document.getElementById(
         const scanStepDegrees = p.scanStepDegrees ?? 12;
         const scanWaitMinutes = p.scanWaitMinutes ?? 5;
         const scanDelayTicks = p.scanDelayTicks ?? 2;
+        const scanPattern = p.scanPattern ?? "circle";
         const refuelThreshold = p.refuelThreshold ?? 50;
 
         const sysOpts = ['<option value="">(current system)</option>'];
@@ -34185,6 +34208,17 @@ ignoreBlacklist: document.getElementById(
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Sweep Pattern</div>
+        <div class="setting-hint">Circle = full 360° sweep. Star = out-and-back spikes in a tight arc around the start degree.</div>
+      </div>
+      <select id="set-pathfinder-scanPattern">
+        <option value="circle" ${scanPattern === "circle" ? "selected" : ""}>Circle</option>
+        <option value="star" ${scanPattern === "star" ? "selected" : ""}>Star</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Refuel Threshold (%)</div>
         <div class="setting-hint">Minimum fuel percentage before attempting jumps.</div>
       </div>
@@ -34224,6 +34258,9 @@ ignoreBlacklist: document.getElementById(
               );
               return Number.isNaN(v) ? 2 : v;
             })(),
+          scanPattern:
+            document.getElementById("set-pathfinder-scanPattern").value ||
+            "circle",
           refuelThreshold:
             parseInt(
               document.getElementById("set-pathfinder-refuelThreshold")

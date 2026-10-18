@@ -19,6 +19,7 @@ interface PathfinderSettings {
   scanWaitMinutes?: number;
   scanDelayTicks?: number;
   refuelThreshold?: number;
+  scanPattern?: "circle" | "star";
 }
 
 interface GalacticPos {
@@ -51,6 +52,7 @@ export function getPathfinderSettings(username?: string): PathfinderSettings {
     scanWaitMinutes: asNumber(botOverrides.scanWaitMinutes, asNumber(global.scanWaitMinutes, 5)),
     scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 2)),
     refuelThreshold: asNumber(botOverrides.refuelThreshold, asNumber(global.refuelThreshold, 50)),
+    scanPattern: (asString(botOverrides.scanPattern, asString(global.scanPattern, "circle")) as "circle" | "star"),
   };
 }
 
@@ -76,6 +78,10 @@ export function setPathfinderRefuelThreshold(username: string, threshold: number
 
 export function setPathfinderScanDelayTicks(username: string, ticks: number): void {
   writeSettings({ [username]: { scanDelayTicks: ticks } });
+}
+
+export function setPathfinderScanPattern(username: string, pattern: "circle" | "star"): void {
+  writeSettings({ [username]: { scanPattern: pattern } });
 }
 
 /** Perform a raw pathfinder jump at a given bearing.
@@ -303,11 +309,15 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
   const scanDelayTicks = settings.scanDelayTicks ?? 2;
   const refuelThreshold = settings.refuelThreshold ?? 50;
 
+  const scanPattern = settings.scanPattern ?? "circle";
+
   const startDegree = ((scanStartDegree % 360) + 360) % 360;
   const numAngles = Math.floor(360 / scanStepDegrees);
-  const totalJumps = numAngles * 2; // one out + one back per angle
+  // Star pattern does an out + back jump per spike; circle does one jump per
+  // angle plus a final return. Use 2x for a conservative fuel estimate either way.
+  const totalJumps = numAngles * 2;
 
-  ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${numAngles} angles), wait: ${scanWaitMinutes} min`);
+  ctx.log("system", `Pathfinder scan routine started — origin: ${originSystem}, start: ${startDegree}°, step: ${scanStepDegrees}° (${numAngles} angles), pattern: ${scanPattern}, wait: ${scanWaitMinutes} min`);
 
   yield "prep";
   await bot.refreshStatus();
@@ -346,53 +356,23 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
   const foundSystems: FoundSystem[] = [];
 
-  for (let i = 0; i < numAngles && bot.state === "running"; i++) {
-    const angle = (startDegree + i * scanStepDegrees) % 360;
-
-    yield "scanning";
-
-    ctx.log("hunt", `Scanning angle ${angle}° (${i + 1}/${numAngles})`);
-
-    // Issue pathfinder jump at this bearing — fire-and-forget, no transit
-    // completion wait. We only want to confirm transit started, then keep
-    // issuing course changes.
-    if (i === 0) {
-      // If we're already in transit, skip the redundant jump command — the
-      // server burns 25 fuel on every jump deg even if it's the same bearing.
-      if (bot.inTransit) {
-        ctx.log("system", `Already drifting at start of sweep — skipping redundant initial jump at ${angle}°, checking destination instead...`);
-      } else {
-        // Initial jump from origin at startDegree. Wait for transit to START,
-        // then wait scanWaitMinutes mid-transit to get away from origin before
-        // the sweep continues.
-        const started = await pathfinderJumpAtBearing(ctx, angle, originPos, {
-          waitForCompletion: false,
-          midTransitWaitMs: scanWaitMinutes > 0 ? scanWaitMinutes * 60 * 1000 : 0,
-        });
-        if (!started.success) {
-          ctx.log("error", `Initial pathfinder jump at ${angle}° failed — aborting sweep`);
-          return;
-        }
-      }
-    } else {
-      // Sweep jump: change course by scanStepDegrees from whatever bearing
-      // we last issued. Fire-and-forget — no completion wait.
-      const jumped = await pathfinderJumpAtBearing(ctx, angle, null, {
-        waitForCompletion: false,
-      });
-      if (!jumped.success) {
-        ctx.log("error", `Sweep jump at ${angle}° failed — skipping angle`);
-        if (bot.state !== "running") break;
-        continue;
-      }
+  /** Issue a pathfinder jump at a bearing, wait 1 tick, then read get_poi and
+   *  log/record the destination. Fire-and-forget — no transit completion wait. */
+  async function scanAngle(angle: number, label: string): Promise<void> {
+    const jumped = await pathfinderJumpAtBearing(ctx, angle, null, { waitForCompletion: false });
+    if (!jumped.success) {
+      ctx.log("error", `Pathfinder jump at ${label} ${angle}° failed`);
+      return;
     }
 
-    if (bot.state !== "running") break;
+    if (bot.state !== "running") return;
 
-    // Wait at least 1 tick for things to update.
+    // Wait 1 mandatory tick for the jump to register.
     await ctx.sleep(11000);
 
-    // Grab get_poi to see if our destination changed / where we're headed.
+    if (bot.state !== "running") return;
+
+    // Grab get_poi to see where we're headed.
     let destinationSystem = "?";
     let inTransit = false;
     let ticksRemaining: number | null = null;
@@ -401,29 +381,23 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
       const p = poiResp.result as Record<string, unknown>;
       inTransit = (p.in_transit as boolean) ?? false;
       ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
-      // While in transit, get_poi returns the destination under to_system.
-      // If to_system is empty/missing while in transit, we're drifting into
-      // infinite void — no destination system at all.
       const toSystem = p.to_system as string | undefined;
       if (toSystem && toSystem !== "") {
         destinationSystem = toSystem;
       } else if (!inTransit) {
-        // Landed — use system or arrival_system for where we actually are.
         destinationSystem = (p.system as string) || (p.arrival_system as string) || "?";
       } else {
         destinationSystem = "VOID";
       }
     }
 
-    ctx.log("system", `Angle ${angle}°: in_transit=${inTransit} ticks_remaining=${ticksRemaining ?? "?"} destination=${destinationSystem}`);
+    ctx.log("system", `${label} ${angle}°: in_transit=${inTransit} ticks_remaining=${ticksRemaining ?? "?"} destination=${destinationSystem}`);
 
     // Refresh to learn where we are / where we're headed.
     await bot.refreshLocation();
     await bot.refreshStatus();
-    const landedSystem = bot.system;
-    const destination = destinationSystem !== "?" ? destinationSystem : landedSystem;
+    const destination = destinationSystem !== "?" ? destinationSystem : bot.system;
     const wasKnown = mapStore.getSystem(destination) !== null;
-
     const atVoid = /void|empty|deep_space|interstellar|space/i.test(destination);
 
     foundSystems.push({
@@ -434,25 +408,62 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
       atVoid,
     });
 
-    // Tell what degree we tried and what the destination changed to.
     if (atVoid) {
-      ctx.log("hunt", `Angle ${angle}°: destination ${destination} (void/empty space)`);
+      ctx.log("hunt", `${label} ${angle}°: destination ${destination} (void/empty space)`);
     } else if (wasKnown) {
-      ctx.log("hunt", `Angle ${angle}°: destination ${destination} (known system)`);
+      ctx.log("hunt", `${label} ${angle}°: destination ${destination} (known system)`);
     } else {
-      ctx.log("hunt", `🎯 JACKPOT! Angle ${angle}°: destination ${destination} (unknown/hidden system)`);
+      ctx.log("hunt", `🎯 JACKPOT! ${label} ${angle}°: destination ${destination} (unknown/hidden system)`);
+    }
+  }
+
+  for (let i = 0; i < numAngles && bot.state === "running"; i++) {
+    const outwardAngle = (startDegree + i * scanStepDegrees) % 360;
+    const returnAngle = (outwardAngle + 180) % 360;
+
+    yield "scanning";
+    ctx.log("hunt", `Scanning spike ${outwardAngle}° (${i + 1}/${numAngles})`);
+
+    if (i === 0) {
+      // Initial jump from origin at startDegree. Wait for transit to START,
+      // then wait scanWaitMinutes mid-transit to get away from origin.
+      if (bot.inTransit) {
+        ctx.log("system", `Already drifting at start of sweep — skipping redundant initial jump at ${outwardAngle}°, checking destination instead...`);
+      } else {
+        const started = await pathfinderJumpAtBearing(ctx, outwardAngle, originPos, {
+          waitForCompletion: false,
+          midTransitWaitMs: scanWaitMinutes > 0 ? scanWaitMinutes * 60 * 1000 : 0,
+        });
+        if (!started.success) {
+          ctx.log("error", `Initial pathfinder jump at ${outwardAngle}° failed — aborting sweep`);
+          return;
+        }
+      }
+    } else if (scanPattern === "star") {
+      // Star pattern: mid-drift redirect to the next outward spike angle.
+      await scanAngle(outwardAngle, "Out");
+    } else {
+      // Circle pattern: mid-drift redirect to the next angle around the circle.
+      await scanAngle(outwardAngle, "Angle");
     }
 
     if (bot.state !== "running") break;
 
-    // Delay between scan jumps (1 tick = 10 seconds).
+    // Star pattern: jump back toward origin after each outward spike.
+    if (scanPattern === "star") {
+      await scanAngle(returnAngle, "Back");
+    }
+
+    if (bot.state !== "running") break;
+
+    // Delay between scan jumps / spikes (1 tick = 10 seconds).
     if (scanDelayTicks > 0 && bot.state === "running") {
       ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan jumps...`);
       await ctx.sleep(scanDelayTicks * 10_000);
     }
   }
 
-  // Return to origin — 180 off the starting degree.
+  // Final return to origin — 180 off the starting degree.
   if (bot.state === "running") {
     const returnBearing = (startDegree + 180) % 360;
     ctx.log("travel", `Returning to origin ${originSystem} at bearing ${returnBearing}° (180 off start degree ${startDegree}°)`);
@@ -469,6 +480,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
   ctx.log("system", `=== Pathfinder Scan Complete ===`);
   ctx.log("system", `Origin: ${originSystem}`);
+  ctx.log("system", `Pattern: ${scanPattern}`);
   ctx.log("system", `Angles scanned: ${numAngles} (start ${startDegree}°, step ${scanStepDegrees}°)`);
   ctx.log("system", `Systems found: ${foundSystems.length} (known: ${knownCount}, unknown/jackpot: ${unknownCount}, void: ${voidCount})`);
 

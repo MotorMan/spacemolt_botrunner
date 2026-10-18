@@ -249,6 +249,13 @@ export class CivilianStore {
     return Object.keys(record.transportedBy);
   }
 
+  /** True when this specific bot has successfully delivered this civilian. */
+  hasBeenTransportedByBot(citizenId: string, botUsername: string): boolean {
+    const record = this.civilians.get(this.normalizeId(citizenId));
+    if (!record || !record.transportedBy) return false;
+    return record.transportedBy[botUsername] > 0;
+  }
+
   getAll(): CivilianRecord[] {
     this.ensureLoaded();
     return Array.from(this.civilians.values()).sort((a, b) => a.name.localeCompare(b.name));

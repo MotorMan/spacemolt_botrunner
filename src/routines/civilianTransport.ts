@@ -579,6 +579,8 @@ interface TransportPassenger {
   loadedAt: string;
   status: "boarded" | "delivered" | "stranded";
   ticksRemaining?: number;
+  /** True when the passenger was picked up from the Transit Lounge (needs lounge-store cleanup on delivery). */
+  fromLounge?: boolean;
 }
 
 interface TransportState {
@@ -1783,46 +1785,77 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
 
 // ── Lounge delivery helper (achievement primary source) ────────────────────
 //
-// Attempts to pick up one expired Transit Lounge passenger and deliver them to
-// their destination. Returns true when it took action (delivered, skipped, or
-// could not resolve) so the caller can `continue` the loop. Returns false when
-// there was nothing actionable, letting the caller fall through to remote
-// station pickup. When `allowAlreadyTransported` is false (achievement mode),
-// passengers already delivered by any bot are skipped entirely, leaving them
-// for normal CT bots.
+// Picks up expired Transit Lounge passengers and fills all available berths,
+// respecting class hierarchy: lower class may ride UP (economy→business→first),
+// but higher class cannot ride down (first→first only, business→business/first).
+// Returns true when it took action so the caller can `continue` the loop.
+// When `botUsername` is null (lounge_transport mode) all expired lounge
+// passengers are delivered. When `botUsername` is set (achievement mode) only
+// passengers this bot has not yet delivered are considered.
 async function tryDeliverExpiredLoungePassenger(
   ctx: RoutineContext,
   bot: Bot,
   state: TransportState,
   settings: CivilianTransportSettings,
-  allowAlreadyTransported: boolean,
+  botUsername: string | null,
 ): Promise<boolean> {
   const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
   if (expiredLoungePassengers.length === 0) return false;
 
-  const candidates = allowAlreadyTransported
+  const candidates = botUsername === null
     ? expiredLoungePassengers
-    : expiredLoungePassengers.filter((p) => !civilianStore.hasBeenTransportedByAnyone(p.citizenId));
+    : expiredLoungePassengers.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
 
-  if (candidates.length === 0) {
-    // All expired lounge passengers already transported by someone else — leave
-    // them for normal CT bots; achievement mode only counts new deliveries.
-    return false;
-  }
+  if (candidates.length === 0) return false;
 
-  const p = candidates[0];
-  if (isBlockedStation(p.destination, p.destinationName)) {
-    ctx.log("transport", `Lounge delivery: skipping ${p.name} — destination ${p.destinationName} is blacklisted`);
-    passengersLounge.markDelivered(p.citizenId);
-    return true;
-  }
-  const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
-  if (resolved) {
-    state.status = "delivering_lounge_passenger";
-    state.onboardPassengers = [{
+  // Sort by class restrictiveness: first → business → economy (most restrictive first)
+  const classOrder: Record<string, number> = { first: 0, business: 1, economy: 2 };
+  const sorted = [...candidates].sort((a, b) => classOrder[a.accommodationClass] - classOrder[b.accommodationClass]);
+
+  // Berth capacities (respect existing usage)
+  let usedFirst = state.berths_used.first;
+  let usedBusiness = state.berths_used.business;
+  let usedEconomy = state.berths_used.economy;
+  const maxFirst = state.berths.first;
+  const maxBusiness = state.berths.business;
+  const maxEconomy = state.berths.economy;
+
+  const onboard: TransportPassenger[] = [];
+
+  for (const p of sorted) {
+    const cls = p.accommodationClass;
+    let canLoad = false;
+
+    if (cls === "first" && usedFirst < maxFirst) {
+      usedFirst++;
+      canLoad = true;
+    } else if (cls === "business") {
+      if (usedBusiness < maxBusiness) {
+        usedBusiness++;
+        canLoad = true;
+      } else if (usedFirst < maxFirst) {
+        usedFirst++;
+        canLoad = true;
+      }
+    } else if (cls === "economy") {
+      if (usedEconomy < maxEconomy) {
+        usedEconomy++;
+        canLoad = true;
+      } else if (usedBusiness < maxBusiness) {
+        usedBusiness++;
+        canLoad = true;
+      } else if (usedFirst < maxFirst) {
+        usedFirst++;
+        canLoad = true;
+      }
+    }
+
+    if (!canLoad) continue;
+
+    onboard.push({
       citizenId: p.citizenId,
       name: p.name,
-      accommodationClass: p.accommodationClass,
+      accommodationClass: cls,
       citizenship: p.citizenship,
       destination: p.destination,
       destinationName: p.destinationName,
@@ -1832,20 +1865,41 @@ async function tryDeliverExpiredLoungePassenger(
       routeData: null,
       loadedAt: p.checkedInAt,
       status: "boarded",
-    }];
-    state.route = [{ system: resolved.system, poi: resolved.poi, poiName: resolved.poiName, origDest: p.destination }];
-    state.currentRouteIndex = 0;
-    state.currentDestination = resolved.poiName;
-    state.pickupStation = settings.homeStation || null;
-    state.pickupSystem = settings.homeSystem || null;
-    saveTransportState(state);
-    ctx.log("transport", `Lounge delivery: picking up ${p.name} from lounge, delivering to ${resolved.poiName}`);
-    return true;
-  } else {
-    ctx.log("transport", `Lounge delivery: could not resolve destination for ${p.name}, skipping`);
-    passengersLounge.markDelivered(p.citizenId);
-    return true;
+      fromLounge: true,
+    });
   }
+
+  if (onboard.length === 0) return false;
+
+  // Build destination map and plan a route to all destinations
+  const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+  for (const p of onboard) {
+    const existing = destMap.get(p.destination);
+    if (existing) { existing.count++; continue; }
+    const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
+    destMap.set(p.destination, {
+      system: resolved?.system || "",
+      poi: resolved?.poi || p.destination,
+      poiName: resolved?.poiName || p.destinationName,
+      count: 1,
+    });
+  }
+
+  const routeDests = Array.from(destMap.values()).filter(d => d.system);
+  const planned = await planTourRoute(bot.system || "", routeDests, settings.maxJumps, bot);
+
+  state.onboardPassengers = onboard;
+  state.route = planned;
+  state.currentRouteIndex = 0;
+  state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+  state.status = "in_transit";
+  state.berths_used = { economy: usedEconomy, business: usedBusiness, first: usedFirst };
+  state.routeRebuildAttempts = 0;
+  state.roundsWithoutPassengers = 0;
+  saveTransportState(state);
+
+  ctx.log("transport", `Lounge delivery: loaded ${onboard.length} passengers from Transit Lounge (berths used: ${usedEconomy}e/${usedBusiness}b/${usedFirst}f)`);
+  return true;
 }
 
 // ── Main routine ─────────────────────────────────────────────
@@ -1919,7 +1973,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
   if (settings.mode === "achievement") {
-    ctx.log("transport", "★ ACHIEVEMENT MODE ★ Only picking up civilians no bot has delivered yet, to transport every civilian once.");
+    ctx.log("transport", `★ ACHIEVEMENT MODE ★ Only picking up civilians ${bot.username} has not delivered yet, to transport every civilian once for this bot.`);
   }
 
   // Enable cloaking if configured and module is available
@@ -2159,7 +2213,7 @@ if (state && state.status !== "idle") {
       // expired lounge passenger first; only fall back to remote station
       // pickup when the lounge has nothing new to deliver.
       if (settings.mode === "achievement") {
-        const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, false);
+        const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, bot.username);
         if (loungeActed) continue;
       }
 
@@ -2428,9 +2482,9 @@ if (state && state.status !== "idle") {
         const cls = p.class.toLowerCase();
         // Achievement mode: only pick up civilians no bot has successfully
         // delivered yet, so we make progress toward transporting every single
-        // civilian. Anyone already transported by any bot is skipped here.
-        if (settings.mode === "achievement" && civilianStore.hasBeenTransportedByAnyone(p.citizen_id)) {
-          skipped.push({ name: p.name, reason: "already transported (achievement mode)" });
+        // civilian. Anyone already transported by this bot is skipped here.
+        if (settings.mode === "achievement" && civilianStore.hasBeenTransportedByBot(p.citizen_id, bot.username)) {
+          skipped.push({ name: p.name, reason: "already transported by this bot (achievement mode)" });
           continue;
         }
         if (settings.blockPirateStations && isPirateStation(p.destination)) {
@@ -3235,7 +3289,7 @@ if (state && state.status !== "idle") {
     // Deliver expired Transit Lounge passengers to their destinations.
     // (In achievement mode this runs first as the primary source, above.)
     if (settings.mode === "lounge_transport") {
-      const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, true);
+      const loungeActed = await tryDeliverExpiredLoungePassenger(ctx, bot, state, settings, null);
       if (loungeActed) continue;
     }
 
@@ -3546,6 +3600,9 @@ if (state && state.status !== "idle") {
           status: "delivered",
         }, bot.username);
         recordTransportedPassenger(bot.username, p.name);
+        if (p.fromLounge) {
+          passengersLounge.markDelivered(p.citizenId);
+        }
         logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }
 

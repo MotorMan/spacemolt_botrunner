@@ -50,7 +50,7 @@ export function getPathfinderSettings(username?: string): PathfinderSettings {
     scanStartDegree: asNumber(botOverrides.scanStartDegree, asNumber(global.scanStartDegree, 0)),
     scanStepDegrees: asNumber(botOverrides.scanStepDegrees, asNumber(global.scanStepDegrees, 12)),
     scanWaitMinutes: asNumber(botOverrides.scanWaitMinutes, asNumber(global.scanWaitMinutes, 5)),
-    scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 2)),
+    scanDelayTicks: asNumber(botOverrides.scanDelayTicks, asNumber(global.scanDelayTicks, 0)),
     refuelThreshold: asNumber(botOverrides.refuelThreshold, asNumber(global.refuelThreshold, 50)),
     scanPattern: (asString(botOverrides.scanPattern, asString(global.scanPattern, "circle")) as PathfinderSettings["scanPattern"]),
   };
@@ -445,7 +445,7 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
   const foundSystems: FoundSystem[] = [];
 
-  /** Issue a pathfinder jump at a bearing, wait 1 tick, then read get_poi and
+  /** Issue a pathfinder jump at a bearing, then immediately read get_poi and
    *  log/record the destination. Fire-and-forget — no transit completion wait.
    *  `midTransitWaitMs` waits that many ms after transit starts (used for the
    *  initial jump to get away from origin). */
@@ -461,8 +461,8 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (bot.state !== "running") return;
 
-    // Wait 1 mandatory tick for the jump to register.
-    await ctx.sleep(11000);
+    // Brief settle so the server registers the jump before we read get_poi.
+    await ctx.sleep(1000);
 
     if (bot.state !== "running") return;
 

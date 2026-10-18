@@ -434,17 +434,10 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (bot.state !== "running") break;
 
-    // Delay between scan jumps.
+    // Delay between scan jumps (1 tick = 10 seconds).
     if (scanDelayTicks > 0 && bot.state === "running") {
-      const startTick = await bot.pollCurrentTick();
-      if (startTick !== null) {
-        ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan jumps...`);
-        while (bot.state === "running") {
-          const now = await bot.pollCurrentTick();
-          if (now !== null && now - startTick >= scanDelayTicks) break;
-          await ctx.sleep(5000);
-        }
-      }
+      ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan jumps...`);
+      await ctx.sleep(scanDelayTicks * 10_000);
     }
   }
 

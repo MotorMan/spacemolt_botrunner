@@ -7,7 +7,7 @@ import {
   getSystemInfo,
   getFuelCellFuelValue,
 } from "./common.js";
-import { calculatePathfinderBearing, formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
+import { formatBearing, PATHFINDER_SPEED } from "../pathfinder.js";
 
 const PATHFINDER_SETTINGS_KEY = "pathfinder";
 
@@ -77,13 +77,20 @@ export function setPathfinderScanDelayTicks(username: string, ticks: number): vo
   writeSettings({ [username]: { scanDelayTicks: ticks } });
 }
 
-/** Perform a raw pathfinder jump at a given bearing and wait for arrival.
+/** Perform a raw pathfinder jump at a given bearing.
+ *  When `waitForCompletion` is true (default), waits for transit to START then
+ *  COMPLETE before returning. When false, returns as soon as transit has
+ *  STARTED (fire-and-forget) so the caller can sweep mid-transit.
+ *  `midTransitWaitMs` (when waitForCompletion is true) makes the routine wait
+ *  that many ms mid-transit after transit starts, before waiting for completion
+ *  — used to get away from the origin system before the sweep continues.
  *  Tracks galactic position by recording start/end ticks and applying the
  *  fixed pathfinder speed (10 GU/tick) along the jump bearing. */
 async function pathfinderJumpAtBearing(
   ctx: RoutineContext,
   bearingDegrees: number,
   originPos: GalacticPos | null,
+  { waitForCompletion = true, midTransitWaitMs = 0 }: { waitForCompletion?: boolean; midTransitWaitMs?: number } = {},
 ): Promise<JumpResult> {
   const { bot } = ctx;
 
@@ -119,17 +126,14 @@ async function pathfinderJumpAtBearing(
     ctx.log("travel", `Jump result: arrived at ${arrivalSystemName || '?'} (${arrivalSystemId})`);
   }
 
-  // Wait for transit to complete, capturing the tick we land on.
-  // Pathfinder jumps are fire-and-forget — the server may not register
-  // transit immediately. Wait for in_transit to become TRUE first, then
-  // wait for it to become FALSE before capturing the end tick.
+  // Wait for transit to START (server may need a tick to register it).
   let inTransit = false;
   let ticksRemaining: number | null = null;
   let endTick: number | null = null;
   let poll = 0;
   const maxPolls = 720; // up to ~60 minutes at 5s polls
 
-  // Phase 1: wait for transit to START (server may need a tick to register it)
+  // Phase 1: wait for transit to START
   let startPolls = 0;
   const maxStartPolls = 24; // up to ~2 minutes to detect transit start
   while (bot.state === "running" && startPolls < maxStartPolls && !inTransit) {
@@ -147,6 +151,18 @@ async function pathfinderJumpAtBearing(
   if (!inTransit && bot.state === "running") {
     ctx.log("error", `Pathfinder jump at bearing ${formatBearing(bearing, 2)}° — transit never started`);
     return { success: false, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
+  }
+
+  // Mid-transit sweep wait: get away from the origin system before continuing.
+  if (midTransitWaitMs > 0 && bot.state === "running") {
+    ctx.log("system", `Waiting ${Math.round(midTransitWaitMs / 60000)} minute(s) into jump at ${formatBearing(bearing, 2)}° to get away from origin...`);
+    await ctx.sleep(midTransitWaitMs);
+  }
+
+  if (!waitForCompletion) {
+    // Fire-and-forget: transit started, caller will sweep mid-transit and
+    // wait for completion separately. No end tick / arrival pos available yet.
+    return { success: true, landedSystem: bot.system, arrivalPos: null, ticksTraveled: 0 };
   }
 
   // Phase 2: wait for transit to COMPLETE
@@ -217,34 +233,6 @@ async function pathfinderJumpAtBearing(
   }
 
   return { success: true, landedSystem: landed, arrivalPos, ticksTraveled: endTick !== null && startTick !== null ? Math.max(0, endTick - startTick) : 0 };
-}
-
-/** Return to a target system from our tracked position, using x/y math. */
-async function returnToSystem(
-  ctx: RoutineContext,
-  targetSystem: string,
-  currentPos: GalacticPos | null,
-  originPos: GalacticPos | null,
-): Promise<void> {
-  const { bot } = ctx;
-
-  // Option 1: calculated bearing from our tracked position to target (x/y math)
-  if (currentPos && originPos) {
-    const bearing = calculatePathfinderBearing(
-      currentPos.x, currentPos.y,
-      originPos.x, originPos.y,
-    );
-    ctx.log("travel", `Returning to ${targetSystem} at calculated bearing ${formatBearing(bearing, 2)}° from tracked position (${currentPos.x.toFixed(1)}, ${currentPos.y.toFixed(1)})`);
-    const jump = await pathfinderJumpAtBearing(ctx, bearing, currentPos);
-    if (jump.success && bot.system.toLowerCase() === targetSystem.toLowerCase()) {
-      ctx.log("travel", `Returned to ${targetSystem}`);
-      return;
-    }
-    ctx.log("warn", `Calculated return jump did not land at ${targetSystem} (now at ${bot.system})`);
-  }
-
-  // No position data available — cannot navigate back. We are in the void.
-  ctx.log("error", `No valid return path to ${targetSystem} — no galactic position data to calculate bearing back (stranded in void)`);
 }
 
 interface FoundSystem {
@@ -346,6 +334,8 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
   const foundSystems: FoundSystem[] = [];
 
+  let currentPos: GalacticPos | null = originPos;
+
   for (let i = 0; i < numAngles && bot.state === "running"; i++) {
     const angle = (startDegree + i * scanStepDegrees) % 360;
 
@@ -353,18 +343,111 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
 
     ctx.log("hunt", `Scanning angle ${angle}° (${i + 1}/${numAngles})`);
 
-    const jumped = await pathfinderJumpAtBearing(ctx, angle, originPos);
-    if (!jumped.success) {
-      ctx.log("error", `Pathfinder jump at ${angle}° failed — skipping angle`);
+    // First jump: issue from origin at startDegree, fire-and-forget, then wait
+    // scanWaitMinutes mid-transit to get away from the origin system before
+    // the sweep continues. Subsequent jumps issue from wherever we landed.
+    if (i === 0) {
+      const started = await pathfinderJumpAtBearing(ctx, angle, currentPos, {
+        waitForCompletion: false,
+      });
+      if (!started.success) {
+        ctx.log("error", `Initial pathfinder jump at ${angle}° failed — aborting sweep`);
+        return;
+      }
+
+      // Sweep wait: wait user-specified time INTO the jump (mid-transit) so we
+      // get away from the origin system before checking the destination.
+      if (scanWaitMinutes > 0 && bot.state === "running") {
+        ctx.log("system", `Waiting ${scanWaitMinutes} minute(s) into jump at ${angle}° to get away from origin...`);
+        await ctx.sleep(scanWaitMinutes * 60 * 1000);
+      }
+
       if (bot.state !== "running") break;
-      continue;
+
+      // Wait for transit to COMPLETE before issuing the next jump.
+      let inTransit = true;
+      let poll = 0;
+      const maxPolls = 720; // up to ~60 minutes at 5s polls
+      while (bot.state === "running" && poll < maxPolls && inTransit) {
+        await ctx.sleep(5000);
+        if (bot.state !== "running") break;
+        poll++;
+        const p = await bot.exec("get_poi");
+        if (p.result && typeof p.result === "object") {
+          const pp = p.result as Record<string, unknown>;
+          inTransit = (pp.in_transit as boolean) ?? false;
+        }
+      }
+      if (inTransit && bot.state === "running") {
+        ctx.log("error", `Initial transit did not complete after ${Math.round(maxPolls * 5 / 1000)}s — aborting`);
+        return;
+      }
+    } else {
+      // Sweep jump from current position, changing course by scanStepDegrees.
+      const jumped = await pathfinderJumpAtBearing(ctx, angle, currentPos, { waitForCompletion: true });
+      if (!jumped.success) {
+        ctx.log("error", `Sweep jump at ${angle}° failed — skipping angle`);
+        if (bot.state !== "running") break;
+        continue;
+      }
+      currentPos = jumped.arrivalPos ?? currentPos;
     }
 
-    const landedSystem = jumped.landedSystem;
+    if (bot.state !== "running") break;
+
+    // Wait at least 1 tick for things to update.
+    await ctx.sleep(11000);
+
+    // Grab get_poi to see if our destination changed / where we're headed.
+    let destinationSystem = "?";
+    let inTransit = false;
+    let ticksRemaining: number | null = null;
+    const poiResp = await bot.exec("get_poi");
+    if (poiResp.result && typeof poiResp.result === "object") {
+      const p = poiResp.result as Record<string, unknown>;
+      inTransit = (p.in_transit as boolean) ?? false;
+      ticksRemaining = (p.ticks_remaining as number) ?? ticksRemaining;
+      destinationSystem = (p.system as string) || (p.arrival_system as string) || "?";
+    }
+
+    ctx.log("system", `Angle ${angle}°: in_transit=${inTransit} ticks_remaining=${ticksRemaining ?? "?"} destination=${destinationSystem}`);
+
+    // Wait for transit to COMPLETE if we're still in transit.
+    if (inTransit && bot.state === "running") {
+      ctx.log("travel", `Waiting for transit to complete at ${angle}°...`);
+      let poll = 0;
+      const maxPolls = 720; // up to ~60 minutes at 5s polls
+      while (bot.state === "running" && poll < maxPolls && inTransit) {
+        await ctx.sleep(5000);
+        if (bot.state !== "running") break;
+        poll++;
+        const p2 = await bot.exec("get_poi");
+        if (p2.result && typeof p2.result === "object") {
+          const pp = p2.result as Record<string, unknown>;
+          inTransit = (pp.in_transit as boolean) ?? false;
+          ticksRemaining = (pp.ticks_remaining as number) ?? ticksRemaining;
+        }
+      }
+      if (inTransit && bot.state === "running") {
+        ctx.log("error", `Transit did not complete after ${Math.round(maxPolls * 5 / 1000)}s at angle ${angle}° — aborting`);
+        return;
+      }
+    }
+
+    // Refresh to learn where we actually landed.
+    await bot.refreshLocation();
+    await bot.refreshStatus();
+    const landedSystem = bot.system;
     const wasKnown = mapStore.getSystem(landedSystem) !== null;
 
-    // Update tracked position from the jump result (computed or mapStore-exact).
-    let currentPos: GalacticPos | null = jumped.arrivalPos;
+    // Track position for the return jump. Use mapStore-exact position if
+    // available, otherwise keep our computed tracked position.
+    if (!currentPos) {
+      const landedSys = mapStore.getSystem(landedSystem);
+      if (landedSys?.position) {
+        currentPos = landedSys.position;
+      }
+    }
 
     const atVoid = /void|empty|deep_space|interstellar|space/i.test(landedSystem);
 
@@ -376,38 +459,38 @@ export const pathfinderRoutine: Routine = async function* (ctx: RoutineContext) 
       atVoid,
     });
 
+    // Tell what degree we tried and what the destination changed to.
     if (atVoid) {
-      ctx.log("hunt", `Angle ${angle}°: landed at void/empty space (no system)`);
+      ctx.log("hunt", `Angle ${angle}°: destination ${landedSystem} (void/empty space)`);
     } else if (wasKnown) {
-      ctx.log("hunt", `Angle ${angle}°: known system ${landedSystem}`);
+      ctx.log("hunt", `Angle ${angle}°: destination ${landedSystem} (known system)`);
     } else {
-      ctx.log("hunt", `🎯 JACKPOT! Angle ${angle}°: discovered unknown/hidden system ${landedSystem}`);
-    }
-
-    // Wait to let distance accumulate before returning
-    if (scanWaitMinutes > 0 && bot.state === "running") {
-      ctx.log("system", `Waiting ${scanWaitMinutes} minute(s) before returning...`);
-      await ctx.sleep(scanWaitMinutes * 60 * 1000);
+      ctx.log("hunt", `🎯 JACKPOT! Angle ${angle}°: destination ${landedSystem} (unknown/hidden system)`);
     }
 
     if (bot.state !== "running") break;
 
-    // Return to origin using x/y math from our tracked position.
-    await returnToSystem(ctx, originSystem, currentPos, originPos);
-    if (bot.state !== "running") break;
-
-    // Delay between angles for aesthetic spacing on the fleet tracking map.
-    // Set to 0 to skip (default 2 ticks = ~20 seconds).
+    // Delay between scan jumps.
     if (scanDelayTicks > 0 && bot.state === "running") {
       const startTick = await bot.pollCurrentTick();
       if (startTick !== null) {
-        ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan angles...`);
+        ctx.log("system", `Delaying ${scanDelayTicks} tick(s) between scan jumps...`);
         while (bot.state === "running") {
           const now = await bot.pollCurrentTick();
           if (now !== null && now - startTick >= scanDelayTicks) break;
           await ctx.sleep(5000);
         }
       }
+    }
+  }
+
+  // Return to origin — 180 off the starting degree.
+  if (bot.state === "running") {
+    const returnBearing = (startDegree + 180) % 360;
+    ctx.log("travel", `Returning to origin ${originSystem} at bearing ${returnBearing}° (180 off start degree ${startDegree}°)`);
+    const returned = await pathfinderJumpAtBearing(ctx, returnBearing, currentPos, { waitForCompletion: true });
+    if (!returned.success) {
+      ctx.log("error", `Return jump failed — may be stranded in ${bot.system}`);
     }
   }
 

@@ -432,43 +432,23 @@ async function flockSalvageWrecks(
 
     // Loot cargo from the wreck (same as standard salvage)
     if (wreck.items.length > 0) {
-      const candidates = [...wreck.items].sort((a, b) => {
-        const aPri = a.item_id.toLowerCase().includes("fuel") || a.item_id.toLowerCase().includes("energy") ? 0 : 1;
-        const bPri = b.item_id.toLowerCase().includes("fuel") || b.item_id.toLowerCase().includes("energy") ? 0 : 1;
-        return aPri - bPri;
-      });
-
-      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
-
-      for (const item of candidates) {
-        if (bot.state !== "running") break;
-        if (remainingOnWreck <= 1) break;
-
-        let qty = item.quantity;
-        const maxSafe = remainingOnWreck - 1;
-        if (qty > maxSafe) qty = maxSafe;
-        if (qty <= 0) continue;
-
-        const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id, item_id: item.item_id, quantity: qty });
-        if (lootResp.error) {
-          if (lootResp.error.message.includes("already")) {
-            continue;
-          }
-          ctx.log("warn", `Failed to loot ${item.name} from ${wreck.name}: ${lootResp.error.message}`);
+      // Bulk loot: omit item_id/module_id to loot everything that fits from the wreck.
+      const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id });
+      if (lootResp.error) {
+        const msg = lootResp.error.message.toLowerCase();
+        if (msg.includes("already")) {
           continue;
         }
-
-        totalLooted += qty;
-        lootedItems.push(`${qty}x ${item.name}`);
-        ctx.log("scavenge", `Looted ${qty}x ${item.name} from ${wreck.name}`);
-        remainingOnWreck -= qty;
-
-        await bot.refreshCargo();
-        if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
-          ctx.log("scavenge", "Cargo full after looting — stopping salvage");
-          return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+        if (msg.includes("empty") || msg.includes("not found")) {
+          continue;
         }
+        ctx.log("warn", `Failed to bulk loot ${wreck.name}: ${lootResp.error.message}`);
+        continue;
       }
+
+      totalLooted++;
+      lootedItems.push(`bulk ${wreck.name}`);
+      ctx.log("scavenge", `Bulk looted ${wreck.name}`);
     }
 
     // Consider towing this wreck (flock-coordinated)

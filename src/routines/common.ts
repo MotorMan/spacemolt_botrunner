@@ -3972,65 +3972,86 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       break;
     }
 
+    // fuelOnly mode must loot item-by-item since bulk loot takes everything.
+    if (fuelOnly && wreck.items.length > 0) {
+      let candidates = [...wreck.items].filter(i =>
+        LOOT_PRIORITY.some(p => i.item_id.toLowerCase().includes(p))
+      );
+      if (candidates.length === 0) continue;
+      candidates = shuffleArray(candidates);
+      candidates.sort((a, b) => {
+        const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
+        const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
+        return aPri - bPri;
+      });
+
+      const wreckLoot: string[] = [];
+      for (const item of candidates) {
+        if (bot.state !== "running") break;
+        if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
+
+        const lootResp = await bot.exec("loot_wreck", {
+          wreck_id: wreck.wreck_id,
+          item_id: item.item_id,
+          quantity: item.quantity,
+        });
+
+        if (lootResp.error) {
+          const errMsg = lootResp.error.message.toLowerCase();
+          if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat") || errMsg.includes("in_battle") || errMsg.includes("cannot perform this action while in combat")) {
+            ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+            return totalLooted;
+          }
+          if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
+            break;
+          }
+          if (errMsg.includes("empty") || errMsg.includes("not found") || errMsg.includes("not in wreck")) {
+            break;
+          }
+          continue;
+        }
+
+        totalLooted++;
+        lootedItems.push(`${item.quantity}x ${item.name}`);
+        wreckLoot.push(`${item.quantity}x ${item.name}`);
+      }
+
+      if (wreckLoot.length > 0) {
+        ctx.log("scavenge", `Wreck ${wreck.wreck_id.substring(0, 8)}...: ${wreckLoot.join(", ")}`);
+      }
+      continue;
+    }
+
+    // Skip wrecks with no cargo to loot (bulk loot takes items + modules together).
     if (wreck.items.length === 0) {
       continue;
     }
 
-    // Filter to fuel items only when fuelOnly is set
-    let candidates = [...wreck.items];
-    if (fuelOnly) {
-      candidates = candidates.filter(i =>
-        LOOT_PRIORITY.some(p => i.item_id.toLowerCase().includes(p))
-      );
-      if (candidates.length === 0) continue;
-    }
-
-    // Randomize item order to reduce cross-bot collisions, then sort: fuel cells first, then everything else
-    candidates = shuffleArray(candidates);
-    candidates.sort((a, b) => {
-      const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
-      const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
-      return aPri - bPri;
+    // Bulk loot: omit item_id/module_id to loot everything that fits from the wreck.
+    const lootResp = await bot.exec("loot_wreck", {
+      wreck_id: wreck.wreck_id,
     });
 
-    // Track what we loot from this specific wreck
-    const wreckLoot: string[] = [];
-
-    for (const item of candidates) {
-      if (bot.state !== "running") break;
-      if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
-
-      const lootResp = await bot.exec("loot_wreck", {
-        wreck_id: wreck.wreck_id,
-        item_id: item.item_id,
-        quantity: item.quantity,
-      });
-
-      if (lootResp.error) {
-        const errMsg = lootResp.error.message.toLowerCase();
-        // CRITICAL: Check for battle interrupt - stop scavenging immediately
-        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat") || errMsg.includes("in_battle") || errMsg.includes("cannot perform this action while in combat")) {
-          ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
-          return totalLooted;
-        }
-        if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
-          break; // cargo full — stop looting this wreck
-        }
-        if (errMsg.includes("empty") || errMsg.includes("not found") || errMsg.includes("not in wreck")) {
-          break; // wreck gone or empty
-        }
+    if (lootResp.error) {
+      const errMsg = lootResp.error.message.toLowerCase();
+      if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat") || errMsg.includes("in_battle") || errMsg.includes("cannot perform this action while in combat")) {
+        ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+        return totalLooted;
+      }
+      if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
+        ctx.log("scavenge", `Cargo full while bulk-looting ${wreck.name} — stopping wreck`);
         continue;
       }
-
-      totalLooted++;
-      lootedItems.push(`${item.quantity}x ${item.name}`);
-      wreckLoot.push(`${item.quantity}x ${item.name}`);
+      if (errMsg.includes("empty") || errMsg.includes("not found") || errMsg.includes("not in wreck")) {
+        ctx.log("scavenge", `Wreck ${wreck.name} empty or gone — skipping`);
+        continue;
+      }
+      ctx.log("warn", `Failed to bulk loot ${wreck.name}: ${lootResp.error.message}`);
+      continue;
     }
 
-    // Log what we got from this wreck
-    if (wreckLoot.length > 0) {
-      ctx.log("scavenge", `Wreck ${wreck.wreck_id.substring(0, 8)}...: ${wreckLoot.join(", ")}`);
-    }
+    totalLooted++;
+    ctx.log("scavenge", `Bulk looted ${wreck.name}`);
   }
 
   if (totalLooted > 0) {
@@ -4102,45 +4123,63 @@ export async function fullSalvageWrecks(
     }
 
     if (wreck.items.length > 0) {
-      let candidates = [...wreck.items];
+      // fuelOnly mode must loot item-by-item since bulk loot takes everything.
       if (fuelOnly) {
-        candidates = candidates.filter(i =>
+        let candidates = [...wreck.items].filter(i =>
           LOOT_PRIORITY.some(p => i.item_id.toLowerCase().includes(p))
         );
-      }
+        if (candidates.length > 0) {
+          candidates = shuffleArray(candidates);
+          candidates.sort((a, b) => {
+            const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
+            const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
+            return aPri - bPri;
+          });
 
-      candidates = shuffleArray(candidates);
-      candidates.sort((a, b) => {
-        const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
-        const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
-        return aPri - bPri;
-      });
+          let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
 
-      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
+          for (const item of candidates) {
+            if (bot.state !== "running") break;
+            if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
+            if (remainingOnWreck <= 1) break;
 
-      for (const item of candidates) {
-        if (bot.state !== "running") break;
-        if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
-        if (remainingOnWreck <= 1) break;
+            let qty = item.quantity;
+            const maxSafe = remainingOnWreck - 1;
+            if (qty > maxSafe) qty = maxSafe;
+            if (qty <= 0) continue;
 
-        let qty = item.quantity;
-        const maxSafe = remainingOnWreck - 1;
-        if (qty > maxSafe) qty = maxSafe;
-        if (qty <= 0) continue;
+            const lootResp = await bot.exec("loot_wreck", {
+              wreck_id: wreck.wreck_id,
+              item_id: item.item_id,
+              quantity: qty,
+            });
 
-        const lootResp = await bot.exec("loot_wreck", {
-          wreck_id: wreck.wreck_id,
-          item_id: item.item_id,
-          quantity: qty,
-        });
+            if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
+              const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
+              if (battleDetected) {
+                ctx.log("combat", "Battle detected while looting wreck - initiating flee!");
+                battleState.isFleeing = false;
+              }
+            }
 
-        if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
-          const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
-          if (battleDetected) {
-            ctx.log("combat", "Battle detected while looting wreck - initiating flee!");
-            battleState.isFleeing = false;
+            if (lootResp.error) {
+              const msg = lootResp.error.message.toLowerCase();
+              if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+                ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+                return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+              }
+              if (msg.includes("empty") || msg.includes("not found")) break;
+              continue;
+            }
+
+            totalLooted++;
+            lootedItems.push(`${qty}x ${item.name}`);
+            remainingOnWreck -= qty;
           }
         }
+      } else {
+        // Bulk loot: omit item_id/module_id to loot everything that fits from the wreck.
+        const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id });
 
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
@@ -4148,13 +4187,16 @@ export async function fullSalvageWrecks(
             ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
             return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
           }
-          if (msg.includes("empty") || msg.includes("not found")) break;
-          continue;
+          if (msg.includes("empty") || msg.includes("not found")) {
+            // wreck gone or empty, skip towing consideration
+          } else {
+            ctx.log("warn", `Failed to bulk loot ${wreck.name}: ${lootResp.error.message}`);
+          }
+        } else {
+          totalLooted++;
+          lootedItems.push(`bulk ${wreck.name}`);
+          ctx.log("scavenge", `Bulk looted ${wreck.name}`);
         }
-
-        totalLooted++;
-        lootedItems.push(`${qty}x ${item.name}`);
-        remainingOnWreck -= qty;
       }
     }
 

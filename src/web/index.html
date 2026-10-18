@@ -8527,7 +8527,7 @@
         });
       }
 
-      /** Loot all items and modules from a single selected wreck */
+      /** Loot all items and modules from a single selected wreck (bulk loot) */
       function mcLootSingleWreckAll() {
         if (!profileBot) return;
 
@@ -8563,95 +8563,30 @@
 
         const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
         logResponse(
-          `<span class="resp-cmd">${ts} > Looting all from ${esc(wreckName)}...</span>`,
+          `<span class="resp-cmd">${ts} > Bulk looting all from ${esc(wreckName)}...</span>`,
         );
         logResponse(
           `<span class="resp-ok">Found ${items.length} cargo item(s) and ${modules.length} module(s)</span>`,
         );
 
-        let totalLooted = 0;
-        let itemIdx = 0;
-        let modIdx = 0;
-
-        const lootNext = () => {
-          // First loot all cargo items
-          if (itemIdx < items.length) {
-            const item = items[itemIdx];
-            const itemId = item.item_id || item.id;
-            const quantity = item.quantity || 1;
-            const itemName = item.name || itemId || "Unknown";
-            itemIdx++;
-
-            sendExec(
-              profileBot,
-              "loot_wreck",
-              {
-                wreck_id: wreckId,
-                item_id: itemId,
-                quantity: quantity,
-              },
-              (lootResult) => {
-                if (lootResult.ok) {
-                  totalLooted++;
-                  logResponse(
-                    `<span class="resp-ok">✓ Looted ${quantity}x ${esc(itemName)}</span>`,
-                  );
-                } else {
-                  logResponse(
-                    `<span class="resp-err">✗ Failed to loot ${esc(itemName)}: ${esc(lootResult.error || "unknown")}</span>`,
-                  );
-                }
-                lootNext();
-              },
-            );
-            return;
-          }
-
-          // Then loot all modules
-          if (modIdx < modules.length) {
-            const mod = modules[modIdx];
-            const modId = mod.module_id || mod.id || mod.type_id;
-            const modName =
-              mod.name ||
-              mod.module_name ||
-              mod.type_name ||
-              modId ||
-              "Unknown Module";
-            modIdx++;
-
-            // Use loot_wreck with module_id to loot (not equip) the module
-            sendExec(
-              profileBot,
-              "loot_wreck",
-              {
-                wreck_id: wreckId,
-                module_id: modId,
-              },
-              (lootResult) => {
-                if (lootResult.ok) {
-                  totalLooted++;
-                  logResponse(
-                    `<span class="resp-ok">✓ Looted module: ${esc(modName)}</span>`,
-                  );
-                } else {
-                  logResponse(
-                    `<span class="resp-err">✗ Failed to loot module ${esc(modName)}: ${esc(lootResult.error || "unknown")}</span>`,
-                  );
-                }
-                lootNext();
-              },
-            );
-            return;
-          }
-
-          // All done
-          logResponse(
-            `<span class="resp-ok">✅ Finished looting from ${esc(wreckName)} - ${totalLooted} total items/modules looted</span>`,
-          );
-          mcExec("get_status", {}); // Refresh status to update cargo
-        };
-
-        lootNext();
+        // Bulk loot: omit item_id/module_id to loot everything that fits in one command.
+        sendExec(
+          profileBot,
+          "loot_wreck",
+          { wreck_id: wreckId },
+          (lootResult) => {
+            if (lootResult.ok) {
+              logResponse(
+                `<span class="resp-ok">✅ Bulk looted all from ${esc(wreckName)}</span>`,
+              );
+            } else {
+              logResponse(
+                `<span class="resp-err">✗ Failed to bulk loot ${esc(wreckName)}: ${esc(lootResult.error || "unknown")}</span>`,
+              );
+            }
+            mcExec("get_status", {}); // Refresh status to update cargo
+          },
+        );
       }
 
       /** Loot a specific module from selected wreck */
@@ -8831,14 +8766,14 @@
               `<span class="resp-ok">Found ${validWrecks.length} wreck(s) with loot - starting mass salvage...</span>`,
             );
 
-            // Process each wreck and loot all items and modules
+            // Process each wreck and loot all items and modules via bulk loot
             let totalLooted = 0;
             let processedWrecks = 0;
 
             const lootNextWreck = () => {
               if (processedWrecks >= validWrecks.length) {
                 logResponse(
-                  `<span class="resp-ok">Looted all items from ${processedWrecks} wreck(s) - ${totalLooted} total items/modules</span>`,
+                  `<span class="resp-ok">Bulk looted ${processedWrecks} wreck(s) - ${totalLooted} total wrecks looted</span>`,
                 );
                 // Refresh status to update cargo
                 mcExec("get_status", {});
@@ -8847,93 +8782,44 @@
 
               const wreck = validWrecks[processedWrecks];
               const wreckId = wreck.wreck_id || wreck.id;
+              const wreckName = wreck.name || wreck.type || "Wreck";
               const items = wreck.items || wreck.cargo || wreck.contents || [];
               const modules = wreck.modules || [];
 
               processedWrecks++;
 
-              // Loot each item from this wreck
-              let itemIdx = 0;
-              const lootNextItem = () => {
-                if (itemIdx >= items.length) {
-                  // After items, loot modules
-                  lootNextModule();
-                  return;
-                }
-
-                const item = items[itemIdx];
-                const itemId = item.item_id || item.id;
-                const quantity = item.quantity || 1;
-                itemIdx++;
-
-                sendExec(
-                  profileBot,
-                  "loot_wreck",
-                  {
-                    wreck_id: wreckId,
-                    item_id: itemId,
-                    quantity: quantity,
-                  },
-                  (lootResult) => {
-                    if (lootResult.ok) {
-                      totalLooted++;
-                      logResponse(
-                        `<span class="resp-ok">Looted ${quantity}x ${esc(item.name || itemId)} from wreck</span>`,
-                      );
-                    } else {
-                      logResponse(
-                        `<span class="resp-err">Failed to loot ${esc(item.name || itemId)}: ${esc(lootResult.error || "unknown")}</span>`,
-                      );
-                    }
-                    // Continue with next item
-                    lootNextItem();
-                  },
+              const totalItems = items.length + modules.length;
+              if (totalItems === 0) {
+                logResponse(
+                  `<span class="resp-warn">Skipping empty wreck: ${esc(wreckName)}</span>`,
                 );
-              };
+                lootNextWreck();
+                return;
+              }
 
-              // Loot each module from this wreck
-              let modIdx = 0;
-              const lootNextModule = () => {
-                if (modIdx >= modules.length) {
-                  // Move to next wreck
+              logResponse(
+                `<span class="resp-cmd">${new Date().toLocaleTimeString("en-US", { hour12: false })} > Bulk looting ${esc(wreckName)}...</span>`,
+              );
+
+              // Bulk loot: omit item_id/module_id to loot everything that fits in one command.
+              sendExec(
+                profileBot,
+                "loot_wreck",
+                { wreck_id: wreckId },
+                (lootResult) => {
+                  if (lootResult.ok) {
+                    totalLooted++;
+                    logResponse(
+                      `<span class="resp-ok">✓ Bulk looted ${esc(wreckName)}</span>`,
+                    );
+                  } else {
+                    logResponse(
+                      `<span class="resp-err">✗ Failed to bulk loot ${esc(wreckName)}: ${esc(lootResult.error || "unknown")}</span>`,
+                    );
+                  }
                   lootNextWreck();
-                  return;
-                }
-
-                const mod = modules[modIdx];
-                const modId = mod.module_id || mod.id || mod.type_id;
-                const modName =
-                  mod.name ||
-                  mod.module_name ||
-                  mod.type_name ||
-                  modId ||
-                  "Unknown Module";
-                modIdx++;
-
-                sendExec(
-                  profileBot,
-                  "loot_wreck",
-                  {
-                    wreck_id: wreckId,
-                    module_id: modId,
-                  },
-                  (lootResult) => {
-                    if (lootResult.ok) {
-                      totalLooted++;
-                      logResponse(
-                        `<span class="resp-ok">Looted module: ${esc(modName)}</span>`,
-                      );
-                    } else {
-                      logResponse(
-                        `<span class="resp-err">Failed to loot module ${esc(modName)}: ${esc(lootResult.error || "unknown")}</span>`,
-                      );
-                    }
-                    lootNextModule();
-                  },
-                );
-              };
-
-              lootNextItem();
+                },
+              );
             };
 
             lootNextWreck();

@@ -1411,52 +1411,16 @@ export async function fightFreshBattle(
       continue;
     }
 
-    // Always advance if we're not at engaged zone (especially when enemy zone is unknown/outer)
-    if (ourCurrentZone !== "engaged") {
-      if (zoneDiff > 1) {
-        ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
-        const retResp = await bot.exec("battle", { action: "retreat" });
-        if (retResp.error) {
-          const errMsg = retResp.error.message.toLowerCase();
-          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-            ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-            return true;
-          }
-          ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-        }
-        await ctx.sleep(10000);
-      } else {
-        ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to engaged (zoneDiff=${zoneDiff}, enemyZone=${enemyZone})`);
-        const beforeUpdate = bot.currentBattle.lastUpdate;
-        const advResp = await bot.exec("battle", { action: "advance" });
-        if (!advResp.error) {
-          await waitForBattleUpdate(ctx, beforeUpdate);
-        }
-        if (advResp.error) {
-          const errMsg = advResp.error.message.toLowerCase();
-          if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-            ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
-            return true;
-          }
-          ctx.log("error", `Advance failed: ${advResp.error.message}`);
-        }
-        await ctx.sleep(10000);
-      }
-    } else if (zoneDiff > 1) {
-      ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
-      const retResp = await bot.exec("battle", { action: "retreat" });
-      if (retResp.error) {
-        const errMsg = retResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-          return true;
-        }
-        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-      }
-      await ctx.sleep(10000);
-    } else if (zoneDiff < -1) {
-      ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to match enemy at ${enemyZone}`);
+    // Hunters brawl: close to engaged and hold ground. Never retreat to match a
+    // kiting enemy — that just runs us out of the fight. The server auto-fires
+    // from our current zone; we only advance when the enemy is 2+ zones ahead.
+    if (zoneDiff < -1) {
+      ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to close distance to enemy at ${enemyZone}`);
+      const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
+        await waitForBattleUpdate(ctx, beforeUpdate);
+      }
       if (advResp.error) {
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
@@ -1607,6 +1571,15 @@ async function acquireEnemyFromNearby(
 /** Issue attack on a target, falling back to the name if the id is rejected. */
 async function attackTarget(ctx: RoutineContext, target: NearbyEntity): Promise<boolean> {
   const { bot } = ctx;
+  // Never issue a fresh `attack` while already in battle — the server treats us as
+  // already engaged and the mutation never resolves (hangs ~180s awaiting
+  // action_result, freezing the routine until stop). Re-targeting is handled via
+  // `battle { action: "target" }` by the caller.
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Already in battle — retargeting ${target.name} instead of re-attacking`);
+    await bot.exec("battle", { action: "target", target_id: target.id });
+    return true;
+  }
   let resp = await bot.exec("attack", { target_id: target.id });
   if (resp.error) {
     const msg = resp.error.message.toLowerCase();
@@ -2275,23 +2248,11 @@ export async function fightJoinedBattle(
       continue;
     }
 
-    if (zoneDiff > 1) {
-      // Enemy is behind us (e.g., we're at engaged(3), enemy at mid(1)) - retreat
-      ctx.log("combat", `↩️ Retreating from ${ourZone} to match enemy at ${enemyZone}`);
-      const retResp = await bot.exec("battle", { action: "retreat" });
-      if (retResp.error) {
-        const errMsg = retResp.error.message.toLowerCase();
-        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
-          await checkAndPraiseMorgThar(ctx, true);
-          return true;
-        }
-        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
-      }
-      await ctx.sleep(10000);
-    } else if (zoneDiff < -1) {
-      // Enemy is ahead of us (e.g., we're at outer(0), enemy at inner(2)) - advance
-      ctx.log("combat", `⚔️ Advancing from ${ourZone} to match enemy at ${enemyZone}`);
+    // Hunters brawl: close to engaged and hold ground. Never retreat to match a
+    // kiting enemy — that just runs us out of the fight. The server auto-fires
+    // from our current zone; we only advance when the enemy is 2+ zones ahead.
+    if (zoneDiff < -1) {
+      ctx.log("combat", `⚔️ Advancing from ${ourZone} to close distance to enemy at ${enemyZone}`);
       const beforeUpdate = bot.currentBattle.lastUpdate;
       const advResp = await bot.exec("battle", { action: "advance" });
       if (!advResp.error) {
@@ -2301,39 +2262,32 @@ export async function fightJoinedBattle(
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
           ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
           return true;
         }
         ctx.log("error", `Advance failed: ${advResp.error.message}`);
       }
       await ctx.sleep(10000);
-    } else {
-      // Already in range and fire stance (default) — server auto-fires each tick.
-      // Re-issue the attack defensively: if the initial engage somehow didn't register
-      // us as engaged (e.g. restarted mid-battle with a stale target id), this keeps
-      // trying to attack instead of silently sitting in the outer ring and dying.
-      // Re-attacking an already-engaged target just returns "already in a battle",
-      // which attackTarget treats as success, so this is harmless when fine.
-      if (nullCannonBraceCycle && status.tick !== undefined) {
-        if (status.tick !== lastNullCannonTick) {
-          lastNullCannonTick = status.tick;
-          nullCannonPhase = (nullCannonPhase + 1) % 4;
+    } else if (nullCannonBraceCycle && status.tick !== undefined) {
+      if (status.tick !== lastNullCannonTick) {
+        lastNullCannonTick = status.tick;
+        nullCannonPhase = (nullCannonPhase + 1) % 4;
 
-          if (nullCannonPhase === 0) {
-            ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
-            await bot.exec("battle", { action: "stance", stance: "fire" });
-            if (currentTarget) {
-              await bot.exec("battle", { action: "target", target_id: currentTarget.id });
-            }
-          } else {
-            ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
-            await bot.exec("battle", { action: "stance", stance: "brace" });
+        if (nullCannonPhase === 0) {
+          ctx.log("combat", `Tick ${status.tick}: Null Cannon fire stance (phase 0/4)`);
+          await bot.exec("battle", { action: "stance", stance: "fire" });
+          if (currentTarget) {
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
           }
+        } else {
+          ctx.log("combat", `Tick ${status.tick}: Null Cannon brace stance (phase ${nullCannonPhase}/4)`);
+          await bot.exec("battle", { action: "stance", stance: "brace" });
         }
-        await ctx.sleep(10000);
-      } else {
-        if (currentTarget) await doEngage(currentTarget);
-        await ctx.sleep(10000);
       }
+      await ctx.sleep(10000);
+    } else {
+      if (currentTarget) await doEngage(currentTarget);
+      await ctx.sleep(10000);
     }
   }
 }

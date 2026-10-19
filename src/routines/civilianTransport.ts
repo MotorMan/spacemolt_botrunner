@@ -642,6 +642,7 @@ interface StationPassengersResponse {
   station: string;
   waiting: StationPassenger[];
   count: number;
+  transitLounge?: LoungePassenger[];
 }
 
 interface AboardPassenger {
@@ -1080,11 +1081,41 @@ function parseStationPassengers(result: unknown): StationPassengersResponse | nu
     ? r.structuredContent as Record<string, unknown>
     : r;
   const waiting = Array.isArray(inner.waiting) ? inner.waiting as StationPassenger[] : [];
-  return {
+  const response: StationPassengersResponse = {
     station: (inner.station as string) || "",
     waiting,
     count: (inner.count as number) || waiting.length,
   };
+
+  // Extract transit lounge passengers from the API response so the lounge store
+  // stays in sync with the actual station lounge contents.
+  const transitLoungeRaw = inner.transit_lounge || inner.transitLounge;
+  if (transitLoungeRaw && typeof transitLoungeRaw === "object") {
+    const tl = transitLoungeRaw as Record<string, unknown>;
+    const loungePassengers = Array.isArray(tl.passengers) ? tl.passengers : [];
+    const nowISO = new Date().toISOString();
+    const checkedInAt = nowISO;
+    const expiresAt = new Date(Date.now() + 360 * 1000).toISOString();
+    response.transitLounge = loungePassengers
+      .filter((p): p is Record<string, unknown> => typeof p === "object" && p !== null)
+      .map((po) => ({
+        citizenId: ((po.citizen_id || po.citizenId || "") as string),
+        name: ((po.name || "") as string),
+        accommodationClass: ((po.class || po.accommodationClass || "economy") as "economy" | "business" | "first"),
+        citizenship: ((po.citizenship || "") as string),
+        destination: ((po.destination || "") as string),
+        destinationName: ((po.destination_name || po.destinationName || "") as string),
+        destinationSystem: ((po.destination_system || po.destinationSystem || "") as string) || undefined,
+        fare: (typeof po.base_fare === "number" ? po.base_fare : typeof po.fare === "number" ? po.fare : 0),
+        bio: ((po.bio || "") as string),
+        loadedAt: checkedInAt,
+        checkedInAt,
+        expiresAt,
+        status: "waiting",
+      }));
+  }
+
+  return response;
 }
 
 /** Trust livePassengers data for this long before falling back to a live API query. */
@@ -1136,6 +1167,16 @@ async function fetchStationPassengers(
   if (resp.error || !resp.result) return null;
   const parsed = parseStationPassengers(resp.result);
   if (!parsed) return null;
+
+  // Populate the lounge store with transit_lounge passengers from the API
+  // response so achievement-mode bots can pick them up from home base.
+  if (parsed.transitLounge && parsed.transitLounge.length > 0) {
+    for (const p of parsed.transitLounge) {
+      passengersLounge.addOrUpdatePassenger(p);
+    }
+    ctx.log("transport", `Lounge store synced: ${parsed.transitLounge.length} passengers from transit lounge at ${parsed.station}`);
+  }
+
   return { station: parsed.station || stationId, waiting: parsed.waiting, count: parsed.count };
 }
 
@@ -1809,6 +1850,12 @@ async function tryDeliverExpiredLoungePassenger(
   settings: CivilianTransportSettings,
   botUsername: string | null,
 ): Promise<boolean> {
+  // When docked at home in achievement mode, sync lounge store from the station
+  // API so we can see transit_lounge passengers before checking candidates.
+  if (botUsername !== null && bot.docked && bot.poi && bot.system && settings.homeStation && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
+    await fetchStationPassengers(ctx, bot.system, bot.poi);
+  }
+
   const expiredLoungePassengers = passengersLounge.checkExpiredPassengers();
 
   let candidates: LoungePassenger[];

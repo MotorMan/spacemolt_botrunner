@@ -1,8 +1,8 @@
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import { join } from "path";
+import { fileURLToPath } from "url";
 import { safeWriteFileSync } from "./diskSpaceGuard.js";
 
-const LOUNGE_FILE = join(process.cwd(), "data", "passengersLounge.json");
+const LOUNGE_FILE = fileURLToPath(new URL("../data/passengersLounge.json", import.meta.url));
 
 export interface LoungePassenger {
   citizenId: string;

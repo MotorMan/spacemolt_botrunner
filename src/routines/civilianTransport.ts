@@ -1953,9 +1953,47 @@ async function tryDeliverExpiredLoungePassenger(
 
   if (onboard.length === 0) return false;
 
+  // Actually load lounge passengers onto the ship, grouped by destination.
+  // `load_passenger` pulls from the Transit Lounge at the current station.
+  const loungeByDest = new Map<string, TransportPassenger[]>();
+  for (const p of onboard) {
+    const arr = loungeByDest.get(p.destination) || [];
+    arr.push(p);
+    loungeByDest.set(p.destination, arr);
+  }
+
+  for (const [destId, passengers] of loungeByDest) {
+    const loadResp = await bot.exec("load_passenger", { id: destId, target: "lounge" });
+    if (loadResp.error) {
+      ctx.log("error", `load_passenger from lounge failed for ${destId}: ${loadResp.error.message}`);
+    } else {
+      ctx.log("transport", `Loaded ${passengers.length} lounge passengers for ${destId}`);
+    }
+    await ctx.sleep(11000);
+  }
+
+  // Verify what actually loaded
+  const verifyResp = await bot.exec("list_passengers");
+  let actuallyAboard: TransportPassenger[] = [];
+  if (!verifyResp.error && verifyResp.result) {
+    const parsed = parseListPassengers(verifyResp.result);
+    if (parsed) {
+      const aboardIds = new Set(parsed.passengers.map(p => p.citizen_id || p.name));
+      actuallyAboard = onboard.filter(p => aboardIds.has(p.citizenId));
+      if (actuallyAboard.length === 0) {
+        ctx.log("transport", "Lounge delivery: API confirmed 0 passengers aboard after load — aborting");
+        return false;
+      }
+      // Update berths_used from actual API data
+      state.berths_used = parsed.berths_used || { economy: 0, business: 0, first: 0 };
+    }
+  }
+
+  if (actuallyAboard.length === 0) return false;
+
   // Build destination map and plan a route to all destinations
   const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
-  for (const p of onboard) {
+  for (const p of actuallyAboard) {
     const existing = destMap.get(p.destination);
     if (existing) { existing.count++; continue; }
     const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
@@ -1970,17 +2008,16 @@ async function tryDeliverExpiredLoungePassenger(
   const routeDests = Array.from(destMap.values()).filter(d => d.system);
   const planned = await planTourRoute(bot.system || "", routeDests, settings.maxJumps, bot);
 
-  state.onboardPassengers = onboard;
+  state.onboardPassengers = actuallyAboard;
   state.route = planned;
   state.currentRouteIndex = 0;
   state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
   state.status = "in_transit";
-  state.berths_used = { economy: usedEconomy, business: usedBusiness, first: usedFirst };
   state.routeRebuildAttempts = 0;
   state.roundsWithoutPassengers = 0;
   saveTransportState(state);
 
-  ctx.log("transport", `Lounge delivery: loaded ${onboard.length} passengers from Transit Lounge (berths used: ${usedEconomy}e/${usedBusiness}b/${usedFirst}f)`);
+  ctx.log("transport", `Lounge delivery: loaded ${actuallyAboard.length} passengers from Transit Lounge (berths used: ${usedEconomy}e/${usedBusiness}b/${usedFirst}f)`);
   return true;
 }
 

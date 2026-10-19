@@ -849,22 +849,48 @@ function countFuelCellsInInventory(inventory: any[] | undefined): number {
 }
 
 /**
- * True when the bot has enough fuel cells to complete the planned route
- * (one cell per jump, plus one spare for unexpected detours).
- * Returns false when the route cannot be mapped (treats as unsafe).
+ * Check if the bot can reach its home base with current tank fuel + cargo
+ * fuel cells. Returns true if we can make it home (even arriving empty).
+ * Used to decide whether to return home now while we still can, rather than
+ * stranding mid-route.
+ *
+ * Considers cloak fuel consumption (1 fuel per tick while cloaked) and
+ * slow hunter ship speeds. Conservative per-jump estimate.
  */
-function hasEnoughFuelCellsForRoute(
-  fromSystem: string,
-  toSystem: string,
-  fuelCellCount: number,
-): boolean {
-  if (!fromSystem || !toSystem) return false;
-  // Hunters pass skipBlacklist: true, so match navigateToSystem's behavior
-  // and compute the route without the blacklist.
-  const route = mapStore.findRoute(fromSystem, toSystem, []);
-  const jumpsNeeded = route ? Math.max(0, route.length - 1) : Infinity;
-  if (jumpsNeeded === Infinity) return false;
-  return fuelCellCount > jumpsNeeded;
+async function canReachHomeWithFuel(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getHunterSettings>,
+): Promise<boolean> {
+  const { bot } = ctx;
+  if (!settings.homeSystem) return false;
+
+  await bot.refreshShip();
+  await bot.refreshCargo();
+  await bot.refreshLocation();
+
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+  if (normalizeSystemName(bot.system) === normalizeSystemName(settings.homeSystem)) {
+    return true; // Already at home
+  }
+
+  // Route to home (no blacklist — hunters use skipBlacklist)
+  const route = mapStore.findRoute(bot.system, settings.homeSystem, []);
+  if (!route || route.length <= 1) return false;
+  const jumpsNeeded = route.length - 1;
+
+  // Total available fuel: tank + cargo cells
+  const tankFuel = bot.fuel || 0;
+  const cellFuel = (bot.inventory || [])
+    .filter(i => getFuelCellFuelValue(i.itemId) > 0)
+    .reduce((s, i) => s + (getFuelCellFuelValue(i.itemId) * (i.quantity || 0)), 0);
+  const totalAvailable = tankFuel + cellFuel;
+
+  // Conservative per-jump fuel estimate: ~26/jump base + cloak overhead
+  // (1 fuel/tick, slow ships take multiple ticks per jump)
+  const perJumpFuel = settings.cloakOnStart ? 35 : 30;
+  const estimatedFuelNeeded = jumpsNeeded * perJumpFuel;
+
+  return totalAvailable >= estimatedFuelNeeded;
 }
 
 /**
@@ -2417,10 +2443,15 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      justResupplied = true;
-      continue;
+      // Can we reach home with remaining tank fuel + cargo cells?
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        justResupplied = true;
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
     }
 
     // â”€â”€ Cargo full? â”€â”€
@@ -2459,15 +2490,6 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     // â”€â”€ Navigate to target system â”€â”€
     if (bot.system !== targetSystem) {
-      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-      if (!hasEnoughFuelCellsForRoute(bot.system, targetSystem, fuelCellCount)) {
-        const navRoute = mapStore.findRoute(bot.system, targetSystem, []);
-        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
-        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${targetSystem} â€” returning home to resupply instead of starting the journey`);
-        await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
-        justResupplied = true;
-        continue;
-      }
       ctx.log("travel", `Creature farm: heading to target system ${targetSystem}...`);
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
@@ -2992,10 +3014,16 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
     await bot.refreshCargo();
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
+      // Can we reach home with remaining tank fuel + cargo cells?
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        bigCreatureHuntInFlight.delete(targetKey);
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+        continue;
+      }
       bigCreatureHuntInFlight.delete(targetKey);
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home`);
-      await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
-      continue;
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
     }
 
     const cargoPct = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
@@ -3029,15 +3057,6 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
         continue;
       }
       ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
-      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-      if (!hasEnoughFuelCellsForRoute(bot.system, target.system, fuelCellCount)) {
-        const navRoute = mapStore.findRoute(bot.system, target.system, []);
-        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
-        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${target.system} â€” returning home to resupply instead of starting the journey`);
-        bigCreatureHuntInFlight.delete(targetKey);
-        await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
-        continue;
-      }
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
@@ -3370,9 +3389,14 @@ async function creatureFarmRandomFallbackCycle(
   await bot.refreshCargo();
   const fuelCellCount = countFuelCellsInInventory(bot.inventory);
   if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-    ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-    await returnToHomeAndResupply(ctx, settings);
-    return;
+    // Can we reach home with remaining tank fuel + cargo cells?
+    const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+    if (canMakeItHome) {
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+      await returnToHomeAndResupply(ctx, settings);
+      return;
+    }
+    ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
   }
 
   const fueled = await ensureFueledEx(ctx, settings.refuelThreshold, { homeSystem, homeStation, skipBlacklist: true, skipFleeCheck: true });
@@ -3598,14 +3622,6 @@ if (hullPct <= settings.repairThreshold) {
     }
 
     if (patrolSystem && bot.system !== patrolSystem) {
-      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-      if (!hasEnoughFuelCellsForRoute(bot.system, patrolSystem, fuelCellCount)) {
-        const navRoute = mapStore.findRoute(bot.system, patrolSystem, []);
-        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
-        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${patrolSystem} â€” returning home to resupply instead of starting the journey`);
-        await returnToHomeAndResupply(ctx, settings);
-        continue;
-      }
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
       const arrived = await navigateToSystem(ctx, patrolSystem, safetyOpts);
       if (arrived) {
@@ -4641,61 +4657,64 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       continue;
     }
 
-    // â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= settings.repairThreshold) {
-      ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
-      yield "emergency_repair";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (docked) {
-        await completeActiveMissions(ctx);
-        await repairShip(ctx);
-        await tryRefuel(ctx, { skipApprovedCheck: true });
-        await checkAndAcceptMissions(ctx);
-        await ensureInsured(ctx);
-        await bot.checkSkills();
-        await ensureUndocked(ctx);
-        // Return to stationary position
-        if (bot.system !== originalSystem) {
-          ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
-          const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
-          if (!arrived) {
-            ctx.log("error", `Could not return to ${originalSystem} â€” staying in ${bot.system}`);
-          }
-        }
-        if (bot.poi !== originalPoi) {
-          ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
-          const travelResp = await bot.exec("travel", { target_poi: originalPoi });
-          if (travelResp.error && !travelResp.error.message.includes("already")) {
-            ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
-          } else {
-            bot.poi = originalPoi;
-          }
-        }
-      }
-      continue;
-    }
-
-    // â”€â”€ Low fuel cells check â”€â”€
-    await bot.refreshCargo();
+    // â”€â”€ Can we make it home with remaining fuel? â”€â”€
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
     }
 
-    // â”€â”€ Faction alert check â€” only respond if in current system â”€â”€
-    yield "faction_alert_check";
-    const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
-    if (alertTarget && alertTarget !== bot.system) {
-      ctx.log("info", `Faction alert in ${alertTarget} â€” ignoring (stationary mode)`);
-    }
+    // â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     if (hullPct <= settings.repairThreshold) {
+       ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
+       yield "emergency_repair";
+       const docked = await navigateToSafeStation(ctx, safetyOpts);
+       if (docked) {
+         await completeActiveMissions(ctx);
+         await repairShip(ctx);
+         await tryRefuel(ctx, { skipApprovedCheck: true });
+         await checkAndAcceptMissions(ctx);
+         await ensureInsured(ctx);
+         await bot.checkSkills();
+         await ensureUndocked(ctx);
+         // Return to stationary position
+         if (bot.system !== originalSystem) {
+           ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
+           const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
+           if (!arrived) {
+             ctx.log("error", `Could not return to ${originalSystem} â€” staying in ${bot.system}`);
+           }
+         }
+         if (bot.poi !== originalPoi) {
+           ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
+           const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+           if (travelResp.error && !travelResp.error.message.includes("already")) {
+             ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
+           } else {
+             bot.poi = originalPoi;
+           }
+         }
+       }
+       continue;
+     }
 
-    // â”€â”€ Wait and scan for targets â”€â”€
-    ctx.log("info", `Waiting for targets at ${originalPoi}...`);
-    yield "scan_for_targets";
+     // â”€â”€ Faction alert check â€” only respond if in current system â”€â”€
+     yield "faction_alert_check";
+     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
+     if (alertTarget && alertTarget !== bot.system) {
+       ctx.log("info", `Faction alert in ${alertTarget} â€” ignoring (stationary mode)`);
+     }
+
+     // â”€â”€ Wait and scan for targets â”€â”€
+     ctx.log("info", `Waiting for targets at ${originalPoi}...`);
+     yield "scan_for_targets";
     await ensureObservationSubscribed();
     const obsResult = await getObservationOrNearby(bot);
     const nearbyData = obsResult.result;
@@ -8401,69 +8420,72 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       continue;
     }
 
-    // â”€â”€ Hull â”€â”€
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= settings.repairThreshold) {
-      ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
-      yield "emergency_repair";
-      await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (docked) {
-        await completeActiveMissions(ctx);
-        await repairShip(ctx);
-        await tryRefuel(ctx, { skipApprovedCheck: true });
-        await checkAndAcceptMissions(ctx);
-        await ensureInsured(ctx);
-        await bot.checkSkills();
-        await ensureUndocked(ctx);
-        await resubscribeObservationAfterMove(bot);
-      }
-      continue;
-    }
-
-    // â”€â”€ Low fuel cells check â”€â”€
-    await bot.refreshCargo();
+    // â”€â”€ Can we make it home with remaining fuel? â”€â”€
     const fuelCellCount = countFuelCellsInInventory(bot.inventory);
     if (settings.returnHomeOnFuelCellsRemaining > 0 && fuelCellCount <= settings.returnHomeOnFuelCellsRemaining) {
-      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining â€” returning home to deposit and resupply`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
+      const canMakeItHome = await canReachHomeWithFuel(ctx, settings);
+      if (canMakeItHome) {
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but can reach home — returning to resupply`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
+      ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining and cannot reach home — proceeding anyway`);
     }
 
-    // â”€â”€ Marine health check â”€â”€
-    // If fit marines have dropped below half the ship's capacity (e.g. from
-    // boarding losses), finish up here and head home so treat_personnel +
-    // recruit_personnel can restore the crew. Without this check the bot
-    // sails out to board targets with no marines left to capture ships.
-    if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
-      yield "marine_health";
+    // â”€â”€ Hull check â€” retreat to a high-security system to repair â”€â”€
+     await bot.refreshShip();
+     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+     if (hullPct <= settings.repairThreshold) {
+       ctx.log("system", `Hull at ${hullPct}% â€” retreating to high-security system for repairs`);
+       yield "emergency_repair";
+       await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+       const docked = await navigateToSafeStation(ctx, safetyOpts);
+       if (docked) {
+         await completeActiveMissions(ctx);
+         await repairShip(ctx);
+         await tryRefuel(ctx, { skipApprovedCheck: true });
+         await checkAndAcceptMissions(ctx);
+         await ensureInsured(ctx);
+         await bot.checkSkills();
+         await ensureUndocked(ctx);
+         await resubscribeObservationAfterMove(bot);
+       }
+       continue;
+     }
 
-      // If we're in a battle, finish it before heading home
-      const inBattle = await getBattleStatus(ctx);
-      if (inBattle) {
-        ctx.log("combat", "Marine health critical â€” finishing current battle before heading home to recruit");
-        await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
-      }
+     // â”€â”€ Marine health check â”€â”€
+     // If fit marines have dropped below half the ship's capacity (e.g. from
+     // boarding losses), finish up here and head home so treat_personnel +
+     // recruit_personnel can restore the crew. Without this check the bot
+     // sails out to board targets with no marines left to capture ships.
+     if (settings.boardingEnabled && await isMarineHealthCritical(ctx)) {
+       yield "marine_health";
 
-      ctx.log("system", `Fit marines critically low â€” returning home to treat and recruit personnel`);
-      await returnToHomeAndResupply(ctx, settings);
-      continue;
-    }
+       // If we're in a battle, finish it before heading home
+       const inBattle = await getBattleStatus(ctx);
+       if (inBattle) {
+         ctx.log("combat", "Marine health critical â€” finishing current battle before heading home to recruit");
+         await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs, settings.boardingEnabled, settings.boardingShieldThreshold, settings.boardingMarines, settings.shieldRechargePct, settings.cloakOnStart);
+       }
 
-    // â”€â”€ Stay-in-POI mode: anchor at one POI and re-scan each cycle â”€â”€
-    if (settings.stayInPoi) {
-      if (!stayPoiAnchor) {
-        stayPoiAnchor = { system: bot.system, poi: bot.poi };
-        ctx.log("info", `Boarding stay-in-POI mode: anchored at POI ${bot.poi} in ${bot.system} â€” re-scanning each cycle`);
-      }
-      if (bot.system !== stayPoiAnchor.system) {
-        ctx.log("travel", `Returning to anchor system ${stayPoiAnchor.system}...`);
-        await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
-        const arrived = await navigateToSystem(ctx, stayPoiAnchor.system, safetyOpts);
-        if (arrived) {
-          await resubscribeObservationAfterMove(bot);
-          if (stayPoiAnchor.poi && bot.poi !== stayPoiAnchor.poi) {
+       ctx.log("system", `Fit marines critically low â€” returning home to treat and recruit personnel`);
+       await returnToHomeAndResupply(ctx, settings);
+       continue;
+     }
+
+     // â”€â”€ Stay-in-POI mode: anchor at one POI and re-scan each cycle â”€â”€
+     if (settings.stayInPoi) {
+       if (!stayPoiAnchor) {
+         stayPoiAnchor = { system: bot.system, poi: bot.poi };
+         ctx.log("info", `Boarding stay-in-POI mode: anchored at POI ${bot.poi} in ${bot.system} â€” re-scanning each cycle`);
+       }
+       if (bot.system !== stayPoiAnchor.system) {
+         ctx.log("travel", `Returning to anchor system ${stayPoiAnchor.system}...`);
+         await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
+         const arrived = await navigateToSystem(ctx, stayPoiAnchor.system, safetyOpts);
+         if (arrived) {
+           await resubscribeObservationAfterMove(bot);
+           if (stayPoiAnchor.poi && bot.poi !== stayPoiAnchor.poi) {
             await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
             const t = await bot.exec("travel", { target_poi: stayPoiAnchor.poi });
             if (!t.error) {
@@ -8497,15 +8519,6 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       if (bot.state !== "running") { completedFullCycle = false; break; }
 
       if (bot.system !== targetSystem) {
-        const fuelCellCount = countFuelCellsInInventory(bot.inventory);
-        if (!hasEnoughFuelCellsForRoute(bot.system, targetSystem, fuelCellCount)) {
-          const navRoute = mapStore.findRoute(bot.system, targetSystem, []);
-          const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
-          ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${targetSystem} â€” returning home to resupply instead of starting the journey`);
-          await returnToHomeAndResupply(ctx, settings);
-          continue;
-        }
-
         ctx.log("travel", `Boarding patrol: heading to ${targetSystem}...`);
         await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);

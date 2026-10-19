@@ -1672,8 +1672,7 @@ async function selectNextPickupStation(
       return { system: best.system, poi: best.poi, poiName: best.poiName };
     }
 
-    ctx.log("transport", "No stations with live waiting passengers within maxJumps");
-    return null;
+    ctx.log("transport", "No stations with live waiting passengers within maxJumps; falling back to nearest-station scan");
   }
 
   // ── Fallback: nearest station scan ─────────────────────────────────

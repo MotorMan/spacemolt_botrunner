@@ -849,6 +849,23 @@ function countFuelCellsInInventory(inventory: any[] | undefined): number {
 }
 
 /**
+ * True when the bot has enough fuel cells to complete the planned route
+ * (one cell per jump, plus one spare for unexpected detours).
+ * Returns false when the route cannot be mapped (treats as unsafe).
+ */
+function hasEnoughFuelCellsForRoute(
+  fromSystem: string,
+  toSystem: string,
+  fuelCellCount: number,
+): boolean {
+  if (!fromSystem || !toSystem) return false;
+  const route = mapStore.findRoute(fromSystem, toSystem, getSystemBlacklist());
+  const jumpsNeeded = route ? Math.max(0, route.length - 1) : Infinity;
+  if (jumpsNeeded === Infinity) return false;
+  return fuelCellCount > jumpsNeeded;
+}
+
+/**
  * Split a configured home station into its system and POI parts. The setting
  * may be a bare POI id ("grand_exchange_station") or a "system|poi" pair
  * ("diphda|2574b16e0e18d90b98354bcae963854e").
@@ -2440,6 +2457,15 @@ async function* creatureFarmRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     // â”€â”€ Navigate to target system â”€â”€
     if (bot.system !== targetSystem) {
+      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+      if (!hasEnoughFuelCellsForRoute(bot.system, targetSystem, fuelCellCount)) {
+        const navRoute = mapStore.findRoute(bot.system, targetSystem, getSystemBlacklist());
+        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${targetSystem} â€” returning home to resupply instead of starting the journey`);
+        await returnToCreatureFarmHome(ctx, settings, homeSystem, homeStation);
+        justResupplied = true;
+        continue;
+      }
       ctx.log("travel", `Creature farm: heading to target system ${targetSystem}...`);
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
@@ -3001,6 +3027,15 @@ async function* huntBigCreaturesRoutine(ctx: RoutineContext): AsyncGenerator<str
         continue;
       }
       ctx.log("travel", `Big creature hunt: heading to ${target.system}...`);
+      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+      if (!hasEnoughFuelCellsForRoute(bot.system, target.system, fuelCellCount)) {
+        const navRoute = mapStore.findRoute(bot.system, target.system, getSystemBlacklist());
+        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${target.system} â€” returning home to resupply instead of starting the journey`);
+        bigCreatureHuntInFlight.delete(targetKey);
+        await returnToCreatureFarmHome(ctx, settings, settings.homeSystem, settings.homeStation);
+        continue;
+      }
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: settings.repairThreshold,
@@ -3561,6 +3596,14 @@ if (hullPct <= settings.repairThreshold) {
     }
 
     if (patrolSystem && bot.system !== patrolSystem) {
+      const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+      if (!hasEnoughFuelCellsForRoute(bot.system, patrolSystem, fuelCellCount)) {
+        const navRoute = mapStore.findRoute(bot.system, patrolSystem, getSystemBlacklist());
+        const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
+        ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${patrolSystem} â€” returning home to resupply instead of starting the journey`);
+        await returnToHomeAndResupply(ctx, settings);
+        continue;
+      }
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
       const arrived = await navigateToSystem(ctx, patrolSystem, safetyOpts);
       if (arrived) {
@@ -8452,6 +8495,15 @@ async function* boardingRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       if (bot.state !== "running") { completedFullCycle = false; break; }
 
       if (bot.system !== targetSystem) {
+        const fuelCellCount = countFuelCellsInInventory(bot.inventory);
+        if (!hasEnoughFuelCellsForRoute(bot.system, targetSystem, fuelCellCount)) {
+          const navRoute = mapStore.findRoute(bot.system, targetSystem, getSystemBlacklist());
+          const jumpsNeeded = navRoute ? Math.max(0, navRoute.length - 1) : 0;
+          ctx.log("system", `Only ${fuelCellCount} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${targetSystem} â€” returning home to resupply instead of starting the journey`);
+          await returnToHomeAndResupply(ctx, settings);
+          continue;
+        }
+
         ctx.log("travel", `Boarding patrol: heading to ${targetSystem}...`);
         await ensureCloakedIfNeeded(ctx, settings.cloakOnStart);
         const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);

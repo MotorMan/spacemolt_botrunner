@@ -3317,6 +3317,23 @@ export async function navigateToSystem(
           return false;
         }
       }
+
+    }
+
+    // ── PRE-NAVIGATION FUEL CELL CHECK (combat bots only) ──
+    // Don't commit to a multi-jump route with too few fuel cells.
+    // navigateToSystem refuels from cargo one cell per jump as tank % drops,
+    // but it doesn't know how many jumps remain. Starting a long route with
+    // few cells strands us mid-route with 0 cells.
+    if (opts.isCombatBot && nextSystem && route && route.length > 1) {
+      const jumpsNeeded = route.length - 1;
+      const cargoFuelCells = bot.inventory
+        .filter((i) => isFuelCellItemId(i.itemId))
+        .reduce((s, i) => s + (i.quantity || 0), 0);
+      if (cargoFuelCells <= jumpsNeeded) {
+        ctx.log("system", `Only ${cargoFuelCells} fuel cell(s) remaining but ${jumpsNeeded} jump(s) needed to reach ${targetSystemId} — aborting navigation to avoid stranding mid-route`);
+        return false;
+      }
     }
 
     // Hull check — repair immediately if <= 40%

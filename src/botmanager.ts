@@ -2085,7 +2085,7 @@ export async function handleStart(action: WebAction): Promise<WebActionResult> {
     (bot as unknown as Record<string, unknown>).routineParams = action.params;
   }
 
-  const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort")
+  const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort" || routineKey === "hunter")
     ? {
         getFleetStatus: () => [...bots.values()].map(b => b.status()),
         getFleetStatusAsync: () => getCombinedFleetStatus(),

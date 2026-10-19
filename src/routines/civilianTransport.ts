@@ -1835,9 +1835,13 @@ async function tryDeliverExpiredLoungePassenger(
       }
     }
     candidates = allCandidates.filter((p) => !civilianStore.hasBeenTransportedByBot(p.citizenId, botUsername));
+    ctx.log("transport", `Lounge check: expired=${expiredLoungePassengers.length} waiting=${waitingLoungePassengers.length} ready=${readyLoungePassengers.length} candidates=${candidates.length}`);
   }
 
-  if (candidates.length === 0) return false;
+  if (candidates.length === 0) {
+    ctx.log("transport", `Lounge check: no candidates to load (expired=${expiredLoungePassengers.length} waiting=${passengersLounge.getWaitingPassengers().length} ready=${passengersLounge.getReadyForDeliveryPassengers().length})`);
+    return false;
+  }
 
   // Sort by class restrictiveness: first → business → economy (most restrictive first)
   const classOrder: Record<string, number> = { first: 0, business: 1, economy: 2 };
@@ -1962,8 +1966,8 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     ctx.log("transport", "This is a unique, rare vessel - the Nebula billionaire's flagship.");
     ctx.log("transport", `Only ${currentShipInfo.berths.first} first-class berth(s) available.`);
     ctx.log("transport", "Unarmed luxury yacht built for status, not combat.");
-    ctx.log("transport", "NOTE: This ship cannot carry economy or business passengers.");
-    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=false, allowEconomyClass=false");
+    ctx.log("transport", "NOTE: Economy and business passengers ride up in first-class berths; first-class passengers require first-class berths.");
+    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=true, allowEconomyClass=true (economy/business ride up in first-class berths)");
   }
   
   // Initialize state if none or invalid

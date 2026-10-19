@@ -1963,7 +1963,7 @@ async function tryDeliverExpiredLoungePassenger(
   }
 
   for (const [destId, passengers] of loungeByDest) {
-    const loadResp = await bot.exec("load_passenger", { id: destId, target: "lounge" });
+    const loadResp = await bot.exec("load_passenger", { id: destId });
     if (loadResp.error) {
       ctx.log("error", `load_passenger from lounge failed for ${destId}: ${loadResp.error.message}`);
     } else {

@@ -970,15 +970,6 @@ export async function unloadPassengersToLounge(
  */
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
-
-  // Fuel cells are sourced exclusively from faction storage at the home base.
-  // Away from home the routine returns home to restock (see the fuel-cell
-  // logistics block above); attempting a storage withdraw at any other station
-  // fails with no_faction_storage and floods the error log.
-  if (settings.homeSystem && settings.homeStation && !isAtHomeBase(ctx, settings)) {
-    return;
-  }
-
   await bot.refreshCargo();
   await bot.refreshShip();
 

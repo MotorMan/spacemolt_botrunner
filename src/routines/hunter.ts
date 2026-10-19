@@ -758,7 +758,7 @@ export function getHunterSettings(username?: string): {
     fleetBattleConfirmSeconds: (botOverrides.fleetBattleConfirmSeconds as number) ?? (h.fleetBattleConfirmSeconds as number) ?? 10,
     fleetFightPlayers: (botOverrides.fleetFightPlayers as boolean) ?? (h.fleetFightPlayers as boolean) ?? true,
     fleetUndockToFight: (botOverrides.fleetUndockToFight as boolean) ?? (h.fleetUndockToFight as boolean) ?? true,
-    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (h.boardingEnabled as boolean) ?? (mode === "boarding"),
+    boardingEnabled: (botOverrides.boardingEnabled as boolean) ?? (mode === "boarding"),
     boardingShieldThreshold: (botOverrides.boardingShieldThreshold as number) ?? (h.boardingShieldThreshold as number) ?? 5,
     boardingMarines: (botOverrides.boardingMarines as number) ?? (h.boardingMarines as number) ?? 0,
     boardingPrizeDestination:

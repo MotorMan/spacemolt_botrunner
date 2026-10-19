@@ -1,4 +1,5 @@
 import type { RoutineContext } from "../bot.js";
+import type { BotStatus } from "../bot.js";
 import type { BattleStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
@@ -6,6 +7,7 @@ import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
 import { combatDebugLog } from "../debug.js";
 import { isBoardingClaimedByOther, releaseExpiredBoardingClaims } from "../boardingCooperation.js";
+import { getHunterSettings } from "./hunter.js";
 
 async function waitForBattleUpdate(ctx: RoutineContext, beforeUpdate: number): Promise<void> {
   for (let i = 0; i < 15; i++) {
@@ -68,10 +70,69 @@ export async function waitForServerTick(
 }
 
 /**
+ * Check if any OTHER bot (in this client or a connected client) is running
+ * hunter mode with boarding enabled AND is a participant in the given battle.
+ * Used so non-boarding hunters don't destroy a boarding hunter's prize target.
+ *
+ * Stances are private per the API (battle_update only publishes your own
+ * stance), so we cannot read another player's "board" stance directly.
+ * Instead we detect boarding hunters via their settings: any bot running
+ * hunter mode with `boardingEnabled === true` who is also in this battle
+ * means we should brace to avoid destroying their boarding target.
+ */
+async function anyCrossClientBoardingHunterInBattle(
+  ctx: RoutineContext,
+  status: BattleStatus,
+): Promise<boolean> {
+  const getFleet = ctx.getFleetStatusAsync || ctx.getFleetStatus;
+  if (!getFleet) return false;
+
+  let statuses: BotStatus[];
+  try {
+    if (typeof getFleet === "function") {
+      statuses = await getFleet();
+    } else {
+      statuses = getFleet as unknown as BotStatus[];
+    }
+  } catch {
+    return false;
+  }
+
+  const participantNames = new Set<string>();
+  for (const p of status.participants || []) {
+    if (p.username) participantNames.add(p.username);
+    if (p.player_id) participantNames.add(p.player_id);
+  }
+
+  const self = ctx.bot.username;
+
+  for (const s of statuses) {
+    if (!s.username || s.username === self) continue;
+    if (!participantNames.has(s.username)) continue;
+    if (s.routine !== "hunter") continue;
+
+    try {
+      const settings = getHunterSettings(s.username);
+      if (settings.boardingEnabled === true) {
+        return true;
+      }
+    } catch {
+      // Best effort — skip bots whose settings we can't read
+    }
+  }
+
+  return false;
+}
+
+/**
  * Check if our current target is claimed by another hunter for boarding.
  * If so, and there are other unclaimed enemies, switch to one of them.
  * If there are no other enemies, switch to brace stance to avoid damaging
  * the prize.
+ *
+ * Also checks cross-client bots: if any other bot in this battle is running
+ * hunter mode with boarding enabled, we brace to avoid destroying their
+ * boarding target (stances are private, so we detect via settings).
  *
  * Returns the (possibly new) target and whether we should brace.
  */
@@ -86,6 +147,14 @@ async function cooperateWithBoardingClaim(
   if (!currentTarget) return { target: null, brace: false };
 
   if (!isBoardingClaimedByOther(currentTarget.id, bot.username)) {
+    // No in-process claim on this target. Check cross-client: is any
+    // boarding hunter in this battle? If so, brace to avoid destroying
+    // their prize target (stances are private, detected via settings).
+    if (await anyCrossClientBoardingHunterInBattle(ctx, status)) {
+      ctx.log("combat", `🤝 Boarding cooperation: cross-client boarding hunter in battle with ${currentTarget.name} — switching to brace stance`);
+      await bot.exec("battle", { action: "stance", stance: "brace" });
+      return { target: currentTarget, brace: true };
+    }
     return { target: currentTarget, brace: false };
   }
 

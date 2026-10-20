@@ -1884,6 +1884,30 @@ async function tryDeliverExpiredLoungePassenger(
     ctx.log("transport", `Lounge check: expired=${expiredLoungePassengers.length} waiting=${waitingLoungePassengers.length} ready=${readyLoungePassengers.length} candidates=${candidates.length}`);
   }
 
+  // Lounge passengers live at the faction home base Transit Lounge. Only
+  // attempt to load them when docked there; loading from the wrong station
+  // fails or loads passengers that were never actually present.
+  if (candidates.length > 0 && settings.homeStation &&
+      (!bot.docked || !bot.poi || bot.poi.toLowerCase() !== settings.homeStation.toLowerCase())) {
+    ctx.log("transport", `Lounge check: not docked at home base ${settings.homeStation} - skipping lounge pickup`);
+    return false;
+  }
+
+  // Passengers whose destination is the current station are already where
+  // they want to go; the API refuses to load them (invalid_destination:
+  // "That is your current station."). Mark them delivered so they don't
+  // block future cycles, then remove them from the candidate set.
+  if (candidates.length > 0 && bot.docked && bot.poi) {
+    const currentPoi = bot.poi.toLowerCase();
+    for (const p of candidates) {
+      if (p.destination.toLowerCase() === currentPoi) {
+        passengersLounge.markDelivered(p.citizenId);
+        ctx.log("transport", `Lounge: ${p.name} already at destination ${p.destinationName} - marking delivered`);
+      }
+    }
+    candidates = candidates.filter((p) => p.destination.toLowerCase() !== currentPoi);
+  }
+
   if (candidates.length === 0) {
     ctx.log("transport", `Lounge check: no candidates to load (expired=${expiredLoungePassengers.length} waiting=${passengersLounge.getWaitingPassengers().length} ready=${passengersLounge.getReadyForDeliveryPassengers().length})`);
     return false;

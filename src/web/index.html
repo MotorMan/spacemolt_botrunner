@@ -4031,14 +4031,18 @@
           }, 5000);
         };
 
-        const endHold = () => {
+        const cancelHold = () => {
           if (bulkStartHoldTimer) {
             clearTimeout(bulkStartHoldTimer);
             bulkStartHoldTimer = null;
           }
-          const wasHeld = bulkStartHeld;
           bulkStartHeld = false;
           btn.classList.remove("held");
+        };
+
+        const endHold = () => {
+          const wasHeld = bulkStartHeld;
+          cancelHold();
           if (wasHeld) {
             bulkStartIdleBots(BULK_START_SLOW_DELAY_MS);
           } else {
@@ -4048,10 +4052,10 @@
 
         btn.addEventListener("mousedown", startHold);
         btn.addEventListener("mouseup", endHold);
-        btn.addEventListener("mouseleave", endHold);
+        btn.addEventListener("mouseleave", cancelHold);
         btn.addEventListener("touchstart", startHold, { passive: true });
         btn.addEventListener("touchend", endHold);
-        btn.addEventListener("touchcancel", endHold);
+        btn.addEventListener("touchcancel", cancelHold);
       }
 
       /** Populate the bulk start routine dropdown */

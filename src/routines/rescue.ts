@@ -765,6 +765,67 @@ async function checkForPirateTrap(
   };
 }
 
+async function checkOwnBotMaydayPirateTrap(
+  ctx: RoutineContext,
+  mayday: MaydayRequest,
+  settings: ReturnType<typeof getRescueSettings>,
+): Promise<{ isTrap: boolean; reason: string }> {
+  if (!isOwnBot(mayday.sender)) {
+    return { isTrap: false, reason: "" };
+  }
+
+  const fleet = await getTrackingFleet(ctx);
+  const ourBot = fleet.find(b => b.username === mayday.sender);
+
+  if (!ourBot) {
+    return {
+      isTrap: true,
+      reason: `MAYDAY from our own bot "${mayday.sender}" but they are NOT in our fleet — pirate trap using our bot's name as bait`,
+    };
+  }
+
+  const actualSystem = ourBot.system;
+  const actualPoi = ourBot.poi;
+  const actualDocked = ourBot.docked;
+  const actualFuelPct = ourBot.maxFuel > 0 ? Math.round((ourBot.fuel / ourBot.maxFuel) * 100) : 100;
+
+  ctx.log("mayday", `🔍 Our own bot "${mayday.sender}" live status:`);
+  ctx.log("mayday", `   - System: ${actualSystem} (MAYDAY claims: ${mayday.system})`);
+  ctx.log("mayday", `   - POI: ${actualPoi} (MAYDAY claims: ${mayday.poi})`);
+  ctx.log("mayday", `   - Docked: ${actualDocked}`);
+  ctx.log("mayday", `   - Fuel: ${actualFuelPct}%`);
+
+  if (actualDocked) {
+    return {
+      isTrap: true,
+      reason: `Our bot "${mayday.sender}" is DOCKED at ${actualSystem}/${actualPoi} — MAYDAY claims ${mayday.system}/${mayday.poi}. PIRATE TRAP using our bot's name as bait`,
+    };
+  }
+
+  if (actualFuelPct > 50) {
+    return {
+      isTrap: true,
+      reason: `Our bot "${mayday.sender}" has ${actualFuelPct}% fuel (not stranded) — MAYDAY claims ${mayday.system}/${mayday.poi}. PIRATE TRAP using our bot's name as bait`,
+    };
+  }
+
+  if (actualSystem && normalizeSystemName(actualSystem) !== normalizeSystemName(mayday.system)) {
+    return {
+      isTrap: true,
+      reason: `Our bot "${mayday.sender}" is actually in ${actualSystem}, but MAYDAY claims ${mayday.system} — PIRATE TRAP using our bot's name as bait`,
+    };
+  }
+
+  if (actualPoi && mayday.poi && normalizeSystemName(actualPoi) !== normalizeSystemName(mayday.poi)) {
+    return {
+      isTrap: true,
+      reason: `Our bot "${mayday.sender}" is at ${actualPoi} in ${actualSystem}, but MAYDAY claims ${mayday.poi} — PIRATE TRAP using our bot's name as bait`,
+    };
+  }
+
+  return { isTrap: false, reason: "" };
+}
+
 /**
  * Check proximity to pirate strongholds using BFS.
  * This provides early warning when operating near pirate bases.
@@ -5043,6 +5104,58 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       recordRescueRequest(nextMayday.sender);
 
       mayday = nextMayday;
+
+      // ── PIRATE TRAP CHECK ──
+      const trapCheck = await checkOwnBotMaydayPirateTrap(ctx, mayday, settings);
+      if (trapCheck.isTrap) {
+        ctx.log("mayday", `🚨 PIRATE TRAP DETECTED: ${trapCheck.reason}`);
+
+        // Notify our own bot that their name was used as bait
+        if (!settings.disablePrivateMessages && aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+          try {
+            await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+              situation: `YOUR NAME WAS JUST USED AS BAIT FOR A PIRATE TRAP. Someone sent a MAYDAY distress call using your name "${mayday.sender}", claiming you are stranded at ${mayday.system}/${mayday.poi}. But our live fleet data shows you are at a different location — this is a pirate false-flag operation to lure rescuers into an ambush. Do NOT go to that location. Stay safe!`,
+              currentSystem: bot.system,
+              targetSystem: mayday.system,
+              phase: "trap_detected",
+              jumps: undefined,
+              playerFuelPct: undefined,
+              fuelRefueled: undefined,
+            });
+            ctx.log("mayday", `📧 Sent pirate trap warning to ${mayday.sender}`);
+          } catch (e) {
+            ctx.log("warn", `Failed to send pirate trap warning to ${mayday.sender}: ${e}`);
+          }
+        } else {
+          ctx.log("mayday", `🔇 Private message disabled - skipping trap warning to ${mayday.sender}`);
+        }
+
+        markMaydayHandled(mayday);
+
+        // Cancel movement — do NOT go to the pirate trap. Return home instead.
+        yield "return_home";
+        ctx.log("mayday", `🏠 Aborting rescue and returning to home base instead of responding to pirate trap MAYDAY from ${mayday.sender}`);
+
+        const atHomeSystem = homeSystem && normalizeSystemName(bot.system) === normalizeSystemName(homeSystem);
+        if (!atHomeSystem && homeSystem) {
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklist };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem} after pirate trap detection`);
+          } else {
+            await bot.refreshLocation();
+            ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+          }
+        } else {
+          ctx.log("mayday", `At home system ${homeSystem} - going to home station...`);
+          await ensureUndocked(ctx);
+        }
+
+        await travelToHomeStationOrDockAnywhere(ctx, settings, homeSystem, homeStation, battleState);
+        await ctx.sleep(5000);
+        continue;
+      }
 
     }
 

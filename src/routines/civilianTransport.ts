@@ -603,6 +603,7 @@ interface TransportState {
   lastUpdated: string;
   routeRebuildAttempts: number;
   roundsWithoutPassengers: number;
+  awayPickupAttempts: number;
   needsTravel: boolean;
   recentlyVisitedStations: string[];
 }
@@ -670,6 +671,7 @@ type CivilianTransportMode = "normal" | "lounge_transport" | "achievement";
 interface CivilianTransportSettings {
   maxJumps: number;
   roundsBeforeMoving: number;
+  maxAwayPickupAttempts: number;
   refuelThreshold: number;
   repairThreshold: number;
   homeSystem: string;
@@ -704,6 +706,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
   return {
     maxJumps: Number((t.maxJumps as number) ?? 5),
     roundsBeforeMoving: Number((t.roundsBeforeMoving as number) ?? 5),
+    maxAwayPickupAttempts: Number((t.maxAwayPickupAttempts as number) ?? 3),
     refuelThreshold: Number((t.refuelThreshold as number) ?? 50),
     repairThreshold: Number((t.repairThreshold as number) ?? 40),
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
@@ -1828,6 +1831,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     lastUpdated: new Date().toISOString(),
     routeRebuildAttempts: 0,
     roundsWithoutPassengers: 0,
+    awayPickupAttempts: 0,
     needsTravel: false,
     recentlyVisitedStations: [],
   };
@@ -2375,6 +2379,7 @@ if (state && state.status !== "idle") {
           state.pickupStation = settings.homeStation || null;
           state.pickupSystem = settings.homeSystem || null;
           state.roundsWithoutPassengers = 0;
+          state.awayPickupAttempts = 0;
           saveTransportState(state);
           idleStartTime = 0;
           await ctx.sleep(5000);
@@ -2451,35 +2456,50 @@ if (state && state.status !== "idle") {
             continue;
           } else {
             state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+            const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+            if (isAwayFromHome) {
+              state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+            }
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
               if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
                 ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-                const nextPickup = await selectNextPickupStation(ctx, state, settings);
-                if (!nextPickup) {
-                  // No next pickup available - try to return home
-                  if (settings.homeSystem) {
-                    ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-                    state.pickupStation = settings.homeStation || null;
-                    state.pickupSystem = settings.homeSystem || null;
-                    state.roundsWithoutPassengers = 0;
-                  } else {
-                    await ctx.sleep(60000);
-                    continue;
-                  }
+                if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+                  ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
+                  state.pickupStation = settings.homeStation || null;
+                  state.pickupSystem = settings.homeSystem || null;
+                  state.roundsWithoutPassengers = 0;
+                  state.awayPickupAttempts = 0;
                 } else {
-                  const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-                  if (isSameStation) {
-                    ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                  const nextPickup = await selectNextPickupStation(ctx, state, settings);
+                  if (!nextPickup) {
+                    // No next pickup available - try to return home
+                    if (settings.homeSystem) {
+                      ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+                      state.pickupStation = settings.homeStation || null;
+                      state.pickupSystem = settings.homeSystem || null;
+                      state.roundsWithoutPassengers = 0;
+                      state.awayPickupAttempts = 0;
+                    } else {
+                      await ctx.sleep(60000);
+                      continue;
+                    }
+                  } else {
+                    const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+                    if (isSameStation) {
+                      ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
+                      state.roundsWithoutPassengers = 0;
+                      state.awayPickupAttempts = 0;
+                      state.pickupStation = nextPickup.poi;
+                      state.pickupSystem = nextPickup.system;
+                      await ctx.sleep(5000);
+                      continue;
+                    }
                     state.roundsWithoutPassengers = 0;
+                    state.awayPickupAttempts = 0;
                     state.pickupStation = nextPickup.poi;
                     state.pickupSystem = nextPickup.system;
-                    await ctx.sleep(5000);
-                    continue;
+                    state.needsTravel = true;
                   }
-                  state.roundsWithoutPassengers = 0;
-                  state.pickupStation = nextPickup.poi;
-                  state.pickupSystem = nextPickup.system;
-                  state.needsTravel = true;
                 }
               } else {
                 await ctx.sleep(60000);
@@ -2699,6 +2719,20 @@ if (state && state.status !== "idle") {
       if (waiting.length > 0 && filteredDrafts.length === 0) {
         ctx.log("transport", `All ${waiting.length} passengers have destinations at current station. Moving to next station.`);
         state.roundsWithoutPassengers = 0;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
+        if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+          ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached — returning home to check lounge`);
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+          state.awayPickupAttempts = 0;
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(5000);
+          continue;
+        }
         const nextPickup = await selectNextPickupStation(ctx, state, settings);
         if (nextPickup) {
           const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
@@ -2979,31 +3013,46 @@ if (state && state.status !== "idle") {
 
       if (aboard.length === 0) {
         state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
         ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-          const nextPickup = await selectNextPickupStation(ctx, state, settings);
-          if (nextPickup) {
-            const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-            if (!isSameStation) {
-              state.pickupStation = nextPickup.poi;
-              state.pickupSystem = nextPickup.system;
-              state.roundsWithoutPassengers = 0;
-              state.needsTravel = true;
-              state.status = "idle";
-              saveTransportState(state);
-              await ctx.sleep(5000);
-              continue;
-            }
-            ctx.log("transport", `Next pickup is same station, resetting counter`);
-            state.roundsWithoutPassengers = 0;
-            state.pickupStation = nextPickup.poi;
-            state.pickupSystem = nextPickup.system;
-          } else if (settings.homeSystem) {
-            ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+            ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
+          } else {
+            const nextPickup = await selectNextPickupStation(ctx, state, settings);
+            if (nextPickup) {
+              const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+              if (!isSameStation) {
+                state.pickupStation = nextPickup.poi;
+                state.pickupSystem = nextPickup.system;
+                state.roundsWithoutPassengers = 0;
+                state.awayPickupAttempts = 0;
+                state.needsTravel = true;
+                state.status = "idle";
+                saveTransportState(state);
+                await ctx.sleep(5000);
+                continue;
+              }
+              ctx.log("transport", `Next pickup is same station, resetting counter`);
+              state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
+              state.pickupStation = nextPickup.poi;
+              state.pickupSystem = nextPickup.system;
+            } else if (settings.homeSystem) {
+              ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+              state.pickupStation = settings.homeStation || null;
+              state.pickupSystem = settings.homeSystem || null;
+              state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
+            }
           }
         }
         state.status = "idle";
@@ -3066,15 +3115,33 @@ if (state && state.status !== "idle") {
           continue;
         }
         state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+        if (isAwayFromHome) {
+          state.awayPickupAttempts = (state.awayPickupAttempts || 0) + 1;
+        }
         ctx.log("transport", `No route planned for passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
           ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+          if (isAwayFromHome && state.awayPickupAttempts >= settings.maxAwayPickupAttempts) {
+            ctx.log("transport", `Max away pickup attempts (${settings.maxAwayPickupAttempts}) reached without passengers — returning home to check lounge`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
+            state.onboardPassengers = [];
+            state.route = [];
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
           const nextPickup = await selectNextPickupStation(ctx, state, settings);
           if (nextPickup) {
             const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
             if (isSameStation) {
               ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
               state.roundsWithoutPassengers = 0;
+              state.awayPickupAttempts = 0;
               state.pickupStation = nextPickup.poi;
               state.pickupSystem = nextPickup.system;
               state.onboardPassengers = [];
@@ -3087,6 +3154,7 @@ if (state && state.status !== "idle") {
             state.pickupStation = nextPickup.poi;
             state.pickupSystem = nextPickup.system;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
             state.onboardPassengers = [];
             state.route = [];
             state.status = "idle";
@@ -3099,6 +3167,7 @@ if (state && state.status !== "idle") {
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
             state.roundsWithoutPassengers = 0;
+            state.awayPickupAttempts = 0;
             state.onboardPassengers = [];
             state.route = [];
             state.status = "idle";
@@ -3176,6 +3245,7 @@ if (state && state.status !== "idle") {
       state.status = onboard.length > 0 ? "in_transit" : "idle";
       state.routeRebuildAttempts = 0;
       state.roundsWithoutPassengers = 0;
+      state.awayPickupAttempts = 0;
       const listParsed = listResp.result ? parseListPassengers(listResp.result) : null;
       state.berths = listParsed && (listParsed.berths.economy + listParsed.berths.business + listParsed.berths.first) > 0
         ? listParsed.berths

@@ -36949,6 +36949,7 @@ ignoreBlacklist: document.getElementById(
         const repairThreshold = ct.repairThreshold ?? 40;
         const maxJumps = Number(ct.maxJumps ?? 5);
         const roundsBeforeMoving = Number(ct.roundsBeforeMoving ?? 5);
+        const maxAwayPickupAttempts = Number(ct.maxAwayPickupAttempts ?? 3);
 
         const general = settings.general || {};
         const homeSystem = ct.homeSystem || general.homeSystem || "";
@@ -36997,6 +36998,14 @@ ignoreBlacklist: document.getElementById(
         <div class="setting-hint">Number of rounds with no passengers before the bot moves to the next closest station.</div>
       </div>
       <input type="number" id="set-civilian_transport-roundsBeforeMoving" min="1" max="50" value="${esc(String(roundsBeforeMoving))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max away pickup attempts</div>
+        <div class="setting-hint">Max failed pickup attempts away from home before returning to check the faction lounge (achievement mode).</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxAwayPickupAttempts" min="1" max="20" value="${esc(String(maxAwayPickupAttempts))}">
     </div>
 
     <div class="setting-row">
@@ -37168,6 +37177,10 @@ ignoreBlacklist: document.getElementById(
           document.getElementById("set-civilian_transport-roundsBeforeMoving")
             ?.value || 5,
         );
+        const maxAwayPickupAttempts = Number(
+          document.getElementById("set-civilian_transport-maxAwayPickupAttempts")
+            ?.value || 3,
+        );
         const refuelThreshold = Number(
           document.getElementById("set-civilian_transport-refuelThreshold")
             ?.value || 50,
@@ -37255,6 +37268,7 @@ ignoreBlacklist: document.getElementById(
 
         s.maxJumps = maxJumps;
         s.roundsBeforeMoving = roundsBeforeMoving;
+        s.maxAwayPickupAttempts = maxAwayPickupAttempts;
         s.refuelThreshold = refuelThreshold;
         s.repairThreshold = repairThreshold;
         s.maxPassengers = maxPassengers;

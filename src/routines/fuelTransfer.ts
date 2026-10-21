@@ -1080,6 +1080,7 @@ async function deliverBatchToStation(
     }
     plan.qty = adjustedQty;
     
+    await bot.refreshStorage();
     const personalAvailable = (bot.storage.find((i) => i.itemId === plan.itemId)?.quantity || 0);
     if (personalAvailable > 0) {
       const personalCap = Math.min(plan.qty, personalAvailable);

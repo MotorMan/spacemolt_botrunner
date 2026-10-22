@@ -3694,7 +3694,29 @@ if (state && state.status !== "idle") {
         ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
-        ctx.log("transport", `Traveling to poi ${waypoint.poi}`);
+        // Refuel tank from cargo fuel cells before traveling. Cargo cells are
+        // not usable by `travel` until burned into the tank via `refuel`.
+        // Without this the bot sits with 3900 fuel in cargo and 0 in tank,
+        // failing every travel attempt with "Insufficient fuel for travel".
+        if (!bot.docked) {
+          const dockResp = await bot.exec("dock");
+          if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
+            ctx.log("error", `Dock failed before travel: ${dockResp.error.message}`);
+            await ctx.sleep(30000);
+            continue;
+          }
+          bot.docked = true;
+          await bot.refreshStatus();
+        }
+        await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+        await bot.refreshShip();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+        if (fuelPct <= 0) {
+          ctx.log("error", `No fuel in tank and could not refuel from cargo at ${bot.poi} — cannot travel to ${waypoint.poi}`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        ctx.log("transport", `Traveling to poi ${waypoint.poi} (fuel: ${fuelPct}%)`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
         if (tr.error) {
           const errMsg = tr.error.message || "";

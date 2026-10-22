@@ -8356,7 +8356,7 @@ async function maybeFleeStationAfterBoarding(
   if (!status) return;
 
   const nonStationEnemies = status.participants.filter(p => {
-    if (p.side_id === status.your_side_id) return false;
+    if (p.side_id === status.your_side_id || p.is_destroyed) return false;
     const shipClass = (p.ship_class || "").toLowerCase();
     const kind = (p as any).kind || "";
     return shipClass !== "station" && kind.toLowerCase() !== "station";

@@ -4393,14 +4393,13 @@ if (travelSucceeded) {
       recordRoundRobinComplete(target.system, bot.username);
       ctx.log("coop", `📝 Recorded round-robin completion for ${target.system} by ${bot.username}`);
 
-      // Also mark the queue entry as completed if this was our own bot
-      if (isOwnBot(target.username)) {
-        const queue = getRescueQueue();
-        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
-        if (queuedRescue) {
-          markRescueCompleted(queuedRescue.id);
-          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
-        }
+      // Mark the queue entry as completed so the rescue is removed from the pending queue.
+      const queue = getRescueQueue();
+      const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+      if (queuedRescue) {
+        markRescueCompleted(queuedRescue.id);
+        releaseRescueClaim(queuedRescue.id, bot.username);
+        ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
       }
     }
 
@@ -5565,15 +5564,13 @@ if (refuelResp.error) {
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       await completeRescueSession(bot.username);
 
-      // Also mark the queue entry as completed if this was our own bot
-      if (isOwnBot(mayday.sender)) {
-        const queue = getRescueQueue();
-        const queuedRescue = queue.pending.find(r => r.targetUsername === mayday.sender);
-        if (queuedRescue) {
-          markRescueCompleted(queuedRescue.id);
-          releaseRescueClaim(queuedRescue.id, bot.username); // Release claim when completed
-          ctx.log("rescue", `📋 Marked ${mayday.sender} as completed in rescue queue`);
-        }
+      // Mark the queue entry as completed so the rescue is removed from the pending queue.
+      const queue = getRescueQueue();
+      const queuedRescue = queue.pending.find(r => r.targetUsername === mayday.sender);
+      if (queuedRescue) {
+        markRescueCompleted(queuedRescue.id);
+        releaseRescueClaim(queuedRescue.id, bot.username);
+        ctx.log("rescue", `📋 Marked ${mayday.sender} as completed in rescue queue`);
       }
     }
 
@@ -8595,15 +8592,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       await completeRescueSession(bot.username);
 
-      // Also mark the queue entry as completed if this was our own bot
-      if (isOwnBot(target.username)) {
-        const queue = getRescueQueue();
-        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
-        if (queuedRescue) {
-          markRescueCompleted(queuedRescue.id);
-          releaseRescueClaim(queuedRescue.id, bot.username); // Release claim when completed
-          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
-        }
+      // Mark the queue entry as completed so the rescue is removed from the pending queue.
+      const queue = getRescueQueue();
+      const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+      if (queuedRescue) {
+        markRescueCompleted(queuedRescue.id);
+        releaseRescueClaim(queuedRescue.id, bot.username);
+        ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
       }
 
       // Put the target on a completion cooldown so the next fleet scan (which may

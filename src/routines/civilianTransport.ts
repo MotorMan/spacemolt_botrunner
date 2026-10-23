@@ -3616,6 +3616,12 @@ if (state && state.status !== "idle") {
     }
 
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {
+      if (bot.shouldStopAfterCycle()) {
+        bot.clearStopAfterCycle();
+        bot.initiateStop();
+        await ctx.sleep(5000);
+        return;
+      }
       if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
         if (state.onboardPassengers.length > 0) {
           ctx.log("transport", `Route empty but ${state.onboardPassengers.length} passengers onboard, rebuilding route`);
@@ -3701,15 +3707,18 @@ if (state && state.status !== "idle") {
         if (!bot.docked) {
           const dockResp = await bot.exec("dock");
           if (dockResp.error && !dockResp.error.message.toLowerCase().includes("already")) {
-            ctx.log("error", `Dock failed before travel: ${dockResp.error.message}`);
-            await ctx.sleep(30000);
-            continue;
+            ctx.log("error", `Dock failed before travel: ${dockResp.error.message} — skipping pre-travel refuel at non-station POI`);
+            // Cannot dock here (e.g. current POI is not a station). Skip refuel and attempt travel directly instead of looping.
+          } else {
+            bot.docked = true;
+            await bot.refreshStatus();
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+            await bot.refreshShip();
           }
-          bot.docked = true;
-          await bot.refreshStatus();
+        } else {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
         }
-        await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
-        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
         if (fuelPct <= 0) {
           ctx.log("error", `No fuel in tank and could not refuel from cargo at ${bot.poi} — cannot travel to ${waypoint.poi}`);

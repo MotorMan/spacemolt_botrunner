@@ -1366,6 +1366,7 @@ async function findFactionSellRoutes(
           tradeType: "sell",
           requesterSystemId: currentSystem,
           stationPoiId: resolved.baseId,
+          systemId: resolved.systemId,
         });
         if (stationResp.ok && stationResp.results.length > 0) {
           const match = stationResp.results.find(r => r.quantity > 0);
@@ -3390,6 +3391,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 requesterSystemId: bot.system,
                 stationPoiId: route!.destBaseId || route!.destPoi || route!.destOriginalPoi,
                 baseStationId: route!.destBaseId || route!.destPoi || route!.destOriginalPoi,
+                systemId: route!.destSystem,
               });
               let destBuyer: { quantity: number; price: number } | undefined;
               if (marketResp.ok && marketResp.results.length > 0) {

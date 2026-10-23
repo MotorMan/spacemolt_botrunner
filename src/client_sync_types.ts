@@ -202,6 +202,12 @@ export interface MarketQueryRequest {
    *  global top-10 limit so the caller can inspect the full book for one
    *  station regardless of how it ranks globally). */
   stationPoiId?: string;
+  /** If set, return only results for this exact system id. Required together
+   *  with stationPoiId when verifying a price at a specific station, because
+   *  the same POI id (e.g. a mobile station alias like frontier_station) can
+   *  exist in multiple systems and stale data from another location must not
+   *  hijack route planning. */
+  systemId?: string;
   /** Stable base id of the station, if known. Used as a cross-system fallback:
    *  when the direct system+poi query returns nothing (e.g. a mobile station
    *  that just jumped), the query rescans all systems for entries whose

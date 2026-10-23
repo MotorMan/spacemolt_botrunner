@@ -478,7 +478,7 @@ async function estimateSystemDistance(fromSystem: string, toSystem: string): Pro
  * `source` marker on the result.
  */
 export async function queryLocalMarket(query: MarketQueryRequest): Promise<MarketQueryResult> {
-  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, baseStationId } = query;
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, baseStationId, systemId } = query;
   if (!itemId) {
     return { ok: false, results: [], error: "itemId required", source: "local" };
   }
@@ -504,7 +504,7 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
   }
 
   // Direct path: build results from the merged station map.
-  let filteredResults = await buildMarketResults(byStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId });
+  let filteredResults = await buildMarketResults(byStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId, systemId });
 
   // Cross-system fallback: when the direct path returned nothing and the caller
   // supplied a stable base id (e.g. a mobile station whose resolved poi_id
@@ -525,7 +525,7 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
       }
     }
     if (baseByStation.size > 0) {
-      filteredResults = await buildMarketResults(baseByStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId: baseStationId });
+      filteredResults = await buildMarketResults(baseByStation, { itemId, maxPrice, minQuantity, requesterSystemId, tradeType, stationPoiId: baseStationId, systemId });
     }
   }
 
@@ -541,12 +541,13 @@ export async function queryLocalMarket(query: MarketQueryRequest): Promise<Marke
 
 async function buildMarketResults(
   byStation: Map<string, LocalMarketItem>,
-  opts: { itemId: string; maxPrice?: number; minQuantity?: number; requesterSystemId?: string; tradeType?: "buy" | "sell"; stationPoiId?: string },
+  opts: { itemId: string; maxPrice?: number; minQuantity?: number; requesterSystemId?: string; tradeType?: "buy" | "sell"; stationPoiId?: string; systemId?: string },
 ): Promise<MarketQueryResponse[]> {
-  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId } = opts;
+  const { itemId, maxPrice, minQuantity = 0, requesterSystemId, tradeType = "buy", stationPoiId, systemId } = opts;
   const comparator = tradeType === "sell" ? (p: number) => p >= (maxPrice as number) : (p: number) => p <= (maxPrice as number);
   const results: MarketQueryResponse[] = [];
   for (const item of byStation.values()) {
+    if (systemId && item.systemId !== systemId) continue;
     const orders = tradeType === "sell" ? item.buyOrders : item.sellOrders;
     if (!orders || orders.length === 0) continue;
     let filtered = orders.filter((o) => o.quantity >= minQuantity);

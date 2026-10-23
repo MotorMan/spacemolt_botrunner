@@ -1081,6 +1081,14 @@ export class StationWebServer {
   /** Our own facility reads, keyed by "system|poi". These include `station_facilities`. */
   private facilityReads = new Map<string, { facilities: FacilityRec[]; at: number }>();
 
+  /** Per-station freshness trackers so we don't re-read faction storage more
+   *  often than the configured supply refresh interval. Keyed by system|poi. */
+  private factionStockFresh = new Map<string, {
+    at: number | null;
+    stock: Map<string, number>;
+    names: Map<string, string>;
+  }>();
+
   private static readonly ACTIVE_FACILITY_STATUSES = new Set([
     "active",
     "online",
@@ -1177,9 +1185,13 @@ export class StationWebServer {
   }
 
   /**
-   * Stock held in THIS station's faction storage. Uses the confirmed station POI
-   * from the get_base response (passed as stationPoiId) so we never pick up a
-   * cache entry for a different station, even if the bot's internal poi lags.
+   * Stock held in THIS station's faction storage. Faction storage is per-station,
+   * so we query it through the specific bot docked at THAT station and use what
+   * that bot just returned — never a shared cache keyed under a different station
+   * identifier (the old code wrote to `faction::<bare hex poi>` but read back
+   * under `faction::<system>|<poi>`, so it either picked up another station's
+   * stale stock or nothing at all), and never the degraded-read guard that keeps
+   * phantom stock from a previous read.
    */
   private async readFactionStock(
     botInstance: Bot,
@@ -1188,8 +1200,7 @@ export class StationWebServer {
     ttlMs: number,
     stationPoiId: string,
   ): Promise<SupplyStock> {
-    const faction = botInstance.faction || "unknown";
-    const dockedKey = `${botInstance.system}|${stationPoiId}`;
+    const stationKey = `${botInstance.system}|${stationPoiId}`;
 
     const toStock = (
       entries: { itemId: string; quantity: number; name?: string }[],
@@ -1204,31 +1215,33 @@ export class StationWebServer {
       return { stock, names };
     };
 
-    let best: { at: number; entries: { itemId: string; quantity: number; name?: string }[] } | null =
-      null;
-    const cached = getFactionStorageCache(faction, dockedKey);
+    // Honor the supply refresh TTL from a local, correctly-keyed tracker so we
+    // don't hammer the game server on every sweep.
+    const fresh = this.factionStockFresh.get(stationKey);
+    if (fresh && fresh.at != null && Date.now() - fresh.at <= ttlMs) {
+      return { stock: fresh.stock, names: fresh.names, at: fresh.at, source: "cache" };
+    }
+
+    // Live read of exactly this station through this bot. bot.factionStorage is
+    // authoritative for stationPoiId right after this call returns.
+    const startedAt = Date.now();
+    try {
+      await botInstance.refreshFactionStorage(true, stationPoiId, false);
+      const got = toStock(botInstance.factionStorage);
+      const result: SupplyStock = { stock: got.stock, names: got.names, at: startedAt, source: "live" };
+      this.factionStockFresh.set(stationKey, result);
+      return result;
+    } catch {
+      // fall through to whatever we have
+    }
+
+    // Last resort: the shared cache (may have been filled by other routines
+    // keyed the same way), then nothing.
+    const cached = getFactionStorageCache(botInstance.faction || "unknown", stationKey);
     if (cached?.entries) {
-      best = { at: cached.lastUpdated || 0, entries: cached.entries };
+      const got = toStock(cached.entries);
+      return { stock: got.stock, names: got.names, at: cached.lastUpdated || null, source: "cache" };
     }
-
-    const fresh = !!best && Date.now() - best.at <= ttlMs;
-    if (!fresh && docked) {
-      // Read the faction storage of the confirmed station and refill the
-      // shared cache. Pass the station POI explicitly so the bot reads the
-      // correct station even if its internal poi lags.
-      const startedAt = Date.now();
-      try {
-        await botInstance.refreshFactionStorage(true, stationPoiId, false);
-        const after = getFactionStorageCache(faction, dockedKey);
-        if (after && (after.lastUpdated || 0) >= startedAt) {
-          return { ...toStock(after.entries || []), at: after.lastUpdated, source: "live" };
-        }
-      } catch {
-        // fall through to whatever cache we have
-      }
-    }
-
-    if (best) return { ...toStock(best.entries), at: best.at, source: "cache" };
     return { stock: new Map(), names: new Map(), at: null, source: "none" };
   }
 

@@ -1029,6 +1029,11 @@ async function deliverBatchToStation(
 
   await tryRefuel(ctx, { skipApprovedCheck: true });
 
+  // Ensure any cargo carried back from a previous trip is cleared before
+  // loading new items, so a full hold never blocks a fresh delivery.
+  await depositCargoAtHome(ctx, bot, homeStation);
+  await bot.refreshCargo();
+
   const loadPlan: FtLoadPlanItem[] = [];
   let plannedUsage = 0;
   

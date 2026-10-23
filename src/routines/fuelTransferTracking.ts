@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
 import { safeWriteFileSync } from "../diskSpaceGuard.js";
+import { getFactionStorageCache, updateFactionStorageCache } from "../factionStorageCache.js";
 
 const DATA_DIR = join(process.cwd(), "data");
 const TRACKING_FILE = join(DATA_DIR, "fuelTransfer.json");
@@ -140,34 +141,49 @@ export function updateFactionStorageFromDeposit(
   itemName?: string
 ): void {
   try {
-    const record = loadFactionStorageRecord(station);
+    let record = loadFactionStorageRecord(station);
     const now = Date.now();
     
     if (!record) {
-      const newRecord: FactionStorageRecord = {
+      record = {
         factionName,
         station,
         lastUpdated: now,
         entries: [{ itemId, quantity: depositedQty, name: itemName }],
       };
-      const sanitized = station.replace(/::/g, "--").replace(/[^a-zA-Z0-9\-_]/g, "_");
-      if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
-      const payload = JSON.stringify(newRecord, null, 2);
-      safeWriteFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), payload, Buffer.byteLength(payload, "utf-8"));
-      return;
-    }
-    
-    const existingEntry = record.entries.find(e => e.itemId === itemId);
-    if (existingEntry) {
-      existingEntry.quantity += depositedQty;
     } else {
-      record.entries.push({ itemId, quantity: depositedQty, name: itemName });
+      const existingEntry = record.entries.find(e => e.itemId === itemId);
+      if (existingEntry) {
+        existingEntry.quantity += depositedQty;
+      } else {
+        record.entries.push({ itemId, quantity: depositedQty, name: itemName });
+      }
     }
     record.lastUpdated = now;
     
     const sanitized = station.replace(/::/g, "--").replace(/[^a-zA-Z0-9\-_]/g, "_");
+    if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
     const payload = JSON.stringify(record, null, 2);
     safeWriteFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), payload, Buffer.byteLength(payload, "utf-8"));
+
+    // Keep the factionStorageCache in sync so subsequent station-qty reads
+    // (getRemoteFactionAllItemsRateLimited / getItemStatus) see this deposit
+    // instead of a stale cache that still reports ~0 at the station. Without
+    // this the FT routine re-deposits endlessly and the loadout progress
+    // counter runs past its target.
+    try {
+      const cached = getFactionStorageCache(factionName, station);
+      if (cached) {
+        const hasItem = cached.entries.some(e => e.itemId === itemId);
+        const entries = cached.entries.map(e =>
+          e.itemId === itemId ? { ...e, quantity: e.quantity + depositedQty } : e
+        );
+        const finalEntries = hasItem ? entries : [...entries, { itemId, quantity: depositedQty, name: itemName }];
+        updateFactionStorageCache(factionName, finalEntries, station);
+      }
+    } catch (cacheErr) {
+      console.warn(`Error syncing faction storage cache for ${station}:`, cacheErr);
+    }
   } catch (err) {
     console.warn(`Error updating faction storage for ${station}:`, err);
   }

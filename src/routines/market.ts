@@ -426,6 +426,13 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
   let wasConnected = bot.isConnected();
   const placedOrders = new Map<string, { price: number; quantity: number }>();
 
+  /** Track the last known system for each mobile station POI id so that when
+   *  a mobile station (e.g. Mobile Capital / frontier_station) jumps to a new
+   *  system we can clear its stale market entries from the old system. Without
+   *  this, marketDetails.json accumulates entries for systems the station no
+   *  longer occupies, and traders plan routes against ghost buy orders. */
+  const mobileStationLastSystem = new Map<string, string>();
+
   // Observation subscription: collect the player/pirate/empire-NPC data this bot
   // sees at every station via the live observation feed. The feed is pushed into
   // the shared player tracker (playerNameStore) by bot.ts's
@@ -608,6 +615,18 @@ export const marketRoutine: Routine = async function* (ctx: RoutineContext) {
           const stationKey = isMobileCapital ? "frontier_station" : bot.poi;
 
           if (isMobileCapital) {
+            // If this mobile station jumped to a new system, clear its stale
+            // entries from the previous system so traders don't plan against
+            // ghost buy orders (e.g. a 118800cr buy order left behind in
+            // distant_light after Mobile Capital moved to altais).
+            const prevSystem = mobileStationLastSystem.get(bot.poi);
+            if (prevSystem && prevSystem !== bot.system) {
+              for (const id of ["frontier_station", "mobile_capital", "mobile_capitol"]) {
+                marketDetailsStore.clearStation(prevSystem, id);
+              }
+              ctx.log("info", `Mobile station ${bot.poi} moved ${prevSystem} → ${bot.system}; cleared stale market entries in ${prevSystem}`);
+            }
+            mobileStationLastSystem.set(bot.poi, bot.system);
             marketDetailsStore.clearStation(bot.system, "frontier_station");
             marketDetailsStore.clearStation(bot.system, "mobile_capital");
             marketDetailsStore.clearStation(bot.system, "mobile_capitol");

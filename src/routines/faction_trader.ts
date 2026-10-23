@@ -2309,13 +2309,48 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // Walk the buyers in price order instead of giving up on the item as
           // soon as the single best buyer turns out to be blacklisted/unknown.
           // Capped so a run of rejects can't spam the log with red errors.
+          // Each candidate is verified against the LIVE market at its resolved
+          // station before we commit to it — stale marketDetails.json entries
+          // (e.g. a mobile station that moved systems) must never create a route.
           let bestBuyer: typeof buyers[0] | undefined;
+          let verifiedPrice = 0;
+          let verifiedQty = 0;
           for (const b of buyers.slice(0, 10)) {
             const resolved = await resolveMobileStation(ctx, b.poiId, b.systemId, b.poiName);
-            if (resolved && isValidDestination(ctx, resolved.systemId, resolved.poiId)) {
-              bestBuyer = { ...b, systemId: resolved.systemId, poiId: resolved.poiId, poiName: resolved.poiName };
-              break;
+            if (!resolved || !isValidDestination(ctx, resolved.systemId, resolved.poiId)) {
+              continue;
             }
+
+            // Verify the live price at this exact system+station before trusting it.
+            // Stale cross-system entries (mobile station moved) are rejected here.
+            const stationResp = await queryLocalMarket({
+              itemId: item.itemId,
+              tradeType: "sell",
+              requesterSystemId: bot.system,
+              stationPoiId: resolved.baseId || resolved.poiId,
+              systemId: resolved.systemId,
+            });
+            let liveMatch: { price: number; quantity: number } | undefined;
+            if (stationResp.ok && stationResp.results.length > 0) {
+              const match = stationResp.results.find(r => r.quantity > 0);
+              if (match) {
+                liveMatch = { price: match.price, quantity: match.quantity };
+              }
+            }
+            if (!liveMatch) {
+              ctx.log("trade", `No live buy order for ${item.name} at ${resolved.poiName} (${resolved.systemId}) — stale market data, skipping`);
+              continue;
+            }
+
+            if (liveMatch.price < (itemMinSellPrice || 0)) {
+              ctx.log("trade", `Live price ${liveMatch.price}cr below floor ${itemMinSellPrice}cr for ${item.name} at ${resolved.poiName} — skipping`);
+              continue;
+            }
+
+            bestBuyer = { ...b, systemId: resolved.systemId, poiId: resolved.poiId, poiName: resolved.poiName };
+            verifiedPrice = liveMatch.price;
+            verifiedQty = liveMatch.quantity;
+            break;
           }
           if (!bestBuyer) {
             ctx.log("trade", `No valid destination among the top ${Math.min(buyers.length, 10)} of ${buyers.length} buyer(s) for ${item.quantity}x ${item.name} in cargo`);
@@ -2326,9 +2361,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
           const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
           const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
-          const qty = Math.min(item.quantity, bestBuyer.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+          const qty = Math.min(item.quantity, bestBuyer.quantity, verifiedQty, maxItemsForCargo(cargoCapacity, item.itemId));
 
-          const totalRevenue = qty * bestBuyer.price;
+          const totalRevenue = qty * verifiedPrice;
           const costPerUnit = roundTripJumps > 0 ? roundTripFuel / qty : 0;
           const totalProfit = totalRevenue - costPerUnit;
 
@@ -2341,7 +2376,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             destOriginalPoi: bestBuyer.poiId,
             destBaseId: bestBuyer.poiId,
             destPoiName: bestBuyer.poiName,
-            sellPrice: bestBuyer.price,
+            sellPrice: verifiedPrice,
             sellQty: qty,
             jumps: toDest.jumps,
             roundTripJumps,

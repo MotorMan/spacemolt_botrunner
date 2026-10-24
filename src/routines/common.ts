@@ -6,7 +6,7 @@
  */
 import { combatDebugLog, combatDebugLogLine } from "../debug.js";
 import type { Bot, RoutineContext } from "../bot.js";
-import { isConnectionError } from "../connection.js";
+import { isConnectionError, isStalePositionError } from "../connection.js";
 import { recordInsurancePurchase, getInsuranceRecord, getInsuranceStatus, type InsuranceRecord } from "../insuranceTracker.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance, BattleCombatState, BoardingPublicStatus } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
@@ -742,6 +742,12 @@ export async function ensureDocked(
         const jumpResp = await bot.exec("jump", { target_system: route[i] });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+          if (isStalePositionError(jumpResp.error.message)) {
+            ctx.log("travel", "Stale position detected — refreshing location");
+            await bot.refreshLocation();
+            try { await bot.refreshStatus(true); } catch { /* ignore */ }
+            return false;
+          }
           // Check if we actually made the jump despite the error
           await bot.refreshLocation();
           if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
@@ -751,15 +757,21 @@ export async function ensureDocked(
         }
       }
     } else {
-      const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
-      if (jumpResp.error) {
-        ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        // Check if we actually made the jump despite the error
-        await bot.refreshLocation();
-        if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
-          return false; // Jump truly failed
-        }
-        ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
+        const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
+        if (jumpResp.error) {
+          ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+          if (isStalePositionError(jumpResp.error.message)) {
+            ctx.log("travel", "Stale position detected — refreshing location");
+            await bot.refreshLocation();
+            try { await bot.refreshStatus(true); } catch { /* ignore */ }
+            return false;
+          }
+          // Check if we actually made the jump despite the error
+          await bot.refreshLocation();
+          if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
+            return false; // Jump truly failed
+          }
+          ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
       }
     }
     // Refresh location after navigation
@@ -2857,19 +2869,31 @@ if (looted > 0) {
             return await emergencyFuelRecovery(ctx);
           }
           ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
-          const jumpResp = await bot.exec("jump", { target_system: route[i] });
-          if (jumpResp.error) {
-            ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-            return await emergencyFuelRecovery(ctx);
-          }
+           const jumpResp = await bot.exec("jump", { target_system: route[i] });
+           if (jumpResp.error) {
+             ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+             if (isStalePositionError(jumpResp.error.message)) {
+               ctx.log("travel", "Stale position detected — refreshing location");
+               await bot.refreshLocation();
+               try { await bot.refreshStatus(true); } catch { /* ignore */ }
+               return false;
+             }
+             return await emergencyFuelRecovery(ctx);
+           }
         }
       } else {
         ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
-        const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
-        if (jumpResp.error) {
-          ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          return await emergencyFuelRecovery(ctx);
-        }
+         const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
+         if (jumpResp.error) {
+           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+           if (isStalePositionError(jumpResp.error.message)) {
+             ctx.log("travel", "Stale position detected — refreshing location");
+             await bot.refreshLocation();
+             try { await bot.refreshStatus(true); } catch { /* ignore */ }
+             return false;
+           }
+           return await emergencyFuelRecovery(ctx);
+         }
       }
     }
 
@@ -3548,6 +3572,20 @@ export async function navigateToSystem(
       }
 
       const errorMsg = jumpResp.error.message.toLowerCase();
+
+      // Stale position: the bot actually moved during a reconnect, so the jump
+      // target is no longer valid from its current system. Refresh authoritative
+      // position and recalculate the route from where it really is.
+      if (isStalePositionError(jumpResp.error.message)) {
+        ctx.log("travel", `Stale position detected (moved during reconnect) — refreshing location and recalculating route...`);
+        await bot.refreshLocation();
+        try { await bot.refreshStatus(true); } catch { /* ignore */ }
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Already at target ${targetSystemId} after position refresh`);
+          return true;
+        }
+        continue;
+      }
 
       // Check for in_battle error - for escorts, this means they got pulled into a battle
       // Return false to signal navigation was interrupted by battle so escort routine can handle it

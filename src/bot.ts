@@ -22,7 +22,7 @@ import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState, saveLastUsedRoutine, isCustomsDisabled } from "./web/server.js";
 import { ensureInsured } from "./routines/common.js";
 import { type Account, type Commands, type TypedNotificationType, TYPED_NOTIFICATION_TYPES, type RawFrame } from "@spacemolt/lib";
-import { isConnectionError } from "./connection.js";
+import { isConnectionError, isStalePositionError } from "./connection.js";
 import { isRateLimitError, parseServerDelayMs, reportCleanSend, reportRateLimitHit, shouldLogGateClosed, waitForGate } from "./ratelimitgate.js";
 
 /** A login() promise older than this (ms) is treated as wedged and reset, so a
@@ -1858,6 +1858,15 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
           this.lastPoi = this.poi;
         }
 
+        // Stale-position recovery: a jump/travel command can fail because the bot
+        // actually moved during a reconnect (the server says it is no longer at
+        // the system it thought it was). Refresh authoritative position now so
+        // routines see where the bot really is instead of looping on the old spot.
+        if ((command === "jump" || command === "travel") && resp?.error && isStalePositionError(resp.error.message)) {
+          this.log("warn", `Stale position after ${command}: ${resp.error.message} — refreshing location from server`);
+          try { await this.refreshStatus(true); } catch { /* ignore */ }
+        }
+
         return resp;
         } catch (err) {
         // Handle abort
@@ -2001,10 +2010,11 @@ this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield
   private _lastStatusFetchAt = 0;
   private static readonly STATUS_FETCH_THROTTLE_MS = 5000;
 
-  async refreshStatus(): Promise<ApiResponse> {
+  async refreshStatus(force: boolean = false): Promise<ApiResponse> {
     if (this.account) {
       const now = Date.now();
-      if (now - this._lastStatusFetchAt >= Bot.STATUS_FETCH_THROTTLE_MS) {
+      if (force) this._lastStatusFetchAt = 0;
+      if (now - this._lastStatusFetchAt >= Bot.STATUS_FETCH_THROTTLE_MS || force) {
         const resp = await this.libExec("get_status");
         this._lastStatusFetchAt = now;
         if (!resp.error && resp.result && typeof resp.result === "object") {

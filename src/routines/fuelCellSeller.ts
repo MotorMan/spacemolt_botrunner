@@ -1901,6 +1901,40 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if ((needSellItems || needMilitary) && atHomeStationAfterMaintenance) {
       if (bot.state !== "running") continue;
 
+      // Offload any cargo brought back before loading out again, so it returns
+      // to home faction storage instead of being hauled between stations.
+      for (const itemConfig of settings.sellItems) {
+        const remaining = getSellItemCargo(bot, itemConfig.itemId);
+        if (remaining > 0) {
+          ctx.log("fc", `Depositing ${remaining}x remaining ${itemConfig.itemName} at home station`);
+          await ensureDocked(ctx);
+          const depResp = await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: itemConfig.itemId, quantity: remaining });
+          if (depResp.error) {
+            ctx.log("error", `Deposit ${itemConfig.itemName} at home failed: ${depResp.error.message}`);
+          }
+          await bot.refreshCargo();
+        }
+      }
+      const remainingMil = getSellItemCargo(bot, MILITARY_FUEL_CELL_ITEM_ID);
+      if (remainingMil > 0) {
+        ctx.log("fc", `Depositing ${remainingMil}x remaining military fuel cells at home station`);
+        await ensureDocked(ctx);
+        const depResp = await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: MILITARY_FUEL_CELL_ITEM_ID, quantity: remainingMil });
+        if (depResp.error) {
+          ctx.log("error", `Deposit military fuel cells at home failed: ${depResp.error.message}`);
+        }
+        await bot.refreshCargo();
+      }
+
+      // If we could not offload the returning cargo (home faction storage full),
+      // wait for space to free up instead of heading out again.
+      const cargoStillOnBoard = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (cargoStillOnBoard) {
+        ctx.log("fc", "Home faction storage is full — could not offload returning cargo; waiting for space to free up");
+        await ctx.sleep(60000);
+        continue;
+      }
+
       ctx.log("fc", `At home station — loading items (sell items + ${milTarget} military reserve)`);
 
       const nowStorage = Date.now();
@@ -2268,13 +2302,14 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     let lastPrice: number | null = null;
     const sellItemsToPlace: Array<{ itemConfig: SellItemConfig; qty: number; price: number }> = [];
     const deposits: Record<string, number> = {};
+    let forceReturnHome = false;
 
     if (settings.preStageMode === "preStage") {
       // Pre-stage mode: deposit items to faction storage at each station,
       // falling back to station storage if faction storage is unavailable.
       const planEntry = preStagePlan.find(p => p.idx === targetIdx);
       const needByItem = planEntry?.needByItem ?? {};
-
+      let stationAcceptedDeposit = false;
       for (const itemConfig of settings.sellItems) {
         if (currentFocusItemId && itemConfig.itemId !== currentFocusItemId) continue;
         const inCargo = getSellItemCargo(bot, itemConfig.itemId);
@@ -2322,6 +2357,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         if (!factionResp.error) {
           ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} faction storage`);
           deposits[itemConfig.itemId] = toDeposit;
+          stationAcceptedDeposit = true;
         } else {
           // Fallback to station storage if faction storage fails
           const stationResp = await bot.exec("storage", {
@@ -2335,12 +2371,22 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
           if (!stationResp.error) {
             ctx.log("fc", `Pre-staged ${toDeposit}x ${itemConfig.itemName} to ${target.poiName} station storage (faction storage unavailable)`);
             deposits[itemConfig.itemId] = toDeposit;
+            stationAcceptedDeposit = true;
           } else {
             ctx.log("error", `Pre-stage deposit failed for ${itemConfig.itemName}: faction=${factionResp.error.message}, station=${stationResp.error.message}`);
           }
         }
 
         await ctx.sleep(1000);
+      }
+
+      // If we still hold focus cargo but this station could not take any of it
+      // (full storage, deposit error, blocked, …), return home to offload into
+      // faction storage instead of hauling it between stations and burning fuel.
+      const focusStillOnBoard = currentFocusItemId ? getSellItemCargo(bot, currentFocusItemId) > 0 : false;
+      if (focusStillOnBoard && !stationAcceptedDeposit) {
+        ctx.log("fc", `${target.poiName} could not accept ${currentFocusItemId} — returning home to offload cargo`);
+        forceReturnHome = true;
       }
     } else {
       // Normal mode: calculate prices and create sell orders
@@ -2491,7 +2537,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const focusItemName = settings.sellItems.find(i => i.itemId === currentFocusItemId)?.itemName || currentFocusItemId;
       ctx.log("fc", `${focusItemName} depleted from cargo — returning home to restock`);
     }
-    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted || focusItemDepleted;
+    const shouldReturnHome = settings.preStageMode !== "preStage" || allSellItemsDepleted || focusItemDepleted || forceReturnHome;
 
     if (shouldReturnHome) {
       if (bot.state !== "running") break;
@@ -2533,6 +2579,16 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       saveFCStationsData(fcData);
       ctx.log("fc", "Pre-stage run complete — returned home");
+
+      // If we could not offload the cargo we brought back (home faction storage
+      // full), wait for space to free up instead of burning fuel hauling it out
+      // again.
+      const cargoStillOnBoard = settings.sellItems.some(i => getSellItemCargo(bot, i.itemId) > 0);
+      if (cargoStillOnBoard) {
+        ctx.log("fc", "Home faction storage is full — could not offload remaining cargo; waiting for space to free up");
+        await ctx.sleep(60000);
+        continue;
+      }
 
       // Soft-stop: finished the cycle and back home — stop before starting the next load.
       if (bot.shouldStopAfterCycle()) {

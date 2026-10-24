@@ -946,6 +946,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       const refuelResp = await bot.exec("refuel");
       if (!refuelResp.error) {
         await bot.refreshShip();
+        await bot.refreshCargo();
         const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
         ctx.log("system", `Recovery via scavenge successful! Fuel: ${newFuel}%`);
         return true;
@@ -1553,6 +1554,7 @@ export async function acquireFuelCellsAndRefuel(ctx: RoutineContext): Promise<bo
     }
     improved = true;
     await bot.refreshShip();
+    await bot.refreshCargo();
     const fp = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fp >= 95) break;
   }
@@ -2558,6 +2560,7 @@ async function ensureFueledCore(
   // pointlessly undock, fail the refuel, and then fall through to a market buy at a
   // station that has no market. If cargo is empty, skip straight to the storage/market
   // fallback which checks faction/station storage first and only buys where a market exists.
+  await bot.refreshCargo();
   const cargoFuelCells = bot.inventory
     .filter((i) => isFuelCellItemId(i.itemId))
     .reduce((s, i) => s + (i.quantity || 0), 0);
@@ -2584,6 +2587,7 @@ async function ensureFueledCore(
     }
     cargoFuelAttempts++;
     await bot.refreshShip();
+    await bot.refreshCargo();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= thresholdPct) {
       ctx.log("system", `Refueled from cargo fuel cells — fuel now ${fuelPct}%`);

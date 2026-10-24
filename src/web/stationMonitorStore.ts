@@ -178,6 +178,15 @@ export interface SupplyFacility {
   maintenance: { item_id: string; quantity: number }[];
   /** Ammo item this facility's gun feeds from; null when it is not an armed gun. */
   ammoItem: string | null;
+  /** Service-pool consumable (optional). Facilities such as crew registries and
+   *  med bays draw these cyclically instead of (or in addition to) maintenance_inputs. */
+  servicePoolSupplyItem?: string | null;
+  servicePoolRefillPerCycle?: number;
+  servicePoolUnitsPerItem?: number;
+  // snake_case aliases mirroring the catalog / live facility records
+  service_pool_supply_item?: string | null;
+  service_pool_refill_per_cycle?: number;
+  service_pool_units_per_item?: number;
 }
 
 /** Stock available to the station, i.e. its faction storage. */
@@ -231,7 +240,21 @@ export function evaluateSupplies(
 
   const maintNeed = new Map<string, { need: number; facs: string[] }>();
   const ammoNeed = new Map<string, { guns: number; facs: string[] }>();
+  const serviceItems = new Set<string>();
   let guns = 0;
+
+  const spItemOf = (f: SupplyFacility): string | null => {
+    const v = f.servicePoolSupplyItem ?? f.service_pool_supply_item ?? null;
+    return typeof v === "string" && v ? v : null;
+  };
+  const spRefillOf = (f: SupplyFacility): number => {
+    const v = f.servicePoolRefillPerCycle ?? f.service_pool_refill_per_cycle;
+    return typeof v === "number" && v > 0 ? v : 0;
+  };
+  const spUnitsOf = (f: SupplyFacility): number => {
+    const v = f.servicePoolUnitsPerItem ?? f.service_pool_units_per_item;
+    return typeof v === "number" && v > 0 ? v : 1;
+  };
 
   for (const f of facilities) {
     if (!f.active) continue;
@@ -241,6 +264,16 @@ export function evaluateSupplies(
       e.need += m.quantity || 1;
       if (!e.facs.includes(f.name)) e.facs.push(f.name);
       maintNeed.set(m.item_id, e);
+    }
+    const spItem = spItemOf(f);
+    if (spItem) {
+      const qty = spRefillOf(f) / spUnitsOf(f);
+      const need = qty > 0 ? qty : 1;
+      const e = maintNeed.get(spItem) ?? { need: 0, facs: [] };
+      e.need += need;
+      if (!e.facs.includes(f.name)) e.facs.push(f.name);
+      maintNeed.set(spItem, e);
+      serviceItems.add(spItem);
     }
     if (f.ammoItem) {
       guns++;
@@ -260,7 +293,7 @@ export function evaluateSupplies(
   for (const [itemId, e] of maintNeed) {
     const have = stock.stock.get(itemId) ?? 0;
     const ft = foodTypes[itemId];
-    const isFood = !!ft;
+    const isFood = !!ft && !serviceItems.has(itemId);
     // Food is consumed by civilians (not on a tick cycle), so there is no
     // per-cycle burn rate to project a depletion time from.
     const daysLeft = isFood ? null : (e.need > 0 ? ((have / e.need) * SECS_PER_MAINT_CYCLE) / SECS_PER_DAY : null);

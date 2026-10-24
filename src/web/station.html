@@ -1228,14 +1228,45 @@
   // Per-round maintenance needs. Prefer the facility's own `maintenance_per_cycle`
   // (level-adjusted, actual), falling back to the catalog definition's
   // `maintenance_inputs` for station-type facilities that only expose those.
+  // Service-pool facilities (crew registry, med bays, …) consume their
+  // `service_pool_supply_item` cyclically instead of (or in addition to)
+  // maintenance_inputs, so fold that in too.
   function facilityMaintenance(f) {
     const live = Array.isArray(f.maintenance_per_cycle) ? f.maintenance_per_cycle : [];
+    let items = [];
     if (live.length) {
-      return live.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+      items = live.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+    } else {
+      const cat = detailState.catCache[f.facility_type || f.type || f.id];
+      const mi = (cat && cat.maintenance_inputs) || [];
+      items = Array.isArray(mi) ? mi.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name })) : [];
     }
     const cat = detailState.catCache[f.facility_type || f.type || f.id];
-    const mi = (cat && cat.maintenance_inputs) || [];
-    return Array.isArray(mi) ? mi.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name })) : [];
+    if (cat && cat.service_pool_supply_item) {
+      const sp = cat.service_pool_supply_item;
+      if (!items.some((m) => m.item_id === sp)) {
+        const refill = num(cat.service_pool_refill_per_cycle, 0);
+        const units = num(cat.service_pool_units_per_item, 1) || 1;
+        const qty = refill > 0 ? refill / units : 1;
+        items.push({ item_id: sp, quantity: qty, name: sp });
+      }
+    }
+    return items;
+  }
+
+  function catalogConsumables(f) {
+    const mi = Array.isArray(f && f.maintenance_inputs) ? f.maintenance_inputs : [];
+    const items = mi.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+    if (f && f.service_pool_supply_item) {
+      const sp = f.service_pool_supply_item;
+      if (!items.some((m) => m.item_id === sp)) {
+        const refill = num(f.service_pool_refill_per_cycle, 0);
+        const units = num(f.service_pool_units_per_item, 1) || 1;
+        const qty = refill > 0 ? refill / units : 1;
+        items.push({ item_id: sp, quantity: qty, name: f.name ? sp : sp });
+      }
+    }
+    return items;
   }
 
   function facCard(f, cat) {
@@ -1424,7 +1455,7 @@
         <div class="bc-meta">${esc(f.category)}${f.level ? " · Lv" + f.level : ""}${f.build_cost ? ' · <span class="bc-cost">' + Number(f.build_cost).toLocaleString() + "cr</span>" : ""}</div>
         <div class="bc-meta">${esc(f.description || "")}</div>
         ${matsHtml(f.build_materials, detailState.factionStock)}
-        ${needsHtml(f.maintenance_inputs)}
+        ${needsHtml(catalogConsumables(f))}
         <div style="margin-top:4px"><button class="primary-btn sm" data-act="build">Build</button></div>
       </div>`).join("");
     el.innerHTML =

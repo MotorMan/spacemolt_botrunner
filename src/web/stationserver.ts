@@ -72,6 +72,10 @@ interface SlimFacility {
   station_or_faction_only: boolean;
   /** Item a station gun feeds from. Present only on armed defense facilities. */
   ammo_item: string | null;
+  /** Service-pool consumable (optional). */
+  service_pool_supply_item: string | null;
+  service_pool_refill_per_cycle: number;
+  service_pool_units_per_item: number;
 }
 
 /** A station facility normalized down to just what supply tracking needs. */
@@ -82,6 +86,9 @@ interface FacilityRec {
   active: boolean;
   /** Per-cycle maintenance draw, from the live record when it exposes one. */
   maintenance: SlimMat[];
+  servicePoolSupplyItem: string | null;
+  servicePoolRefillPerCycle: number;
+  servicePoolUnitsPerItem: number;
 }
 
 export interface StationView {
@@ -564,8 +571,11 @@ export class StationWebServer {
           service_type: (f.service_type as string) || null,
           faction_service_type: (f.faction_service_type as string) || null,
           station_or_faction_only: !!f.station_or_faction_only,
-          ammo_item: (f.ammo_item as string) || null,
-        }));
+           ammo_item: (f.ammo_item as string) || null,
+           service_pool_supply_item: (f.service_pool_supply_item as string) || null,
+           service_pool_refill_per_cycle: (f.service_pool_refill_per_cycle as number) ?? 0,
+           service_pool_units_per_item: (f.service_pool_units_per_item as number) ?? 0,
+         }));
       }
     } catch {
       facilities = [];
@@ -1127,12 +1137,16 @@ export class StationWebServer {
             name: typeof m.name === "string" ? m.name : "",
           }))
       : [];
+    const spRaw = f.service_pool_supply_item ?? f.servicePoolSupplyItem;
     return {
       id: id || type,
       name: String(f.custom_name || f.name || type || id),
       type,
       active: this.facilityIsActive(f),
       maintenance,
+      servicePoolSupplyItem: typeof spRaw === "string" && spRaw ? spRaw : null,
+      servicePoolRefillPerCycle: num(f.service_pool_refill_per_cycle ?? f.servicePoolRefillPerCycle, 0),
+      servicePoolUnitsPerItem: num(f.service_pool_units_per_item ?? f.servicePoolUnitsPerItem, 0) || 0,
     };
   }
 
@@ -1277,12 +1291,15 @@ export class StationWebServer {
     const resolved: SupplyFacility[] = facilities.map((f) => {
       const def = cat.byId[f.type];
       const maint = f.maintenance.length ? f.maintenance : (def?.maintenance_inputs ?? []);
-      return {
-        name: f.name,
-        active: f.active,
-        maintenance: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
-        ammoItem: def?.ammo_item ?? null,
-      };
+       return {
+         name: f.name,
+         active: f.active,
+         maintenance: maint.map((m) => ({ item_id: m.item_id, quantity: m.quantity || 1 })),
+         ammoItem: def?.ammo_item ?? null,
+         servicePoolSupplyItem: f.servicePoolSupplyItem ?? def?.service_pool_supply_item ?? null,
+         servicePoolRefillPerCycle: f.servicePoolRefillPerCycle || def?.service_pool_refill_per_cycle || 0,
+         servicePoolUnitsPerItem: f.servicePoolUnitsPerItem || def?.service_pool_units_per_item || 0,
+       };
     });
     return evaluateSupplies(
       resolved,

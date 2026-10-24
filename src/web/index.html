@@ -25636,7 +25636,7 @@ When responding:
                 matsAvailabilityHtml(mats, factionStock) +
                 "</div>";
             }
-            const maint = t.maintenance_inputs || [];
+            const maint = stationFacilityConsumables(t);
             let maintHtml = "";
             if (Array.isArray(maint) && maint.length > 0) {
               maintHtml =
@@ -25681,7 +25681,7 @@ When responding:
             matsAvailabilityHtml(mats, factionStock) +
             "</div>"
           : "";
-        const maint = detail.maintenance_inputs || [];
+         const maint = stationFacilityConsumables(detail);
         const maintHtml = Array.isArray(maint) && maint.length
           ? '<div style="margin-top:6px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Maintenance (per round):</span> ' +
             maint
@@ -25841,7 +25841,7 @@ When responding:
             const desc = active
               ? catDef?.satisfied_description || fac.description || ""
               : catDef?.degraded_description || fac.description || "";
-            const maint = catDef?.maintenance_inputs || [];
+             const maint = stationFacilityConsumables(catDef);
             const maintHtml = Array.isArray(maint) && maint.length
               ? '<div style="margin-top:4px;font-size:11px;color:var(--cyan)"><span style="color:var(--text-dim)">Needs/round:</span> ' +
                 maint
@@ -26098,28 +26098,38 @@ When responding:
           const active = fac.status === "active" || fac.active === true;
           if (!active) return;
           const id = fac.facility_type || fac.type || fac.id;
-          const cat = resolveStationCatalog(fac);
-          const maint = (cat && cat.maintenance_inputs) || [];
-          if (!maint.length) return;
-          const facName = fac.name || id || "?";
-          const regularItems = [];
-          const foodItems = [];
-          maint.forEach((m) => {
-            const key = m.item_id;
-            if (catalog.items?.[key]?.food_type) {
-              foodTotals[key] = (foodTotals[key] || 0) + (m.quantity || 1);
-              foodItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
-            } else {
-              totals[key] = (totals[key] || 0) + (m.quantity || 1);
-              regularItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
-            }
-          });
-          if (regularItems.length) {
-            contributing.push({ name: facName, items: regularItems });
-          }
-          if (foodItems.length) {
-            foodContributing.push(facName);
-          }
+           const cat = resolveStationCatalog(fac);
+           const maint = (cat && cat.maintenance_inputs) || [];
+           if (!maint.length && !(cat && cat.service_pool_supply_item)) return;
+           const facName = fac.name || id || "?";
+           const regularItems = [];
+           const foodItems = [];
+           maint.forEach((m) => {
+             const key = m.item_id;
+             if (catalog.items?.[key]?.food_type) {
+               foodTotals[key] = (foodTotals[key] || 0) + (m.quantity || 1);
+               foodItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
+             } else {
+               totals[key] = (totals[key] || 0) + (m.quantity || 1);
+               regularItems.push({ item_id: m.item_id, quantity: m.quantity || 1 });
+             }
+           });
+           // Service-pool consumables are drawn cyclically (not civilian food),
+           // even when the item itself has a food_type (e.g. protein_rations).
+           if (cat && cat.service_pool_supply_item) {
+             const sp = cat.service_pool_supply_item;
+             const refill = cat.service_pool_refill_per_cycle || 0;
+             const units = cat.service_pool_units_per_item || 1;
+             const qty = refill > 0 ? refill / units : 1;
+             totals[sp] = (totals[sp] || 0) + qty;
+             regularItems.push({ item_id: sp, quantity: qty });
+           }
+           if (regularItems.length) {
+             contributing.push({ name: facName, items: regularItems });
+           }
+           if (foodItems.length) {
+             foodContributing.push(facName);
+           }
         });
 
         // 3b) Sum weapon-ammo requirements from active defense facilities. A
@@ -27402,15 +27412,36 @@ When responding:
       // Resolve a live facility's catalog definition (for maintenance_inputs,
       // descriptions, etc.). Tries several id forms since live `faction_list`
       // entries may key by facility_type/id/type differently than catalog.
-      function resolveStationCatalog(fac) {
-        if (!fac) return null;
-        const ids = [fac.facility_type, fac.id, fac.type].filter(Boolean);
-        for (const id of ids) {
-          const c = getCatalogFacility(id);
-          if (c) return c;
-        }
-        return null;
-      }
+       function resolveStationCatalog(fac) {
+         if (!fac) return null;
+         const ids = [fac.facility_type, fac.id, fac.type].filter(Boolean);
+         for (const id of ids) {
+           const c = getCatalogFacility(id);
+           if (c) return c;
+         }
+         return null;
+       }
+
+       // Consumables a station facility draws per round: its maintenance_inputs
+       // plus, for service-pool facilities (crew registry, med bays, …), the
+       // service_pool_supply_item they refill from.
+       function stationFacilityConsumables(cat) {
+         const list = [];
+         const mi = (cat && cat.maintenance_inputs) || [];
+         if (Array.isArray(mi)) {
+           mi.forEach((m) => list.push({ item_id: m.item_id, quantity: m.quantity || 1, name: m.name }));
+         }
+         if (cat && cat.service_pool_supply_item) {
+           const sp = cat.service_pool_supply_item;
+           if (!list.some((m) => m.item_id === sp)) {
+             const refill = cat.service_pool_refill_per_cycle || 0;
+             const units = cat.service_pool_units_per_item || 1;
+             const qty = refill > 0 ? refill / units : 1;
+             list.push({ item_id: sp, quantity: qty, name: (catalog && catalog.items && catalog.items[sp] && catalog.items[sp].name) || sp });
+           }
+         }
+         return list;
+       }
 
       function fetchFactionBuildableTypes(username) {
         const container = document.getElementById("factionBuildableTypes");

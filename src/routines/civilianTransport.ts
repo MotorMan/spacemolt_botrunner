@@ -1585,6 +1585,7 @@ async function selectNextPickupStation(
   ctx: RoutineContext,
   state: TransportState,
   settings: CivilianTransportSettings,
+  avoidCurrentSystem: boolean = false,
 ): Promise<{ system: string; poi: string; poiName: string } | null> {
   const { bot } = ctx;
 
@@ -1683,6 +1684,7 @@ async function selectNextPickupStation(
   let skippedDueToRecency = false;
   for (const info of sorted) {
     if (info.hops > settings.maxJumps) continue;
+    if (avoidCurrentSystem && info.systemId.toLowerCase() === currentSystem.toLowerCase()) continue;
     if (settings.blockPirateStations && isPirateSystem(info.systemId)) continue;
 
     const sysData = knownSystems[info.systemId];
@@ -1709,12 +1711,14 @@ async function selectNextPickupStation(
   }
 
   // Every reachable station was recently visited — clear the short-term memory
-  // and allow revisiting so the tour can continue instead of stalling.
+  // and allow revisiting so the tour can continue instead of stalling. When
+  // avoidCurrentSystem is set we keep skipping the current system on retry so
+  // we don't ping-pong back into the same two-station loop.
   if (skippedDueToRecency) {
     ctx.log("transport", "All reachable stations recently visited, clearing recent history and retrying");
     state.recentlyVisitedStations = [];
     saveTransportState(state);
-    return selectNextPickupStation(ctx, state, settings);
+    return selectNextPickupStation(ctx, state, settings, true);
   }
 
   ctx.log("transport", "No reachable non-blacklisted station found within maxJumps");

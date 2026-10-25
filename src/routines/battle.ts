@@ -6,7 +6,7 @@ import { mapStore } from "../mapstore.js";
 import { wildlifeStore } from "../wildlivestore.js";
 import { getBattleStatus, topUpShields, useRepairKits } from "./common.js";
 import { combatDebugLog } from "../debug.js";
-import { isBoardingClaimedByOther, releaseExpiredBoardingClaims } from "../boardingCooperation.js";
+import { isBoardingClaimedByOther, releaseExpiredBoardingClaims, boardingClaims } from "../boardingCooperation.js";
 import { getHunterSettings } from "./hunter.js";
 
 async function waitForBattleUpdate(ctx: RoutineContext, beforeUpdate: number): Promise<void> {
@@ -158,7 +158,7 @@ async function cooperateWithBoardingClaim(
     return { target: currentTarget, brace: false };
   }
 
-  const ourSideId = status.your_side_id;
+  const ourSideId = status!.your_side_id;
   const enemies = status.participants.filter(p => {
     if (p.side_id === ourSideId || p.is_destroyed) return false;
     const pid = p.player_id || p.username || "";
@@ -983,7 +983,13 @@ export async function fightFreshBattle(
   let lastHull = bot.hull;
   let lastBattleTick: number | undefined;
   const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-  const originalTarget = target;
+const originalTarget = target;
+  const bracedTargets = new Set<string>();
+  let lastDamageDealt = 0;
+  let damageBaseline = 0;
+  let currentTargetId = target?.id || "";
+  let lastEnemyCount = 0;
+  let lastOurHullPct = -1;
   const fightAtEngaged = (): boolean =>
     stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(target);
 
@@ -1143,6 +1149,59 @@ export async function fightFreshBattle(
     }
     lastBattleTick = status.tick;
 
+    // Brace detection: track our own damage output. If a hit lands at ~25% of
+    // our baseline, the target is likely in brace stance -> switch targets.
+    const ourPartFresh = status.participants?.find((p: any) => p.username === bot.username);
+    const damageDealtFresh = (ourPartFresh as any)?.damage_dealt ?? 0;
+    const damageDeltaFresh = Math.max(0, damageDealtFresh - lastDamageDealt);
+    const ourHullPctFresh = (ourPartFresh as any)?.hull_pct ?? -1;
+    const tookDamageFresh = lastOurHullPct >= 0 && ourHullPctFresh >= 0 && ourHullPctFresh < lastOurHullPct;
+    if (ourHullPctFresh >= 0) lastOurHullPct = ourHullPctFresh;
+    if (currentTargetId !== target.id) { damageBaseline = 0; currentTargetId = target.id; }
+    if (damageDeltaFresh > damageBaseline) damageBaseline = damageDeltaFresh;
+    lastDamageDealt = damageDealtFresh;
+
+    const enemyCountFresh = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed).length;
+    if (enemyCountFresh > lastEnemyCount) bracedTargets.clear();
+    // If everyone was marked braced but we took damage, someone left brace (can't attack while braced).
+    if (tookDamageFresh && enemyCountFresh > 0 && bracedTargets.size >= enemyCountFresh) bracedTargets.clear();
+    lastEnemyCount = enemyCountFresh;
+    if (bracedTargets.has(target.id) && damageDeltaFresh > 0 && damageBaseline > 0 && damageDeltaFresh >= damageBaseline * 0.5) {
+      bracedTargets.delete(target.id);
+    }
+
+    if (damageBaseline > 0 && damageDeltaFresh > 0 && damageDeltaFresh <= damageBaseline * 0.4 && target.id && !bracedTargets.has(target.id) && (bot.maxHull <= 0 || (bot.hull / bot.maxHull) * 100 > fleeThreshold)) {
+      const selfBoardingFresh = boardingClaims.get(target.id)?.claimer === bot.username;
+      if (selfBoardingFresh) {
+        ctx.log("combat", `🛡️ ${target.name} appears braced but we are boarding it — staying`);
+      } else {
+        bracedTargets.add(target.id);
+        ctx.log("combat", `🛡️ ${target.name} appears to be in BRACE stance (damage ${damageDeltaFresh} vs baseline ${damageBaseline}) — switching targets`);
+      const rosterEnemiesFresh = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed && !(p.ship_class === "station" || (p as any).kind === "station"));
+      const nonBracedFresh = rosterEnemiesFresh.filter((p: any) => !bracedTargets.has(p.player_id || p.username || ""));
+      if (nonBracedFresh.length > 0) {
+        const next = nonBracedFresh[0];
+        target = { id: next.player_id || next.username, name: next.username || next.player_id } as NearbyEntity;
+        await bot.exec("battle", { action: "target", target_id: target.id });
+        damageBaseline = 0;
+        currentTargetId = target.id;
+        await ctx.sleep(300);
+        continue;
+      }
+      if (rosterEnemiesFresh.length === 0) {
+        const nearbyBrace = await acquireEnemyFromNearby(ctx, undefined, maxAttackTier, true);
+        if (nearbyBrace && nearbyBrace.id !== target.id) {
+          target = nearbyBrace;
+          await bot.exec("battle", { action: "target", target_id: target.id });
+          damageBaseline = 0;
+          currentTargetId = target.id;
+          await ctx.sleep(300);
+          continue;
+        }
+      }
+      }
+      }
+
     let targetParticipant = status.participants.find(
       p => p.player_id === target.id || p.username === target.name
     );
@@ -1165,7 +1224,7 @@ export async function fightFreshBattle(
 
     if (targetParticipant && targetParticipant.is_destroyed) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — finding new target...`);
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `🎯 Switching to ${better.name} (previous target destroyed)`);
         target = better;
@@ -1213,7 +1272,7 @@ export async function fightFreshBattle(
         continue;
       }
 
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better && better.name !== target.name) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target left the battle)`);
         target = better;
@@ -1454,7 +1513,7 @@ export async function fightFreshBattle(
         const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
         const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
         if (targetZoneNum <= ourNum - 2) {
-          const ourSideId = status.your_side_id;
+          const ourSideId = status!.your_side_id;
           const currentTargetId = target.id;
           const currentTargetName = target.name;
           const closerEnemy = status.participants.find(p => {
@@ -1551,7 +1610,7 @@ function pickRealBattleTarget(
   const validSides = status.sides?.map(s => s.side_id) || [];
   const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId))
     ? ourSideId
-    : status.your_side_id;
+    : status!.your_side_id;
 
   // If we still don't have a valid side, we can't determine enemies
   if (ourSide === undefined || ourSide === null) return null;
@@ -1750,6 +1809,14 @@ export async function fightJoinedBattle(
 
   let currentTarget = target;
 
+  // Brace-stance detection via damage output.
+  const bracedTargetsJoined = new Set<string>();
+  let lastDamageDealtJoined = 0;
+  let damageBaselineJoined = 0;
+  let currentTargetIdJoined = target?.id || "";
+  let lastEnemyCountJoined = 0;
+  let lastOurHullPctJoined = -1;
+
   let lastNullCannonTick: number | undefined;
   let nullCannonPhase = 0;
 
@@ -1761,7 +1828,7 @@ export async function fightJoinedBattle(
       p => p.player_id === currentTarget!.id || p.username === currentTarget!.name
     );
     if (!isValid) {
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `Original target ${currentTarget?.name ?? "none"} not in this battle — auto-targeting real enemy ${better.name}`);
         currentTarget = better;
@@ -1952,6 +2019,7 @@ export async function fightJoinedBattle(
 
     // Immediate hull/shield check at the start of every combat tick — do not
     // wait for target-switching logic to decide whether we're in danger.
+    // wait for target-switching logic to decide whether we're in danger.
     await bot.refreshShip();
     const tickHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const tickShieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
@@ -1971,6 +2039,57 @@ export async function fightJoinedBattle(
       if (await useRepairKits(ctx)) {
         await ctx.sleep(10000);
         continue;
+      }
+    }
+
+    // Brace detection: track our own damage output.
+    const ourPartJoined2 = status.participants?.find((p: any) => p.username === bot.username);
+    const damageDealtJoined2 = (ourPartJoined2 as any)?.damage_dealt ?? 0;
+    const damageDeltaJoined2 = Math.max(0, damageDealtJoined2 - lastDamageDealtJoined);
+    const ourHullPctJoined2 = (ourPartJoined2 as any)?.hull_pct ?? -1;
+    const tookDamageJoined2 = lastOurHullPctJoined >= 0 && ourHullPctJoined2 >= 0 && ourHullPctJoined2 < lastOurHullPctJoined;
+    if (ourHullPctJoined2 >= 0) lastOurHullPctJoined = ourHullPctJoined2;
+    if (currentTargetIdJoined !== currentTarget?.id) { damageBaselineJoined = 0; currentTargetIdJoined = currentTarget?.id || ""; }
+    if (damageDeltaJoined2 > damageBaselineJoined) damageBaselineJoined = damageDeltaJoined2;
+    lastDamageDealtJoined = damageDealtJoined2;
+
+    const enemyCountJoined = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed).length;
+    if (enemyCountJoined > lastEnemyCountJoined) bracedTargetsJoined.clear();
+    if (tookDamageJoined2 && enemyCountJoined > 0 && bracedTargetsJoined.size >= enemyCountJoined) bracedTargetsJoined.clear();
+    lastEnemyCountJoined = enemyCountJoined;
+    if (currentTarget?.id && bracedTargetsJoined.has(currentTarget.id) && damageDeltaJoined2 > 0 && damageBaselineJoined > 0 && damageDeltaJoined2 >= damageBaselineJoined * 0.5) {
+      bracedTargetsJoined.delete(currentTarget.id);
+    }
+
+    if (damageBaselineJoined > 0 && damageDeltaJoined2 > 0 && damageDeltaJoined2 <= damageBaselineJoined * 0.4 && currentTarget?.id && !bracedTargetsJoined.has(currentTarget.id)) {
+      const selfBoardingJoined = boardingClaims.get(currentTarget.id)?.claimer === bot.username;
+      if (selfBoardingJoined) {
+        ctx.log("combat", `🛡️ ${currentTarget.name} appears braced but we are boarding it — staying`);
+      } else {
+        bracedTargetsJoined.add(currentTarget.id);
+        ctx.log("combat", `🛡️ ${currentTarget.name} appears to be in BRACE stance (damage ${damageDeltaJoined2} vs baseline ${damageBaselineJoined}) — switching targets`);
+        const rosterEnemiesJoined = (status.participants || []).filter((p: any) => p.side_id !== status!.your_side_id && !p.is_destroyed && !(p.ship_class === "station" || (p as any).kind === "station"));
+        const nonBracedJoined = rosterEnemiesJoined.filter((p: any) => !bracedTargetsJoined.has(p.player_id || p.username || ""));
+        if (nonBracedJoined.length > 0) {
+          const next = nonBracedJoined[0];
+          currentTarget = { id: next.player_id || next.username, name: next.username || next.player_id } as NearbyEntity;
+          await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+          damageBaselineJoined = 0;
+          currentTargetIdJoined = currentTarget.id;
+          await ctx.sleep(300);
+          continue;
+        }
+        if (rosterEnemiesJoined.length === 0) {
+          const nearbyBraceJoined2 = await acquireEnemyFromNearby(ctx, undefined, maxAttackTier, onlyNPCs);
+          if (nearbyBraceJoined2 && nearbyBraceJoined2.id !== currentTarget.id) {
+            currentTarget = nearbyBraceJoined2;
+            await bot.exec("battle", { action: "target", target_id: currentTarget.id });
+            damageBaselineJoined = 0;
+            currentTargetIdJoined = currentTarget.id;
+            await ctx.sleep(300);
+            continue;
+          }
+        }
       }
     }
 
@@ -2018,7 +2137,7 @@ export async function fightJoinedBattle(
         continue;
       }
 
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better && (!currentTarget || better.id !== currentTarget.id)) {
         ctx.log("combat", `🎯 Switching target to ${better.name} (previous target invalid or left the battle)`);
         currentTarget = better;
@@ -2070,7 +2189,7 @@ export async function fightJoinedBattle(
 
     if (targetParticipant && targetParticipant.is_destroyed && currentTarget) {
       ctx.log("combat", `⚠️ ${currentTarget.name} marked destroyed but battle still active — finding new target...`);
-      const better = pickRealBattleTarget(status, status.your_side_id);
+      const better = pickRealBattleTarget(status, status!.your_side_id);
       if (better) {
         ctx.log("combat", `🎯 Switching to ${better.name} (previous target destroyed)`);
         currentTarget = better;
@@ -2131,8 +2250,8 @@ export async function fightJoinedBattle(
     }
 
     const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-    const originalTarget = target;
-    const fightAtEngaged = (): boolean =>
+const originalTarget = target;
+  const fightAtEngaged = (): boolean =>
       stayAtEngaged || isCreatureFightTarget(originalTarget) || isCreatureFightTarget(currentTarget);
 
     // If the enemy isn't in the participants roster (newer server combat code omits
@@ -2273,7 +2392,7 @@ export async function fightJoinedBattle(
         const targetZoneNum = zoneDirMap[targetParticipant.zone || "outer"] ?? 0;
         const ourNum = zoneDirMap[status.your_zone || "outer"] ?? 0;
         if (targetZoneNum <= ourNum - 2) {
-          const ourSideId = status.your_side_id;
+          const ourSideId = status!.your_side_id;
           const currentTargetId = currentTarget.id;
           const currentTargetName = currentTarget.name;
           const closerEnemy = status.participants.find(p => {

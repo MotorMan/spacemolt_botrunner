@@ -15,6 +15,8 @@ import {
   getItemSize,
   maxItemsForCargo,
   cargoUsedFromInventory,
+  estimateRouteFuel,
+  ensureFuelCellReserve,
   type BattleState,
 } from "./common.js";
 import {
@@ -1210,10 +1212,8 @@ async function deliverBatchToStation(
   ctx.log("fuel", `Co-op: Tracked ${actualLoad.reduce((s, p) => s + p.qty, 0)} units in-transit to ${remoteStationId}`);
 
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelPct < safetyOpts.fuelThresholdPct) {
-    ctx.log("fuel", `Fuel low (${fuelPct}%) before departure — refueling...`);
-    await tryRefuel(ctx, { skipApprovedCheck: true });
-  }
+  ctx.log("fuel", `Fuel before departure: ${fuelPct}% — topping up...`);
+  await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem });
 
   ctx.log("fuel", `Heading to ${destSystem} with ${actualLoad.length} item types...`);
   if (bot.system !== destSystem) {
@@ -1331,12 +1331,30 @@ async function deliverBatchToStation(
   }
 
   const fuelPctAfter = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelPctAfter < safetyOpts.fuelThresholdPct) {
-    ctx.log("fuel", `Fuel low (${fuelPctAfter}%) after delivery — refueling at ${remoteStationId} before return...`);
-    await tryRefuel(ctx, { skipApprovedCheck: true });
-    await bot.refreshShip();
-    const postRefuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    ctx.log("fuel", `Refueled at ${remoteStationId} — fuel now ${postRefuelPct}%`);
+  ctx.log("fuel", `Fuel after delivery at ${remoteStationId}: ${fuelPctAfter}% — refueling before return...`);
+  await tryRefuel(ctx, { skipApprovedCheck: true, homeSystem });
+  await bot.refreshShip();
+  const postRefuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  ctx.log("fuel", `Refueled at ${remoteStationId} — fuel now ${postRefuelPct}%`);
+
+  // Grab fuel cells for the trip home, like other routines do, so a low tank
+  // mid-route can be topped up from cargo instead of panicking to another station.
+  if (homeSystem) {
+    if (!bot.docked) {
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) bot.docked = true;
+    }
+    await bot.refreshCargo();
+    await bot.refreshLocation();
+    const routeHome = await estimateRouteFuel(ctx, homeSystem);
+    const tripFuelHome = routeHome?.estimatedFuel ?? 0;
+    const tankFuelHome = bot.fuel;
+    ctx.log("fuel", `Return trip needs ~${Math.round(tripFuelHome)} fuel; tank has ${tankFuelHome}; reserving fuel cells...`);
+    await ensureFuelCellReserve(ctx, {
+      fuelNeeded: Math.max(0, Math.ceil(tripFuelHome * 1.25) - tankFuelHome),
+      reason: `return to ${homeSystem}`,
+    });
+    await bot.refreshCargo();
   }
 
   if (!bot.docked) bot.docked = false;

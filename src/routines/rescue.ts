@@ -1283,6 +1283,19 @@ async function checkTargetStillNeedsRescue(
   const currentDocked = targetBot.docked;
   const rescueThresholdPct = opts?.rescueFuelThresholdPct ?? getRescueSettings().fuelThreshold;
 
+  // If the target carries fuel cells in cargo, it can self-refuel instead of
+  // needing a rescue delivery. Skip so we don't waste a trip.
+  if (botHasFuelCellReserve(targetBot)) {
+    ctx.log("rescue", `✓ ${targetUsername} has fuel cells in cargo — can self-refuel, skipping rescue`);
+    return {
+      needsRescue: false,
+      currentFuelPct,
+      currentSystem,
+      currentDocked,
+      reason: `Target has cargo fuel cell reserve`,
+    };
+  }
+
   // Check if target has refueled themselves.
   // Compared against the configured trigger threshold — the previous
   // "fuel > 25% && original <= 10%" test could never fire for a bot flagged at,
@@ -1437,9 +1450,10 @@ function botHasFuelCellReserve(bot: BotStatus): boolean {
   if (!Array.isArray(inv)) return false;
   for (const item of inv) {
     const id = (item.itemId || "").toLowerCase();
+    const name = ((item as any).name || (item as any).itemName || "").toLowerCase();
     const qty = typeof item.quantity === "number" ? item.quantity : 0;
     if (qty <= 0) continue;
-    if (id === "fuel_cell" || id === "premium_fuel_cell" || id === "military_fuel_cell") {
+    if (id.includes("fuel_cell") || name.includes("fuel cell") || id.includes("fuelcell")) {
       return true;
     }
   }

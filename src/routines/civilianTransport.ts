@@ -2328,7 +2328,21 @@ if (state && state.status !== "idle") {
     // and behaviour falls back to the old (storage-only) collection.
     if (settings.homeSystem && settings.homeStation) {
       await bot.refreshCargo();
+      await bot.refreshShip();
       const fuelCellCount = countFuelCells(ctx);
+      const tankPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+      // Refuel the tank from cargo cells / station reserve when it runs low,
+      // so we don't attempt travel with an empty tank.
+      if (tankPct < settings.refuelThreshold) {
+        if (bot.docked) {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
+        } else {
+          await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          await bot.refreshShip();
+        }
+      }
+      const tankPctAfter = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
       if (isAtHomeBase(ctx, settings)) {
         if (fuelCellCount <= settings.minFuelCellsToDepart) {
           ctx.log("transport", `Home base: only ${fuelCellCount} fuel cells (need >${settings.minFuelCellsToDepart}) — topping up from faction storage before departing`);
@@ -2341,8 +2355,13 @@ if (state && state.status !== "idle") {
             continue;
           }
         }
-      } else if (fuelCellCount <= settings.minFuelCellsToDepart) {
-        ctx.log("transport", `Low on fuel cells (${fuelCellCount} <= ${settings.minFuelCellsToDepart}) away from home — returning to base to restock instead of buying`);
+        if (tankPctAfter < settings.refuelThreshold && fuelCellCount === 0) {
+          ctx.log("transport", `Home base: tank low (${Math.round(tankPctAfter)}%) and no cargo fuel cells — waiting for stockpile`);
+          await ctx.sleep(30000);
+          continue;
+        }
+      } else if (fuelCellCount <= settings.minFuelCellsToDepart && tankPctAfter < settings.refuelThreshold) {
+        ctx.log("transport", `Low on fuel cells (${fuelCellCount} <= ${settings.minFuelCellsToDepart}) and tank low away from home — returning to base to restock`);
         await returnHomeForFuelCells(ctx, settings);
         await ctx.sleep(2000);
         continue;
@@ -2559,6 +2578,27 @@ if (state && state.status !== "idle") {
         }
         state.status = "traveling_to_ship";
         saveTransportState(state);
+        // Refuel tank before traveling (from cargo cells / station reserve).
+        // Without this the bot sits with fuel in cargo and 0 in tank, failing
+        // every travel attempt with "Insufficient fuel for travel".
+        await bot.refreshShip();
+        const idleTankPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+        if (idleTankPct < settings.refuelThreshold) {
+          if (bot.docked) {
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          } else {
+            await tryRefuel(ctx, { homeSystem: settings.homeSystem, skipApprovedCheck: true });
+          }
+          await bot.refreshShip();
+        }
+        const idleTankPctAfter = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+        if (idleTankPctAfter <= 0) {
+          ctx.log("error", `No fuel in tank and could not refuel at ${bot.poi} — cannot travel`);
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
+        }
         if (state.pickupSystem !== bot.system) {
           const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
           if (!ok) {
